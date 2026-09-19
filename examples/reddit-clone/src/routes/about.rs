@@ -4,15 +4,41 @@
 //! static HTML — zero compute per request. It showcases all the Autumn
 //! features used in this Reddit clone example.
 
+use autumn_web::seo::SeoMeta;
 use autumn_web::{Markup, html, static_get};
 
-use super::layout::layout;
+use super::layout::layout_with_seo;
 
+/// The about page, pre-rendered at build time.
+///
+/// The `seo(...)` argument on the attribute holds every meta value this page
+/// needs, and the `SeoMeta` parameter receives them. The handler adds nothing:
+/// a page whose text never changes needs no per-request builder.
+///
+/// `#[static_get]` honours `seo(...)` in the same way as `#[get]`, so the
+/// pre-rendered HTML carries the tags too.
+///
+/// This route also puts `/about` in `/sitemap.xml`. The framework derives a
+/// sitemap entry for each `#[static_get]` path when `[seo] base_url` is set,
+/// so `RedditSitemapSource` does not list this page. See `docs/guide/seo.md`.
 #[allow(clippy::too_many_lines)] // Template-heavy function
-#[static_get("/about")]
-pub async fn about() -> Markup {
-    layout(
-        "About",
+#[static_get(
+    "/about",
+    seo(
+        title = "About \u{2022} Autumn Reddit",
+        description = "Autumn Reddit is a demo link-sharing site. It shows every major feature of \
+                       the Autumn web framework for Rust in one application.",
+        og_type = "website",
+        twitter_card = "summary"
+    )
+)]
+pub async fn about(seo: SeoMeta) -> Markup {
+    layout_with_seo(
+        // The canonical URL is the one value the attribute cannot hold: it
+        // needs `[seo] base_url` from `autumn.toml`, which is a run-time
+        // value. `main` records it before the app starts, and `autumn build`
+        // runs that same `main`, so the pre-rendered HTML carries the tag too.
+        crate::seo::with_canonical(seo, "/about"),
         None,
         None,
         html! {
@@ -168,4 +194,58 @@ pub async fn about() -> Markup {
             }
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use autumn_web::config::{AutumnConfig, SeoConfig};
+
+    use super::*;
+
+    /// `crate::seo::BASE_URL` is a process-wide `OnceLock`, so this test sets
+    /// it for the whole lib-test binary. That is safe today because no other
+    /// test in this binary reads it: the two `crate::seo` tests exercise the
+    /// pure `with_canonical_in` instead. Keep it that way — a test that
+    /// asserts the *unset* path through `with_canonical` would become
+    /// order-dependent.
+    fn configure_base_url() {
+        crate::seo::init_base_url(&AutumnConfig {
+            seo: SeoConfig {
+                base_url: Some("https://autumn-reddit.example.com".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    }
+
+    #[tokio::test]
+    async fn about_page_renders_its_attribute_tags_and_a_canonical_url() {
+        configure_base_url();
+
+        // The route attribute normally feeds these values in through the
+        // `SeoMeta` extractor. This test calls the handler directly, so it
+        // stands in for the router and passes the same values.
+        let seo = SeoMeta::new()
+            .title("About \u{2022} Autumn Reddit")
+            .description("Autumn Reddit is a demo link-sharing site.")
+            .og_type("website")
+            .twitter_card("summary");
+
+        let html = about(seo).await.into_string();
+
+        assert!(
+            html.contains("<title>About \u{2022} Autumn Reddit</title>"),
+            "html: {html}"
+        );
+        assert!(
+            html.contains(r#"<meta property="og:type" content="website">"#),
+            "html: {html}"
+        );
+        assert!(
+            html.contains(
+                r#"<link rel="canonical" href="https://autumn-reddit.example.com/about">"#
+            ),
+            "the static page must carry a canonical URL too; html: {html}"
+        );
+    }
 }

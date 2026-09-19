@@ -327,11 +327,27 @@ fn build_table_schema(
             .column_default
             .as_deref()
             .is_some_and(|d| d.trim_start().to_ascii_lowercase().starts_with("nextval("));
+        // Whether the default is a plain integer literal, so the database really
+        // does initialize the column when an INSERT omits it. `column_default`
+        // being present is not enough: `DEFAULT nullif(0,0)` is a default that
+        // still violates a NOT NULL constraint. Accepts an optional `::type`
+        // cast and surrounding parens/whitespace, which is how Postgres renders
+        // `DEFAULT 0` back (`0`) and `DEFAULT 0::integer` (`0::integer`).
+        let default_is_integer_literal = row.column_default.as_deref().is_some_and(|d| {
+            let d = d.trim();
+            let d = d
+                .strip_prefix('(')
+                .and_then(|r| r.strip_suffix(')'))
+                .unwrap_or(d);
+            let literal = d.split("::").next().unwrap_or(d).trim();
+            !literal.is_empty() && literal.parse::<i64>().is_ok()
+        });
         columns.push(Column {
             nullable: row.is_nullable.eq_ignore_ascii_case("YES"),
             is_pk: pk.iter().any(|c| c == &row.column_name),
             has_default: row.column_default.is_some(),
             has_sequence_default,
+            default_is_integer_literal,
             is_generated: row.is_generated.eq_ignore_ascii_case("ALWAYS"),
             is_identity: row.is_identity.eq_ignore_ascii_case("YES"),
             name: row.column_name.clone(),
@@ -347,6 +363,60 @@ fn build_table_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `ColumnRow` as `information_schema.columns` would hand it back, with
+    /// only the `column_default` varying — the field this test module is about.
+    fn column_row(column_default: Option<&str>) -> ColumnRow {
+        ColumnRow {
+            table_name: "posts".into(),
+            column_name: "lock_version".into(),
+            udt_name: "int4".into(),
+            is_nullable: "NO".into(),
+            column_default: column_default.map(ToOwned::to_owned),
+            is_generated: "NEVER".into(),
+            is_identity: "NO".into(),
+        }
+    }
+
+    fn built(column_default: Option<&str>) -> Column {
+        let mut by_table = BTreeMap::new();
+        by_table.insert("posts".to_owned(), vec![column_row(column_default)]);
+        let schema = build_table_schema("posts", &by_table, &BTreeMap::new()).unwrap();
+        schema.columns.into_iter().next().unwrap()
+    }
+
+    /// Issue #1318: the `#[lock_version]` annotation hinges on the database
+    /// really initializing the column when an INSERT omits it, so a *present*
+    /// default is not enough — the value matters. Strings below are exactly what
+    /// Postgres 16 renders back into `column_default`.
+    #[test]
+    fn integer_literal_defaults_are_distinguished_from_other_defaults() {
+        for usable in ["0", "1", "0::integer", " 0 ", "(0)", "-1"] {
+            assert!(
+                built(Some(usable)).default_is_integer_literal,
+                "`{usable}` initializes the column and must count"
+            );
+        }
+        for unusable in [
+            // A default that evaluates to NULL: reported, but every insert that
+            // omits the column still violates the NOT NULL constraint.
+            "NULLIF(0, 0)",
+            "nextval('posts_id_seq'::regclass)",
+            "now()",
+            "'draft'::text",
+            "gen_random_uuid()",
+        ] {
+            assert!(
+                !built(Some(unusable)).default_is_integer_literal,
+                "`{unusable}` does not initialize an integer counter"
+            );
+        }
+        // A literal `DEFAULT NULL` never reaches us: Postgres normalizes a
+        // constant-NULL default away and reports no default at all.
+        let none = built(None);
+        assert!(!none.has_default);
+        assert!(!none.default_is_integer_literal);
+    }
 
     #[test]
     fn parse_host_port_extracts_pieces() {

@@ -3,7 +3,7 @@
 Autumn relies on procedural macros to eliminate boilerplate. This guide shows
 you exactly what those macros generate so there are no surprises at runtime.
 
-Examples in this guide track the Autumn 0.6.x line and Rust 1.88.0+ as of
+Examples in this guide track the Autumn 0.7.x line and Rust 1.88.0+ as of
 2026-07-10.
 
 The code snippets are **illustrative**, not compiled doctests: the "what it
@@ -24,7 +24,7 @@ in `autumn-macros/src/*.rs` and by trybuild/integration tests.
   - [Repositories](#repositories) — `#[repository(Model)]` and its advanced surface
   - [Services](#services) — `#[service]`
   - [Background Work: Scheduled Tasks, Jobs, Events, Listeners, One-off Tasks](#background-work-scheduled-tasks-jobs-events-listeners-one-off-tasks) — `#[scheduled]` + `tasks![]`, `#[job]` + `jobs![]`, `#[event]`, `#[listener]` + `listeners![]`, `#[task]` + `one_off_tasks![]`, `#[cached]`
-  - [Guards & Rate Limiting](#guards--rate-limiting) — `#[secured]`, `#[authorize]`, `#[step_up]`, `#[feature_flag]`, `#[throttle]`
+  - [Guards & Rate Limiting](#guards--rate-limiting) — `#[secured]`, `#[authorize]`, `#[step_up]`, `#[feature_flag]`, `#[throttle]`, `#[query_budget]`, `#[agent_operable]`
   - [Mail](#mail) — `#[mailer]`, `#[mailer_preview]` + `mail_previews![]`, `#[inbound_mail]`
   - [i18n, Stories & Path Helpers](#i18n-stories--path-helpers) — `t!`, `story!`, `paths![]`
 - [The Companion Function Pattern](#the-companion-function-pattern)
@@ -38,7 +38,7 @@ When your application starts, Autumn logs every decision it makes. A typical
 startup sequence looks like this:
 
 ```
-  INFO autumn: Autumn starting version="0.6.0" profile="dev"
+  INFO autumn: Autumn starting version="0.7.0" profile="dev"
   INFO autumn: Database pool configured max_connections=10
   INFO autumn: Registered task name="db_cleanup" schedule="every 5m"
   INFO autumn: Listening addr=127.0.0.1:3000
@@ -47,7 +47,7 @@ startup sequence looks like this:
 If you omit the database:
 
 ```
-  INFO autumn: Autumn starting version="0.6.0" profile="dev"
+  INFO autumn: Autumn starting version="0.7.0" profile="dev"
   INFO autumn: Database not configured
   INFO autumn: Listening addr=127.0.0.1:3000
 ```
@@ -74,7 +74,7 @@ AUTUMN_SHOW_CONFIG=1 cargo run
 This produces output like:
 
 ```
-  INFO autumn: Autumn starting version="0.6.0" profile="dev"
+  INFO autumn: Autumn starting version="0.7.0" profile="dev"
   INFO autumn: Registered routes:
     /            GET      -> index
     /todos       GET      -> list_todos
@@ -180,8 +180,8 @@ async fn hello() -> &'static str {
 **The macro generates (alongside your function):**
 
 ```rust
-pub fn __autumn_route_info_hello() -> ::autumn_web::route::Route {
-    ::autumn_web::route::Route {
+pub fn __autumn_route_info_hello() -> ::autumn_web::Route {
+    ::autumn_web::Route {
         method: ::http::Method::GET,
         path: "/hello",
         handler: ::axum::routing::get(hello),
@@ -289,6 +289,11 @@ A WebSocket upgrade route built on a **two-function** pattern: your outer
 function runs at upgrade time (with normal extractors) and returns a value
 implementing `WsHandler` that owns the live socket.
 
+Behind the non-default `ws` Cargo feature — `autumn-web = { version = "0.7",
+features = ["ws"] }`. Without it the attribute does not exist, and the block
+below fails to compile against your own file. See
+[WebSockets](./websockets.md).
+
 **You write:**
 
 ```rust
@@ -340,7 +345,8 @@ fn __autumn_route_info_echo() -> ::autumn_web::Route { /* method GET, hidden fro
 Enriches a route's auto-generated OpenAPI documentation with fields that can't
 be inferred from the signature. It does **not** stand alone: it folds its
 metadata into the *paired* route macro's `ApiDoc`. Applied without a route
-macro, it is a no-op.
+macro, it is a no-op. For what ends up in the served document, see the
+[OpenAPI guide](openapi.md).
 
 **You write:**
 
@@ -491,7 +497,8 @@ Beyond `#[id]`, `#[default]`, `#[validate(...)]`, `#[indexed]`, and
 These are stripped from the emitted Diesel query struct (they'd confuse the
 derives) and instead drive extra generated code. The full recognized set is
 `id`, `indexed`, `validate`, `default`, `factory_assoc`, `lock_version`,
-`searchable`, `encrypted`, `private`, `normalize`, and `state_machine`. The
+`searchable`, `encrypted`, `classified`, `private`, `normalize`, and
+`state_machine`. The
 association attributes `belongs_to` / `has_many` / `has_one` are **not**
 field-level — they are struct-level attributes placed *above* the struct (see
 [Associations and search keys](#associations-and-search-keys) below).
@@ -560,10 +567,53 @@ pub struct Customer {
 leakage) for queryability — reach for it only when you must filter on the
 column. See [Attribute Encryption](./attribute-encryption.md).
 
-#### `#[normalize(trim, downcase, upcase, squish, with = path)]`
+#### `#[classified]` / `#[classified(personal_data)]`
+
+Marks a `String` column as personal data and carries that classification on the
+**type**: the generated field is `Classified<String, {Model}{Column}Classified>`, a
+wrapper with no `Serialize`, no `Display`, no `Deref` and no `into_inner`, and
+the model itself loses its `Serialize` derive. There is no expression that gets
+the value to a serializer, so `Json(model)` and `Json(View { email: model.email })`
+are both compile errors.
+
+```rust
+#[model(table = "customers")]
+pub struct Customer {
+    #[id] pub id: i64,
+    pub name: String,
+    #[classified] pub email: String, // Classified<String, CustomerEmailClassified>
+}
+
+autumn_web::declassify! {
+    /// Support agents need the customer's email address to answer the ticket.
+    pub SUPPORT_LOOKUP: CustomerEmailClassified => JsonResponse,
+    purpose = "support_lookup",
+    reason = "Support agents need the email address to answer the ticket.",
+}
+```
+
+The write structs (`New*` / `Update*` / changeset) and the generated factory
+still *accept* the value —
+a client sets it, and deserialization, `#[validate]` and form rendering are
+unchanged — but they carry the wrapper too (`Classified<String, F>`, or
+`Patch<Classified<String, F>>` on the patch) and get
+`#[serde(skip_serializing)]`. Their fields are `pub`, so a bare `String` there
+would have let a handler move the plaintext into a response view and release it
+with no boundary; building one by hand now costs an `.into()`. `Debug` renders
+`<classified>` on every generated struct. `autumn data-flow` emits the manifest of which sinks each classified
+column can reach.
+
+**Gotcha:** it cannot be combined with `#[encrypted]`, `#[searchable]`,
+`#[normalize]`, `#[translatable]`, `#[id]`, `#[lock_version]`, `#[position]`,
+`#[state_machine]`, or a serde rename — each is rejected with a diagnostic
+saying why. A `#[repository]` recording version history or a ledger serializes
+the whole model, which a classified model cannot do; gating those sinks is a
+follow-up slice. See [Data Classification](./data-classification.md).
+
+#### `#[normalize(trim, downcase, upcase, squish, strip_nul, with = path)]`
 
 Runs an ordered normalizer chain over the owned `String` before every insert
-and update. Built-ins (`trim`, `downcase`, `upcase`, `squish`) are
+and update. Built-ins (`trim`, `downcase`, `upcase`, `squish`, `strip_nul`) are
 `fn(&str) -> String` in `autumn_web::normalize`; `with = path` calls your own
 function with the same signature. Normalizers apply left-to-right.
 
@@ -851,12 +901,28 @@ the aggregate per shard via `from_shard(...)` instead. Grouping/filtering on an
 #### `dependent(...)` cascades
 
 `dependent(ChildRepository, fk = "col", on_delete = destroy | delete_all |
-nullify | restrict)` makes `delete_by_id` cascade into the child repository's
-delete path within one transaction (overriding the plain `delete_by_id`).
+nullify | restrict)` makes both `delete_by_id` and the bulk `delete_many`
+cascade into the child repository's delete path within one transaction
+(overriding the plain delete bodies).
 
-**Gotcha:** the cascade is **single-level** — it applies this model's deletion
-to each directly-matched child but does *not* recurse into the child's own
-`dependent(...)` declarations, so grandchildren are not handled.
+The same cascade can be declared on the model instead — `#[has_many(Comment,
+dependent = destroy)]` / `#[has_one(...)]`, which resolves the child repository
+by the `Pg{Child}Repository` convention and drives it through a generated
+`Model::dependents()` table. When a repository declares `dependent(...)`, the
+repository attribute wins and a debug-only `tracing::warn!` names the inert
+model-side declaration.
+
+A `destroy`d child runs its **own** dependents before its row is removed, so
+multi-level graphs (`Post -> Comment -> Reply`) cascade end to end, with a
+`(table, id)` guard so self- and mutually-referential graphs terminate.
+
+**Gotcha:** `delete_all` is the one action that stays **single-level** — it is a
+set-based delete that fires no child hooks and does not recurse, so rows it
+removes must not have dependents of their own.
+
+Full treatment — the action table, ordering guarantees, precedence, and the
+rejected combinations — is in the
+[repositories guide](repositories.md#9-dependent-cascades-dependent--action).
 
 #### `cursor_page` (keyset pagination)
 
@@ -1124,11 +1190,30 @@ async fn get_user(id: i64) -> AutumnResult<User> {
 
 ```rust
 async fn get_user(id: i64) -> AutumnResult<User> {
-    static __AUTUMN_CACHE: OnceLock<MokaCache> = OnceLock::new();
-    let __autumn_moka = __AUTUMN_CACHE.get_or_init(|| MokaCache::new(100, Some(::core::time::Duration::from_secs(300))));
+    // #1716: registers this read in the cache-coherence manifest. It lives in
+    // the BODY, not beside the function, because it expands to an anonymous
+    // `const _` that an `impl` block cannot hold.
+    inventory::submit! {
+        CachedReadDescriptor {
+            id: concat!(module_path!(), "::", "get_user"),
+            kind: ReadKind::Cached,
+            reads: &[/* declared `reads(...)`, else what derivation found */],
+            provenance: DependencyProvenance::Undetermined,
+            acknowledged_stale: None,
+            location: concat!(file!(), ":", line!()),
+        }
+    }
+    // `Arc` so a clone can be handed to the coherence registry; the store is
+    // still a per-function static.
+    static __AUTUMN_CACHE: OnceLock<Arc<MokaCache>> = OnceLock::new();
+    let __autumn_moka = __AUTUMN_CACHE.get_or_init(|| {
+        let store = Arc::new(MokaCache::new(100, Some(::core::time::Duration::from_secs(300))));
+        coherence::register_namespace_store(concat!(module_path!(), "::", "get_user"), store.clone());
+        store
+    });
     // Prefer a process-wide shared backend (e.g. Redis) when registered,
     // else fall back to the per-function Moka store.
-    let __autumn_cache = global_cache().unwrap_or(__autumn_moka);
+    let __autumn_cache = global_cache().unwrap_or(&**__autumn_moka);
     let __autumn_key = make_cache_key(concat!(module_path!(), "::", "get_user"), &(id.clone(),));
     if let Some(hit) = get_cached::<User>(__autumn_cache, &__autumn_key) {
         return Ok(hit); // `result` mode caches only Ok values
@@ -1137,14 +1222,31 @@ async fn get_user(id: i64) -> AutumnResult<User> {
     // insert on success ...
     out
 }
+
+// Two companion items beside the function. Both are valid ASSOCIATED items, so
+// `#[cached]` still works on an associated function; that is also why the
+// identity above is spliced rather than referenced through this constant.
+#[doc(hidden)]
+const __AUTUMN_CACHE_READ_ID__get_user: &'static str =
+    concat!(module_path!(), "::", "get_user");
+
+#[doc(hidden)]
+fn __autumn_cache_invalidate__get_user() -> bool {
+    coherence::invalidate_namespace(concat!(module_path!(), "::", "get_user"))
+}
 ```
 
 Options: `ttl` (duration string, e.g. `"5m"`), `max` (entry cap, default
-`10_000`, LRU eviction), and the `result` flag (cache only `Ok` values, pass
-`Err` through uncached).
+`10_000`, LRU eviction), the `result` flag (cache only `Ok` values, pass `Err`
+through uncached), `key(a, b)` (hash only the named parameters — this is what
+lets a cached read take a repository handle, which is `Clone` but not `Hash`),
+and the cache-coherence pair `reads(Model, …)` / `acknowledge_stale = "…"`.
 
 **Gotcha:** `#[cached]` cannot be applied to methods with a `self` receiver.
-See [Fragment Caching](./fragment-caching.md) and [Cache Stampede](./cache-stampede.md).
+The `__AUTUMN_CACHE_READ_ID__…` constant inherits the function's visibility, so
+a private cached read cannot be named by an `invalidates(...)` in another module.
+See [Fragment Caching](./fragment-caching.md), [Cache Stampede](./cache-stampede.md)
+and [Cache Coherence](./cache-coherence.md).
 
 ---
 
@@ -1186,8 +1288,9 @@ async fn admin_panel(__autumn_session: Session) -> AutumnResult<&'static str> {
 
 ### `#[authorize("action", resource = Type)]`
 
-Injects hidden `Session` and `State<AppState>` extractors and a
-record-level [`Policy`](./authorization.md) check at the top of your
+Injects hidden extractors (`Session`, `State<AppState>`, the granted
+API-token scopes, and the route-version/idempotency-replay extensions) and
+a record-level [`Policy`](./authorization.md) check at the top of your
 handler. Mirrors `#[secured]` but answers "are you allowed to act on
 *this* record?" instead of "are you allowed to call this *route*?"
 
@@ -1206,17 +1309,31 @@ async fn edit_post(post: Post) -> AutumnResult<Markup> {
 ```rust
 #[get("/posts/{id}/edit")]
 async fn edit_post(
+    __autumn_token_scopes: Option<Extension<ApiTokenScopes>>,
     __autumn_session: Session,
     State(__autumn_state): State<AppState>,
+    // … plus hidden route-version and idempotency-replay extractors
     post: Post,
-) -> AutumnResult<Markup> {
-    ::autumn_web::authorization::__check_policy::<Post>(
+) -> Response {
+    // Inert build-time marker — nothing reads it at runtime. It lets the
+    // route macro recover the binding when `#[authorize]` expands *before*
+    // `#[get]` (attribute order decides which macro sees the other's output).
+    const __AUTUMN_AUTHORIZE_BINDINGS: &[(&str, &str)] = &[("update", "Post")];
+
+    if let Err(__autumn_error) = ::autumn_web::authorization::__check_policy_scoped::<Post>(
         &__autumn_state,
         &__autumn_session,
+        __autumn_token_scopes.as_ref().map(|__e| &__e.0),
         "update",
         &post,
-    ).await?;
-    Ok(html! { h1 { (post.title) } })
+    ).await {
+        return __autumn_error.into_response();
+    }
+    // … sunset check and idempotency-replay short-circuit …
+    let __autumn_inner: AutumnResult<Markup> = (async move {
+        Ok(html! { h1 { (post.title) } })
+    }).await;
+    __autumn_inner.into_response()
 }
 ```
 
@@ -1225,8 +1342,21 @@ async fn edit_post(
 - The check returns the configured deny status — `404` by default to
   avoid leaking record existence, configurable via
   `[security] forbidden_response = "403"`.
+- The scope-aware `__check_policy_scoped` takes the request's granted API-token
+  scopes as its third argument, so a policy can decide on `ctx.has_scope(...)`
+  for token-authenticated principals as well as session ones.
+- The handler is rewritten to return `Response`, and the original body is
+  wrapped in `(async move { … }).await` so the deny path can return early
+  before it runs.
+- `__AUTUMN_AUTHORIZE_BINDINGS` records the resource *identifier as written*,
+  never the `Policy` impl that serves the check — that is resolved from the
+  registry at boot. It is what puts the route's `(action, resource)` pair into
+  the `authorization_policies` dimension of the build-time security manifest;
+  see [Security Posture Manifest](./security-posture-manifest.md).
 - Coexists with `#[secured]`: stack both attributes when a route should
-  require both authentication/role gating and a record-level check.
+  require both authentication/role gating and a record-level check. Each
+  attribute leaves its own marker, so both the roles and the binding survive
+  however the two expand around each other.
 
 ### `#[step_up]` / `#[step_up(max_age = "5m")]`
 
@@ -1355,9 +1485,168 @@ envelope bucket and **still** charge it, exactly as a direct call (use
 `RateLimitExempt` to bypass *every* limiter). It's mentioned here only because it
 lives next to the throttle machinery. See [Rate Limiting](./rate-limiting.md).
 
+### `#[query_budget(N)]`
+
+A **build-time** gate, not a runtime guard: it walks the handler's AST, bounds
+how many database queries any statically reachable path can issue, and fails
+the compile when that bound exceeds `N`.
+
+**You write:**
+
+```rust
+#[get("/posts")]
+#[query_budget(2)]
+async fn index(repo: PgPostRepository) -> AutumnResult<Markup> {
+    let posts = repo.find_all().await?;                                // 1
+    let posts = repo.preload(posts, Post::preload().author()).await?;  // 2
+    Ok(render(&posts))
+}
+```
+
+**Effect:** the handler is emitted **unchanged** — no injected extractors, no
+prologue, no rewritten return type, nothing at runtime. The only added item is
+a hidden constant recording the contract and the proof:
+
+```rust
+#[doc(hidden)]
+#[allow(non_upper_case_globals, dead_code)]
+const __AUTUMN_QUERY_BUDGET_index: ::autumn_web::query_budget::StaticQueryBudget =
+    ::autumn_web::query_budget::StaticQueryBudget::new("index", Some(2u32), Some(2u32));
+```
+
+(That constant is withheld for a method taking `self`, where a trait impl would
+reject an associated const the trait never declared.)
+
+Two statement-level annotations, `#[query_cost(N)]` and
+`#[query_exempt(reason = "…")]`, are this macro's own vocabulary: it reads them
+and **strips them from the emitted function**, so they never reach rustc — and
+so they are meaningless outside a `#[query_budget]`-annotated function.
+
+**Attribute ordering:** either order works, since the handler is emitted
+verbatim. Keep the method attribute outermost anyway, matching `#[throttle]` /
+`#[secured]`, so the route macro still sees the real return type for the
+OpenAPI response schema.
+
+See [Compile-Time Query Budgets](./query-budgets.md).
+
+### `#[agent_operable(grant = G)]`
+
+Also a **build-time** gate: it walks the handler's AST, derives the side effects
+it can prove — row writes, unbounded writes, cross-tenant access, outbound
+hosts, webhook topics, job enqueues — and fails the compile when the named
+grant does not allow one of them. Unlike `#[query_budget]`, it *does* add items
+to your code, so it is worth knowing exactly which.
+
+**You write:**
+
+```rust
+use autumn_web::prelude::*;
+
+authority_grant! {
+    pub RefundDrafter {
+        writes: [Refund],
+        tenant_scope: scoped,
+        reversibility: compensable,
+    }
+}
+
+#[post("/api/refunds")]
+#[agent_operable(grant = RefundDrafter)]
+async fn draft_refund(repo: PgRefundRepository) -> AutumnResult<Json<Refund>> {
+    let refund = repo.create(&body).await?;
+    Ok(Json(refund))
+}
+```
+
+**Effect:** the handler's *body* is emitted with one added statement, and three
+items are added beside it.
+
+1. A marker const, injected as the **first statement of the body**:
+
+   ```rust
+   #[allow(dead_code, non_upper_case_globals)]
+   const __AUTUMN_AGENT_OPERABLE: &::core::primitive::str = "RefundDrafter";
+   ```
+
+   This is what makes attribute order irrelevant: attributes expand
+   outermost-first, so with `#[agent_operable]` on top it expands first and
+   strips itself — and the route macro, running afterwards, finds this marker
+   in the body and fills `ApiDoc::agent_authority` anyway. (The other order
+   needs no marker: `#[post]` expands while the attribute is still there to
+   read.)
+
+2. One `const _: () = assert!(…)` per proved effect, **respanned onto the call
+   that produced it** — which is why the error points at your write rather than
+   at the attribute:
+
+   ```rust
+   const _: () = ::core::assert!(
+       RefundDrafter.allows_write(PgRefundRepository::__AUTUMN_MODEL_IDENT),
+       "agent authority: `draft_refund` writes `Refund`, which grant … "
+   );
+   ```
+
+   Const-eval reads the linked `Grant`, not tokens, so the check holds when the
+   grant is declared in another crate. A reversibility-floor assertion is added
+   the same way when any effect requires one.
+
+3. A `static` recording what was proved, and its manifest registration:
+
+   ```rust
+   #[doc(hidden)]
+   #[allow(non_upper_case_globals, dead_code)]
+   static __AUTUMN_AGENT_AUTHORITY_draft_refund:
+       ::autumn_web::agent_authority::AgentAuthority = /* action, grant, effects, … */;
+
+   ::autumn_web::reexports::inventory::submit! {
+       ::autumn_web::agent_authority::AgentAuthorityDescriptor(&__AUTUMN_AGENT_AUTHORITY_draft_refund)
+   }
+   ```
+
+   It takes the handler's own visibility, and carries every proved effect with
+   its `file:line`, plus one `AssertedEffectFree { location, reason }` per
+   `#[agent_effect(none, …)]` site — so a reviewer reads not just *that* a
+   hatch was used but where and why. `inventory` is what lets
+   `autumn agents manifest` see every action in the linked binary, including
+   ones declared in plugins. Any plain `#[cfg]` on the handler is replayed onto
+   both (a `cfg_attr` is not — it applies an attribute written for a function),
+   so a handler that does not exist in this build contributes no row and leaves
+   no dangling reference.
+
+   For a method taking `self`, **all three** of these are withheld — the
+   marker included, so no route macro can reference a static that was not
+   emitted. A trait impl would reject an associated item the trait never
+   declared. The analysis still runs.
+
+One statement-level annotation, `#[agent_effect(...)]`, is this macro's own
+vocabulary: it reads it and **strips it from the emitted function**, so it
+never reaches rustc — and so it is meaningless outside an
+`#[agent_operable]`-annotated function.
+
+`authority_grant!` itself expands to a `pub const G: Grant = …` plus its own
+`inventory::submit!`, so a declared-but-unused envelope still appears in the
+manifest.
+
+**Attribute ordering:** either order works, via the marker in (1). Keep the
+method attribute outermost anyway, as elsewhere. `#[edge]` is the one attribute
+this cannot be combined with, and that is a compile error rather than a silent
+skip.
+
+See [The Agent Authority Envelope](./agent-authority.md).
+
 ---
 
 ## Mail
+
+Every macro in this section is behind a non-default Cargo feature:
+`#[mailer]`, `#[mailer_preview]` and `mail_previews![]` need `mail`,
+and `#[inbound_mail]` needs `inbound-mail`.
+
+```toml
+autumn-web = { version = "0.7", features = ["mail", "inbound-mail"] }
+```
+
+See [Mail](./mail.md) for the subsystem itself.
 
 ### `#[mailer]`
 
@@ -1430,7 +1719,9 @@ Recipient matching: `to = "address@example.com"` (exact),
 ### `t!` (i18n translate)
 
 Translates an i18n key, with **compile-time validation** that the key exists in
-the default locale's `.ftl` file.
+the default locale's `.ftl` file. Behind the non-default `i18n` feature —
+`autumn-web = { version = "0.7", features = ["i18n"] }`; see
+[Internationalization](./i18n.md).
 
 **You write:**
 

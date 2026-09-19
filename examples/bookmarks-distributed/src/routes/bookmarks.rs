@@ -17,6 +17,12 @@ fn layout(title: &str, content: Markup) -> Markup {
                 script src="/static/js/htmx.min.js" {}
             }
             body class="bg-gray-50 min-h-screen" {
+                a href="#main-content"
+                  class="skip-link sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 \
+                         focus:z-50 focus:px-4 focus:py-2 focus:bg-white focus:text-gray-900 \
+                         focus:border focus:border-gray-300 focus:rounded focus:shadow" {
+                    "Skip to main content"
+                }
                 nav class="bg-indigo-600 text-white p-4" {
                     div class="max-w-3xl mx-auto flex justify-between items-center" {
                         a href=(paths::list()) class="text-xl font-bold" { "Bookmarks" }
@@ -26,7 +32,7 @@ fn layout(title: &str, content: Markup) -> Markup {
                         }
                     }
                 }
-                main class="max-w-3xl mx-auto p-6" { (content) }
+                main id="main-content" class="max-w-3xl mx-auto p-6" { (content) }
             }
         }
     }
@@ -135,9 +141,16 @@ pub async fn new_form() -> Markup {
 }
 
 #[post("/bookmarks")]
-pub async fn create(form: Form<NewBookmark>) -> AutumnResult<Redirect> {
+pub async fn create(
+    State(state): State<AppState>,
+    form: Form<NewBookmark>,
+) -> AutumnResult<Redirect> {
     let repo = BookmarkRepository;
     repo.save(&form).await?;
+    // Cluster-wide, coordination-service-free: this replica adds to its own
+    // entry and the other replica sees the new total within a push interval.
+    // See `src/routes/cluster.rs`.
+    crate::routes::cluster::record_bookmark_created(&state);
     Ok(Redirect::to(&paths::list()))
 }
 

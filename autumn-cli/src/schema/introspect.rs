@@ -492,33 +492,31 @@ fn fetch_columns(
     conn: &mut PgConnection,
     tables: &[String],
 ) -> Result<BTreeMap<String, Vec<ColumnRow>>, IntrospectError> {
-    // `numeric_precision` / `numeric_scale` / `character_maximum_length` are the
-    // `information_schema` `cardinal_number` domain, not a plain `int4`. Decoding
-    // that domain as diesel `Nullable<Integer>` on the wire is unproven (no sibling
-    // query reads them), and if it does not present as `int4` the whole column query
-    // would error and every pull would fail. Cast each to a plain `integer` in SQL so
-    // the output type is guaranteed `int4` regardless of the domain. The `AS <name>`
-    // aliases keep the result column names aligned with the `ColumnRow` field bindings.
+    // `numeric_precision`, `numeric_scale`, and `character_maximum_length` are the
+    // `information_schema` `cardinal_number` domain, not a plain `int4`. Decoding that
+    // domain as diesel `Nullable<Integer>` on the wire is unproven — no sibling query
+    // reads them — and if it does not present as `int4` the whole column query would error
+    // and every pull would fail. Cast each to a plain `integer` in SQL, so the output type
+    // is guaranteed `int4` whatever the domain. The `AS <name>` aliases keep the result
+    // column names aligned with the `ColumnRow` field bindings.
     //
-    // `owns_sequence` is an `EXISTS` over `pg_depend` that is `true` only when the
-    // column OWNS the SAME sequence its `nextval(...)` default allocates from — the
-    // conventional `SERIAL`/`BIGSERIAL` shape. It ties TWO dependencies to one
-    // sequence:
+    // `owns_sequence` is an `EXISTS` over `pg_depend` that is true only when the column
+    // owns the same sequence its `nextval(...)` default allocates from — the conventional
+    // `SERIAL`/`BIGSERIAL` shape. It ties two dependencies to one sequence:
     //   * OWNED BY (`deptype = 'a'`): a `pg_depend` row linking a sequence
-    //     (`pg_class.relkind = 'S'`, as `objid`) to this exact column
-    //     (`refobjid = <table oid>`, `refobjsubid = <column attnum>`).
-    //   * used-by-default (`deptype = 'n'`): a `pg_depend` row from the column's
-    //     default expression (`pg_attrdef`, `classid = 'pg_attrdef'::regclass`) to
-    //     that SAME sequence (`refobjid = seq.oid`).
-    // Requiring BOTH on the same sequence closes the brownfield hole where a column
-    // still owns an old sequence (`t_id_seq`, `deptype = 'a'`) but its default was
-    // repointed to a different one (`DEFAULT nextval('global_ids')`): the used-by
-    // dependency then targets `global_ids`, not the owned `t_id_seq`, so `EXISTS` is
-    // `false`, the raw `nextval('global_ids')` default is preserved verbatim (never
-    // stripped to a fresh owned `BIGSERIAL`), and the column classifies as
-    // `Some(Plain)`. A plain shared/custom-sequence PK (owns nothing) likewise has no
-    // `deptype = 'a'` row → `false` → preserved. `pg_depend`/`pg_attrdef` exist in
-    // every supported Postgres, so this never breaks older servers.
+    //     (`pg_class.relkind = 'S'`, as `objid`) to this exact column (`refobjid = <table
+    //     oid>`, `refobjsubid = <column attnum>`).
+    //   * used-by-default (`deptype = 'n'`): a `pg_depend` row from the column's default
+    //     expression (`pg_attrdef`, `classid = 'pg_attrdef'::regclass`) to that same
+    //     sequence (`refobjid = seq.oid`).
+    // Requiring both on the same sequence closes the brownfield hole where a column still
+    // owns an old sequence (`t_id_seq`, `deptype = 'a'`) but its default was repointed to
+    // another (`DEFAULT nextval('global_ids')`): the used-by dependency then targets
+    // `global_ids`, not the owned `t_id_seq`, so `EXISTS` is false, the raw
+    // `nextval('global_ids')` default is preserved verbatim rather than stripped to a
+    // fresh owned `BIGSERIAL`, and the column classifies as `Some(Plain)`. A plain shared
+    // or custom-sequence PK owns nothing and likewise has no `deptype = 'a'` row.
+    // `pg_depend` and `pg_attrdef` exist in every supported Postgres.
     let query = format!(
         "SELECT c.table_name, c.column_name, c.udt_name, c.is_nullable, c.column_default, \
          c.numeric_precision::integer AS numeric_precision, \
@@ -864,15 +862,14 @@ fn build_table(
         .collect();
 
     for row in columns {
-        // Fail-closed floor for Postgres DOMAIN columns: when the column is typed
-        // on a domain (`CREATE DOMAIN email_dom AS text CHECK (…)`),
-        // `information_schema` reports the base type in `udt_name` (`text`) while
-        // naming the domain in `domain_name`. Flattening to the base type would
-        // silently drop the domain's identity and validation on recreation, so
-        // preserve the domain verbatim as `Opaque` (schema-qualified when not in
-        // `public`). `Opaque`'s `sql_type` emits `pg_type` unchanged, so the down
-        // migration re-references the still-existing domain type. A non-domain
-        // column (`domain_name` NULL) maps exactly as before.
+        // Fail-closed floor for Postgres DOMAIN columns. When a column is typed on a
+        // domain (`CREATE DOMAIN email_dom AS text CHECK (…)`), `information_schema`
+        // reports the base type in `udt_name` (`text`) while naming the domain in
+        // `domain_name`. Flattening to the base type would silently drop the domain's
+        // identity and validation on recreation, so preserve the domain verbatim as
+        // `Opaque`, schema-qualified when not in `public`. `Opaque`'s `sql_type` emits
+        // `pg_type` unchanged, so the down migration re-references the still-existing
+        // domain type. A non-domain column, with `domain_name` NULL, maps as before.
         let ty = row.domain_name.as_ref().map_or_else(
             || {
                 ColumnType::from_pg_introspection(
@@ -1010,23 +1007,23 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
             .filter(|c| !c.is_empty())
             .map(str::to_owned)
             .collect();
-        // "Simple" == a single representable column set (not partial, not an
-        // expression, and NOT a covering `INCLUDE` index — whose key/INCLUDE
-        // columns are indistinguishable in the `indkey`-derived list). A
-        // single-column simple unique index sets the owning column's `unique`
-        // flag whether or not it backs a constraint (the flag is accurate either
-        // way and is never diffed). A covering `INCLUDE` unique index is NOT
-        // simple, so it never sets that flag (its uniqueness scope is only its
-        // key columns) and is retained verbatim via its `definition`.
-        // A PG15+ `NULLS NOT DISTINCT` unique index enforces STRICTER uniqueness
-        // than a plain (nulls-distinct) unique index, and the model DSL cannot
-        // express it. `pg_get_indexdef` (version-safe on every supported Postgres —
-        // it never emits the clause on PG13/14) renders the `NULLS NOT DISTINCT`
-        // clause into the `definition` text; detecting it there (rather than via the
-        // PG15-only `pg_index.indnullsnotdistinct` catalog column, which would break
-        // introspection on PG13/14) forces the index to be retained VERBATIM via its
-        // `definition` so the clause round-trips, instead of collapsing to an
-        // ordinary unique index that would silently drop it.
+        // "Simple" means a single representable column set: not partial, not an
+        // expression, and not a covering `INCLUDE` index, whose key and INCLUDE columns
+        // are indistinguishable in the `indkey`-derived list. A single-column simple
+        // unique index sets the owning column's `unique` flag whether or not it backs a
+        // constraint — the flag is accurate either way and is never diffed. A covering
+        // `INCLUDE` unique index is not simple, so it never sets that flag, since its
+        // uniqueness scope is only its key columns, and is retained verbatim via its
+        // `definition`.
+        //
+        // A PG15+ `NULLS NOT DISTINCT` unique index enforces stricter uniqueness than a
+        // plain nulls-distinct one, and the model DSL cannot express it.
+        // `pg_get_indexdef` — version-safe on every supported Postgres, never emitting the
+        // clause on PG13/14 — renders `NULLS NOT DISTINCT` into the `definition` text.
+        // Detecting it there, rather than via the PG15-only
+        // `pg_index.indnullsnotdistinct` catalog column that would break introspection on
+        // PG13/14, forces the index to be retained verbatim so the clause round-trips
+        // instead of collapsing to an ordinary unique index that silently drops it.
         let nulls_not_distinct = row
             .definition
             .to_ascii_uppercase()
@@ -1036,19 +1033,17 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
         if simple && row.is_unique && key_columns.len() == 1 {
             unique_columns.insert(key_columns[0].clone());
         }
-        // Retain (preserve verbatim, never drop) any index the model DSL cannot
-        // express: an expression, partial, or covering `INCLUDE` index, OR a
-        // constraint-owned index (UNIQUE/EXCLUDE) whose backing constraint
-        // Postgres won't let us drop. A plain, non-constraint index keeps
-        // `definition: None` so its JSON is unchanged and the model round-trip
-        // stays clean.
+        // Retain — preserve verbatim, never drop — any index the model DSL cannot
+        // express: an expression, partial, or covering `INCLUDE` index, or a
+        // constraint-owned index (UNIQUE/EXCLUDE) whose backing constraint Postgres will
+        // not let us drop. A plain, non-constraint index keeps `definition: None`, so its
+        // JSON is unchanged and the model round-trip stays clean.
         //
-        // For a SIMPLE index `Index.columns` stays the ordered key columns (exact
-        // round-trip parity; the `pg_depend` set equals the key columns anyway).
-        // For a DEFINITION-carrying index (expression / partial / constraint-owned),
-        // `Index.columns` is the exact `pg_depend` dependent-column set — key,
-        // expression-referenced, AND predicate columns — the set the diff engine
-        // uses for exact cascade/dependency detection (no string scan).
+        // For a simple index, `Index.columns` stays the ordered key columns — exact
+        // round-trip parity, and the `pg_depend` set equals the key columns anyway. For a
+        // definition-carrying index, `Index.columns` is the exact `pg_depend`
+        // dependent-column set: key, expression-referenced, and predicate columns, the set
+        // the diff engine uses for cascade and dependency detection without a string scan.
         let (columns, definition, key_cols) = if simple && !row.is_constraint {
             // A plain simple index's key columns ARE its `columns`, so recording
             // `key_columns` separately would be redundant JSON noise — leave it empty
@@ -1062,16 +1057,15 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
                 .map(str::to_owned)
                 .collect();
             if row.is_constraint && row.constraint_type == "x" {
-                // An EXCLUDE constraint (`pg_constraint.contype = 'x'`) is backed by
-                // an index, but the backing `CREATE INDEX` (pg_get_indexdef) alone
-                // does NOT enforce the exclusion — recreating only the plain index on
-                // rollback would silently allow overlapping rows (a data-integrity
-                // loss). Retain the REAL constraint instead: `pg_get_constraintdef`
-                // yields `EXCLUDE USING <method> (…)`, which the `ALTER TABLE … ADD
-                // CONSTRAINT <name> …` form wraps into a valid, exclusion-enforcing
-                // statement (`index_sql` emits `definition` verbatim). The table is
-                // referenced by its bare name, matching the rest of the emitter
-                // (`index_sql`'s plain branch / `CREATE TABLE`). `key_columns` is left
+                // An EXCLUDE constraint (`pg_constraint.contype = 'x'`) is backed by an
+                // index, but the backing `CREATE INDEX` from `pg_get_indexdef` does not
+                // enforce the exclusion: recreating only the plain index on rollback
+                // would silently allow overlapping rows, a data-integrity loss. Retain
+                // the real constraint instead — `pg_get_constraintdef` yields `EXCLUDE
+                // USING <method> (…)`, which the `ALTER TABLE … ADD CONSTRAINT <name> …`
+                // form wraps into a valid, exclusion-enforcing statement, since
+                // `index_sql` emits `definition` verbatim. The table is referenced by its
+                // bare name, matching the rest of the emitter. `key_columns` is left
                 // empty: an EXCLUDE index is not `unique`, so it never participates in
                 // the model `#[unique]` coverage check.
                 let definition = format!(

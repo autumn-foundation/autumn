@@ -1,0 +1,20 @@
+   Compiling inventory v0.3.24
+   Compiling autumn-web v0.7.0 (/home/user/autumn/autumn)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5m 22s
+     Running unittests src/lib.rs (target/debug/deps/autumn_web-f80b1f0eb825ceb7)
+
+running 1 test
+  Route /storefront -> 1 page(s)
+  Rendering /storefront ...
+  Route /storefront -> 1 page(s)
+  Rendering /storefront ...
+  Route /storefront -> 1 page(s)
+  Rendering /storefront ...
+  Route /storefront -> 1 page(s)
+  Rendering /storefront ...
+test app::tests::static_get_route_reading_tenant_fails_closed_for_every_tenancy_source ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5575 filtered out; finished in 0.60s
+
+
+[exited with code 0]

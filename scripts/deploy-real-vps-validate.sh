@@ -31,7 +31,6 @@
 #   PUBLIC_PORT          public HTTP port kamal-proxy binds on the VM (80)
 #   APP_NAME             deploy app name (rvpsapp)
 #   SIGNING_SECRET       AUTUMN_SECURITY__SIGNING_SECRET (64 hex chars)
-#   KAMAL_PROXY_VERSION  kamal-proxy image tag to install on the host bootstrap
 #   ONBOARD_BUDGET_SECS  wall-clock budget for onboarding->first-serve (900 = 15m)
 set -euo pipefail
 
@@ -44,12 +43,6 @@ SSH_PORT="${SSH_PORT:-22}"
 PUBLIC_PORT="${PUBLIC_PORT:-80}"
 APP_NAME="${APP_NAME:-rvpsapp}"
 : "${SIGNING_SECRET:?SIGNING_SECRET is required}"
-# Pin to a specific released tag, not `latest`: the CLI surface drifts across
-# releases (e.g. v0.9.2 dropped the `version` subcommand), so a mutable `latest`
-# makes this a non-deterministic test. Production does NOT pin kamal-proxy (it
-# defers binary provisioning to host bootstrap), so this pin is the test's own
-# reproducibility choice — bump it deliberately when validating a newer proxy.
-KAMAL_PROXY_VERSION="${KAMAL_PROXY_VERSION:-v0.9.2}"
 ONBOARD_BUDGET_SECS="${ONBOARD_BUDGET_SECS:-900}"
 
 BASE_URL="http://${TARGET_HOST}:${PUBLIC_PORT}"
@@ -202,24 +195,22 @@ eval "$(ssh-agent -s)"
 trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
 ssh-add "${WORK}/home/.ssh/id_ed25519"
 
-# ── Host bootstrap on the STOCK Ubuntu image (item 2) ────────────────────────
-# `autumn deploy` does the app-specific host prep itself; the ONE documented
-# precondition (see docs/guide/deployment.md "Limitations") is that the
-# kamal-proxy binary is present at /usr/local/bin/kamal-proxy. We install curl +
-# drop the proxy binary here, from a stock image — nothing deploy-specific is
-# pre-baked. (This mirrors "install ssh/curl, drop kamal-proxy" from the issue.)
-log "host bootstrap on stock Ubuntu (install curl + kamal-proxy ${KAMAL_PROXY_VERSION})"
+# ── STOCK Ubuntu, nothing pre-baked (item 2, issue #1607 AC-1) ───────────────
+# NOTHING is bootstrapped here any more. AC-1 puts the target-host precondition at
+# "at most a stock Ubuntu LTS with SSH access — the command performs any remaining
+# host preparation itself", so `autumn deploy up` below must install the
+# kamal-proxy binary itself on this freshly-provisioned image. Installing it here
+# would hide exactly the behaviour this workflow exists to prove.
+#
+# We only wait for sshd and ASSERT the host is bare, so a provider image that
+# happens to ship kamal-proxy can never make the run pass vacuously.
+log "verifying the target is a STOCK image (no pre-installed kamal-proxy)"
 wait_for_ssh 300
-rssh 'set -e; export DEBIAN_FRONTEND=noninteractive; apt-get update -qq;
-      apt-get install -y -qq curl docker.io >/dev/null;
-      cid=$(docker create basecamp/kamal-proxy:'"${KAMAL_PROXY_VERSION}"');
-      docker cp "$cid:/usr/local/bin/kamal-proxy" /usr/local/bin/kamal-proxy;
-      docker rm -f "$cid" >/dev/null;
-      chmod 755 /usr/local/bin/kamal-proxy;
-      /usr/local/bin/kamal-proxy --help >/dev/null 2>&1 \
-        && echo "kamal-proxy binary present and runnable" \
-        || echo "kamal-proxy --help probe failed (non-fatal informational check)"' \
-  || fail "host bootstrap failed"
+rssh 'test -x /usr/local/bin/kamal-proxy && echo present || echo absent' \
+  | grep -q '^absent$' \
+  || fail "the provisioned image already has /usr/local/bin/kamal-proxy — this run \
+could not prove that autumn deploy prepares a bare host"
+log "target is bare: autumn deploy must install kamal-proxy itself"
 # pam_systemd is deliberately LEFT ENABLED (unlike the container fixture) so the
 # ssh sessions the deploy opens get XDG_RUNTIME_DIR=/run/user/0 — the real-host
 # control-socket shape (item 4).
@@ -232,8 +223,9 @@ write_config
 
 # ── 1. First deploy (v1) + onboarding wall-clock metric (item 3) ─────────────
 # The onboarding "commands to first serve" the metric counts are the
-# autumn-specific ones a new user runs; host bootstrap above is the documented
-# precondition. We TIME from the first deploy command to first public serve.
+# autumn-specific ones a new user runs. Since #1607 there is no host-bootstrap
+# step to exclude: the host is stock, and `deploy up` prepares it. We TIME from
+# the first deploy command to first public serve.
 log "onboarding: first deploy (v1) — timing to first public serve"
 onboard_start=$(date +%s)
 stage_release "${WORK}/app_v1"
@@ -245,6 +237,15 @@ log "first deploy serves: ${body}"
 log "ONBOARDING METRIC: first serve in ${onboard_secs}s (budget ${ONBOARD_BUDGET_SECS}s), onboarding commands = 1 (\`autumn deploy up\`)"
 [ "${onboard_secs}" -le "${ONBOARD_BUDGET_SECS}" ] \
   || fail "onboarding exceeded ${ONBOARD_BUDGET_SECS}s (took ${onboard_secs}s)"
+
+# HOST PREPARATION actually happened (issue #1607, AC-1). The host was asserted
+# bare above, so a working kamal-proxy at the supervised path can only have been
+# installed by `autumn deploy up` itself.
+rssh 'test -x /usr/local/bin/kamal-proxy' \
+  || fail "autumn deploy did not install kamal-proxy on the bare host (#1607 AC-1)"
+rssh 'kamal-proxy deploy --help >/dev/null 2>&1' \
+  || fail "the kamal-proxy autumn deploy installed is not usable (#1607 AC-1)"
+log "host preparation OK — autumn deploy installed a working kamal-proxy on a stock image"
 
 # Boot-survival persistence intent (same as the container harness asserts).
 rssh "systemctl is-enabled ${APP_NAME}-blue.service" | grep -q enabled \

@@ -1,0 +1,5 @@
+error: `published"; DROP TABLE posts; --` is not a valid column name for `column = ...`: the value is spliced verbatim into the generated `UPDATE <parent> SET <column> = <column> + $1` statement, so it must be a plain identifier — ASCII letters, digits and underscores only, and no leading digit
+  --> tests/compile-fail/model_derivation_bad_column.rs:31:20
+   |
+31 | #[derivation(Post, column = "published\"; DROP TABLE posts; --", filter = published)]
+   |                    ^^^^^^

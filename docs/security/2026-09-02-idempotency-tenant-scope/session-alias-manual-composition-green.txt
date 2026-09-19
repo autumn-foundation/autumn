@@ -1,0 +1,26 @@
+$ cargo test -p autumn-web --test integration_tests idempotency_tenant_scope
+
+test integration::idempotency_tenant_scope::header_tenancy_does_not_replay_across_tenants ... ok
+test integration::idempotency_tenant_scope::manually_composed_stack_uses_finalized_tenant_after_switch ... ok
+test integration::idempotency_tenant_scope::same_tenant_retry_still_replays ... ok
+test integration::idempotency_tenant_scope::session_tenancy_alias_uses_finalized_tenant_after_switch ... ok
+test integration::idempotency_tenant_scope::session_tenancy_public_path_alias_stays_tenantless ... ok
+test integration::idempotency_tenant_scope::subdomain_tenancy_does_not_replay_across_tenants ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 1786 filtered out
+
+$ cargo test -p autumn-web --test integration_tests idempotency   # full suite
+
+test result: ok. 67 passed; 0 failed; 0 ignored; 0 measured; 1725 filtered out; finished in 0.74s
+
+$ cargo fmt --all
+$ cargo clippy -p autumn-web --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s)
+
+$ ./scripts/check-semver.sh
+error: Rust 1.94.1 toolchain is required for SemVer checks; run: rustup toolchain install 1.94.1
+# Sandbox doesn't have this pinned toolchain installed (same class of environment
+# limitation noted in the original PR's verification table). Not run here; the
+# change is a single additive pub method with the same shape as the existing
+# with_entropy/with_signing_keys builders on SessionLayer, so semver risk is nil.
+# CI's own SemVer check job will run it on the pushed commit.

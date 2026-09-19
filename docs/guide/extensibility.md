@@ -17,7 +17,7 @@ points you at the per-tier how-tos.
 | Tier | Mechanism | Scope | Typical use case |
 |------|-----------|-------|------------------|
 | **1** | `AppBuilder::with_<subsystem>(impl Trait)` | Boot-time, one-per-app | Replace a framework subsystem (config loader, DB pool, session store, telemetry, error pages) |
-| **2** | `#[intercept(Layer::new(...))]` | Per-request, stackable | Add cross-cutting middleware (caching, custom auth, request shaping, tracing) |
+| **2** | `#[intercept(Layer)]` | Per-request, stackable | Add cross-cutting middleware (caching, custom auth, request shaping, tracing) |
 | **3** | `Plugin::build(app)` | Distribution wrapper around tier 1 + 2 | Ship a reusable integration as a crate (e.g. `autumn-aws-secrets-plugin`) |
 
 These compose: a tier-3 `Plugin` typically does its work by calling tier-1 or
@@ -76,16 +76,24 @@ run once per matching request and can stack arbitrarily.
 
 ```rust,no_run
 # use autumn_web::prelude::*;
-# struct CacheResponseLayer;
-# impl CacheResponseLayer { fn new(_: ()) -> Self { Self } }
-# let cache = ();
+# #[derive(Clone)]
+# struct CacheExpensive;
+# impl<S> tower::Layer<S> for CacheExpensive {
+#     type Service = S;
+#     fn layer(&self, inner: S) -> S { inner }
+# }
 
 #[get("/expensive")]
-#[intercept(CacheResponseLayer::new(cache.clone()))]
+#[intercept(CacheExpensive)]
 async fn expensive() -> &'static str {
     "computed once, served many"
 }
 ```
+
+> The attribute argument is parsed as a path and used as a value, so the layer
+> must be nameable as one — a unit struct, or a `const`/`static`. `Layer::new(..)`
+> does not parse and is currently dropped **silently**. See the
+> [middleware guide](./middleware.md) for the full constraint.
 
 ### When tier 2 is the right answer
 
@@ -96,7 +104,7 @@ async fn expensive() -> &'static str {
 
 ### Tier-2 examples
 
-- **Caching** — `#[intercept(CacheResponseLayer::new(my_cache))]` is the
+- **Caching** — a response-cache layer is the
   intentional path for response caching. The `Cache` trait isn't a tier-1
   install because there is no single "framework cache" — different routes
   benefit from different cache configurations.
@@ -169,6 +177,36 @@ See [`autumn/src/plugin.rs`](../../autumn/src/plugin.rs) for the trait
 definition and naming conventions for first-party vs third-party plugin
 crates.
 
+### The stability contract you get, and the one you owe
+
+Once you are distributing to someone else, the question stops being "can I
+reach this API" and becomes "will it still be here next release". Autumn
+answers that explicitly (issue #1601):
+
+- **What Autumn owes you.** Every plugin-facing API — including the four tier-1
+  seams above — is declared `stable` or `experimental` in
+  [the plugin API contract](../plugins.md#the-plugin-api-contract). A stable
+  one follows [`STABILITY.md`](../../STABILITY.md)'s SemVer promise, is
+  compiled on every commit by a pinned reference plugin, and cannot break
+  without a **Plugin authors** section in that release's migration guide.
+- **What you owe your users.** Implement `Plugin::contract` to declare the
+  `autumn-web` range you support. An app on a framework outside it then fails
+  at registration with a message naming both versions, instead of misbehaving
+  in a way nobody can trace back to a version mismatch.
+
+```rust,ignore
+fn contract(&self) -> Option<autumn_web::plugin_contract::PluginContract> {
+    Some(
+        autumn_web::plugin_contract::PluginContract::new(env!("CARGO_PKG_NAME"))
+            .plugin_version(env!("CARGO_PKG_VERSION"))
+            .autumn_web("0.7"),
+    )
+}
+```
+
+`autumn generate plugin` scaffolds this, and
+`autumn plugin-check --plugin-name <your-plugin>` verifies it.
+
 ---
 
 ## Choosing between tiers — a quick decision tree
@@ -189,11 +227,14 @@ issue — adding one is mechanical and we generally welcome the patch.
 
 - [`custom-subsystems.md`](custom-subsystems.md) — per-trait how-to for tier-1
   hooks, with full runnable code.
-- [`examples/custom_config_loader`](../../examples/custom_config_loader) — a
-  workspace example demonstrating a JSON-file `ConfigLoader` installed via
-  `with_config_loader`.
+- [`ConfigLoader`](https://docs.rs/autumn-web/latest/autumn_web/config/trait.ConfigLoader.html)
+  — the trait behind `with_config_loader`, for sourcing config from Vault,
+  Secrets Manager, or a JSON/YAML file instead of five-layer TOML.
 - [`autumn/src/plugin.rs`](../../autumn/src/plugin.rs) — `Plugin` trait
   documentation, including the naming conventions for distributed plugins.
+- [`plugins.md`](../plugins.md#the-plugin-api-contract) — which plugin-facing
+  APIs are stable versus experimental, the SemVer policy for each tier, and how
+  a plugin declares the `autumn-web` range it supports.
 
 ---
 

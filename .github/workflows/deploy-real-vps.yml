@@ -6,6 +6,11 @@
 # reboot, bare-host prep from a STOCK image, the onboarding wall-clock metric,
 # and real pam_systemd / XDG_RUNTIME_DIR control-socket fidelity.
 #
+# Since #1607 (AC-1) the bare-host lane is the real thing: the VM is provisioned
+# from a stock Ubuntu image, the script ASSERTS it has no kamal-proxy, and
+# `autumn deploy up` installs one itself. Nothing is pre-bootstrapped here — that
+# is the point of this workflow.
+#
 # It NEVER runs on `pull_request` or `push`: it costs money (a real VM) and must
 # never block or bill routine CI. It runs only when a maintainer triggers it
 # (`workflow_dispatch`) or on the off-peak nightly schedule.
@@ -35,10 +40,6 @@ on:
         description: "Hetzner location"
         type: string
         default: "nbg1"
-      kamal_proxy_version:
-        description: "kamal-proxy image tag to install during host bootstrap (pin a released tag, not latest)"
-        type: string
-        default: "v0.9.2"
   schedule:
     # 04:17 UTC nightly — off-peak, jittered minute to avoid the top-of-hour herd.
     - cron: "17 4 * * *"
@@ -206,7 +207,6 @@ jobs:
         env:
           AUTUMN_BIN: ${{ github.workspace }}/target/release/autumn
           SSH_PORT: "22"
-          KAMAL_PROXY_VERSION: ${{ inputs.kamal_proxy_version || 'v0.9.2' }}
         run: |
           chmod +x scripts/deploy-real-vps-validate.sh
           ./scripts/deploy-real-vps-validate.sh

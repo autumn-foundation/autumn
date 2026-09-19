@@ -1,0 +1,5 @@
+error: `#[derivation]` tenant column `tenant` names a field carrying `#[diesel(column_name = ...)]`: the maintenance scopes its statements by `comments.tenant` and by the same column of the parent, spelled after the Rust field, so a renamed database column would be spliced under a name the tables do not have. Name the Rust field after the column instead
+  --> tests/compile-fail/model_derivation_tenant_renamed.rs:37:3
+   |
+37 | #[derivation(Post, column = "published_comment_count", filter = published, tenant = "tenant")]
+   |   ^^^^^^^^^^

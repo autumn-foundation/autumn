@@ -218,3 +218,25 @@ problem under sustained overload.
 - `autumn dev-loop-bench --overload` benchmark harness ✓ (done)
 - Consider adaptive/AIMD tuning and per-route ceilings as separate,
   evidence-driven follow-ups once this slice has production usage data.
+
+---
+
+## Update (2026-09, issue #1733) — the ceiling stops being a guess
+
+This ADR left `server.max_concurrent_requests` as an operator-tuned number,
+noting that adaptive tuning was a follow-up. The first half of that follow-up
+has landed, and it is not adaptive: it is *proven*.
+
+`autumn calibrate` measures what a build sustains on a host class and records
+it in a committed `capacity.lock`; `[server] capacity_contract` then sources
+this layer's ceiling from that envelope. The shedding mechanism described above
+is unchanged — same layer, same `503` + `Retry-After`, same probe exemptions,
+same counter. Only the provenance of the number changed.
+
+Precedence is deliberate: an explicit `max_concurrent_requests` always wins
+(including an explicit `0`), and every failure along the contract path degrades
+to *unlimited* with a warning rather than to a ceiling, so a stale or missing
+lockfile can never shed every request on the way up. Per-route ceilings and
+adaptive/AIMD tuning remain open follow-ups.
+
+See `docs/guide/capacity-contracts.md`.

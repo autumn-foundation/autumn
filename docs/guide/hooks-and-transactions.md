@@ -155,6 +155,11 @@ Called before the `INSERT`, inside the transaction. Receives a mutable
 reference to the new-record struct so you can enrich or normalize it before
 it is written.
 
+The model's own `#[normalize]` and `#[validate]` rules have already run by
+then (#2586), so a field this hook *fills in* — the derived slug below — is
+judged before it exists. Do not put a `#[validate]` rule on a hook-populated
+column: it would reject every insert. Rules belong on what the caller supplies.
+
 ```rust,no_run
 async fn before_create(
     &self,
@@ -635,10 +640,12 @@ for (index, error) in &errors {
 }
 ```
 
-`before_create` hook failures are filtered out immediately. If the resulting
-batch insert fails due to a database constraint (e.g. a unique violation),
-Autumn falls back to row-by-row insertion for that chunk so that individual
-constraint failures are isolated rather than aborting all remaining valid rows.
+Rows are normalized, then checked against the model's `#[validate]` rules, then
+passed to `before_create`; a failure at any of those steps is filtered out and
+reported against the caller's own index. If the resulting batch insert fails due
+to a database constraint (e.g. a unique violation), Autumn falls back to
+row-by-row insertion for that chunk so that individual constraint failures are
+isolated rather than aborting all remaining valid rows.
 
 ### `upsert_many` and hooks — a compile-time guard
 
@@ -673,7 +680,8 @@ atomicity is preserved across chunks.
 | What you need | Use |
 |---|---|
 | Multiple tables written atomically in a handler | `db.tx` |
-| Validate or normalize a record before every insert | `before_create` |
+| Enforce a rule on a field the caller supplies, on every insert | `#[validate]` on the `#[model]` — it runs on every generated insert path, before this hook |
+| Enrich a record, or check something the model cannot see (another table, the request context), before every insert | `before_create` |
 | Derive a field from another on every update (e.g. slug from title) | `before_update` |
 | Prevent deletion based on model state | `before_delete` |
 | Write multiple tables atomically | `db.tx` with raw Diesel — repository methods acquire their own connection and cannot share a `db.tx` transaction |

@@ -249,9 +249,10 @@ fn belongs_to_sharded_routes(name: &str) -> (tempfile::TempDir, String) {
 fn sharded_index_renders_parent_label_via_loaded_map() {
     // Issue #1146's index parent-display (a `<select>`-free VIEW concern) must
     // survive `--sharded` too: the sharded index handler already threads a
-    // `ShardedDb` (for `from_shard`) and the `{name}_select_options` loader is
-    // generated against that same connection type, so the index reuses the
-    // label map rather than falling back to the raw FK id.
+    // `ShardedDb` (for `from_shard`), and the page-scoped label query (issue
+    // #835) derefs it the same way (`&mut *db`) as the non-sharded `Db` path,
+    // so the index reuses the label map rather than falling back to the raw
+    // FK id.
     let (_tmp, routes) = belongs_to_sharded_routes("bt-sharded-index-app");
 
     // Sharded handler stays sharded: ShardedDb extractor (promoted to `mut`
@@ -275,8 +276,9 @@ fn sharded_index_renders_parent_label_via_loaded_map() {
         "sharded index must load a parent-label map:\n{routes}"
     );
     assert!(
-        routes.contains("post_id_select_options(&mut db).await?"),
-        "the sharded label map must be built from the ShardedDb-aware loader:\n{routes}"
+        routes.contains("posts::table")
+            && routes.contains(".filter(posts::id.eq_any(post_id_ids))"),
+        "the sharded label map must be built from a page-scoped query, not a full-table load:\n{routes}"
     );
     assert!(
         routes.contains("post_id_labels.get(&row.post_id.to_string())"),
@@ -327,12 +329,13 @@ fn live_validation_keeps_parent_display_on_index_and_show() {
             || routes.contains("use crate::schema::posts"),
         "the referenced `posts` schema must be imported for the label loads:\n{routes}"
     );
-    // The option loader IS emitted — the index parent-label map is built by
-    // collecting it into a HashMap, so it's a live dependency of the restored
-    // index display (not dead code).
+    // The option loader IS emitted — it populates the in-FORM `<select>`
+    // below, so it's a live dependency of the form (not dead code). The index
+    // parent-label map (asserted above) is built by its own page-scoped
+    // query (#835), not by this loader.
     assert!(
         routes.contains("async fn post_id_select_options"),
-        "the option loader must be emitted (the index label map depends on it):\n{routes}"
+        "the option loader must be emitted (the form's select depends on it):\n{routes}"
     );
     // Issue #1750: the in-FORM belongs_to `<select>` is now rendered in
     // live-validation too — the FK no longer leaks out as a raw per-field text

@@ -1,5 +1,8 @@
 //! Field normalization primitives (issue #1379).
 //!
+//! See the [forms, validation and normalization guide](https://github.com/autumn-foundation/autumn/blob/trunk/docs/guide/forms.md)
+//! for where normalization sits relative to validation and hooks.
+//!
 //! Canonicalizes `#[model]` `String` columns declared with the
 //! `#[normalize(...)]` attribute. Normalizers are the small, composable
 //! building blocks the macro chains left-to-right; the traits are the
@@ -13,6 +16,8 @@
 //! - [`upcase`] — uppercase (str casing).
 //! - [`squish`] — trim **and** collapse internal runs of whitespace to a single
 //!   space.
+//! - [`strip_nul`] — remove every NUL (`U+0000`), which a Postgres
+//!   `TEXT`/`VARCHAR` column cannot store (#2423).
 //!
 //! All built-ins are idempotent: normalizing an already-normalized value is a
 //! no-op, so applying them on both the write path and on lookups converges on
@@ -20,13 +25,35 @@
 //!
 //! # Ordering (write path)
 //!
-//! `#[model]` runs normalization at the head of the repository save flow —
-//! `save`/`save_many` (insert) normalize the `New*` input, and `update`
-//! normalizes through `UpdateDraft::from_patch` — **before** the
-//! `before_create` / `before_update` hooks (where `#[validate(...)]` and other
-//! user rejection logic run) and before the row is written, so validators and
-//! the database observe the canonical value. Normalizers apply left-to-right in
-//! the order written in the attribute.
+//! `#[model]` runs normalization at the head of the repository insert flow,
+//! before the model's `#[validate(...)]` rules, before the hooks, and before the
+//! row is written. Normalizers apply left-to-right in the order written in the
+//! attribute.
+//!
+//! **Insert** (`save`, `save_many`, `save_many_skip_invalid`, and the create
+//! half of `find_or_create_by_*`) normalizes the `New*` input, so the model's
+//! rules *and the database* observe the canonical value (#2586).
+//!
+//! **Update is not symmetric with insert, and there are three cases, not two.**
+//!
+//! | Repository | Merged draft | Persisted |
+//! |---|---|---|
+//! | no hooks, no knob (**blind**) | none built — `from_patch` is not emitted | raw patch |
+//! | `validate_on_update = fetch` | built and normalized, **validation only** | raw patch |
+//! | has hooks | built and normalized | the normalized draft |
+//!
+//! The middle row is the one that surprises: `from_patch` normalizes the merged
+//! model so validators see the canonical value, but the generated code keeps
+//! only its 422 and persists `changes.__to_changeset()` unchanged. So on either
+//! of the first two, an `update` that sets a `#[normalize(trim, downcase)]`
+//! column to `"  FOO@X.com "` stores it verbatim, and
+//! [`normalize_lookup_value`]-based finders will not match that row. Only the
+//! hooked path writes the canonical value.
+//!
+//! If a normalized column is ever written through `update`, give the repository
+//! hooks or normalize before building the patch — and consider a `CITEXT`
+//! column or a functional unique index as the durable backstop. See
+//! `docs/guide/forms.md`.
 
 /// Strip leading and trailing whitespace.
 #[must_use]
@@ -52,11 +79,33 @@ pub fn squish(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Remove every NUL (`U+0000`) character (issue #2423).
+///
+/// A Postgres `TEXT`/`VARCHAR` column cannot hold `0x00`, so a value carrying
+/// one is rejected by the server at `INSERT`/`UPDATE` time. Reach for this on
+/// a column fed by input that may legitimately arrive dirty (a paste from a
+/// binary source, a misbehaving input method) and where silently dropping the
+/// byte is preferable to rejecting the write.
+///
+/// Only NUL is removed: every other control character is storable and is left
+/// exactly as written.
+///
+/// Prefer rejecting over cleaning where the author can see and fix the value —
+/// [`crate::form::ChangesetForm`] already surfaces a NUL as an inline field
+/// error without any attribute.
+#[must_use]
+pub fn strip_nul(s: &str) -> String {
+    s.replace('\u{0}', "")
+}
+
 /// A type whose `#[normalize]` columns can be canonicalized in place.
 ///
-/// Implemented by `#[model]` for every generated `New*` insert struct and for
-/// the model itself. `normalize` applies each field's normalizer chain; it is a
-/// no-op for models with no `#[normalize]` columns.
+/// Implemented by `#[model]` for the model itself, and for every generated
+/// `New*` insert struct whose model declares `#[normalize]` columns (#2634:
+/// a `New*` with no normalized columns does not implement this, so the
+/// repository probe's no-clone fallback wins). `normalize` applies each
+/// field's normalizer chain; it is a no-op for models with no `#[normalize]`
+/// columns.
 pub trait Normalize {
     /// Canonicalize every `#[normalize]` field in place.
     fn normalize(&mut self);
@@ -102,10 +151,16 @@ pub fn normalize_lookup_value<M: NormalizedModel>(column: &str, value: &str) -> 
 /// Holds an immutable borrow of the caller's input. The specialized `Yes` impl
 /// (selected only when the concrete type is `Normalize + Clone`) clones and
 /// canonicalizes, returning the owned value; the `No` fallback returns the
-/// borrow untouched — so a model with no `#[normalize]` columns (or a
-/// hand-written `New*` that doesn't implement `Normalize`) pays no clone on the
-/// save path. The generated code unifies the two arms with `Borrow` (see
-/// `#[repository]` `save`/`save_many`).
+/// borrow untouched, paying no clone.
+///
+/// In practice only a **hand-written** `New*` reaches that fallback — plus, as
+/// of #2634, a `#[model]`-generated `New*` whose model declares no
+/// `#[normalize]` columns: the macro no longer emits the empty-bodied `impl
+/// Normalize` for those, so the `Yes` arm cannot win and the `No` arm hands
+/// back the caller's borrow with no clone. The generated code unifies the two
+/// arms with `Borrow` (see
+/// `#[repository]` `save`, `save_many`, `save_many_skip_invalid` and
+/// `find_or_create_by_*`).
 #[doc(hidden)]
 pub struct SpezNormalize<'a, T: ?Sized>(pub &'a T);
 
@@ -196,6 +251,26 @@ mod tests {
     fn trim_strips_edges() {
         assert_eq!(trim("  hi  "), "hi");
         assert_eq!(trim("hi"), "hi");
+    }
+
+    #[test]
+    fn strip_nul_removes_embedded_nuls() {
+        assert_eq!(strip_nul("before\u{0}after"), "beforeafter");
+        assert_eq!(strip_nul("\u{0}\u{0}a\u{0}"), "a");
+    }
+
+    #[test]
+    fn strip_nul_leaves_clean_text_untouched() {
+        assert_eq!(strip_nul("plain text"), "plain text");
+        // Other control characters are storable in a Postgres TEXT column and
+        // are deliberately left alone.
+        assert_eq!(strip_nul("tab\there"), "tab\there");
+    }
+
+    #[test]
+    fn strip_nul_is_idempotent() {
+        let once = strip_nul("a\u{0}b");
+        assert_eq!(strip_nul(&once), once);
     }
 
     #[test]

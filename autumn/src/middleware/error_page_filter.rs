@@ -21,6 +21,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -671,18 +673,13 @@ fn form_pairs_to_nested_json(pairs: Vec<(String, String)>) -> serde_json::Value 
 /// `"user.password"` → `["user", "password"]`
 /// `"a[b][c]"` → `["a", "b", "c"]`
 /// `"simple"` → `["simple"]`
-#[allow(
-    clippy::indexing_slicing,
-    reason = "pos is a valid byte index returned by str::find('['); both slices split on that boundary"
-)]
 fn bracket_key_segments(key: &str) -> Vec<String> {
-    // Dot notation: split on '.' first (only if no brackets present)
-    if key.contains('[') {
-        let Some(pos) = key.find('[') else {
-            return vec![key.to_owned()];
-        };
-        let mut parts = vec![key[..pos].to_owned()];
-        for seg in key[pos + 1..].split('[') {
+    // Bracket notation: `split_once` yields the head segment and the remainder
+    // past the first '[' without any index arithmetic or slicing, then each
+    // '['-delimited fragment contributes one more segment.
+    if let Some((head, rest)) = key.split_once('[') {
+        let mut parts = vec![head.to_owned()];
+        for seg in rest.split('[') {
             let seg = seg.trim_end_matches(']');
             if !seg.is_empty() {
                 parts.push(seg.to_owned());

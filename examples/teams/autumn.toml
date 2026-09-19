@@ -1,0 +1,43 @@
+# Autumn configuration for teams — organization membership + email invitations.
+
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[log]
+level = "info"
+
+[health]
+path = "/health"
+
+[database]
+# Matches docker-compose.yml. Point this at your own Postgres in production.
+url = "postgres://autumn:autumn@localhost:5432/teams"
+pool_size = 10
+
+# Tenancy is middleware-driven, exactly like `examples/saas`, except the tenant
+# here is the *active organization* the signed-in user is currently a member of
+# (not the user itself — a user can belong to many organizations). The session
+# key is populated on login/signup/org-switch/invite-accept from the caller's
+# `Membership` row, and `tenant_scoped` repositories (Membership, Invitation)
+# filter every query by it automatically — no second isolation mechanism on top
+# of the row-level multi-tenancy seam (#695).
+#
+# `public_paths` matches by path *prefix*, so the invitee-facing accept flow
+# lives under its own `/invite` prefix rather than sharing `/invitations` with
+# the Admin-only create/revoke/resend routes — listing `/invitations` here
+# would have accidentally exempted those too, letting them run with no
+# ambient tenant and fail every request (see `routes/invitations.rs`'s module
+# doc comment).
+[tenancy]
+enabled = true
+source = "session"
+session_key = "organization_id"
+public_paths = ["/", "/login", "/signup", "/logout", "/static", "/favicon.ico", "/invite"]
+login_redirect = "/login"
+
+# Dev default: log emails to stdout. Point at a real SMTP relay in production,
+# or switch to `transport = "file"` to inspect .eml files locally.
+[mail]
+transport = "log"
+from = "Teams <noreply@example.com>"

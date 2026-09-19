@@ -16,18 +16,30 @@
 
 ## Installation
 
-Add the plugin alongside `autumn-web`:
+```bash
+autumn plugin add autumn-admin-plugin
+```
+
+One command adds the dependency at a version compatible with your app's
+`autumn-web`, mounts the plugin in your `autumn_web::app()` builder chain, and
+prints any configuration still needed. It is safe to re-run, and it refuses —
+before touching any file — to install into an app on an incompatible
+`autumn-web` version. See [docs/plugins.md](https://github.com/autumn-foundation/autumn/blob/main/docs/plugins.md#installing-a-plugin).
+
+### Manual install
+
+If you would rather wire it yourself (or `autumn plugin add` could not find your
+builder chain and printed these lines for you):
 
 ```toml
 [dependencies]
-autumn-web = { version = "0.4", features = ["db", "flash", "htmx", "maud"] }
-autumn-admin-plugin = "0.4"
+autumn-web = { version = "0.7", features = ["db", "flash", "htmx", "maud"] }
+autumn-admin-plugin = "0.7"
 ```
 
-`autumn-admin-plugin` expects a configured Autumn database pool for registered
-admin models because model operations receive the app's Postgres pool. The
-built-in jobs dashboard can render without a database pool when no model route
-is accessed.
+`autumn-admin-plugin` expects a configured Autumn database pool: model
+operations receive the app's pool. The built-in jobs dashboard can render
+without a database pool when no model route is accessed.
 
 ## Quick Start
 
@@ -69,6 +81,29 @@ When mounted at the default `/admin` prefix, the plugin serves:
 The plugin also serves a hashed same-origin JavaScript asset under
 `/admin/static/admin.<hash>.js` so long-lived caching stays safe across deploys.
 
+## Database Backends
+
+The plugin core is backend-agnostic. It takes the app's
+`autumn_web::RuntimeConnection` pool, which is Postgres by default and SQLite
+under the `autumn-web/sqlite` feature. An app on either backend can register
+its own models.
+
+The three **built-in** models are Postgres-only:
+
+| Model | Manages | Audit table |
+| --- | --- | --- |
+| `tokens::TokenAdminModel` | `api_tokens` | — |
+| `experiments::ExperimentAdminModel` | `autumn_experiments` | `autumn_experiment_changes` |
+| `feature_flags::FeatureFlagAdminModel` | `autumn_feature_flags` | `feature_flag_changes` |
+
+Do not register those three on SQLite. Their migrations use Postgres-only DDL,
+so the tables do not exist on SQLite. Autumn's experiment and feature-flag
+stores also refuse a SQLite target.
+
+On SQLite each of the three refuses every call with an error that names the
+model and points here. Before issue #2108 the crate did not compile at all on
+SQLite, so this was a build error; now it is a clear run-time one.
+
 ## `AdminModel` Contract
 
 Each registered model supplies:
@@ -90,6 +125,28 @@ Optional hooks let you customize:
 
 All values flow through `serde_json::Value` so the plugin stays object-safe and
 does not need to know your application's concrete model types.
+
+### Writing a model that runs on both backends
+
+Your own models choose their own SQL. Four rules keep it portable.
+
+1. **Write `$N` placeholders in ascending order. Use each placeholder one
+   time.** Postgres reads the digits. SQLite gives each distinct `$name` the
+   next free index, in order of first appearance. If you write
+   `SET name = $2 ... WHERE id = $1`, SQLite binds the id into `name`. To
+   repeat a value, bind it two times under two placeholders.
+2. **Do not use `ILIKE`.** Write `LOWER(col) LIKE LOWER($1)`. Both backends
+   then match without case for ASCII text. SQLite's `lower()` folds ASCII only,
+   so non-ASCII text stays case-sensitive there.
+3. **Do not use a `::type` cast, an `ANY($1)` array bind, or a writable CTE.**
+   SQLite has none of the three. Use `CAST(x AS TEXT)`, an `IN` list, and
+   separate statements in one transaction.
+4. **Use `CURRENT_TIMESTAMP`, not `NOW()`.** Read a timestamp column as
+   `Timestamp` into a `NaiveDateTime`. The `Timestamptz` SQL type is
+   Postgres-only.
+
+`tests/custom_admin_model.rs` is a worked example. The same test body runs on
+both backends.
 
 ## Configuration
 

@@ -1,0 +1,19 @@
+error[E0277]: the trait bound `[u8; 16]: CommentAuthorKey` is not satisfied
+  --> tests/compile-fail/model_commentable_author_key_not_integer.rs:21:1
+   |
+21 | #[model]
+   | ^^^^^^^^ the trait `CommentAuthorKey` is not implemented for `[u8; 16]`
+   |
+help: the following other types implement trait `CommentAuthorKey`
+  --> src/commentable.rs
+   |
+   | impl CommentAuthorKey for i64 {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `i64`
+   | impl CommentAuthorKey for i32 {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `i32`
+note: required by a bound in `__autumn_commentable_author_key`
+  --> tests/compile-fail/model_commentable_author_key_not_integer.rs:21:1
+   |
+21 | #[model]
+   | ^^^^^^^^ required by this bound in `__autumn_commentable_author_key`
+   = note: this error originates in the attribute macro `model` (in Nightly builds, run with -Z macro-backtrace for more info)

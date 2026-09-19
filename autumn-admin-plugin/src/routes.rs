@@ -28,7 +28,8 @@ use futures::future::join_all;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::auth::check_role;
+use crate::auth::{check_role, publish_current_actor};
+use crate::impersonation::AdminImpersonation;
 use crate::registry::AdminRegistry;
 use crate::templates;
 use crate::traits::{
@@ -143,8 +144,12 @@ pub fn admin_router(
     config_svc: Option<Arc<RuntimeConfigService>>,
     step_up_mutations: bool,
     step_up_max_age_secs: u64,
+    impersonation_enabled: bool,
 ) -> axum::Router<AppState> {
     let has_config = config_svc.is_some();
+    // Cloned up front: the role-check closure below takes ownership of
+    // `auth_session_key`, but the actor layer needs it too.
+    let actor_session_key = auth_session_key.clone();
 
     let mut router = axum::Router::new()
         // Dashboard
@@ -167,6 +172,17 @@ pub fn admin_router(
                 auth_session_key.clone(),
             )))
             .layer(axum::Extension(svc));
+    }
+
+    // Begin-impersonation route (#1394). Registered before the `/{slug}`
+    // catch-all and *inside* the role + step-up guards; the framework's
+    // `ImpersonationGate` then gates it again (default-deny), so holding the
+    // admin role is never sufficient on its own.
+    if impersonation_enabled {
+        router = router.route(
+            "/impersonate",
+            routing::post(crate::impersonation::impersonate_begin),
+        );
     }
 
     router = router
@@ -208,17 +224,44 @@ pub fn admin_router(
         router
     };
 
-    match require_role {
+    let router = match require_role {
         Some(role) => router.layer(from_fn(move |req, next| {
             check_role(role.clone(), auth_session_key.clone(), req, next)
         })),
         None => router,
+    };
+
+    if !impersonation_enabled {
+        return router.layer(from_fn(move |req, next| {
+            publish_current_actor(actor_session_key.clone(), req, next)
+        }));
     }
+
+    // The revert route is merged *after* the role and step-up layers, so it is
+    // deliberately outside both. While impersonating, the session carries the
+    // target's role (usually none) — a gated revert would trap the operator in
+    // the target's identity with no way back. The route is self-gating: a
+    // session that is not impersonating gets a 400 and nothing changes.
+    router
+        .merge(
+            axum::Router::new()
+                .route(
+                    "/impersonate/stop",
+                    routing::post(crate::impersonation::impersonate_stop),
+                )
+                .layer(axum::Extension(AdminPrefix(prefix.to_owned()))),
+        )
+        // Outermost, and applied after the merge so it covers the ungated
+        // revert route too. Attribution must not depend on the *optional* role
+        // check, so this is its own layer rather than part of `check_role`.
+        .layer(from_fn(move |req, next| {
+            publish_current_actor(actor_session_key.clone(), req, next)
+        }))
 }
 
 /// Typed Extension carrying the admin URL prefix so handlers can build links.
 #[derive(Clone)]
-struct AdminPrefix(String);
+pub struct AdminPrefix(pub String);
 
 /// Typed Extension signalling whether the runtime config service is mounted.
 #[derive(Clone)]
@@ -383,6 +426,91 @@ fn render(markup: maud::Markup) -> Response {
     Html(markup.into_string()).into_response()
 }
 
+/// Re-render the create/edit form after a validation failure instead of
+/// navigating away to the generic error page. Preserves every value the
+/// admin typed (`submitted`) and surfaces `error_message` through the same
+/// persistent, accessible flash banner every other page uses — no toast, no
+/// blank form, no lost input.
+#[allow(clippy::too_many_arguments)]
+fn invalid_form_response(
+    registry: &AdminRegistry,
+    slug: &str,
+    model: &dyn AdminModel,
+    fields: &[AdminField],
+    submitted: &Value,
+    // Names of fields in `submitted` whose value is raw, unparsed form text
+    // (e.g. a `Json` field that failed to parse) rather than a genuinely
+    // typed value — forwarded to `model_form_page` so it skips round-tripping
+    // that one field through `Value::to_string()` and shows the raw text
+    // verbatim instead. Empty when `submitted` is fully coerced/typed (the
+    // `AdminError::Validation` case).
+    raw_fields: &[&str],
+    error_message: String,
+    id: Option<i64>,
+    csrf: &AdminCsrf,
+    prefix: &str,
+    actuator_prefix: &str,
+    show_config: bool,
+    imp: &AdminImpersonation,
+) -> Response {
+    let messages = [FlashMessage {
+        level: FlashLevel::Error,
+        message: error_message,
+    }];
+    let markup = templates::model_form_page(
+        registry,
+        slug,
+        model.display_name(),
+        model.display_name_plural(),
+        fields,
+        Some(submitted),
+        id,
+        raw_fields,
+        &messages,
+        csrf.token(),
+        csrf.form_field(),
+        csrf.token_header(),
+        prefix,
+        actuator_prefix,
+        show_config,
+        imp.banner(prefix, csrf.token(), csrf.form_field()).as_ref(),
+    );
+    (StatusCode::UNPROCESSABLE_ENTITY, Html(markup.into_string())).into_response()
+}
+
+/// After a validation failure on update, `submitted` holds only the fields
+/// the browser actually sent — create-only columns render read-only with no
+/// `name` attribute (see `render_readonly_display`), so they never round-trip
+/// through the form post. Merge the submitted edits onto the stored record so
+/// those columns keep showing their real value on redisplay instead of going
+/// blank.
+///
+/// A genuinely missing record (`Ok(None)` — e.g. deleted between the edit
+/// page loading and this submit) falls back to `submitted` alone, same as
+/// before: there is no stored record to merge with. A fetch error, though,
+/// is a real backend problem (e.g. `AdminError::Database`) unrelated to the
+/// admin's input — it must reach the caller so it renders the normal error
+/// response, not be swallowed into a 422 that quietly blanks out every
+/// `create_only` field and calls it a validation failure (Codex review,
+/// PR #2422).
+async fn merge_with_stored_record(
+    model: &dyn AdminModel,
+    pool: &Pool<::autumn_web::RuntimeConnection>,
+    id: i64,
+    submitted: &Value,
+) -> Result<Value, AdminError> {
+    let mut base = model
+        .get(pool, id)
+        .await?
+        .unwrap_or_else(|| submitted.clone());
+    if let (Some(obj), Some(sub)) = (base.as_object_mut(), submitted.as_object()) {
+        for (k, v) in sub {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    Ok(base)
+}
+
 /// Extract the value of the `__autumn_reveal` cookie from request headers.
 fn extract_reveal_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
     let cookie_str = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
@@ -397,7 +525,9 @@ fn extract_reveal_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
 // ── Handlers ────────────────────────────────────────────────────────
 
 /// `GET /admin` — Dashboard with model counts.
+#[allow(clippy::too_many_arguments)]
 async fn dashboard(
+    imp: AdminImpersonation,
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
@@ -433,12 +563,15 @@ async fn dashboard(
         &prefix,
         &actuator_prefix,
         show_config,
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     )))
 }
 
 /// `GET /admin/jobs` -- built-in background jobs dashboard.
 #[allow(clippy::too_many_arguments)]
 async fn jobs_dashboard(
+    imp: AdminImpersonation,
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
@@ -465,6 +598,8 @@ async fn jobs_dashboard(
         &prefix,
         &actuator_prefix,
         show_config,
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     )))
 }
 
@@ -550,6 +685,7 @@ fn scheduled_job_summaries(state: &AppState) -> Vec<JobScheduleSummary> {
 /// `GET /admin/{slug}` -- Model list view.
 #[allow(clippy::too_many_arguments)]
 async fn model_list(
+    imp: AdminImpersonation,
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
@@ -614,11 +750,15 @@ async fn model_list(
         show_config,
         model.supports_csv_export(),
         model.supports_csv_import(),
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     )))
 }
 
 /// `GET /admin/{slug}/new` — Create form.
+#[allow(clippy::too_many_arguments)]
 async fn model_new_form(
+    imp: AdminImpersonation,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
     axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
@@ -641,6 +781,7 @@ async fn model_new_form(
         &fields,
         None,
         None,
+        &[],
         &messages,
         csrf.token(),
         csrf.form_field(),
@@ -648,26 +789,70 @@ async fn model_new_form(
         &prefix,
         &actuator_prefix,
         show_config,
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     )))
 }
 
 /// `POST /admin/{slug}` — Create a record.
+#[allow(clippy::too_many_arguments)]
 async fn model_create(
+    imp: AdminImpersonation,
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path(slug): Path<String>,
+    csrf: AdminCsrf,
     flash: Flash,
     axum::extract::Form(form_data): axum::extract::Form<Value>,
 ) -> AutumnResult<Response> {
     let (pool, model) = resolve(&state, &registry, &slug)?;
 
     let fields = model.fields();
-    let form_data = coerce_form_fields(strip_meta_fields(form_data, &fields, false), &fields);
-    let record = model
-        .create(&pool, form_data)
-        .await
-        .map_err(|e| admin_err("Create failed", e))?;
+    let submitted = strip_meta_fields(form_data, &fields, false);
+    let form_data = match coerce_form_fields(submitted, &fields) {
+        Ok(v) => v,
+        Err((partial, field_names, msg)) => {
+            return Ok(invalid_form_response(
+                &registry,
+                &slug,
+                model,
+                &fields,
+                &partial,
+                &field_names,
+                msg,
+                None,
+                &csrf,
+                &prefix,
+                &actuator_prefix,
+                show_config,
+                &imp,
+            ));
+        }
+    };
+    let record = match model.create(&pool, form_data.clone()).await {
+        Ok(record) => record,
+        Err(AdminError::Validation(msg)) => {
+            return Ok(invalid_form_response(
+                &registry,
+                &slug,
+                model,
+                &fields,
+                &form_data,
+                &[],
+                msg,
+                None,
+                &csrf,
+                &prefix,
+                &actuator_prefix,
+                show_config,
+                &imp,
+            ));
+        }
+        Err(e) => return Err(admin_err("Create failed", e)),
+    };
     // The post-create redirect needs a routable ID. Treat a missing or
     // non-numeric `id` as a model-impl bug rather than silently sending
     // the admin to `/{slug}/0` (which lands on the wrong row or a 404).
@@ -697,7 +882,9 @@ async fn model_create(
     if let Some(Value::String(secret)) = record.get("token") {
         // Mirror the session cookie's Secure flag so the reveal cookie is
         // accepted in both HTTPS and explicit HTTP-only deployments.
-        let secure_attr = if state.config().session.secure {
+        // `config_arc` reads through the shared handle: reading one `bool` must
+        // not deep-clone every config section on a request path.
+        let secure_attr = if state.config_arc().session.secure {
             "; Secure"
         } else {
             ""
@@ -724,6 +911,7 @@ async fn model_create(
 /// `GET /admin/{slug}/{id}` — Detail view.
 #[allow(clippy::too_many_arguments)]
 async fn model_detail(
+    imp: AdminImpersonation,
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
@@ -776,13 +964,15 @@ async fn model_detail(
         &actuator_prefix,
         model.has_history(),
         show_config,
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     ))
     .into_response();
 
     // Clear the reveal cookie so a page refresh does not show the token again.
     // Mirror the session cookie's Secure flag for consistency.
     if reveal_secret.is_some() {
-        let secure_attr = if state.config().session.secure {
+        let secure_attr = if state.config_arc().session.secure {
             "; Secure"
         } else {
             ""
@@ -806,6 +996,7 @@ async fn model_detail(
 /// (`model.has_history()` returns `false`).
 #[allow(clippy::too_many_arguments)]
 async fn model_history(
+    imp: AdminImpersonation,
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
@@ -846,12 +1037,15 @@ async fn model_history(
         &actuator_prefix,
         csrf.token_header(),
         show_config,
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     )))
 }
 
 /// `GET /admin/{slug}/{id}/edit` — Edit form.
 #[allow(clippy::too_many_arguments)]
 async fn model_edit_form(
+    imp: AdminImpersonation,
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
@@ -881,6 +1075,7 @@ async fn model_edit_form(
         &fields,
         Some(&record),
         Some(id),
+        &[],
         &messages,
         csrf.token(),
         csrf.form_field(),
@@ -888,26 +1083,77 @@ async fn model_edit_form(
         &prefix,
         &actuator_prefix,
         show_config,
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     )))
 }
 
 /// `POST /admin/{slug}/{id}` — Update a record.
+#[allow(clippy::too_many_arguments)]
 async fn model_update(
+    imp: AdminImpersonation,
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path((slug, id)): Path<(String, i64)>,
+    csrf: AdminCsrf,
     flash: Flash,
     axum::extract::Form(form_data): axum::extract::Form<Value>,
 ) -> AutumnResult<Response> {
     let (pool, model) = resolve(&state, &registry, &slug)?;
 
     let fields = model.fields();
-    let form_data = coerce_form_fields(strip_meta_fields(form_data, &fields, true), &fields);
-    model
-        .update(&pool, id, form_data)
-        .await
-        .map_err(|e| admin_err("Update failed", e))?;
+    let submitted = strip_meta_fields(form_data, &fields, true);
+    let form_data = match coerce_form_fields(submitted, &fields) {
+        Ok(v) => v,
+        Err((partial, field_names, msg)) => {
+            let display = match merge_with_stored_record(model, &pool, id, &partial).await {
+                Ok(v) => v,
+                Err(e) => return Err(admin_err("Update failed", e)),
+            };
+            return Ok(invalid_form_response(
+                &registry,
+                &slug,
+                model,
+                &fields,
+                &display,
+                &field_names,
+                msg,
+                Some(id),
+                &csrf,
+                &prefix,
+                &actuator_prefix,
+                show_config,
+                &imp,
+            ));
+        }
+    };
+    if let Err(e) = model.update(&pool, id, form_data.clone()).await {
+        if let AdminError::Validation(msg) = e {
+            let display = match merge_with_stored_record(model, &pool, id, &form_data).await {
+                Ok(v) => v,
+                Err(e) => return Err(admin_err("Update failed", e)),
+            };
+            return Ok(invalid_form_response(
+                &registry,
+                &slug,
+                model,
+                &fields,
+                &display,
+                &[],
+                msg,
+                Some(id),
+                &csrf,
+                &prefix,
+                &actuator_prefix,
+                show_config,
+                &imp,
+            ));
+        }
+        return Err(admin_err("Update failed", e));
+    }
     flash
         .success(format!("{} #{id} updated.", model.display_name()))
         .await;
@@ -1054,7 +1300,16 @@ async fn model_export_csv(
 
     // Page through records in batches to avoid buffering the entire dataset
     // as JSON in memory at once.
-    let columns = model.csv_export_columns();
+    // #1771: `csv_export_columns` is overridable, and an override that returns a
+    // curated list never runs the default's filter. The export is the one admin
+    // surface that leaves the database in a file built for sharing, so the
+    // confidential columns and their blind-index companions are dropped here,
+    // where no model can opt back in.
+    let columns: Vec<&'static str> = model
+        .csv_export_columns()
+        .into_iter()
+        .filter(|name| !::autumn_web::confidential::is_confidential_column_name(name))
+        .collect();
     let mut buf = Vec::new();
     {
         let mut wtr = csv::WriterBuilder::new()
@@ -1111,6 +1366,7 @@ async fn model_export_csv(
 /// `GET /admin/{slug}/import` — Render the CSV import form.
 #[allow(clippy::too_many_arguments)]
 async fn model_import_form(
+    imp: AdminImpersonation,
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
@@ -1143,12 +1399,15 @@ async fn model_import_form(
         &prefix,
         &actuator_prefix,
         show_config,
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     )))
 }
 
 /// `POST /admin/{slug}/import` — Accept a multipart CSV upload and import rows.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn model_import_csv(
+    imp: AdminImpersonation,
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
@@ -1263,6 +1522,8 @@ async fn model_import_csv(
         &prefix,
         &actuator_prefix,
         show_config,
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     )))
 }
 
@@ -1270,6 +1531,7 @@ async fn model_import_csv(
 
 /// `GET /admin/config` — List all runtime config keys with their values.
 async fn config_list(
+    imp: AdminImpersonation,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
     axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
@@ -1290,6 +1552,8 @@ async fn config_list(
         csrf.token_header(),
         &prefix,
         &actuator_prefix,
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     )))
 }
 
@@ -1304,15 +1568,29 @@ async fn config_set(
     axum::extract::Form(form): axum::extract::Form<HashMap<String, String>>,
 ) -> AutumnResult<Response> {
     let value = form.get("value").map_or("", String::as_str);
-    let actor = session
-        .get(&auth_session_key)
-        .await
-        .unwrap_or_else(|| "admin-ui".to_owned());
+    let actor = config_actor(&session, &auth_session_key).await;
     match svc.set(&key, value, Some(&actor)) {
         Ok(()) => flash.success(format!("Updated {key} = {value}")).await,
         Err(e) => flash.error(format!("Failed to set {key}: {e}")).await,
     }
     Ok(Redirect::to(&format!("{prefix}/config")).into_response())
+}
+
+/// Who to record in the runtime-config change history for this request.
+///
+/// Reads the request's current actor, which the admin router publishes — so
+/// while impersonating (#1394) a config change is recorded against the **real
+/// operator**, not the customer whose session it is being made from. Falls back
+/// to the session's own user, then to `"admin-ui"`, so an app that resolves its
+/// principal some other way still gets a name rather than a blank.
+async fn config_actor(session: &autumn_web::session::Session, auth_session_key: &str) -> String {
+    if let Some(actor) = autumn_web::current::Current::actor() {
+        return actor;
+    }
+    session
+        .get(auth_session_key)
+        .await
+        .unwrap_or_else(|| "admin-ui".to_owned())
 }
 
 /// `POST /admin/config/{key}/unset` — Revert a config key to its default.
@@ -1324,10 +1602,7 @@ async fn config_unset(
     Path(key): Path<String>,
     flash: Flash,
 ) -> AutumnResult<Response> {
-    let actor = session
-        .get(&auth_session_key)
-        .await
-        .unwrap_or_else(|| "admin-ui".to_owned());
+    let actor = config_actor(&session, &auth_session_key).await;
     match svc.unset(&key, Some(&actor)) {
         Ok(()) => flash.success(format!("Reset {key} to default")).await,
         Err(e) => flash.error(format!("Failed to reset {key}: {e}")).await,
@@ -1338,6 +1613,7 @@ async fn config_unset(
 /// `GET /admin/config/{key}/history` — View change history for a config key.
 #[allow(clippy::too_many_arguments)]
 async fn config_key_history(
+    imp: AdminImpersonation,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
     axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
@@ -1359,6 +1635,8 @@ async fn config_key_history(
         csrf.token_header(),
         &prefix,
         &actuator_prefix,
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     )))
 }
 
@@ -1422,22 +1700,44 @@ fn strip_meta_fields(mut data: Value, fields: &[AdminField], for_update: bool) -
     data
 }
 
-fn coerce_form_fields(mut data: Value, fields: &[AdminField]) -> Value {
-    let Some(obj) = data.as_object_mut() else {
-        return data;
-    };
-
-    for field in fields {
-        let Some(value) = obj.get_mut(field.name) else {
-            continue;
-        };
-        coerce_form_value(value, field);
+/// Coerce every field's raw form-string value to its declared type.
+///
+/// Attempts every field regardless of earlier failures (currently only
+/// possible for `Json`) — never stops at the first one — so a field
+/// declared after a malformed one still comes back properly typed rather
+/// than redisplaying with its pre-coercion raw string (e.g. a checked
+/// `Boolean` appearing unchecked, or a valid JSON object getting
+/// re-quoted). Returns the fully-attempted `data` alongside every failing
+/// field's name and a combined message on error — rather than discarding
+/// it — so a caller redisplaying the form after a validation failure can
+/// show every successfully coerced field normally and single out just the
+/// field(s) that didn't parse (see `render_form_widget`'s `raw_fields`;
+/// Codex review, PR #2422).
+fn coerce_form_fields(
+    mut data: Value,
+    fields: &[AdminField],
+) -> Result<Value, (Value, Vec<&'static str>, String)> {
+    let mut failed_names = Vec::new();
+    let mut messages = Vec::new();
+    if let Some(obj) = data.as_object_mut() {
+        for field in fields {
+            let Some(value) = obj.get_mut(field.name) else {
+                continue;
+            };
+            if let Err(msg) = coerce_form_value(value, field) {
+                failed_names.push(field.name);
+                messages.push(msg);
+            }
+        }
     }
-
-    data
+    if messages.is_empty() {
+        Ok(data)
+    } else {
+        Err((data, failed_names, messages.join("; ")))
+    }
 }
 
-fn coerce_form_value(value: &mut Value, field: &AdminField) {
+fn coerce_form_value(value: &mut Value, field: &AdminField) -> Result<(), String> {
     // On a nullable text-ish column (String/Uuid/Enum/Decimal all route to
     // `AdminFieldKind::Text`), as well as the numeric/date kinds, an empty
     // submission clears to NULL — matching the existing numeric/date
@@ -1447,7 +1747,7 @@ fn coerce_form_value(value: &mut Value, field: &AdminField) {
         && matches!(value, Value::String(raw) if raw.trim().is_empty())
     {
         *value = Value::Null;
-        return;
+        return Ok(());
     }
 
     match &field.kind {
@@ -1473,11 +1773,32 @@ fn coerce_form_value(value: &mut Value, field: &AdminField) {
                 *value = Value::Number(number);
             }
         }
+        // Unlike Integer/Float/Boolean above — where a value that fails to
+        // parse is simply left as a raw JSON string, and the strict target
+        // type (`i64`/`f64`/`bool`) then rejects that string during the
+        // model's own `serde_json::from_value` deserialize — a JSON column's
+        // Rust type is `serde_json::Value` itself, which happily accepts
+        // *any* JSON value, including that leftover raw string. So a
+        // malformed submission here needs its own explicit rejection: a
+        // required field would otherwise silently persist a string like
+        // `"{broken"` as the "JSON" value instead of surfacing a validation
+        // error (issue #1341 review). Only the exact empty string is exempt
+        // — for a required column it deliberately falls through unparsed,
+        // matching the required-text convention below (and ONLY that exact
+        // convention: a whitespace-only submission like `"   "` is not
+        // "blank", it's malformed JSON, and must still be rejected — a
+        // browser's `required` validation accepts whitespace as non-empty,
+        // so `raw.trim().is_empty()` would have silently let it through
+        // unparsed). For an optional column the blank-to-null short-circuit
+        // above already handled every whitespace-only submission.
         AdminFieldKind::Json => {
             if let Value::String(raw) = value
-                && let Ok(parsed) = serde_json::from_str(raw)
+                && !raw.is_empty()
             {
-                *value = parsed;
+                match serde_json::from_str::<Value>(raw) {
+                    Ok(parsed) => *value = parsed,
+                    Err(err) => return Err(format!("{}: invalid JSON ({err})", field.name)),
+                }
             }
         }
         AdminFieldKind::Text
@@ -1488,6 +1809,7 @@ fn coerce_form_value(value: &mut Value, field: &AdminField) {
         | AdminFieldKind::Hidden
         | AdminFieldKind::Password => {}
     }
+    Ok(())
 }
 
 fn parse_form_bool(raw: &str) -> Option<bool> {
@@ -1501,7 +1823,7 @@ fn parse_form_bool(raw: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::SelectOption;
+    use crate::traits::{AdminFuture, ListResult, SelectOption};
     use autumn_web::job::{JobAdminBackendEntry, JobAdminMemoryBackend};
     use autumn_web::session::Session;
     use axum::body::Body;
@@ -1515,6 +1837,350 @@ mod tests {
             .cloned()
             .map(|(name, kind)| AdminField::new(name, kind))
             .collect()
+    }
+
+    // ── Validation-failure redisplay (form data loss on 400) ────────────
+    //
+    // Baseline (pre-fix): a validation failure on `POST /{slug}` or
+    // `POST /{slug}/{id}` — malformed JSON in a `Json` field, or the model
+    // rejecting the payload with `AdminError::Validation` — propagated as an
+    // `AutumnError`, which the framework's `ErrorPageFilter` renders as a
+    // full generic error page (status/title/"Go to homepage" link only).
+    // The admin lost every value they had typed; the only recovery step
+    // offered was navigating away. See PR description for the audit.
+    //
+    // A lazy pool that never connects: fine here because every scenario
+    // below fails validation before any handler reaches the database.
+    fn lazy_pool() -> Pool<::autumn_web::RuntimeConnection> {
+        let config = autumn_web::config::DatabaseConfig {
+            url: Some("postgres://localhost/unused".into()),
+            pool_size: 1,
+            ..Default::default()
+        };
+        autumn_web::db::create_pool(&config)
+            .expect("pool config")
+            .expect("pool")
+    }
+
+    /// Minimal `AdminModel` for exercising the create/update
+    /// validation-failure path without a real database. `name == "taken"`
+    /// simulates a model-level validation failure (e.g. a uniqueness
+    /// check); everything else succeeds. `owner` is `create_only` so it
+    /// renders read-only (and is never submitted) on the edit form —
+    /// exactly the case that needs the stored record merged back in on
+    /// redisplay.
+    struct FormTestModel;
+
+    impl AdminModel for FormTestModel {
+        fn slug(&self) -> &'static str {
+            "widgets"
+        }
+        fn display_name(&self) -> &'static str {
+            "Widget"
+        }
+        fn display_name_plural(&self) -> &'static str {
+            "Widgets"
+        }
+        fn fields(&self) -> Vec<AdminField> {
+            vec![
+                AdminField::new("name", AdminFieldKind::Text),
+                AdminField::new("owner", AdminFieldKind::Text).create_only(),
+                AdminField::new("metadata", AdminFieldKind::Json),
+                AdminField::new("api_key", AdminFieldKind::Text)
+                    .optional()
+                    .encrypted(),
+                AdminField::new("published", AdminFieldKind::Boolean).optional(),
+            ]
+        }
+        fn list(
+            &self,
+            _pool: &Pool<::autumn_web::RuntimeConnection>,
+            _params: ListParams,
+        ) -> AdminFuture<'_, ListResult> {
+            Box::pin(async {
+                Ok(ListResult {
+                    records: vec![],
+                    total: 0,
+                    page: 1,
+                    per_page: 25,
+                })
+            })
+        }
+        fn get(
+            &self,
+            _pool: &Pool<::autumn_web::RuntimeConnection>,
+            id: i64,
+        ) -> AdminFuture<'_, Option<Value>> {
+            Box::pin(async move {
+                if id == 1 {
+                    Ok(Some(json!({
+                        "id": 1,
+                        "name": "Widget One",
+                        "owner": "alice",
+                        "metadata": {"a": 1},
+                    })))
+                } else if id == 999 {
+                    // Sentinel id simulating a backend outage on the
+                    // refetch `merge_with_stored_record` does to redisplay
+                    // an update's `create_only` fields correctly.
+                    Err(AdminError::Database("simulated outage".into()))
+                } else {
+                    Ok(None)
+                }
+            })
+        }
+        fn create(
+            &self,
+            _pool: &Pool<::autumn_web::RuntimeConnection>,
+            data: Value,
+        ) -> AdminFuture<'_, Value> {
+            Box::pin(async move {
+                if data.get("name").and_then(Value::as_str) == Some("taken") {
+                    return Err(AdminError::Validation("name already taken".into()));
+                }
+                let mut record = data;
+                if let Some(obj) = record.as_object_mut() {
+                    obj.insert("id".into(), json!(2));
+                }
+                Ok(record)
+            })
+        }
+        fn update(
+            &self,
+            _pool: &Pool<::autumn_web::RuntimeConnection>,
+            _id: i64,
+            data: Value,
+        ) -> AdminFuture<'_, Value> {
+            Box::pin(async move {
+                if data.get("name").and_then(Value::as_str) == Some("taken") {
+                    return Err(AdminError::Validation("name already taken".into()));
+                }
+                Ok(data)
+            })
+        }
+        fn delete(
+            &self,
+            _pool: &Pool<::autumn_web::RuntimeConnection>,
+            _id: i64,
+        ) -> AdminFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn form_test_app() -> axum::Router {
+        let mut registry = AdminRegistry::new();
+        registry.register(FormTestModel);
+        let session = Session::new_for_test("sid".to_owned(), HashMap::new());
+        let state = AppState::for_test().with_pool(lazy_pool());
+        admin_router(
+            Arc::new(registry),
+            "/admin",
+            "/actuator".to_owned(),
+            "user_id".to_owned(),
+            None,
+            None,
+            false,
+            autumn_web::step_up::DEFAULT_MAX_AGE_SECS,
+            false,
+        )
+        .layer(axum::Extension(session))
+        .with_state(state)
+    }
+
+    async fn post_form(
+        app: axum::Router,
+        uri: &str,
+        pairs: &[(&str, &str)],
+    ) -> (StatusCode, String) {
+        let body = {
+            let mut ser = form_urlencoded::Serializer::new(String::new());
+            for (k, v) in pairs {
+                ser.append_pair(k, v);
+            }
+            ser.finish()
+        };
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    // Real browser form-submit navigation always sends this —
+                    // exercise the same HTML error-page path a real admin hits,
+                    // not the JSON fallback an unspecified `Accept` would take.
+                    .header(header::ACCEPT, "text/html,application/xhtml+xml")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, String::from_utf8(bytes.to_vec()).expect("utf8"))
+    }
+
+    // FIXED: a validation failure on `POST /{slug}` or `POST /{slug}/{id}`
+    // now re-renders the same form (422, HTML) with every value the admin
+    // typed still filled in and the failure surfaced through the same
+    // persistent, accessible flash banner every other admin page uses —
+    // instead of discarding the form for a bare `application/problem+json`
+    // body. See the previous commit for the measured baseline this replaces.
+    #[tokio::test]
+    async fn model_create_malformed_json_redisplays_form_with_entered_data() {
+        let (status, html) = post_form(
+            form_test_app(),
+            "/widgets",
+            &[("name", "Widget X"), ("metadata", "{broken")],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "html: {html}");
+        assert!(html.contains("New Widget"), "html: {html}");
+        assert!(html.contains(r#"value="Widget X""#), "html: {html}");
+        assert!(html.contains("invalid JSON"), "html: {html}");
+        assert!(!html.contains("Go to homepage"), "html: {html}");
+        // The malformed text must reach the textarea VERBATIM — not
+        // round-tripped through `Value::to_string()`, which would wrap it in
+        // an extra pair of quotes (`"{broken"`) and risk silently persisting
+        // that as a valid-but-wrong JSON string on a blind resubmit (Codex
+        // review, PR #2422).
+        assert!(
+            html.contains(">{broken</textarea>"),
+            "malformed JSON must render raw, unquoted: {html}"
+        );
+        assert!(
+            !html.contains(r"&quot;{broken&quot;") && !html.contains(r#">"{broken"</textarea>"#),
+            "malformed JSON must not be re-quoted: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_create_malformed_json_keeps_encrypted_field_editable() {
+        // A validation failure on CREATE passes `Some(record)` to
+        // `model_form_page` (the resubmitted values) so they can be
+        // refilled — but the encrypted-field branch must still treat this
+        // as CREATE (no stored ciphertext to protect yet), not EDIT, or an
+        // encrypted field silently becomes a disabled, unsubmittable control
+        // and the admin can never get past validation for a model with a
+        // required encrypted column (Codex review, PR #2422).
+        let (status, html) = post_form(
+            form_test_app(),
+            "/widgets",
+            &[
+                ("name", "Widget X"),
+                ("metadata", "{broken"),
+                ("api_key", "sk-live-123"),
+            ],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "html: {html}");
+        assert!(
+            html.contains(r#"name="api_key""#),
+            "encrypted field must stay submittable on a create failure: {html}"
+        );
+        // The redacted edit-only control has no `name=` attribute at all (so
+        // it never submits and can't overwrite the stored ciphertext) — the
+        // `name="api_key"` check above already rules it out; this pins down
+        // the other half of that control's shape.
+        assert!(
+            !html.contains("••••••••"),
+            "encrypted field must not show the edit-only redaction mask on create: {html}"
+        );
+        // The admin's just-typed secret must not round-trip back into the
+        // response body (Codex review, PR #2422) — the control stays
+        // enabled and submittable, but blank, so they retype it.
+        assert!(
+            !html.contains("sk-live-123"),
+            "encrypted field's plaintext must not leak into the redisplayed HTML: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_create_malformed_json_keeps_other_fields_coerced() {
+        // Codex review, PR #2422: coercion used to stop at the first
+        // failure, leaving every later field's raw form string uncoerced —
+        // a checked Boolean would redisplay unchecked. `published` is
+        // declared after `metadata` on `FormTestModel`, so this exercises
+        // exactly that ordering.
+        let (status, html) = post_form(
+            form_test_app(),
+            "/widgets",
+            &[
+                ("name", "Widget X"),
+                ("metadata", "{broken"),
+                ("published", "true"),
+            ],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "html: {html}");
+        assert!(
+            html.contains(r#"id="published" value="true" checked"#),
+            "a later field must still coerce and redisplay checked: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_create_validation_error_redisplays_form_with_entered_data() {
+        let (status, html) = post_form(
+            form_test_app(),
+            "/widgets",
+            &[("name", "taken"), ("owner", "bob"), ("metadata", "{}")],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "html: {html}");
+        assert!(html.contains("New Widget"), "html: {html}");
+        assert!(html.contains(r#"value="taken""#), "html: {html}");
+        assert!(html.contains("name already taken"), "html: {html}");
+        assert!(!html.contains("Go to homepage"), "html: {html}");
+    }
+
+    #[tokio::test]
+    async fn model_update_validation_error_preserves_create_only_field_and_entered_data() {
+        let (status, html) = post_form(
+            form_test_app(),
+            "/widgets/1",
+            &[("name", "taken"), ("metadata", "{}")],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "html: {html}");
+        assert!(html.contains("Edit Widget"), "html: {html}");
+        assert!(html.contains(r#"value="taken""#), "html: {html}");
+        assert!(html.contains("name already taken"), "html: {html}");
+        // `owner` is create_only: never submitted by the edit form (it
+        // renders read-only, with no `name=` attribute). It must still show
+        // its stored value on redisplay instead of going blank.
+        assert!(html.contains("alice"), "html: {html}");
+        assert!(!html.contains("Go to homepage"), "html: {html}");
+    }
+
+    #[tokio::test]
+    async fn model_update_validation_error_propagates_a_refetch_backend_failure() {
+        // Codex review, PR #2422: `merge_with_stored_record`'s refetch (done
+        // purely to redisplay `create_only` fields correctly) used to turn
+        // ANY error from it — including a real backend outage — into a
+        // silent fallback, masking the outage as an ordinary 422 validation
+        // failure with blanked-out `create_only` fields. It must surface as
+        // the normal error response instead.
+        let (status, body) = post_form(
+            form_test_app(),
+            "/widgets/999",
+            &[("name", "taken"), ("metadata", "{}")],
+        )
+        .await;
+
+        assert_ne!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a backend outage on the refetch must not be reported as a validation failure: {body}"
+        );
+        assert!(status.is_server_error(), "status: {status}, body: {body}");
+        assert!(body.contains("simulated outage"), "body: {body}");
     }
 
     #[tokio::test]
@@ -1542,6 +2208,7 @@ mod tests {
             None,
             false,
             autumn_web::step_up::DEFAULT_MAX_AGE_SECS,
+            false,
         )
         .layer(axum::Extension(session))
         .with_state(state);
@@ -1612,10 +2279,10 @@ mod tests {
     #[test]
     fn coerce_form_fields_converts_boolean_strings() {
         let fields = fields(&[("published", AdminFieldKind::Boolean)]);
-        let out = coerce_form_fields(json!({"published": "true"}), &fields);
+        let out = coerce_form_fields(json!({"published": "true"}), &fields).unwrap();
         assert_eq!(out, json!({"published": true}));
 
-        let out = coerce_form_fields(json!({"published": "false"}), &fields);
+        let out = coerce_form_fields(json!({"published": "false"}), &fields).unwrap();
         assert_eq!(out, json!({"published": false}));
     }
 
@@ -1633,7 +2300,8 @@ mod tests {
                 "settings": "{\"published\":true}"
             }),
             &fields,
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             out,
@@ -1651,7 +2319,7 @@ mod tests {
             AdminField::new("count", AdminFieldKind::Integer).optional(),
             AdminField::new("rating", AdminFieldKind::Float).optional(),
         ];
-        let out = coerce_form_fields(json!({"count": "", "rating": ""}), &fields);
+        let out = coerce_form_fields(json!({"count": "", "rating": ""}), &fields).unwrap();
 
         assert_eq!(out, json!({"count": null, "rating": null}));
     }
@@ -1662,7 +2330,8 @@ mod tests {
             AdminField::new("published_on", AdminFieldKind::Date).optional(),
             AdminField::new("starts_at", AdminFieldKind::DateTime).optional(),
         ];
-        let out = coerce_form_fields(json!({"published_on": "", "starts_at": "   "}), &fields);
+        let out =
+            coerce_form_fields(json!({"published_on": "", "starts_at": "   "}), &fields).unwrap();
 
         assert_eq!(out, json!({"published_on": null, "starts_at": null}));
     }
@@ -1684,7 +2353,8 @@ mod tests {
             )
             .optional(),
         ];
-        let out = coerce_form_fields(json!({"token": "", "notes": "   ", "status": ""}), &fields);
+        let out = coerce_form_fields(json!({"token": "", "notes": "   ", "status": ""}), &fields)
+            .unwrap();
 
         assert_eq!(out, json!({"token": null, "notes": null, "status": null}));
     }
@@ -1697,23 +2367,25 @@ mod tests {
         // The null-coercion short-circuit runs before the JSON parse arm.
         let fields = vec![AdminField::new("settings", AdminFieldKind::Json).optional()];
 
-        let out = coerce_form_fields(json!({"settings": ""}), &fields);
+        let out = coerce_form_fields(json!({"settings": ""}), &fields).unwrap();
         assert_eq!(out, json!({"settings": null}));
 
-        let out = coerce_form_fields(json!({"settings": "   "}), &fields);
+        let out = coerce_form_fields(json!({"settings": "   "}), &fields).unwrap();
         assert_eq!(out, json!({"settings": null}));
 
         // A non-blank optional JSON submission still parses normally.
-        let out = coerce_form_fields(json!({"settings": "{\"published\":true}"}), &fields);
+        let out = coerce_form_fields(json!({"settings": "{\"published\":true}"}), &fields).unwrap();
         assert_eq!(out, json!({"settings": {"published": true}}));
     }
 
     #[test]
     fn coerce_form_fields_keeps_blank_required_json_as_empty_string() {
         // Required columns keep the empty string rather than clearing to NULL,
-        // matching the required-text convention.
+        // matching the required-text convention. A blank submission is exempt
+        // from the malformed-JSON rejection below — it's left for the model's
+        // own required-field validation to catch.
         let fields = vec![AdminField::new("settings", AdminFieldKind::Json)];
-        let out = coerce_form_fields(json!({"settings": ""}), &fields);
+        let out = coerce_form_fields(json!({"settings": ""}), &fields).unwrap();
         assert_eq!(out, json!({"settings": ""}));
     }
 
@@ -1721,9 +2393,116 @@ mod tests {
     fn coerce_form_fields_keeps_blank_required_text_as_empty_string() {
         // Required columns keep the empty string rather than clearing to NULL.
         let fields = vec![AdminField::new("token", AdminFieldKind::Text)];
-        let out = coerce_form_fields(json!({"token": ""}), &fields);
+        let out = coerce_form_fields(json!({"token": ""}), &fields).unwrap();
 
         assert_eq!(out, json!({"token": ""}));
+    }
+
+    #[test]
+    fn coerce_form_fields_rejects_malformed_non_blank_json() {
+        // Issue #1341 review: unlike Integer/Float/Boolean, a JSON column's
+        // Rust type (`serde_json::Value`) accepts *any* JSON value — including
+        // a raw string — so a malformed, non-blank submission must be rejected
+        // here rather than silently persisted as a JSON string literal.
+        let fields = vec![AdminField::new("settings", AdminFieldKind::Json)];
+        let (partial, field_names, msg) =
+            coerce_form_fields(json!({"settings": "{broken"}), &fields)
+                .expect_err("malformed non-blank JSON must be rejected, not silently stored");
+        assert_eq!(
+            field_names,
+            vec!["settings"],
+            "error should name the offending field"
+        );
+        assert!(msg.contains("settings"), "error message: {msg}");
+        // The raw, unparsed text survives in the partial result so the caller
+        // can redisplay exactly what the admin typed.
+        assert_eq!(partial, json!({"settings": "{broken"}));
+
+        // Nullable columns are rejected the same way.
+        let fields = vec![AdminField::new("settings", AdminFieldKind::Json).optional()];
+        assert!(coerce_form_fields(json!({"settings": "{broken"}), &fields).is_err());
+
+        // A syntactically valid JSON string scalar (not a formula/exploit —
+        // just quoted text) is NOT malformed and must still round-trip.
+        let fields = vec![AdminField::new("settings", AdminFieldKind::Json)];
+        let out = coerce_form_fields(json!({"settings": "\"not broken\""}), &fields).unwrap();
+        assert_eq!(out, json!({"settings": "not broken"}));
+    }
+
+    #[test]
+    fn coerce_form_fields_partial_result_keeps_earlier_fields_coerced() {
+        // A field ahead of the failing one in declaration order must still
+        // come back properly typed in the partial result — only the failing
+        // field itself is left as raw text (routes.rs's redisplay path
+        // relies on this: every other widget renders normally).
+        let fields = vec![
+            AdminField::new("count", AdminFieldKind::Integer),
+            AdminField::new("settings", AdminFieldKind::Json),
+        ];
+        let (partial, field_names, _msg) =
+            coerce_form_fields(json!({"count": "42", "settings": "{broken"}), &fields)
+                .expect_err("malformed JSON must be rejected");
+        assert_eq!(field_names, vec!["settings"]);
+        assert_eq!(partial, json!({"count": 42, "settings": "{broken"}));
+    }
+
+    #[test]
+    fn coerce_form_fields_still_coerces_fields_declared_after_a_failure() {
+        // Codex review, PR #2422: stopping at the first failure left every
+        // LATER field's raw form string uncoerced too — a checked Boolean
+        // after a malformed Json field would redisplay unchecked, and if the
+        // admin didn't notice and resubmitted, that wrong value would be
+        // persisted. Coercion must keep going past a failure.
+        let fields = vec![
+            AdminField::new("settings", AdminFieldKind::Json),
+            AdminField::new("published", AdminFieldKind::Boolean),
+        ];
+        let (partial, field_names, _msg) =
+            coerce_form_fields(json!({"settings": "{broken", "published": "true"}), &fields)
+                .expect_err("malformed JSON must be rejected");
+        assert_eq!(field_names, vec!["settings"]);
+        assert_eq!(
+            partial,
+            json!({"settings": "{broken", "published": true}),
+            "a field declared after the failing one must still coerce"
+        );
+    }
+
+    #[test]
+    fn coerce_form_fields_collects_every_failing_field() {
+        // Two independently malformed Json fields must both be named and
+        // both kept as raw text — not just the first one encountered.
+        let fields = vec![
+            AdminField::new("a", AdminFieldKind::Json),
+            AdminField::new("b", AdminFieldKind::Json),
+        ];
+        let (partial, field_names, msg) =
+            coerce_form_fields(json!({"a": "{broken", "b": "[also-broken"}), &fields)
+                .expect_err("both malformed fields must be rejected");
+        assert_eq!(field_names, vec!["a", "b"]);
+        assert!(msg.contains('a') && msg.contains('b'), "message: {msg}");
+        assert_eq!(partial, json!({"a": "{broken", "b": "[also-broken"}));
+    }
+
+    #[test]
+    fn coerce_form_fields_rejects_whitespace_only_required_json() {
+        // Issue #1341 review: a browser's `required` validation treats
+        // whitespace as satisfying the constraint, so a required JSON field
+        // can receive "   " even though it's not the exact blank string the
+        // required-text convention exempts. Whitespace-only content is
+        // malformed JSON (not valid on its own) and must be rejected — not
+        // silently skipped past parsing and persisted as a literal
+        // `Value::String("   ")`.
+        let fields = vec![AdminField::new("settings", AdminFieldKind::Json)];
+        assert!(
+            coerce_form_fields(json!({"settings": "   "}), &fields).is_err(),
+            "whitespace-only required JSON must be rejected, not silently stored"
+        );
+
+        // The exact empty string is still exempt (unchanged pre-existing
+        // behavior, matching the required-text convention).
+        let out = coerce_form_fields(json!({"settings": ""}), &fields).unwrap();
+        assert_eq!(out, json!({"settings": ""}));
     }
 
     #[test]

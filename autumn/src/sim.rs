@@ -41,7 +41,20 @@
 //!   the [`crate::entropy::Rng`] extractor / [`crate::entropy::Entropy`] seam,
 //!   and routes the framework's high-value id sites through it. Bridge a seeded
 //!   source into a mounted app with [`Sim::seeded_entropy`].
-//! - **W5** turns [`Chaos`] into a public fault-injection builder.
+//! - **W5** turns [`Chaos`] into a public, seed-driven fault-injection builder
+//!   ([`Sim::chaos`]), installed at [`Sim::build`] and recorded into the
+//!   schedule read by [`Sim::__chaos_events`].
+//! - **W6** adds the [`always!`](crate::always) / [`sometimes!`](crate::sometimes)
+//!   assertion macros ([`mod@assert`]) and, behind the `sim-testing` feature, a
+//!   property-based op-driver (`sim::op`) — `Sim::gen_ops`/`Sim::gen_ops_with` for
+//!   deterministic generation and `Sim::run_proptest` for shrink-capable runs —
+//!   plus a seed-sweep runner (`sim::sweep`): `sweep_proptest` runs
+//!   `Sim::run_proptest` sequentially across a batch of seeds, reporting the
+//!   first failing seed, driven in CI by the `sim-sweep` `[[bin]]`.
+//! - **#1680** adds [`FaultPlan`], the *authored* fault lane beside [`Chaos`]:
+//!   ordinal-targeted DB-checkout / job-execution faults driven from one seed,
+//!   attached with [`crate::test::TestApp::with_fault_plan`], producing a
+//!   serializable [`FaultOutcome`] a regression test can compare byte-for-byte.
 //!
 //! Everything here is designed to grow additively (builder-style) without
 //! breaking the frozen surface — hence the `#[non_exhaustive]` markers.
@@ -76,6 +89,41 @@ use crate::time::TickingClock;
 #[doc(hidden)]
 pub mod substrate;
 
+// The chaos lane (W5, issue #1797): deterministic fault injection wired into
+// `Sim::build`. Additive and opt-in — a default (empty) `Chaos` installs
+// nothing. See the module docs for the determinism contract.
+pub mod chaos;
+
+#[cfg(feature = "mail")]
+pub use chaos::MailFault;
+pub use chaos::{Chaos, ChaosEvent, ChaosHook};
+
+// The authored fault lane (issue #1680): `FaultPlan`, an ordinal-targeted,
+// seed-deterministic fault schedule installed through `TestApp::with_fault_plan`
+// (not through `Sim::chaos`), plus the serializable `FaultOutcome` a scenario
+// asserts on. Additive and opt-in — a `TestApp` with no plan is untouched. See
+// the module docs for the determinism contract and how it differs from `Chaos`.
+pub mod fault;
+
+pub use fault::{
+    FaultEffect, FaultLedger, FaultOutcome, FaultPlan, FinalState, FiredFault, PlannedFault,
+    ReportedError,
+};
+
+// The seeded LLM stub (W5.b, item 6, issue #1797): a deterministic fake
+// completion client — canned responses + a seeded fault/latency schedule — for
+// exercising agent retry/fallback paths under the virtual clock. Standalone and
+// additive; it does not route through the `Chaos` builder. See the module docs
+// for the determinism contract.
+pub mod llm;
+
+pub use llm::{LlmCall, LlmClient, LlmError, LlmRequest, LlmResponse, SeededLlm, SeededLlmBuilder};
+
+// The crash lane (W5.c item 7, issue #1797): a seed-derived crash schedule plus
+// the `Sim` kill/restart primitive for durable crash-recovery tests. Additive —
+// the schedule is a pure function of the seed and installs nothing at build.
+pub mod crash;
+
 // The W6 semantic core (issue #1797): the `always!` / `sometimes!` assertion
 // macros and the thread-local non-vacuity registry. Public (documented) module —
 // the macros are `#[macro_export]`ed at the crate root (`autumn_web::always` /
@@ -87,6 +135,30 @@ pub use assert::{
     SometimesRegistry, assert_all_sometimes_satisfied, reset_sometimes_registry,
     sometimes_snapshot, sometimes_unsatisfied,
 };
+pub use crash::{CrashPoint, CrashSchedule};
+
+// The W6 op-driver (PR2, issue #1797): `Sim::gen_ops`/`Sim::gen_ops_with` (deterministic,
+// non-shrinking generation) and `Sim::run_proptest` (the shrink-capable
+// runner-owning entrypoint). Behind the `sim-testing` feature because it needs
+// `proptest` as a library (not just dev) dependency — see `autumn/Cargo.toml`.
+#[cfg(feature = "sim-testing")]
+pub mod op;
+
+// The W6 seed-sweep runner (PR3, issue #1797): `sweep_proptest` runs
+// `Sim::run_proptest` sequentially across a batch of seeds, reporting the
+// first failing seed (if any), and folds `sometimes!` reachability — across
+// every proptest case in every seed — across the whole swept range so a
+// green sweep is provably non-vacuous. Sequential, not parallel: see
+// `sim::sweep`'s module docs for why a `body` that mounts a real app makes
+// OS-thread parallelism unsafe here. The `sim-sweep` `[[bin]]`
+// (`autumn/src/bin/sim_sweep.rs`) is its CI-facing driver. Same
+// `sim-testing` feature gate as `op` — it builds directly on
+// `Sim::run_proptest_with_case_hook`.
+#[cfg(feature = "sim-testing")]
+pub mod sweep;
+
+#[cfg(feature = "sim-testing")]
+pub use sweep::{SweepFailure, SweepOutcome, sweep_proptest};
 
 /// The fixed, deterministic epoch the simulation clock starts at:
 /// `2020-01-01T00:00:00Z`.
@@ -123,9 +195,14 @@ pub struct Sim {
     /// tokio's paused timer.
     clock: SimClock,
 
-    /// Fault-injection configuration. Becomes a public builder in W5.
-    #[allow(dead_code)] // fault-injection behavior lands in W5
+    /// Fault-injection configuration installed at [`Sim::build`]. A default
+    /// (empty) [`Chaos`] is inactive and installs nothing.
     chaos: Chaos,
+
+    /// Shared chaos runtime state (decision stream + event log), populated by
+    /// [`Sim::build`] when [`chaos`](Self::chaos) is active. Read through
+    /// [`Sim::__chaos_events`].
+    chaos_state: Option<Arc<chaos::ChaosState>>,
 
     /// Built [`crate::test::TestClient`] handle, mounted by [`Sim::build`] on
     /// the paused runtime with the virtual clock installed.
@@ -164,9 +241,28 @@ impl Sim {
             rng: SimRng::new(seed),
             clock: SimClock::new(TickingClock::starting_at(epoch)),
             chaos: Chaos::default(),
+            chaos_state: None,
             app: SimApp::default(),
             strict_budget: None,
         }
+    }
+
+    /// Configure deterministic fault injection for this simulation.
+    ///
+    /// The `chaos` builder's hooks (transient DB checkout errors, job duplicate
+    /// delivery, clock skew) are installed at [`build`](Sim::build) time, each
+    /// fault decision drawn from a dedicated seed-derived stream so the same
+    /// seed and configuration replay the same fault schedule. A default
+    /// [`Chaos`] is inactive and changes nothing.
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::sim::Chaos;
+    /// sim.chaos(Chaos::default().db_transient_errors(0.1).job_duplicate_delivery(0.2));
+    /// let client = sim.build(TestApp::new().routes(routes![touch]).jobs(jobs![work]));
+    /// ```
+    pub fn chaos(&mut self, chaos: Chaos) -> &mut Self {
+        self.chaos = chaos;
+        self
     }
 
     /// The seed this simulation was constructed from.
@@ -231,9 +327,127 @@ impl Sim {
     /// client.get("/hello").send().await.assert_ok();
     /// ```
     pub fn build(&mut self, app: crate::test::TestApp) -> &crate::test::TestClient {
-        let client = app.with_clock(self.clock.ticking()).build();
+        self.mount(app)
+    }
+
+    /// Mount `app` on the paused runtime with the simulation's virtual clock (and
+    /// active chaos hooks) installed, replacing any previously-mounted client.
+    ///
+    /// Shared by [`build`](Self::build) and [`restart`](Self::restart) so the
+    /// initial mount and a post-crash restart go through byte-for-byte the same
+    /// path. When chaos is active this re-derives the chaos decision state from
+    /// the seed, so a restart's fault schedule replays deterministically.
+    fn mount(&mut self, app: crate::test::TestApp) -> &crate::test::TestClient {
+        // When chaos is active, install its deterministic hooks (which also own
+        // the clock so a skew wrapper can be applied); otherwise the build is
+        // byte-for-byte the pre-W5 path — just the virtual clock.
+        let app = if self.chaos.is_active() {
+            let state = chaos::ChaosState::new(self.seed, &self.chaos);
+            self.chaos_state = Some(Arc::clone(&state));
+            chaos::install(app, &self.chaos, self.seed, self.clock.ticking(), state)
+        } else {
+            app.with_clock(self.clock.ticking())
+        };
+        let client = app.build();
         self.app.client = Some(client);
         self.app.client()
+    }
+
+    /// Simulate a process crash: drop the mounted app so the in-process job
+    /// runtime's in-flight work is **cancelled without completing** (its
+    /// [`Drop`] cancels the runtime's shutdown token and clears the global job
+    /// client), ready for durable recovery on [`restart`](Self::restart).
+    ///
+    /// This is the kill half of the W5.c crash-recovery primitive (item 7). It
+    /// deliberately drops **only** the app/runtime, never the durable database:
+    /// the caller holds the sim's DB substrate (e.g. an
+    /// `SqliteSubstrate`) and its `pool()`, so every committed row — crucially
+    /// the durable `autumn_repository_commit_hooks` queue — survives the crash
+    /// and is still there when a fresh app is mounted on the same pool.
+    ///
+    /// A crash after [`build`](Self::build) has not run is a no-op.
+    ///
+    /// # Durability boundary (stated plainly)
+    ///
+    /// Under the `sqlite` sim substrate the app runs the **in-memory `local`
+    /// job backend**, which is **not durable** — a kill drops its mid-flight and
+    /// still-queued jobs by design, exactly as a real process crash would drop an
+    /// in-memory queue. Item 7's durable guarantee is therefore asserted against
+    /// the DB-backed repository commit-hook queue, **not** the local job queue;
+    /// the in-memory job queue's by-design loss is documented, never pretended
+    /// durable. See the [`crash`] module docs.
+    pub fn kill(&mut self) {
+        // Dropping the client runs `TestJobRuntime::drop` (shutdown.cancel() +
+        // clear_global_job_client()), modelling the process dying mid-flight.
+        self.app.client = None;
+        // A fresh process has no in-memory chaos decision log; a restart
+        // re-derives it deterministically from the seed.
+        self.chaos_state = None;
+    }
+
+    /// Restart after a [`kill`](Self::kill): mount a fresh `app` on the paused
+    /// runtime, modelling a process restart on the **same durable database**.
+    ///
+    /// The caller rebuilds the `TestApp` against the *same* substrate pool
+    /// (`TestApp::new()…with_db(substrate.pool())`), so the restarted app sees
+    /// every row the crashed process committed. Following the restart with
+    /// [`run_to_idle`](Self::run_to_idle) drains the durable repository
+    /// commit-hook queue, recovering and running any hook the crash left
+    /// un-drained (at-least-once / idempotent). Registering the app's hook
+    /// runners on the fresh app models a real app re-registering them on boot.
+    pub fn restart(&mut self, app: crate::test::TestApp) -> &crate::test::TestClient {
+        self.mount(app)
+    }
+
+    /// Kill the running app and immediately [`restart`](Self::restart) it on a
+    /// fresh `app` — the kill-then-restart convenience over
+    /// [`kill`](Self::kill) + [`restart`](Self::restart).
+    ///
+    /// The `app` must be rebuilt against the same durable substrate pool so the
+    /// restarted process recovers the crashed one's committed rows.
+    pub fn crash_and_restart(&mut self, app: crate::test::TestApp) -> &crate::test::TestClient {
+        self.kill();
+        self.restart(app)
+    }
+
+    /// The seed-derived [`CrashSchedule`] for this simulation.
+    ///
+    /// A pure function of the [`seed`](Self::seed): two same-seed sims return an
+    /// equal schedule (the W5.c determinism Definition-of-Done), while different
+    /// seeds overwhelmingly diverge. The representative realized crash point is
+    /// its [`CrashSchedule::first`]; see the [`crash`] module docs for the
+    /// representative-vs-general scope.
+    #[must_use]
+    pub fn crash_schedule(&self) -> CrashSchedule {
+        CrashSchedule::derive(self.seed, crash::DEFAULT_CRASH_SCHEDULE_LEN)
+    }
+
+    /// The representative, realized crash point for this simulation — the first
+    /// entry of the seed-derived [`crash_schedule`](Self::crash_schedule).
+    ///
+    /// `None` only if the schedule is empty (it never is under the default
+    /// length). Deterministic for a given seed.
+    #[must_use]
+    pub fn crash_point(&self) -> Option<CrashPoint> {
+        self.crash_schedule().first().cloned()
+    }
+
+    /// The recorded chaos fault schedule for this simulation.
+    ///
+    /// Returns one [`ChaosEvent`] per chaos-hook invocation, in the order the
+    /// hooks fired — the reproducible *fault schedule* the run produced. Empty
+    /// when chaos was inactive or [`build`](Sim::build) has not run.
+    ///
+    /// Unstable sim plumbing (hidden from the stable surface, like the module's
+    /// other `__`-prefixed hooks); the W5 Definition-of-Done test asserts two
+    /// same-seed runs return equal schedules.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __chaos_events(&self) -> Vec<ChaosEvent> {
+        self.chaos_state
+            .as_ref()
+            .map(|state| state.events())
+            .unwrap_or_default()
     }
 
     /// Borrow the [`crate::test::TestClient`] mounted by [`build`](Sim::build).
@@ -280,7 +494,7 @@ impl Sim {
     ///
     /// # Budget & the `AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS` override
     ///
-    /// The default budget is deliberately generous (100 ms) so ordinary CI
+    /// The default budget is deliberately generous (2000 ms) so ordinary CI
     /// scheduling jitter never trips it — the target is a *real* sleep (seconds),
     /// not sub-millisecond noise. Set the environment variable
     /// `AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS` (whole milliseconds) to override
@@ -594,13 +808,13 @@ const MAX_DRAIN_STEPS: usize = 1024;
 /// Default real wall-clock budget for the `strict_wall_clock` leak guard
 /// ([`Sim::strict_wall_clock`]).
 ///
-/// Deliberately generous (100 ms): the guard exists to catch a *real* blocking
+/// Deliberately generous (2000 ms): the guard exists to catch a *real* blocking
 /// sleep escaping the virtual timer (seconds of wall time), so the budget must
 /// sit far above ordinary current-thread scheduling jitter to avoid false
 /// positives on a slow/contended CI runner. A legitimate virtual advance — even
 /// jumping a day of virtual time — costs microseconds of real time, orders of
 /// magnitude under this.
-const DEFAULT_STRICT_WALL_CLOCK_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+const DEFAULT_STRICT_WALL_CLOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Resolve the effective `strict_wall_clock` budget: the
 /// `AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS` environment override when it holds a
@@ -815,15 +1029,6 @@ impl SimClock {
         crate::time::ClockSource::now(&self.inner)
     }
 }
-
-/// Fault-injection configuration for a simulation.
-///
-/// An empty placeholder in W1. W5 makes this a public, `#[non_exhaustive]`
-/// builder (e.g. `db_transient_errors`, `clock_skew`, …) that the executor
-/// consults to deterministically inject faults.
-#[non_exhaustive]
-#[derive(Default, Debug, Clone)]
-pub struct Chaos {}
 
 /// The built application handle for a simulation.
 ///

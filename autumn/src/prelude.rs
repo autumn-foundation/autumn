@@ -32,9 +32,22 @@ pub use autumn_macros::ws;
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
     api_doc, authorize, cached, delete, event, feature_flag, get, job, jobs, listener, listeners,
-    main, oauth2_callback, one_off_tasks, patch, paths, post, public, put, routes, scheduled,
-    secured, service, static_get, static_routes, step_up, task, tasks, throttle,
+    main, oauth2_callback, one_off_tasks, patch, paths, post, public, put, query_budget, routes,
+    scheduled, secured, service, static_get, static_routes, step_up, task, tasks, throttle,
 };
+
+/// Service-to-service wire contracts (#1755): mark an endpoint, derive a DTO's
+/// wire shape, and check a caller's call sites against the callee.
+pub use crate::wire::NoBody;
+/// Generate a typed client for another Autumn service (#1755).
+#[cfg(feature = "http-client")]
+pub use autumn_macros::wire_client;
+pub use autumn_macros::{WireShape, contract_checked, endpoint};
+
+/// Declare a named agent authority envelope (#1691).
+pub use crate::authority_grant;
+/// Declare a handler agent-operable and check its effects against a grant (#1691).
+pub use autumn_macros::agent_operable;
 #[cfg(feature = "mail")]
 pub use autumn_macros::{mail_previews, mailer, mailer_preview};
 
@@ -48,9 +61,13 @@ pub use crate::assets::asset_url;
 /// Render a `<script>` tag with SRI integrity for a named vendored JS dependency.
 #[cfg(feature = "maud")]
 pub use crate::assets::javascript_include_tag;
-/// Cache a rendered Maud fragment keyed by `(identity, version)`.
+/// Cache a rendered Maud fragment keyed by `(identity, version)`; the `_in`
+/// variants add a cache-key namespace so a repository write can invalidate the
+/// fragment as a group (#1716).
 #[cfg(feature = "maud")]
-pub use crate::cache::{cache_fragment, cache_fragment_global};
+pub use crate::cache::{
+    cache_fragment, cache_fragment_global, cache_fragment_global_in, cache_fragment_in,
+};
 /// Maud HTML templating types.
 #[cfg(feature = "maud")]
 pub use maud::{Markup, PreEscaped, html};
@@ -61,6 +78,10 @@ pub use crate::canary::CanaryRoute;
 /// Database connection extractor.
 #[cfg(feature = "db")]
 pub use crate::db::Db;
+/// Lazy database connection extractor. Use instead of `Db` alongside a body
+/// extractor. See [`crate::db::LazyDb`].
+#[cfg(feature = "db")]
+pub use crate::db::LazyDb;
 /// Transaction isolation levels and retry options for [`crate::db::Db::tx_with`].
 #[cfg(feature = "db")]
 pub use crate::db::{IsolationLevel, TxOptions};
@@ -200,6 +221,11 @@ pub use validator::Validate;
 pub use crate::form::{Changeset, ChangesetForm, IntoChangeset};
 
 // ── Display & search widgets ───────────────────────────────────────
+/// Rewrite a path to point at a different locale's prefixed URL (issue
+/// #1251). Plain string logic — no `maud` dependency — so it's available
+/// regardless of the `maud` feature, unlike [`locale_switcher`] above which
+/// renders `maud::Markup`.
+pub use crate::widgets::localized_path;
 /// Card, stat tile, hero, active search, autocomplete, data table, property
 /// list, and breadcrumb configuration types and rendering helpers.
 ///
@@ -207,14 +233,15 @@ pub use crate::form::{Changeset, ChangesetForm, IntoChangeset};
 #[cfg(feature = "maud")]
 pub use crate::widgets::{
     ActiveSearchConfig, AlertConfig, AlertVariant, AutocompleteConfig, AvatarConfig, AvatarSize,
-    BadgeConfig, BadgeVariant, CardConfig, Column, ConfirmActionConfig, Crumb, Cta, CtaStyle,
-    DEFAULT_TOAST_REGION_ID, DataTableConfig, FeedConfig, FeedMode, HeadingLevel, HeroConfig,
-    ModalConfig, NavBarConfig, NavBarLayout, NavItem, NavLinkMatch, NavMenu, SearchMethod,
-    active_search, active_search_empty_state, active_search_input, active_search_results, alert,
-    alert_with, autocomplete_empty_state, autocomplete_input, autocomplete_option, avatar, badge,
-    badge_with, breadcrumb, card, confirm_action, data_table, error_summary, feed_page, hero,
-    infinite_feed, modal, modal_close_button, modal_trigger, nav_bar, nav_link, nav_link_matched,
-    property_list, stat_card, status_tag, tabs, toast, toast_in, toast_region,
+    BadgeConfig, BadgeVariant, CardConfig, Column, CommentThread, CommentView, ConfirmActionConfig,
+    Crumb, Cta, CtaStyle, DEFAULT_TOAST_REGION_ID, DataTableConfig, FeedConfig, FeedMode,
+    HeadingLevel, HeroConfig, ModalConfig, NavBarConfig, NavBarLayout, NavItem, NavLinkMatch,
+    NavMenu, ReactionControls, SearchMethod, active_search, active_search_empty_state,
+    active_search_input, active_search_results, alert, alert_with, autocomplete_empty_state,
+    autocomplete_input, autocomplete_option, avatar, badge, badge_with, breadcrumb, card,
+    comment_thread, confirm_action, data_table, error_summary, feed_page, hero, infinite_feed,
+    locale_switcher, modal, modal_close_button, modal_trigger, nav_bar, nav_link, nav_link_matched,
+    property_list, reaction_controls, stat_card, status_tag, tabs, toast, toast_in, toast_region,
 };
 
 // ── Widget stories ───────────────────────────────────────────────
@@ -258,6 +285,13 @@ pub use crate::auth::RequireApiToken;
 /// actuator log buffer, the access line, any context-aware layer). See
 /// [`crate::log::context`] for the full surface.
 pub use crate::log::context::with_log_field;
+/// In-app notifications service/extractor (persistent per-recipient feed
+/// with read/unread state). See [`crate::notifications`] for the full surface.
+pub use crate::notifications::Notifications;
+/// Web Push service/extractor (deliver a notification to a subscribed browser
+/// even when the app's tab is closed). See [`crate::push`] for the full
+/// surface.
+pub use crate::push::{PushMessage, WebPush};
 /// Session extractor for accessing per-user session data.
 pub use crate::session::Session;
 /// Tenant extractor and context helpers.
@@ -320,7 +354,7 @@ pub use crate::state::AppState;
 ///
 /// Use in handlers instead of `chrono::Utc::now()` to make time-sensitive
 /// logic testable without sleeping. Override via `TestApp::with_clock`.
-pub use crate::time::Clock;
+pub use crate::time::{Clock, MonotonicInstant};
 
 // ── Feature flags ─────────────────────────────────────────────────
 /// The main feature-flag service, typically stored as an `AppState` extension.
@@ -404,71 +438,7 @@ mod tests {
 
     #[test]
     fn prelude_types_are_accessible() {
-        #[cfg(feature = "db")]
-        let _state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            pool: None,
-            replica_pool: None,
-            shards: None,
-            profile: None,
-            role: crate::config::ProcessRole::Combined,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
-            app_id: AppState::next_app_id(),
-        };
-        #[cfg(not(feature = "db"))]
-        let _state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            profile: None,
-            role: crate::config::ProcessRole::Combined,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
-            app_id: AppState::next_app_id(),
-        };
+        let _state = AppState::test_default();
         let _err: AutumnResult<()> = Ok(());
     }
 

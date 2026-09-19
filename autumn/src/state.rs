@@ -9,12 +9,20 @@
 //! from the state. However, custom extractors can access the state via
 //! `crate::extract::State<AppState>`.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cache::Cache;
-use crate::time::{ClockSource, SystemClock};
+use crate::time::{ClockSource, MonotonicInstant, SystemClock};
 
 /// Newtype wrapper used to store the global cache in the extension map so that
 /// `set_cache` (called from startup hooks) is visible to all `AppState` clones.
@@ -24,6 +32,8 @@ use crate::actuator;
 use crate::authorization::{ForbiddenResponse, Policy, PolicyRegistry, Scope};
 #[cfg(feature = "ws")]
 use crate::channels::Channels;
+#[cfg(all(feature = "collab", feature = "presence"))]
+use crate::collab::CollabHub;
 #[cfg(feature = "db")]
 use crate::db::DbState;
 use crate::middleware;
@@ -77,8 +87,20 @@ pub struct AppState {
     #[cfg(feature = "db")]
     pub(crate) shards: Option<crate::sharding::ShardSet>,
 
+    /// Why failure-capsule capture cannot record this app's database traffic,
+    /// copied from [`DatabaseTopology::capture_gap`](crate::db::DatabaseTopology::capture_gap)
+    /// when the pools were built. Per-app by construction: another app in the
+    /// same process carries its own state and its own gap.
+    #[cfg(all(feature = "db", feature = "reporting"))]
+    pub(crate) db_capture_gap: Option<Arc<str>>,
+
     /// Active profile name (e.g., "dev", "prod", "staging").
-    pub(crate) profile: Option<String>,
+    ///
+    /// `Arc<str>` rather than `String`: `AppState` is cloned once per tower
+    /// ingress traversal (`Route::call` deep-clones the boxed service beneath
+    /// it, per #2193/#2198), so an owned `String` here would be deep-copied
+    /// on every one of those clones rather than once per request.
+    pub(crate) profile: Option<Arc<str>>,
 
     /// Resolved process role for this replica, after config parsing and the
     /// `AUTUMN_ROLE` env override. This is the same value the framework uses to
@@ -88,8 +110,15 @@ pub struct AppState {
     /// without re-reading `AUTUMN_ROLE` by hand.
     pub(crate) role: crate::config::ProcessRole,
 
-    /// When the application started. Used for uptime calculation.
-    pub(crate) started_at: std::time::Instant,
+    /// When the application started, on the injected clock's monotonic
+    /// timeline. Used for uptime calculation.
+    ///
+    /// Read through [`crate::time::ClockSource::monotonic`] rather than a raw
+    /// [`std::time::Instant`] so uptime is virtual (and reproducible) under a
+    /// [`#[sim_test]`](crate::sim_test). Re-stamped by
+    /// [`with_clock`](Self::with_clock) so a clock installed after construction
+    /// owns the origin uptime is measured from.
+    pub(crate) started_at: MonotonicInstant,
 
     /// Whether the health endpoint should include detailed info.
     pub(crate) health_detailed: bool,
@@ -133,6 +162,13 @@ pub struct AppState {
     #[cfg(feature = "presence")]
     pub(crate) presence: Presence,
 
+    /// Registry of live collaborative documents (issue #1806).
+    ///
+    /// Available when both `collab` and `presence` are enabled. Use
+    /// [`collab()`](Self::collab) for convenient access.
+    #[cfg(all(feature = "collab", feature = "presence"))]
+    pub(crate) collab: CollabHub,
+
     /// Cancellation token signalled during graceful shutdown.
     ///
     /// WebSocket handlers receive a child token so they can clean up
@@ -153,7 +189,10 @@ pub struct AppState {
     /// authenticated user id for the
     /// [`PolicyContext`](crate::authorization::PolicyContext).
     /// Mirrors `[auth] session_key` (default: `"user_id"`).
-    pub(crate) auth_session_key: String,
+    ///
+    /// `Arc<str>` for the same reason as [`Self::profile`]: shared across the
+    /// per-traversal clones instead of deep-copied by each one.
+    pub(crate) auth_session_key: Arc<str>,
 
     /// Shared application cache backend. `None` means no global cache has been
     /// registered; `#[cached]` will fall back to its per-function Moka store.
@@ -185,6 +224,24 @@ pub struct AppState {
 /// Monotonic source for [`AppState::app_id`]. Starts at 1 so `0` can never be a
 /// live app id.
 static NEXT_APP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Process-wide default config backing [`AppState::config_arc`]'s no-extension
+/// fallback, so that path clones a refcount instead of building a fresh
+/// `AutumnConfig` on every call.
+///
+/// Sharing one value across every config-less `AppState` is only sound because
+/// `AutumnConfig` and its whole section tree are plain data: no `Mutex`,
+/// `RwLock`, `Cell`, `OnceLock` or atomic anywhere in it, so there is no state
+/// one app could mutate and another observe. Introducing interior mutability
+/// into any config section invalidates that and this static must go back to a
+/// per-call `Arc::new`.
+static DEFAULT_CONFIG: std::sync::OnceLock<Arc<crate::config::AutumnConfig>> =
+    std::sync::OnceLock::new();
+
+/// Handle to the shared default config, built on first use.
+fn default_config() -> &'static Arc<crate::config::AutumnConfig> {
+    DEFAULT_CONFIG.get_or_init(|| Arc::new(crate::config::AutumnConfig::default()))
+}
 
 impl crate::authorization::ProvideAuthorizationState for AppState {
     fn policy_registry(&self) -> &crate::authorization::PolicyRegistry {
@@ -246,6 +303,38 @@ impl AppState {
             .get(&TypeId::of::<T>())
             .cloned()
             .and_then(|value| Arc::downcast::<T>(value).ok())
+    }
+
+    /// Borrow the app's designated live-state block, if one was registered
+    /// with [`AppBuilder::with_live_state`](crate::app::AppBuilder::with_live_state).
+    ///
+    /// This is the block an in-place upgrade carries into the next build; see
+    /// [`upgrade`](crate::upgrade).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use autumn_web::AppState;
+    /// # use autumn_web::upgrade::LiveState;
+    /// # use serde::{Deserialize, Serialize};
+    /// # #[derive(Serialize, Deserialize)] struct Stats { hits: u64 }
+    /// # impl LiveState for Stats { const VERSION: u32 = 1; }
+    /// # fn handler(state: &AppState) {
+    /// if let Some(stats) = state.live_state::<Stats>() {
+    ///     let hits = stats.read(|s| s.hits);
+    ///     let _ = hits;
+    /// }
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn live_state<T>(&self) -> Option<crate::upgrade::LiveStateHandle<T>>
+    where
+        T: crate::upgrade::LiveState,
+    {
+        // The handle is itself an `Arc` over the state, so hand back a clone of
+        // it rather than an `Arc<Arc<…>>` the caller has to keep alive.
+        self.extension::<crate::upgrade::LiveStateHandle<T>>()
+            .map(|handle| (*handle).clone())
     }
 
     /// Fetch the extension of type `T`, inserting `f()`'s result if absent.
@@ -389,10 +478,42 @@ impl AppState {
     ///
     /// Falls back to a default config if no config has been installed
     /// (typically only in tests that don't wire the full startup pipeline).
+    ///
+    /// This hands back an owned, independently mutable snapshot, which costs a
+    /// deep clone of every config section; on request paths use
+    /// [`config_arc`](Self::config_arc) instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal extension map mutex is poisoned, inherited from
+    /// [`extension`](Self::extension).
     #[must_use]
     pub fn config(&self) -> crate::config::AutumnConfig {
+        (*self.config_arc()).clone()
+    }
+
+    /// Returns the resolved [`crate::config::AutumnConfig`] as a shared handle.
+    ///
+    /// The cheap accessor: it clones only the [`Arc`], never the
+    /// configuration behind it, so callers pay a refcount bump instead of a
+    /// deep copy of every config section. Prefer this over
+    /// [`config`](Self::config) on request paths, and reach for `config()`
+    /// only when an owned, independently mutable snapshot is genuinely needed.
+    ///
+    /// When no config extension has been installed (typically only in tests
+    /// that don't wire the full startup pipeline) this yields a handle to a
+    /// shared default-valued config, so the fallback is free too. That fallback
+    /// is never written back into the extension map, so a config installed
+    /// afterwards is still observed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal extension map mutex is poisoned, inherited from
+    /// [`extension`](Self::extension).
+    #[must_use]
+    pub fn config_arc(&self) -> Arc<crate::config::AutumnConfig> {
         self.extension::<crate::config::AutumnConfig>()
-            .map_or_else(crate::config::AutumnConfig::default, |arc| (*arc).clone())
+            .unwrap_or_else(|| Arc::clone(default_config()))
     }
 
     /// Allocate the next process-unique app id.
@@ -501,10 +622,84 @@ impl AppState {
     }
 
     /// Replace the clock (builder / test helper).
+    ///
+    /// Also re-stamps the app's start instant from the new clock, so
+    /// [`uptime`](Self::uptime) is measured on the timeline that is actually
+    /// installed. Without this, a state built with the default [`SystemClock`]
+    /// and then handed a virtual clock would compare a *virtual* `now` against a
+    /// *real* origin and report a nonsense uptime.
+    ///
+    /// A construction-time builder: it also gives the state a fresh job registry
+    /// on `clock`, so a state's clock and the queue gauges judged by it can
+    /// never belong to different timelines. A state cloned *before* this call
+    /// keeps its own clock and its own registry, equally consistent — the two
+    /// simply stop sharing queue gauges from here on.
+    ///
+    /// # Call this before starting a job runtime
+    ///
+    /// Once [`job::start_runtime`](mod@crate::job) has run, the runtime holds its
+    /// own clone of the registry and keeps recording into it, and **no**
+    /// behaviour here is correct:
+    ///
+    /// | if `with_clock` … | then |
+    /// |---|---|
+    /// | re-clocks this handle only | the runtime's clone judges shared marks on the old clock |
+    /// | re-clocks a shared cell | the runtime stamps with the old clock into gauges moved to the new one |
+    /// | takes a fresh registry (what it does) | the runtime keeps writing to the old one, and this state's gauges stay empty |
+    ///
+    /// The operation is simply not meaningful after initialization, so rather
+    /// than pick the least-bad wrong answer this asserts in debug builds and
+    /// logs at `error` in release. It is not silently tolerated.
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn ClockSource>) -> Self {
+        let already_initialized = self.job_registry.is_initialized();
+        debug_assert!(
+            !already_initialized,
+            "AppState::with_clock is a construction-time builder: by the time job \
+             names are registered a runtime holds its own clone of the registry, \
+             and re-clocking the state can no longer reach it. Install the clock \
+             before starting the job runtime."
+        );
+        if already_initialized {
+            tracing::error!(
+                "AppState::with_clock called after the job registry was populated; the \
+                 job runtime holds its own clone and keeps recording there, so this \
+                 state's actuator gauges will stay empty. Install the clock before \
+                 starting the job runtime."
+            );
+        }
+        self.started_at = clock.monotonic();
+        // A registry's queue gauges compare ready-at marks against a clock, and
+        // the marks come from the job runtime started off *this* state — so the
+        // registry has to be the one this state's clock governs, and only that
+        // one. Hence a fresh registry rather than re-clocking the existing one:
+        //
+        // * re-clocking only this handle leaves a clone's runtime stamping on
+        //   the old clock while the shared gauges judge on the new one, and
+        // * re-clocking through a shared cell inverts it — the *other* handle
+        //   then stamps with its own clock into gauges moved out from under it.
+        //
+        // Detaching gives every state one clock and one registry that agree,
+        // whichever order states are cloned and re-clocked in. Before a runtime
+        // starts — the only point at which this builder is meaningful, checked
+        // above — the registry is empty, so nothing is dropped.
+        self.job_registry = actuator::JobRegistry::new().with_clock(Arc::clone(&clock));
         self.clock = clock;
         self
+    }
+
+    /// Returns the current instant on the injected clock's monotonic timeline —
+    /// the deterministic replacement for [`std::time::Instant::now`] when
+    /// measuring how long something took.
+    ///
+    /// Framework internals and app code alike should bracket work with two of
+    /// these and take the difference via
+    /// [`MonotonicInstant::saturating_duration_since`]. Handlers can reach the
+    /// same value through the [`crate::time::Clock`] extractor's
+    /// [`monotonic`](crate::time::Clock::monotonic).
+    #[must_use]
+    pub fn monotonic(&self) -> MonotonicInstant {
+        self.clock.monotonic()
     }
 
     /// Clone the shared clock handle, e.g. to thread into a subsystem that needs
@@ -556,7 +751,7 @@ impl AppState {
     /// Sets the active profile.
     #[must_use]
     pub fn with_profile(mut self, profile: impl Into<String>) -> Self {
-        self.profile = Some(profile.into());
+        self.profile = Some(Arc::from(profile.into()));
         self
     }
 
@@ -605,7 +800,7 @@ impl AppState {
     #[doc(hidden)]
     #[must_use]
     pub fn with_auth_session_key(mut self, value: impl Into<String>) -> Self {
-        self.auth_session_key = value.into();
+        self.auth_session_key = Arc::from(value.into());
         self
     }
 
@@ -658,15 +853,20 @@ impl AppState {
     }
 
     /// Returns how long the application has been running.
+    ///
+    /// Measured on the injected clock's monotonic timeline, so it is immune to
+    /// wall-clock jumps in production and moves with
+    /// [`Sim::advance`](crate::sim::Sim::advance) under a
+    /// [`#[sim_test]`](crate::sim_test).
     #[must_use]
     pub fn uptime(&self) -> std::time::Duration {
-        self.started_at.elapsed()
+        self.monotonic().saturating_duration_since(self.started_at)
     }
 
     /// Format uptime as a human-readable string (e.g., "2h 15m").
     #[must_use]
     pub fn uptime_display(&self) -> String {
-        let secs = self.started_at.elapsed().as_secs();
+        let secs = self.uptime().as_secs();
         if secs < 60 {
             format!("{secs}s")
         } else if secs < 3600 {
@@ -692,6 +892,15 @@ impl AppState {
     #[must_use]
     pub const fn presence(&self) -> &Presence {
         &self.presence
+    }
+
+    /// Returns a reference to the registry of live collaborative documents.
+    ///
+    /// Shorthand for the [`CollabHub`] extractor.
+    #[cfg(all(feature = "collab", feature = "presence"))]
+    #[must_use]
+    pub const fn collab(&self) -> &CollabHub {
+        &self.collab
     }
 
     /// Returns a high-level broadcast facade for raw and htmx HTML payloads.
@@ -746,6 +955,11 @@ impl AppState {
     pub fn detached() -> Self {
         #[cfg(feature = "ws")]
         let channels = Channels::new(32);
+        // One tracker, shared: `state.presence()` and the collaboration hub
+        // must see the same membership, or a participant list read through
+        // one would disagree with the other.
+        #[cfg(feature = "presence")]
+        let presence = Presence::new(channels.clone());
         Self {
             extensions: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(feature = "db")]
@@ -754,9 +968,11 @@ impl AppState {
             replica_pool: None,
             #[cfg(feature = "db")]
             shards: None,
+            #[cfg(all(feature = "db", feature = "reporting"))]
+            db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
-            started_at: std::time::Instant::now(),
+            started_at: crate::time::monotonic_now(),
             health_detailed: true,
             probes: probe::ProbeState::ready_for_test(),
             metrics: middleware::MetricsCollector::new(),
@@ -766,15 +982,17 @@ impl AppState {
             config_props: actuator::ConfigProperties::default(),
             metrics_source_registry: actuator::MetricsSourceRegistry::new(),
             health_indicator_registry: actuator::HealthIndicatorRegistry::new(),
+            #[cfg(all(feature = "collab", feature = "presence"))]
+            collab: CollabHub::new(channels.clone(), presence.clone()),
             #[cfg(feature = "presence")]
-            presence: Presence::new(channels.clone()),
+            presence,
             #[cfg(feature = "ws")]
             channels,
             #[cfg(feature = "ws")]
             shutdown: CancellationToken::new(),
             policy_registry: PolicyRegistry::default(),
             forbidden_response: ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
+            auth_session_key: "user_id".into(),
             shared_cache: None,
             clock: Arc::new(SystemClock),
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
@@ -793,6 +1011,10 @@ impl AppState {
 
 #[cfg(feature = "db")]
 impl DbState for AppState {
+    fn clock(&self) -> Arc<dyn ClockSource> {
+        self.clock_arc()
+    }
+
     fn metrics(&self) -> Option<&crate::middleware::MetricsCollector> {
         Some(&self.metrics)
     }
@@ -809,6 +1031,11 @@ impl DbState for AppState {
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
     {
         self.replica_pool.as_ref()
+    }
+
+    #[cfg(feature = "reporting")]
+    fn db_capture_gap(&self) -> Option<Arc<str>> {
+        self.db_capture_gap.clone()
     }
 
     fn read_pool(
@@ -921,6 +1148,18 @@ impl crate::actuator::ProvideActuatorState for AppState {
         self.health_detailed
     }
 
+    /// The shadow-mirroring handle, installed into the runtime extension map
+    /// when the framework router assembled a mirror layer for this app.
+    ///
+    /// Read from extensions rather than stored as an `AppState` field because
+    /// the mirror is built during router assembly — after the state exists —
+    /// and because an app that never enables `[shadow]` should carry no extra
+    /// bytes for it.
+    fn shadow(&self) -> Option<crate::shadow::ShadowHandle> {
+        self.extension::<crate::shadow::ShadowHandle>()
+            .map(|handle| (*handle).clone())
+    }
+
     fn deploy_version(&self) -> String {
         self.extension::<crate::canary::CanaryState>().map_or_else(
             || crate::canary::STABLE.to_owned(),
@@ -998,7 +1237,138 @@ impl std::fmt::Debug for AppState {
 }
 
 #[cfg(test)]
+impl AppState {
+    /// Build a default `AppState` for unit tests.
+    ///
+    /// Every field here is the value duplicated verbatim across the crate's
+    /// test helpers (`app::tests::test_router`, `router::tests::test_state`,
+    /// `session::tests::test_state`, `auth::tests::test_app_state`, and
+    /// several inline call sites) before they were consolidated onto this
+    /// function. Callers that need one or two fields to differ do so with
+    /// struct-update syntax (`AppState { field: ..., ..AppState::test_default() }`)
+    /// rather than repeating the other twenty-odd fields.
+    pub(crate) fn test_default() -> Self {
+        // One registry and one tracker across all three fields, for the
+        // reason `detached()` gives: a hub wired to a different `Channels`
+        // than `state.channels()` publishes where nobody is listening, and a
+        // test asserting on either would pass vacuously.
+        #[cfg(feature = "ws")]
+        let channels = crate::channels::Channels::new(32);
+        #[cfg(feature = "presence")]
+        let presence = crate::presence::Presence::new(channels.clone());
+        Self {
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            #[cfg(feature = "db")]
+            pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
+            #[cfg(feature = "db")]
+            shards: None,
+            #[cfg(all(feature = "db", feature = "reporting"))]
+            db_capture_gap: None,
+            profile: None,
+            role: crate::config::ProcessRole::Combined,
+            started_at: crate::time::monotonic_now(),
+            health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
+            #[cfg(all(feature = "collab", feature = "presence"))]
+            collab: CollabHub::new(channels.clone(), presence.clone()),
+            #[cfg(feature = "presence")]
+            presence,
+            #[cfg(feature = "ws")]
+            channels,
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".into(),
+            shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
+            app_id: Self::next_app_id(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    /// Re-clocking a state that a runtime has already touched is refused loudly.
+    ///
+    /// By the time job names are registered, the runtime holds its own clone of
+    /// the registry and keeps recording there — so no behaviour `with_clock`
+    /// could pick is correct (see its docs for the three-way trade). It asserts
+    /// in debug rather than silently leaving this state's gauges empty.
+    #[test]
+    #[should_panic(expected = "construction-time builder")]
+    fn re_clocking_an_initialized_state_is_refused() {
+        use chrono::{TimeZone, Utc};
+
+        let state = AppState::detached();
+        // What `job::start_runtime` does: register the app's job names.
+        state.job_registry().register_on_queue("probe", "default");
+
+        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let _ = state.with_clock(Arc::new(crate::time::FixedClock::at(epoch)));
+    }
+
+    /// A state's clock and the gauges it judges must never come apart.
+    ///
+    /// The job runtime started off a state stamps ready-at marks with that
+    /// state's clock, and the state's registry judges them. Re-clocking a state
+    /// therefore has to move both together. Re-clocking only the handle leaves a
+    /// clone's runtime stamping on the old clock while shared gauges judge on
+    /// the new one; re-clocking through a shared cell inverts it, moving the
+    /// gauges out from under the other handle's runtime. `with_clock` detaches
+    /// instead, so each state keeps a matched pair.
+    #[test]
+    fn re_clocking_a_state_keeps_its_gauges_on_its_own_clock() {
+        use chrono::{TimeZone, Utc};
+
+        let real_state = AppState::detached();
+        let cloned_before = real_state.clone();
+
+        // Behind real time, like a sim epoch: the direction where a stale
+        // judgement calls a not-yet-due job ready.
+        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let virtual_state = real_state.with_clock(Arc::new(crate::time::FixedClock::at(epoch)));
+
+        // A job the virtual state's runtime would stamp: due a minute after its
+        // epoch, so not yet ready *on that state's clock*.
+        let ready_at = u64::try_from(epoch.timestamp_millis()).unwrap() + 60_000;
+        virtual_state
+            .job_registry()
+            .register_on_queue("probe", "default");
+        virtual_state
+            .job_registry()
+            .record_enqueue_scheduled("probe", ready_at);
+
+        let virtual_depth = virtual_state.job_registry().queue_snapshot()["default"].depth;
+        assert_eq!(
+            virtual_depth, 0,
+            "the state that stamped the mark must judge it as scheduled"
+        );
+
+        // The clone kept the real clock, so it must also have kept its own
+        // registry — otherwise its runtime would stamp real-time deadlines into
+        // gauges now judged against 2020, and every one of them would read as
+        // scheduled for years.
+        let clone_snapshot = cloned_before.job_registry().queue_snapshot();
+        assert!(
+            !clone_snapshot.contains_key("default"),
+            "a state cloned before the clock swap must not share gauges with a \
+             state on a different clock; it saw {clone_snapshot:?}"
+        );
+    }
+
     use super::*;
     #[cfg(feature = "db")]
     use crate::config;
@@ -1017,7 +1387,7 @@ mod tests {
     #[test]
     fn app_state_debug_with_pool() {
         let config = config::DatabaseConfig {
-            url: Some("postgres://localhost/test".into()),
+            url: Some(crate::test_urls::primary("test")),
             pool_size: 5,
             ..Default::default()
         };
@@ -1031,12 +1401,12 @@ mod tests {
     #[test]
     fn database_topology_state_exposes_replica_as_read_pool() {
         let primary_config = config::DatabaseConfig {
-            url: Some("postgres://localhost/primary".into()),
+            url: Some(crate::test_urls::primary("primary")),
             pool_size: 5,
             ..Default::default()
         };
         let replica_config = config::DatabaseConfig {
-            url: Some("postgres://localhost/replica".into()),
+            url: Some(crate::test_urls::replica("primary", "replica")),
             pool_size: 2,
             ..Default::default()
         };
@@ -1063,12 +1433,12 @@ mod tests {
     #[test]
     fn read_pool_uses_primary_when_replica_is_unready_and_policy_allows_fallback() {
         let primary_config = config::DatabaseConfig {
-            url: Some("postgres://localhost/primary".into()),
+            url: Some(crate::test_urls::primary("primary")),
             pool_size: 5,
             ..Default::default()
         };
         let replica_config = config::DatabaseConfig {
-            url: Some("postgres://localhost/replica".into()),
+            url: Some(crate::test_urls::replica("primary", "replica")),
             pool_size: 2,
             ..Default::default()
         };
@@ -1099,12 +1469,12 @@ mod tests {
     #[test]
     fn read_pool_does_not_route_to_unready_replica_when_policy_fails_readiness() {
         let primary_config = config::DatabaseConfig {
-            url: Some("postgres://localhost/primary".into()),
+            url: Some(crate::test_urls::primary("primary")),
             pool_size: 5,
             ..Default::default()
         };
         let replica_config = config::DatabaseConfig {
-            url: Some("postgres://localhost/replica".into()),
+            url: Some(crate::test_urls::replica("primary", "replica")),
             pool_size: 2,
             ..Default::default()
         };
@@ -1128,12 +1498,12 @@ mod tests {
     #[tokio::test]
     async fn readiness_fails_when_app_state_replica_is_unready_and_policy_is_fail_readiness() {
         let primary_config = config::DatabaseConfig {
-            url: Some("postgres://localhost/primary".into()),
+            url: Some(crate::test_urls::primary("primary")),
             pool_size: 5,
             ..Default::default()
         };
         let replica_config = config::DatabaseConfig {
-            url: Some("postgres://localhost/replica".into()),
+            url: Some(crate::test_urls::replica("primary", "replica")),
             pool_size: 2,
             ..Default::default()
         };
@@ -1236,5 +1606,106 @@ mod tests {
             .expect("runtime extension should be installed");
 
         assert_eq!(stored.as_str(), "haunted");
+    }
+
+    /// `config_arc` must hand back the very `Arc` the extension map holds, and
+    /// must keep reading through to that map rather than caching a handle:
+    /// `app::build` re-inserts a mutated config after `build_state` (static
+    /// routes excluded from locale prefixing), so a cached handle would serve
+    /// the pre-mutation config forever.
+    #[test]
+    fn config_arc_returns_the_installed_arc_without_deep_cloning() {
+        let state = AppState::for_test();
+        state.insert_extension(crate::config::AutumnConfig {
+            profile: Some("staging".to_owned()),
+            ..Default::default()
+        });
+
+        let installed = state
+            .extension::<crate::config::AutumnConfig>()
+            .expect("config extension should be installed");
+        let first = state.config_arc();
+        let second = state.config_arc();
+
+        assert!(
+            Arc::ptr_eq(&first, &installed),
+            "config_arc must return the extension map's Arc, not a fresh allocation"
+        );
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two config_arc calls must share one allocation"
+        );
+
+        state.insert_extension(crate::config::AutumnConfig {
+            profile: Some("prod".to_owned()),
+            ..Default::default()
+        });
+        let after_reinsert = state.config_arc();
+
+        assert_eq!(
+            after_reinsert.profile.as_deref(),
+            Some("prod"),
+            "config_arc must observe a config re-inserted after construction"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &after_reinsert),
+            "a re-inserted config must replace the handle, not alias the old one"
+        );
+    }
+
+    #[test]
+    fn config_arc_falls_back_to_default_without_extension() {
+        let state = AppState::for_test();
+        let defaults = crate::config::AutumnConfig::default();
+
+        let fallback = state.config_arc();
+
+        assert_eq!(fallback.profile, defaults.profile);
+        assert_eq!(fallback.server.port, defaults.server.port);
+        assert_eq!(fallback.server.host, defaults.server.host);
+        // Reading config must not install one: a state that boots without a
+        // config and gets one later must see the later one, and the fallback
+        // must not become a phantom entry other `extension` callers observe.
+        assert!(
+            state.extension::<crate::config::AutumnConfig>().is_none(),
+            "the fallback default must not be written into the extension map"
+        );
+    }
+
+    /// `AutumnConfig` has no `PartialEq`, so `Debug` rendering stands in for
+    /// value equality.
+    #[test]
+    fn config_matches_config_arc_by_value() {
+        let absent = AppState::for_test();
+        assert_eq!(
+            format!("{:?}", absent.config()),
+            format!("{:?}", *absent.config_arc()),
+            "the two accessors must agree in the no-extension fallback case"
+        );
+
+        let present = AppState::for_test();
+        present.insert_extension(crate::config::AutumnConfig {
+            profile: Some("staging".to_owned()),
+            ..Default::default()
+        });
+        assert_eq!(
+            format!("{:?}", present.config()),
+            format!("{:?}", *present.config_arc()),
+            "the two accessors must agree when a config is installed"
+        );
+    }
+
+    /// Both accessors' signatures are load-bearing beyond this crate: autumn-cli's
+    /// auth generator emits reads against them as strings that CI never compiles,
+    /// so a change here surfaces only in generated apps.
+    ///
+    /// `config_arc` is the one generated request handlers call — they bind the
+    /// handle and borrow sections off it (`&config.auth.password`), so it has to
+    /// keep returning an owned `Arc` that outlives the borrow. `config` stays
+    /// pinned too: it remains the per-boot owned-snapshot accessor.
+    #[test]
+    fn config_signature_is_unchanged() {
+        let _: fn(&AppState) -> crate::config::AutumnConfig = AppState::config;
+        let _: fn(&AppState) -> Arc<crate::config::AutumnConfig> = AppState::config_arc;
     }
 }

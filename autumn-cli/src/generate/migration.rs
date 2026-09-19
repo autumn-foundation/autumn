@@ -72,7 +72,57 @@ pub fn plan_migration_with_options(
     super::model::validate_resource_name(name)?;
     let mut fields = parse_fields(field_tokens)?;
     super::model::apply_unique_flags(&mut fields, uniques)?;
-
+    // Issue #1340: `generate migration` emits SQL and nothing else — it never
+    // writes a model file, so there is nowhere for the `#[encrypted(...)]`
+    // attribute to land. Accepting `{encrypted}` here would add an ordinary
+    // plaintext column while the author believes they declared encryption:
+    // precisely the silent failure this DSL token exists to eliminate. Point at
+    // the two generators that do wire the attribute, and at the existing
+    // `Encrypt<Column>On<Table>` shape for converting a column that already
+    // exists.
+    if let Some(field) = fields.iter().find(|f| f.is_encrypted()) {
+        return Err(GenerateError::InvalidField {
+            token: field.name.clone(),
+            reason: format!(
+                "the `encrypted` modifier is not supported by `generate migration`: this \
+                 command emits SQL only, so the `#[encrypted]` attribute would never reach a \
+                 model and the column would silently be plaintext. Declare the column with \
+                 `autumn generate model`/`autumn generate scaffold` \
+                 (`{}:String{{encrypted}}`), or convert an existing plaintext column with \
+                 `autumn generate migration Encrypt{}On<Table>`, which emits the documented \
+                 offline backfill.",
+                field.name,
+                super::naming::pascal(&field.name),
+            ),
+        });
+    }
+    // Issue #1384: same reasoning as `{encrypted}` above, and the same silent
+    // failure. `generate migration` emits SQL only, so the `#[translatable]`
+    // attribute — and the `Translated` field type that carries every bit of the
+    // behaviour — would never reach a model. The column would be added as
+    // `TEXT NOT NULL DEFAULT '{}'` while the model kept reading it as a plain
+    // `String`, so the app would render raw JSON where the author believed they
+    // had declared per-locale content.
+    //
+    // Refusing here also closes the `--unique` hole by construction: the flag is
+    // folded in above by `apply_unique_flags`, after `parse_field`'s own
+    // `:unique` cross-check has already run, so `--unique` on a translatable
+    // column would otherwise have emitted a UNIQUE index over the whole JSON
+    // container — precisely what the inline spelling refuses.
+    if let Some(field) = fields.iter().find(|f| f.is_translatable()) {
+        return Err(GenerateError::InvalidField {
+            token: field.name.clone(),
+            reason: format!(
+                "the `translatable` modifier is not supported by `generate migration`: this \
+                 command emits SQL only, so the `#[translatable]` attribute and the \
+                 `autumn_web::i18n::Translated` field type would never reach a model, and the \
+                 app would read the per-locale JSON container as a plain string. Declare the \
+                 column with `autumn generate model` (`{}:String{{translatable}}`), which emits \
+                 the model, the schema entry, the migration and the `i18n` feature together.",
+                field.name
+            ),
+        });
+    }
     // Determine the target app's database backend so the emitted ALTER TABLE
     // DDL is backend-aware (SQLite foundation, issue #1614).
     let backend = detect_backend(project_root);
@@ -98,10 +148,22 @@ pub fn plan_migration_with_options(
             // anywhere the generator can see — a self-reference here is left
             // unvalidated rather than guessed at.
             super::model::check_reference_targets(&mut plan, project_root, &fields, table, None)?;
-            // A field kind with no working diesel SQLite conversion (Uuid,
-            // Attachment, Decimal) would leak an uncompilable column into the
-            // generated SQLite app, so reject it here too — same guard as
-            // `generate model`/`scaffold` (AC #4, #1924).
+            // Issue #1318: a `lock_version` token means optimistic locking here
+            // too — `add_columns_up_sql_for` gives it the `DEFAULT 0` the
+            // DB-managed column needs — so validate it exactly as `generate
+            // model`/`generate scaffold` do. Scoped to the ADD shape on
+            // purpose: a REMOVE migration names a column that already exists,
+            // and dropping a legacy `lock_version` whose name now collides with
+            // the magic one is a legitimate (indeed, the recommended) thing to
+            // do. Its rollback re-adds the column with the type the user
+            // supplied, so rejecting `RemoveLockVersionFromPosts
+            // lock_version:String` would block the very escape hatch the other
+            // error messages point at.
+            super::model::validate_lock_version_field(&fields, &[])?;
+            // The same standing guard `generate model`/`scaffold` carries: a
+            // field kind with no working diesel SQLite conversion would leak an
+            // uncompilable column into the app. Every kind converts as of #1924
+            // (AC #4).
             if backend == autumn_web::config::DatabaseBackend::Sqlite {
                 super::reject_sqlite_unsupported_field_kinds(&fields)?;
             }
@@ -134,9 +196,29 @@ pub fn plan_migration_with_options(
             }
             let existing_schema =
                 std::fs::read_to_string(project_root.join("src/schema.rs")).unwrap_or_default();
+            // SQLite refuses `DROP COLUMN` while an index names the column.
+            // Recover the table's prior indexes so the up path drops them first
+            // (#1906). Postgres cascades the drop and needs none of this.
+            let prior_indexes = if backend == autumn_web::config::DatabaseBackend::Sqlite {
+                super::prior_index::scan_prior_indexes(&project_root.join("migrations"), table)
+            } else {
+                Vec::new()
+            };
             (
-                remove_columns_up_sql_for(backend, table, &fields, &existing_schema),
-                remove_columns_down_sql_for(backend, table, &fields, &existing_schema)?,
+                remove_columns_up_sql_for(
+                    backend,
+                    table,
+                    &fields,
+                    &existing_schema,
+                    &prior_indexes,
+                ),
+                remove_columns_down_sql_for(
+                    backend,
+                    table,
+                    &fields,
+                    &existing_schema,
+                    &prior_indexes,
+                )?,
             )
         }
         MigrationShape::EncryptColumns {
@@ -284,8 +366,47 @@ fn pascalish(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1384 (Codex round 4): `generate migration` emits SQL only, so a
+    /// `{translatable}` column would arrive without the `#[translatable]`
+    /// attribute or the `Translated` field type — the app would read the JSON
+    /// container as a plain string. Same silent failure `{encrypted}` refuses.
+    #[test]
+    fn migration_rejects_a_translatable_field() {
+        let tmp = project();
+        let err = plan_migration(
+            tmp.path(),
+            "AddTitleToPosts",
+            &["title:String{translatable}".into()],
+            "20260427000000",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("translatable"), "{err}");
+        assert!(err.contains("generate model"), "{err}");
+    }
+
+    /// The refusal also closes the `--unique` hole: the flag is applied after
+    /// `parse_field`'s own `:unique` cross-check has run, so without it
+    /// `--unique` would emit a UNIQUE index over the whole JSON container.
+    #[test]
+    fn migration_rejects_a_translatable_field_flagged_unique() {
+        let tmp = project();
+        let err = plan_migration_with_options(
+            tmp.path(),
+            "AddTitleToPosts",
+            &["title:String{translatable}".into()],
+            "20260427000000",
+            &["title".to_owned()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("translatable"), "{err}");
+    }
     use crate::generate::Flags;
+    use crate::generate::emit::Action;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn project() -> TempDir {
@@ -816,6 +937,90 @@ pub struct Post {
         });
     }
 
+    /// Issue #1906: a `Remove…From…` on `SQLite` must drop a PRE-EXISTING index
+    /// that names the removed column, not just the conventional
+    /// `idx_<table>_<col>` the generator itself would have created. `SQLite`
+    /// refuses `DROP COLUMN` while any index still references the column, so a
+    /// composite index from an earlier migration would otherwise break the
+    /// migration at apply time.
+    #[test]
+    fn remove_columns_migration_on_sqlite_drops_a_pre_existing_composite_index() {
+        with_no_db_env(|| {
+            let tmp = sqlite_project();
+            let earlier = tmp.path().join("migrations/20260101000000_create_posts");
+            fs::create_dir_all(&earlier).unwrap();
+            fs::write(
+                earlier.join("up.sql"),
+                "CREATE TABLE posts (id INTEGER PRIMARY KEY AUTOINCREMENT);\n\
+                 CREATE INDEX idx_posts_author_title ON posts (author_id, title);\n",
+            )
+            .unwrap();
+
+            let plan = plan_migration(
+                tmp.path(),
+                "RemoveTitleFromPosts",
+                &["title:Option<String>".into()],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+            let dir = tmp
+                .path()
+                .join("migrations/20260427000000_remove_title_from_posts");
+
+            let up = fs::read_to_string(dir.join("up.sql")).unwrap();
+            let drop_idx = up
+                .find("DROP INDEX IF EXISTS idx_posts_author_title;")
+                .unwrap_or_else(|| panic!("composite index not dropped: {up}"));
+            let drop_col = up
+                .find("ALTER TABLE posts DROP COLUMN title;")
+                .unwrap_or_else(|| panic!("column not dropped: {up}"));
+            assert!(drop_idx < drop_col, "index drop must come first: {up}");
+
+            // The rollback restores it, after the column is back.
+            let down = fs::read_to_string(dir.join("down.sql")).unwrap();
+            let add_col = down
+                .find("ALTER TABLE posts ADD COLUMN title")
+                .unwrap_or_else(|| panic!("column not re-added: {down}"));
+            let recreate = down
+                .find("CREATE INDEX idx_posts_author_title ON posts (author_id, title);")
+                .unwrap_or_else(|| panic!("index not re-created: {down}"));
+            assert!(add_col < recreate, "column must precede its index: {down}");
+        });
+    }
+
+    /// The same project shape on Postgres emits no explicit `DROP INDEX` — it
+    /// cascades the drop with the column, so the output is unchanged by #1906.
+    #[test]
+    fn remove_columns_migration_on_postgres_ignores_pre_existing_indexes() {
+        with_no_db_env(|| {
+            let tmp = project();
+            let earlier = tmp.path().join("migrations/20260101000000_create_posts");
+            fs::create_dir_all(&earlier).unwrap();
+            fs::write(
+                earlier.join("up.sql"),
+                "CREATE INDEX idx_posts_author_title ON posts (author_id, title);\n",
+            )
+            .unwrap();
+
+            let plan = plan_migration(
+                tmp.path(),
+                "RemoveTitleFromPosts",
+                &["title:Option<String>".into()],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+            let dir = tmp
+                .path()
+                .join("migrations/20260427000000_remove_title_from_posts");
+            let up = fs::read_to_string(dir.join("up.sql")).unwrap();
+            let down = fs::read_to_string(dir.join("down.sql")).unwrap();
+            assert!(!up.contains("DROP INDEX"), "Postgres up.sql: {up}");
+            assert!(!down.contains("idx_posts_author_title"), "down.sql: {down}");
+        });
+    }
+
     /// Regression guard: the same `Add…To…` on a Postgres app emits no explicit
     /// `DROP INDEX` in `down.sql` — Postgres cascades the index drop with the
     /// column, so the rollback stays byte-for-byte the historical output.
@@ -844,27 +1049,39 @@ pub struct Post {
         });
     }
 
-    /// A `SQLite` `Add…To…` / `Remove…From…` migration rejects field kinds with
-    /// no working diesel `SQLite` conversion (`Uuid`, `Attachment`, `Decimal`) at
-    /// generate time, citing #1924 (issue #1614 AC #4).
+    /// A `SQLite` `Add…To…` / `Remove…From…` migration now accepts every field
+    /// kind: #1924 gave `Uuid`, `Decimal` and `Enum` working `SQLite`
+    /// conversions, so the generate-time rejection no longer fires. All three
+    /// store `TEXT`.
+    ///
+    /// Nullable columns here, deliberately: `SQLite`'s own `ALTER TABLE ADD
+    /// COLUMN` rule still refuses a `NOT NULL` column with no default, which is
+    /// a separate gate (#1918) this test must not trip over.
     #[test]
-    fn column_migrations_on_sqlite_reject_unsupported_field_kinds_citing_1924() {
+    fn column_migrations_on_sqlite_accept_uuid_decimal_and_enum_after_1924() {
         with_no_db_env(|| {
-            for name in ["AddTokenToPosts", "RemoveTokenFromPosts"] {
-                let tmp = sqlite_project();
-                let err =
-                    plan_migration(tmp.path(), name, &["token:Uuid".into()], "20260427000000")
-                        .unwrap_err();
-                let msg = err.to_string();
-                assert!(
-                    matches!(err, GenerateError::Config(_)),
-                    "{name}: expected Config error, got: {err:?}"
-                );
-                assert!(msg.contains("1924"), "{name}: must cite #1924: {msg}");
-                assert!(
-                    msg.contains("uuid::Uuid"),
-                    "{name}: message must name the Rust type: {msg}"
-                );
+            for token in [
+                "token:Option<Uuid>",
+                "price:Option<decimal{10,2}>",
+                "status:Option<enum{draft,published}>",
+            ] {
+                for name in ["AddTokenToPosts", "RemoveTokenFromPosts"] {
+                    let tmp = sqlite_project();
+                    let plan = plan_migration(tmp.path(), name, &[token.into()], "20260427000000")
+                        .unwrap_or_else(|e| {
+                            panic!("{name} with `{token}` must plan on SQLite (#1924): {e}")
+                        });
+                    let up = sql_action(&plan, "up.sql");
+                    let down = sql_action(&plan, "down.sql");
+                    for sql in [&up, &down] {
+                        for leak in ["UUID", "NUMERIC"] {
+                            assert!(
+                                !sql.contains(leak),
+                                "{name}/{token}: SQLite SQL leaked `{leak}`: {sql}"
+                            );
+                        }
+                    }
+                }
             }
         });
     }
@@ -987,6 +1204,37 @@ pub struct Post {
 
     // ── `plan_migration_destroy_fallback` (issue #1048 PR review) ───────────
 
+    /// A project holding a `#[searchable]` `Post` model and the
+    /// `AddSearchToPosts` migration generated from it, returned with the
+    /// migration's directory. Shared by the three `destroy` fallback tests.
+    fn searchable_post_with_migration() -> (TempDir, PathBuf) {
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            r#"
+#[autumn_web::model(table = "posts")]
+#[searchable(language = "english")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    pub title: String,
+}
+"#,
+        )
+        .unwrap();
+
+        let plan = plan_migration(tmp.path(), "AddSearchToPosts", &[], "20260427000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let dir = tmp
+            .path()
+            .join("migrations/20260427000000_add_search_to_posts");
+        assert!(dir.exists());
+        (tmp, dir)
+    }
+
     #[test]
     fn destroy_add_search_migration_after_model_already_destroyed_still_removes_it() {
         // A common cleanup order — destroying the model before destroying
@@ -1000,31 +1248,9 @@ pub struct Post {
                 ("DATABASE_URL", None::<&str>),
             ],
             || {
-                let tmp = project();
-                let models_dir = tmp.path().join("src/models");
-                fs::create_dir_all(&models_dir).unwrap();
-                let model_src = r#"
-#[autumn_web::model(table = "posts")]
-#[searchable(language = "english")]
-pub struct Post {
-    #[id]
-    pub id: i64,
-    #[searchable(weight = "A")]
-    pub title: String,
-}
-"#;
-                fs::write(models_dir.join("post.rs"), model_src).unwrap();
-
-                let plan =
-                    plan_migration(tmp.path(), "AddSearchToPosts", &[], "20260427000000").unwrap();
-                plan.execute(Flags::default()).unwrap();
-                let dir = tmp
-                    .path()
-                    .join("migrations/20260427000000_add_search_to_posts");
-                assert!(dir.exists());
-
+                let (tmp, dir) = searchable_post_with_migration();
                 // Simulate `autumn destroy model Post` having already run.
-                fs::remove_file(models_dir.join("post.rs")).unwrap();
+                fs::remove_file(tmp.path().join("src/models/post.rs")).unwrap();
                 assert!(
                     plan_migration(tmp.path(), "AddSearchToPosts", &[], "99999999999999").is_err()
                 );
@@ -1035,25 +1261,76 @@ pub struct Post {
                     "99999999999999",
                 )
                 .unwrap();
-                // Without --force: content is unverifiable (the search
-                // config is gone), so it's treated as diverged and left in
-                // place.
-                let err = fallback_plan
-                    .revert(Flags {
-                        dry_run: false,
-                        force: false,
-                    })
-                    .unwrap_err();
-                assert!(matches!(err, GenerateError::Diverged(_)));
-                assert!(dir.exists());
+                // The fallback plan cannot reproduce the SQL — the search
+                // config is gone — but the digest `generate` recorded still
+                // proves the files are its own untouched output, so no
+                // --force is needed (issue #1835).
+                fallback_plan.revert(Flags::default()).unwrap();
+                assert!(!dir.exists());
+            },
+        );
+    }
 
-                let fallback_plan = plan_migration_destroy_fallback(
+    #[test]
+    fn destroy_add_search_migration_still_refuses_hand_edited_sql() {
+        // The #1048 guard under the #1835 code path: the recorded digest makes
+        // the fallback plan usable, and an edit still has to break it.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let (tmp, dir) = searchable_post_with_migration();
+                fs::remove_file(tmp.path().join("src/models/post.rs")).unwrap();
+                fs::write(dir.join("up.sql"), "-- my own SQL\n").unwrap();
+
+                let err = plan_migration_destroy_fallback(
                     tmp.path(),
                     "AddSearchToPosts",
                     "99999999999999",
                 )
-                .unwrap();
-                fallback_plan
+                .unwrap()
+                .revert(Flags::default())
+                .unwrap_err();
+
+                assert!(matches!(err, GenerateError::Diverged(_)));
+                assert!(dir.exists());
+            },
+        );
+    }
+
+    #[test]
+    fn destroy_add_search_migration_without_provenance_still_needs_force() {
+        // The pre-#1835 path, still taken by a project generated before the
+        // manifest existed: nothing was recorded and the search config is
+        // gone, so the SQL is unverifiable and the directory is left alone.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let (tmp, dir) = searchable_post_with_migration();
+                fs::remove_file(tmp.path().join("src/models/post.rs")).unwrap();
+                fs::remove_file(tmp.path().join(crate::generate::provenance::MANIFEST_PATH))
+                    .unwrap();
+
+                let err = plan_migration_destroy_fallback(
+                    tmp.path(),
+                    "AddSearchToPosts",
+                    "99999999999999",
+                )
+                .unwrap()
+                .revert(Flags::default())
+                .unwrap_err();
+                assert!(matches!(err, GenerateError::Diverged(_)));
+                assert!(dir.exists());
+
+                plan_migration_destroy_fallback(tmp.path(), "AddSearchToPosts", "99999999999999")
+                    .unwrap()
                     .revert(Flags {
                         dry_run: false,
                         force: true,
@@ -1172,5 +1449,135 @@ pub struct Post {
         .unwrap_err();
         assert!(err.to_string().contains("UUID"));
         assert!(err.to_string().contains("self-referential"));
+    }
+
+    // ── optimistic locking (issue #1318) ────────────────────────────────────
+
+    /// The contents of the planned `up.sql`/`down.sql` action.
+    fn sql_action(plan: &Plan, file: &str) -> String {
+        plan.actions
+            .iter()
+            .find(|a| a.path().file_name().is_some_and(|n| n == file))
+            .map_or_else(
+                || panic!("no {file} action"),
+                |a| match a {
+                    Action::Create { contents, .. } | Action::Modify { contents, .. } => {
+                        contents.clone()
+                    }
+                    _ => String::new(),
+                },
+            )
+    }
+
+    #[test]
+    fn adding_a_lock_version_column_carries_the_default_that_makes_it_usable() {
+        // The retrofit path — "add optimistic locking to a resource I already
+        // shipped" — is how this column normally arrives. `#[lock_version]`
+        // keeps it out of `New{Model}`, so a bare NOT NULL add would leave
+        // every later insert failing; the DEFAULT also backfills existing rows.
+        let tmp = project();
+        let plan = plan_migration(
+            tmp.path(),
+            "AddLockVersionToPosts",
+            &["lock_version:i32".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let up = sql_action(&plan, "up.sql");
+        assert!(
+            up.contains("ADD COLUMN lock_version INTEGER NOT NULL DEFAULT 0;"),
+            "up.sql:\n{up}"
+        );
+    }
+
+    #[test]
+    fn adding_a_lock_version_column_of_the_wrong_type_is_rejected() {
+        // Same DSL token, same feedback as `generate model`/`generate scaffold`
+        // — otherwise the diagnosis depends only on which subcommand you typed.
+        let tmp = project();
+        let err = plan_migration(
+            tmp.path(),
+            "AddLockVersionToPosts",
+            &["lock_version:String".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lock_version") && msg.contains("i32"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn removing_a_legacy_lock_version_column_is_never_type_checked() {
+        // Dropping a pre-existing ordinary `lock_version` is exactly the escape
+        // hatch the other error messages point at, and the rollback re-adds the
+        // column with the type the caller supplied. Applying the optimistic-lock
+        // type restriction to a REMOVE migration would block it.
+        let tmp = project();
+        let plan = plan_migration(
+            tmp.path(),
+            "RemoveLockVersionFromPosts",
+            &["lock_version:String".into()],
+            "20260427000000",
+        )
+        .expect("a removal migration must not be type-checked as a lock version");
+        let down = sql_action(&plan, "down.sql");
+        assert!(
+            down.contains("ADD COLUMN lock_version TEXT"),
+            "the rollback must restore the caller's original type:\n{down}"
+        );
+    }
+
+    // ── `{encrypted}` is not a `generate migration` token (issue #1340) ─────
+
+    /// R8: `generate migration` emits SQL only — it never touches a model
+    /// file — so accepting `{encrypted}` here would add a plaintext column
+    /// while the developer believes they declared encryption. That is exactly
+    /// the silent failure issue #1340 exists to close, so refuse and name the
+    /// two commands that really do wire the attribute.
+    #[test]
+    fn add_columns_migration_rejects_the_encrypted_modifier() {
+        let tmp = project();
+        let err = plan_migration(
+            tmp.path(),
+            "AddApiTokenToAccounts",
+            &["api_token:String{encrypted}".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("encrypted"), "must name the modifier: {msg}");
+        assert!(
+            msg.contains("generate model") || msg.contains("generate scaffold"),
+            "must point at the commands that emit the attribute: {msg}"
+        );
+        assert!(
+            msg.contains("EncryptApiTokenOnAccounts") || msg.contains("Encrypt"),
+            "must point at the existing encrypt-columns migration shape: {msg}"
+        );
+    }
+
+    /// The pre-existing `Encrypt<Column>On<Table>` shape is unaffected — it
+    /// takes no field tokens and stays the supported way to convert an
+    /// existing plaintext column.
+    #[test]
+    fn encrypt_columns_migration_shape_still_works() {
+        let tmp = project();
+        let plan = plan_migration(
+            tmp.path(),
+            "EncryptApiTokenOnAccounts",
+            &[],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_encrypt_api_token_on_accounts/up.sql"),
+        )
+        .unwrap();
+        assert!(up.contains("api_token"), "up.sql: {up}");
     }
 }

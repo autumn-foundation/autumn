@@ -184,3 +184,14 @@ inspector_capacity = 0
 ```
 
 Or simply run in `test` or `prod` profile — the inspector is not mounted.
+
+---
+
+## The build-time counterpart
+
+The inspector flags an N+1 only on a path you actually browse.
+[`#[query_budget(N)]`](query-budgets.md) bounds a route's query count at
+**compile time**, so a regression on an untested branch fails the build instead
+of waiting to be clicked. Use both: the gate proves the upper bound, the
+inspector shows you the SQL.
+

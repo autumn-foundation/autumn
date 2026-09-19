@@ -12,7 +12,7 @@ This guide covers:
 - The [`Policy`](#the-policy-trait) trait and `PolicyContext`.
 - [Scope queries](#scope-queries) for filtering list endpoints.
 - The [`#[authorize]`](#the-authorize-attribute-macro) attribute macro.
-- The [`#[repository(policy = ...)]`](#the-repository-policy-argument)
+- The [`#[repository(policy = ...)]`](#the-repository-policy--argument)
   argument that wires policies into auto-generated CRUD endpoints.
 - The [403-vs-404 decision](#403-vs-404).
 - [Common patterns](#common-patterns) (ownership, group membership,
@@ -69,7 +69,7 @@ autumn_web::app()
     .await;
 ```
 
-`PolicyContext` carries the resolved [`Session`](../api/session.md), the
+`PolicyContext` carries the resolved [`Session`](authentication.md#the-session-api), the
 authenticated user id (when any), the active role set, and a clone of the
 database pool so policies can consult related rows. The trait is
 object-safe — apps can hold `Arc<dyn Policy<Post>>` and swap
@@ -178,6 +178,17 @@ use autumn_web::authorization::authorize;
 let post: Post = posts::table.find(id).first(&mut *db).await?;
 authorize::<Post>(&state, &session, "update", &post).await?;
 ```
+
+Every `#[authorize]` attribute is also recorded in the build-time security
+manifest: `autumn routes audit` emits one `(action, resource)` entry per
+binding in its provable `authorization_policies` dimension, so deleting an
+attribute deletes exactly that entry. The recorded resource is the identifier
+as written — `Post`, not the `PostPolicy` impl, which the attribute never names
+and the registry only resolves at boot. The inline `authorize::<Post>`
+call above is invisible to the audit by contrast: it is a call site, not an
+attribute, so it contributes no binding *and* no classification — a handler
+relying on it still needs `#[secured]` or `#[public]` to pass the coverage
+gate. See [Security Posture Manifest](./security-posture-manifest.md).
 
 ## The `#[repository] policy =` argument
 
@@ -306,7 +317,9 @@ empty.
 
 ## See also
 
-- [Macro transparency: `#[authorize]`](./macro-transparency.md#authorize)
+- [Authentication](./authentication.md) — how a request acquires the identity
+  these policies are evaluated against: sessions, login, and `#[secured]`.
+- [Macro transparency: `#[authorize]`](./macro-transparency.md#authorizeaction-resource--type)
 - [Coming from other frameworks](./coming-from-other-frameworks.md) — maps
   Pundit, Bodyguard, `@PreAuthorize`, and `before_action` onto autumn's
   `Policy` + `#[authorize]`.

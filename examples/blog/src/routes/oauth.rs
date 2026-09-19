@@ -33,7 +33,10 @@ pub async fn oauth_redirect(
         )));
     }
 
-    let auth_cfg = state.config().auth;
+    // `config_arc` shares the resolved config behind an `Arc`; `config()` would
+    // deep-clone every section (including the OAuth provider map) per request.
+    let config = state.config_arc();
+    let auth_cfg = &config.auth;
     let provider = auth_cfg
         .oauth2
         .providers
@@ -66,7 +69,10 @@ pub async fn oauth_callback(
         )));
     }
 
-    let auth_cfg = state.config().auth;
+    // `config_arc` shares the resolved config behind an `Arc`; `config()` would
+    // deep-clone every section (including the OAuth provider map) per request.
+    let config = state.config_arc();
+    let auth_cfg = &config.auth;
     let provider = auth_cfg
         .oauth2
         .providers

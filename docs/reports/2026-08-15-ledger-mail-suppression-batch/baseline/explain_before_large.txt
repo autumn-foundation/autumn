@@ -1,0 +1,34 @@
+=== BEFORE: single-recipient lookup, HIT (real unsubscribe) ===
+                                                                                  QUERY PLAN                                                                                  
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=4.45..4.46 rows=1 width=8) (actual time=0.055..0.056 rows=1 loops=1)
+   Output: count(*)
+   Buffers: shared hit=2 read=2
+   ->  Index Only Scan using mail_unsubscribes_subscriber_list_id_key on public.mail_unsubscribes  (cost=0.42..4.44 rows=1 width=0) (actual time=0.050..0.051 rows=1 loops=1)
+         Output: subscriber, list_id
+         Index Cond: ((mail_unsubscribes.subscriber = 'user1@example.com'::text) AND (mail_unsubscribes.list_id = 'weekly_digest'::text))
+         Heap Fetches: 0
+         Buffers: shared hit=2 read=2
+ Query Identifier: -5409687402289277798
+ Planning:
+   Buffers: shared hit=60
+ Planning Time: 0.181 ms
+ Execution Time: 0.076 ms
+(13 rows)
+
+=== BEFORE: single-recipient lookup, MISS (never unsubscribed) ===
+                                                                                  QUERY PLAN                                                                                  
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=4.45..4.46 rows=1 width=8) (actual time=0.014..0.015 rows=1 loops=1)
+   Output: count(*)
+   Buffers: shared hit=3
+   ->  Index Only Scan using mail_unsubscribes_subscriber_list_id_key on public.mail_unsubscribes  (cost=0.42..4.44 rows=1 width=0) (actual time=0.013..0.013 rows=0 loops=1)
+         Output: subscriber, list_id
+         Index Cond: ((mail_unsubscribes.subscriber = 'active14000@example.com'::text) AND (mail_unsubscribes.list_id = 'weekly_digest'::text))
+         Heap Fetches: 0
+         Buffers: shared hit=3
+ Query Identifier: -5409687402289277798
+ Planning Time: 0.039 ms
+ Execution Time: 0.027 ms
+(11 rows)
+

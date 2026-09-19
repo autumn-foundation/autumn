@@ -19,8 +19,14 @@ it, and which one you want depends on where TLS is terminated:
 
 > **Quick decision.** Own cert, single host → [Direct TLS](#direct-in-process-tls-servertls).
 > Want auto-issued certs, single host, no proxy →
-> [ACME](#automatic-acme-certificates-servertlsacme). Using `autumn deploy`, a
-> proxy, or multiple replicas → [Reverse-proxy termination](#terminating-tls-at-a-reverse-proxy).
+> [ACME](#automatic-acme-certificates-servertlsacme). Tenants bringing their own
+> hostnames → [Tenant custom domains](#tenant-custom-domains-servertlsacmecustom_domains).
+> Using `autumn deploy`, a proxy, or multiple replicas →
+> [Reverse-proxy termination](#terminating-tls-at-a-reverse-proxy).
+
+Whichever way the *server's* certificate is provisioned, you can additionally
+verify the *client's* — see
+[Mutual TLS](#mutual-tls-verifying-client-certificates-servertlsclient_auth).
 
 Direct TLS and ACME are both **off by default** and each gated behind an
 off-by-default cargo feature (`tls` and `acme`), so a default build never links
@@ -116,6 +122,118 @@ site**.
 **fails** on a missing, invalid, or expired certificate and **warns** when the
 leaf expires within 30 days — so an approaching expiry surfaces in CI or a
 pre-deploy check rather than at the moment the cert lapses.
+
+### What behaves the same under TLS
+
+Turning on `[server.tls]` changes the transport, not the app. The framework
+probes (`/health`, `/live`, `/ready`, `/startup`), `/actuator/health`, the
+inbound request timeout (`[server.timeouts]`), SSE streams, `wss://` WebSockets,
+and graceful shutdown of an in-flight request all behave exactly as they do over
+plain HTTP — including that an SSE body still streams incrementally rather than
+being buffered, and that a stream is still exempt from the request deadline.
+
+That parity is enforced, not asserted: `autumn/tests/integration/tls_app_surface.rs`
+serves the *same* router twice — once over the TLS listener, once over plain TCP
+— and requires each probe response to match on status, body, and content type;
+it also drives a `wss://` echo, an SSE stream, a timed-out handler, and a
+shutdown drain over TLS on every CI run.
+
+Two things do differ, both by construction:
+
+- **`[server.tls]` cannot be combined with `server.unix_socket`.** Direct TLS
+  terminates on `host:port`; configuring both is a startup error.
+- **In-place upgrades (`SIGUSR2` handoff) do not apply to a TLS build.** A
+  handoff passes the listening socket to a successor process, and a successor
+  that terminates TLS cannot adopt a plaintext listener whose clients are
+  mid-connection. So a TLS build never offers its socket for handoff (the signal
+  logs `in-place upgrade refused` and the running app carries on), and a TLS
+  build handed an inherited socket exits at startup rather than failing every
+  connection. Restart the process to deploy a new build.
+
+### Serving HTTPS from the release image
+
+`autumn release init` generates a Dockerfile whose builder runs a bare
+`cargo build --release` (or `autumn build --embed` with `--embed`). Neither
+passes `--features`, so the `tls` feature has to be a **default** feature of
+your app for the image to link the TLS stack:
+
+```toml
+[features]
+default = ["flash", "tls"]
+tls = ["autumn-web/tls"]
+```
+
+Mount the certificate and key into the container and point `[server.tls]` at
+them with the environment (no `autumn.toml` edit needed — the runtime
+materializes the section from these vars), and re-point the image's own
+HEALTHCHECK at `https://`:
+
+```bash
+docker run -d \
+  -v /etc/letsencrypt:/etc/letsencrypt:ro \
+  -e AUTUMN_SERVER__TLS__CERT_PATH=/etc/letsencrypt/live/app.example.com/fullchain.pem \
+  -e AUTUMN_SERVER__TLS__KEY_PATH=/etc/letsencrypt/live/app.example.com/privkey.pem \
+  -e AUTUMN_HEALTHCHECK_URL=https://localhost:3000/health \
+  -e AUTUMN_HEALTHCHECK_INSECURE=1 \
+  -p 443:3000 \
+  my-app
+```
+
+**Mount the whole `/etc/letsencrypt` tree, at the same path**, not just the
+`live/<domain>` directory. certbot's `live/*.pem` are *relative symlinks* into
+`../../archive/<domain>/`, so a bind mount of `live/<domain>` alone leaves every
+target outside the mount: the container resolves them under `/etc/archive`,
+finds nothing, and the app fails fast on an unreadable certificate instead of
+serving HTTPS. Mounting the tree at the identical path keeps the symlinks valid
+and lets a renewal — which writes a new `archive/` file and re-points the
+symlink — be picked up by the poller, since the mtime it stats is the
+symlink's target.
+
+With a certificate that is *not* symlinked (a corporate or vendor PEM), any
+directory works:
+
+```bash
+docker run -d \
+  -v /srv/tls:/etc/autumn/tls:ro \
+  -e AUTUMN_SERVER__TLS__CERT_PATH=/etc/autumn/tls/fullchain.pem \
+  -e AUTUMN_SERVER__TLS__KEY_PATH=/etc/autumn/tls/privkey.pem \
+  -e AUTUMN_HEALTHCHECK_URL=https://localhost:3000/health \
+  -e AUTUMN_HEALTHCHECK_INSECURE=1 \
+  -p 443:3000 \
+  my-app
+```
+
+Both health-check variables matter. `AUTUMN_HEALTHCHECK_URL` re-points the
+generated `HEALTHCHECK`, which defaults to `http://localhost:3000/health`: a
+plain-HTTP probe against an HTTPS listener marks the container **unhealthy**
+forever — and in the generated `docker-compose.yml`, anything waiting on
+`condition: service_healthy` then never starts.
+
+`AUTUMN_HEALTHCHECK_INSECURE=1` lets that probe skip certificate verification.
+It is needed because the probe is a loopback call to the container's own
+listener while your certificate is issued to the app's *public* hostname, so it
+can never validate as `localhost`. Set it only with a loopback URL — it applies
+to whatever URL you configure, and unset (the default) the probe always
+verifies. The opt-in is deliberate rather than inferred from the URL: `user@`,
+`#fragment`, and lookalike hostnames all make a URL *read* as loopback while
+curl resolves it somewhere else, so a scheme/host parser in the probe would
+quietly stop verifying certificates for a remote endpoint.
+
+Mount the key read-only and keep it `0600` on the host, owned by a user the
+container's `autumn` user (uid 10001) can read. (certbot's `archive/` is
+`0700 root` by default, so either run the container as a user that can read it
+or relax the group permission for the app's user — a certificate the app cannot
+open is a fail-fast boot error naming the path, not a silent fallback.) Because
+the certificate lives on a bind mount, a host-side `certbot renew` rewrites the
+files the container polls — the hot reload works exactly as it does outside a
+container, with no image rebuild and no restart.
+
+CI exercises this path on every change to the deployment scaffold: the
+`https-target` job in `.github/workflows/release-image-boot.yml` builds the
+generated image with `tls` on, boots it with a self-signed test certificate,
+and requires an HTTPS `/health` + `/actuator/health` 200 (validated with
+`--cacert`), that plain HTTP on the same port does *not* answer, and that the
+container's own HEALTHCHECK reaches `healthy`.
 
 ### Renewing with certbot
 
@@ -233,12 +351,13 @@ Fields:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `domains` | required | One or more non-wildcard domains to issue for. |
+| `domains` | required | One or more non-wildcard domains to issue for. Each entry is used **verbatim** as the certificate's SAN and as the ACME order's DNS identifier, so an entry with leading or trailing whitespace is rejected at startup rather than requested as-is. |
 | `contact_email` | required | Contact address registered with the ACME account. |
 | `directory` | Let's Encrypt **staging** | ACME directory. Built-in endpoints are the bare strings `"staging"` (default) and `"production"`. A private CA / Pebble uses the inline table `{ custom = { url = "https://your-ca.example/dir" } }` — a bare URL string is **not** accepted (see below). |
 | `cache_dir` | `config/acme` | Where the account key and issued certificate are cached. |
 | `http_challenge_port` | `80` | Port the HTTP-01 challenge (and HTTP→HTTPS redirect) listens on. |
-| `renew_before_days` | `30` | Renew this many days before expiry (must be `< 90`). |
+| `renew_before_days` | `30` | Renew this many days before expiry (a whole number, unquoted, and `< 90`). |
+| `ca_root_path` | unset | PEM root that signs the **ACME directory's own HTTPS certificate**. Only needed for a private CA / Pebble; see below. |
 
 > **Staging is the default — switch to production deliberately.** When
 > `directory` is unset the app uses the **Let's Encrypt staging** environment,
@@ -266,6 +385,29 @@ Fields:
 >
 > A bare URL string (`directory = "https://pebble.test/dir"`) is **not** a valid
 > value and makes the config fail to load at startup — use the inline-table form.
+>
+> A custom directory almost always also needs **`ca_root_path`**. The ACME client
+> speaks HTTPS to the directory and, by default, verifies it against the
+> **platform trust store** — the host's own installed CA certificates. That is
+> right for Let's Encrypt (both its staging and production API endpoints carry
+> publicly-trusted certificates) and wrong for a private CA or a Pebble test
+> server, whose API certificate chains to a root the host does not know. Unless
+> you have installed that root system-wide, the TLS handshake to the directory
+> fails and **every** order dies before an authorization is even created:
+>
+> ```toml
+> [server.tls.acme]
+> domains = ["app.example.com"]
+> contact_email = "admin@example.com"
+> directory = { custom = { url = "https://pebble.test/dir" } }
+> ca_root_path = "config/pebble-root.pem"
+> ```
+>
+> `ca_root_path` replaces the client's trust anchors *for the ACME control plane
+> only* — it has no bearing on which certificates browsers accept from your site.
+> `autumn doctor` grades it (`acme_ca_root`) and **fails** on a path that is
+> missing or holds no certificate, since that state can only ever produce failed
+> orders.
 
 ### How issuance and renewal work
 
@@ -290,16 +432,843 @@ Fields:
 > election only decides **which** instance orders a certificate; it does not make
 > multi-replica ACME work — the app logs a loud startup warning when a
 > distributed scheduler backend is configured. For multi-replica or clustered
-> deployments, terminate TLS at a shared reverse proxy / load balancer (or a
-> single dedicated TLS-terminating instance) instead of in-process ACME
-> ([#1620](https://github.com/autumn-foundation/autumn/issues/1620)).
+> deployments, terminate TLS at a shared reverse proxy / load balancer, or use a
+> single dedicated TLS-terminating instance.
+>
+> [DNS-01](#wildcard-certificates-via-dns-01-servertlsacmedns) removes **half**
+> of this: its challenge record lives in your zone rather than in one replica's
+> memory, so the `:80` routing problem goes away and the CA never connects to
+> your host at all. It does not distribute certificates. The store is still
+> local disk, so replicas that did not win the renewal lease never receive the
+> issued certificate and keep serving the self-signed placeholder — the startup
+> warning still fires under DNS-01, naming the certificate store. To run ACME
+> across replicas at all, `cache_dir` must be on storage every replica shares.
 
 ### Scope
 
-This is a **single-host** slice. Wildcard certificates and the DNS-01 challenge
-are out of scope (tracked in
-[#1620](https://github.com/autumn-foundation/autumn/issues/1620)). For multiple replicas
-behind a shared entry point, terminate TLS at the proxy instead — see below.
+HTTP-01 as described above is a **single-host** path: the challenge token lives
+in the process, so behind a load balancer the CA's `:80` probe can land on a
+replica that never published it. For a wildcard certificate — or for a
+multi-replica deployment — use **DNS-01**, next.
+
+---
+
+## Wildcard certificates via DNS-01 (`[server.tls.acme.dns]`)
+
+If you run subdomain-per-tenant (`tenant1.myapp.com`, `tenant2.myapp.com`, …),
+HTTP-01 is the wrong shape: it needs one issuance per hostname, so tenant *N*'s
+first request waits on a certificate order, and Let's Encrypt's rate limits
+become a ceiling on how fast you can onboard. A **wildcard** certificate for
+`*.myapp.com` covers every tenant that exists and every tenant that ever will —
+but no CA will validate a wildcard over HTTP-01. It requires **DNS-01**: proving
+you control the zone by publishing a `_acme-challenge` TXT record.
+
+Add a `[server.tls.acme.dns]` section naming your DNS provider, and list the
+wildcard in `domains`:
+
+```toml
+[server.tls.acme]
+domains = ["myapp.com", "*.myapp.com"]
+contact_email = "ops@myapp.com"
+directory = "production"
+
+[server.tls.acme.dns]
+provider = "cloudflare"
+```
+
+That is the whole configuration. Everything else — issuance on first boot,
+renewal before expiry with no restart, persistence across restarts, the staging
+directory, the health indicator — is the same lifecycle the HTTP-01 path above
+already has; only the challenge answer changes.
+
+Onboarding a tenant after that costs **zero** certificate work: no issuance, no
+restart, no config change. `tenant42.myapp.com` serves valid HTTPS from the
+moment it resolves to your host.
+
+### Supported providers
+
+| `provider` | Credential fields | Notes |
+|---|---|---|
+| `cloudflare` | `api_token` | A scoped API token with **Zone:Read** *and* **DNS:Edit** on the zone — `Zone:Read` because the zone id is discovered from the record name. |
+| `route53` | `access_key_id`, `secret_access_key`, optionally `session_token`, `hosted_zone_id`, `region` | Needs `route53:ChangeResourceRecordSets` and `route53:ListResourceRecordSets` on the zone (plus `route53:ListHostedZonesByName` unless you set `hosted_zone_id`). |
+| `exec` | none — the hook authenticates itself | The escape hatch: any other provider. See below. |
+
+### Where the credential lives
+
+**Never in `autumn.toml`.** The section has no field that could hold a token,
+and it rejects unknown keys — so an `api_token = "..."` written into the config
+file is a startup error naming the key, not a plaintext secret nobody notices.
+
+Put it in the encrypted credentials store:
+
+```console
+$ autumn credentials edit
+```
+
+```console
+$ autumn credentials edit --env prod
+```
+
+```toml
+# config/credentials/prod.toml.enc (decrypted for editing)
+[acme_dns]
+api_token = "your-cloudflare-token"
+```
+
+> Pass the profile you will run under. `AUTUMN_ENV=production` resolves to the
+> **`prod`** profile, so the server reads `config/credentials/prod.toml.enc` —
+> while a bare `autumn credentials edit` writes `development.toml.enc`. A
+> credentials file that does not exist loads as an *empty store*, so the
+> mismatch surfaces as "no Cloudflare API token found" rather than as a missing
+> file.
+
+The table name is the `credential` key from `[server.tls.acme.dns]`, which
+defaults to `acme_dns`. For Route 53 the same table carries the AWS fields:
+
+```toml
+[acme_dns]
+access_key_id = "AKIA..."
+secret_access_key = "..."
+# optional; skips the hosted-zone lookup
+hosted_zone_id = "Z0123456789ABCDEFGHIJ"
+```
+
+The store is decrypted with `AUTUMN_MASTER_KEY` (or `config/master.key`) exactly
+like every other credential — see the [credentials guide](./credentials.md).
+
+If you inject secrets through the environment instead, these variables override
+the store, field for field:
+
+| Variable | Field |
+|---|---|
+| `AUTUMN_ACME_DNS_API_TOKEN` | `api_token` |
+| `AUTUMN_ACME_DNS_ACCESS_KEY_ID` | `access_key_id` |
+| `AUTUMN_ACME_DNS_SECRET_ACCESS_KEY` | `secret_access_key` |
+| `AUTUMN_ACME_DNS_SESSION_TOKEN` | `session_token` |
+| `AUTUMN_ACME_DNS_HOSTED_ZONE_ID` | `hosted_zone_id` |
+| `AUTUMN_ACME_DNS_REGION` | `region` |
+
+Tokens never reach logs, error messages, or `/actuator` output: the secret type
+they are held in renders as `<redacted>`, and provider errors carry the API's
+own message and status, never the request headers.
+
+### The escape hatch: `provider = "exec"`
+
+Any provider autumn does not ship support for — RFC 2136 dynamic updates, a
+registrar's CLI, a webhook shim — is reachable through a hook program:
+
+```toml
+[server.tls.acme.dns]
+provider = "exec"
+command = ["/usr/local/bin/acme-dns-hook"]
+```
+
+Autumn runs it twice per challenge record, appending three arguments:
+
+```console
+$ /usr/local/bin/acme-dns-hook present _acme-challenge.myapp.com <txt-value>
+$ /usr/local/bin/acme-dns-hook cleanup _acme-challenge.myapp.com <txt-value>
+```
+
+Exactly those three arguments are appended — no `--` marker, so `$1` is the
+action. (A hook that forwards `"$@"` on to another CLI should insert its own
+`--` there, since a challenge value is base64url and starts with `-` about once
+in sixty-four.)
+
+Exit `0` means the record was written (or removed); anything else fails the
+order, with the hook's `stderr` quoted in the message. `command` is an **argv
+array** run without a shell, so the record value is never interpreted as shell
+syntax. A hook that has not finished within 120 seconds is killed, and its
+output is read through a bounded buffer, so a hook that never stops writing
+cannot grow the server.
+
+**Credentials.** The hook inherits autumn's environment — that is how an
+`nsupdate` or vendor-CLI hook is expected to authenticate, and autumn passes it
+no secret of its own. Because that `stderr` is published (in logs, in the
+operator alert, on `/actuator/health`), autumn scrubs it: every value the
+environment holds under a credential-shaped name (`*TOKEN*`, `*SECRET*`,
+`*KEY*`, `*PASSWORD*`, `*CREDENTIAL*`, `*AUTH*`) is replaced with `<redacted>`,
+as are the DNS credentials autumn itself holds. That is a backstop, not a
+guarantee — a credential in a variable named something like `MY_THING` is not
+recognisable as one — so a hook still should not trace its own secrets to
+`stderr`.
+
+An RFC 2136 hook is a five-line script:
+
+```sh
+#!/bin/sh
+# $1 = present|cleanup, $2 = fqdn, $3 = value
+[ "$1" = present ] && ACTION="add $2. 60 TXT \"$3\"" || ACTION="delete $2. TXT \"$3\""
+printf 'server ns1.myapp.com\nupdate %s\nsend\n' "$ACTION" | nsupdate -k /etc/autumn/tsig.key
+```
+
+### Waiting for propagation
+
+After writing the records, autumn waits until they are visible before telling
+the CA to validate — signalling early is how a DNS-01 authorization gets burnt.
+
+The probe goes to the zone's **authoritative** nameservers, not to the resolvers
+you configure. That is deliberate, and it is the difference between a feature
+that works and one that fails every renewal: a probe sent to a public recursive
+resolver the instant the provider's API returns arrives *before* the record is
+live on the zone's own servers, so the resolver answers `NXDOMAIN` and **caches
+that negatively** for the zone's SOA minimum — 900s on Route 53, 1800s on
+Cloudflare, both longer than the propagation budget. Every later probe would
+then read the cached "not there". So `resolvers` is used to *discover* the
+zone's nameservers (an `NS` lookup, then an `A` lookup per server), and the
+propagation probe is sent to those directly. When discovery fails — a
+split-horizon setup, a resolver that will not answer `NS` — autumn falls back to
+probing `resolvers` directly and logs a warning.
+
+Discovery runs once per distinct challenge name, so an order spanning several
+domains probes each zone through *its own* nameservers. This matters: a
+nameserver answers only for the zones it is authoritative for, so probing
+`myapp.io`'s challenge record at `myapp.com`'s nameservers can never see the
+record, and the wait would time out on an order that is in fact correct. An
+apex + wildcard order challenges a single name, so the common case still costs
+one discovery. Fallback is per name too — one domain with a broken delegation
+does not pull the others onto recursive resolvers.
+
+`[server.tls.acme.dns]` fields:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `provider` | required | `cloudflare`, `route53`, or `exec`. |
+| `credential` | `acme_dns` | Key in the encrypted credentials store holding the provider credential. A key *name*, never a token. |
+| `propagation_timeout_secs` | `300` | Give up if the records are still not visible after this long. Capped at `3600`. |
+| `poll_interval_secs` | `5` | Gap between propagation probes. |
+| `resolvers` | `["1.1.1.1:53", "8.8.8.8:53"]` | Resolvers used to discover the zone's nameservers, and probed directly if that fails. Each entry is an IP (port 53 implied) or `IP:port`; hostnames are rejected. |
+| `command` | — | The `exec` hook's argv array. Required for `exec`, rejected for the others. |
+
+A timeout names the exact record, the value that never appeared, and the
+resolver that never saw it:
+
+> DNS-01 propagation timed out after 300s: the TXT record
+> `_acme-challenge.myapp.com` still does not carry `LPJNul-w…` at resolver
+> `1.1.1.1:53` (the name does not exist yet). Check that the record was written
+> to the zone that actually serves this name and that its NS delegation is live,
+> then raise `[server.tls.acme.dns] propagation_timeout_secs` if the provider is
+> simply slow.
+
+Challenge records are removed after the order finishes — **including when it
+fails**, so a retrying deployment does not fill the zone with dead
+`_acme-challenge` entries.
+
+### Two records, one name
+
+An order for `myapp.com` **and** `*.myapp.com` produces two authorizations whose
+TXT records share the name `_acme-challenge.myapp.com` but carry different
+values. Both must be live at validation time. Every provider here appends a
+value and deletes by `(name, value)`, never "replace the record set" — worth
+knowing if you write your own `exec` hook, because `nsupdate delete <name> TXT`
+without a value would remove its sibling and fail the order.
+
+Route 53 is the exception that proves the rule: its API has no "append", only
+`ChangeResourceRecordSets`, which replaces the whole set. Autumn therefore
+read-modify-writes — and applies **both** values in a *single* change, because
+Route 53 may keep serving the pre-change values until the first change reaches
+`INSYNC`, so a second read-modify-write could read the old set and write back
+only its own value, dropping the first. The same read-modify-write preserves
+the set's existing **TTL**: the name can already hold another ACME client's
+challenge values, so autumn's own 60-second TTL is written only when it is
+creating the set — and Route 53 rejects a `DELETE` whose TTL differs from the
+live set, so cleanup has to send the TTL that is actually there. If your `exec`
+hook talks to an API shaped like that, batch the same way and preserve what you
+did not set, or make the hook idempotent under a stale read.
+
+### What DNS-01 does *not* need
+
+- **Inbound port 80.** The CA never connects to your host for DNS-01. Autumn
+  still *tries* to bind `http_challenge_port` for the HTTP→HTTPS redirect, but a
+  bind failure is only a warning under DNS-01 — the app starts and serves HTTPS
+  without it, so a container with no `CAP_NET_BIND_SERVICE` is a supported
+  deployment. `autumn doctor` grades an unreachable `:80` the same way.
+- **A record for the wildcard.** `*.myapp.com` has no address record of its own;
+  the tenant subdomains point at your host (a wildcard `A`/`AAAA` record, or one
+  per tenant). Creating those is your one-time job — autumn only writes the
+  ephemeral challenge TXT records.
+
+### `autumn doctor` for DNS-01
+
+Three checks cover the failure classes DNS-01 adds:
+
+| Check | Grades |
+|---|---|
+| `acme_dns_credential` | The provider credential is readable and carries the fields the provider needs. **Fail** when missing — without it every issuance and renewal fails. |
+| `acme_dns_propagation` | (`--online`) Public DNS can answer for `_acme-challenge.<domain>` at all. **Fail** on `SERVFAIL`/timeout — a broken delegation defeats a correctly-written record. **Warn** on leftover records from an interrupted run. |
+| `acme_tenancy_domain` | `[tenancy] base_domain`'s subdomains are actually covered by `[server.tls.acme] domains`. **Fail** otherwise — every tenant host would serve a name mismatch. |
+
+### Failure surfaces through health and alerts
+
+A failed DNS-01 issuance or renewal — an expired provider token, a propagation
+timeout, a provider outage — is recorded on the `acme` health indicator (with
+`challenge: "dns-01"` and the provider name in its details, never a credential)
+and raises the operator-alert
+[`scheduled_task_failure`](./operator-alerts.md) condition for
+`acme-renewal`. Because renewal starts `renew_before_days` (default 30) ahead of
+expiry, that alert fires with weeks of validity left, and clears automatically
+on the first successful renewal.
+
+---
+
+## Tenant custom domains (`[server.tls.acme.custom_domains]`)
+
+Wildcard certificates cover `tenant42.myapp.com`. A B2B customer who wants
+`app.clientco.com` needs a certificate of their own. Turn the feature on and
+autumn does the whole journey: it hands each tenant exact DNS instructions,
+independently confirms the hostname points here, orders one certificate per
+hostname, serves it by SNI, routes requests on that `Host` to the owning
+tenant, and renews it. There is no per-domain configuration — a thousand
+tenants use the same twenty lines.
+
+```toml
+[server.tls.acme]
+domains        = ["myapp.com", "*.myapp.com"]
+contact_email  = "ops@myapp.com"
+directory      = "production"
+
+[server.tls.acme.custom_domains]
+enabled          = true
+ingress_hostname = "ingress.myapp.com"   # CNAME target for tenant subdomains
+ingress_ipv4     = ["203.0.113.10"]      # A records, for tenant APEX domains
+# ingress_ipv6   = ["2001:db8::10"]      # AAAA records
+# store_dir                  = "config/acme/domains"  # the registry (0600 files)
+# max_domains                = 1000
+# cert_cache_size            = 256       # certificates held in memory at once
+# issuance_per_domain_per_day = 5
+# issuance_global_per_hour    = 50
+# failure_backoff_secs        = 300      # doubles per consecutive failure
+# max_failure_backoff_secs    = 86400
+# poll_interval_secs          = 60
+```
+
+`ingress_hostname` is what tenants CNAME at. An **apex** domain
+(`clientco.com`) cannot carry a CNAME, so it needs `ingress_ipv4` /
+`ingress_ipv6` instead; set both kinds if you accept both.
+
+### The tenant journey
+
+Your app owns the screens; autumn owns the state. Register a hostname when a
+tenant asks for it, show them what the framework says to publish, and render
+the status.
+
+Autumn refuses a hostname the deployment already serves — anything under
+`[server.tls.acme] domains` or `[tenancy] base_domain` — so one tenant cannot
+connect another's subdomain. **Per-tenant quotas are yours**: `max_domains` is
+deployment-wide, so cap registrations per tenant in your own code if one tenant
+must not be able to spend the whole budget.
+
+```rust
+use autumn_web::custom_domain::{CustomDomainPruner, CustomDomainRegistry, DnsInstructions};
+
+let registry = CustomDomainRegistry::from_state(&state).expect("custom domains are enabled");
+let ingress = config.server.tls.as_ref()
+    .and_then(|t| t.acme.as_ref())
+    .and_then(|a| a.custom_domains.as_ref())
+    .map(|cd| cd.ingress())
+    .unwrap_or_default();
+
+// 1. Connect. Your app decides who may — plan, entitlement, per-tenant quota.
+let domain = registry.register("app.clientco.com", &tenant_id, now_unix).await?;
+
+// 2. Show the tenant exactly what to publish. Fields are tab-separated.
+let instructions = DnsInstructions::for_hostname(&domain.hostname, &ingress)?;
+println!("{}", instructions.render());   // app.clientco.com\tCNAME\tingress.myapp.com
+
+// 3. Render status, including why it is stuck.
+for d in registry.list_for_tenant(&tenant_id) {
+    println!("{} — {} {}", d.hostname, d.status, d.failure_reason.unwrap_or_default());
+}
+
+// 4. Offboard. Routing, serving and renewal stop AND the certificate is deleted.
+let domains = <dyn CustomDomainPruner>::from_state(&state).expect("custom domains are enabled");
+domains.offboard_domain("app.clientco.com").await?;
+domains.offboard_tenant_domains(&tenant_id).await?;   // every domain the tenant owns
+```
+
+`registry.remove` forgets the registration only — routing and serving stop, but
+the certificate stays in the ACME store. Offboard through `CustomDomainPruner`
+so the private key goes too.
+
+The states are `pending_dns` → `verified` → `issuing` → `active`. There is no
+separate failed state: a domain that fails carries a `failure_reason` and a
+`next_attempt_unix`, and one that already reached `active` **stays** `active`
+while it retries — a failed renewal never takes a live tenant offline.
+
+Once a domain is `active`, requests carrying that `Host` resolve to its tenant.
+The usual `[tenancy] base_domain` rejection does not apply to a registered
+domain, and subdomain tenancy is unchanged for every other host.
+
+### Abuse posture toward the CA
+
+Custom domains mean tenant-supplied hostnames drive certificate orders, so
+three gates stand between a hostname and Let's Encrypt:
+
+1. **Registration.** Only a hostname your app registered is known at all. An
+   SNI hostname nobody registered is refused at the TLS handshake, and no code
+   path from there reaches the ACME provider.
+2. **Verification.** No order is created until autumn independently resolves
+   the hostname and finds it pointing at this deployment. A domain whose DNS
+   points elsewhere sits at `pending_dns` with the observed address in its
+   `failure_reason` and costs the CA nothing.
+3. **Budget.** At the defaults, at most **5 orders per domain per day** and
+   **50 across the whole deployment per hour** — comfortably inside Let's
+   Encrypt's 300-new-orders-per-account-per-3-hours limit. Failures back off
+   exponentially from 5 minutes to a day, so a permanently broken domain
+   converges to roughly one attempt a day rather than one a tick.
+
+Tenant certificates are ordered over **HTTP-01** even when your own certificate
+uses DNS-01: the record lives in the *tenant's* zone, where autumn holds no
+credential. That is the same condition verification already proved, so
+`:80` must reach this deployment for tenant domains to issue.
+
+Every tenant order uses the **same ACME account** as your own certificate, so
+the CA sees one registration however many domains connect.
+
+### Scale and restarts
+
+The registry is one `0600` JSON file per domain, loaded into an in-memory index
+before the listener binds — a restart routes and serves every connected domain
+on the first request. Certificates load **incrementally**: at most
+`cert_cache_size` are held in memory, and a handshake for a colder domain reads
+its certificate back from the store and caches it. Nothing requires every
+certificate to be resident, so `cert_cache_size` is a memory knob, not a
+correctness one.
+
+Custom domains live **inside** the ACME TLS listener, so they exist only where
+autumn terminates TLS itself. Behind
+[reverse-proxy termination](#terminating-tls-at-a-reverse-proxy) there is no
+registry and no `Host`-based tenant routing — the proxy owns the certificates
+and your app owns the mapping.
+
+Ordering is leader-elected per domain through the same `SchedulerCoordinator`
+the deployment's own renewal uses, so replicas do not race the CA. Everything
+else about the ACME path is still single-host: the HTTP-01 token map and the
+certificate store are per-process, so behind a load balancer the CA's
+validation request usually reaches a replica that never published the token.
+Run custom domains on a single host.
+
+### Offboarding and retention
+
+`offboard_domain` (or `offboard_tenant_domains`) stops routing, stops serving,
+halts renewal, drops the cached certificate and deletes the stored pair. Beyond
+that, the
+`custom_domains`
+[retention dataset](./data-retention.md) prunes two things the app cannot: a
+registration that never reached DNS verification within its window, and a stored
+certificate for a hostname no longer registered at all.
+
+```toml
+[retention]
+custom_domains = "30d"   # drop connections abandoned before DNS was ever published
+```
+
+A registry that cannot be read at boot disables custom-domain **connections**
+as well as routing: an index that hydrated nothing cannot tell whether a
+hostname already belongs to someone, so `register` refuses with "the
+custom-domain registry has not loaded" rather than overwriting the durable
+record of whoever owns it. The deployment's own certificate keeps serving; fix
+the store and restart.
+
+### What doctor checks
+
+| Check | What it catches |
+|---|---|
+| `custom_domains` | The section loads, has somewhere for tenants to point, and its cap is not already exceeded. **Fail** on anything the server would exit at boot on. |
+| `custom_domain_dns` | (`--online`) Each registered domain still points here. **Fail** for an `active` or `verified` domain whose DNS has moved away or vanished — it is serving a certificate nobody can reach and will fail its next renewal. **Warn** for one still `pending_dns`. Probes the first 25 domains and says so. |
+| `custom_domain_http01` | (`--online`) Port 80 is reachable on **every address** each configured ingress target resolves to — one member of a load-balancer record set that drops it fails HTTP-01 for whatever share of tenants lands there. **Fail** when any is unreachable — tenant certificates are always issued over HTTP-01, so a closed port 80 blocks every one of them **even under a DNS-01 deployment**, where `acme_ports` rightly calls it optional for the deployment's own certificate. |
+
+### Failure surfaces through health and alerts
+
+The `custom_domains` health indicator reports how many domains are registered
+and active, and names every unhealthy one **with its tenant** — so an operator
+reading `/actuator/health` can act without a registry lookup. It is `Down` only
+when a certificate has actually expired: one tenant's pending retry is not a
+deployment outage. A failed order also raises the
+[`scheduled_task_failure`](./operator-alerts.md) alert for
+`custom_domain_certificates`, naming the domain and tenant, and that alert
+clears when the **last** failing domain recovers — or is offboarded, since a
+domain that no longer exists is not still failing.
+
+A renewal skipped because the domain stopped pointing here is recorded the same
+way. The certificate keeps serving until it expires, so the domain stays
+`active`, but the reason and the alert appear immediately rather than at expiry,
+when it would already be down: either the tenant restores the record or the
+domain should be offboarded.
+
+---
+
+## Mutual TLS: verifying client certificates (`[server.tls.client_auth]`)
+
+Everything above secures *who the client is talking to*. Mutual TLS (mTLS)
+secures the other half: **who is calling**. The app requests a certificate
+during the handshake, verifies it against a CA bundle you supply, and hands the
+verified identity to your handlers and policies — so an internal API can be
+locked to known machines without an mTLS-terminating proxy in front.
+
+This is machine identity: service-to-service calls, partner APIs, zero-trust
+networks. Autumn *verifies* client certificates; it does not issue them. Use
+your own CA, Vault PKI, SPIRE, or `cert-manager` to mint them.
+
+Needs the `tls` feature. With the `[server.tls.client_auth]` section absent, the
+handshake is byte-for-byte the server-only TLS above — nothing changes.
+
+### Configuration
+
+```toml
+[server.tls]
+cert_path = "/etc/autumn/tls/fullchain.pem"
+key_path  = "/etc/autumn/tls/privkey.pem"
+
+[server.tls.client_auth]
+mode           = "optional"                          # off (default) | optional | required
+ca_bundle_path = "/etc/autumn/tls/client-ca.pem"     # one or more PEM CAs
+crl_path       = "/etc/autumn/tls/client-ca.crl.pem" # optional revocation list
+required_paths = ["/internal/"]                      # routes that demand a certificate
+# reload_interval_secs = 60                          # bundle/CRL poll interval
+```
+
+Ten lines, and an internal route is locked to a client CA.
+
+**Modes** are per listener:
+
+| `mode` | Handshake | Use when |
+| --- | --- | --- |
+| `off` (default) | No certificate requested. | Server-only TLS. |
+| `optional` | Certificate requested; a client that presents one must pass verification, a client that presents none still connects. | One process serves public routes **and** mTLS-only routes. |
+| `required` | Handshake fails without a valid certificate. | The whole listener is machine-to-machine. |
+
+`optional` is not "unverified": a client that *offers* a certificate must still
+chain to a configured CA. The option is whether presenting one is mandatory.
+
+A `process.role = "worker"` replica serves only the probes and the actuator,
+but it serves them over the same listener, so `required_paths` applies there
+too — a prefix covering `/actuator/` holds on every role.
+
+Prefixes are taken as written. Startup refuses a noncanonical entry — an empty
+segment (`//`) or a `.` / `..` segment — because it would protect less than it
+appears to. Write the resolved prefix.
+
+**Per-route requirements** come from `required_paths`, matched at segment
+boundaries — so `/internal/` covers `/internal/keys` but not `/internal-tools`.
+A requirement matches the raw request path AND the normalized one, and demands
+a certificate if either matches: `/open/../internal/keys` cannot slip in, and
+`/internal/%2e%2e` — which normalizes to `/` but which the router still
+dispatches to `/internal/{id}` — cannot slip out.
+
+A request reaching one of these over a connection with no verified
+certificate is rejected with **`403 Forbidden`** and the standard JSON error
+envelope:
+
+```json
+{
+  "type": "https://autumn.dev/problems/forbidden",
+  "title": "Forbidden",
+  "status": 403,
+  "code": "autumn.forbidden",
+  "detail": "this route requires a verified client certificate (mTLS)",
+  "errors": []
+}
+```
+
+`403`, not `401`: there is no credential the client could re-send on this
+connection, so a `WWW-Authenticate` challenge would be meaningless.
+
+For a requirement in code rather than config, layer a sub-router:
+
+```rust
+use autumn_web::tls::client_auth::RequireClientCertLayer;
+
+let internal = Router::new()
+    .route("/keys", get(rotate_keys))
+    .layer(RequireClientCertLayer::new());
+```
+
+These compose: a route can be covered by `required_paths`, by the layer, by the
+`ClientCert` extractor below, or by all three.
+
+### The verified identity in handlers
+
+```rust
+use autumn_web::tls::client_auth::{ClientCert, OptionalClientCert};
+
+// Rejects with 403 when the connection carries no verified certificate.
+async fn rotate_keys(ClientCert(client): ClientCert) -> String {
+    format!("caller {} (fingerprint {})", client.subject, client.fingerprint)
+}
+
+// Never rejects — serves machines and people from one route.
+async fn whoami(OptionalClientCert(client): OptionalClientCert) -> String {
+    client.map_or_else(|| "anonymous".into(), |c| c.subject.clone())
+}
+```
+
+`ClientIdentity` carries:
+
+| Field | Example |
+| --- | --- |
+| `subject` | `O=Acme, OU=Services, CN=svc-orders` |
+| `issuer` | `O=Acme, CN=Acme Internal Client CA` |
+| `sans` | `["DNS:svc-orders.internal", "URI:spiffe://acme/svc/orders"]` |
+| `fingerprint` | `sha256:9f86d0…` |
+| `serial` | `139C8A13442053B0…` |
+| `not_after_unix` | `4102444800` |
+
+`common_name()` returns the subject's `CN` and `has_san("URI:…")` matches a SAN
+including its kind prefix. Both read the **parsed** certificate.
+
+> **Authorize on `common_name()` and `has_san()`, never on `subject`.** The DN
+> strings render attributes in certificate order (not the reversed order
+> `openssl -nameopt rfc2253` prints) and do not escape attribute values, so a
+> subject whose `O` happens to contain `, CN=svc-payments` renders exactly like
+> two real attributes. A CA that copies `O` from a CSR would then let a caller
+> pick its own identity out of a string search. `common_name()` cannot be
+> spoofed that way. `DNS:` SANs compare case-insensitively; every other kind
+> compares exactly.
+
+These compose with session auth on the same router: `Auth<T>` and `RequireAuth`
+read the request, `ClientCert` reads the connection, and neither consults the
+other.
+
+### Machine identity in a policy
+
+The same identity is on the `PolicyContext`, alongside the session user and
+token scopes, so an `#[authorize]` policy can decide on the calling *service*:
+
+```rust
+impl Policy<ApiKey> for ApiKeyPolicy {
+    fn can_update<'a>(&'a self, ctx: &'a PolicyContext, key: &'a ApiKey)
+        -> BoxFuture<'a, bool>
+    {
+        Box::pin(async move {
+            // Only the orders service may rotate its own keys.
+            ctx.client_has_san("URI:spiffe://acme/svc/orders")
+                && key.service == "orders"
+        })
+    }
+}
+```
+
+`ctx.has_client_identity()` asks whether the connection was verified at all;
+`ctx.client_identity()` returns the full record.
+
+The identity is scoped to the task serving the request, like
+[`Current::actor()`](./audit-logging.md) — a policy check moved onto a
+`tokio::spawn`ed task sees `None`. To exercise such a policy in a unit test,
+wrap the call in `autumn_web::tls::client_auth::with_client_identity(...)`.
+
+### CA rotation without a restart
+
+The bundle and CRL hot-reload on the same mechanism the server certificate uses
+— a modification-time poll, `reload_interval_secs` apart. A rotation is two
+edits, no restart, and no dropped connection:
+
+1. **Overlap.** Append the new CA to the bundle, so old and new are both
+   trusted. Re-issue client certificates from the new CA at your leisure.
+2. **Retire.** Remove the old CA from the bundle.
+
+```console
+$ cat old-ca.pem new-ca.pem > /etc/autumn/tls/client-ca.pem   # step 1
+$ cp new-ca.pem /etc/autumn/tls/client-ca.pem                 # step 2, later
+```
+
+rustls verifies once, at handshake time, so a connection established under the
+old bundle keeps serving after step 2 — the swap only affects handshakes that
+start after it. A bundle that fails to load logs an error and keeps the previous
+trust store: a bad rotation never takes the listener down.
+
+### Revocation
+
+**The recommended baseline is short-lived client certificates plus CA rotation**,
+not a revocation list. A certificate that lives hours cannot be usefully revoked,
+and a CA rotation retires a whole generation at once. Reach for a CRL when a
+single certificate must be killed before it expires.
+
+`crl_path` points at a PEM revocation list issued by a CA in the bundle. It
+hot-reloads like the bundle, so publishing a revocation takes effect within one
+poll interval, and a connection presenting a revoked certificate is rejected at
+the handshake — visible in the logs and the metrics below.
+
+Two deliberate choices:
+
+- **Only the presented certificate's revocation status is checked**, not the
+  whole chain. A single CRL from the issuing CA cannot speak for intermediates,
+  and chain-depth checking would reject every certificate under an intermediate
+  as "unknown status".
+- **A stale CRL keeps working.** If `nextUpdate` has passed, autumn keeps
+  honoring the list rather than failing every handshake — the revocations it
+  names stay enforced. `autumn doctor` warns so the staleness is not silent.
+
+**OCSP and OCSP stapling are not supported.** CRL plus short-lived certificates
+first.
+
+### TLS session resumption is off under client auth
+
+A listener with `mode` other than `off` disables TLS session resumption — both
+the session cache and TLS 1.3 tickets. rustls restores a resumed connection's
+peer certificate from the stored session and does **not** re-run the verifier,
+so a client whose CA you rotated out (or whose certificate you just revoked)
+would otherwise keep reconnecting on a resumed session until it expired — and
+would keep presenting a verified-looking identity to your handlers. That is the
+one hole a swappable trust store cannot close by swapping, because the check it
+swaps is never run.
+
+The cost is a full handshake per connection. For a listener whose purpose is
+deciding who may connect, that is the right trade. Server-only TLS
+(`[server.tls]` without this section) keeps resumption exactly as it was.
+
+### Failure diagnostics
+
+A rejected handshake is invisible to the client beyond the standard TLS alert —
+no reason is ever put on the wire, so a prober learns nothing about the trust
+store. Operator-side, every rejection is counted and logged with a
+distinguishing reason:
+
+| Reason | Meaning |
+| --- | --- |
+| `no_certificate` | Nothing presented on a `required` listener. |
+| `untrusted_ca` | Chains to no CA in the bundle. |
+| `expired` | Past its `notAfter`. |
+| `not_yet_valid` | Its `notBefore` has not arrived — usually clock skew. |
+| `revoked` | Listed in the CRL. |
+| `unknown_revocation` | Revocation status undeterminable. |
+| `invalid` | Malformed, bad signature, or otherwise unacceptable. |
+
+```
+WARN rejected an mTLS client certificate reason=untrusted_ca peer=10.0.3.7:51422 suppressed=0
+```
+
+The reason is classified where the handshake fails, so `no_certificate` — which
+rustls raises without ever consulting the trust store — is counted and logged
+like the rest.
+
+Rejections are attacker-triggerable, so the log is rate-limited to one line per
+second per reason; lines held back are reported in the next one's `suppressed`
+field. The **counters are exact** regardless:
+
+- `tls_client_auth_rejected_total{reason="…"}` — handshakes rejected.
+- `tls_client_auth_route_rejected_total` — requests that reached an
+  mTLS-only route with no verified certificate.
+
+Both surface through the usual metrics/actuator endpoints.
+
+Startup **fails fast** with the offending path in the message on a missing,
+unparseable, or empty CA bundle or CRL — the listener never binds trusting
+nobody.
+
+### `autumn doctor`
+
+`autumn doctor` grades the mTLS surface offline, as the `tls_client_auth` check:
+
+- **Fail** — the bundle or CRL is missing, unparseable, or empty (the same
+  conditions the runtime refuses to boot on), or a CA in the bundle has expired.
+- **Warn** — a CA expires within 30 days, the CRL's `nextUpdate` has passed, or
+  `mode = "optional"` with no route requiring a certificate (client auth
+  configured and enforcing nothing).
+- **Pass** — otherwise, reporting the mode, the CA count, and how many route
+  prefixes demand a certificate.
+
+### Posture manifest
+
+A route's mTLS requirement is a dimension of the [security posture
+manifest](./security-posture-manifest.md): `autumn routes posture diff` raises
+`mtls_requirement_removed` (**widening**, blocks until acknowledged) when a
+route that demanded a certificate stops demanding one, and `mtls_mode_weakened`
+when the listener mode itself drops a rank. So a refactor cannot quietly unlock
+an internal API.
+
+### End to end: a dev client CA in ten minutes
+
+Generate a CA and one client certificate with `openssl`:
+
+```console
+$ openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+    -keyout client-ca.key.pem -out client-ca.pem \
+    -subj "/O=Acme/CN=Acme Internal Client CA" \
+    -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign"
+
+$ openssl req -newkey rsa:2048 -sha256 -nodes \
+    -keyout svc-orders.key.pem -out svc-orders.csr.pem \
+    -subj "/O=Acme/OU=Services/CN=svc-orders"
+
+$ cat > svc-orders.ext <<'EOF'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=clientAuth
+subjectAltName=DNS:svc-orders.internal,URI:spiffe://acme/svc/orders
+EOF
+
+$ openssl x509 -req -in svc-orders.csr.pem \
+    -CA client-ca.pem -CAkey client-ca.key.pem -CAcreateserial \
+    -days 365 -sha256 -extfile svc-orders.ext -out svc-orders.pem
+```
+
+`mkcert -client` can mint a client certificate from the mkcert CA if you would
+rather not run the two commands above; use `mkcert` for the *server* certificate
+either way (see [Local development
+certificates](#local-development-certificates-mkcert)). Point `ca_bundle_path`
+at whichever CA signed the client certificate — mkcert's `rootCA.pem` or the one
+generated here.
+
+Point the app at the CA, keeping `/internal/` mTLS-only:
+
+```toml
+[server.tls]
+cert_path = "localhost.pem"
+key_path  = "localhost-key.pem"
+
+[server.tls.client_auth]
+mode           = "optional"
+ca_bundle_path = "client-ca.pem"
+required_paths = ["/internal/"]
+```
+
+Then smoke-test the whole matrix with `curl`:
+
+```console
+# Valid certificate → 200
+$ curl --cacert rootCA.pem --cert svc-orders.pem --key svc-orders.key.pem \
+    https://localhost:8443/internal/keys
+rotated
+
+# No certificate → 403 with the JSON envelope
+$ curl --cacert rootCA.pem https://localhost:8443/internal/keys
+{"type":"https://autumn.dev/problems/forbidden","title":"Forbidden","status":403,
+ "code":"autumn.forbidden","detail":"this route requires a verified client certificate (mTLS)"}
+
+# Public routes are unaffected
+$ curl --cacert rootCA.pem https://localhost:8443/health
+ok
+
+# A certificate from another CA → handshake rejected, no HTTP response
+$ curl --cacert rootCA.pem --cert other.pem --key other.key.pem \
+    https://localhost:8443/internal/keys
+curl: (56) OpenSSL SSL_read: ... alert unknown ca
+```
+
+With `mode = "required"` the second call fails at the handshake instead of
+returning `403` — the listener never lets an uncertified client speak HTTP at
+all.
+
+### Revoking a certificate
+
+```console
+$ openssl ca -config ca.cnf -revoke svc-retired.pem
+$ openssl ca -config ca.cnf -gencrl -out client-ca.crl.pem
+```
+
+Add `crl_path = "client-ca.crl.pem"`; the next poll picks it up, and
+`svc-retired` is rejected at the handshake while its siblings keep working.
+
+### Not in this slice
+
+- **Proxy-forwarded client-certificate headers** (XFCC-style) are never trusted.
+  The identity comes from the handshake this process performed, or there is
+  none.
+- **mTLS on outbound calls** (`http_client`) and database connections.
+- **Mapping certificates to human user accounts** (PIV / smart-card login).
+  Machine identity only.
 
 ---
 

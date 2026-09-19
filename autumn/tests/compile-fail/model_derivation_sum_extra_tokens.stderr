@@ -1,0 +1,5 @@
+error: `sum(...)` takes exactly one field name: an expression, a second field or anything else after it is not part of the derivation grammar
+  --> tests/compile-fail/model_derivation_sum_extra_tokens.rs:34:68
+   |
+34 | #[derivation(Post, column = "visible_score", transform = sum(score + bonus))]
+   |                                                                    ^

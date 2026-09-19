@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::capacity::{POOL_DB, ResourceShape};
+
 use crate::app::ScopedGroup;
 use crate::route::Route;
 
@@ -84,6 +86,22 @@ pub struct HeadersDump {
     pub csp_nonce: bool,
 }
 
+/// Resolved mTLS client-auth configuration carried across the dump boundary for
+/// the `declared` mTLS manifest dimension (issue #1640).
+///
+/// Mirrors the runtime-relevant subset of
+/// [`ClientAuthConfig`](crate::config::ClientAuthConfig): the listener mode plus
+/// the route prefixes that demand a certificate. The trust-store *paths* are
+/// deliberately absent — rotating a bundle is not a posture change, and a path
+/// in the manifest would make every filesystem-layout change a finding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientAuthDump {
+    /// Listener requirement level: `off`, `optional`, or `required`.
+    pub mode: String,
+    /// Route prefixes that demand a verified client certificate (sorted).
+    pub required_paths: Vec<String>,
+}
+
 /// Resolved security configuration snapshot emitted after
 /// [`SECURITY_CONFIG_MARKER`] for the manifest's `declared` dimensions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +110,22 @@ pub struct SecurityDump {
     pub csrf: CsrfDump,
     /// Security-headers configuration.
     pub headers: HeadersDump,
+    /// mTLS client-certificate configuration (issue #1640). Defaults to `off`
+    /// with no required paths, so a dump from a build without
+    /// `[server.tls.client_auth]` reads as "no route requires mTLS".
+    #[serde(default = "ClientAuthDump::off")]
+    pub client_auth: ClientAuthDump,
+}
+
+impl ClientAuthDump {
+    /// The dump for a deployment with no client-certificate verification.
+    #[must_use]
+    pub fn off() -> Self {
+        Self {
+            mode: crate::config::ClientAuthMode::Off.as_str().to_owned(),
+            required_paths: Vec::new(),
+        }
+    }
 }
 
 impl SecurityDump {
@@ -146,6 +180,20 @@ impl SecurityDump {
                 hsts_include_subdomains: headers.hsts_include_subdomains,
                 csp_nonce: headers.csp_nonce.enabled,
             },
+            client_auth: config
+                .server
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.client_auth.as_ref())
+                .map_or_else(ClientAuthDump::off, |ca| {
+                    let mut required_paths = ca.required_paths.clone();
+                    required_paths.sort();
+                    required_paths.dedup();
+                    ClientAuthDump {
+                        mode: ca.mode.as_str().to_owned(),
+                        required_paths,
+                    }
+                }),
         }
     }
 }
@@ -252,6 +300,25 @@ impl<'de> Deserialize<'de> for RouteSource {
     }
 }
 
+/// One record-level authorization binding declared by `#[authorize]`.
+///
+/// Wire twin of [`AuthorizeBinding`](crate::openapi::AuthorizeBinding): the
+/// same `("action", resource = Type)` pair in owned form, so it round-trips
+/// through the routes-dump JSON. (The `*Info` suffix follows [`RouteInfo`].)
+///
+/// [`Self::resource`] is the identifier exactly as written at the use site,
+/// not a resolved path, and never the `impl Policy<_>` that serves the check:
+/// that binding is established from the `PolicyRegistry` at boot
+/// (`AppBuilder::policy::<R, _>(...)`) and is not knowable at build time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AuthorizeBindingInfo {
+    /// Action verb passed to the policy check — the first `#[authorize]`
+    /// argument, recorded verbatim.
+    pub action: String,
+    /// Resource type identifier exactly as written in `resource = Type`.
+    pub resource: String,
+}
+
 /// Metadata for a single mounted route, suitable for display and JSON export.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteInfo {
@@ -293,6 +360,48 @@ pub struct RouteInfo {
     /// route in audit diagnostics. `None` for routes without a known module.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module: Option<String>,
+    /// `file:line` source location of the handler (from `file!()`/`line!()`),
+    /// used to point an audit diagnostic straight at the offending handler.
+    /// `None` for routes without a known location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    /// Record-level authorization bindings proven from the handler's
+    /// `#[authorize]` attributes — one `(action, resource)` entry per binding,
+    /// sorted and deduplicated. Empty for routes that declare none.
+    ///
+    /// This is the provable *subset* of [`Self::policy`], never a replacement
+    /// for it: that boolean is also `true` for a hand-written `__check_policy`
+    /// call in the body and for a `policy = ...` repository auto-API, neither
+    /// of which carries a binding a macro can recover. A route with
+    /// `policy: true` and no bindings is therefore normal, not a defect.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authorize_bindings: Vec<AuthorizeBindingInfo>,
+    /// Name of the authority grant proved for this handler by
+    /// `#[agent_operable(grant = ...)]` (issue #1691), so `autumn routes` shows
+    /// which endpoints an agent may drive and under what envelope.
+    ///
+    /// `None` means the handler declares no grant. For a *mutating*
+    /// MCP-exposed route that is the "ungoverned tool" case the authority
+    /// manifest reports; for everything else it simply means the endpoint is
+    /// not agent-operable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_grant: Option<String>,
+    /// Statically derived resource character of the route — the capacity
+    /// contract's per-route shape (issue #1733). Computed from [`Self::pools`]
+    /// by [`ResourceShape::from_pools`], so the classification rule lives in
+    /// exactly one place.
+    #[serde(default)]
+    pub resource_shape: ResourceShape,
+    /// Pool tags this route provably touches, sorted and deduplicated.
+    ///
+    /// A **provable subset**, never a complete accounting: it is read off the
+    /// handler's declared extractors at macro-expansion time, so a pool
+    /// reached through an application-held `State` value is invisible here and
+    /// the route reads as compute-bound. A route with no pools is therefore
+    /// normal, not a defect — the same "provable" caveat the security
+    /// dimensions of the routes manifest carry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<String>,
 }
 
 /// `skip_serializing_if` helper: elide `false` booleans from JSON output.
@@ -395,8 +504,82 @@ fn module_of(api_doc: &crate::openapi::ApiDoc) -> Option<String> {
     (!api_doc.module_path.is_empty()).then(|| api_doc.module_path.to_owned())
 }
 
+/// The handler's `file:line` source location, when the route macros captured
+/// one (`ApiDoc::source_file`/`ApiDoc::source_line`, from `file!()`/`line!()`
+/// at the handler's definition site). `None` for routes constructed without
+/// the route macros, so an audit diagnostic can point straight at the
+/// offending handler instead of only naming its module.
+fn source_location_of(api_doc: &crate::openapi::ApiDoc) -> Option<String> {
+    (!api_doc.source_file.is_empty())
+        .then(|| format!("{}:{}", api_doc.source_file, api_doc.source_line))
+}
+
+/// The route's `#[authorize]` bindings, canonicalized for the wire.
+///
+/// Framework routes are pre-classified and carry no handler metadata, so —
+/// like [`classify`], which short-circuits before it reads the `ApiDoc` at all
+/// — they never report a binding.
+///
+/// The list is sorted by `(action, resource)` and then deduplicated. That
+/// diverges deliberately from `roles`/`scopes`, which preserve `#[secured]`
+/// attribute source order: the audit's falsifiability claim over these
+/// bindings is a *set* claim ("removing an `#[authorize]` removes exactly that
+/// binding"), so a stable set serves it better than a stable sequence, and the
+/// manifest diff stays byte-deterministic — the same contract
+/// [`SecurityDump::from_config`] holds every list it emits to. Sorting must run
+/// *first*: [`Vec::dedup`] only collapses adjacent duplicates, so two equal
+/// bindings written apart in the source would otherwise both survive.
+fn authorize_bindings_of(
+    source: &RouteSource,
+    api_doc: &crate::openapi::ApiDoc,
+) -> Vec<AuthorizeBindingInfo> {
+    if matches!(source, RouteSource::Framework) {
+        return Vec::new();
+    }
+    let mut bindings: Vec<AuthorizeBindingInfo> = api_doc
+        .authorize_bindings
+        .iter()
+        .map(|binding| AuthorizeBindingInfo {
+            action: binding.action.to_owned(),
+            resource: binding.resource.to_owned(),
+        })
+        .collect();
+    bindings.sort();
+    bindings.dedup();
+    bindings
+}
+
+/// Name of the authority grant proved for a handler by `#[agent_operable]`.
+///
+/// Read straight off [`crate::openapi::ApiDoc::agent_authority`], so the grant
+/// shown by `autumn routes` disappears exactly when the attribute does.
+fn agent_grant_of(api_doc: &crate::openapi::ApiDoc) -> Option<String> {
+    api_doc
+        .agent_authority
+        .map(|authority| authority.grant.name.to_owned())
+}
+
 /// Helper type alias representing version name, status string, and sunset opt-out flag.
 type RouteVersionInfo = (Option<String>, Option<String>, Option<bool>);
+
+/// Pool tags proven for one route, sorted and deduplicated.
+///
+/// Repository auto-API routes are database-backed *by construction*: the
+/// generated CRUD handlers own their pool checkout internally, so no extractor
+/// appears in a signature the route macro could read. Adding the database tag
+/// here keeps the contract honest about the routes an app never wrote by hand.
+fn pools_of(
+    api_doc: &crate::openapi::ApiDoc,
+    repository: Option<&crate::route::RepositoryApiMeta>,
+) -> Vec<String> {
+    let mut pools: Vec<String> = api_doc.pools.iter().map(|p| (*p).to_owned()).collect();
+    if repository.is_some() && !pools.iter().any(|p| p == POOL_DB) {
+        pools.push(POOL_DB.to_owned());
+    }
+    pools.sort();
+    pools.dedup();
+    pools
+}
 
 /// Collect [`RouteInfo`] entries from user routes and scoped groups.
 ///
@@ -461,6 +644,8 @@ pub fn collect_route_infos(
             resolve_status(route.name, route.api_version, route.sunset_opt_out)?;
         let (classification, roles, scopes, policy) =
             classify(&source, &route.api_doc, route.repository.as_ref());
+        let authorize_bindings = authorize_bindings_of(&source, &route.api_doc);
+        let pools = pools_of(&route.api_doc, route.repository.as_ref());
         infos.push(RouteInfo {
             method: route.method.to_string(),
             path: route.path.to_owned(),
@@ -475,6 +660,11 @@ pub fn collect_route_infos(
             scopes,
             policy,
             module: module_of(&route.api_doc),
+            location: source_location_of(&route.api_doc),
+            authorize_bindings,
+            agent_grant: agent_grant_of(&route.api_doc),
+            resource_shape: ResourceShape::from_pools(&pools),
+            pools,
         });
     }
 
@@ -485,6 +675,7 @@ pub fn collect_route_infos(
                 resolve_status(route.name, route.api_version, route.sunset_opt_out)?;
             let (classification, roles, scopes, policy) =
                 classify(&group.source, &route.api_doc, route.repository.as_ref());
+            let pools = pools_of(&route.api_doc, route.repository.as_ref());
             infos.push(RouteInfo {
                 method: route.method.to_string(),
                 path: full_path,
@@ -499,6 +690,11 @@ pub fn collect_route_infos(
                 scopes,
                 policy,
                 module: module_of(&route.api_doc),
+                location: source_location_of(&route.api_doc),
+                authorize_bindings: authorize_bindings_of(&group.source, &route.api_doc),
+                agent_grant: agent_grant_of(&route.api_doc),
+                resource_shape: ResourceShape::from_pools(&pools),
+                pools,
             });
         }
     }
@@ -633,7 +829,7 @@ pub(crate) fn append_framework_routes(
     }
 
     // Dev request inspector routes.
-    if matches!(config.profile.as_deref(), Some("dev" | "development")) {
+    if crate::config::profile_is_dev(config.profile.as_deref()) {
         let inspector_path = &config.dev.inspector_path;
         let inspector_detail_path = format!("{inspector_path}/requests/{{id}}");
         for (path, handler) in [
@@ -662,7 +858,7 @@ pub(crate) fn append_framework_routes(
     ));
 }
 
-/// Append `OpenAPI` documentation routes (`/v3/api-docs`, `/swagger-ui`).
+/// Append `OpenAPI` documentation routes (`/openapi.json`, `/swagger-ui`).
 ///
 /// Only compiled when the `openapi` feature is enabled.
 #[cfg(feature = "openapi")]
@@ -741,6 +937,14 @@ mod tests {
         make_route_with(method, path, name, dummy_api_doc())
     }
 
+    /// Shorthand for an expected wire-side `#[authorize]` binding.
+    fn binding(action: &str, resource: &str) -> AuthorizeBindingInfo {
+        AuthorizeBindingInfo {
+            action: action.to_owned(),
+            resource: resource.to_owned(),
+        }
+    }
+
     /// Build a [`RepositoryApiMeta`](crate::route::RepositoryApiMeta) with the
     /// given `has_policy`, mirroring what the `#[repository]` macro emits for a
     /// `policy = ...` (or bare) auto-API.
@@ -799,6 +1003,7 @@ mod tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         }
@@ -1102,6 +1307,254 @@ mod tests {
         let route = make_route_with(Method::GET, "/widgets", "list_widgets", api_doc);
         let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[]).unwrap();
         assert_eq!(infos[0].module.as_deref(), Some("myapp::widgets"));
+    }
+
+    // ── #[authorize] bindings (#1627) ──────────────────────────────────────
+
+    /// The wire list is a *set* of bindings, not a transcript of the source:
+    /// unlike `roles`/`scopes` (which keep `#[secured]` attribute order), it is
+    /// sorted by `(action, resource)` and deduplicated so the manifest diff is
+    /// byte-deterministic and the audit's "removing an `#[authorize]` removes
+    /// exactly that binding" claim is order-independent.
+    #[test]
+    fn authorize_bindings_are_sorted_and_deduped() {
+        let api_doc = crate::openapi::ApiDoc {
+            has_policy: true,
+            authorize_bindings: &[
+                crate::openapi::AuthorizeBinding {
+                    action: "update",
+                    resource: "Note",
+                },
+                crate::openapi::AuthorizeBinding {
+                    action: "delete",
+                    resource: "Note",
+                },
+                crate::openapi::AuthorizeBinding {
+                    action: "update",
+                    resource: "Note",
+                },
+                crate::openapi::AuthorizeBinding {
+                    action: "update",
+                    resource: "Comment",
+                },
+            ],
+            ..dummy_api_doc()
+        };
+
+        let bindings = authorize_bindings_of(&RouteSource::User, &api_doc);
+
+        assert_eq!(
+            bindings,
+            vec![
+                binding("delete", "Note"),
+                binding("update", "Comment"),
+                binding("update", "Note"),
+            ],
+            "bindings must be sorted by (action, resource) and deduplicated"
+        );
+    }
+
+    /// `Vec::dedup` only collapses *adjacent* equal elements, so a helper that
+    /// deduped before sorting would leave the duplicate pair in place. Pin the
+    /// order of the two operations with duplicates that are separated in the
+    /// source.
+    #[test]
+    fn authorize_bindings_dedup_runs_after_sorting() {
+        let api_doc = crate::openapi::ApiDoc {
+            authorize_bindings: &[
+                crate::openapi::AuthorizeBinding {
+                    action: "show",
+                    resource: "Note",
+                },
+                crate::openapi::AuthorizeBinding {
+                    action: "delete",
+                    resource: "Note",
+                },
+                crate::openapi::AuthorizeBinding {
+                    action: "show",
+                    resource: "Note",
+                },
+            ],
+            ..dummy_api_doc()
+        };
+
+        assert_eq!(
+            authorize_bindings_of(&RouteSource::User, &api_doc),
+            vec![binding("delete", "Note"), binding("show", "Note")],
+        );
+    }
+
+    /// Framework routes are pre-classified and carry no handler metadata, so
+    /// they never report a binding — mirroring `classify`, which short-circuits
+    /// on [`RouteSource::Framework`] before reading the `ApiDoc` at all.
+    #[test]
+    fn framework_routes_carry_no_authorize_bindings() {
+        let api_doc = crate::openapi::ApiDoc {
+            has_policy: true,
+            authorize_bindings: &[crate::openapi::AuthorizeBinding {
+                action: "update",
+                resource: "Note",
+            }],
+            ..dummy_api_doc()
+        };
+
+        assert!(
+            authorize_bindings_of(&RouteSource::Framework, &api_doc).is_empty(),
+            "a framework route must never report an #[authorize] binding"
+        );
+    }
+
+    /// End-to-end through `collect_route_infos`: the bindings recorded by the
+    /// route macros reach the `RouteInfo` the dump serializes.
+    #[test]
+    fn collect_carries_authorize_bindings() {
+        let api_doc = crate::openapi::ApiDoc {
+            has_policy: true,
+            authorize_bindings: &[crate::openapi::AuthorizeBinding {
+                action: "update",
+                resource: "Note",
+            }],
+            ..dummy_api_doc()
+        };
+        let route = make_route_with(Method::POST, "/notes/{id}", "update_note", api_doc);
+        let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[]).unwrap();
+
+        assert_eq!(infos[0].authorize_bindings, vec![binding("update", "Note")]);
+        assert!(infos[0].policy, "a bound route is still policy-guarded");
+    }
+
+    // ── `agent_grant` (#1691) ───────────────────────────────────────────
+
+    /// One hand-built authority, standing in for what `#[agent_operable]`
+    /// emits. `autumn routes` only ever reads the grant's *name* off it.
+    fn refund_authority() -> &'static crate::agent_authority::AgentAuthority {
+        static GRANT: crate::agent_authority::Grant = crate::agent_authority::Grant {
+            name: "RefundDrafter",
+            writes: &["Refund"],
+            unbounded_writes: &[],
+            tenant_scope: crate::agent_authority::TenantScope::Scoped,
+            outbound: &[],
+            webhooks: &[],
+            jobs: &[],
+            rate: None,
+            spend: None,
+            reversibility: crate::agent_authority::Reversibility::Compensable,
+            location: "autumn/src/route_listing.rs",
+        };
+        static AUTHORITY: crate::agent_authority::AgentAuthority =
+            crate::agent_authority::AgentAuthority {
+                action: "draft_refund",
+                module_path: "autumn_web::route_listing::tests",
+                location: "autumn/src/route_listing.rs",
+                grant: &GRANT,
+                effects: &[],
+                asserted_effect_free_sites: 0,
+                asserted_effect_free: &[],
+            };
+        &AUTHORITY
+    }
+
+    #[test]
+    fn collect_carries_the_agent_grant_name() {
+        let api_doc = crate::openapi::ApiDoc {
+            agent_authority: Some(refund_authority()),
+            ..dummy_api_doc()
+        };
+        let route = make_route_with(Method::POST, "/api/refunds", "draft_refund", api_doc);
+        let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[]).unwrap();
+
+        assert_eq!(infos[0].agent_grant.as_deref(), Some("RefundDrafter"));
+    }
+
+    #[test]
+    fn collect_leaves_an_ungoverned_route_without_a_grant() {
+        // `None` is the signal the authority manifest keys `ungoverned_tools`
+        // off, so inventing one here would hide the gap the listing exists to
+        // show.
+        let route = make_route_with(Method::POST, "/api/notes", "write_note", dummy_api_doc());
+        let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[]).unwrap();
+
+        assert_eq!(infos[0].agent_grant, None);
+    }
+
+    #[test]
+    fn route_info_elides_an_absent_agent_grant() {
+        // Same compatibility convention as the fields before it: elided when
+        // absent, so an existing dump entry stays byte-stable for an older
+        // consumer.
+        let info = RouteInfo {
+            method: "POST".to_owned(),
+            path: "/api/notes".to_owned(),
+            handler: "write_note".to_owned(),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&info).unwrap();
+        assert!(
+            value.get("agent_grant").is_none(),
+            "an absent grant must not be serialized: {value}"
+        );
+
+        let governed = RouteInfo {
+            agent_grant: Some("RefundDrafter".to_owned()),
+            ..info
+        };
+        let value = serde_json::to_value(&governed).unwrap();
+        assert_eq!(value["agent_grant"], "RefundDrafter");
+        let decoded: RouteInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.agent_grant.as_deref(), Some("RefundDrafter"));
+    }
+
+    /// Field 15 follows the field 9-14 convention: elided when empty, so the
+    /// first fourteen keys of every existing dump entry stay byte-stable and an
+    /// *old* consumer sees the JSON it already knows.
+    #[test]
+    fn route_info_elides_empty_authorize_bindings() {
+        let info = RouteInfo {
+            method: "GET".to_owned(),
+            path: "/health".to_owned(),
+            handler: "health".to_owned(),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&info).unwrap();
+        assert!(
+            value.get("authorize_bindings").is_none(),
+            "an empty binding list must not be serialized: {value}"
+        );
+
+        let bound = RouteInfo {
+            authorize_bindings: vec![binding("update", "Note")],
+            ..info
+        };
+        let value = serde_json::to_value(&bound).unwrap();
+        assert_eq!(
+            value["authorize_bindings"],
+            serde_json::json!([{ "action": "update", "resource": "Note" }]),
+        );
+        let decoded: RouteInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.authorize_bindings, vec![binding("update", "Note")]);
+    }
+
+    /// The other half of the compatibility contract: `#[serde(default)]` lets a
+    /// *new* consumer read a dump produced before the field existed, rather
+    /// than failing the whole parse on a missing key.
+    #[test]
+    fn route_info_deserializes_old_dump_without_bindings() {
+        let old = serde_json::json!({
+            "method": "POST",
+            "path": "/notes/{id}",
+            "handler": "update_note",
+            "source": "user",
+            "middleware": [],
+            "classification": "gated",
+            "policy": true,
+        });
+
+        let decoded: RouteInfo = serde_json::from_value(old).unwrap();
+        assert!(
+            decoded.authorize_bindings.is_empty(),
+            "a dump without the key must decode to an empty list"
+        );
+        assert!(decoded.policy, "the pre-existing keys must still decode");
     }
 
     #[test]
@@ -1762,5 +2215,69 @@ mod tests {
             "unmounted unsubscribe path must not be exempt: {:?}",
             plain_dump.csrf.exempt_paths
         );
+    }
+
+    // ── capacity contract: per-route resource shape (#1733) ──────────────
+
+    #[test]
+    fn a_route_declaring_a_database_pool_is_db_bound() {
+        let mut api_doc = dummy_api_doc();
+        api_doc.pools = &["db"];
+        let route = make_route_with(Method::GET, "/posts", "index", api_doc);
+
+        let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[])
+            .expect("route listing should collect");
+
+        assert_eq!(
+            infos[0].resource_shape,
+            crate::capacity::ResourceShape::DbBound
+        );
+        assert_eq!(infos[0].pools, vec!["db".to_owned()]);
+    }
+
+    #[test]
+    fn a_route_declaring_only_non_database_pools_is_io_bound() {
+        let mut api_doc = dummy_api_doc();
+        api_doc.pools = &["mail"];
+        let route = make_route_with(Method::POST, "/invite", "invite", api_doc);
+
+        let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[])
+            .expect("route listing should collect");
+
+        assert_eq!(
+            infos[0].resource_shape,
+            crate::capacity::ResourceShape::IoBound
+        );
+    }
+
+    #[test]
+    fn a_route_proving_no_pool_is_compute_bound() {
+        let route = make_route(Method::GET, "/about", "about");
+
+        let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[])
+            .expect("route listing should collect");
+
+        assert_eq!(
+            infos[0].resource_shape,
+            crate::capacity::ResourceShape::ComputeBound
+        );
+        assert!(infos[0].pools.is_empty());
+    }
+
+    #[test]
+    fn a_repository_auto_api_route_is_db_bound_without_a_declared_extractor() {
+        // The generated CRUD handlers own their pool checkout internally, so no
+        // extractor appears in a signature the macro could read — but the route
+        // is database-backed by construction.
+        let route = make_repo_route(Method::GET, "/api/posts", "list", Some(repo_meta(true)));
+
+        let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[])
+            .expect("route listing should collect");
+
+        assert_eq!(
+            infos[0].resource_shape,
+            crate::capacity::ResourceShape::DbBound
+        );
+        assert_eq!(infos[0].pools, vec!["db".to_owned()]);
     }
 }

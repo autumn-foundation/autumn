@@ -194,6 +194,18 @@ struct RepoConfig {
     /// `_autumn_version_history`. Generates a `Model::history(id, &mut db, filter)`
     /// associated function on the repository.
     versioned: bool,
+    /// Promote version history to a bitemporal, tamper-evident ledger (#1699).
+    /// Implies `versioned`, so every write path that already appends a version
+    /// entry also appends an immutable, hash-chained `LedgerRevision` carrying a
+    /// full row snapshot. Requires `soft_delete`: a hard `DELETE` would erase the
+    /// row the ledger reconstructs, and `purge` is not generated for a ledgered
+    /// repository for the same reason.
+    ledgered: bool,
+    /// Column supplying a ledger revision's **valid time**
+    /// (`ledgered(valid_time = "effective_at")`). `None` — the default — means
+    /// valid time equals transaction time: the fact became true when the
+    /// database learned it.
+    ledger_valid_time: Option<String>,
     /// When `true`, suppress the auto-generated `impl VersionedRecord for Model`.
     /// Use this when the model already has a hand-written `VersionedRecord`
     /// implementation (custom serialization, non-`i64` primary key, etc.) to
@@ -234,6 +246,545 @@ struct RepoConfig {
     /// users' rows. The column may be `BigInt` or `Nullable<BigInt>`; a nullable
     /// owner never matches NULL (unowned) rows, which is the intended semantics.
     owner_column: Option<String>,
+    /// `retention(...)` declarative data-retention policy (issue #1342).
+    /// `None` (the default) emits nothing extra: every existing `#[repository]`
+    /// is unaffected — retention is opt-in.
+    retention: Option<RetentionSpec>,
+    /// `position` / `position(column = "...", scope = "...")` — ordered-list
+    /// support (issue #1358). `None` (the default) emits nothing extra.
+    /// `Some` generates `move_to`/`move_before`/`move_after`/`move_up`/
+    /// `move_down` inherent methods that maintain a contiguous `0..len-1`
+    /// ordering over `column` (default `"position"`), scoped to `scope` when
+    /// given (a sibling foreign-key column) or over the whole table
+    /// otherwise. Insert-time assignment and delete-time compaction are
+    /// handled by database triggers the migration emits (see
+    /// `autumn-cli`'s `position_triggers_up_sql_for`), not by this macro —
+    /// so they apply uniformly to every insert/delete path, not just the
+    /// generated repository's.
+    position: Option<PositionSpec>,
+    /// `invalidates(path::to::cached_fn, ...)` — cache-coherence invalidation
+    /// edges declared for **every** write method on this repository (#1716).
+    /// Each path names a `#[cached]` function; the macro rewrites its last
+    /// segment to the generated id/invalidator companions, so rustc — not a
+    /// string table — proves the target is a real cached read.
+    invalidates: Vec<syn::Path>,
+    /// `acknowledge_stale = "reason"` — opt every write on this repository out
+    /// of the coherence gate (#1716). The reason is mandatory and non-blank so
+    /// the escape hatch always carries its justification into the manifest.
+    acknowledge_stale: Option<String>,
+}
+
+/// Per-method cache-coherence overrides read off the declared trait (#1716).
+///
+/// Populated from `#[invalidates(...)]` / `#[acknowledge_stale(reason = "…")]`
+/// on a trait method. The macro regenerates the trait from scratch, so these
+/// attributes are consumed here and never reach the emitted code.
+#[derive(Default)]
+struct MethodCoherence {
+    invalidates: Vec<syn::Path>,
+    acknowledge_stale: Option<String>,
+}
+
+/// Parsed `position(...)` clause (issue #1358). See [`RepoConfig::position`].
+#[derive(Clone, Debug)]
+struct PositionSpec {
+    /// The `i64`/`BIGINT` ordering column. Defaults to `"position"` when the
+    /// bare `position` flag is used with no explicit `column = "..."`.
+    column: String,
+    /// The sibling foreign-key column (`i64`) this ordering is scoped to,
+    /// when given. `None` means a single sequence over the whole table.
+    scope: Option<String>,
+}
+
+/// Parsed `retention(...)` clause (issue #1342).
+///
+/// At least one of `after` (with `basis`) or `purge_deleted_after` is always
+/// present — `parse_repo_args` rejects an empty `retention()` and rejects
+/// `after` without `basis` before this is ever constructed.
+struct RetentionSpec {
+    /// Age threshold (a `parse_duration`-compatible string, e.g. `"30d"`)
+    /// past which a row is stale, measured from `basis`. Soft-deletes the row
+    /// on a `soft_delete` repository, hard-deletes otherwise.
+    after: Option<String>,
+    /// Column read against `after` (e.g. `created_at`). Required when `after`
+    /// is set.
+    basis: Option<Ident>,
+    /// Age threshold past which an already soft-deleted row is hard-purged.
+    /// Requires `soft_delete`.
+    purge_deleted_after: Option<String>,
+    /// Rows deleted per batch. Defaults to
+    /// [`DEFAULT_RETENTION_BATCH_SIZE`] when unset.
+    batch_size: Option<u64>,
+    /// How often the sweep runs. Defaults to
+    /// [`DEFAULT_RETENTION_SWEEP_INTERVAL`] when unset.
+    every: Option<String>,
+}
+
+/// Default rows-per-batch for a `retention(...)` sweep when `batch_size` is
+/// not given. Small enough that a single `DELETE`/`UPDATE` never holds a long
+/// lock or spikes replication lag; large enough to drain realistic backlogs
+/// in a bounded number of round trips.
+const DEFAULT_RETENTION_BATCH_SIZE: u64 = 500;
+
+/// Default recurring interval for a `retention(...)` sweep when `every` is
+/// not given.
+const DEFAULT_RETENTION_SWEEP_INTERVAL: &str = "1h";
+
+/// Upper bound on batches processed in a single sweep run, regardless of
+/// `batch_size`. Bounds one run's wall-clock time so a huge backlog drains
+/// across multiple scheduled ticks instead of one very long run; the AC's
+/// "per-run cap" (issue #1342).
+const MAX_RETENTION_BATCHES_PER_RUN: u32 = 1000;
+
+// ── #1716: cache-coherence mutation surface ──────────────────────────
+
+/// Write methods every `#[repository]` generates, whatever its configuration.
+const ALWAYS_GENERATED_WRITES: &[&str] = &[
+    "save",
+    "update",
+    "delete_by_id",
+    "save_many",
+    "save_many_skip_invalid",
+    "update_many",
+    "delete_many",
+];
+
+/// The ordered-list mutations `position(...)` adds (issue #1358).
+const POSITION_WRITES: &[&str] = &[
+    "move_to",
+    "move_before",
+    "move_after",
+    "move_up",
+    "move_down",
+];
+
+/// Every method on this repository that mutates the model's table.
+///
+/// The cache-coherence gate is model-granular, so for a write against this
+/// model's own table the list decides how *precisely* a violation can be named,
+/// not whether it is caught: `save`, `update` and `delete_by_id` are
+/// unconditional, so a model with any repository at all always has at least one
+/// registered mutation. `find_or_create_by_*` and the retention sweep are
+/// therefore rolled up rather than enumerated — they write the same table those
+/// three do.
+///
+/// Two families are genuinely *not* covered and are named in the manifest's
+/// `excluded` list rather than pretended away: a many-to-many `add_*`/`remove_*`
+/// helper writes the JOIN table, and a `counter_cache` write updates the
+/// PARENT's table (a fact declared on the model, which this macro cannot see).
+/// A `dependent(...)` cascade IS covered — see [`dependent_child_models`].
+///
+/// Returns the names sorted and deduplicated.
+fn write_method_names(config: &RepoConfig, trait_def: &ItemTrait) -> Vec<String> {
+    let mut names: Vec<String> = ALWAYS_GENERATED_WRITES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+    // Mirrors `upsert_many_trait_method`'s own condition.
+    if config.hooks_type.is_none() && !config.no_upsert_trait {
+        names.push("upsert_many".to_string());
+    }
+    if config.soft_delete {
+        names.push("restore".to_string());
+        // A ledgered repository never generates `purge`: a hard DELETE would
+        // erase the row the ledger reconstructs.
+        if !config.ledgered {
+            names.push("purge".to_string());
+        }
+    }
+    if config.position.is_some() {
+        names.extend(POSITION_WRITES.iter().map(|s| (*s).to_string()));
+    }
+
+    // Derived queries: only the `delete_by_*` family writes.
+    for item in &trait_def.items {
+        if let TraitItem::Fn(method) = item {
+            let name = method.sig.ident.to_string();
+            if parse_query_name(&name).is_some_and(|q| q.prefix == "delete") {
+                names.push(name);
+            }
+        }
+    }
+
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Read `#[invalidates(...)]` / `#[acknowledge_stale(reason = "…")]` off the
+/// declared trait's methods.
+///
+/// The macro regenerates the trait from scratch, so these attributes are
+/// consumed here and never reach the emitted code — which is also why an
+/// unrecognized shape has to be a hard error: a silently-dropped invalidation
+/// edge is exactly the bug this feature exists to prevent.
+fn parse_method_coherence_attrs(
+    trait_def: &ItemTrait,
+) -> syn::Result<std::collections::HashMap<String, MethodCoherence>> {
+    let mut out: std::collections::HashMap<String, MethodCoherence> =
+        std::collections::HashMap::new();
+
+    for item in &trait_def.items {
+        let TraitItem::Fn(method) = item else {
+            continue;
+        };
+        let name = method.sig.ident.to_string();
+        for attr in &method.attrs {
+            if attr.path().is_ident("invalidates") {
+                let paths = attr.parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+                )?;
+                if paths.is_empty() {
+                    return Err(syn::Error::new_spanned(
+                        attr,
+                        "`#[invalidates(...)]` must name at least one #[cached] function, \
+                         e.g. `#[invalidates(crate::views::recent_posts)]`",
+                    ));
+                }
+                out.entry(name.clone())
+                    .or_default()
+                    .invalidates
+                    .extend(paths);
+            } else if attr.path().is_ident("acknowledge_stale") {
+                let mut reason: Option<LitStr> = None;
+                attr.parse_nested_meta(|nested| {
+                    if nested.path.is_ident("reason") {
+                        reason = Some(nested.value()?.parse()?);
+                        Ok(())
+                    } else {
+                        Err(nested.error(
+                            "unknown key: `#[acknowledge_stale(reason = \"…\")]` takes only \
+                             `reason`",
+                        ))
+                    }
+                })?;
+                let Some(reason) = reason else {
+                    return Err(syn::Error::new_spanned(
+                        attr,
+                        "`#[acknowledge_stale]` requires a reason: \
+                         `#[acknowledge_stale(reason = \"…\")]`",
+                    ));
+                };
+                if reason.value().trim().is_empty() {
+                    return Err(syn::Error::new_spanned(
+                        &reason,
+                        "`acknowledge_stale` requires a non-empty reason: it is the only record \
+                         of why this write is allowed to strand a cached read",
+                    ));
+                }
+                out.entry(name.clone()).or_default().acknowledge_stale = Some(reason.value());
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// Rewrite `crate::views::recent_posts` to the companion item `#[cached]`
+/// generates beside that function, e.g.
+/// `crate::views::__AUTUMN_CACHE_READ_ID__recent_posts`.
+///
+/// This is what makes an invalidation edge unfakeable: the path has to resolve,
+/// so naming a function that is not `#[cached]` — or misspelling one that is —
+/// is a rustc error at the write site rather than an unmatched string in the
+/// manifest.
+fn cached_read_companion_path(path: &syn::Path, prefix: &str) -> syn::Path {
+    let mut companion = path.clone();
+    if let Some(last) = companion.segments.last_mut() {
+        last.ident = format_ident!("{}{}", prefix, last.ident);
+    }
+    companion
+}
+
+/// The child repositories a `dependent(...)` cascade actually writes through.
+///
+/// A `dependent(PgCommentRepository, fk = "post_id", on_delete = destroy)`
+/// clause makes `delete_by_id`/`delete_many` delete or nullify rows in the
+/// CHILD's table. Registering those writes under the parent model only would be
+/// a false pass: a cached read derived from `Comment` really is stranded by
+/// `PostRepository::delete_by_id`.
+///
+/// `on_delete = restrict` is excluded, because that action only *probes* for
+/// child rows and then either rejects the parent delete or proceeds when there
+/// are none — it never writes the child's table. Registering it would demand an
+/// invalidation for a read that cannot go stale, and a gate that fails correct
+/// code is a gate that gets deleted.
+///
+/// Returns the child repository paths, deduplicated by their rendered form. The
+/// model is NOT inferred from the repository's type name — see
+/// `__AUTUMN_MODEL_NAME` in [`generate_coherence_items`] for why that guess is
+/// wrong exactly where it matters.
+fn dependent_child_repositories(config: &RepoConfig) -> Vec<syn::Path> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut paths: Vec<syn::Path> = Vec::new();
+    for dep in config
+        .dependents
+        .iter()
+        .filter(|dep| dep.action != DependentAction::Restrict)
+    {
+        let child = &dep.child_repo;
+        let rendered = quote!(#child).to_string();
+        if !seen.contains(&rendered) {
+            seen.push(rendered);
+            paths.push(dep.child_repo.clone());
+        }
+    }
+    paths
+}
+
+/// Write methods that run the `dependent(...)` cascade.
+const CASCADING_WRITES: &[&str] = &["delete_by_id", "delete_many"];
+
+/// Registrations for the writes a `dependent(...)` cascade performs against the
+/// CHILD's rows.
+///
+/// Without these the gate reports a clean build for a cached read the cascade
+/// really does strand: `PostRepository::delete_by_id` deletes `Comment` rows,
+/// but registering only the parent model would never intersect a read derived
+/// from `Comment`.
+fn cascade_mutation_registrations(
+    config: &RepoConfig,
+    overrides: &std::collections::HashMap<String, MethodCoherence>,
+    writes: &[String],
+    trait_name_str: &str,
+) -> Vec<TokenStream> {
+    let child_repos = dependent_child_repositories(config);
+    CASCADING_WRITES
+        .iter()
+        .filter(|method| writes.contains(&(*method).to_string()))
+        .flat_map(|method| -> Vec<TokenStream> {
+            let edges: Vec<syn::Path> = config
+                .invalidates
+                .iter()
+                .chain(
+                    overrides
+                        .get(*method)
+                        .into_iter()
+                        .flat_map(|o| o.invalidates.iter()),
+                )
+                .map(|p| cached_read_companion_path(p, "__AUTUMN_CACHE_READ_ID__"))
+                .collect();
+            let acknowledged = overrides
+                .get(*method)
+                .and_then(|o| o.acknowledge_stale.as_ref())
+                .or(config.acknowledge_stale.as_ref())
+                .map_or_else(
+                    || quote! { ::core::option::Option::None },
+                    |reason| quote! { ::core::option::Option::Some(#reason) },
+                );
+            child_repos
+                .iter()
+                .map(|child| {
+                    let (edges, acknowledged) = (edges.clone(), acknowledged.clone());
+                    quote! {
+                    ::autumn_web::reexports::inventory::submit! {
+                        ::autumn_web::cache::coherence::MutationDescriptor {
+                            repository: #trait_name_str,
+                            method: #method,
+                            // The child repository publishes its own model, so
+                            // an escape-hatch name like `ModerationRepository`
+                            // over a `Comment` model resolves correctly.
+                            model: <#child>::__AUTUMN_MODEL_NAME,
+                            // Empty rather than guessed: the child's table name
+                            // lives on ITS `#[repository]`, which may override
+                            // the inferred one, and a wrong table string in the
+                            // manifest is worse than an absent one. Matching is
+                            // on the model, so nothing is lost.
+                            table: "",
+                            invalidates: &[#(#edges),*],
+                            acknowledged_stale: #acknowledged,
+                            location: concat!(file!(), ":", line!()),
+                        }
+                    }
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Reject a cache-coherence attribute on a method that generates no write.
+///
+/// The trait is regenerated from scratch, so an attribute the macro does not
+/// consume vanishes without a trace — and a silently-dropped invalidation edge
+/// is exactly the bug this feature exists to prevent.
+fn reject_orphaned_coherence_attrs(
+    trait_def: &ItemTrait,
+    overrides: &std::collections::HashMap<String, MethodCoherence>,
+    writes: &[String],
+) -> syn::Result<()> {
+    let Some(orphan) = overrides.keys().find(|name| !writes.contains(name)) else {
+        return Ok(());
+    };
+    // Point the error at the method's own ident so the fix is where the reader
+    // is looking.
+    let span = trait_def
+        .items
+        .iter()
+        .find_map(|item| match item {
+            TraitItem::Fn(f) if f.sig.ident == **orphan => Some(f.sig.ident.span()),
+            _ => None,
+        })
+        .unwrap_or_else(proc_macro2::Span::call_site);
+    Err(syn::Error::new(
+        span,
+        format!(
+            "`{orphan}` is not a write method, so a cache-coherence attribute on it would \
+             never reach the manifest. Only the generated mutations carry one: {}. Move the \
+             attribute to the `#[repository(...)]` attribute to cover every write.",
+            writes.join(", ")
+        ),
+    ))
+}
+
+/// The `inventory` registrations and invalidator this repository publishes for
+/// the cache-coherence manifest (#1716).
+fn generate_coherence_items(
+    config: &RepoConfig,
+    trait_def: &ItemTrait,
+    pg_name: &Ident,
+) -> syn::Result<TokenStream> {
+    let overrides = parse_method_coherence_attrs(trait_def)?;
+    let model_name = &config.model_name;
+    // The grant spells the model as source does, and `r#Type` is written
+    // `Type` there: `stringify!` would have kept the `r#`.
+    let model_ident = {
+        let spelled = model_name.to_string();
+        spelled.strip_prefix("r#").unwrap_or(&spelled).to_string()
+    };
+    let table_name = &config.table_name;
+    let trait_name_str = trait_def.ident.to_string();
+    let writes = write_method_names(config, trait_def);
+
+    reject_orphaned_coherence_attrs(trait_def, &overrides, &writes)?;
+
+    let submissions: Vec<TokenStream> = writes
+        .clone()
+        .into_iter()
+        .map(|method| {
+            let method_override = overrides.get(&method);
+            // Trait-level edges apply to every write; a method-level edge adds
+            // to them rather than replacing them, so annotating one method can
+            // never silently drop the repository-wide declaration.
+            let edges: Vec<syn::Path> = config
+                .invalidates
+                .iter()
+                .chain(
+                    method_override
+                        .into_iter()
+                        .flat_map(|o| o.invalidates.iter()),
+                )
+                .map(|p| cached_read_companion_path(p, "__AUTUMN_CACHE_READ_ID__"))
+                .collect();
+            let acknowledged = method_override
+                .and_then(|o| o.acknowledge_stale.as_ref())
+                .or(config.acknowledge_stale.as_ref())
+                .map_or_else(
+                    || quote! { ::core::option::Option::None },
+                    |reason| quote! { ::core::option::Option::Some(#reason) },
+                );
+            quote! {
+                ::autumn_web::reexports::inventory::submit! {
+                    ::autumn_web::cache::coherence::MutationDescriptor {
+                        repository: #trait_name_str,
+                        method: #method,
+                        model: || ::core::any::type_name::<#model_name>(),
+                        table: #table_name,
+                        invalidates: &[#(#edges),*],
+                        acknowledged_stale: #acknowledged,
+                        location: concat!(file!(), ":", line!()),
+                    }
+                }
+            }
+        })
+        .collect();
+
+    // The repository-wide invalidator: one call that drops every cached read
+    // this repository declares it dirties, from EITHER the attribute or a
+    // method-level `#[invalidates(...)]`. Method-level edges are folded in
+    // deliberately: over-invalidating is safe, whereas an edge that discharges
+    // the gate with no callable counterpart is the paperwork this feature
+    // exists to prevent. Emitted only when edges exist, so an untouched
+    // repository's generated output is unchanged.
+    let mut declared_edges: Vec<syn::Path> = config.invalidates.clone();
+    for name in &writes {
+        if let Some(entry) = overrides.get(name) {
+            declared_edges.extend(entry.invalidates.iter().cloned());
+        }
+    }
+    // Published unconditionally so a PARENT repository's `dependent(...)` cascade
+    // can name this child's model instead of guessing it from the repository's
+    // type name. The guess is wrong for the supported escape hatch where they
+    // differ — `#[repository(Comment)] trait ModerationRepository` — and a wrong
+    // model means the cascade intersects nothing and the audit reports clean.
+    let published_model = quote! {
+        impl #pg_name {
+            /// The model this repository writes, for the cache-coherence
+            /// manifest (#1716). Read by a parent repository's `dependent(...)`
+            /// cascade registration.
+            #[doc(hidden)]
+            pub const __AUTUMN_MODEL_NAME: fn() -> &'static ::core::primitive::str =
+                || ::core::any::type_name::<#model_name>();
+
+            /// The model this repository writes, unqualified — the subject an
+            /// agent-authority grant names (#1691). `__AUTUMN_MODEL_NAME`
+            /// carries the full `type_name` path, which no grant can be
+            /// expected to spell; this is the last segment alone, readable in
+            /// const context so the authority assertion works across crates.
+            #[doc(hidden)]
+            pub const __AUTUMN_MODEL_IDENT: &'static ::core::primitive::str = #model_ident;
+        }
+    };
+
+    let invalidator = if declared_edges.is_empty() {
+        quote! {}
+    } else {
+        // Reference the id CONSTANT, not the generated invalidator function:
+        // a mistyped edge then produces one "cannot find value" error naming
+        // the user's own path, rather than two errors that also leak the
+        // invalidator's mangled name.
+        let ids: Vec<syn::Path> = declared_edges
+            .iter()
+            .map(|p| cached_read_companion_path(p, "__AUTUMN_CACHE_READ_ID__"))
+            .collect();
+        quote! {
+            impl #pg_name {
+                /// Drop every cached read this repository declares it
+                /// invalidates.
+                ///
+                /// Returns whether every one of them was invalidated
+                /// **completely** — see
+                /// [`autumn_web::cache::coherence::invalidate_namespace`]. It is
+                /// `false` when a registered cache backend cannot drop a
+                /// namespace; the shipped `MokaCache` and `RedisCache` both can.
+                ///
+                /// Call this after a write (or from a commit hook). The
+                /// build-time gate proves the *edge* is declared and that it
+                /// names a real cached read; it does not prove this function
+                /// runs.
+                #[must_use = "an ignored `false` means the cached value is still being served"]
+                pub fn invalidate_declared_caches() -> bool {
+                    let mut __autumn_complete = true;
+                    #(
+                        __autumn_complete &=
+                            ::autumn_web::cache::coherence::invalidate_namespace(#ids);
+                    )*
+                    __autumn_complete
+                }
+            }
+        }
+    };
+
+    let cascade_submissions =
+        cascade_mutation_registrations(config, &overrides, &writes, &trait_name_str);
+
+    Ok(quote! {
+        #published_model
+        #(#submissions)*
+        #(#cascade_submissions)*
+        #invalidator
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -255,6 +806,8 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut searchable = false;
     let mut versioned = false;
     let mut no_versioned_record_impl = false;
+    let mut ledgered = false;
+    let mut ledger_valid_time: Option<String> = None;
     let mut primary_reads = false;
     let mut sharded = false;
     let mut broadcasts = false;
@@ -264,8 +817,45 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut dependents: Vec<DependentSpec> = Vec::new();
     let mut validate_on_update_fetch = false;
     let mut owner_column: Option<String> = None;
+    let mut retention: Option<RetentionSpec> = None;
+    let mut position: Option<PositionSpec> = None;
+    let mut invalidates: Vec<syn::Path> = Vec::new();
+    let mut acknowledge_stale: Option<String> = None;
 
     syn::meta::parser(|meta| {
+        // #1716 keys are checked before the catch-all model_name case below.
+        if meta.path.is_ident("invalidates") {
+            // Parsed through an explicit `parenthesized!` rather than
+            // `parse_nested_meta` so the EMPTY case reaches our own diagnostic
+            // instead of syn's "expected nested attribute".
+            let content;
+            syn::parenthesized!(content in meta.input);
+            let paths: syn::punctuated::Punctuated<syn::Path, syn::Token![,]> =
+                content.parse_terminated(syn::Path::parse_mod_style, syn::Token![,])?;
+            if paths.is_empty() {
+                return Err(meta.error(
+                    "`invalidates()` must name at least one #[cached] function, e.g. \
+                     `invalidates(crate::views::recent_posts)`; omit it entirely if this \
+                     repository's writes cannot strand a cached read",
+                ));
+            }
+            invalidates.extend(paths);
+            return Ok(());
+        }
+        if meta.path.is_ident("acknowledge_stale") {
+            let value: LitStr = meta.value()?.parse()?;
+            let reason = value.value();
+            if reason.trim().is_empty() {
+                return Err(syn::Error::new_spanned(
+                    &value,
+                    "`acknowledge_stale` requires a non-empty reason: it is the only record of \
+                     why this repository's writes are allowed to strand a cached read",
+                ));
+            }
+            acknowledge_stale = Some(reason);
+            return Ok(());
+        }
+
         // `hooks = Ident` must be checked before the catch-all model_name case,
         // otherwise "hooks" would be parsed as the model name.
         if meta.path.is_ident("hooks") {
@@ -378,6 +968,29 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             let value: syn::LitBool = meta.value()?.parse()?;
             versioned = value.value;
             Ok(())
+        } else if meta.path.is_ident("ledgered") {
+            // `ledgered` (bare), `ledgered = true|false`, or
+            // `ledgered(valid_time = "column")` (issue #1699).
+            if meta.input.peek(syn::Token![=]) {
+                let value: syn::LitBool = meta.value()?.parse()?;
+                ledgered = value.value;
+            } else {
+                ledgered = true;
+                if meta.input.peek(syn::token::Paren) {
+                    meta.parse_nested_meta(|nested| {
+                        if nested.path.is_ident("valid_time") {
+                            let value: LitStr = nested.value()?.parse()?;
+                            ledger_valid_time = Some(value.value());
+                            Ok(())
+                        } else {
+                            Err(nested.error(
+                                "expected `valid_time = \"column\"` inside `ledgered(...)`",
+                            ))
+                        }
+                    })?;
+                }
+            }
+            Ok(())
         } else if meta.path.is_ident("no_versioned_record_impl") {
             no_versioned_record_impl = true;
             Ok(())
@@ -467,12 +1080,140 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
                 action,
             });
             Ok(())
+        } else if meta.path.is_ident("retention") {
+            // `retention(after = "30d", basis = created_at)` and/or
+            // `retention(purge_deleted_after = "90d")`, plus optional
+            // `batch_size = N` and `every = "..."` (#1342).
+            //
+            // Repeating the whole clause — `retention(after = "90d", basis =
+            // created_at), retention(after = "7d", basis = created_at)` — once
+            // silently overwrote `retention` with the second policy below, with no
+            // error. `retention(...)` controls irreversible deletion, so this must
+            // fail loudly at compile time, for the same reason a repeated key does.
+            if retention.is_some() {
+                return Err(meta.error(
+                    "duplicate retention(...) clause: #[repository(...)] may declare at most \
+                     one retention(...) policy",
+                ));
+            }
+            let mut after: Option<String> = None;
+            let mut basis: Option<Ident> = None;
+            let mut purge_deleted_after: Option<String> = None;
+            let mut batch_size: Option<u64> = None;
+            let mut every: Option<String> = None;
+            meta.parse_nested_meta(|nested| {
+                // Each arm once just overwrote its `Option`, so a repeated key
+                // silently kept the last value: `retention(after = "90d", after =
+                // "7d", basis = created_at)` compiled and hard-deleted rows after
+                // 7 days, not the intended 90. `retention(...)` controls
+                // irreversible deletion, so a typo'd or twice-generated key must
+                // fail loudly rather than pick whichever assignment ran last.
+                if nested.path.is_ident("after") {
+                    if after.is_some() {
+                        return Err(nested.error("duplicate `after = \"...\"` in retention(...)"));
+                    }
+                    let value: LitStr = nested.value()?.parse()?;
+                    after = Some(value.value());
+                    Ok(())
+                } else if nested.path.is_ident("basis") {
+                    if basis.is_some() {
+                        return Err(nested.error("duplicate `basis = <column>` in retention(...)"));
+                    }
+                    let value: Ident = nested.value()?.parse()?;
+                    basis = Some(value);
+                    Ok(())
+                } else if nested.path.is_ident("purge_deleted_after") {
+                    if purge_deleted_after.is_some() {
+                        return Err(nested.error(
+                            "duplicate `purge_deleted_after = \"...\"` in retention(...)",
+                        ));
+                    }
+                    let value: LitStr = nested.value()?.parse()?;
+                    purge_deleted_after = Some(value.value());
+                    Ok(())
+                } else if nested.path.is_ident("batch_size") {
+                    if batch_size.is_some() {
+                        return Err(
+                            nested.error("duplicate `batch_size = N` in retention(...)")
+                        );
+                    }
+                    let value: syn::LitInt = nested.value()?.parse()?;
+                    batch_size = Some(value.base10_parse()?);
+                    Ok(())
+                } else if nested.path.is_ident("every") {
+                    if every.is_some() {
+                        return Err(nested.error("duplicate `every = \"...\"` in retention(...)"));
+                    }
+                    let value: LitStr = nested.value()?.parse()?;
+                    every = Some(value.value());
+                    Ok(())
+                } else {
+                    Err(nested.error(
+                        "expected `after = \"...\"`, `basis = <column>`, \
+                         `purge_deleted_after = \"...\"`, `batch_size = N`, or `every = \"...\"`",
+                    ))
+                }
+            })?;
+            if after.is_none() && purge_deleted_after.is_none() {
+                return Err(meta.error(
+                    "retention(...) requires `after = \"...\"` (with `basis = <column>`), \
+                     `purge_deleted_after = \"...\"`, or both",
+                ));
+            }
+            if after.is_some() && basis.is_none() {
+                return Err(meta.error(
+                    "retention(after = \"...\") requires `basis = <column>` — the timestamp \
+                     column age is measured from, e.g. `basis = created_at`",
+                ));
+            }
+            retention = Some(RetentionSpec {
+                after,
+                basis,
+                purge_deleted_after,
+                batch_size,
+                every,
+            });
+            Ok(())
+        } else if meta.path.is_ident("position") {
+            // `position` (bare, column defaults to "position") or
+            // `position(column = "...", scope = "...")` (issue #1358).
+            if position.is_some() {
+                return Err(meta.error(
+                    "duplicate `position`/`position(...)`: #[repository(...)] may declare at \
+                     most one",
+                ));
+            }
+            let mut column: Option<String> = None;
+            let mut scope: Option<String> = None;
+            if meta.input.peek(syn::token::Paren) {
+                meta.parse_nested_meta(|nested| {
+                    if nested.path.is_ident("column") {
+                        let value: LitStr = nested.value()?.parse()?;
+                        column = Some(value.value());
+                        Ok(())
+                    } else if nested.path.is_ident("scope") {
+                        let value: LitStr = nested.value()?.parse()?;
+                        scope = Some(value.value());
+                        Ok(())
+                    } else {
+                        Err(nested.error(
+                            "expected `column = \"...\"` or `scope = \"...\"` inside \
+                             `position(...)`",
+                        ))
+                    }
+                })?;
+            }
+            position = Some(PositionSpec {
+                column: column.unwrap_or_else(|| "position".to_owned()),
+                scope,
+            });
+            Ok(())
         } else if meta.path.get_ident().is_some() && model_name.is_none() {
             model_name = Some(meta.path.get_ident().unwrap().clone());
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", mcp, mcp = \"read\", policy = Type, scope = Type, owner = column, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, sharded, validate_on_update = fetch, dependent(ChildRepository, fk = \"...\", on_delete = ...), broadcasts = true, topic = \"...\", render = fn, or container = \"...\"",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", mcp, mcp = \"read\", policy = Type, scope = Type, owner = column, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, sharded, validate_on_update = fetch, dependent(ChildRepository, fk = \"...\", on_delete = ...), retention(after = \"...\", basis = column, purge_deleted_after = \"...\", batch_size = N, every = \"...\"), position or position(column = \"...\", scope = \"...\"), broadcasts = true, topic = \"...\", render = fn, or container = \"...\"",
             ))
         }
     })
@@ -496,12 +1237,229 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             "mcp requires api = \"/path\": MCP tools are derived from the generated CRUD routes",
         ));
     }
+    // Warden 2026-09-13: `owner = <column>` has no effect on the generated
+    // `api = "..."` CRUD routes. It only emits opt-in `list_scoped`/
+    // `search_page_scoped` repository methods for a hand-written handler to
+    // call with an explicit owner id — the auto-generated `_api_list`,
+    // `_api_get`, `_api_update` and `_api_delete` handlers never call them,
+    // and always fall back to the plain, unscoped `page`/`find_by_id`/
+    // `update`/`delete_by_id`. Only `policy = Type` actually gates the
+    // single-record handlers: `policy_check_show`/`policy_check_update_pre`/
+    // `policy_check_delete_pre` are each generated purely from `has_policy` —
+    // there is no `scope`-driven equivalent for `_api_get`/`_api_update`/
+    // `_api_delete`. `scope = Type` only ever filters the *list* endpoint's
+    // SQL (`scope_list_body`'s `scope_type.is_some()` arm) — it is a
+    // performance companion to a policy, never a substitute for one. So
+    // `policy_type` must be present; `scope_type` may additionally be present
+    // (for a cheaper SQL-level list filter) but never as its replacement. A
+    // first cut of this fix accepted `scope` as an alternative to `policy`,
+    // which left `_api_get`/`_api_update`/`_api_delete` fully unguarded for
+    // `owner = <column>` + `api = "..."` + `scope = Type` with no `policy` —
+    // caught in review (Codex, PR #2770) before merge.
+    if api_path.is_some() && owner_column.is_some() && policy_type.is_none() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "owner = <column> has no effect on the generated `api = \"...\"` CRUD routes: only \
+             `policy = Type` gates `GET`/`PUT`/`DELETE <api>/{id}` (via can_show/can_update/\
+             can_delete) and the list endpoint when no `scope` is set. `scope = Type` alone \
+             is not enough — it only filters `GET <api>`'s SQL query and has no effect on the \
+             single-record routes, which would stay fully open. Add `policy = Type` (referencing \
+             `owner_id`/`ctx.user_id_i64()` from it), keeping `scope = Type` alongside it if you \
+             want the list endpoint's cheaper SQL-level filter too, or drop `api = \"...\"` and \
+             call the generated `list_scoped(owner_id, ..)` / `search_page_scoped(owner_id, ..)` \
+             methods from your own hand-written, owner-checked routes instead",
+        ));
+    }
     if validate_on_update_fetch && no_upsert_trait {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
             "validate_on_update = fetch requires the generated update draft (from_patch), \
              which no_upsert_trait repositories do not have; remove one of the two",
         ));
+    }
+    if ledgered {
+        // The ledger is version history promoted to queryable, hash-chained
+        // state, so it rides the version-history write paths rather than adding
+        // its own. Opting into `ledgered` opts into `versioned` by construction:
+        // one marker, per the issue's first acceptance criterion.
+        versioned = true;
+        if !soft_delete {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "ledgered = true requires soft_delete: a hard DELETE erases the row the \
+                 ledger reconstructs, so an as-of query would return state whose record \
+                 no longer exists and `verify` could not tell erasure from tampering. Add \
+                 `soft_delete` to #[repository(...)] — a ledgered delete records a revision \
+                 and is undone with restore()",
+            ));
+        }
+        if no_versioned_record_impl {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "ledgered = true is incompatible with no_versioned_record_impl: the ledger \
+                 snapshots a record through the generated VersionedRecord impl, and a \
+                 hand-written one is not guaranteed to serialize every column. Remove \
+                 `no_versioned_record_impl`, or drop `ledgered = true`",
+            ));
+        }
+    } else if ledger_valid_time.is_some() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "ledgered(valid_time = \"...\") has no effect without the ledger; write \
+             `ledgered(valid_time = \"...\")` rather than disabling `ledgered`",
+        ));
+    }
+    if let Some(spec) = &retention {
+        if spec.purge_deleted_after.is_some() && !soft_delete {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "retention(purge_deleted_after = \"...\") requires soft_delete: there is no \
+                 deleted_at column to purge against without it. Add `soft_delete` to \
+                 #[repository(...)], or use retention(after = \"...\", basis = <column>) for a \
+                 hard-delete policy instead",
+            ));
+        }
+        if soft_delete
+            && spec.after.is_some()
+            && spec
+                .basis
+                .as_ref()
+                .is_some_and(|basis| basis == "deleted_at")
+        {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "retention(after = \"...\", basis = deleted_at) on a soft_delete repository \
+                 silently sweeps nothing forever: the age branch's query always combines \
+                 `basis < cutoff` with the generated `deleted_at IS NULL` filter, and SQL's \
+                 NULL semantics mean no row ever satisfies both at once. Use a different \
+                 column for `basis` (e.g. created_at, updated_at, or last_seen_at) — \
+                 `purge_deleted_after` is what ages out already-soft-deleted rows by \
+                 `deleted_at`",
+            ));
+        }
+        if sharded {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "retention(...) does not support sharded repositories yet: a sweep would only \
+                 reach the pool it happens to be given, silently skipping every other shard. \
+                 Remove `sharded`, or sweep each shard's table by hand for now",
+            ));
+        }
+        if !dependents.is_empty() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "retention(...) does not support dependent(...) yet: the sweep mutates rows \
+                 directly and does not run the cascade-aware delete path dependent(...) \
+                 generates, so a hard-delete sweep could orphan children (or silently ignore \
+                 an on_delete = restrict rule) and a soft-delete sweep would leave active \
+                 children attached to a swept parent. Remove `dependent(...)`, or call \
+                 delete_many(ids)/delete_by_id(id) yourself from a hand-written #[scheduled] \
+                 sweep for now",
+            ));
+        }
+        if spec.batch_size == Some(0) {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "retention(batch_size = 0) would select zero rows every run and disable the \
+                 sweep permanently while still reporting success; remove `batch_size` for the \
+                 default, or set it to a positive number",
+            ));
+        }
+        if spec.batch_size.is_some_and(|n| n > i64::MAX as u64) {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "retention(batch_size = ...) must fit in a Postgres LIMIT (at most i64::MAX); \
+                 a larger value wraps to a negative LIMIT and every sweep query fails",
+            ));
+        }
+        if versioned {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "retention(...) does not support versioned = true yet: the sweep mutates rows \
+                 directly and does not run the version-history-writing delete path \
+                 delete_by_id/delete_many use, so a swept row would disappear with no audit \
+                 record. Remove `versioned = true`, or call delete_many(ids)/delete_by_id(id) \
+                 yourself from a hand-written #[scheduled] sweep for now",
+            ));
+        }
+        if hooks_type.is_some() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "retention(...) does not support hooks = Type yet: the sweep mutates rows \
+                 directly and does not run the hook-aware delete path delete_by_id/delete_many \
+                 use, so a before_delete hook that rejects deletion (e.g. a published-record \
+                 guard) cannot protect a row from the scheduled sweep, and post-delete side \
+                 effects never run. Remove `hooks = Type`, or call \
+                 delete_many(ids)/delete_by_id(id) yourself from a hand-written #[scheduled] \
+                 sweep for now",
+            ));
+        }
+        if broadcasts {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "retention(...) does not support broadcasts = true yet: the sweep mutates rows \
+                 directly and does not run the inline delete broadcast the scaffolded-live \
+                 delete path emits, so realtime subscribers would keep a stale record after a \
+                 swept row is gone. Remove `broadcasts = true`, or call \
+                 delete_many(ids)/delete_by_id(id) yourself from a hand-written #[scheduled] \
+                 sweep for now",
+            ));
+        }
+        if position.is_some() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "retention(...) does not support position(...) yet: the sweep batches up to \
+                 `batch_size` rows into one DELETE/UPDATE statement, and each swept row's \
+                 compaction trigger only sees its own pre-statement OLD position — several \
+                 swept rows from the same scope in one sweep statement can leave a gap in the \
+                 ordered sequence (#2240, same root cause already fixed for \
+                 delete_many/update_many by forcing chunk size 1). Remove `position(...)`, or \
+                 age rows out of the ordered list yourself via delete_many(ids) (already \
+                 single-row-chunked for position tables) from a hand-written #[scheduled] \
+                 sweep for now",
+            ));
+        }
+    }
+    if position.is_some() {
+        // Scoped down for this slice (issue #1358), mirroring retention(...)'s
+        // own incompatibility list above: the generated `move_*` methods open
+        // their own plain transaction and do not run the tenant/shard/version/
+        // hooks/cascade machinery those options add to the *generated CRUD*
+        // paths, so combining them would silently skip that machinery for a
+        // move rather than actually supporting it.
+        if sharded {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "position(...) does not support sharded repositories yet: a move only reaches \
+                 the pool it happens to be given. Remove `sharded`, or reorder within a single \
+                 shard's table by hand for now",
+            ));
+        }
+        if tenant_scoped {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "position(...) does not support tenant_scoped repositories yet: the generated \
+                 `move_*` methods do not add the tenant filter, so a move could read or shift \
+                 another tenant's rows. Remove `tenant_scoped`, or scope the ordering to a \
+                 tenant-owned parent column instead (`position(scope = \"...\")`) for now",
+            ));
+        }
+        if versioned {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "position(...) does not support versioned = true yet: a move does not write a \
+                 version-history entry the way delete_by_id/update do. Remove \
+                 `versioned = true`, or treat position moves as unaudited for now",
+            ));
+        }
+        if !dependents.is_empty() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "position(...) does not support dependent(...) yet: these are independent \
+                 concerns today (a move never deletes a row), but combining them is untested. \
+                 Remove `dependent(...)`, or file a follow-up if you need both",
+            ));
+        }
     }
     let table = table_name.unwrap_or_else(|| infer_table_name(&model));
     let generated_internal_hooks = false;
@@ -523,6 +1481,8 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         searchable,
         versioned,
         no_versioned_record_impl,
+        ledgered,
+        ledger_valid_time,
         primary_reads,
         sharded,
         broadcasts,
@@ -533,6 +1493,10 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         dependents,
         validate_on_update_fetch,
         owner_column,
+        retention,
+        position,
+        invalidates,
+        acknowledge_stale,
     })
 }
 
@@ -540,8 +1504,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
 struct DerivedQuery {
     prefix: String,      // "find", "count", "delete", "exists"
     fields: Vec<String>, // ["title", "published"]
-    #[allow(dead_code)] // reserved for Tier 2 OR support
-    combinator: String, // "and" or "or"
+    combinator: String,  // "and" or "or"
 }
 
 fn parse_query_name(name: &str) -> Option<DerivedQuery> {
@@ -805,6 +1768,53 @@ struct FindOrCreateSpec {
     error: Option<String>,
 }
 
+/// A build-time refusal of a server-side predicate over a `#[confidential]`
+/// column (issue #1771).
+///
+/// `#[model]` publishes every model's confidential columns as
+/// `__AUTUMN_CONFIDENTIAL_COLUMNS`. This macro cannot see the model's fields, so
+/// it emits a `const` that reads that list and fails const evaluation when the
+/// column is sealed. Unlike the at-rest encryption guard above, which can only
+/// be a runtime check, this one stops the build — which is the point: a sealed
+/// column can never satisfy the predicate, so shipping it is never correct.
+///
+/// The message is composed here, where the method and column names are known.
+///
+/// The `const` is non-generic in every emission site (a fn body, a closure body,
+/// an `async` block), so it is always evaluated eagerly. Moving it into an
+/// associated const of a generic impl would defer it to monomorphization and
+/// silently stop refusing anything.
+///
+/// The const list is emitted for every `#[model]`, so this resolves for every
+/// repository over one. A repository over a hand-rolled Diesel struct fails with
+/// `E0599: no associated item named __AUTUMN_CONFIDENTIAL_COLUMNS` — the same
+/// class of error that struct already gets from the other `#[model]` items this
+/// macro calls.
+fn confidential_column_guard(
+    model_name: &Ident,
+    column: &str,
+    method: &str,
+    clause: &str,
+) -> TokenStream {
+    let msg = format!(
+        "`{method}` puts `{model_name}::{column}` in a server-side {clause}, but that column \
+         is `#[confidential]`: it is sealed under a key the server never holds, so the \
+         database only ever compares ciphertext. Declare the field \
+         `#[confidential(blind_index)]` and query its companion column `{column}_bidx`, \
+         whose token the client computes and the server can compare."
+    );
+    quote! {
+        const _: () = {
+            if ::autumn_web::confidential::__column_is_confidential(
+                #model_name::__AUTUMN_CONFIDENTIAL_COLUMNS,
+                #column,
+            ) {
+                ::core::panic!(#msg);
+            }
+        };
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn generate_derived_query_for_source(
     query: &DerivedQuery,
@@ -817,6 +1827,18 @@ fn generate_derived_query_for_source(
     let field_idents: Vec<Ident> = query.fields.iter().map(|f| format_ident!("{f}")).collect();
     let param_names: Vec<Ident> = query.fields.iter().map(|f| format_ident!("{f}")).collect();
     let table_name_str = table_ident.to_string();
+
+    // #1771: refuse a WHERE over a sealed column at build time.
+    let method_name = format!(
+        "{}_by_{}",
+        query.prefix,
+        query.fields.join(&format!("_{}_", query.combinator))
+    );
+    let confidential_guards: Vec<TokenStream> = query
+        .fields
+        .iter()
+        .map(|f| confidential_column_guard(model_name, f, &method_name, "WHERE clause"))
+        .collect();
 
     // Build the filter chain. For `String`-typed parameters we route the value
     // through the encrypted-column registry at runtime: a deterministic-encrypted
@@ -875,6 +1897,7 @@ fn generate_derived_query_for_source(
     match query.prefix.as_str() {
         "find" => {
             quote! {
+                #(#confidential_guards)*
                 #(#encode_lets)*
                 let mut conn = self.__autumn_acquire_read_conn().await?;
                 #query_source
@@ -887,6 +1910,7 @@ fn generate_derived_query_for_source(
         }
         "count" => {
             quote! {
+                #(#confidential_guards)*
                 #(#encode_lets)*
                 let mut conn = self.__autumn_acquire_read_conn().await?;
                 #query_source
@@ -901,7 +1925,16 @@ fn generate_derived_query_for_source(
         "delete" => {
             if soft_delete {
                 quote! {
+                    #(#confidential_guards)*
                     #(#encode_lets)*
+                    // The derived soft-delete / timestamp write has no `AppState`
+                    // in scope, so it cannot reach the injected clock. The allow is
+                    // emitted into the expansion so a determinism deny-lint never
+                    // fires in the *calling* crate, whose author did not write this
+                    // code. Known-open gap, tracked as an autumn #1797 follow-up.
+                    // Keep the emitted `reason` SHORT: it is repeated in every
+                    // generated method in every downstream crate.
+                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::reexports::diesel::update(
@@ -915,6 +1948,7 @@ fn generate_derived_query_for_source(
                 }
             } else {
                 quote! {
+                    #(#confidential_guards)*
                     #(#encode_lets)*
                     let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::reexports::diesel::delete(#query_source #(#filters)*)
@@ -927,6 +1961,7 @@ fn generate_derived_query_for_source(
         }
         "exists" => {
             quote! {
+                #(#confidential_guards)*
                 #(#encode_lets)*
                 let mut conn = self.__autumn_acquire_read_conn().await?;
                 ::autumn_web::reexports::diesel::select(
@@ -1035,8 +2070,11 @@ fn is_string_param_type(ty: &syn::Type) -> bool {
 /// - `conn_ident` — identifier of the `&mut AsyncPgConnection`-like variable
 // #1996: the write path forks into pg / sqlite `backend_select!` arms (drop the
 // `$7::jsonb` cast, bind `recorded_at` explicitly on SQLite), which pushes this
-// token builder just past the line lint.
-#[allow(clippy::too_many_lines)]
+// token builder just past the line lint. #1699 adds the `ledgered` flag, which
+// selects whether a ledger revision is appended alongside the history row —
+// one more parameter than the arg lint allows, and splitting the tuple would
+// only rename the same eight values.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn vh_insert_ts(
     table_name_str: &str,
     op: &str,
@@ -1045,6 +2083,7 @@ fn vh_insert_ts(
     before_expr: Option<&TokenStream>,
     conn_ident: &TokenStream,
     model_ident: &proc_macro2::Ident,
+    ledgered: bool,
 ) -> TokenStream {
     // Choose the version-history actor. Hooked repos read the per-record
     // `MutationContext` (already seeded from the ambient current actor, and
@@ -1069,12 +2108,20 @@ fn vh_insert_ts(
         quote! { ::core::option::Option::None::<&str> }
     };
 
+    // #2429: the `__vh_json` / `__vh_before_json` / `__vh_after_json` bindings are
+    // freshly serialized per mutation and feed nothing but the diff, so they go to
+    // the `*_owned` entry points by value. Those move each retained column name
+    // and value straight into the `ColumnChange`, where the `&Value` variants had
+    // to clone and then drop each one — two allocations and two drops per retained
+    // field on the audit-trail write path of every versioned repository. Output is
+    // identical (`autumn/src/version_history.rs` holds the owned and borrowed
+    // functions to an exact parity matrix); do not reintroduce a borrow here.
     let changes_ts = match op {
         "insert" => quote! {
             {
                 use ::autumn_web::version_history::VersionedRecord as _;
                 let __vh_json = (#record_expr).version_column_values();
-                let __vh_changes = ::autumn_web::version_history::compute_insert_changes(&__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
+                let __vh_changes = ::autumn_web::version_history::compute_insert_changes_owned(__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
                 ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
                     .unwrap_or_else(|_| "[]".to_string())
             }
@@ -1083,7 +2130,7 @@ fn vh_insert_ts(
             {
                 use ::autumn_web::version_history::VersionedRecord as _;
                 let __vh_json = (#record_expr).version_column_values();
-                let __vh_changes = ::autumn_web::version_history::compute_delete_changes(&__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
+                let __vh_changes = ::autumn_web::version_history::compute_delete_changes_owned(__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
                 ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
                     .unwrap_or_else(|_| "[]".to_string())
             }
@@ -1096,7 +2143,7 @@ fn vh_insert_ts(
                     use ::autumn_web::version_history::VersionedRecord as _;
                     let __vh_before_json = (#before).version_column_values();
                     let __vh_after_json = (#record_expr).version_column_values();
-                    let __vh_changes = ::autumn_web::version_history::compute_diff(&__vh_before_json, &__vh_after_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
+                    let __vh_changes = ::autumn_web::version_history::compute_diff_owned(__vh_before_json, __vh_after_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
                     ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
                         .unwrap_or_else(|_| "[]".to_string())
                 }
@@ -1105,6 +2152,17 @@ fn vh_insert_ts(
     };
 
     let table_name_ts = table_name_str.to_string();
+    let op_variant = version_op_variant(op);
+
+    // #1699: a ledgered repository appends an immutable, hash-chained revision
+    // alongside the version-history row, in the same already-open transaction.
+    // Emitted here rather than at each call site so every write path version
+    // history already covers is covered by the ledger too, by construction.
+    let ledger_ts = if ledgered {
+        ledger_append_ts(&table_name_ts, op, record_expr, conn_ident, model_ident)
+    } else {
+        quote! {}
+    };
 
     quote! {
         {
@@ -1119,53 +2177,506 @@ fn vh_insert_ts(
             };
             let __vh_actor: ::std::string::String = #actor_ts;
             let __vh_request_id: ::core::option::Option<&str> = #request_id_ts;
-            // #1996: the Postgres arm keeps the `$7::jsonb` cast (`changes` is a
-            // JSONB column). The SQLite arm drops the cast (JSON is stored as
-            // TEXT) and additionally binds `recorded_at` explicitly: the DDL
-            // `DEFAULT CURRENT_TIMESTAMP` yields `YYYY-MM-DD HH:MM:SS` (no
-            // offset), which is not lexicographically comparable with the
-            // offset-bearing encoding diesel produces for a bound `DateTime<Utc>`
-            // filter value — binding the timestamp here makes stored and filter
-            // values share one encoding so the `recorded_at >= / <=` TEXT
-            // comparisons in `version_history()` stay monotonic.
-            ::autumn_web::backend_select! {
-                pg => {
-                    ::autumn_web::reexports::diesel::sql_query(
-                        "INSERT INTO _autumn_version_history \
-                         (table_name, tenant_id, record_id, op, actor, request_id, changes) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)"
-                    )
-                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name_ts)
-                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_tenant_id)
-                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__vh_record_id)
-                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#op)
-                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_actor)
-                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_request_id)
-                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_changes_str)
-                    .execute(#conn_ident)
-                    .await
-                    .map_err(::autumn_web::AutumnError::from)?;
+            // The statement itself — both backend arms, all seven binds — lives
+            // in `autumn_web::version_history` rather than here. It is fully
+            // monomorphic (a concrete `RuntimeConnection`, primitive binds,
+            // nothing model-specific), so inlining it at each of this macro's
+            // ~30 mutation sites only made every versioned repository bigger.
+            ::autumn_web::version_history::append_version_history(
+                &mut *#conn_ident,
+                &::autumn_web::version_history::VersionHistoryWrite {
+                    table_name: #table_name_ts,
+                    tenant_id: __vh_tenant_id,
+                    record_id: __vh_record_id,
+                    op: #op_variant,
+                    actor: __vh_actor.as_str(),
+                    request_id: __vh_request_id,
+                    changes_json: __vh_changes_str.as_str(),
                 },
-                sqlite => {
-                    ::autumn_web::reexports::diesel::sql_query(
-                        "INSERT INTO _autumn_version_history \
-                         (table_name, tenant_id, record_id, op, actor, request_id, changes, recorded_at) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
-                    )
-                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name_ts)
-                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_tenant_id)
-                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__vh_record_id)
-                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#op)
-                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_actor)
-                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_request_id)
-                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_changes_str)
-                    .bind::<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite, _>(::autumn_web::reexports::chrono::Utc::now())
-                    .execute(#conn_ident)
+            )
+            .await?;
+            #ledger_ts
+        }
+    }
+}
+
+/// The [`VersionOp`] variant path for one of the three op strings this macro
+/// passes around (`"insert"`, `"update"`, `"delete"`).
+///
+/// [`VersionOp`]: autumn_web::version_history::VersionOp
+fn version_op_variant(op: &str) -> TokenStream {
+    match op {
+        "insert" => quote! { ::autumn_web::version_history::VersionOp::Insert },
+        "delete" => quote! { ::autumn_web::version_history::VersionOp::Delete },
+        _ => quote! { ::autumn_web::version_history::VersionOp::Update },
+    }
+}
+
+/// Generate the token stream that appends one `LedgerRevision` to
+/// `_autumn_ledger_revisions` (issue #1699).
+///
+/// Emitted from [`vh_insert_ts`] inside the caller's already-open transaction,
+/// so the revision and the row it describes commit together or not at all.
+///
+/// The append itself — the chain-state read, the #2323 high-water cross-checks,
+/// the sequence allocation, the hash, and the two writes — lives in
+/// `autumn_web::ledger::append_revision`, not here. None of it depends on the
+/// model: `RuntimeConnection` is a concrete type alias and every bound value is
+/// a primitive or a `serde_json::Value` the caller already built. Expanding all
+/// of it at each of `vh_insert_ts`'s ~30 call sites (two `QueryableByName`
+/// derives and a chain-state struct apiece) is what took a ledgered
+/// repository's generated source from 72 KB to 508 KB.
+///
+/// What stays here is exactly what needs the model:
+///
+/// * the snapshot, taken through the model's durable per-field codec rather
+///   than `serde_json::to_value` — `#[model]` stamps `#[serde(skip_serializing)]`
+///   on `#[private]` and non-`admin_visible` `#[encrypted]` fields while leaving
+///   `Deserialize` requiring them, so a serde snapshot would omit exactly the
+///   columns as-of reconstruction then demands back, and every `ledger_as_of` on
+///   such a model would fail. The same codec rewrites `#[encrypted]` columns as
+///   recoverable ciphertext, so the ledger table never holds plaintext the model
+///   chose to protect, and `__autumn_commit_hook_from_value` decrypts on the way
+///   out;
+/// * the typed `deleted_at` read-back on the delete path, which is a
+///   `schema.rs`-checked diesel query against this model's own table;
+/// * `LedgeredRecord::ledger_valid_from`, the model's valid-time source.
+fn ledger_append_ts(
+    table_name_ts: &str,
+    op: &str,
+    record_expr: &TokenStream,
+    conn_ident: &TokenStream,
+    model_ident: &proc_macro2::Ident,
+) -> TokenStream {
+    let op_variant = version_op_variant(op);
+
+    // `ledgered` implies `soft_delete`, so a delete here is always soft: the row
+    // survives with `deleted_at` set. Version history's delete entry records the
+    // row's pre-delete values, and the record handed to this builder is that same
+    // pre-delete load — but every ledger revision snapshots the state after its
+    // write, or as-of reconstruction after a delete would return a row whose
+    // `deleted_at` is null while a live `with_deleted()` query shows it set.
+    //
+    // The `deleted_at` the UPDATE wrote is read back from the table rather than
+    // recomputed: the several soft-delete paths bind it from differently-scoped
+    // locals, and the bulk paths from a per-chunk one, so reading the stored value
+    // is the only spelling that compiles everywhere and the only one guaranteed
+    // byte-identical to the row. One extra indexed lookup, on ledgered deletes only.
+    let table_ident = format_ident!("{table_name_ts}");
+    let soft_delete_stamp = if op == "delete" {
+        quote! {
+            {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                // Named, not glob-aliased: the sync prelude also brings a
+                // `first`, and only an explicit import shadows it.
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let __lg_deleted_at: ::core::option::Option<
+                    ::autumn_web::reexports::chrono::NaiveDateTime,
+                > = #table_ident::table
+                    .find(__lg_record_id)
+                    .select(#table_ident::deleted_at)
+                    .first::<::core::option::Option<
+                        ::autumn_web::reexports::chrono::NaiveDateTime,
+                    >>(&mut *#conn_ident)
                     .await
-                    .map_err(::autumn_web::AutumnError::from)?;
-                },
+                    .optional()
+                    .map_err(::autumn_web::AutumnError::from)?
+                    .flatten();
+                if let ::core::option::Option::Some(__lg_obj) = __lg_snapshot.as_object_mut() {
+                    __lg_obj.insert(
+                        "deleted_at".to_string(),
+                        ::autumn_web::reexports::serde_json::to_value(__lg_deleted_at)
+                            .unwrap_or(::autumn_web::reexports::serde_json::Value::Null),
+                    );
+                }
             }
         }
+    } else {
+        quote! {}
+    };
+
+    quote! {
+        {
+            let __lg_record_id: i64 = {
+                use ::autumn_web::version_history::VersionedRecord as _;
+                (#record_expr).version_record_id()
+            };
+            let __lg_tenant_id: ::core::option::Option<&str> = {
+                use ::autumn_web::version_history::VersionedRecord as _;
+                (#record_expr).version_tenant_id()
+            };
+            #[allow(unused_mut, reason = "only the delete arm rewrites the snapshot")]
+            let mut __lg_snapshot: ::autumn_web::reexports::serde_json::Value =
+                (#record_expr).__autumn_commit_hook_to_value()?;
+            #soft_delete_stamp
+            let __lg_valid_from: ::core::option::Option<
+                ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+            > = {
+                use ::autumn_web::ledger::LedgeredRecord as _;
+                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_valid_from(&(#record_expr))
+            };
+            ::autumn_web::ledger::append_revision(
+                &mut *#conn_ident,
+                ::autumn_web::ledger::LedgerAppend {
+                    table_name: #table_name_ts,
+                    tenant_id: __lg_tenant_id,
+                    record_id: __lg_record_id,
+                    op: #op_variant,
+                    actor: __vh_actor.as_str(),
+                    request_id: __vh_request_id,
+                    snapshot: __lg_snapshot,
+                    valid_from: __lg_valid_from,
+                },
+            )
+            .await?;
+        }
+    }
+}
+
+/// `#[validate(...)]` on the repository insert path (#2586).
+///
+/// `payload` is a `&New*` expression. Expands to a no-op for a payload type
+/// that does not implement `validator::Validate` — a model with no
+/// `#[validate]` columns, or a hand-written insert struct — so no repository
+/// needs migrating.
+///
+/// Pass the borrow the caller already holds rather than adding one: `validator`
+/// supplies a blanket `impl<T: Validate> Validate for &T`, so an extra `&` does
+/// still validate, but only through that impl. The direct form does not depend
+/// on it.
+fn maybe_validate_insert(payload: &TokenStream) -> TokenStream {
+    quote! {
+        {
+            // Both traits must be in scope for autoref resolution to choose
+            // between them; exactly one applies to any concrete payload type,
+            // so the other is (correctly) unused.
+            #[allow(unused_imports)]
+            use ::autumn_web::validation::{
+                MaybeValidateFallback as _, MaybeValidateViaValidator as _,
+            };
+            (&::autumn_web::validation::MaybeValidate(#payload)).autumn_maybe_validate()
+        }
+    }
+}
+
+/// Generate the `move_to`/`move_before`/`move_after`/`move_up`/`move_down`
+/// inherent methods for a `position(...)`-declaring repository (issue #1358).
+/// Empty `TokenStream` when `config.position` is `None`, so every existing
+/// repository's generated output is byte-for-byte unaffected.
+///
+/// `move_to` is the sole primitive that touches SQL; the other four compute
+/// an absolute target index (an unlocked read of the current/neighbor
+/// position — a benign race, since `move_to` itself re-reads under lock, see
+/// below) and delegate. All five run in one `scoped_immediate_transaction`
+/// each.
+///
+/// `move_to`'s algorithm: (1) look up the row's scope value (or `()` when
+/// unscoped); (2) lock every row in that scope, ordered by `id` — a FIXED
+/// global lock order, so two concurrent movers on the *same* scope serialize
+/// against each other's first lock rather than deadlock (they always attempt
+/// the same ascending-id order), while movers on *different* scopes never
+/// contend at all; (3) re-derive the row's current position from that locked
+/// set (a prior mover may have shifted it between step 1's unlocked read and
+/// step 2's lock) and clamp the requested target into `[0, len-1]`; (4) shift
+/// the rows strictly between `current` and `target` by one (toward `current`),
+/// then set this row's position to `target` — `O(rows shifted)`, not
+/// `O(table)`. A `soft_delete` repository additionally filters every query to
+/// live rows (`deleted_at IS NULL`), matching the migration's compaction
+/// triggers.
+#[allow(clippy::too_many_lines)]
+fn position_impl_methods(config: &RepoConfig, table_ident: &syn::Ident) -> TokenStream {
+    let Some(spec) = &config.position else {
+        return quote! {};
+    };
+    let model_name = &config.model_name;
+    let position_ident = format_ident!("{}", spec.column);
+    let scope_ident = spec.scope.as_ref().map(|s| format_ident!("{}", s));
+
+    let live_filter = if config.soft_delete {
+        quote! { .filter(#table_ident::deleted_at.is_null()) }
+    } else {
+        quote! {}
+    };
+
+    // `move_to`'s body, specialized at macro-expansion time for the scoped
+    // vs. unscoped case — the scope column identifier simply does not exist
+    // to reference in the unscoped case, so this can't be a runtime branch.
+    let (scope_lookup, scope_filter) = scope_ident.as_ref().map_or_else(
+        || (quote! {}, quote! {}),
+        |scope_ident| {
+            (
+                quote! {
+                    let __autumn_scope: i64 = #table_ident::table
+                        .find(id)
+                        .select(#table_ident::#scope_ident)
+                        #live_filter
+                        .first(conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?;
+                },
+                quote! { .filter(#table_ident::#scope_ident.eq(__autumn_scope)) },
+            )
+        },
+    );
+
+    // Same advisory-lock key the migration's insert-assign/delete-compact
+    // triggers take (see `position_triggers_up_sql_for`) — taking it here
+    // too, before the row-locking `SELECT`, closes a deadlock between
+    // `move_to`'s fixed id-ordered row locks and the compaction trigger's
+    // position-ordered `UPDATE`. Postgres-only; a no-op on `SQLite`.
+    let position_lock_name = format!("{}_{}_assign", config.table_name, spec.column);
+    let position_lock_scope_arg = scope_ident.as_ref().map_or_else(
+        || quote! { ::core::option::Option::None },
+        |_| quote! { ::core::option::Option::Some(__autumn_scope) },
+    );
+    let position_advisory_lock = quote! {
+        ::autumn_web::__private::position_advisory_lock(conn, #position_lock_name, #position_lock_scope_arg)
+            .await
+            .map_err(::autumn_web::AutumnError::from)?;
+    };
+
+    // Shared transaction body for move_to/move_up/move_down, parameterized only on
+    // how `__autumn_target` is computed from `__autumn_current` — the row's
+    // position as of this transaction's own locked read — and `__autumn_len`.
+    // move_up/move_down used to read the row's position in a separate, unlocked
+    // query, compute an absolute target, then hand that stale index to move_to: a
+    // TOCTOU window in which a concurrent mover could change the row's real
+    // position between the read and move_to's locked re-read, landing the row
+    // somewhere other than one step away, possibly in the wrong direction (#1358).
+    // Generating move_up/move_down as standalone methods that compute their
+    // relative target from the same locked `__autumn_current` this body reads
+    // removes the external read, and with it the gap.
+    let move_transaction_body = |target_expr: proc_macro2::TokenStream| {
+        quote! {
+            #scope_lookup
+            #position_advisory_lock
+            let __autumn_locked: ::std::vec::Vec<(i64, i64)> = ::autumn_web::maybe_for_update!(
+                #table_ident::table
+                    #scope_filter
+                    #live_filter
+                    .select((#table_ident::id, #table_ident::#position_ident))
+                    .order(#table_ident::id.asc())
+            )
+            .load(conn)
+            .await
+            .map_err(::autumn_web::AutumnError::from)?;
+            let Some(&(_, __autumn_current)) =
+                __autumn_locked.iter().find(|(rid, _)| *rid == id)
+            else {
+                return ::core::result::Result::Err(::autumn_web::AutumnError::not_found_msg(
+                    format!("{} with id {id} not found", stringify!(#model_name)),
+                ));
+            };
+            let __autumn_len = __autumn_locked.len() as i64;
+            let __autumn_target = #target_expr;
+            if __autumn_target != __autumn_current {
+                if __autumn_target > __autumn_current {
+                    ::autumn_web::reexports::diesel::update(
+                        #table_ident::table
+                            #scope_filter
+                            #live_filter
+                            .filter(#table_ident::#position_ident.gt(__autumn_current))
+                            .filter(#table_ident::#position_ident.le(__autumn_target)),
+                    )
+                    .set(#table_ident::#position_ident.eq(#table_ident::#position_ident - 1))
+                    .execute(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                } else {
+                    ::autumn_web::reexports::diesel::update(
+                        #table_ident::table
+                            #scope_filter
+                            #live_filter
+                            .filter(#table_ident::#position_ident.ge(__autumn_target))
+                            .filter(#table_ident::#position_ident.lt(__autumn_current)),
+                    )
+                    .set(#table_ident::#position_ident.eq(#table_ident::#position_ident + 1))
+                    .execute(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                }
+                ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                    .set(#table_ident::#position_ident.eq(__autumn_target))
+                    .execute(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+            }
+            ::core::result::Result::Ok(())
+        }
+    };
+
+    // Wraps `body` (from `move_transaction_body`) in the retry-wrapped
+    // `pub async fn #sig` shell every move_* method shares: connection
+    // acquisition, the deadlock/serialization-failure retry loop (Codex
+    // review — see the doc comment on the loop below), and the
+    // `scoped_immediate_transaction` call.
+    let move_method = |doc: proc_macro2::TokenStream,
+                       sig: proc_macro2::TokenStream,
+                       pre_check: proc_macro2::TokenStream,
+                       body: proc_macro2::TokenStream| {
+        quote! {
+            #doc
+            pub async fn #sig -> ::autumn_web::AutumnResult<()> {
+                #pre_check
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                let mut conn = self.__autumn_acquire_conn().await?;
+                // The advisory lock closes the id-order-vs-position-order row-lock
+                // deadlock between this method and the compaction triggers, but a
+                // concurrent delete or soft-delete can still win a row lock on one
+                // of this scope's rows before reaching its own trigger's advisory
+                // lock. That is a lock-type inversion — row lock then advisory
+                // lock, against this method's advisory lock then row locks — which
+                // Postgres's deadlock detector resolves by aborting one side with
+                // `40P01`. Retry a bounded few times on that, or on the `40001`
+                // serialization failure a stricter isolation level could raise,
+                // rather than surface a transient deadlock as a hard failure. Same
+                // classification `Db::tx_with` uses for its own retry loop (#1358).
+                let mut __autumn_attempt: u32 = 0;
+                loop {
+                let __autumn_move_result = ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(
+                    &mut *conn,
+                    |conn| {
+                        async move {
+                            #body
+                        }
+                        .scope_boxed()
+                    },
+                )
+                .await;
+                match __autumn_move_result {
+                    ::core::result::Result::Ok(()) => return ::core::result::Result::Ok(()),
+                    ::core::result::Result::Err(__autumn_move_err) => {
+                        if __autumn_attempt < 2
+                            && ::autumn_web::__private::is_retryable_txn_error(&__autumn_move_err)
+                        {
+                            __autumn_attempt += 1;
+                            continue;
+                        }
+                        return ::core::result::Result::Err(__autumn_move_err);
+                    }
+                }
+                }
+            }
+        }
+    };
+
+    let move_to = move_method(
+        quote! {
+            /// Move this row to absolute index `target` within its position
+            /// scope, clamped into `[0, len-1]`. Transaction-safe: see
+            /// `position_impl_methods`'s doc comment for the locking scheme.
+        },
+        quote! { move_to(&self, id: i64, target: i64) },
+        quote! {},
+        move_transaction_body(quote! { target.clamp(0, (__autumn_len - 1).max(0)) }),
+    );
+
+    let move_up = move_method(
+        quote! {
+            /// Move this row one position toward index 0 within its scope.
+            /// A no-op at the start of its scope.
+        },
+        quote! { move_up(&self, id: i64) },
+        quote! {},
+        move_transaction_body(
+            quote! { (__autumn_current - 1).clamp(0, (__autumn_len - 1).max(0)) },
+        ),
+    );
+
+    let move_down = move_method(
+        quote! {
+            /// Move this row one position away from index 0 within its scope.
+            /// A no-op at the end of its scope.
+        },
+        quote! { move_down(&self, id: i64) },
+        quote! {},
+        move_transaction_body(
+            quote! { (__autumn_current + 1).clamp(0, (__autumn_len - 1).max(0)) },
+        ),
+    );
+    let move_up_down = quote! { #move_up #move_down };
+
+    // `move_before` and `move_after` derive `other_id`'s position from the same
+    // `__autumn_locked` row set `move_transaction_body` already loads for `id`,
+    // not a separate unlocked read, so there is no TOCTOU window for a concurrent
+    // mover. An earlier version read `other_id`'s position before entering the
+    // lock, so a concurrent move of `other_id` could land the row somewhere other
+    // than immediately before or after the requested neighbor (#1358).
+    // `__autumn_locked` is already filtered to `id`'s scope, so "not found in it"
+    // doubles as the cross-scope check — a stricter one: it catches `other_id`
+    // missing or soft-deleted the same way it catches a genuine cross-scope
+    // mismatch, where the external lookup surfaced those as a 404 rather than this
+    // 400. That behaviour change is intentional and minor: to the caller, "can't
+    // find `other_id` in my scope" reads the same whichever cause applies.
+    let other_target_lookup = |cmp_gt: proc_macro2::TokenStream,
+                               adjust: proc_macro2::TokenStream| {
+        quote! {
+            {
+                let ::core::option::Option::Some(&(_, __autumn_other)) =
+                    __autumn_locked.iter().find(|(rid, _)| *rid == other_id)
+                else {
+                    return ::core::result::Result::Err(::autumn_web::AutumnError::bad_request_msg(
+                        format!(
+                            "{} {other_id} is not in the same position scope as {id}",
+                            stringify!(#model_name)
+                        ),
+                    ));
+                };
+                if __autumn_current #cmp_gt __autumn_other {
+                    __autumn_other
+                } else {
+                    __autumn_other #adjust
+                }
+            }
+        }
+    };
+
+    let move_before = move_method(
+        quote! {
+            /// Move this row to immediately before `other_id` within their
+            /// shared position scope. A no-op if `id == other_id`; returns
+            /// `400 Bad Request` if `other_id` is not found in `id`'s scope
+            /// (not in the table, soft-deleted, or genuinely in a different
+            /// scope). Transaction-safe: `other_id`'s position is derived
+            /// from the same locked row set `id`'s is, inside the same
+            /// transaction — see `position_impl_methods`'s doc comment.
+        },
+        quote! { move_before(&self, id: i64, other_id: i64) },
+        quote! {
+            if id == other_id {
+                return ::core::result::Result::Ok(());
+            }
+        },
+        move_transaction_body(other_target_lookup(quote! { > }, quote! { - 1 })),
+    );
+
+    let move_after = move_method(
+        quote! {
+            /// Move this row to immediately after `other_id` within their
+            /// shared position scope. A no-op if `id == other_id`; returns
+            /// `400 Bad Request` if `other_id` is not found in `id`'s scope
+            /// (not in the table, soft-deleted, or genuinely in a different
+            /// scope). Transaction-safe: `other_id`'s position is derived
+            /// from the same locked row set `id`'s is, inside the same
+            /// transaction — see `position_impl_methods`'s doc comment.
+        },
+        quote! { move_after(&self, id: i64, other_id: i64) },
+        quote! {
+            if id == other_id {
+                return ::core::result::Result::Ok(());
+            }
+        },
+        move_transaction_body(other_target_lookup(quote! { < }, quote! { + 1 })),
+    );
+    let move_before_after = quote! { #move_before #move_after };
+
+    quote! {
+        #move_to
+        #move_up_down
+        #move_before_after
     }
 }
 
@@ -1201,12 +2712,221 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let vis = &trait_def.vis;
     let commit_hooks_enabled = config.hooks_type.is_some() && config.commit_hooks;
     let tenant_extra = usize::from(config.tenant_scoped);
+    // Issue #1358: `move_to`/`move_before`/`move_after`/`move_up`/`move_down`.
+    // Empty when `position(...)` is not declared.
+    let position_impl_methods_ts = position_impl_methods(&config, &table_ident);
+    // The ordering column a `position(...)` repository assigns and reorders is
+    // a framework-maintained column, so it is registered as a claim (#1769): a
+    // `#[derivation]` on another model naming the same `(table, column)` would
+    // adjust it arithmetically and replace it on backfill, breaking the
+    // ordered-list invariant, and the boot refuses the pair.
+    let position_claim_registration = config.position.as_ref().map_or_else(
+        || quote! {},
+        |spec| {
+            let column = spec.column.as_str();
+            let table = table_ident.to_string();
+            let model_name = &config.model_name;
+            quote! {
+                ::autumn_web::reexports::inventory::submit! {
+                    ::autumn_web::derivation::CounterCacheClaim {
+                        model: ::core::stringify!(#model_name),
+                        child_table: #table,
+                        parent_table: #table,
+                        column: #column,
+                        direct_sql: true,
+                        module_path: ::core::module_path!(),
+                    }
+                }
+            }
+        },
+    );
 
-    // Soft-delete filter fragment: appended to every finder when soft_delete is true.
+    // ── #1325 counter caches ────────────────────────────────────────────────
+    //
+    // `#[model]` and `#[repository]` are separate proc-macro invocations, so this
+    // macro cannot see the model's `#[belongs_to(..., counter_cache)]` attributes.
+    // The bridge is the one `Model::dependents()` uses: the model emits inherent
+    // `counter_caches()` / `HAS_COUNTER_CACHES` items that shadow an empty blanket
+    // impl, and the generated code names them by concrete path. Each fragment
+    // below is emitted into every mutation path unconditionally. For a model with
+    // no counter cache the slice is empty, so the loop body never runs and no
+    // statement is issued, and the flag is a `const false` the optimizer folds
+    // away.
+    //
+    // Both fragments carry their own `use` of the trait inside a block expression,
+    // so a model relying on the blanket impl resolves without this macro injecting
+    // an import into every arm's scope.
+    let cc_specs = quote! {
+        {
+            #[allow(unused_imports)]
+            use ::autumn_web::repository::AutumnCounterCaches as _;
+            <#model_name>::counter_caches()
+        }
+    };
+    let cc_has = quote! {
+        ({
+            #[allow(unused_imports)]
+            use ::autumn_web::repository::AutumnCounterCaches as _;
+            <#model_name>::HAS_COUNTER_CACHES
+        })
+    };
+    // Increment every counter-cached parent of the freshly inserted `record`.
+    // Placed inside the mutation's transaction, after the insert.
+    let cc_after_insert = quote! {
+        ::autumn_web::repository::counter_cache_after_insert(conn, #cc_specs, &record).await?;
+    };
+    // Decrement before the row is (soft-)deleted: the parent is resolved from
+    // the still-present child row, and for a soft-deleting model the sub-select
+    // requires it to still be live, so a repeated delete moves nothing.
+    let cc_before_delete = quote! {
+        ::autumn_web::repository::counter_cache_before_delete_by_id(conn, #cc_specs, id).await?;
+    };
+    // Snapshot the foreign keys before an update so the post-update record can
+    // be diffed against them. Issues no statement when there are no specs.
+    let cc_capture = quote! {
+        let __autumn_cc_before =
+            ::autumn_web::repository::counter_cache_capture_fks(conn, #cc_specs, id).await?;
+    };
+    // Bulk variants. `save_many`/`save_many_skip_invalid` fold a chunk into one
+    // `+ n` per parent; `delete_many` decrements every affected parent in a
+    // single statement; `update_many` captures the whole batch's foreign keys in
+    // one `SELECT` per leg and diffs each returned record against them.
+    let cc_after_insert_chunk = quote! {
+        ::autumn_web::repository::counter_cache_after_insert_many(
+            conn, #cc_specs, &chunk_inserted,
+        ).await?;
+    };
+    let cc_capture_many = quote! {
+        let __autumn_cc_before_many =
+            ::autumn_web::repository::counter_cache_capture_fks_many(conn, #cc_specs, ids).await?;
+    };
+    // Every counter-cache hook takes the per-table advisory lock that
+    // serializes mutations on a table with a leg onto itself, but a hook runs
+    // where the mutation needs it, and several mutations row-lock before that
+    // point: `upsert_many` loads each chunk `FOR UPDATE` before it can diff it,
+    // the hooked delete loads the row `FOR UPDATE` for `before_delete`,
+    // `delete_many` preloads its rows, the dependent cascade locks the child
+    // ids, and a retention sweep locks its batch. Two such transactions that
+    // each hold the other's parent row would deadlock on the way to the
+    // advisory lock, so each of those paths takes it first, at the top of its
+    // transaction; the hook's later take is then a re-entrant no-op. A model
+    // without a self-referential leg issues nothing here.
+    let cc_serialize = quote! {
+        ::autumn_web::repository::counter_cache_serialize_self_referential(
+            conn, #cc_specs,
+        ).await?;
+    };
+    let cc_after_upsert_chunk = quote! {
+        ::autumn_web::repository::counter_cache_after_upsert_many(
+            conn, #cc_specs, &existing_rows, &chunk_upserted,
+        ).await?;
+    };
+    let cc_after_update_chunk = quote! {
+        ::autumn_web::repository::counter_cache_after_update_many(
+            conn, #cc_specs, &__autumn_cc_before_many, &chunk_updated,
+        ).await?;
+    };
+
+    // Move the counters for any leg whose foreign key actually changed.
+    let cc_after_update = quote! {
+        ::autumn_web::repository::counter_cache_after_update(
+            conn, #cc_specs, &__autumn_cc_before, &record,
+        ).await?;
+    };
+    // Increment before a soft-deleted row is revived, while the sub-select can
+    // still see it as soft-deleted — restoring a live row is then a no-op.
+    let cc_before_restore = quote! {
+        ::autumn_web::repository::counter_cache_before_restore_by_id(conn, #cc_specs, id).await?;
+    };
+
+    // Several no-hooks mutation paths are deliberately transaction-free: they
+    // issue exactly one statement, so a `BEGIN`/`COMMIT` round trip would be pure
+    // overhead. A counter cache makes that one statement two, which must commit or
+    // roll back together. Those paths therefore need a transaction if and only if
+    // the model declares a counter cache — which this macro cannot see, and learns
+    // from the model's `const HAS_COUNTER_CACHES`.
+    //
+    // That used to be spelled as an early-return transactional variant followed by
+    // the original statement: the whole mutation body twice, at seven sites per
+    // repository. Free at runtime, since the const folds, but not at compile time —
+    // both copies are parsed, name-resolved, type-checked, and borrow-checked on
+    // every build, together about 13.5% of every generated repository.
+    // `maybe_immediate_transaction` takes the const as a runtime flag and opens a
+    // transaction only when it is set, so the body is emitted once and runtime
+    // behaviour is unchanged.
+    //
+    // `body` is spliced inside `|conn| async move { … }`, so it must end in
+    // `Ok(<value>)` and may use `conn` freely. The result is a complete tail
+    // expression: call sites splice it instead of their bare statement, not before it.
+    let cc_tx_wrap = |ret_ty: &TokenStream, body: &TokenStream| {
+        quote! {
+            {
+                #[allow(unused_imports)]
+                use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                #[allow(unused_imports)]
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                ::autumn_web::__private::maybe_immediate_transaction::<
+                    #ret_ty, ::autumn_web::AutumnError, _,
+                >(&mut *conn, #cc_has, |conn| async move { #body }.scope_boxed())
+                .await
+            }
+        }
+    };
+
+    // Cascade variants (#1325). `__autumn_apply_dependent_on_conn` removes or
+    // detaches THIS model's rows on behalf of a parent's `dependent(...)`
+    // cascade; those rows may themselves be counter-cached children of some
+    // other parent, whose counters have to move too — otherwise a
+    // `dependent = destroy` on `User` silently leaves every surviving post's
+    // `comment_count` inflated.
+    let cc_before_delete_cascade = quote! {
+        ::autumn_web::repository::counter_cache_before_delete_by_id(
+            conn, #cc_specs, __cid,
+        ).await?;
+    };
+
+    // Soft-delete filter fragment: appended to every finder when soft_delete is true.    // Soft-delete filter fragment: appended to every finder when soft_delete is true.
     let sd_filter = if config.soft_delete {
         quote! { .filter(#table_ident::deleted_at.is_null()) }
     } else {
         quote! {}
+    };
+
+    // The decrement has to see exactly the rows the delete will remove. On a
+    // tenant-scoped repository the delete carries a `tenant_id` filter the raw
+    // `chunk` does not, so an id belonging to another tenant would decrement a
+    // counter for a child that survives — and the transaction commits, so
+    // nothing rolls it back. Narrow the chunk to the deletable rows first.
+    let cc_delete_chunk_scope = if config.tenant_scoped {
+        quote! {
+            let __autumn_cc_scoped: ::std::vec::Vec<i64> = {
+                let __q = #table_ident::table
+                    .filter(#table_ident::id.eq_any(chunk))
+                    #sd_filter;
+                if let ::core::option::Option::Some(ref t) = tenant_id {
+                    __q.filter(#table_ident::tenant_id.eq(t))
+                        .select(#table_ident::id)
+                        .load::<i64>(conn)
+                        .await
+                } else {
+                    __q.select(#table_ident::id).load::<i64>(conn).await
+                }
+                .map_err(::autumn_web::AutumnError::from)?
+            };
+            let __autumn_cc_chunk: &[i64] = &__autumn_cc_scoped;
+        }
+    } else {
+        quote! {
+            let __autumn_cc_chunk: &[i64] = chunk;
+        }
+    };
+    let cc_before_delete_chunk = quote! {
+        if #cc_has {
+            #cc_delete_chunk_scope
+            ::autumn_web::repository::counter_cache_before_delete_many(
+                conn, #cc_specs, __autumn_cc_chunk,
+            ).await?;
+        }
     };
 
     // #1841 owner-scoping: when the repository declares `owner = <column>`, we
@@ -1219,13 +2939,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // ── #1369 dependent destroy/nullify ─────────────────────────────
     //
     // Every generated repository exposes an internal, connection-taking helper
-    // that applies a `DependentAction` to *this* model's rows selected by an
-    // arbitrary foreign-key column. It runs on the caller's connection (and
-    // therefore inside the caller's transaction), so a parent repository's
-    // `delete_by_id` can cascade to its children transactionally. The helper is
-    // generated for every repository (cheap, no callers when unused) so the
-    // parent side only needs the child repository *type* — it never has to know
-    // the child's Diesel schema module.
+    // that applies a `DependentAction` to this model's rows, selected by an
+    // arbitrary foreign-key column. It runs on the caller's connection, and so
+    // inside the caller's transaction, letting a parent repository's `delete_by_id`
+    // cascade to its children transactionally. It is generated for every
+    // repository — cheap, and unused when nothing calls it — so the parent side
+    // needs only the child repository type, never the child's Diesel schema module.
     let dependent_child_helper = {
         // Per-row DESTROY: mirror the repository delete path for one child id
         // (`__cid`) on the caller's connection — load for-update (soft-delete
@@ -1262,9 +2981,46 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // soft-delete child must be hard-deleted too: a soft-deleted child left
         // pointing at a hard-deleted parent is both FK-invalid (NOT NULL FK) and a
         // semantic orphan. Non-soft-delete children are always hard-deleted.
-        let destroy_mutation = if config.soft_delete {
+        let destroy_mutation = if config.soft_delete && config.ledgered {
+            // #1699: a ledgered child is never hard-deleted, even by a cascade.
+            // Erasing the row erases the record the ledger reconstructs, which is
+            // what `ledgered` refusing `purge` and requiring `soft_delete` prevents.
+            //
+            // A soft-deleted parent takes the child with it and records a revision,
+            // as any other delete would. A hard-deleted parent leaves no good
+            // outcome: erasing the child is refused above, and soft-deleting it
+            // leaves a live foreign key pointing at a row about to disappear, which
+            // the database rejects, rolling the cascade back with an opaque
+            // constraint error. The parent's macro cannot see that this child is
+            // ledgered — separate `#[repository]` invocations — so the combination
+            // is refused here at runtime, with a typed error naming the fix.
+            quote! {
+                #destroy_count_bind = {
+                    if !__parent_soft {
+                        return ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::conflict(
+                                ::autumn_web::ledger::LedgerError::HardDeleteCascade {
+                                    table: #table_name.to_string(),
+                                    record_id: __cid,
+                                },
+                            ),
+                        );
+                    }
+                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
+                    let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                    ::autumn_web::reexports::diesel::update(
+                        #table_ident::table.find(__cid).filter(#table_ident::deleted_at.is_null())
+                    )
+                        .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                        .execute(conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?
+                };
+            }
+        } else if config.soft_delete {
             quote! {
                 #destroy_count_bind = if __parent_soft {
+                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     ::autumn_web::reexports::diesel::update(
                         #table_ident::table.find(__cid).filter(#table_ident::deleted_at.is_null())
@@ -1297,6 +3053,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 None,
                 &quote! { conn },
                 model_name,
+                config.ledgered,
             )
         } else {
             quote! {}
@@ -1323,17 +3080,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
-        // Live-child filter (`AND deleted_at IS NULL`), gated on the PARENT's
-        // delete kind at runtime (#1369). The filter applies only when the parent
-        // is being soft-deleted: the parent row survives, so an already
-        // soft-deleted child is logically gone and would cause no FK problem, and
-        // a live-only selection is correct. When the parent is HARD-deleted the
-        // filter is dropped so the cascade (and the restrict EXISTS probe) operate
-        // on EVERY physically-present child row — otherwise a pre-soft-deleted
-        // child whose NOT NULL FK still points at the parent would survive the
-        // filter and make the subsequent hard parent DELETE fail (destroy) or slip
-        // past the existence check as a raw DB 500 instead of a 409 (restrict).
-        // Non-soft-delete children have no `deleted_at` column, so no filter ever.
+        // Live-child filter (`AND deleted_at IS NULL`), gated at runtime on the
+        // parent's delete kind (#1369). It applies only when the parent is
+        // soft-deleted: the parent row survives and an already soft-deleted child
+        // is logically gone, so a live-only selection is correct. For a
+        // hard-deleted parent the filter is dropped, so the cascade and the
+        // restrict EXISTS probe cover every physically-present child row —
+        // otherwise a pre-soft-deleted child whose NOT NULL FK still points at the
+        // parent would survive it and make the hard parent DELETE fail, or slip
+        // past the existence check as a raw DB 500 instead of a 409. Non-soft-delete
+        // children have no `deleted_at` column, so they never get a filter.
         let destroy_live_filter = if config.soft_delete {
             quote! { if __parent_soft { " AND \"deleted_at\" IS NULL" } else { "" } }
         } else {
@@ -1361,19 +3117,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {}
         };
         // #1369 AC4: inline OOB delete broadcast for a broadcasts-only child,
-        // built from the child record we already hold (`__record`) so no
-        // pre-fetch is needed. Mirrors the inline delete broadcast the normal
-        // `delete_by_id` wrapper emits (static/dynamic topic, tenant scoping,
-        // custom `broadcast_render`), keyed on the destroyed child record.
-        // #1369 broadcast timing: do NOT publish the cascaded child's OOB delete
-        // mid-transaction. If a later dependent action or the parent mutation
-        // fails and the tx rolls back, a mid-tx publish can't be retracted and
-        // clients would drop a fragment for a child that still exists. Instead,
-        // accumulate (topic, dom_id) into `__ret_broadcasts` and hand them back to
-        // the parent, which publishes them only AFTER the tx commits (mirroring
-        // the normal inline delete broadcast, which effectively fires post-commit
-        // for that single op). Commit-hook children defer via the durable outbox
-        // and are unaffected (they never accumulate here — no double publish).
+        // built from the child record already held (`__record`), so no pre-fetch is
+        // needed. Mirrors the inline delete broadcast the normal `delete_by_id`
+        // wrapper emits — static/dynamic topic, tenant scoping, custom
+        // `broadcast_render` — keyed on the destroyed child record.
+        //
+        // Do not publish a cascaded child's OOB delete mid-transaction: if a later
+        // dependent action or the parent mutation fails and the tx rolls back, a
+        // mid-tx publish cannot be retracted and clients would drop a fragment for
+        // a child that still exists. Accumulate (topic, dom_id) into
+        // `__ret_broadcasts` and hand them to the parent, which publishes after
+        // commit. Commit-hook children defer via the durable outbox and never
+        // accumulate here, so they cannot double-publish.
         let destroy_broadcast = if dep_needs_broadcast {
             let base_topic = match generate_topic_format(
                 config
@@ -1430,19 +3185,47 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
-        // #1739 grandchild recursion: within the Destroy arm, after selecting a
-        // child row but before removing it, recurse into THIS model's own
-        // `dependent(...)` cascade keyed on the child's id, so grandchildren (and
-        // deeper) are destroyed/nullified inside the SAME transaction. Only
-        // `destroy` recurses: `delete_all` stays single-level (#1739 scope), and
-        // `nullify`/`restrict` remove no rows that could themselves own children.
-        // Restrict grandchildren are probed before mutating ones (mirroring the
-        // single-record restrict-first ordering); a restrict 409 anywhere in the
-        // tree rolls the whole transaction back. Cycle guard: `__visited` holds
-        // every (table, id) already on the destroy path; an already-seen row is
-        // skipped (see the per-row guard in the loop), so self-/mutual-referential
-        // graphs terminate rather than looping forever.
+        // #1739 grandchild recursion: inside the Destroy arm, after selecting a
+        // child row but before removing it, recurse into this model's own
+        // `dependent(...)` cascade keyed on the child's id, so grandchildren and
+        // deeper are destroyed or nullified in the same transaction. Only `destroy`
+        // recurses: `delete_all` stays single-level (#1739 scope), and
+        // `nullify`/`restrict` remove no rows that could own children. Restrict
+        // grandchildren are probed before mutating ones, mirroring the
+        // single-record restrict-first ordering; a restrict 409 anywhere in the
+        // tree rolls the whole transaction back. `__visited` holds every (table,
+        // id) already on the destroy path, and an already-seen row is skipped (see
+        // the per-row guard in the loop), so cyclic graphs terminate.
         let has_dependents = !config.dependents.is_empty();
+        // Ledger: when this child has none of the per-row machinery the Destroy
+        // cascade exists for — no repository-attribute grandchildren, no
+        // `before_delete`/etc. hooks, no version history/commit-hook/broadcast
+        // bookkeeping, and it is never soft-deleted — the per-row reload-then-
+        // delete loop below does no work a single batched statement couldn't:
+        // `#destroy_mutation`'s plain-hard-delete arm never reads `__record`, and
+        // nothing else in Phase 2 needs it either. Route that case through the
+        // same `dependent_delete_all` runtime helper already used for the
+        // `DeleteAll` action (which already batches its optional counter-cache
+        // decrement via `counter_cache_before_delete_many`), guarded by an
+        // additional RUNTIME check that this model has no *model-attribute*
+        // `#[has_many(dependent = ...)]` grandchildren either — `has_dependents`
+        // only rules out the repository-attribute route, and the two routes are
+        // resolved independently (see `dep_autumn_dependents_use` below). A model
+        // with runtime grandchildren still needs the per-row loop to cascade into
+        // them, so it falls through to the unchanged path at runtime.
+        // Codex review, PR #2647: `position(...)` is excluded too. A bulk
+        // multi-row DELETE removes several same-scope siblings in one
+        // statement, but the row-level compaction triggers `position(...)`
+        // installs only ever see one departing row at a time (see
+        // `delete_chunk_size`'s `config.position.is_some()` guard elsewhere in
+        // this file, which forces single-row chunks for the exact same
+        // reason) — removing several ranked siblings at once leaves the
+        // survivors' ranks gapped or duplicated instead of compacted.
+        let destroy_fast_path_eligible = !has_dependents
+            && config.hooks_type.is_none()
+            && !dep_needs_post
+            && !config.soft_delete
+            && config.position.is_none();
         // The grandchildren follow this child's delete kind: a soft-delete child
         // is only soft-deleted when its parent is (`__parent_soft`), so its own
         // children inherit `__parent_soft`; a non-soft-delete child is always hard
@@ -1506,26 +3289,24 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let compiletime_grandchild_mutating = quote! {
             #(#grandchild_mutating_calls)*
         };
-        // Codex P1 (model-side deps): when this repo has NO repository-attribute
-        // `dependent(...)`, its grandchildren may be declared ONLY on the child
-        // model (via `#[has_many(..., dependent = ...)]`), which populates the
-        // runtime `Model::dependents()` slice but leaves `config.dependents`
-        // empty. The #1739 compile-time recursion above is then empty, so without
-        // this the child row would be deleted while its own children still
-        // FK-reference it (FK failure on a hard delete, or silent orphans). So
-        // consult THIS model's runtime specs and recurse into each grandchild,
-        // mirroring the top-level model-side dispatch: restrict-probe first (a
-        // 409 rolls the whole tx back), then mutating. Reuses the existing
-        // `__visited` (table, id) cycle-guard set, the boxed-future `fn`
-        // recursion (the `Send` edge stays erased through the fn-pointer), and
-        // the `__ret_broadcasts` deferred-broadcast buffer for grandchild
-        // broadcasts. For a model with no dependents this is a cheap no-op that
-        // iterates an empty `&[]`, so the plain path stays behavior-equivalent.
-        // Codex round-5-A: same restrict/mutating split as the compile-time path,
-        // for the model-declared runtime walk. #1800 case 2: the two blocks are now
-        // emitted in SEPARATE loops (the restrict probe pre-scans every selected
-        // child id before any child hook), so each block re-binds
-        // `__autumn_gc_rt_deps` independently rather than sharing one binding.
+        // Codex P1 (model-side deps): when this repo declares no
+        // repository-attribute `dependent(...)`, its grandchildren may be declared
+        // only on the child model, via `#[has_many(..., dependent = ...)]`. That
+        // populates the runtime `Model::dependents()` slice but leaves
+        // `config.dependents` empty, so the compile-time recursion above is empty
+        // and the child row would be deleted while its own children still
+        // FK-reference it — an FK failure on a hard delete, or silent orphans.
+        // Consult this model's runtime specs instead and recurse into each
+        // grandchild, mirroring the top-level model-side dispatch: restrict-probe
+        // first, where a 409 rolls the whole tx back, then mutating. It reuses the
+        // `__visited` cycle guard, the boxed-future `fn` recursion that keeps the
+        // `Send` edge erased, and the `__ret_broadcasts` buffer. For a model with
+        // no dependents it iterates an empty `&[]`.
+        //
+        // #1800 case 2: the restrict and mutating blocks are emitted in separate
+        // loops — the restrict probe pre-scans every selected child id before any
+        // child hook — so each re-binds `__autumn_gc_rt_deps` independently rather
+        // than sharing one binding.
         let runtime_grandchild_restrict = quote! {
             // Inherent `dependents()` (real specs) shadows the blanket trait
             // method (empty); unqualified so the shadow wins, `&[]` otherwise.
@@ -1590,18 +3371,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { use ::autumn_web::repository::AutumnDependents as _; }
         };
 
-        // Declaration + return of the deferred-broadcast buffer for the Destroy
-        // arm. A broadcasts-only child accumulates its own OOB delete fragments;
-        // additionally, when this repo has dependents (#1739), grandchild cascades
-        // return their broadcasts here to propagate up to the top-level parent for
-        // post-commit publishing. Repos with neither return an empty buffer.
-        // The Destroy arm always declares `__ret_broadcasts` now (hence `true`):
-        // with repo-attribute deps for the #1739 compile-time grandchild
-        // broadcasts (`has_dependents`), and without them for the Codex-P1
-        // runtime model-side grandchild walk, which always emits its
-        // `__ret_broadcasts.extend(...)` even though the loop is a no-op for a
-        // model with no dependents. `dep_needs_broadcast` still additionally
-        // drives this repo's own broadcasts-only child accumulation.
+        // Declaration and return of the deferred-broadcast buffer for the Destroy
+        // arm. A broadcasts-only child accumulates its own OOB delete fragments,
+        // and when this repo has dependents (#1739) grandchild cascades return
+        // their broadcasts here to propagate up to the top-level parent for
+        // post-commit publishing. A repo with neither returns an empty buffer.
+        // The arm always declares `__ret_broadcasts` (hence `true`): with
+        // repo-attribute deps for the #1739 compile-time grandchild broadcasts,
+        // and without them for the model-side runtime walk, which always emits its
+        // `__ret_broadcasts.extend(...)` even when the loop is a no-op.
+        // `dep_needs_broadcast` still drives this repo's own accumulation.
         let needs_ret_buffer = true;
         let destroy_ret_decl = if needs_ret_buffer {
             quote! {
@@ -1627,20 +3406,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
-        // #1800 case 1: record every HANDLED row in the monotonic `__deleted` set
-        // (soft OR physical) so the bulk `delete_many` root dedup / hook
+        // #1800 case 1: record every handled row — soft or physical — in the
+        // monotonic `__deleted` set, so the bulk `delete_many` root dedup and hook
         // double-fire guard skips a root already processed as another root's
-        // descendant — a soft-deleted descendant MUST land here or its
-        // `before_delete` fires a second time in the bulk root loop. Separately
-        // record ONLY physically-removed rows in `__physical`: a soft delete
-        // (`SET deleted_at`, when this is a `#[soft_delete]` child AND the parent is
-        // soft-deleted) leaves the row physically present, so the diamond
-        // revisit-skip (which consults `__physical`, not `__deleted`) must NOT see
-        // it — otherwise a LATER hard-delete path (reached through a hard-deleted
-        // sibling/parent in a mixed soft/hard diamond) would skip it, leaving a
-        // dangling FK or FK-failing the hard delete. A non-soft child, or a soft
-        // child under a HARD parent, is always physically deleted, so it is recorded
-        // in BOTH sets.
+        // descendant. A soft-deleted descendant must land here, or its
+        // `before_delete` fires again in the bulk root loop.
+        //
+        // Record only physically-removed rows in `__physical`. A soft delete leaves
+        // the row present, so the diamond revisit-skip — which consults `__physical`,
+        // not `__deleted` — must not see it; otherwise a later hard-delete path,
+        // reached through a hard-deleted sibling or parent in a mixed diamond, would
+        // skip it and leave a dangling FK or fail the hard delete. A non-soft child,
+        // or a soft child under a hard parent, is always physically deleted and
+        // lands in both sets.
         let destroy_deleted_mark = if config.soft_delete {
             quote! {
                 __deleted.insert((#table_name, __cid));
@@ -1654,16 +3432,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 __physical.insert((#table_name, __cid));
             }
         };
-        // #1800 case 1 (companion guard): because a soft-deleted row is deliberately
-        // NOT recorded in `__physical` (only in the "all handled" `__deleted`), the
-        // Phase-2 revisit-skip — which consults `__physical` so the diamond's hard
-        // branch can still reach it — does NOT suppress a later SOFT re-visit of the
-        // SAME row (a pure-soft diamond), which would otherwise re-fire its
-        // `before_delete` hook and re-issue a no-op UPDATE. Skip it here instead: if
-        // this visit would soft-delete (`__parent_soft`) and the row is already
-        // soft-deleted, it is logically gone and nothing more is owed. A HARD
-        // re-visit (`!__parent_soft`) still proceeds to physically delete the row
-        // (the diamond's hard branch).
+        // #1800 case 1, companion guard. A soft-deleted row is deliberately absent
+        // from `__physical` and present only in `__deleted`, so the Phase-2
+        // revisit-skip — which consults `__physical` so the diamond's hard branch
+        // can still reach the row — does not suppress a later soft re-visit of the
+        // same row in a pure-soft diamond, which would re-fire `before_delete` and
+        // re-issue a no-op UPDATE. Skip it here instead: if this visit would
+        // soft-delete (`__parent_soft`) and the row is already soft-deleted, it is
+        // logically gone. A hard re-visit still proceeds to physically delete it.
         let destroy_soft_revisit_skip = if config.soft_delete {
             quote! {
                 if __parent_soft && __record.deleted_at.is_some() {
@@ -1673,6 +3449,204 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         } else {
             quote! {}
+        };
+
+        // Ledger: the unmodified per-row Destroy body — one bulk `FOR UPDATE` id
+        // select, a restrict pre-scan pass, then a reload-then-mutate pass per
+        // child id. Emitted verbatim regardless of `destroy_fast_path_eligible` so
+        // a model with runtime (`#[has_many(dependent = ...)]`) grandchildren —
+        // invisible to `has_dependents`, which only sees the repository-attribute
+        // route — still gets the recursive cascade it needs; see
+        // `destroy_fast_path` below.
+        let destroy_per_row_loop = quote! {
+            #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+            struct __AutumnDepId {
+                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                id: i64,
+            }
+            // Codex P2, "lock children before the restrict pre-scan": this id
+            // selection takes `FOR UPDATE` on every selected child row before the
+            // read-only restrict pre-scan below. Under READ COMMITTED an FK insert
+            // of a `restrict` grandchild takes `FOR KEY SHARE` on the referenced
+            // child row, so holding `FOR UPDATE` here blocks that insert until this
+            // transaction ends. A concurrent grandchild therefore cannot slip in
+            // between the pre-scan `EXISTS` probe and either the Phase-2 reload /
+            // `before_delete` hook or the child delete. The Phase-2 reload still
+            // calls `.for_update()`, but that is now a no-op re-lock rather than
+            // the first lock. The lock is hoisted from Phase 2 to here, over the
+            // same rows in the same parent→child order, so it adds no new deadlock
+            // class, and `ORDER BY id` makes acquisition order deterministic
+            // across concurrent cascades. This covers `delete_by_id` and both
+            // `delete_many` bulk paths, and both soft and hard child deletes:
+            // `#destroy_live_filter` is applied before `FOR UPDATE`, so the locked
+            // rows match the rows the later passes operate on.
+            //
+            // The `FOR UPDATE` clause is emitted only on Postgres. SQLite rejects
+            // `SELECT … FOR UPDATE` and needs no such clause: its single-writer
+            // database-level lock already serializes concurrent cascades — the
+            // rationale that also degrades the DSL `maybe_for_update!` seam to a
+            // plain read. `backend_select!` picks the suffix in autumn-web's own
+            // compilation, so the Postgres SQL is byte-identical to before and the
+            // SQLite form drops the clause.
+            #cc_serialize
+            let __for_update: &str = ::autumn_web::backend_select! {
+                pg => { " FOR UPDATE" },
+                sqlite => { "" },
+            };
+            let __q = format!(
+                "SELECT id FROM \"{}\" WHERE \"{}\" = $1{} ORDER BY id{}",
+                __table, __fk_column, #destroy_live_filter, __for_update
+            );
+            let __ids: ::std::vec::Vec<__AutumnDepId> =
+                ::autumn_web::reexports::diesel::sql_query(__q)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__parent_id)
+                    .load::<__AutumnDepId>(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+            // #1800 case 2, pre-scan pass: probe the `restrict` grandchildren of
+            // every selected child id before any child `before_delete` hook fires.
+            // Codex round-5-A already ordered a child's own grandchild restrict
+            // ahead of that child's hook, but the probe sat inside the per-child
+            // mutating loop, so with several siblings an earlier sibling's
+            // `before_delete` fired and only then did a later sibling's restrict
+            // grandchild return the 409. The transaction rolls back; a
+            // non-transactional hook side effect does not. Hoisting the read-only
+            // probe into its own pass closes that window. The probe mutates
+            // neither `__path` nor `__deleted` — a `restrict` action is a pure
+            // `SELECT EXISTS` — so it is safe ahead of, and need not re-run in, the
+            // mutating pass.
+            for __row in &__ids {
+                let __cid = __row.id;
+                // #1800, "re-probe restricts on hard revisits": skip a row already
+                // physically removed elsewhere, whose restrict grandchildren were
+                // probed on that path. This consults `__physical`, not the
+                // all-handled `__deleted`, to match the Phase-2 diamond
+                // revisit-skip below: a row merely soft-deleted on an earlier path
+                // is in `__deleted` but not in `__physical`, so a later
+                // hard-delete revisit still re-runs this pre-scan. Keyed on
+                // `__deleted` it would skip the probe while Phase 2, keyed on
+                // `__physical`, still hard-deletes the row — firing the child hook
+                // and falling through to a raw FK failure instead of the typed 409
+                // when the row has a soft-deleted restrict dependent. The
+                // hard-path probe drops the live filter, since `__parent_soft` is
+                // false there, so it includes the soft-deleted dependent and
+                // returns the 409 before any hook. The probe body may be empty, so
+                // this is a positive guard rather than an early `continue`, which
+                // clippy flags as redundant when it is the loop's last statement.
+                if !__physical.contains(&(#table_name, __cid)) {
+                    #grandchild_restrict_cascade
+                }
+            }
+            // Phase 2: now that every sibling's restrict grandchildren have
+            // passed, fire hooks and mutate.
+            for __row in __ids {
+                let __cid = __row.id;
+                // The diamond traversal revisit-skip (Codex round-5-B, #1800 case
+                // 1). Skip a row already physically removed, which dedups across
+                // independent batch roots and branches. It consults `__physical`,
+                // not the all-handled `__deleted`: a row soft-deleted on an
+                // earlier path is not physically gone, so a later hard path in a
+                // mixed diamond must still remove it. A redundant soft re-visit is
+                // caught by the `__record.deleted_at` guard below once reloaded,
+                // so a soft-handled row is not re-hooked either.
+                if __physical.contains(&(#table_name, __cid)) {
+                    continue;
+                }
+                // #1739 cycle guard (now the ACTIVE-path stack): skip a (table,
+                // id) already on the current destroy path. `insert` returns false
+                // when the row is already present, so a self- or mutual-reference
+                // (e.g. a grandchild pointing back at an ancestor) is not
+                // re-entered and the traversal terminates. Pushed here before
+                // descending; popped after this row's subtree completes (see the
+                // `__path.remove` below), so a completed sibling/root never
+                // suppresses a later cascade.
+                if !__path.insert((#table_name, __cid)) {
+                    continue;
+                }
+                // #1369: reload the exact id the parent-soft-gated selection
+                // returned. Do not re-apply `#sd_filter` (`deleted_at IS NULL`)
+                // here: on a hard parent delete the selection deliberately
+                // includes already soft-deleted children, whose FK still
+                // references the parent, so a live-only reload would return
+                // `None`, skip the hard delete, and leave the row to FK-fail the
+                // parent DELETE. The id set is authoritative for the parent kind,
+                // and the row is locked with `for_update`.
+                let __record = ::autumn_web::maybe_for_update!(#table_ident::table.find(__cid))
+                    .first::<#model_name>(conn)
+                    .await
+                    .optional()
+                    .map_err(::autumn_web::AutumnError::from)?;
+                if let ::core::option::Option::Some(__record) = __record {
+                    // #1800 case 1: skip a redundant SOFT re-visit of an already-
+                    // soft-deleted row (it is not in `__deleted`).
+                    #destroy_soft_revisit_skip
+                    #destroy_ctx_decl
+                    // #1800 case 2: this child's own `restrict` grandchildren were
+                    // already probed in the pre-scan pass above (read-only 409),
+                    // so the child `before_delete` hook only ever fires once every
+                    // reachable sibling restrict has passed.
+                    #destroy_before_delete
+                    // #1739: mutate this child's OWN dependents (grandchildren)
+                    // before removing the child row, so a hard delete never
+                    // leaves an FK-dangling grandchild and never FK-fails the
+                    // child delete.
+                    #grandchild_mutating_cascade
+                    // #1325: this child's OWN counter caches move as it is
+                    // destroyed, in the cascade's transaction. Without it a
+                    // `dependent = destroy` parent silently leaves every
+                    // surviving grandparent's count inflated.
+                    #cc_before_delete_cascade
+                    #destroy_mutation
+                    // #1800 case 1: record the row as gone ONLY when it was
+                    // physically deleted (a soft-deleted row stays reachable for a
+                    // later hard-delete path).
+                    #destroy_deleted_mark
+                    #destroy_post_mutation
+                }
+                // Codex round-5-B: pop this row off the ACTIVE path once its
+                // whole subtree is processed, so it only ever blocks re-entry
+                // WHILE on the recursion stack (cycle-break), never afterwards.
+                // Runs whether or not the row was still present.
+                __path.remove(&(#table_name, __cid));
+            }
+            ::core::result::Result::Ok(#destroy_ret_value)
+        };
+
+        // Ledger: when `destroy_fast_path_eligible` (no repository-attribute
+        // grandchildren, no hooks, no version-history/commit-hook/broadcast
+        // bookkeeping, never soft-deleted, no `position(...)` — see where it's
+        // computed above), route through the SAME bulk helper the `DeleteAll`
+        // action already uses
+        // (`dependent_delete_all`, which already batches its optional
+        // counter-cache decrement via `counter_cache_before_delete_many` instead
+        // of one decrement per row) rather than the per-row reload-then-delete
+        // loop, which for this exact configuration reloads a record nothing reads
+        // (`#destroy_mutation`'s plain-hard-delete arm deletes by id alone) and
+        // deletes it one row at a time. `has_dependents` only rules out
+        // repository-attribute grandchildren; a model can still declare runtime
+        // grandchildren via `#[has_many(dependent = ...)]`, invisible to this
+        // macro invocation, so this checks `#model_name::dependents()` — cheap,
+        // no DB round trip — and falls back to the untouched per-row loop when it
+        // is non-empty.
+        let destroy_body = if destroy_fast_path_eligible {
+            quote! {
+                if #model_name::dependents().is_empty() {
+                    ::autumn_web::repository::dependent_delete_all(
+                        conn,
+                        __table,
+                        #cc_specs,
+                        #cc_has,
+                        __fk_column,
+                        __parent_id,
+                    )
+                    .await?;
+                    ::core::result::Result::Ok(#destroy_ret_value)
+                } else {
+                    #destroy_per_row_loop
+                }
+            }
+        } else {
+            destroy_per_row_loop
         };
 
         quote! {
@@ -1704,12 +3678,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // `async fn`. The Destroy cascade is recursive and, for a self- or
             // mutual-referential `dependent(...)` graph, calls back into an
             // `__autumn_apply_dependent_on_conn` of this same type. An `async fn`'s
-            // anonymous future cannot then be proven `Send` (the auto-trait check
-            // is circular: the future's `Send`-ness depends on itself), so the
-            // whole cascade — and every `delete_by_id` that drives it — would fail
-            // its `+ Send` bound. Returning a `Pin<Box<dyn Future + Send>>` erases
-            // the recursive edge behind a trait object whose `Send` is axiomatic,
-            // breaking the cycle while keeping the cascade `Send`.
+            // anonymous future cannot then be proven `Send` — the auto-trait check
+            // is circular — so the cascade, and every `delete_by_id` driving it,
+            // would fail its `+ Send` bound. A `Pin<Box<dyn Future + Send>>` erases
+            // the recursive edge behind a trait object whose `Send` is axiomatic.
             #[doc(hidden)]
             // Codex round-5-B split the single cycle set into an active-path stack
             // plus a monotonic handled set; #1800 case 1 added the physical-delete
@@ -1723,26 +3695,25 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 __parent_id: i64,
                 __action: ::autumn_web::repository::DependentAction,
                 __parent_soft: bool,
-                // Codex round-5-B + #1800 case 1: THREE guard sets threaded through
-                // the recursion.
-                // `__path` is the ACTIVE recursion stack — a (table, id) is pushed
+                // Three guard sets are threaded through the recursion (Codex
+                // round-5-B, #1800 case 1).
+                //
+                // `__path` is the active recursion stack: a (table, id) is pushed
                 // before descending into its children and popped once its subtree
-                // completes; it breaks self-/mutual-referential cycles ONLY.
-                // `__deleted` is a MONOTONIC set of every row HANDLED by the cascade
-                // — soft OR physical. The bulk `delete_many` root dedup / hook
-                // double-fire guard consults it so a root already processed as
-                // another root's descendant is neither re-cascaded nor re-hooked
-                // (this is why a soft-handled row MUST be recorded here — #1800).
-                // `__physical` is the subset of rows PHYSICALLY removed; the diamond
-                // traversal revisit-skip consults ONLY it, so a hard-delete path can
-                // still physically remove a row a soft-delete path merely marked
-                // `deleted_at` on (a mixed soft/hard diamond) without the "all
-                // handled" set suppressing it.
-                // Separating `__path` from the others is what lets a batch process a
-                // descendant root before its ancestor without the ancestor's cascade
-                // pre-skipping a still-referenced intermediate (the removed
-                // monotonic-preseed's immediate-FK bug). See the Destroy arm's
-                // guards below.
+                // completes. It breaks self- and mutual-referential cycles only.
+                //
+                // `__deleted` is a monotonic set of every row the cascade handled,
+                // soft or physical. The bulk `delete_many` root dedup and hook
+                // double-fire guard consults it, so a root already processed as
+                // another root's descendant is neither re-cascaded nor re-hooked —
+                // which is why a soft-handled row must be recorded here (#1800).
+                //
+                // `__physical` is the subset physically removed; the diamond
+                // revisit-skip consults only it, so a hard-delete path can still
+                // remove a row a soft-delete path merely marked `deleted_at` on.
+                // Keeping `__path` separate lets a batch process a descendant root
+                // before its ancestor without the ancestor's cascade pre-skipping a
+                // still-referenced intermediate.
                 __path: &'__dep mut ::std::collections::HashSet<(&'static str, i64)>,
                 __deleted: &'__dep mut ::std::collections::HashSet<(&'static str, i64)>,
                 __physical: &'__dep mut ::std::collections::HashSet<(&'static str, i64)>,
@@ -1760,60 +3731,48 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #dep_autumn_dependents_use
                 let __table: &str = #table_name;
                 match __action {
+                    // Restrict, Nullify, and DeleteAll are pure dynamic SQL over
+                    // `__table` and `__fk_column`, both runtime `&str`s here, and
+                    // nothing in them is checked against this model's `schema.rs`.
+                    // They live in `autumn_web::repository` so the statements and
+                    // their `QueryableByName` rows compile once per program rather
+                    // than once per repository. Only `Destroy` stays generated: it
+                    // loads and deletes through diesel's typed DSL and recurses
+                    // through this repository's own pool.
                     ::autumn_web::repository::DependentAction::Restrict => {
-                        #[derive(::autumn_web::reexports::diesel::QueryableByName)]
-                        struct __AutumnDepExists {
-                            #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Bool)]
-                            dep_present: bool,
-                        }
-                        // `AS dep_present` (not `AS exists`): `exists` is a
-                        // Postgres reserved word and would need quoting.
-                        // The live filter makes `restrict` soft-delete-aware: an
-                        // already-soft-deleted child must not block the parent
-                        // with a 409 (it is no longer a live orphan).
-                        let __q = format!(
-                            "SELECT EXISTS(SELECT 1 FROM \"{}\" WHERE \"{}\" = $1{}) AS dep_present",
-                            __table, __fk_column, #destroy_live_filter
-                        );
-                        let __row: __AutumnDepExists =
-                            ::autumn_web::reexports::diesel::sql_query(__q)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__parent_id)
-                                .get_result::<__AutumnDepExists>(conn)
-                                .await
-                                .map_err(::autumn_web::AutumnError::from)?;
-                        if __row.dep_present {
-                            return ::core::result::Result::Err(
-                                ::autumn_web::AutumnError::conflict_msg(format!(
-                                    "cannot delete: dependent {} row(s) referencing this record \
-                                     via \"{}\".\"{}\" still exist (dependent = restrict)",
-                                    stringify!(#model_name), __table, __fk_column
-                                ))
-                            );
-                        }
+                        ::autumn_web::repository::dependent_restrict(
+                            conn,
+                            __table,
+                            stringify!(#model_name),
+                            #destroy_live_filter,
+                            __fk_column,
+                            __parent_id,
+                        )
+                        .await?;
                         ::core::result::Result::Ok(::std::vec::Vec::new())
                     }
                     ::autumn_web::repository::DependentAction::Nullify => {
-                        let __q = format!(
-                            "UPDATE \"{}\" SET \"{}\" = NULL WHERE \"{}\" = $1",
-                            __table, __fk_column, __fk_column
-                        );
-                        ::autumn_web::reexports::diesel::sql_query(__q)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__parent_id)
-                            .execute(conn)
-                            .await
-                            .map_err(::autumn_web::AutumnError::from)?;
+                        ::autumn_web::repository::dependent_nullify(
+                            conn,
+                            __table,
+                            #cc_specs,
+                            #cc_has,
+                            __fk_column,
+                            __parent_id,
+                        )
+                        .await?;
                         ::core::result::Result::Ok(::std::vec::Vec::new())
                     }
                     ::autumn_web::repository::DependentAction::DeleteAll => {
-                        let __q = format!(
-                            "DELETE FROM \"{}\" WHERE \"{}\" = $1",
-                            __table, __fk_column
-                        );
-                        ::autumn_web::reexports::diesel::sql_query(__q)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__parent_id)
-                            .execute(conn)
-                            .await
-                            .map_err(::autumn_web::AutumnError::from)?;
+                        ::autumn_web::repository::dependent_delete_all(
+                            conn,
+                            __table,
+                            #cc_specs,
+                            #cc_has,
+                            __fk_column,
+                            __parent_id,
+                        )
+                        .await?;
                         ::core::result::Result::Ok(::std::vec::Vec::new())
                     }
                     ::autumn_web::repository::DependentAction::Destroy => {
@@ -1825,170 +3784,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         // set breaks self-/mutual-referential cycles.
                         #destroy_register
                         #destroy_ret_decl
-                        #[derive(::autumn_web::reexports::diesel::QueryableByName)]
-                        struct __AutumnDepId {
-                            #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
-                            id: i64,
-                        }
-                        // Codex P2 ("Lock children before the restrict pre-scan"):
-                        // this id selection acquires `FOR UPDATE` on every selected
-                        // child row BEFORE the read-only restrict pre-scan below runs
-                        // its `EXISTS` probes. Under READ COMMITTED an FK insert of a
-                        // `restrict` grandchild takes a `FOR KEY SHARE` lock on the
-                        // referenced child row; holding `FOR UPDATE` on that row here
-                        // blocks such an insert until this transaction commits/rolls
-                        // back, so a concurrent grandchild cannot slip in between the
-                        // pre-scan `EXISTS` probe and either the Phase-2 child reload /
-                        // `before_delete` hook or the child delete. The Phase-2 reload
-                        // still calls `.for_update()`, but that is now a re-lock of a
-                        // row already held (a no-op) rather than the FIRST lock — the
-                        // TOCTOU window between probe and hook/delete is closed. The
-                        // lock is hoisted from Phase 2 to here (same parent -> child
-                        // order, same rows), so it introduces no new lock-ordering /
-                        // deadlock class. `ORDER BY id` also makes the lock acquisition
-                        // order deterministic across concurrent cascades. This covers
-                        // the single `delete_by_id` path and both `delete_many` bulk
-                        // paths (they all reach this shared helper), and both soft and
-                        // hard child deletes (the `#destroy_live_filter` gate is applied
-                        // BEFORE `FOR UPDATE`, so the locked row set matches the rows
-                        // the pre-scan + mutating pass operate on).
-                        // The `FOR UPDATE` locking clause is emitted only on
-                        // Postgres. `SQLite` rejects `SELECT … FOR UPDATE`
-                        // outright, and it needs no such clause: its single-writer
-                        // database-level lock already serializes concurrent
-                        // cascades (the same rationale that degrades the DSL
-                        // `maybe_for_update!` seam to a plain read on `SQLite`).
-                        // The suffix is selected in autumn-web's compilation via
-                        // `backend_select!`, so the Postgres SQL is byte-identical
-                        // to before and the `SQLite` form simply drops the clause.
-                        let __for_update: &str = ::autumn_web::backend_select! {
-                            pg => { " FOR UPDATE" },
-                            sqlite => { "" },
-                        };
-                        let __q = format!(
-                            "SELECT id FROM \"{}\" WHERE \"{}\" = $1{} ORDER BY id{}",
-                            __table, __fk_column, #destroy_live_filter, __for_update
-                        );
-                        let __ids: ::std::vec::Vec<__AutumnDepId> =
-                            ::autumn_web::reexports::diesel::sql_query(__q)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__parent_id)
-                                .load::<__AutumnDepId>(conn)
-                                .await
-                                .map_err(::autumn_web::AutumnError::from)?;
-                        // #1800 case 2: PRE-SCAN pass. Probe the `restrict`
-                        // grandchildren of EVERY selected child id BEFORE any child
-                        // `before_delete` hook fires. Codex round-5-A already ordered
-                        // a child's own grandchild restrict ahead of that SAME child's
-                        // hook, but the probe was still inside the per-child mutating
-                        // loop — so with multiple siblings an EARLIER sibling's
-                        // before_delete fired and only THEN a LATER sibling's restrict
-                        // grandchild returned the 409. The transaction rolls back, but
-                        // a non-transactional hook side effect does not. Hoisting the
-                        // read-only probe into its own pass over all ids closes that
-                        // window; the probe mutates neither `__path` nor `__deleted`
-                        // (a `restrict` action is a pure `SELECT EXISTS`), so it is
-                        // safe to run ahead of — and without re-running in — the
-                        // mutating pass below.
-                        for __row in &__ids {
-                            let __cid = __row.id;
-                            // #1800 (Codex "Re-probe restricts on hard revisits"):
-                            // skip a row already PHYSICALLY removed elsewhere (its
-                            // restrict grandchildren, if any, were probed on that
-                            // path). This consults `__physical`, NOT the "all handled"
-                            // `__deleted`, to stay consistent with the Phase-2 diamond
-                            // revisit-skip below: a row merely SOFT-deleted on an
-                            // earlier path is still in `__deleted` but NOT in
-                            // `__physical`, so a later HARD-delete revisit (mixed
-                            // soft/hard diamond) still re-runs this restrict pre-scan.
-                            // If the pre-scan keyed on `__deleted` it would skip the
-                            // probe while Phase-2 (keyed on `__physical`) still hard-
-                            // deletes the row — firing the child hook and falling
-                            // through to a raw FK failure instead of the typed 409
-                            // when the row has a soft-deleted restrict dependent. The
-                            // hard-path probe drops the live filter (`__parent_soft`
-                            // is false on that path), so it INCLUDES the soft-deleted
-                            // dependent and returns the 409 before any hook. The probe
-                            // body may be empty (no restrict grandchildren), so this is
-                            // written as a positive guard rather than an early
-                            // `continue` (which clippy flags as redundant when it is
-                            // the loop's last statement).
-                            if !__physical.contains(&(#table_name, __cid)) {
-                                #grandchild_restrict_cascade
-                            }
-                        }
-                        // Phase 2: now that every sibling's restrict grandchildren
-                        // have passed, fire hooks and mutate.
-                        for __row in __ids {
-                            let __cid = __row.id;
-                            // Codex round-5-B + #1800 case 1: the diamond traversal
-                            // revisit-skip. Skip a row already PHYSICALLY removed
-                            // (genuinely gone) — dedup across independent batch roots
-                            // / branches. This consults `__physical`, NOT the "all
-                            // handled" `__deleted`: a row soft-deleted on an earlier
-                            // path is NOT physically gone, so a later HARD path (mixed
-                            // soft/hard diamond) must still reach and physically remove
-                            // it. A redundant SOFT re-visit is instead caught by the
-                            // `__record.deleted_at` guard below (once reloaded), so a
-                            // soft-handled row is not re-hooked either.
-                            if __physical.contains(&(#table_name, __cid)) {
-                                continue;
-                            }
-                            // #1739 cycle guard (now the ACTIVE-path stack): skip a
-                            // (table, id) already on the current destroy path. `insert`
-                            // returns false when the row is already present, so a self-
-                            // or mutual-reference (e.g. a grandchild pointing back at an
-                            // ancestor) is not re-entered and the traversal terminates.
-                            // Pushed here before descending; popped after this row's
-                            // subtree completes (see the `__path.remove` below), so a
-                            // completed sibling/root never suppresses a later cascade.
-                            if !__path.insert((#table_name, __cid)) {
-                                continue;
-                            }
-                            // #1369: reload the EXACT id the (parent-soft-gated)
-                            // selection returned — do NOT re-apply `#sd_filter`
-                            // (`deleted_at IS NULL`) here. On a hard parent delete
-                            // the selection intentionally includes already
-                            // soft-deleted children (their FK still references the
-                            // parent), so a live-only reload would return `None`,
-                            // skip the hard delete, and leave the row to FK-fail
-                            // the parent DELETE. The id set is authoritative for
-                            // the parent kind; the row is locked with `for_update`.
-                            let __record = ::autumn_web::maybe_for_update!(#table_ident::table.find(__cid))
-
-                                .first::<#model_name>(conn)
-                                .await
-                                .optional()
-                                .map_err(::autumn_web::AutumnError::from)?;
-                            if let ::core::option::Option::Some(__record) = __record {
-                                // #1800 case 1: skip a redundant SOFT re-visit of an
-                                // already-soft-deleted row (it is not in `__deleted`).
-                                #destroy_soft_revisit_skip
-                                #destroy_ctx_decl
-                                // #1800 case 2: this child's own `restrict`
-                                // grandchildren were already probed in the pre-scan
-                                // pass above (read-only 409), so the child
-                                // `before_delete` hook only ever fires once every
-                                // reachable sibling restrict has passed.
-                                #destroy_before_delete
-                                // #1739: mutate this child's OWN dependents
-                                // (grandchildren) before removing the child row, so
-                                // a hard delete never leaves an FK-dangling
-                                // grandchild and never FK-fails the child delete.
-                                #grandchild_mutating_cascade
-                                #destroy_mutation
-                                // #1800 case 1: record the row as gone ONLY when it
-                                // was physically deleted (a soft-deleted row stays
-                                // reachable for a later hard-delete path).
-                                #destroy_deleted_mark
-                                #destroy_post_mutation
-                            }
-                            // Codex round-5-B: pop this row off the ACTIVE path once
-                            // its whole subtree is processed, so it only ever blocks
-                            // re-entry WHILE on the recursion stack (cycle-break), never
-                            // afterwards. Runs whether or not the row was still present.
-                            __path.remove(&(#table_name, __cid));
-                        }
-                        ::core::result::Result::Ok(#destroy_ret_value)
+                        #destroy_body
                     }
                 }
                 })
@@ -1996,21 +3792,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    // #1740 + Codex P1: bulk `delete_many` dependent cascade. `delete_many`
-    // historically bypassed `dependent(...)` entirely (a plain bulk parent
-    // delete), silently orphaning children. These tokens splice the SAME cascade
-    // the single-record delete path runs into both `delete_many_body` codegen
-    // branches (hooks and no-hooks). A repository-attribute `dependent(...)`
-    // drives it at compile time; a model-declared `#[has_many(dependent = ...)]`
-    // drives it at run time via `Model::dependents()` (Codex P1). A model with no
-    // dependents at all keeps its exact prior bulk codegen (byte-identical plain
-    // path, `()` tx return). Correctness over raw throughput: children are
-    // cascaded per parent row via the shared `__autumn_apply_dependent_on_conn`
-    // helper (so `destroy` recurses into grandchildren for free, #1739), which is
-    // the "per row" tradeoff called out in the issue.
+    // #1740 + Codex P1: bulk `delete_many` dependent cascade. `delete_many` once
+    // bypassed `dependent(...)` entirely — a plain bulk parent delete — silently
+    // orphaning children. These tokens splice the same cascade the single-record
+    // delete path runs into both `delete_many_body` codegen branches, hooks and
+    // no-hooks. A repository-attribute `dependent(...)` drives it at compile time;
+    // a model-declared `#[has_many(dependent = ...)]` drives it at run time via
+    // `Model::dependents()`. A model with no dependents keeps its exact prior bulk
+    // codegen. Correctness over raw throughput: children cascade per parent row
+    // through the shared `__autumn_apply_dependent_on_conn` helper, so `destroy`
+    // recurses into grandchildren for free (#1739).
     //
     // The parent's delete kind drives the child `destroy` cascade: soft when the
-    // parent repo is `#[soft_delete]` (its bulk path soft-deletes), hard otherwise.
+    // parent repo is `#[soft_delete]`, hard otherwise.
     let delete_many_parent_soft_lit = if config.soft_delete {
         quote! { true }
     } else {
@@ -2086,26 +3880,25 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .map_err(::autumn_web::AutumnError::from)?;
         }
     };
-    // Shared preamble: preload the affected (tenant/live-filtered, row-locked)
-    // parents and collect their ids, and declare the two cascade-guard sets +
-    // deferred-broadcast buffer. Used by BOTH the compile-time (repo-attribute)
-    // and runtime (Codex P1, model-declared) cascade blocks.
+    // Shared preamble: preload the affected parents — tenant- and live-filtered,
+    // row-locked — collect their ids, and declare the two cascade-guard sets plus
+    // the deferred-broadcast buffer. Used by both the compile-time
+    // (repo-attribute) and runtime (model-declared) cascade blocks.
     //
-    // Codex round-5-B: the bulk cascade threads TWO guard sets, NOT one monotonic
-    // visited set. `__autumn_path` is the ACTIVE recursion stack (pushed before a
-    // node's own cascade, popped right after — cycle-break ONLY); `__autumn_deleted`
-    // is the monotonic set of rows actually removed. The removed round-2/round-4
-    // monotonic pre-seed marked a batch root visited BEFORE it was deleted, so a
-    // self-referential `dependent = destroy` batch that happened to process a
-    // descendant root before its ancestor made the ancestor's cascade skip that
-    // descendant while deleting the intermediate it still references — tripping an
-    // IMMEDIATE foreign-key constraint. With the split, a descendant root's own
-    // Phase-2 iteration pushes then pops itself on `__autumn_path`, so it is NOT on
-    // the path (and not yet in `__autumn_deleted`) when the ancestor's cascade later
-    // reaches it: the ancestor cascades it deepest-first (no FK), and once it is
-    // truly removed `__autumn_deleted` skips it everywhere after (no double delete,
-    // no double hook — including the bulk-root hook loop, which consults it too).
-    // Cycles still terminate via `__autumn_path`.
+    // The bulk cascade threads two guard sets, not one monotonic visited set.
+    // `__autumn_path` is the active recursion stack, pushed before a node's own
+    // cascade and popped right after, and breaks cycles only. `__autumn_deleted`
+    // is the monotonic set of rows actually removed. A monotonic pre-seed marked a
+    // batch root visited before it was deleted, so a self-referential `dependent =
+    // destroy` batch that processed a descendant root before its ancestor made the
+    // ancestor's cascade skip that descendant while deleting the intermediate it
+    // still references, tripping an immediate foreign-key constraint. With the
+    // split, a descendant root's Phase-2 iteration pushes and pops itself on
+    // `__autumn_path`, so it is neither on the path nor yet in `__autumn_deleted`
+    // when the ancestor's cascade reaches it: the ancestor cascades it
+    // deepest-first, and once truly removed `__autumn_deleted` skips it everywhere
+    // after — no double delete, no double hook, including in the bulk-root hook
+    // loop. Cycles still terminate via `__autumn_path`.
     let delete_many_collect_parents = quote! {
         let mut __autumn_path: ::std::collections::HashSet<(&'static str, i64)> =
             ::std::collections::HashSet::new();
@@ -2755,13 +4548,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // ── Build struct fields, extractor init, and CRUD bodies ──────────────
     //
-    // When `hooks_type` is present, the struct gains a `hooks` field,
-    // the extractor initialises it with `Default::default()`, and the
-    // save / update / delete methods are wrapped in a transactional
-    // hook lifecycle (before_* ΓåÆ persist).
-    //
-    // When absent, the generated code is identical to the pre-hooks version
-    // (zero-cost path).
+    // With `hooks_type` present, the struct gains a `hooks` field, the extractor
+    // initialises it with `Default::default()`, and the save, update, and delete
+    // methods are wrapped in a transactional hook lifecycle (before_* → persist).
+    // Without it, the generated code is identical to the pre-hooks version.
 
     let tenant_struct_field = if config.tenant_scoped {
         quote! { across_tenants: bool, }
@@ -3003,10 +4793,63 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Bridge this repository to the many-to-many mutation traits `#[model]`
     // generates for `#[has_many(Target, through = ...)]` associations on
-    // `#model_name` (see `M2mConnSource`). Emitted unconditionally — cheap
-    // when the model has no `through =` associations (nothing calls it) —
-    // so it doesn't need to know which associations exist, only its own
-    // model and write-connection helper.
+    // `#model_name` (see `M2mConnSource`). Emitted unconditionally — cheap when
+    // the model has no `through =` associations, since nothing calls it — so it
+    // needs only its own model and write-connection helper.
+    // The tenant a `#[votable]` `react()` / `reaction_of()` must filter its target
+    // lookup on, resolved with the idiom the derived queries use:
+    // `across_tenants()` opts out, and a missing context fails closed.
+    // §1d parity for reactions: on a sharded repository `across_tenants()` cannot
+    // target a single shard's connection, so `react()` would mutate — and
+    // `reaction_of()` silently read — whichever shard backs the routed pool.
+    // Reject as the derived-write and preload guards do, but key off the runtime
+    // `across_tenants` flag alone (the grouped-aggregate stance, not the older
+    // `__autumn_shards.is_some()` conjunction): a repo built without shard context
+    // (`with_pool_untracked`) would otherwise slip past and silently hit whichever
+    // single pool backs it. Empty unless sharded and tenant-scoped.
+    let m2m_cross_shard_guard = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.across_tenants {
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::bad_request_msg(
+                        "cross-shard reactions are not supported: across_tenants() on a \
+                         sharded repository cannot target a single shard; scope to a \
+                         tenant first"
+                    )
+                );
+            }
+        }
+    } else {
+        quote! {}
+    };
+    let m2m_tenant_scope_body = if config.tenant_scoped {
+        quote! {
+            #m2m_cross_shard_guard
+            if self.across_tenants {
+                ::core::result::Result::Ok(::core::option::Option::None)
+            } else {
+                match ::autumn_web::tenancy::CURRENT_TENANT
+                    .try_with(|t| t.clone())
+                    .ok()
+                    .flatten()
+                {
+                    ::core::option::Option::Some(t) => {
+                        ::core::result::Result::Ok(::core::option::Option::Some(t))
+                    }
+                    ::core::option::Option::None => {
+                        ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::internal_server_error_msg(
+                                "no tenant context was established"
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    } else {
+        quote! { ::core::result::Result::Ok(::core::option::Option::None) }
+    };
+
     let m2m_conn_source_impl = quote! {
         impl ::autumn_web::repository::M2mConnSource for #pg_name {
             type Model = #model_name;
@@ -3019,6 +4862,29 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 >,
             > {
                 self.__autumn_acquire_conn().await
+            }
+
+            // Read-only association/reaction accessors (`#[votable]`'s
+            // `reaction_of()`) route exactly like every other generated read:
+            // through the repository's `ReadRoute` snapshot, without marking
+            // the read-your-writes pin.
+            async fn __autumn_m2m_read_conn(
+                &self,
+            ) -> ::autumn_web::AutumnResult<
+                ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<
+                    ::autumn_web::RuntimeConnection,
+                >,
+            > {
+                self.__autumn_acquire_read_conn().await
+            }
+
+            // `#[votable]` target scoping: `Some(tenant)` for a tenant_scoped
+            // repository in a tenant context, `None` for a non-scoped one and
+            // for `across_tenants()`, `Err` when scoped with no context.
+            fn __autumn_m2m_tenant_scope(
+                &self,
+            ) -> ::autumn_web::AutumnResult<::core::option::Option<::std::string::String>> {
+                #m2m_tenant_scope_body
             }
         }
     };
@@ -3209,6 +5075,32 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             let __autumn_read_route =
                 ::autumn_web::repository::ReadRoute::from_state(state);
+        }
+    };
+
+    // #2586: `docs/guide/forms.md` promises the model's `#[validate]` rules
+    // hold on every write path — a form, an API endpoint, a seed, a job, a CSV
+    // import. Only the generated REST handlers ran them, so a caller reaching
+    // the repository directly bypassed the model entirely. These fragments put
+    // them on the insert path itself, after `#[normalize]` canonicalizes the
+    // payload and before the `before_create` hook, exactly as the guide states.
+    //
+    // Update paths are deliberately untouched: they keep the documented
+    // hooked / `validate_on_update = fetch` / blind table.
+    let validate_insert_new = {
+        let call = maybe_validate_insert(&quote! { new });
+        quote! { #call?; }
+    };
+    let validate_row_result = maybe_validate_insert(&quote! { __autumn_row });
+    let validate_item_result = maybe_validate_insert(&quote! { &item });
+    let validate_insert_each_row = {
+        let call = maybe_validate_insert(&quote! { __autumn_row });
+        quote! {
+            // Every row is checked before any row is written, so a rejected
+            // batch leaves nothing behind.
+            for __autumn_row in new {
+                #call?;
+            }
         }
     };
 
@@ -3710,6 +5602,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 None,
                 &quote! { conn },
                 model_name,
+                config.ledgered,
             );
             quote! { #vh }
         } else {
@@ -3736,6 +5629,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
+                                #cc_serialize
                                 let mut input = new.clone();
                                 let mut ctx = MutationContext::new(MutationOp::Create);
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -3776,6 +5670,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 )
                                 .await?;
 
+                                #cc_after_insert
                                 Ok((record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record))
                             }
                             .scope_boxed()
@@ -3795,7 +5690,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     match __autumn_after_create {
                         ::core::result::Result::Ok(::core::result::Result::Ok(())) => {}
                         ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
-                            let __autumn_error_message = ::std::format!("{__autumn_error}");
+                            let __autumn_error_message = __autumn_error.message();
                             ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
                                 &self.pool,
                                 &__autumn_commit_hook_id,
@@ -3872,6 +5767,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let (record, mut ctx) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
+                                #cc_serialize
                                 let mut input = new.clone();
                                 let mut ctx = MutationContext::new(MutationOp::Create);
 
@@ -3892,6 +5788,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                                 #vh_create_in_hooks
 
+                                #cc_after_insert
                                 Ok((record, ctx))
                             }
                             .scope_boxed()
@@ -3916,6 +5813,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
+                                #cc_serialize
                                 let mut input = new.clone();
                                 let mut ctx = MutationContext::new(MutationOp::Create);
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -3949,6 +5847,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 )
                                 .await?;
 
+                                #cc_after_insert
                                 Ok((record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record))
                             }
                             .scope_boxed()
@@ -3968,7 +5867,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     match __autumn_after_create {
                         ::core::result::Result::Ok(::core::result::Result::Ok(())) => {}
                         ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
-                            let __autumn_error_message = ::std::format!("{__autumn_error}");
+                            let __autumn_error_message = __autumn_error.message();
                             ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
                                 &self.pool,
                                 &__autumn_commit_hook_id,
@@ -4036,6 +5935,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     None,
                     &quote! { conn },
                     model_name,
+                    config.ledgered,
                 );
                 quote! {
                     use ::autumn_web::reexports::diesel::prelude::*;
@@ -4047,6 +5947,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let (record, mut ctx) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
+                                #cc_serialize
                                 let mut input = new.clone();
                                 let mut ctx = MutationContext::new(MutationOp::Create);
 
@@ -4060,6 +5961,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                                 #vh_insert
 
+                                #cc_after_insert
                                 Ok((record, ctx))
                             }
                             .scope_boxed()
@@ -4081,6 +5983,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let (record, mut ctx) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
+                                #cc_serialize
                                 let mut input = new.clone();
                                 let mut ctx = MutationContext::new(MutationOp::Create);
 
@@ -4092,6 +5995,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     .await
                                     .map_err(::autumn_web::AutumnError::from)?;
 
+                                #cc_after_insert
                                 Ok((record, ctx))
                             }
                             .scope_boxed()
@@ -4117,6 +6021,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 Some(&quote! { __vh_before }),
                 &quote! { conn },
                 model_name,
+                config.ledgered,
             );
             quote! { #vh }
         } else {
@@ -4146,6 +6051,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id) = ::autumn_web::__private::scoped_immediate_transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
+                                #cc_capture
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
                                     ::core::option::Option::None;
                                 if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
@@ -4264,6 +6170,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 )
                                 .await?;
 
+                                #cc_after_update
                                 Ok((record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id))
                             }
                             .scope_boxed()
@@ -4283,7 +6190,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     match __autumn_after_update {
                         ::core::result::Result::Ok(::core::result::Result::Ok(())) => {}
                         ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
-                            let __autumn_error_message = ::std::format!("{__autumn_error}");
+                            let __autumn_error_message = __autumn_error.message();
                             ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
                                 &self.pool,
                                 &__autumn_commit_hook_id,
@@ -4364,6 +6271,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let (record, mut ctx) = ::autumn_web::__private::scoped_immediate_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
+                                #cc_capture
                                 let (record, __vh_before): (#model_name, ::core::option::Option<#model_name>) = if let ::core::option::Option::Some(expected_version) =
                                     changes.__autumn_lock_version_expected()
                                 {
@@ -4462,6 +6370,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     #vh_update_in_hooks
                                 }
 
+                                #cc_after_update
                                 Ok((record, ctx))
                             }
                             .scope_boxed()
@@ -4488,6 +6397,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id) = ::autumn_web::__private::scoped_immediate_transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
+                                #cc_capture
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
                                     ::core::option::Option::None;
                                 if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
@@ -4580,6 +6490,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 )
                                 .await?;
 
+                                #cc_after_update
                                 Ok((record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id))
                             }
                             .scope_boxed()
@@ -4599,7 +6510,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     match __autumn_after_update {
                         ::core::result::Result::Ok(::core::result::Result::Ok(())) => {}
                         ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
-                            let __autumn_error_message = ::std::format!("{__autumn_error}");
+                            let __autumn_error_message = __autumn_error.message();
                             ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
                                 &self.pool,
                                 &__autumn_commit_hook_id,
@@ -4668,6 +6579,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Some(&quote! { __vh_before }),
                     &quote! { conn },
                     model_name,
+                    config.ledgered,
                 );
                 quote! {
                     use ::autumn_web::reexports::diesel::prelude::*;
@@ -4681,6 +6593,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let (record, mut ctx) = ::autumn_web::__private::scoped_immediate_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
+                                #cc_capture
                                 let (record, __vh_before): (#model_name, #model_name) = if let ::core::option::Option::Some(expected_version) =
                                     changes.__autumn_lock_version_expected()
                                 {
@@ -4746,6 +6659,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                                 #vh_insert
 
+                                #cc_after_update
                                 Ok((record, ctx))
                             }
                             .scope_boxed()
@@ -4769,6 +6683,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let (record, mut ctx) = ::autumn_web::__private::scoped_immediate_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
+                                #cc_capture
                                 let record: #model_name = if let ::core::option::Option::Some(expected_version) =
                                     changes.__autumn_lock_version_expected()
                                 {
@@ -4828,6 +6743,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                         .map_err(::autumn_web::AutumnError::from)?
                                 };
 
+                                #cc_after_update
                                 Ok((record, ctx))
                             }
                             .scope_boxed()
@@ -4849,6 +6765,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // Both paths still fire before_delete / after_delete_commit hooks.
         let hooked_delete_mutation_stmt = if config.soft_delete {
             quote! {
+                #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                 let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                 let __autumn_deleted = ::autumn_web::reexports::diesel::update(
                     #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null())
@@ -4887,6 +6804,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 None,
                 &quote! { conn },
                 model_name,
+                config.ledgered,
             );
             quote! { #vh }
         } else {
@@ -4916,6 +6834,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                             async move {
+                                #cc_serialize
                                 let mut ctx = MutationContext::new(MutationOp::Delete);
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
                                     ::core::option::Option::None;
@@ -4942,6 +6861,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                                 self.hooks.before_delete(&mut ctx, &record).await?;
 
+                                #cc_before_delete
                                 #hooked_delete_mutation_stmt
 
                                 #vh_delete_in_hooks
@@ -4980,6 +6900,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                             async move {
+                                #cc_serialize
                                 let mut ctx = MutationContext::new(MutationOp::Delete);
 
                                 let load_query = #table_ident::table.find(id);
@@ -4996,6 +6917,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                                 self.hooks.before_delete(&mut ctx, &record).await?;
 
+                                #cc_before_delete
                                 #hooked_delete_mutation_stmt
 
                                 #vh_delete_in_hooks
@@ -5022,6 +6944,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                         async move {
+                            #cc_serialize
                             let mut ctx = MutationContext::new(MutationOp::Delete);
                             let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
                                 ::core::option::Option::None;
@@ -5042,6 +6965,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                             self.hooks.before_delete(&mut ctx, &record).await?;
 
+                            #cc_before_delete
                             #hooked_delete_mutation_stmt
 
                             #vh_delete_in_hooks
@@ -5077,6 +7001,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 None,
                 &quote! { conn },
                 model_name,
+                config.ledgered,
             );
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
@@ -5088,6 +7013,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                         async move {
+                            #cc_serialize
                             let mut ctx = MutationContext::new(MutationOp::Delete);
 
                             let load_query = #table_ident::table.find(id);
@@ -5100,6 +7026,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                             self.hooks.before_delete(&mut ctx, &record).await?;
 
+                            #cc_before_delete
                             #hooked_delete_mutation_stmt
 
                             #vh_insert
@@ -5124,6 +7051,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                         async move {
+                            #cc_serialize
                             let mut ctx = MutationContext::new(MutationOp::Delete);
 
                             let load_query = #table_ident::table.find(id);
@@ -5136,6 +7064,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                             self.hooks.before_delete(&mut ctx, &record).await?;
 
+                            #cc_before_delete
                             #hooked_delete_mutation_stmt
 
                             Ok(())
@@ -5262,6 +7191,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     None,
                     &quote! { conn },
                     model_name,
+                    config.ledgered,
                 );
                 quote! {
                     for (idx, record) in chunk_inserted.iter().enumerate() {
@@ -5309,6 +7239,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let contexts_ref = &contexts;
                     let (inserted_records, hook_infos, global_indices) = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
+                            #cc_serialize
                             let mut inserted_records = Vec::new();
                             let mut hook_infos = Vec::new();
                             let mut global_indices = Vec::new();
@@ -5365,7 +7296,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     hook_infos.push((info.0, info.1, hook_records[idx].0.clone()));
                                 }
 
-                                inserted_records.extend(chunk_inserted);
+                                #cc_after_insert_chunk
+                            inserted_records.extend(chunk_inserted);
                                 offset += chunk.len();
                             }
                             Ok((inserted_records, hook_infos, global_indices))
@@ -5420,7 +7352,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 }
                             }
                             ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
-                                let __autumn_error_message = ::std::format!("{__autumn_error}");
+                                let __autumn_error_message = __autumn_error.message();
                                 ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
                                     &self.pool,
                                     hook_id,
@@ -5494,6 +7426,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let inputs_ref = &inputs;
                     let inserted_records = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
+                            #cc_serialize
                             let mut inserted = Vec::new();
                             let mut offset = 0;
                             let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
@@ -5502,7 +7435,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 let chunk_inserted = (#insert_expr)
                                     .map_err(::autumn_web::AutumnError::from)?;
                                 #vh_create_many_in_hooks
-                                inserted.extend(chunk_inserted);
+                                #cc_after_insert_chunk
+                            inserted.extend(chunk_inserted);
                                 offset += chunk.len();
                             }
                             Ok(inserted)
@@ -5692,6 +7626,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     for chunk in valid_items.chunks(chunk_size) {
                         let batch_res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
+                                #cc_serialize
                                 let chunk_inserted = (#insert_expr)
                                     .map_err(::autumn_web::AutumnError::from)?;
 
@@ -5734,6 +7669,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     hook_infos.push((info.0, info.1, hook_records[idx].0.clone()));
                                 }
 
+                                #cc_after_insert_chunk
                                 Ok((chunk_inserted, hook_infos, mapped_indices))
                             }
                             .scope_boxed()
@@ -5782,7 +7718,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                             }
                                         }
                                         ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
-                                            let __autumn_error_message = ::std::format!("{__autumn_error}");
+                                            let __autumn_error_message = __autumn_error.message();
                                             ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
                                                 &self.pool,
                                                 hook_id,
@@ -5841,6 +7777,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 for item in chunk {
                                     let row_res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                                         async move {
+                                            #cc_serialize
                                             let record = #row_insert_expr
                                                 .map_err(::autumn_web::AutumnError::from)?;
 
@@ -5862,6 +7799,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                             )
                                             .await?;
 
+                                            #cc_after_insert
                                             Ok((record, __autumn_hook_info.0, __autumn_hook_info.1, __autumn_commit_hook_record))
                                         }
                                         .scope_boxed()
@@ -5905,7 +7843,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                                     }
                                                 }
                                                 ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
-                                                    let __autumn_error_message = ::std::format!("{__autumn_error}");
+                                                    let __autumn_error_message = __autumn_error.message();
                                                     ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
                                                         &self.pool,
                                                         &hook_id,
@@ -5960,8 +7898,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     for chunk in valid_items.chunks(chunk_size) {
                         let batch_res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
-                                (#insert_expr)
-                                    .map_err(::autumn_web::AutumnError::from)
+                                #cc_serialize
+                                let chunk_inserted = (#insert_expr)
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                                #cc_after_insert_chunk
+                                Ok(chunk_inserted)
                             }
                             .scope_boxed()
                         })
@@ -6023,8 +7964,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 for item in chunk {
                                     let row_res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                                         async move {
-                                            #row_insert_expr
-                                                .map_err(::autumn_web::AutumnError::from)
+                                            #cc_serialize
+                                            let record = #row_insert_expr
+                                                .map_err(::autumn_web::AutumnError::from)?;
+                                            #cc_after_insert
+                                            Ok(record)
                                         }
                                         .scope_boxed()
                                     })
@@ -6087,10 +8031,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut successes = Vec::new();
                 let mut failures = Vec::new();
 
-                // 1. Run before_create hooks sequentially
+                // 1. Run the model's `#[validate]` rules, then before_create,
+                //    sequentially. A row either side rejects is reported by
+                //    index and skipped — the method's partial-success contract.
                 let mut valid_items = Vec::new();
                 for (idx, original_item) in new.iter().enumerate() {
                     let mut item = original_item.clone();
+                    // #2586: model rules first, so a hook never sees a row the
+                    // model would refuse.
+                    if let ::core::result::Result::Err(err) = #validate_item_result {
+                        failures.push((idx, err));
+                        continue;
+                    }
                     let mut ctx = MutationContext::new(MutationOp::Create);
                     #idempotency_setup
                     match self.hooks.before_create(&mut ctx, &mut item).await {
@@ -6409,7 +8361,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             }
                         }
                         ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
-                            let __autumn_error_message = ::std::format!("{__autumn_error}");
+                            let __autumn_error_message = __autumn_error.message();
                             ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
                                 &self.pool,
                                 hook_id,
@@ -6485,6 +8437,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut conn = self.__autumn_acquire_conn().await?;
                 let (updated_records, contexts, hook_infos) = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
+                        #cc_capture_many
                         let mut current_rows = Vec::new();
                         for chunk in ids.chunks(1000) {
                             let load_query = #table_ident::table.filter(#table_ident::id.eq_any(chunk))
@@ -6535,8 +8488,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         let mut offset = 0;
                         for chunk in proposed_rows.chunks(1000) {
                             let mut chunk_updated = Vec::new();
+                            // Owned via `.clone()`, not the borrowed `proposed`: an
+                            // `#[encrypted]` column routes through diesel's
+                            // `serialize_as`, which consumes the value, so diesel
+                            // implements `AsChangeset` only for the owned model. A
+                            // borrow here failed to compile any hooks-enabled or
+                            // `broadcasts = true` repository over a model with an
+                            // encrypted column. The single-record hooks paths clone
+                            // for the same reason, and cloning suits plain models too.
                             for proposed in chunk {
                                 let update_target = #table_ident::table.find(proposed.id);
+                                let proposed = ::core::clone::Clone::clone(proposed);
                                 let updated = #update_expr
                                     .map_err(::autumn_web::AutumnError::from)?;
                                 chunk_updated.push(updated);
@@ -6544,6 +8506,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                             #commit_hooks_enqueue_block
 
+                            #cc_after_update_chunk
                             updated_records.extend(chunk_updated);
                             offset += chunk.len();
                         }
@@ -6580,6 +8543,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let delete_many_body = {
+            // The position insert-assign trigger takes its advisory lock, but the
+            // delete and soft-delete-compact triggers fire once per row, each
+            // computing its shift from that row's own `OLD.position`. A single
+            // multi-row `DELETE ... WHERE id = ANY(chunk)`, or the soft-delete
+            // `UPDATE ... SET deleted_at = ...`, removes several rows from the same
+            // scope in one statement; their row-level triggers do not see each
+            // other's removals, so the relative shifts can under- or over-compact
+            // and leave a gap or a duplicate rank. Forcing chunk size to 1 when a
+            // position field exists makes every chunk single-row, so each trigger
+            // firing sees a settled table and the single-row-safe compaction logic
+            // stays correct (#1358).
+            let delete_chunk_size: usize = if config.position.is_some() { 1 } else { 1000 };
             let tenant_id_setup = if config.tenant_scoped {
                 quote! {
                     let tenant_id = if self.across_tenants {
@@ -6742,6 +8717,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     None,
                     &quote! { conn },
                     model_name,
+                    config.ledgered,
                 );
                 quote! {
                     for r in &__vh_deleted_records {
@@ -6755,7 +8731,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let delete_execution = if config.versioned {
                 quote! {
                     let mut __vh_actually_deleted: ::std::collections::HashSet<i64> = ::std::collections::HashSet::new();
-                    for chunk in ids.chunks(1000) {
+                    for chunk in ids.chunks(#delete_chunk_size) {
+                        #cc_before_delete_chunk
                         let chunk_deleted_ids = #delete_returning_expr
                             .map_err(::autumn_web::AutumnError::from)?;
                         __vh_actually_deleted.extend(chunk_deleted_ids);
@@ -6766,7 +8743,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             } else {
                 quote! {
-                    for chunk in ids.chunks(1000) {
+                    for chunk in ids.chunks(#delete_chunk_size) {
+                        #cc_before_delete_chunk
                         #delete_expr
                             .map_err(::autumn_web::AutumnError::from)?;
                     }
@@ -6840,10 +8818,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                         #tenant_id_setup
                         let mut conn = self.__autumn_acquire_conn().await?;
+                        #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                         let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
 
                         #delete_many_tx_bind ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
+                                #cc_serialize
                                 let mut current_rows = Vec::new();
                                 for chunk in ids.chunks(1000) {
                                     let load_query = #table_ident::table.filter(#table_ident::id.eq_any(chunk))
@@ -6853,16 +8833,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     current_rows.extend(chunk_rows);
                                 }
 
-                                // #1740: cascade dependent actions for every parent BEFORE
-                                // the bulk parent delete, so no child is orphaned and the
-                                // parent delete never trips a foreign-key constraint.
-                                // Codex round-5-B: the cascade runs FIRST so a batch root
-                                // that is also another root's descendant is deleted (and
-                                // recorded in `__autumn_deleted`) here — its `before_delete`
-                                // fires exactly once as that descendant; the root hook loop
-                                // below then skips it (`#delete_many_root_skip`), avoiding a
-                                // second firing, and the tolerant bulk `id = ANY` delete no
-                                // longer touches it.
+                                // #1740: cascade dependent actions for every parent
+                                // before the bulk parent delete, so no child is
+                                // orphaned and the parent delete never trips a
+                                // foreign-key constraint. The cascade runs first, so
+                                // a batch root that is also another root's descendant
+                                // is deleted here and recorded in `__autumn_deleted`,
+                                // firing `before_delete` exactly once. The root hook
+                                // loop below then skips it (`#delete_many_root_skip`)
+                                // and the tolerant bulk `id = ANY` delete no longer
+                                // touches it.
                                 #delete_many_cascade
 
                                 for record in &current_rows {
@@ -7027,6 +9007,44 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             })
         };
 
+        // #1325: transactional variants for the two transaction-free `save`
+        // arms. Emitted behind the `const HAS_COUNTER_CACHES` guard, so they are
+        // dead code for a model with no counter cache and the single-statement
+        // insert below each one is reached unchanged.
+        let cc_save_tenant_wrap = cc_tx_wrap(
+            &quote! { #model_name },
+            &quote! {
+                #cc_serialize
+                let record = if let ::core::option::Option::Some(ref t) = tenant_id {
+                    ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                        .values(::autumn_web::tenancy::TenantInsertable::tenant_values(new.clone(), t))
+                        .get_result::<#model_name>(conn)
+                        .await
+                } else {
+                    ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                        .values(new.clone())
+                        .get_result::<#model_name>(conn)
+                        .await
+                }
+                .map_err(::autumn_web::AutumnError::from)?;
+                #cc_after_insert
+                Ok(record)
+            },
+        );
+        let cc_save_plain_wrap = cc_tx_wrap(
+            &quote! { #model_name },
+            &quote! {
+                #cc_serialize
+                let record = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                    .values(new.clone())
+                    .get_result::<#model_name>(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                #cc_after_insert
+                Ok(record)
+            },
+        );
+
         let save_body = if config.tenant_scoped && config.versioned {
             let vh_insert = vh_insert_ts(
                 table_name,
@@ -7036,6 +9054,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 None,
                 &quote! { conn },
                 model_name,
+                config.ledgered,
             );
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
@@ -7051,6 +9070,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 };
                 let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
+                    #cc_serialize
                     let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                             .values(::autumn_web::tenancy::TenantInsertable::tenant_values(new.clone(), t))
@@ -7064,6 +9084,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                     .map_err(::autumn_web::AutumnError::from)?;
                     #vh_insert
+                    #cc_after_insert
                     Ok(record)
                 }.scope_boxed())
                 .await
@@ -7080,18 +9101,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::core::option::Option::Some(t)
                 };
                 let mut conn = self.__autumn_acquire_conn().await?;
-                if let ::core::option::Option::Some(ref t) = tenant_id {
-                    ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                        .values(::autumn_web::tenancy::TenantInsertable::tenant_values(new.clone(), t))
-                        .get_result::<#model_name>(&mut conn)
-                        .await
-                } else {
-                    ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                        .values(new.clone())
-                        .get_result::<#model_name>(&mut conn)
-                        .await
-                }
-                .map_err(::autumn_web::AutumnError::from)
+                #cc_save_tenant_wrap
             }
         } else if config.versioned {
             let vh_insert = vh_insert_ts(
@@ -7102,6 +9112,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 None,
                 &quote! { conn },
                 model_name,
+                config.ledgered,
             );
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
@@ -7110,12 +9121,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                 let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
+                    #cc_serialize
                     let record = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                         .values(new.clone())
                         .get_result::<#model_name>(conn)
                         .await
                         .map_err(::autumn_web::AutumnError::from)?;
                     #vh_insert
+                    #cc_after_insert
                     Ok(record)
                 }.scope_boxed())
                 .await
@@ -7125,48 +9138,41 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 let mut conn = self.__autumn_acquire_conn().await?;
-                ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                    .values(new.clone())
-                    .get_result::<#model_name>(&mut conn)
-                    .await
-                    .map_err(::autumn_web::AutumnError::from)
+                #cc_save_plain_wrap
             }
         };
 
         // #1801: opt-in merged-model validation on the no-hooks update path.
-        // `#knob_validate_current` is spliced into branches where `current`
-        // (the loaded row) is already in scope — it borrows the row, validates
-        // the merged model via `from_patch`, and discards the draft (we only
-        // want its 422 side-effect; the blind write below is unchanged).
-        // `#knob_load_and_validate` (plain, no tenant filter) and
-        // `#knob_load_and_validate_tenant` (tenant-filtered) are spliced into the
-        // otherwise-blind no-lock sub-branches: each first SELECTs the current row
-        // (only when the knob is set — no unconditional extra query), then
-        // validates. The tenant variant is used in the tenant_scoped blind branch
-        // so its SELECT matches that branch's own tenant-filtered UPDATE and the
-        // sibling version-checked load — otherwise a cross-tenant `id` would load a
-        // foreign row and surface 422 instead of the correct 404. All expand to
-        // nothing when the knob is off, keeping the blind path byte-for-byte.
         //
-        // Note (normalize-vs-persist asymmetry): `from_patch` normalizes the merged
-        // model before validating, but the blind path deliberately persists the
-        // un-normalized `changes.__to_changeset()` (the validation here is
-        // side-effect-only — we keep only its 422). So a value that passes only
-        // because normalization cleaned it up is stored raw. This is a known,
-        // deliberate limitation of the opt-in blind path; the hooked/#1804 path
-        // persists the normalized draft instead.
+        // `#knob_validate_current` is spliced into branches where `current`, the
+        // loaded row, is already in scope: it borrows the row, validates the merged
+        // model via `from_patch`, and discards the draft — only the 422 side effect
+        // is wanted, and the blind write below is unchanged.
+        // `#knob_load_and_validate` and `#knob_load_and_validate_tenant` go into the
+        // otherwise-blind no-lock sub-branches: each SELECTs the current row, only
+        // when the knob is set, then validates. The tenant variant is used in the
+        // tenant-scoped blind branch so its SELECT matches that branch's
+        // tenant-filtered UPDATE and the sibling version-checked load; otherwise a
+        // cross-tenant `id` would load a foreign row and surface 422 instead of 404.
+        // All expand to nothing when the knob is off.
         //
-        // Concurrency (known, deliberate): this merged validation is point-in-time
-        // against a non-locked snapshot (a plain SELECT, no `FOR UPDATE`). It
-        // reliably rejects a single request that is invalid once merged (the #1801
-        // acceptance criterion), but does not provide a serializable cross-field
-        // invariant under concurrent partial writes to different fields — two
-        // concurrent requests can each validate against the same old row and then
-        // persist a combination the validator would reject. This matches the blind
-        // path's intentionally non-transactional, last-write-wins-per-column
-        // semantics; callers needing atomic cross-field enforcement should use a
-        // versioned or `hooks = ...` repository, whose update runs
-        // `SELECT ... FOR UPDATE` inside the mutation transaction.
+        // Normalize-vs-persist asymmetry: `from_patch` normalizes the merged model
+        // before validating, but the blind path deliberately persists the
+        // un-normalized `changes.__to_changeset()`, since only the 422 is kept. A
+        // value that passes only because normalization cleaned it up is stored raw.
+        // This is a known limitation of the opt-in blind path; the hooked/#1804 path
+        // persists the normalized draft.
+        //
+        // Concurrency: this merged validation is point-in-time against a non-locked
+        // snapshot — a plain SELECT, no `FOR UPDATE`. It reliably rejects a single
+        // request that is invalid once merged (the #1801 acceptance criterion), but
+        // gives no serializable cross-field invariant under concurrent partial
+        // writes: two requests can each validate against the same old row and then
+        // persist a combination the validator would reject. That matches the blind
+        // path's non-transactional, last-write-wins-per-column semantics. Callers
+        // needing atomic cross-field enforcement should use a versioned or
+        // `hooks = ...` repository, whose update runs `SELECT ... FOR UPDATE` inside
+        // the mutation transaction.
         let draft_ext_trait = format_ident!("{}DraftExt", model_name);
         let knob_validate_current = if config.validate_on_update_fetch {
             quote! {
@@ -7187,10 +9193,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 format!("{} with id {} not found", stringify!(#model_name), id)
             ))
         };
-        let knob_load_and_validate = if config.validate_on_update_fetch {
+        // Both no-lock update branches now run their statement through
+        // `cc_tx_wrap`, whose body is spliced inside a transaction closure where
+        // the connection is a `&mut RuntimeConnection` named `conn`. There is no
+        // longer a `&mut conn` variant of these knobs — the two spellings that
+        // used to exist side by side were the same query, the same 404 mapping
+        // and the same draft validation, differing only in how they named the
+        // connection.
+        let knob_load_and_validate_in_tx = if config.validate_on_update_fetch {
             quote! {
                 let __merged_current = #table_ident::table.find(id)
-                    .first::<#model_name>(&mut conn)
+                    .first::<#model_name>(conn)
                     .await
                     #not_found_to_404 ?;
                 { let _ = <::autumn_web::hooks::UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&__merged_current, changes)?; }
@@ -7201,12 +9214,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // Tenant-scoped variant: mirror the branch's own UPDATE and sibling load,
         // which filter by `#table_ident::tenant_id.eq(t)` when a tenant is in scope
         // and fall back to the bare PK lookup only for across-tenants queries.
-        let knob_load_and_validate_tenant = if config.validate_on_update_fetch {
+        let knob_load_and_validate_tenant_in_tx = if config.validate_on_update_fetch {
             quote! {
                 let __merged_current = if let ::core::option::Option::Some(ref t) = tenant_id {
-                    #table_ident::table.find(id).filter(#table_ident::tenant_id.eq(t)).first::<#model_name>(&mut conn).await
+                    #table_ident::table.find(id).filter(#table_ident::tenant_id.eq(t)).first::<#model_name>(conn).await
                 } else {
-                    #table_ident::table.find(id).first::<#model_name>(&mut conn).await
+                    #table_ident::table.find(id).first::<#model_name>(conn).await
                 }
                 #not_found_to_404 ?;
                 { let _ = <::autumn_web::hooks::UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&__merged_current, changes)?; }
@@ -7215,6 +9228,54 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {}
         };
 
+        // #1325: transactional variants for the two transaction-free `update`
+        // branches (the no-lock-version fast path, tenant-scoped and plain).
+        // Both re-do the same single `UPDATE`, wrapped so the counter moves in
+        // the same transaction; behind the `const HAS_COUNTER_CACHES` guard they
+        // are dead code for every model without a counter cache.
+        let cc_update_tenant_wrap = cc_tx_wrap(
+            &quote! { #model_name },
+            &quote! {
+                #cc_capture
+                #knob_load_and_validate_tenant_in_tx
+                let mut diesel_changeset = changes.__to_changeset();
+                if let ::core::option::Option::Some(ref t) = tenant_id {
+                    use ::autumn_web::repository::CanSetTenantId as _;
+                    diesel_changeset.set_tenant_id(t.clone());
+                }
+                let update_target = #table_ident::table.find(id);
+                let record = if let ::core::option::Option::Some(ref t) = tenant_id {
+                    ::autumn_web::reexports::diesel::update(update_target.filter(#table_ident::tenant_id.eq(t)))
+                        .set(diesel_changeset)
+                        .get_result::<#model_name>(conn)
+                        .await
+                } else {
+                    ::autumn_web::reexports::diesel::update(update_target)
+                        .set(diesel_changeset)
+                        .get_result::<#model_name>(conn)
+                        .await
+                }
+                .map_err(::autumn_web::AutumnError::from)?;
+                #cc_after_update
+                Ok(record)
+            },
+        );
+        let cc_update_plain_wrap = cc_tx_wrap(
+            &quote! { #model_name },
+            &quote! {
+                #cc_capture
+                #knob_load_and_validate_in_tx
+                let diesel_changeset = changes.__to_changeset();
+                let update_target = #table_ident::table.find(id);
+                let record = ::autumn_web::reexports::diesel::update(update_target)
+                    .set(diesel_changeset)
+                    .get_result::<#model_name>(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                #cc_after_update
+                Ok(record)
+            },
+        );
         let update_body = if config.tenant_scoped && config.versioned {
             let vh_insert = vh_insert_ts(
                 table_name,
@@ -7224,6 +9285,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 Some(&quote! { current }),
                 &quote! { conn },
                 model_name,
+                config.ledgered,
             );
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
@@ -7241,6 +9303,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                     async move {
+                        #cc_capture
                         let load_query = #table_ident::table.find(id);
                         let current = if let ::core::option::Option::Some(expected_version) =
                             changes.__autumn_lock_version_expected()
@@ -7298,6 +9361,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         }
                         .map_err(::autumn_web::AutumnError::from)?;
                         #vh_insert
+                        #cc_after_update
                         Ok(record)
                     }
                     .scope_boxed()
@@ -7326,6 +9390,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                         async move {
+                            #cc_capture
                             // SELECT FOR UPDATE grabs an exclusive row lock so
                             // no concurrent writer can commit between our
                             // version check and the UPDATE below.
@@ -7362,7 +9427,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 diesel_changeset.set_tenant_id(t.clone());
                             }
                             let update_target = #table_ident::table.find(id);
-                            if let ::core::option::Option::Some(ref t) = tenant_id {
+                            let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                                 ::autumn_web::reexports::diesel::update(update_target.filter(#table_ident::tenant_id.eq(t)))
                                     .set(diesel_changeset)
                                     .get_result::<#model_name>(conn)
@@ -7373,31 +9438,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     .get_result::<#model_name>(conn)
                                     .await
                             }
-                            .map_err(::autumn_web::AutumnError::from)
+                            .map_err(::autumn_web::AutumnError::from)?;
+                            #cc_after_update
+                            Ok(record)
                         }
                         .scope_boxed()
                     })
                     .await
                 } else {
-                    #knob_load_and_validate_tenant
-                    let mut diesel_changeset = changes.__to_changeset();
-                    if let ::core::option::Option::Some(ref t) = tenant_id {
-                        use ::autumn_web::repository::CanSetTenantId as _;
-                        diesel_changeset.set_tenant_id(t.clone());
-                    }
-                    let update_target = #table_ident::table.find(id);
-                    if let ::core::option::Option::Some(ref t) = tenant_id {
-                        ::autumn_web::reexports::diesel::update(update_target.filter(#table_ident::tenant_id.eq(t)))
-                            .set(diesel_changeset)
-                            .get_result::<#model_name>(&mut conn)
-                            .await
-                    } else {
-                        ::autumn_web::reexports::diesel::update(update_target)
-                            .set(diesel_changeset)
-                            .get_result::<#model_name>(&mut conn)
-                            .await
-                    }
-                    .map_err(::autumn_web::AutumnError::from)
+                    #cc_update_tenant_wrap
                 }
             }
         } else if config.versioned {
@@ -7409,6 +9458,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 Some(&quote! { current }),
                 &quote! { conn },
                 model_name,
+                config.ledgered,
             );
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
@@ -7420,6 +9470,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                     async move {
+                        #cc_capture
                         let load_query = #table_ident::table.find(id);
                         let current = if let ::core::option::Option::Some(expected_version) =
                             changes.__autumn_lock_version_expected()
@@ -7461,6 +9512,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             .await
                             .map_err(::autumn_web::AutumnError::from)?;
                         #vh_insert
+                        #cc_after_update
                         Ok(record)
                     }
                     .scope_boxed()
@@ -7482,6 +9534,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                         async move {
+                            #cc_capture
                             let load_query = #table_ident::table.find(id);
                             let current = ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                             .optional()
@@ -7507,28 +9560,111 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #knob_validate_current
                             let diesel_changeset = changes.__to_changeset();
                             let update_target = #table_ident::table.find(id);
-                            ::autumn_web::reexports::diesel::update(update_target)
+                            let record = ::autumn_web::reexports::diesel::update(update_target)
                                 .set(diesel_changeset)
                                 .get_result::<#model_name>(conn)
                                 .await
-                                .map_err(::autumn_web::AutumnError::from)
+                                .map_err(::autumn_web::AutumnError::from)?;
+                            #cc_after_update
+                            Ok(record)
                         }
                         .scope_boxed()
                     })
                     .await
                 } else {
-                    #knob_load_and_validate
-                    let diesel_changeset = changes.__to_changeset();
-                    let update_target = #table_ident::table.find(id);
-                    ::autumn_web::reexports::diesel::update(update_target)
-                        .set(diesel_changeset)
-                        .get_result::<#model_name>(&mut conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)
+                    #cc_update_plain_wrap
                 }
             }
         };
 
+        // #1325: transactional twins of the four transaction-free
+        // `delete_by_id` arms (tenant/plain x soft/hard). Each decrements the
+        // counter-cached parents *before* its own delete statement, so the two
+        // commit or roll back together; behind the `const HAS_COUNTER_CACHES`
+        // guard they are dead code for every model without a counter cache.
+        let cc_delete_tenant_soft_wrap = cc_tx_wrap(
+            &quote! { () },
+            &quote! {
+                #cc_before_delete
+                let delete_query = #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null());
+                let __count = if let ::core::option::Option::Some(ref t) = tenant_id {
+                    ::autumn_web::reexports::diesel::update(delete_query.filter(#table_ident::tenant_id.eq(t)))
+                        .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                        .execute(conn)
+                        .await
+                } else {
+                    ::autumn_web::reexports::diesel::update(delete_query)
+                        .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                        .execute(conn)
+                        .await
+                }
+                .map_err(::autumn_web::AutumnError::from)?;
+                if __count == 0 {
+                    return Err(::autumn_web::AutumnError::not_found_msg(
+                        format!("{} with id {} not found", stringify!(#model_name), id)
+                    ));
+                }
+                Ok(())
+            },
+        );
+        let cc_delete_tenant_hard_wrap = cc_tx_wrap(
+            &quote! { () },
+            &quote! {
+                #cc_before_delete
+                let delete_query = #table_ident::table.find(id);
+                let __count = if let ::core::option::Option::Some(ref t) = tenant_id {
+                    ::autumn_web::reexports::diesel::delete(delete_query.filter(#table_ident::tenant_id.eq(t)))
+                        .execute(conn)
+                        .await
+                } else {
+                    ::autumn_web::reexports::diesel::delete(delete_query)
+                        .execute(conn)
+                        .await
+                }
+                .map_err(::autumn_web::AutumnError::from)?;
+                if __count == 0 {
+                    return Err(::autumn_web::AutumnError::not_found_msg(
+                        format!("{} with id {} not found", stringify!(#model_name), id)
+                    ));
+                }
+                Ok(())
+            },
+        );
+        let cc_delete_soft_wrap = cc_tx_wrap(
+            &quote! { () },
+            &quote! {
+                #cc_before_delete
+                let delete_query = #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null());
+                let __count = ::autumn_web::reexports::diesel::update(delete_query)
+                    .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                    .execute(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                if __count == 0 {
+                    return Err(::autumn_web::AutumnError::not_found_msg(
+                        format!("{} with id {} not found", stringify!(#model_name), id)
+                    ));
+                }
+                Ok(())
+            },
+        );
+        let cc_delete_hard_wrap = cc_tx_wrap(
+            &quote! { () },
+            &quote! {
+                #cc_before_delete
+                let delete_query = #table_ident::table.find(id);
+                let __count = ::autumn_web::reexports::diesel::delete(delete_query)
+                    .execute(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                if __count == 0 {
+                    return Err(::autumn_web::AutumnError::not_found_msg(
+                        format!("{} with id {} not found", stringify!(#model_name), id)
+                    ));
+                }
+                Ok(())
+            },
+        );
         let delete_body = if config.tenant_scoped {
             let tenant_id_setup = quote! {
                 let tenant_id = if self.across_tenants {
@@ -7548,6 +9684,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     None,
                     &quote! { conn },
                     model_name,
+                    config.ledgered,
                 );
                 quote! {
                     use ::autumn_web::reexports::diesel::prelude::*;
@@ -7555,9 +9692,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel_async::AsyncConnection;
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                     #tenant_id_setup
+                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
+                        #cc_before_delete
                         let load_query = #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null());
                         let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                             ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
@@ -7597,27 +9736,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     #tenant_id_setup
+                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let delete_query = #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null());
-                    let __count = if let ::core::option::Option::Some(ref t) = tenant_id {
-                        ::autumn_web::reexports::diesel::update(delete_query.filter(#table_ident::tenant_id.eq(t)))
-                            .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
-                            .execute(&mut conn)
-                            .await
-                    } else {
-                        ::autumn_web::reexports::diesel::update(delete_query)
-                            .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
-                            .execute(&mut conn)
-                            .await
-                    }
-                    .map_err(::autumn_web::AutumnError::from)?;
-                    if __count == 0 {
-                        return Err(::autumn_web::AutumnError::not_found_msg(
-                            format!("{} with id {} not found", stringify!(#model_name), id)
-                        ));
-                    }
-                    Ok(())
+                    #cc_delete_tenant_soft_wrap
                 }
             } else if config.versioned {
                 let vh_insert = vh_insert_ts(
@@ -7628,6 +9750,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     None,
                     &quote! { conn },
                     model_name,
+                    config.ledgered,
                 );
                 quote! {
                     use ::autumn_web::reexports::diesel::prelude::*;
@@ -7637,6 +9760,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
+                        #cc_before_delete
                         let load_query = #table_ident::table.find(id);
                         let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                             ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
@@ -7675,23 +9799,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let delete_query = #table_ident::table.find(id);
-                    let __count = if let ::core::option::Option::Some(ref t) = tenant_id {
-                        ::autumn_web::reexports::diesel::delete(delete_query.filter(#table_ident::tenant_id.eq(t)))
-                            .execute(&mut conn)
-                            .await
-                    } else {
-                        ::autumn_web::reexports::diesel::delete(delete_query)
-                            .execute(&mut conn)
-                            .await
-                    }
-                    .map_err(::autumn_web::AutumnError::from)?;
-                    if __count == 0 {
-                        return Err(::autumn_web::AutumnError::not_found_msg(
-                            format!("{} with id {} not found", stringify!(#model_name), id)
-                        ));
-                    }
-                    Ok(())
+                    #cc_delete_tenant_hard_wrap
                 }
             }
         } else if config.soft_delete {
@@ -7704,15 +9812,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     None,
                     &quote! { conn },
                     model_name,
+                    config.ledgered,
                 );
                 quote! {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     use ::autumn_web::reexports::diesel_async::AsyncConnection;
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
+                        #cc_before_delete
                         let record = ::autumn_web::maybe_for_update!(#table_ident::table.find(id)
                             .filter(#table_ident::deleted_at.is_null()))
 
@@ -7744,20 +9855,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 quote! {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let delete_query = #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null());
-                    let __count = ::autumn_web::reexports::diesel::update(delete_query)
-                        .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
-                        .execute(&mut conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)?;
-                    if __count == 0 {
-                        return Err(::autumn_web::AutumnError::not_found_msg(
-                            format!("{} with id {} not found", stringify!(#model_name), id)
-                        ));
-                    }
-                    Ok(())
+                    #cc_delete_soft_wrap
                 }
             }
         } else if config.versioned {
@@ -7769,6 +9870,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 None,
                 &quote! { conn },
                 model_name,
+                config.ledgered,
             );
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
@@ -7777,6 +9879,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                 let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
+                    #cc_before_delete
                     let record = ::autumn_web::maybe_for_update!(#table_ident::table.find(id))
 
                         .first::<#model_name>(conn)
@@ -7805,17 +9908,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 let mut conn = self.__autumn_acquire_conn().await?;
-                let delete_query = #table_ident::table.find(id);
-                let __count = ::autumn_web::reexports::diesel::delete(delete_query)
-                    .execute(&mut conn)
-                    .await
-                    .map_err(::autumn_web::AutumnError::from)?;
-                if __count == 0 {
-                    return Err(::autumn_web::AutumnError::not_found_msg(
-                        format!("{} with id {} not found", stringify!(#model_name), id)
-                    ));
-                }
-                Ok(())
+                #cc_delete_hard_wrap
             }
         };
 
@@ -7828,6 +9921,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 None,
                 &quote! { conn },
                 model_name,
+                config.ledgered,
             );
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
@@ -7851,6 +9945,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
+                        #cc_serialize
                         let mut inserted = Vec::new();
                         let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
                         let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
@@ -7911,6 +10006,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             for r in &chunk_inserted {
                                 #vh_r
                             }
+                            #cc_after_insert_chunk
                             inserted.extend(chunk_inserted);
                         }
                         Ok(inserted)
@@ -7942,6 +10038,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
+                        #cc_serialize
                         let mut inserted = Vec::new();
                         let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
                         let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
@@ -7999,6 +10096,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                             }
                             .map_err(::autumn_web::AutumnError::from)?;
+                            #cc_after_insert_chunk
                             inserted.extend(chunk_inserted);
                         }
                         Ok(inserted)
@@ -8016,6 +10114,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 None,
                 &quote! { conn },
                 model_name,
+                config.ledgered,
             );
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
@@ -8031,6 +10130,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
+                        #cc_serialize
                         let mut inserted = Vec::new();
                         let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
                         let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
@@ -8063,6 +10163,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             for r in &chunk_inserted {
                                 #vh_r
                             }
+                            #cc_after_insert_chunk
                             inserted.extend(chunk_inserted);
                         }
                         Ok(inserted)
@@ -8086,6 +10187,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
+                        #cc_serialize
                         let mut inserted = Vec::new();
                         let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
                         let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
@@ -8115,6 +10217,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         },
                     }
                                 .map_err(::autumn_web::AutumnError::from)?;
+                            #cc_after_insert_chunk
                             inserted.extend(chunk_inserted);
                         }
                         Ok(inserted)
@@ -8135,6 +10238,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     None,
                     &quote! { conn },
                     model_name,
+                    config.ledgered,
                 );
                 quote! { for r in &results { #vh } }
             } else {
@@ -8149,6 +10253,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     None,
                     &quote! { conn },
                     model_name,
+                    config.ledgered,
                 );
                 quote! { #vh }
             } else {
@@ -8295,16 +10400,48 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut successes = Vec::new();
                 let mut failures = Vec::new();
 
+                // #2586: run the model's `#[validate]` rules first and report a
+                // rejected row by index, keeping the partial-success contract.
+                // Only the surviving indices are recorded here; the rows are
+                // re-collected below solely when something was dropped, so a
+                // model with no rules still writes from the caller's slice with
+                // no extra clone.
+                let mut __autumn_kept: ::std::vec::Vec<usize> =
+                    ::std::vec::Vec::with_capacity(new.len());
+                for (idx, __autumn_row) in new.iter().enumerate() {
+                    match #validate_row_result {
+                        ::core::result::Result::Ok(()) => __autumn_kept.push(idx),
+                        ::core::result::Result::Err(err) => failures.push((idx, err)),
+                    }
+                }
+                let __autumn_retained: ::std::vec::Vec<#new_name>;
+                let new: &[#new_name] = if __autumn_kept.len() == new.len() {
+                    new
+                } else {
+                    __autumn_retained =
+                        __autumn_kept.iter().map(|&i| new[i].clone()).collect();
+                    &__autumn_retained
+                };
+                if new.is_empty() {
+                    return Ok((successes, failures));
+                }
+
                 let mut offset = 0;
                 let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
                 let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
                 for chunk in new.chunks(chunk_size) {
                     let batch_res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
+                            #cc_serialize
                             let results = (#insert_expr_conn)
                                 .map_err(::autumn_web::AutumnError::from)?;
                             #vh_skip_batch
-                            Ok(results)
+                            // #1325: renamed rather than referenced directly so
+                            // the shared `#cc_after_insert_chunk` fragment sees
+                            // the binding it expects on every insert path.
+                            let chunk_inserted = results;
+                            #cc_after_insert_chunk
+                            Ok(chunk_inserted)
                         }
                         .scope_boxed()
                     })
@@ -8336,15 +10473,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 return ::core::result::Result::Err(batch_err);
                             }
 
-                            // Fallback to row-by-row insertion for this chunk
+                            // Fallback to row-by-row insertion for this chunk.
+                            // #2586: chunks index into the retained rows, so map
+                            // back to the caller's index before reporting.
                             for (idx, item) in chunk.iter().enumerate() {
-                                let global_idx = offset + idx;
+                                let global_idx = __autumn_kept[offset + idx];
                                 let res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                                     async move {
+                                        #cc_serialize
                                         let model = (#row_insert_expr_conn)
                                             .map_err(::autumn_web::AutumnError::from)?;
                                         #vh_skip_row
-                                        Ok(model)
+                                        // See the batch path above: renamed for
+                                        // the shared `#cc_after_insert` fragment.
+                                        let record = model;
+                                        #cc_after_insert
+                                        Ok(record)
                                     }
                                     .scope_boxed()
                                 })
@@ -8363,6 +10507,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let update_many_body = {
+            // Unlike the hooks-enabled `update_many`, which updates one row per
+            // statement with its own derived `draft`, this path issues one
+            // `UPDATE ... WHERE id = ANY(chunk) SET <changes>` per chunk and applies
+            // the same changeset to every row. If `changes` reassigns a scoped
+            // position field's scope column, several same-scope rows can be rescoped
+            // in that one statement — the same batching race `delete_many`'s
+            // chunk-size fix closes, via `rescope` instead of `compact`. Force
+            // single-row chunks whenever a position field exists, so every `rescope`
+            // trigger firing sees a settled table (#1358).
+            let update_chunk_size: usize = if config.position.is_some() { 1 } else { 1000 };
             let vh_update_pair = if config.versioned {
                 let vh = vh_insert_ts(
                     table_name,
@@ -8372,6 +10526,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Some(&quote! { before_rec }),
                     &quote! { conn },
                     model_name,
+                    config.ledgered,
                 );
                 quote! {
                     for after_rec in &chunk_updated {
@@ -8511,6 +10666,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 if let ::core::option::Option::Some(expected_version) = changes.__autumn_lock_version_expected() {
                     ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
+                            #cc_capture_many
                             // Load existing to verify versions
                             let mut current_rows = Vec::new();
                             for chunk in ids.chunks(1000) {
@@ -8538,10 +10694,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #vh_build_before_map_from_current
 
                             let mut updated = Vec::new();
-                            for chunk in ids.chunks(1000) {
+                            for chunk in ids.chunks(#update_chunk_size) {
                                 let chunk_updated = #update_expr_conn
                                     .map_err(::autumn_web::AutumnError::from)?;
                                 #vh_update_pair
+                                #cc_after_update_chunk
                                 updated.extend(chunk_updated);
                             }
                             Ok(updated)
@@ -8552,13 +10709,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 } else {
                     ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
+                            #cc_capture_many
                             #vh_load_before_map_no_lock
 
                             let mut updated = Vec::new();
-                            for chunk in ids.chunks(1000) {
+                            for chunk in ids.chunks(#update_chunk_size) {
                                 let chunk_updated = #update_expr_conn
                                     .map_err(::autumn_web::AutumnError::from)?;
                                 #vh_update_pair
+                                #cc_after_update_chunk
                                 updated.extend(chunk_updated);
                             }
                             Ok(updated)
@@ -8571,6 +10730,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let delete_many_body = {
+            // See the identical comment in the hooks-enabled `delete_many_body`
+            // above (Codex review, issue #1358): force single-row chunks when
+            // a position field exists so the per-row delete/soft-delete-compact
+            // triggers never see more than one removal per statement.
+            let delete_chunk_size: usize = if config.position.is_some() { 1 } else { 1000 };
             let vh_delete_load_before = if config.versioned {
                 // Soft-delete preload must mirror the actual delete filter so that
                 // already-deleted rows are not snapshotted as newly deleted.
@@ -8625,6 +10789,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     None,
                     &quote! { conn },
                     model_name,
+                    config.ledgered,
                 );
                 quote! {
                     for r in &__vh_deleted_records {
@@ -8710,7 +10875,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 };
                 let loop_ts = quote! {
                     let mut __vh_actually_deleted: ::std::collections::HashSet<i64> = ::std::collections::HashSet::new();
-                    for chunk in ids.chunks(1000) {
+                    for chunk in ids.chunks(#delete_chunk_size) {
+                        #cc_before_delete_chunk
                         let chunk_deleted_ids = #delete_returning_expr
                             .map_err(::autumn_web::AutumnError::from)?;
                         __vh_actually_deleted.extend(chunk_deleted_ids);
@@ -8766,7 +10932,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 };
                 let loop_ts = quote! {
-                    for chunk in ids.chunks(1000) {
+                    for chunk in ids.chunks(#delete_chunk_size) {
+                        #cc_before_delete_chunk
                         #delete_expr
                             .map_err(::autumn_web::AutumnError::from)?;
                     }
@@ -8796,10 +10963,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                         #tenant_id_setup
                         let mut conn = self.__autumn_acquire_conn().await?;
+                        #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                         let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
 
                         #delete_many_tx_bind ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
+                                #cc_serialize
                                 // #1740: cascade dependent actions for every parent BEFORE
                                 // the bulk parent delete (empty for repos with no
                                 // dependents, preserving the prior bulk codegen).
@@ -8851,6 +11020,24 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         let upsert_many_body = {
+            // A position-scoped table's compaction trigger fires per row and only
+            // sees its own pre-statement OLD position, so one multi-row upsert
+            // chunk that reassigns several rows' scope can under- or over-compact
+            // (#2240, same root cause already fixed for delete_many/update_many).
+            // Force every upsert chunk to a single row when a position field
+            // exists, skipping the bind-param-based cap entirely: a plain
+            // `.min(1).max(1)` on that cap is always 1, so clippy's `min_max`
+            // lint (deny-by-default) correctly flags it as dead code.
+            let chunk_size_setup = if config.position.is_some() {
+                quote! {
+                    let chunk_size: usize = 1;
+                }
+            } else {
+                quote! {
+                    let cols = (&records[0]).__autumn_column_count() + #tenant_extra;
+                    let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
+                }
+            };
             let vh_upsert_write = if config.versioned {
                 let vh_ins = vh_insert_ts(
                     table_name,
@@ -8860,6 +11047,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     None,
                     &quote! { conn },
                     model_name,
+                    config.ledgered,
                 );
                 let vh_upd = vh_insert_ts(
                     table_name,
@@ -8869,6 +11057,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Some(&quote! { before_rec }),
                     &quote! { conn },
                     model_name,
+                    config.ledgered,
                 );
                 quote! {
                     for r in &chunk_upserted {
@@ -8906,19 +11095,35 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 records.iter().map(|r| r.id).collect();
                             __autumn_upsert_lock_ids.sort_unstable();
                             __autumn_upsert_lock_ids.dedup();
-                            for __autumn_upsert_lock_id in __autumn_upsert_lock_ids {
-                                let __autumn_upsert_lock_key =
-                                    ::autumn_web::repository::repository_upsert_advisory_lock_key(
-                                        #table_name,
-                                        __autumn_upsert_lock_id,
-                                    );
-                                ::autumn_web::reexports::diesel::sql_query("SELECT pg_advisory_xact_lock($1)")
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(
-                                        __autumn_upsert_lock_key,
-                                    )
-                                    .execute(conn)
-                                    .await
-                                    .map_err(::autumn_web::AutumnError::from)?;
+                            if !__autumn_upsert_lock_ids.is_empty() {
+                                let __autumn_upsert_lock_keys: Vec<i64> = __autumn_upsert_lock_ids
+                                    .iter()
+                                    .map(|id| {
+                                        ::autumn_web::repository::repository_upsert_advisory_lock_key(
+                                            #table_name,
+                                            *id,
+                                        )
+                                    })
+                                    .collect();
+                                // One round trip for the whole batch instead of one
+                                // per unique id: `pg_advisory_xact_lock` is called
+                                // once per row of the unnested array, so the lock
+                                // count and (via `ORDER BY t.ord`) the acquisition
+                                // order are identical to the per-id loop this
+                                // replaces — same technique as `pg_next_versions`'s
+                                // `generate_series ... WITH ORDINALITY ... ORDER BY`
+                                // batching in `autumn/src/sync/server.rs`.
+                                ::autumn_web::reexports::diesel::sql_query(
+                                    "SELECT pg_advisory_xact_lock(t.key) \
+                                     FROM unnest($1::bigint[]) WITH ORDINALITY AS t(key, ord) \
+                                     ORDER BY t.ord",
+                                )
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Array<::autumn_web::reexports::diesel::sql_types::BigInt>, _>(
+                                    __autumn_upsert_lock_keys,
+                                )
+                                .execute(conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
                             }
                         },
                         sqlite => {},
@@ -8991,45 +11196,42 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
             let size_check = if config.tenant_scoped {
-                // Tenant-scoped path: replace the old coarse post-upsert size check
-                // with a drop-triggered, tenant-scoped RECONCILIATION (ref #1963 +
-                // the Codex P2 fail-closed follow-up).
+                // Tenant-scoped path: a drop-triggered, tenant-scoped reconciliation
+                // replacing the old coarse post-upsert size check (#1963, plus the
+                // Codex P2 fail-closed follow-up).
                 //
                 // The versioned tenant-scoped upsert SQL is
                 //   INSERT ... ON CONFLICT (id) DO UPDATE SET ..., lock_version = lock_version + 1
                 //   WHERE lock_version = excluded.lock_version AND tenant_id = $t RETURNING *
-                // so a row can be silently dropped (not RETURNed) for EITHER of two
-                // reasons: (1) a tenant_id mismatch — a cross-tenant row we must NOT
-                // touch and must stay SILENT about (this is exactly the #1963
-                // false-positive we are avoiding); or (2) a lock_version mismatch — a
-                // genuine SAME-tenant optimistic-lock conflict that must be LOUD (409).
+                // so a row can be silently dropped for either of two reasons: a
+                // tenant_id mismatch — a cross-tenant row we must not touch and must
+                // stay silent about, the #1963 false positive — or a lock_version
+                // mismatch, a genuine same-tenant optimistic-lock conflict that must
+                // be loud (409).
                 //
-                // The pre-upsert per-row lock check above only sees rows present in
-                // `existing_rows` at load time. A row inserted by a DIFFERENT write
-                // path (raw insert / save / save_many / another repo — none of which
-                // take this upsert's `pg_advisory_xact_lock`, which only versioned
-                // `upsert_many` acquires) BETWEEN our FOR UPDATE snapshot and the
-                // upsert is invisible to it. With the old size check gone entirely, a
-                // real same-tenant lock conflict on such a raced-in row was returned
-                // as `Ok` instead of a 409 — the Codex P2 bug.
+                // The pre-upsert per-row lock check sees only rows present in
+                // `existing_rows` at load time. A row inserted by a different write
+                // path — raw insert, save, save_many, another repo, none of which
+                // take the `pg_advisory_xact_lock` that only versioned `upsert_many`
+                // acquires — between our FOR UPDATE snapshot and the upsert is
+                // invisible to it. With the size check gone, a real same-tenant lock
+                // conflict on such a raced-in row returned `Ok` instead of a 409.
                 //
-                // The fix is fail-closed AND cannot reintroduce the #1963 false
-                // positive: only when a drop actually happened do we re-select the
-                // dropped ids UNDER THE CURRENT TENANT SCOPE (mirroring `load_expr`).
-                // If a dropped id is STILL PRESENT under this tenant, its tenant_id
-                // matched, so the only reason it was dropped is a lock_version
-                // mismatch (reason 2) → we fail closed with the SAME `Conflict` shape
-                // the pre-upsert detector emits. If NONE of the dropped ids are
-                // present under this tenant, every drop was cross-tenant/absent
-                // (reason 1) → we stay SILENT (`Ok`), preserving the #1963 behavior.
-                // Because it fires ONLY when a dropped id still exists under the
-                // current tenant, a cross-tenant row — filtered out of this re-select
-                // by construction — can never trip it.
+                // The fix fails closed without reintroducing the false positive: only
+                // when a drop happened do we re-select the dropped ids under the
+                // current tenant scope, mirroring `load_expr`. A dropped id still
+                // present under this tenant had a matching tenant_id, so the only
+                // reason it was dropped is a lock_version mismatch: fail closed with
+                // the same `Conflict` shape the pre-upsert detector emits. If none of
+                // the dropped ids are present under this tenant, every drop was
+                // cross-tenant or absent, so stay silent (`Ok`). Because it fires only
+                // when a dropped id still exists under the current tenant, a
+                // cross-tenant row — filtered out of this re-select by construction —
+                // can never trip it.
                 //
-                // Gated at runtime by `has_lock` (mirroring the pre-upsert detector):
-                // a non-versioned tenant-scoped model has no `lock_version`, so its
-                // drops are ALWAYS cross-tenant and this reconciliation never fires,
-                // leaving that path a silent no-op exactly as #1963 requires.
+                // Gated at runtime by `has_lock`, mirroring the pre-upsert detector: a
+                // non-versioned tenant-scoped model has no `lock_version`, so its drops
+                // are always cross-tenant and this reconciliation never fires.
                 quote! {
                     if has_lock && upserted.len() != records.len() {
                         let __autumn_done: ::std::collections::HashSet<_> =
@@ -9130,8 +11332,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let mut upserted = Vec::new();
-                        let cols = (&records[0]).__autumn_column_count() + #tenant_extra;
-                        let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
+                        #chunk_size_setup
+                        #cc_serialize
                         #vh_upsert_lock_keys
                         for chunk in records.chunks(chunk_size) {
                             let chunk_ids: Vec<_> = chunk.iter().map(|r| r.id).collect();
@@ -9164,6 +11366,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                             #vh_upsert_write
 
+                            #cc_after_upsert_chunk
                             upserted.extend(chunk_upserted);
                         }
                         #size_check
@@ -9215,32 +11418,88 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // ── #1325 counter-cache repair ──────────────────────────────────────────
+    //
+    // Recompute the maintained columns from the source of truth. Idempotent by
+    // construction — the column is assigned a `COUNT(*)`, never adjusted — so it is
+    // both the backfill for a table adopting the column and the repair for drift
+    // from writes that bypassed the repository.
+    //
+    // Always emitted: for a model with no counter cache the spec slice is empty, so
+    // the method is a zero-statement no-op returning 0 rather than a missing method
+    // the caller must feature-detect.
+    let counter_cache_recompute_methods = quote! {
+        /// Recompute every counter cache this model maintains, for **all**
+        /// parent rows, from the source of truth (#1325).
+        ///
+        /// Idempotent: running it twice leaves the same values. Returns the
+        /// number of parent rows updated, summed across every counter-cached
+        /// association (0 when the model declares none).
+        ///
+        /// # Errors
+        ///
+        /// Propagates any database error from the recompute `UPDATE`s.
+        pub async fn recompute_counter_caches(&self) -> ::autumn_web::AutumnResult<usize> {
+            // A repair sweep is a write: reject it under `across_tenants()` on a
+            // sharded repository, where it would silently touch one arbitrary
+            // shard while promising every parent row (matching `restore`/`purge`).
+            #cross_shard_write_guard
+            let mut conn = self.__autumn_acquire_conn().await?;
+            ::autumn_web::repository::counter_cache_recompute(
+                &mut conn,
+                #cc_specs,
+                ::core::option::Option::None,
+            )
+            .await
+        }
+
+        /// Recompute every counter cache this model maintains for a **single**
+        /// parent row (#1325), leaving every other parent untouched.
+        ///
+        /// # Errors
+        ///
+        /// Propagates any database error from the recompute `UPDATE`s.
+        pub async fn recompute_counter_caches_for(
+            &self,
+            parent_id: i64,
+        ) -> ::autumn_web::AutumnResult<usize> {
+            #cross_shard_write_guard
+            let mut conn = self.__autumn_acquire_conn().await?;
+            ::autumn_web::repository::counter_cache_recompute(
+                &mut conn,
+                #cc_specs,
+                ::core::option::Option::Some(parent_id),
+            )
+            .await
+        }
+    };
+
     // ── #1369: transactional dependent cascade for delete_by_id ──────
     //
     // When the repository declares `dependent(...)` associations, override the
-    // default `delete_body` with one that (1) always opens a transaction, (2)
-    // loads and locks the parent, (3) applies every declared dependent action
-    // to the children on that same connection *before* deleting the parent, and
-    // (4) deletes the parent. Any error rolls the whole graph back. Children are
-    // removed/nullified before the parent delete so no FK/orphan can occur.
+    // default `delete_body` with one that opens a transaction, loads and locks the
+    // parent, applies every declared dependent action to the children on that same
+    // connection, then deletes the parent. Any error rolls the whole graph back,
+    // and children are removed or nullified first, so no FK violation or orphan
+    // can occur.
     //
-    // This override is computed before the `cross_shard_write_guard` tuple below
-    // so the guard is prepended here too: on a sharded + tenant_scoped repo an
-    // `across_tenants()` delete is rejected rather than cascading across shards
-    // from a single routed connection (honoring the #1592/#1664/#1687 guards; a
-    // cascade cannot silently skip children living on other shards).
+    // Computed before the `cross_shard_write_guard` tuple below, so the guard is
+    // prepended here too: on a sharded, tenant-scoped repo an `across_tenants()`
+    // delete is rejected rather than cascading across shards from one routed
+    // connection (#1592/#1664/#1687) — a cascade must not silently skip children
+    // on other shards.
     let delete_body = {
         // #1738: the parent-side cascade body is shared between the
-        // repository-attribute (compile-time `dependent(...)`) form and the
-        // model-declared `#[has_many(dependent = ...)]` form (dispatched at run
-        // time via `Model::dependents()`). The parent load/mutation/hook/version
-        // tokens below are identical for both; only the per-child cascade calls
-        // differ (a compile-time list vs a runtime `RuntimeDependentSpec` slice),
-        // so those are passed into `assemble_cascade_body`.
-        //
-        // The parent's own delete kind (soft vs hard) drives the child `destroy`
-        // cascade (#1369 P1): a soft-delete child is only soft-deleted alongside
-        // a soft-deleted parent; a hard-deleted parent hard-deletes its children.
+        // repository-attribute form (compile-time `dependent(...)`) and the
+        // model-declared form (`#[has_many(dependent = ...)]`, dispatched at run
+        // time via `Model::dependents()`). The parent load, mutation, hook, and
+        // version tokens below are identical for both; only the per-child cascade
+        // calls differ — a compile-time list against a runtime
+        // `RuntimeDependentSpec` slice — so those are passed into
+        // `assemble_cascade_body`. The parent's own delete kind drives the child
+        // `destroy` cascade (#1369 P1): a soft-delete child is soft-deleted only
+        // alongside a soft-deleted parent, and a hard-deleted parent hard-deletes
+        // its children.
         let parent_soft_lit = if config.soft_delete {
             quote! { true }
         } else {
@@ -9335,6 +11594,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             };
             quote! {
+                #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                 let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                 #tenant_scoped_update
                 if __count == 0 {
@@ -9387,6 +11647,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 None,
                 &quote! { conn },
                 model_name,
+                config.ledgered,
             )
         } else {
             quote! {}
@@ -9447,16 +11708,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
-        // Assemble the full transactional delete body around a given cascade,
-        // split into its read-only `restrict` PROBE block and its mutating block.
-        // Shared by the repository-attribute and model-declared (#1738) cascade
-        // forms. #1800 case 3: the parent's `restrict` dependents are probed
-        // BEFORE the parent's own `before_delete` hook fires (mirroring the
-        // child-tier ordering) — a `restrict` 409 must not leave a
-        // non-transactional parent hook side effect behind on a doomed
-        // transaction. The mutating dependents still run AFTER the hook (so a
-        // hook that vetoes the delete short-circuits them) and BEFORE the parent
-        // row mutation (so no FK dangles).
+        // Assemble the full transactional delete body around a given cascade, split
+        // into its read-only `restrict` probe block and its mutating block. Shared
+        // by the repository-attribute and model-declared (#1738) forms. The parent's
+        // `restrict` dependents are probed before the parent's own `before_delete`
+        // hook fires, mirroring the child-tier ordering: a `restrict` 409 must not
+        // leave a non-transactional parent hook side effect behind on a doomed
+        // transaction (#1800 case 3). The mutating dependents still run after the
+        // hook, so a vetoing hook short-circuits them, and before the parent row
+        // mutation, so no FK dangles.
         let assemble_cascade_body =
             |cascade_restrict_calls: proc_macro2::TokenStream,
              cascade_mutating_calls: proc_macro2::TokenStream| {
@@ -9483,6 +11743,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 async move {
                                     let mut __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
                                         ::std::vec::Vec::new();
+                                    #cc_serialize
                                     #parent_ctx_decl
                                     #parent_idempotency_setup
 
@@ -9504,6 +11765,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     // is removed, so the parent delete never trips a
                                     // foreign-key constraint and no orphan can survive.
                                     #cascade_mutating_calls
+
+                                    // #1325: decrement this row's own
+                                    // counter-cached parents before it is
+                                    // (soft-)deleted, inside the same cascade
+                                    // transaction. A model that is both a
+                                    // cascade parent and a counter-cached child
+                                    // (reddit-clone's `Comment`) needs both.
+                                    #cc_before_delete
 
                                     #parent_mutation
 
@@ -9535,15 +11804,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         if config.dependents.is_empty() {
             // ── #1738: model-declared `#[has_many(dependent = ...)]` cascade ──
             //
-            // No repository-attribute `dependent(...)` was declared, so consult
-            // the model's runtime `Model::dependents()` (an inherent shadow of
+            // No repository-attribute `dependent(...)` was declared, so consult the
+            // model's runtime `Model::dependents()` — an inherent shadow of
             // `AutumnDependents::dependents`, emitted by `#[model]` only when the
             // struct declares dependent associations; otherwise the blanket impl
-            // yields an empty slice). When empty this is exactly the prior plain
-            // delete body; when non-empty it drives the SAME transactional
-            // cascade as the repository-attribute form, resolving each child
-            // repository through the `Pg{Child}Repository` convention baked into
-            // the spec's `cascade` thunk.
+            // yields an empty slice. When empty this is the prior plain delete body;
+            // when non-empty it drives the same transactional cascade as the
+            // repository-attribute form, resolving each child repository through the
+            // `Pg{Child}Repository` convention baked into the spec's `cascade` thunk.
             let runtime_cascade_restrict = quote! {
                 // Codex round-5-B cycle guard: the ACTIVE recursion path, seeded
                 // with this parent row so a grandchild that references an ancestor
@@ -9616,19 +11884,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             // ── #1369 repository-attribute `dependent(...)` cascade ──────────
             //
-            // Precedence (#1738): a repository that declares `dependent(...)` is
-            // the explicit escape hatch (for children whose repository does not
-            // follow the `Pg{Child}Repository` convention, or lives in another
-            // crate). Its compile-time specs are authoritative; any model-side
+            // Precedence (#1738): a repository declaring `dependent(...)` is the
+            // explicit escape hatch, for children whose repository does not follow
+            // the `Pg{Child}Repository` convention or lives in another crate. Its
+            // compile-time specs are authoritative, and any model-side
             // `#[has_many(dependent = ...)]` is ignored here.
             //
-            // #1369 restrict ordering: probe every `restrict` dependent BEFORE
-            // running any mutating dependent (`destroy`/`delete_all`/`nullify`).
-            // Mutating actions fire child `before_delete` hooks (counters, cache
-            // invalidation, external calls) that are NOT commit hooks — a later
-            // `restrict` 409 rolls back the DB but cannot retract those side
-            // effects. Hoisting all restrict probes ahead of the mutating pass
-            // means a blocked delete never touches a child hook.
+            // Restrict ordering: probe every `restrict` dependent before running any
+            // mutating dependent. Mutating actions fire child `before_delete` hooks —
+            // counters, cache invalidation, external calls — that are not commit
+            // hooks, so a later `restrict` 409 rolls back the DB but cannot retract
+            // them. Hoisting the probes ahead of the mutating pass means a blocked
+            // delete never touches a child hook.
             let emit_cascade_call = |dep: &DependentSpec| {
                 let child_repo = &dep.child_repo;
                 let fk = &dep.fk;
@@ -9671,19 +11938,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // ── #1788: both-sites override diagnostic ────────────────────
                 //
                 // The repository-attribute `dependent(...)` above is authoritative
-                // and drives this cascade. But the model MAY ALSO declare
-                // `#[has_many(..., dependent = ...)]`; if so, that model-side
-                // declaration is silently overridden (repo-attr wins, see the
-                // precedence note above) and is inert. Emit a debug-only warn so a
-                // user does not wrongly believe the model-side `dependent` is
-                // active. Mirrors the `across_tenants()` debug-warn template
-                // (`cfg!(debug_assertions)`-gated `tracing::warn!`): zero-cost in
-                // release builds. The unqualified `#model_name::dependents()` call
-                // resolves to the model's inherent shadow (real specs) when present
-                // and to the blanket `AutumnDependents` fallback (empty slice)
-                // otherwise, so the `use` is required for the fallback to resolve.
-                // Runs at the very top of the restrict (Phase 1) block, before any
-                // restrict probe or the parent `before_delete` hook fires.
+                // and drives this cascade, but the model may also declare
+                // `#[has_many(..., dependent = ...)]`. That model-side declaration
+                // is then silently overridden and inert, so emit a debug-only warn
+                // rather than let a user believe it is active. Mirrors the
+                // `across_tenants()` debug-warn template — a
+                // `cfg!(debug_assertions)`-gated `tracing::warn!` — so it costs
+                // nothing in release. The unqualified `#model_name::dependents()`
+                // call resolves to the model's inherent shadow when present and to
+                // the blanket `AutumnDependents` fallback otherwise, so the `use` is
+                // required for the fallback to resolve. Runs at the top of the
+                // restrict (Phase 1) block, before any probe or the parent
+                // `before_delete` hook.
                 if ::core::cfg!(debug_assertions) {
                     use ::autumn_web::repository::AutumnDependents as _;
                     if !#model_name::dependents().is_empty() {
@@ -9735,20 +12001,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     ) = if config.sharded && config.tenant_scoped {
         let write_guard = &cross_shard_write_guard;
         (
-            quote! { #write_guard #save_body },
+            quote! { #write_guard #validate_insert_new #save_body },
             quote! { #write_guard #update_body },
             quote! { #write_guard #delete_body },
-            quote! { #write_guard #save_many_body },
+            quote! { #write_guard #validate_insert_each_row #save_many_body },
             quote! { #write_guard #save_many_skip_invalid_body },
             quote! { #write_guard #update_many_body },
             quote! { #write_guard #delete_many_body },
         )
     } else {
         (
-            save_body,
+            quote! { #validate_insert_new #save_body },
             update_body,
             delete_body,
-            save_many_body,
+            quote! { #validate_insert_each_row #save_many_body },
             save_many_skip_invalid_body,
             update_many_body,
             delete_many_body,
@@ -9842,16 +12108,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
         // Determine whether a pre-fetch is needed before the delete/update body.
-        // Pre-fetch is required when:
-        //  - the topic is dynamic (contains a field placeholder like "{category}"),
-        //    because after deletion the record is gone and the topic cannot be
-        //    interpolated; and for updates we need the pre-mutation topic to detect
+        // It is required when:
+        //  - the topic is dynamic (it contains a field placeholder such as
+        //    "{category}"): after deletion the record is gone and the topic cannot
+        //    be interpolated, and an update needs the pre-mutation topic to detect
         //    topic changes and publish a delete on the old channel.
-        //  - broadcast_render is configured, because the custom render fn must run
-        //    on the live record to extract the real DOM id for delete broadcasts.
+        //  - `broadcast_render` is configured: the custom render fn must run on the
+        //    live record to extract the real DOM id for delete broadcasts.
         //
-        // The simple case (static topic, no broadcast_render — what `--live`
-        // scaffolds) keeps the existing fast, zero-extra-query path.
+        // The simple case — static topic, no `broadcast_render`, what `--live`
+        // scaffolds — keeps the fast, zero-extra-query path.
         let raw_topic_outer = config
             .broadcast_topic
             .as_deref()
@@ -10140,14 +12406,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
         // ── update_many broadcast ─────────────────────────────────────────
-        // Only broadcast OuterHTML for the simplest case: static topic + default render.
-        // Skipped when update_needs_prefetch (dynamic topic OR custom render) because:
-        // - dynamic topic: OuterHTML sent to the post-update topic leaves old-topic
-        //   subscribers with stale elements and new-topic clients with a failed swap.
-        // - custom render: the rendered element id may encode a mutable field; clients
-        //   hold the element under the pre-update id, so a swap keyed by the post-update
-        //   id misses its target.
-        // Both cases require N pre-fetches to handle correctly; use commit_hooks = true.
+        // Broadcast OuterHTML only for the simplest case: static topic and default
+        // render. Skipped when `update_needs_prefetch` (dynamic topic or custom
+        // render), because a dynamic topic sends OuterHTML to the post-update topic,
+        // leaving old-topic subscribers with stale elements and new-topic clients
+        // with a failed swap; and a custom render may encode a mutable field in the
+        // element id, so a swap keyed by the post-update id misses the element
+        // clients hold under the pre-update id. Both need N pre-fetches to handle
+        // correctly — use `commit_hooks = true`.
         let ium = if update_needs_prefetch {
             quote! {}
         } else {
@@ -10368,6 +12634,53 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         quote! {}
     };
+    // #1367: tell the comment router that this model's queries route through a
+    // shard. The model macro cannot see this attribute, and a sharded
+    // repository does NOT imply a `#[shard_key]` on the model, so the fact has
+    // to be published from here or the router's guard misses the shape
+    // entirely and serves the model from the control pool.
+    let facts_model_name = &config.model_name;
+    let (facts_sharded, facts_tenant_scoped, facts_soft_delete) =
+        (config.sharded, config.tenant_scoped, config.soft_delete);
+    // Registered for EVERY repository, not only the opted-in ones: the router
+    // has to distinguish "this repository opted out" from "no repository said
+    // anything", and only an unconditional entry can tell those apart.
+    let sharded_inventory_registration = quote! {
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::commentable::RepositoryFacts {
+                model: || ::core::any::type_name::<#facts_model_name>(),
+                sharded: #facts_sharded,
+                tenant_scoped: #facts_tenant_scoped,
+                soft_delete: #facts_soft_delete,
+            }
+        }
+    };
+    // ── Architecture-graph node (#1747) ─────────────────────────────────
+    // A repository states its model outright, so this is the one edge in the
+    // graph that is a declaration rather than a name match. The generated
+    // `Pg*` implementation name is published alongside the trait name because
+    // that is what a handler writes when it takes the repository as an
+    // extractor — the strongest evidence a route touches this model.
+    let graph_api_path = config.api_path.clone().unwrap_or_default();
+    let graph_inventory_registration = {
+        let trait_name_lit = trait_name.to_string();
+        let pg_name_lit = pg_name.to_string();
+        let model_name_lit = config.model_name.to_string();
+        quote! {
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::graph::RepositoryGraphDescriptor {
+                    repository: #trait_name_lit,
+                    implementation: #pg_name_lit,
+                    model: #model_name_lit,
+                    table: #table_name,
+                    api: #graph_api_path,
+                    module_path: ::core::module_path!(),
+                    file: ::core::file!(),
+                    line: ::core::line!(),
+                }
+            }
+        }
+    };
     let versioned_inventory_registration = if config.versioned {
         quote! {
             ::autumn_web::reexports::inventory::submit! {
@@ -10378,15 +12691,813 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // ── #1342: declarative retention sweeps ─────────────────────────────
+    //
+    // `retention(...)` compiles to a batched sweep method plus a companion
+    // `TaskInfo` builder (mirroring `#[scheduled]`'s `__autumn_task_info_*`
+    // pattern) and an `inventory::submit!` descriptor, so the sweep is
+    // auto-collected by `autumn_web::retention::collect_retention_tasks()`
+    // at boot with zero `tasks![...]` wiring and zero hand-written SQL.
+    let (retention_sweep_methods, retention_inventory_registration) = if let Some(spec) =
+        &config.retention
+    {
+        let batch_size = spec.batch_size.unwrap_or(DEFAULT_RETENTION_BATCH_SIZE);
+        #[allow(clippy::cast_possible_wrap)]
+        let batch_size_i64 = batch_size as i64;
+        let every_str = spec
+            .every
+            .clone()
+            .unwrap_or_else(|| DEFAULT_RETENTION_SWEEP_INTERVAL.to_string());
+        let max_batches = MAX_RETENTION_BATCHES_PER_RUN;
+        let model_name_str = model_name.to_string();
+        // Table-qualified, not model-qualified: two modules can declare same-named
+        // model types (`auth::Session`, `admin::Session`), which would collide on a
+        // model-derived task name. The scheduler coordinates by name, so a collision
+        // merges two policies' actuator state and can drop one under the Postgres
+        // advisory-lock backend. Table names are already uniquely enforced by the
+        // schema — but only as exact strings: Postgres allows distinct quoted tables
+        // "Events" and "events", so `to_lowercase()` here would reintroduce the very
+        // collision this prevents (#1342). Use `table_name` verbatim.
+        let task_name_str = format!("retention-sweep-{table_name}");
+        // When both `after` and `purge_deleted_after` are declared, split
+        // the per-run batch budget between them instead of sharing one
+        // counter: a shared counter starves whichever branch runs second
+        // (the purge phase) whenever the first branch's backlog alone fills
+        // the whole budget. Each branch still gets the full budget when
+        // it's the only one declared.
+        let both_branches = spec.after.is_some() && spec.purge_deleted_after.is_some();
+        // `age_max_batches` is still a fixed per-run reservation for the
+        // age phase's *primary* pass (never more than half the budget when
+        // both branches are declared) so a huge age backlog can't starve
+        // the purge phase entirely — the round-9 P1 fix.
+        let age_max_batches = if both_branches {
+            max_batches / 2
+        } else {
+            max_batches
+        };
+
+        // Age-based branch: soft-deletes on a soft_delete repository, never
+        // re-touching an already soft-deleted row, and hard-deletes otherwise.
+        // Absent unless `after` was declared.
+        //
+        // The query and mutation fragments are hoisted into `age_fragments` rather
+        // than built inline, because the loop body is needed twice: once for the
+        // capped primary pass below, and again — after `purge_block` runs and its
+        // actual usage is known — as a reclaim pass letting age consume whatever
+        // budget purge left unused (#1342), symmetric with the
+        // purge-borrows-from-age fix. `build_age_loop` below builds each pass's
+        // token stream from these shared fragments.
+        let age_fragments = spec.after.as_ref().map(|_after| {
+            let basis_ident = spec
+                .basis
+                .as_ref()
+                .expect("validated by parse_repo_args: after requires basis")
+                .clone();
+            // Yields the number of rows the statement actually touched, not the
+            // SELECT's candidate count, so a row that changed state between the
+            // SELECT and this statement — a concurrent `restore()`, or, when `basis`
+            // is a mutable column like `last_seen_at`, a concurrent update that
+            // un-stales the row — is counted correctly in `rows_swept` rather than
+            // over-reported. Re-checking `basis < __age_cutoff` here, not just `id`,
+            // is what makes the second case safe.
+            //
+            // A counter-cached model swept by `retention(...)` must move its parent's
+            // counter exactly as every other delete path does, or each swept live
+            // child leaves its parent's stored count permanently inflated (#1342).
+            // `counter_cache_before_delete_many` has to run on still-present,
+            // still-live rows before the mutation, so the `#cc_has` arm first locks
+            // (`FOR UPDATE`) the subset of `ids` still eligible under the recheck
+            // filter — a candidate can have dropped out since the batch SELECT — then
+            // decrements against exactly that locked set before mutating it. A model
+            // with no counter cache keeps the original single-statement path.
+            //
+            // `scoped_immediate_transaction`, not `scoped_transaction`: on SQLite,
+            // `maybe_for_update!` degrades to a plain read, so a deferred transaction
+            // would not take a write lock until the first write below, leaving a
+            // window for a concurrent writer to commit between the locked-ids SELECT
+            // and that write — which SQLite reports as `SQLITE_BUSY_SNAPSHOT` rather
+            // than waiting on the busy timeout. Every other generated read-then-write
+            // path uses the immediate form for this reason.
+            let apply_stmt = if config.soft_delete {
+                quote! {
+                    let __applied: u64 = if dry_run {
+                        __n
+                    } else if #cc_has {
+                        #[allow(unused_imports)]
+                        use ::autumn_web::reexports::diesel_async::AsyncConnection as _;
+                        #[allow(unused_imports)]
+                        use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                        let __now = ::autumn_web::time::ClockSource::now(state.clock()).naive_utc();
+                        ::autumn_web::__private::scoped_immediate_transaction::<u64, ::autumn_web::AutumnError, _>(
+                            &mut *conn,
+                            |conn| async move {
+                                // `order(id.asc())` before the `FOR UPDATE`
+                                // lock (#1342): on Postgres a sweep here can
+                                // race a normal `delete_many` locking an
+                                // overlapping batch of the same counter-cached
+                                // children. `delete_many`'s own
+                                // `counter_cache_before_delete_many` locks
+                                // ascending by id to avoid a deadlock, but that
+                                // only helps if every locker does the same.
+                                // Without it here, the two transactions could
+                                // take the same rows in opposite orders and one
+                                // would be aborted.
+                                #cc_serialize
+                                let __locked_ids: ::std::vec::Vec<i64> = ::autumn_web::maybe_for_update!(
+                                    #table_ident::table
+                                        .filter(#table_ident::id.eq_any(ids))
+                                        .filter(#table_ident::#basis_ident.lt(__age_cutoff))
+                                        .filter(#table_ident::deleted_at.is_null())
+                                        .order(#table_ident::id.asc())
+                                        .select(#table_ident::id)
+                                )
+                                .load::<i64>(conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+                                ::autumn_web::repository::counter_cache_before_delete_many(
+                                    conn, #cc_specs, &__locked_ids,
+                                ).await?;
+                                let __n2 = ::autumn_web::reexports::diesel::update(
+                                    #table_ident::table.filter(#table_ident::id.eq_any(&__locked_ids))
+                                )
+                                .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                                .execute(conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+                                ::core::result::Result::Ok(__n2 as u64)
+                            }
+                            .scope_boxed(),
+                        )
+                        .await?
+                    } else {
+                        let __now = ::autumn_web::time::ClockSource::now(state.clock()).naive_utc();
+                        ::autumn_web::reexports::diesel::update(
+                            #table_ident::table
+                                .filter(#table_ident::id.eq_any(ids))
+                                .filter(#table_ident::#basis_ident.lt(__age_cutoff))
+                                .filter(#table_ident::deleted_at.is_null())
+                        )
+                        .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                        .execute(&mut conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)? as u64
+                    };
+                }
+            } else {
+                quote! {
+                    let __applied: u64 = if dry_run {
+                        __n
+                    } else if #cc_has {
+                        #[allow(unused_imports)]
+                        use ::autumn_web::reexports::diesel_async::AsyncConnection as _;
+                        #[allow(unused_imports)]
+                        use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                        ::autumn_web::__private::scoped_immediate_transaction::<u64, ::autumn_web::AutumnError, _>(
+                            &mut *conn,
+                            |conn| async move {
+                                // Locked ascending by id, matching the
+                                // soft-delete branch's identical fix above
+                                // (#1342 review round 22).
+                                #cc_serialize
+                                let __locked_ids: ::std::vec::Vec<i64> = ::autumn_web::maybe_for_update!(
+                                    #table_ident::table
+                                        .filter(#table_ident::id.eq_any(ids))
+                                        .filter(#table_ident::#basis_ident.lt(__age_cutoff))
+                                        .order(#table_ident::id.asc())
+                                        .select(#table_ident::id)
+                                )
+                                .load::<i64>(conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+                                ::autumn_web::repository::counter_cache_before_delete_many(
+                                    conn, #cc_specs, &__locked_ids,
+                                ).await?;
+                                let __n2 = ::autumn_web::reexports::diesel::delete(
+                                    #table_ident::table.filter(#table_ident::id.eq_any(&__locked_ids))
+                                )
+                                .execute(conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+                                ::core::result::Result::Ok(__n2 as u64)
+                            }
+                            .scope_boxed(),
+                        )
+                        .await?
+                    } else {
+                        ::autumn_web::reexports::diesel::delete(
+                            #table_ident::table
+                                .filter(#table_ident::id.eq_any(ids))
+                                .filter(#table_ident::#basis_ident.lt(__age_cutoff))
+                        )
+                        .execute(&mut conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)? as u64
+                    };
+                }
+            };
+            let not_already_deleted_filter = if config.soft_delete {
+                quote! { .filter(#table_ident::deleted_at.is_null()) }
+            } else {
+                quote! {}
+            };
+            (basis_ident, apply_stmt, not_already_deleted_filter)
+        });
+
+        // Cutoff plus cursor/counter state shared by both the primary age
+        // pass below and the round-13 reclaim pass spliced in after
+        // `purge_block` — hoisted out of either loop so the reclaim pass
+        // resumes from the primary pass's cursor instead of rescanning.
+        // `__age_capped` is only meaningful (and only declared) when a
+        // reclaim pass could actually run.
+        let age_cutoff_and_state_decl = spec.after.as_ref().map_or_else(
+            || quote! {},
+            |after| {
+                let capped_decl = if both_branches {
+                    quote! { let mut __age_capped: bool = false; }
+                } else {
+                    quote! {}
+                };
+                quote! {
+                    let __age_duration = ::autumn_web::task::parse_duration(#after)
+                        .expect(concat!(
+                            "invalid duration in #[repository(..., retention(after = \"",
+                            #after,
+                            "\"))]"
+                        ));
+                    let __age_chrono =
+                        ::autumn_web::reexports::chrono::Duration::from_std(__age_duration)
+                            .expect("retention `after` duration out of range");
+                    // Checked, not `-` (#1342): `after` fitting in
+                    // `chrono::Duration`'s range does not mean subtracting it
+                    // from this clock reading stays inside `NaiveDateTime`'s
+                    // range. A custom clock near `NaiveDateTime::MIN` — a test
+                    // clock, or a misconfigured system clock — can underflow
+                    // even for a boot-validated `after`. `-` panics on overflow;
+                    // this fails with the same actionable message boot validation
+                    // uses for the config-level check.
+                    let __age_cutoff = ::autumn_web::time::ClockSource::now(state.clock())
+                        .naive_utc()
+                        .checked_sub_signed(__age_chrono)
+                        .expect(concat!(
+                            "retention `after` duration is too large to compute a valid cutoff \
+                             from the current time in #[repository(..., retention(after = \"",
+                            #after,
+                            "\"))]"
+                        ));
+                    // `Option<i64>`, not a sentinel `i64` floor: no `i64` is
+                    // guaranteed below every possible id — `i64::MIN` is itself a
+                    // legal id, and `id.gt(i64::MIN)` would exclude exactly that
+                    // row — and this repository's PK convention does not forbid
+                    // ids at or below zero, as a manual import can produce. `None`
+                    // means "first page, no lower bound"; every later page,
+                    // including the reclaim pass's first, carries a real cursor.
+                    let mut __age_last_id: ::core::option::Option<i64> = ::core::option::Option::None;
+                    let mut __age_batches: u32 = 0;
+                    #capped_decl
+                }
+            },
+        );
+
+        let mark_capped_true = if both_branches {
+            quote! { __age_capped = true; }
+        } else {
+            quote! {}
+        };
+        let mark_capped_false = if both_branches {
+            quote! { __age_capped = false; }
+        } else {
+            quote! {}
+        };
+
+        // One bounded pass over the age loop, capped at `cap_expr` (a
+        // runtime `u32` expression). Reads/writes the outer
+        // `__age_last_id`/`__age_batches` declared above rather than
+        // re-declaring locals, so calling this twice — the primary pass
+        // below, then the round-13 reclaim pass after `purge_block` —
+        // resumes the second call from the first's cursor instead of
+        // rescanning.
+        let build_age_loop = |cap_expr: TokenStream| -> TokenStream {
+            let Some((basis_ident, apply_stmt, not_already_deleted_filter)) =
+                age_fragments.as_ref()
+            else {
+                return quote! {};
+            };
+            quote! {
+                {
+                    let __age_cap_this_pass: u32 = #cap_expr;
+                    loop {
+                        if __age_batches >= __age_cap_this_pass {
+                            #mark_capped_true
+                            break;
+                        }
+                        let mut __query = #table_ident::table
+                            .into_boxed()
+                            .filter(#table_ident::#basis_ident.lt(__age_cutoff))
+                            #not_already_deleted_filter;
+                        if let ::core::option::Option::Some(__last) = __age_last_id {
+                            __query = __query.filter(#table_ident::id.gt(__last));
+                        }
+                        let ids: ::std::vec::Vec<i64> = __query
+                            .order(#table_ident::id.asc())
+                            .select(#table_ident::id)
+                            .limit(#batch_size_i64)
+                            .load::<i64>(&mut conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        if ids.is_empty() {
+                            #mark_capped_false
+                            break;
+                        }
+                        let __n = ids.len() as u64;
+                        __age_last_id = ::core::option::Option::Some(
+                            *ids.last().expect("ids non-empty"),
+                        );
+                        #apply_stmt
+                        rows_swept += __applied;
+                        __age_batches += 1;
+                        if __n < #batch_size_i64 as u64 {
+                            #mark_capped_false
+                            break;
+                        }
+                        if __age_batches >= __age_cap_this_pass {
+                            #mark_capped_true
+                            break;
+                        }
+                    }
+                }
+            }
+        };
+
+        let age_block = build_age_loop(quote! { #age_max_batches });
+
+        // Purge's cap is computed at *runtime*, after the age phase's
+        // primary pass finishes, as the total budget minus whatever that
+        // pass actually used — never less than its guaranteed floor (age's
+        // primary pass can never use more than its own fixed
+        // `age_max_batches` cap), but free to claim everything age's
+        // primary pass left unused (#1342 review round 11).
+        let purge_max_batches_expr = if both_branches {
+            quote! { (#max_batches).saturating_sub(__age_batches) }
+        } else {
+            quote! { #max_batches }
+        };
+        // Read by the round-13 age reclaim pass below, to compute how much
+        // of the shared budget purge left unused after age's primary pass
+        // ceded it some (or all) of the floor purge didn't need.
+        let purge_batches_used_decl = if both_branches {
+            quote! { let mut __purge_batches_used: u32 = 0; }
+        } else {
+            quote! {}
+        };
+        let purge_batches_used_write = if both_branches {
+            quote! { __purge_batches_used = __batches; }
+        } else {
+            quote! {}
+        };
+
+        // Purge branch: always a hard DELETE of rows soft-deleted longer
+        // than `purge_deleted_after`. Absent unless declared (and only
+        // ever declared alongside `soft_delete` — enforced above).
+        let purge_block = spec.purge_deleted_after.as_ref().map_or_else(
+                || quote! {},
+                |purge_after| {
+                    quote! {
+                        {
+                            let __purge_duration = ::autumn_web::task::parse_duration(#purge_after)
+                                .expect(concat!(
+                                    "invalid duration in #[repository(..., retention(purge_deleted_after = \"",
+                                    #purge_after,
+                                    "\"))]"
+                                ));
+                            let __purge_chrono =
+                                ::autumn_web::reexports::chrono::Duration::from_std(__purge_duration)
+                                    .expect("retention `purge_deleted_after` duration out of range");
+                            // Checked, not `-` (#1342 review round 16): see
+                            // the age branch's identical cutoff computation
+                            // for why a boot-validated duration can still
+                            // underflow against a particular clock reading.
+                            let __cutoff = ::autumn_web::time::ClockSource::now(state.clock())
+                                .naive_utc()
+                                .checked_sub_signed(__purge_chrono)
+                                .expect(concat!(
+                                    "retention `purge_deleted_after` duration is too large to \
+                                     compute a valid cutoff from the current time in \
+                                     #[repository(..., retention(purge_deleted_after = \"",
+                                    #purge_after,
+                                    "\"))]"
+                                ));
+                            // Computed at runtime, not a fixed macro-time
+                            // half-share (#1342 review round 11): lets the
+                            // purge phase claim whatever budget the age
+                            // phase didn't use, while never exceeding the
+                            // total per-run cap.
+                            let __purge_max_batches: u32 = #purge_max_batches_expr;
+                            let mut __last_id: ::core::option::Option<i64> = ::core::option::Option::None;
+                            let mut __batches: u32 = 0;
+                            loop {
+                                if __batches >= __purge_max_batches {
+                                    break;
+                                }
+                                let mut __query = #table_ident::table
+                                    .into_boxed()
+                                    .filter(#table_ident::deleted_at.lt(__cutoff));
+                                if let ::core::option::Option::Some(__last) = __last_id {
+                                    __query = __query.filter(#table_ident::id.gt(__last));
+                                }
+                                let ids: ::std::vec::Vec<i64> = __query
+                                    .order(#table_ident::id.asc())
+                                    .select(#table_ident::id)
+                                    .limit(#batch_size_i64)
+                                    .load::<i64>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                                if ids.is_empty() {
+                                    break;
+                                }
+                                let __n = ids.len() as u64;
+                                __last_id = ::core::option::Option::Some(
+                                    *ids.last().expect("ids non-empty"),
+                                );
+                                // Re-check `deleted_at < __cutoff` at delete
+                                // time, not just `id`: a row concurrently
+                                // `restore()`d between the SELECT above and this
+                                // DELETE must survive rather than be purged out
+                                // from under the restore. The `#cc_has` arm also
+                                // locks the still-eligible subset and runs
+                                // `counter_cache_before_delete_many` on it before
+                                // purging. That is normally a no-op — the row's
+                                // counter moved when it was soft-deleted — but it
+                                // keeps the purge path symmetric with the age
+                                // branch, and correct if that invariant changes.
+                                let __applied: u64 = if dry_run {
+                                    __n
+                                } else if #cc_has {
+                                    #[allow(unused_imports)]
+                                    use ::autumn_web::reexports::diesel_async::AsyncConnection as _;
+                                    #[allow(unused_imports)]
+                                    use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                                    ::autumn_web::__private::scoped_immediate_transaction::<u64, ::autumn_web::AutumnError, _>(
+                                        &mut *conn,
+                                        |conn| async move {
+                                            // Locked ascending by id, matching
+                                            // the age branches' identical fix
+                                            // above (#1342 review round 22).
+                                            #cc_serialize
+                                            let __locked_ids: ::std::vec::Vec<i64> = ::autumn_web::maybe_for_update!(
+                                                #table_ident::table
+                                                    .filter(#table_ident::id.eq_any(ids))
+                                                    .filter(#table_ident::deleted_at.lt(__cutoff))
+                                                    .order(#table_ident::id.asc())
+                                                    .select(#table_ident::id)
+                                            )
+                                            .load::<i64>(conn)
+                                            .await
+                                            .map_err(::autumn_web::AutumnError::from)?;
+                                            ::autumn_web::repository::counter_cache_before_delete_many(
+                                                conn, #cc_specs, &__locked_ids,
+                                            ).await?;
+                                            let __n2 = ::autumn_web::reexports::diesel::delete(
+                                                #table_ident::table.filter(#table_ident::id.eq_any(&__locked_ids))
+                                            )
+                                            .execute(conn)
+                                            .await
+                                            .map_err(::autumn_web::AutumnError::from)?;
+                                            ::core::result::Result::Ok(__n2 as u64)
+                                        }
+                                        .scope_boxed(),
+                                    )
+                                    .await?
+                                } else {
+                                    ::autumn_web::reexports::diesel::delete(
+                                        #table_ident::table
+                                            .filter(#table_ident::id.eq_any(ids))
+                                            .filter(#table_ident::deleted_at.lt(__cutoff))
+                                    )
+                                    .execute(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)? as u64
+                                };
+                                rows_swept += __applied;
+                                __batches += 1;
+                                if __n < #batch_size_i64 as u64 || __batches >= __purge_max_batches {
+                                    break;
+                                }
+                            }
+                            #purge_batches_used_write
+                        }
+                    }
+                },
+            );
+
+        // Symmetric with round 11's purge-borrows-from-age fix (#1342
+        // review round 13): if age's primary pass hit its cap — there may
+        // be more matching rows still waiting — and purge didn't use its
+        // whole share, let age reclaim whatever purge left unused instead
+        // of leaving it idle until the next scheduled tick. Resumes from
+        // the primary pass's cursor via the shared `__age_last_id`/
+        // `__age_batches` state rather than rescanning.
+        let age_reclaim_block = if both_branches {
+            let reclaim_loop =
+                build_age_loop(quote! { (#max_batches).saturating_sub(__purge_batches_used) });
+            quote! {
+                if __age_capped {
+                    #reclaim_loop
+                }
+            }
+        } else {
+            quote! {}
+        };
+
+        // Validate `after`/`purge_deleted_after` at task-registration time (boot),
+        // matching `every` below. Otherwise a typo'd unit such as "30dd" compiles
+        // and boots cleanly and panics only on the sweep's first scheduled tick,
+        // well after anyone was watching the deploy.
+        //
+        // This also validates the `chrono::Duration` conversion, not just
+        // `parse_duration`'s `std::time::Duration` (#1342): a value that parses as
+        // a `std::time::Duration` — a huge second count like
+        // `"18446744073709551615s"` — can still overflow `chrono::Duration`, which
+        // the sweep loop converts to when computing the cutoff.
+        //
+        // `chrono::Duration::from_std` checks that a duration fits chrono's range,
+        // but a value that fits — `after = "100000000d"`, about 274,000 years — can
+        // still place the cutoff outside `NaiveDateTime`'s range once subtracted
+        // from a clock reading. That is checked against the real wall clock, not the
+        // test-mockable `ClockSource`, which `task_info()` — a plain
+        // `fn() -> TaskInfo` with no `state` parameter — cannot reach. It is a
+        // sanity bound: an `after` that large overflows whatever "now" turns out to be.
+        let after_boot_validation = spec.after.as_ref().map_or_else(
+            || quote! {},
+            |after| {
+                quote! {
+                    {
+                        let __duration = ::autumn_web::task::parse_duration(#after)
+                            .expect(concat!(
+                                "invalid duration in #[repository(..., retention(after = \"",
+                                #after,
+                                "\"))]"
+                            ));
+                        let __chrono_duration =
+                            ::autumn_web::reexports::chrono::Duration::from_std(__duration)
+                                .expect(concat!(
+                                    "retention `after` duration out of range in \
+                                     #[repository(..., retention(after = \"",
+                                    #after,
+                                    "\"))]"
+                                ));
+                        ::autumn_web::reexports::chrono::Utc::now()
+                            .naive_utc()
+                            .checked_sub_signed(__chrono_duration)
+                            .expect(concat!(
+                                "retention `after` duration is too large to compute a valid \
+                                 cutoff (overflows the representable date range) in \
+                                 #[repository(..., retention(after = \"",
+                                #after,
+                                "\"))]"
+                            ));
+                    }
+                }
+            },
+        );
+        let purge_boot_validation = spec.purge_deleted_after.as_ref().map_or_else(
+            || quote! {},
+            |purge_after| {
+                quote! {
+                    {
+                        let __duration = ::autumn_web::task::parse_duration(#purge_after)
+                            .expect(concat!(
+                                "invalid duration in #[repository(..., retention(purge_deleted_after = \"",
+                                #purge_after,
+                                "\"))]"
+                            ));
+                        let __chrono_duration =
+                            ::autumn_web::reexports::chrono::Duration::from_std(__duration)
+                                .expect(concat!(
+                                    "retention `purge_deleted_after` duration out of range in \
+                                     #[repository(..., retention(purge_deleted_after = \"",
+                                    #purge_after,
+                                    "\"))]"
+                                ));
+                        ::autumn_web::reexports::chrono::Utc::now()
+                            .naive_utc()
+                            .checked_sub_signed(__chrono_duration)
+                            .expect(concat!(
+                                "retention `purge_deleted_after` duration is too large to \
+                                 compute a valid cutoff (overflows the representable date \
+                                 range) in #[repository(..., retention(purge_deleted_after = \"",
+                                #purge_after,
+                                "\"))]"
+                            ));
+                    }
+                }
+            },
+        );
+        // The `dependents.is_empty()` check in `parse_repo_args` sees only
+        // repository-attribute `dependent(...)`. A model can also declare
+        // `#[has_many(..., dependent = ...)]` or `#[has_one(...)]` directly, in a
+        // separate `#[model]` invocation this macro cannot see at compile time,
+        // resolved instead through the same runtime `Model::dependents()` the normal
+        // cascade delete path drives. The sweep mutates rows directly and never
+        // calls it, so the orphan and restrict-bypass risk the repository-attribute
+        // rejection exists for applies here too. Check at boot, like the duration
+        // validation above, rather than on the first scheduled tick (#1342).
+        let model_dependents_boot_validation = quote! {
+            {
+                #[allow(unused_imports)]
+                use ::autumn_web::repository::AutumnDependents as _;
+                assert!(
+                    #model_name::dependents().is_empty(),
+                    "retention(...) on {} does not support a model-declared \
+                     #[has_many(..., dependent = ...)] (or #[has_one(...)]) association yet: \
+                     the sweep mutates rows directly and does not run the cascade-aware delete \
+                     path Model::dependents() drives, so a hard-delete sweep could orphan \
+                     children (or silently ignore an on_delete = restrict rule) and a \
+                     soft-delete sweep would leave active children attached to a swept parent. \
+                     Remove the model-side `dependent = ...`, or call \
+                     delete_many(ids)/delete_by_id(id) yourself from a hand-written \
+                     #[scheduled] sweep for now",
+                    ::core::stringify!(#model_name)
+                );
+            }
+        };
+        // `parse_repo_args` rejects only `batch_size` values that overflow `i64`,
+        // the Postgres `LIMIT` bound. It cannot know the bind-parameter limit: that
+        // is backend-specific (`MAX_BIND_PARAMS` is 32766 on SQLite, 65535 on
+        // Postgres) and which backend is active is a Cargo feature of the consuming
+        // crate, invisible to a proc macro that sees only its own crate's features.
+        // Each swept batch binds one parameter per row id (`id.eq_any(ids)`) plus up
+        // to two more — the age or purge cutoff, and for a soft-delete age sweep the
+        // new `deleted_at` timestamp — so a `batch_size` within 2 of the backend's
+        // limit would compile and boot cleanly, then fail every real sweep with "too
+        // many SQL variables". `MAX_BIND_PARAMS` resolves per backend at the
+        // boot-time assert below, because that is evaluated in the consuming crate
+        // where the feature choice is visible (#1342).
+        let batch_size_bind_boot_validation = quote! {
+            assert!(
+                (#batch_size_i64 as u64) + 2 <= ::autumn_web::repository::MAX_BIND_PARAMS as u64,
+                "retention(batch_size = {}) leaves no headroom under this backend's \
+                 bind-parameter limit ({}): each swept batch binds one parameter per row id \
+                 plus the cutoff (and, for a soft-delete age sweep, the new deleted_at \
+                 timestamp), so a sweep this large would compile and boot cleanly but fail \
+                 every real run with \"too many SQL variables\". Lower `batch_size`, or remove \
+                 it for the default of {}",
+                #batch_size_i64,
+                ::autumn_web::repository::MAX_BIND_PARAMS,
+                #DEFAULT_RETENTION_BATCH_SIZE
+            );
+        };
+        let retention_duration_boot_validation = quote! {
+            #after_boot_validation
+            #purge_boot_validation
+            #model_dependents_boot_validation
+            #batch_size_bind_boot_validation
+        };
+
+        let methods = quote! {
+            /// Run this model's declared `retention(...)` policy once,
+            /// deleting (or soft-deleting) stale rows in bounded batches.
+            /// Registered as a fleet-coordinated scheduled task
+            /// automatically — apps never call this directly. See
+            /// `docs/guide/retention-sweeps.md`.
+            #[doc(hidden)]
+            pub async fn __autumn_retention_sweep(
+                state: &::autumn_web::AppState,
+            ) -> ::autumn_web::AutumnResult<::autumn_web::retention::RetentionSweepReport> {
+                Self::__autumn_retention_run(state, false).await
+            }
+
+            /// Count (never delete) the rows this policy would sweep
+            /// right now. Powers `autumn retention --dry-run`.
+            #[doc(hidden)]
+            pub fn __autumn_retention_dry_run(
+                state: ::autumn_web::AppState,
+            ) -> ::std::pin::Pin<::std::boxed::Box<
+                dyn ::std::future::Future<
+                    Output = ::autumn_web::AutumnResult<::autumn_web::retention::RetentionSweepReport>,
+                > + Send,
+            >> {
+                ::std::boxed::Box::pin(async move {
+                    Self::__autumn_retention_run(&state, true).await
+                })
+            }
+
+            #[doc(hidden)]
+            async fn __autumn_retention_run(
+                state: &::autumn_web::AppState,
+                dry_run: bool,
+            ) -> ::autumn_web::AutumnResult<::autumn_web::retention::RetentionSweepReport> {
+                use ::autumn_web::db::DbState as _;
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::time::ClockSource as _;
+
+                let __started = state.monotonic();
+                let pool = state
+                    .pool()
+                    .ok_or_else(|| {
+                        ::autumn_web::AutumnError::service_unavailable_msg(
+                            "retention sweep: no database pool configured",
+                        )
+                    })?
+                    .clone();
+                let repo = Self::with_pool_untracked(pool);
+                let mut conn = repo.__autumn_acquire_conn().await?;
+                let mut rows_swept: u64 = 0;
+                #age_cutoff_and_state_decl
+                #purge_batches_used_decl
+
+                // Each batch commits independently — no transaction spans the run —
+                // so a mid-run failure leaves earlier batches committed. Capturing
+                // the sweep's `Result` here, rather than letting a bare `?` inside
+                // these blocks return straight out of the function, lets the partial
+                // `rows_swept` reach `log_retention_sweep` below before the error
+                // propagates (#1342). Otherwise those committed rows would be missing
+                // from `retention_sweep_rows_total` and no structured report would
+                // record the partial work.
+                let __sweep_result: ::autumn_web::AutumnResult<()> = async {
+                    #age_block
+                    #purge_block
+                    #age_reclaim_block
+                    ::core::result::Result::Ok(())
+                }
+                .await;
+
+                #[allow(clippy::cast_possible_truncation)]
+                let duration_ms =
+                    state.monotonic().saturating_duration_since(__started).as_millis() as u64;
+                let report = ::autumn_web::retention::RetentionSweepReport {
+                    model: #model_name_str.to_string(),
+                    table: #table_name.to_string(),
+                    rows_swept,
+                    duration_ms,
+                    dry_run,
+                };
+                match __sweep_result {
+                    ::core::result::Result::Ok(()) => ::core::result::Result::Ok(report),
+                    ::core::result::Result::Err(error) => {
+                        ::autumn_web::retention::log_retention_sweep(&report);
+                        ::core::result::Result::Err(error)
+                    }
+                }
+            }
+
+            /// Builds the recurring `TaskInfo` `autumn_web::retention`
+            /// auto-registers with the scheduler.
+            ///
+            /// Validates every declared duration string up front — `after`,
+            /// `purge_deleted_after`, and `every` all fail loudly here, at
+            /// boot, rather than a `basis`/`purge_deleted_after` typo only
+            /// surfacing on the sweep's first scheduled tick (up to `every`
+            /// later).
+            #[doc(hidden)]
+            pub fn __autumn_retention_task_info() -> ::autumn_web::task::TaskInfo {
+                #retention_duration_boot_validation
+                ::autumn_web::task::TaskInfo {
+                    name: #task_name_str.to_string(),
+                    schedule: ::autumn_web::task::Schedule::FixedDelay(
+                        ::autumn_web::task::parse_duration(#every_str)
+                            .expect(concat!(
+                                "invalid duration in #[repository(..., retention(every = \"",
+                                #every_str,
+                                "\"))]"
+                            ))
+                    ),
+                    coordination: ::autumn_web::task::TaskCoordination::Fleet,
+                    handler: |state: ::autumn_web::AppState| {
+                        ::std::boxed::Box::pin(async move {
+                            let report = Self::__autumn_retention_sweep(&state).await?;
+                            ::autumn_web::retention::log_retention_sweep(&report);
+                            Ok(())
+                        })
+                    },
+                }
+            }
+        };
+
+        let registration = quote! {
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::retention::RetentionSweepDescriptor {
+                    model_name: stringify!(#model_name),
+                    table_name: #table_name,
+                    task_info: #pg_name::__autumn_retention_task_info,
+                    dry_run: #pg_name::__autumn_retention_dry_run,
+                }
+            }
+        };
+
+        (methods, registration)
+    } else {
+        (quote! {}, quote! {})
+    };
+
     // ── Pagination methods (`page` always; `cursor_page` when cursor_key is declared) ──
     //
-    // `page` executes a COUNT(*) + a LIMIT/OFFSET query and wraps the result in
-    // `Page<Model>`. `cursor_page` uses keyset pagination on the primary key `id`
-    // (always i64 per the Autumn PK convention) so the cursor is stable and
-    // requires no knowledge of the model's field types.  When `cursor_key = field`
-    // is declared, the query also orders by that field (descending) as a secondary
-    // sort key; the cursor payload remains the last-seen `id` so that filtering
-    // is always correct.
+    // `page` runs a COUNT(*) plus a LIMIT/OFFSET query and wraps the result in
+    // `Page<Model>`. `cursor_page` uses keyset pagination on the primary key `id`,
+    // always i64 per the Autumn PK convention, so the cursor is stable and needs no
+    // knowledge of the model's field types. When `cursor_key = field` is declared,
+    // the query also orders by that field descending as a secondary sort key; the
+    // cursor payload stays the last-seen `id`, so filtering is always correct.
     let pagination_trait_method = quote! {
         /// Fetch one page of records using offset pagination.
         ///
@@ -10505,13 +13616,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // ── #1126: allowlisted sort/filter list method ──────────────────────
     //
-    // `list()` is `page()` plus allowlisted ordering + equality filtering. The
-    // ordering/filtering DSL is *typed* — the `#[model]` macro generated
-    // `__autumn_list_apply_filters` / `__autumn_list_apply_order` over a boxed
-    // Diesel query, matching requested keys against the model's own columns.
-    // An unknown `sort`/`filter[..]` key hits the default arm and is ignored,
-    // so a request like `?sort=id;DROP TABLE` can never reach SQL. Filters are
-    // applied to both the COUNT and the page query so `total` is consistent.
+    // `list()` is `page()` plus allowlisted ordering and equality filtering. The DSL
+    // is typed: `#[model]` generates `__autumn_list_apply_filters` and
+    // `__autumn_list_apply_order` over a boxed Diesel query, matching requested keys
+    // against the model's own columns. An unknown `sort` or `filter[..]` key hits
+    // the default arm and is ignored, so `?sort=id;DROP TABLE` can never reach SQL.
+    // Filters apply to both the COUNT and the page query, so `total` stays consistent.
     let list_trait_method = quote! {
         /// Fetch one page of records applying **allowlisted** sort + equality
         /// filters from a [`::autumn_web::pagination::ListQuery`], with offset
@@ -10619,14 +13729,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // ── #1841: owner-scoped list method ─────────────────────────────────
     //
     // `list_scoped(owner_id, ..)` is `list(..)` with an unconditional
-    // `owner_column = owner_id` filter applied to BOTH the COUNT and the page
-    // query *before* the allowlisted sort/filter helpers run, so `total` and the
-    // returned rows agree and neither can be widened by a request-supplied
-    // filter. Emitted only when `owner =` is declared; otherwise both fragments
-    // are empty and every existing `#[repository]` is byte-for-byte unchanged.
-    // The owner filter composes with tenant scoping (both are `.filter(..)` on
-    // the boxed query) so a repository that is both tenant- and owner-scoped
-    // narrows by tenant AND owner.
+    // `owner_column = owner_id` filter applied to both the COUNT and the page query
+    // before the allowlisted sort/filter helpers run, so `total` and the returned
+    // rows agree and neither can be widened by a request-supplied filter. Emitted
+    // only when `owner =` is declared; otherwise both fragments are empty. The owner
+    // filter composes with tenant scoping — both are `.filter(..)` on the boxed
+    // query — so a repository that is both narrows by tenant and owner.
     let (list_scoped_trait_method, list_scoped_impl_method) = if let Some(ref owner_col) =
         owner_col_ident
     {
@@ -10725,20 +13833,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         (quote! {}, quote! {})
     };
 
-    // `cursor_page` is only generated when the user declares `cursor_key = field`.
+    // `cursor_page` is generated only when the user declares `cursor_key = field`.
+    // Two modes, depending on whether `cursor_key_type` is also declared:
     //
-    // Two modes depending on whether `cursor_key_type` is also declared:
-    //
-    // **With `cursor_key_type = Type`** (always correct):
-    //   Cursor payload is `(Type, i64)`.  The WHERE clause advances the
-    //   `(cursor_key DESC, id DESC)` sort order exactly:
+    // With `cursor_key_type = Type` (always correct): the cursor payload is
+    //   `(Type, i64)`, and the WHERE clause advances the `(cursor_key DESC, id
+    //   DESC)` sort order exactly:
     //     WHERE (cursor_key < after_k) OR (cursor_key = after_k AND id < after_id)
     //
-    // **Without `cursor_key_type`** (correct for correlated cursor_key / id):
-    //   Cursor payload is `id` (i64) only.  The filter is `id < after_id`.
-    //   This is correct when cursor_key values are monotonically correlated
-    //   with id (e.g. `created_at` on an auto-increment table).  For
-    //   non-monotonic data (backfills, imports) implement cursor_page manually.
+    // Without `cursor_key_type`: the cursor payload is `id` alone and the filter is
+    //   `id < after_id`. This is correct when cursor_key values are monotonically
+    //   correlated with id, e.g. `created_at` on an auto-increment table. For
+    //   non-monotonic data (backfills, imports) implement `cursor_page` manually.
     let tenant_query_filter = if config.tenant_scoped {
         quote! {
             if !self.across_tenants {
@@ -10761,6 +13867,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         config.cursor_key
     {
         let cursor_key_ident = format_ident!("{ck}");
+        // #1771: the keyset paginator both orders by this column and compares it.
+        // Over randomized ciphertext the order is arbitrary and the keyset never
+        // converges, so this is a build failure rather than silent nonsense.
+        let cursor_confidential_guard = confidential_column_guard(
+            model_name,
+            ck,
+            "cursor_page",
+            "ORDER BY and keyset predicate",
+        );
         let trait_method = quote! {
             /// Fetch one page of records using keyset (cursor) pagination.
             ///
@@ -10798,6 +13913,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &self,
                     req: &::autumn_web::pagination::CursorRequest,
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
+                    #cursor_confidential_guard
                     #cursor_cross_shard_guard
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
@@ -10842,6 +13958,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &self,
                     req: &::autumn_web::pagination::CursorRequest,
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
+                    #cursor_confidential_guard
                     #cursor_cross_shard_guard
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
@@ -10876,20 +13993,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         (quote! {}, quote! {})
     };
 
-    // ── Batched iteration (find_in_batches / find_each), issue #1395 ─────────
+    // ── Batched iteration (find_in_batches / find_each), #1395 ──────────────
     //
-    // Generated for EVERY repository (not gated on cursor_key): a primary-key
-    // ascending keyset walk that streams the whole table in bounded-memory
-    // chunks. Each batch is `WHERE id > last ORDER BY id ASC LIMIT batch_size`
-    // (no id predicate on the first batch), reusing the same soft-delete
-    // filter, tenant scoping and read-routing as `find_all`/`cursor_page`, so
-    // those semantics come for free.
+    // Generated for every repository, not gated on cursor_key: a primary-key
+    // ascending keyset walk that streams the whole table in bounded-memory chunks.
+    // Each batch is `WHERE id > last ORDER BY id ASC LIMIT batch_size`, with no id
+    // predicate on the first batch, reusing the same soft-delete filter, tenant
+    // scoping, and read-routing as `find_all`/`cursor_page`.
     //
-    // The generic driver + handle types live in `autumn_web::batches`; the
-    // macro only emits a thin per-repo `BatchSource` impl (the keyset query)
-    // plus two inherent constructors. Sharded repos mirror `cursor_page`:
-    // cross-shard `across_tenants` iteration is rejected (shard fan-out is out
-    // of scope per #1395); a single routed shard iterates normally.
+    // The generic driver and handle types live in `autumn_web::batches`; the macro
+    // emits only a thin per-repo `BatchSource` impl — the keyset query — plus two
+    // inherent constructors. Sharded repos mirror `cursor_page`: cross-shard
+    // `across_tenants` iteration is rejected, since shard fan-out is out of scope
+    // for #1395, and a single routed shard iterates normally.
     let batch_cross_shard_guard = if config.sharded && config.tenant_scoped {
         quote! {
             // Reject on the runtime `across_tenants` flag alone — independent of
@@ -11002,16 +14118,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    // ── Typed grouped aggregate queries (issue #1364) ───────────────────────
+    // ── Typed grouped aggregate queries (#1364) ─────────────────────────────
     //
-    // Emitted as inherent methods on the Pg* struct (parallel to
-    // find_in_batches / find_or_create_by): each returns a lazy
-    // `GroupedAggregate<'_, K, V>` builder. Under the hood a parameterized
-    // `diesel::sql_query` with a QueryableByName row (concrete SQL types baked
-    // from the declared `Vec<(K, V)>`), routed through the read-role helper and
-    // composing the same soft-delete + tenant predicates as `count`. Filter
-    // values are bound (never interpolated). sum/avg/min/max cannot be merged
-    // across shards, so across_tenants() on a sharded repo is rejected.
+    // Emitted as inherent methods on the Pg* struct, parallel to
+    // `find_in_batches`/`find_or_create_by`: each returns a lazy
+    // `GroupedAggregate<'_, K, V>` builder. Underneath is a parameterized
+    // `diesel::sql_query` with a `QueryableByName` row whose SQL types are baked
+    // from the declared `Vec<(K, V)>`, routed through the read-role helper and
+    // composing the same soft-delete and tenant predicates as `count`. Filter values
+    // are bound, never interpolated, and `across_tenants()` on a sharded repo is
+    // rejected because sum/avg/min/max cannot merge across shards.
     let grouped_aggregate_methods = {
         // Baked literals shared by every generated method.
         let table_q = format!("\"{table_name}\"");
@@ -11057,15 +14173,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             (quote! {}, quote! {}, quote! {})
         };
 
-        // Reject cross-shard aggregates whenever the repo is (compile-time)
-        // sharded + tenant-scoped AND the runtime `across_tenants` flag is set —
-        // independent of whether a live shard set (`__autumn_shards`) is loaded.
-        // sum/avg/min/max cannot be merged across shards, and an across-tenant
-        // scan without a shard set (e.g. built via `with_pool_untracked`, where
-        // `__autumn_shards` is `None`) would bind a NULL tenant predicate and
-        // silently return a PARTIAL result over only the current pool. Gating on
-        // `__autumn_shards.is_some()` missed exactly that no-shard-set case, so
-        // the guard fires purely on the sharded config + the `across_tenants`
+        // Reject cross-shard aggregates whenever the repo is sharded and
+        // tenant-scoped at compile time and the runtime `across_tenants` flag is
+        // set, whether or not a live shard set (`__autumn_shards`) is loaded.
+        // sum/avg/min/max cannot merge across shards, and an across-tenant scan with
+        // no shard set — built via `with_pool_untracked`, where `__autumn_shards` is
+        // `None` — would bind a NULL tenant predicate and silently return a partial
+        // result over the current pool alone. Gating on `__autumn_shards.is_some()`
+        // missed exactly that case, so the guard keys on the sharded config and the
         // flag (#1364).
         let cross_shard_guard = if config_sharded && config_tenant_scoped {
             quote! {
@@ -11098,20 +14213,31 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let agg_expr = &spec.agg_sql_expr;
             let group_col_q = format!("\"{}\"", spec.group_col);
 
-            // #1364 encryption correctness: grouped aggregates cannot operate on
-            // an at-rest `#[encrypted(...)]` column. The stored value is
-            // ciphertext, so grouping would return ciphertext keys deserialized
-            // into the declared key type, and `.filter_eq(plaintext)` would bind
-            // plaintext against a ciphertext column and match nothing (the
-            // `find_by` path avoids this by routing string params through the
-            // registry encoder; this raw-SQL path cannot). Whether a column is
-            // encrypted is only known at runtime — the mode is declared on the
-            // model, which the repository macro cannot see (see
-            // `encode_derived_query_param`) — so this is a runtime guard against
-            // the SAME registry the `find_by` surface consults, not a
-            // `compile_error!`. It rejects only columns that are actually
-            // encrypted, so non-encrypted grouping (e.g. `count_grouped_by_kind`
-            // on a plain `String`) is unchanged. The escape hatch is a raw query.
+            // #1364 encryption correctness: grouped aggregates cannot operate on an
+            // at-rest `#[encrypted(...)]` column. The stored value is ciphertext, so
+            // grouping would return ciphertext keys deserialized into the declared
+            // key type, and `.filter_eq(plaintext)` would bind plaintext against a
+            // ciphertext column and match nothing. The `find_by` path avoids this by
+            // routing string params through the registry encoder; this raw-SQL path
+            // cannot. Whether a column is encrypted is known only at runtime — the
+            // mode is declared on the model, which this macro cannot see — so this is
+            // a runtime guard against the same registry `find_by` consults, not a
+            // `compile_error!`. It rejects only genuinely encrypted columns, so
+            // grouping a plain `String` is unchanged. The escape hatch is a raw query.
+            // #1771: a sealed column cannot be a GROUP BY key or an aggregated
+            // value, so this one is refused at build time rather than at runtime.
+            let confidential_guards: Vec<TokenStream> = ::core::iter::once(&spec.group_col)
+                .chain(spec.value_col.as_ref())
+                .map(|col| {
+                    confidential_column_guard(
+                        model_name,
+                        col,
+                        &spec.fn_ident.to_string(),
+                        "GROUP BY / aggregate",
+                    )
+                })
+                .collect();
+
             let enc_guard = {
                 let fn_name_str = spec.fn_ident.to_string();
                 let group_col_raw = spec.group_col.as_str();
@@ -11147,7 +14273,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         }
                     });
                 }
-                quote! { #(#checks)* }
+                quote! { #(#confidential_guards)* #(#checks)* }
             };
             // #1364 timezone correctness: only a `timestamptz` (`DateTime<Utc>`)
             // bucket key gets the UTC-pinning 3-arg `date_trunc` zone argument.
@@ -11190,15 +14316,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     agg_val: #value_type,
                                 }
 
-                                // Group expression: bucketed (date_trunc) or the raw column.
-                                // For a `timestamptz` (`DateTime<Utc>`) key, `#bucket_zone_arg`
-                                // is `, 'UTC'` so the 3-arg `date_trunc('unit', col, 'UTC')`
-                                // (Postgres 12+) truncates in UTC — otherwise the 2-arg form
-                                // would truncate in the DB session `TimeZone`, drifting bucket
-                                // boundaries across deployments (#1364). For a `NaiveDateTime`
-                                // (`timestamp`) key it is empty, keeping the deterministic
-                                // 2-arg field truncation. SELECT and GROUP BY reuse this same
-                                // string, so the bucket expression always matches exactly.
+                                // Group expression: bucketed (date_trunc) or the raw
+                                // column. For a `timestamptz` (`DateTime<Utc>`) key,
+                                // `#bucket_zone_arg` is `, 'UTC'`, so the 3-arg
+                                // `date_trunc('unit', col, 'UTC')` (Postgres 12+)
+                                // truncates in UTC; the 2-arg form would truncate in
+                                // the DB session `TimeZone` and drift bucket
+                                // boundaries across deployments (#1364). For a
+                                // `NaiveDateTime` key it is empty. SELECT and GROUP BY
+                                // reuse this string, so the expressions always match.
                                 let __group_expr: ::std::string::String = match __opts.bucket {
                                     ::core::option::Option::Some(__b) => format!(
                                         "date_trunc('{unit}', {col}{zone})",
@@ -11217,14 +14343,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 #soft_delete_cond
                                 #tenant_cond
                                 // A non-nullable declared key type cannot represent a
-                                // NULL group (and `Option<K>` is rejected at compile
-                                // time), so exclude rows whose raw group column is NULL —
-                                // otherwise `GROUP BY` would emit a NULL-key group that
-                                // fails to deserialize at runtime (#1364). Guarding the
-                                // raw column also drops null-timestamp rows under
-                                // `.bucket()` (date_trunc of NULL is NULL). No bind param,
-                                // so the `$n` numbering below is unaffected. Harmless
-                                // no-op when the column is already NOT NULL.
+                                // NULL group, and `Option<K>` is rejected at compile
+                                // time, so exclude rows whose raw group column is
+                                // NULL: `GROUP BY` would otherwise emit a NULL-key
+                                // group that fails to deserialize (#1364). Guarding
+                                // the raw column also drops null-timestamp rows under
+                                // `.bucket()`, since date_trunc of NULL is NULL. No
+                                // bind param, so `$n` numbering below is unaffected,
+                                // and it is a no-op on a NOT NULL column.
                                 __conds.push(format!("{col} IS NOT NULL", col = #group_col_q));
                                 let __eq_n = { __n += 1; __n };
                                 __conds.push(format!("(${n} IS NULL OR {col} = ${n})", n = __eq_n, col = #group_col_q));
@@ -11293,21 +14419,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { #(#__methods)* }
     };
 
-    // ── Race-safe get-or-insert (find_or_create_by_*, issue #1382) ──────────
+    // ── Race-safe get-or-insert (find_or_create_by_*, #1382) ────────────────
     //
-    // Emitted as inherent async methods on the Pg* struct (parallel to
-    // find_in_batches) — they return `(Model, bool)` and take an extra `new`
-    // insert value, so they don't fit the trait finder surface. Recipe:
-    //   1. Preliminary lookup on the READ path (replica-eligible), honoring
-    //      tenant scoping + soft-delete. Found → `(row, false)`, no hooks.
-    //   2. Else INSERT on the PRIMARY with `ON CONFLICT DO NOTHING`, which
-    //      avoids the Postgres 23505 transaction abort entirely — no
-    //      unique-violation error ever escapes to a caller.
-    //        - Some(row) → a real insert happened → `(row, true)`; the same
-    //          before_create / after_create / commit-hook weaving as `save`
-    //          runs (only on this created path).
-    //        - None → a concurrent caller won the race → re-lookup on the
-    //          PRIMARY (read-your-writes) → `(row, false)`, no hooks.
+    // Emitted as inherent async methods on the Pg* struct, parallel to
+    // `find_in_batches`. They return `(Model, bool)` and take an extra `new` insert
+    // value, so they do not fit the trait finder surface. The recipe:
+    //   1. Preliminary lookup on the read path (replica-eligible), honoring tenant
+    //      scoping and soft-delete. Found → `(row, false)`, no hooks.
+    //   2. Otherwise INSERT on the primary with `ON CONFLICT DO NOTHING`, which
+    //      avoids the Postgres 23505 transaction abort entirely, so no
+    //      unique-violation error escapes to a caller.
+    //        - Some(row): a real insert happened → `(row, true)`, with the same
+    //          before_create / after_create / commit-hook weaving as `save`.
+    //        - None: a concurrent caller won the race → re-lookup on the primary
+    //          for read-your-writes → `(row, false)`, no hooks.
     // Unlike `upsert_many`, this is generated even on hooked repositories.
     let foc_sd_boxed = if config.soft_delete {
         quote! { query = query.filter(#table_ident::deleted_at.is_null()); }
@@ -11374,6 +14499,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             None,
             &quote! { conn },
             model_name,
+            config.ledgered,
         )
     } else {
         quote! {}
@@ -11387,6 +14513,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             None,
             &quote! { conn },
             model_name,
+            config.ledgered,
         )
     } else {
         quote! {}
@@ -11408,7 +14535,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         match __autumn_after_create {
             ::core::result::Result::Ok(::core::result::Result::Ok(())) => {}
             ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
-                let __autumn_error_message = ::std::format!("{__autumn_error}");
+                let __autumn_error_message = __autumn_error.message();
                 ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
                     &self.pool,
                     &__autumn_commit_hook_id,
@@ -11482,6 +14609,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .map(|(name, ty)| quote! { #name: #ty })
                 .collect();
 
+            // #1771: a get-or-insert looks the row up first, so a sealed
+            // column is refused here on the same terms as `find_by`.
+            let foc_name = fn_ident.to_string();
+            let confidential_guards: Vec<TokenStream> = spec
+                .lookup_params
+                .iter()
+                .map(|(name, _)| {
+                    confidential_column_guard(
+                        model_name,
+                        &name.to_string(),
+                        &foc_name,
+                        "WHERE clause",
+                    )
+                })
+                .collect();
+
             // Encrypted-column encoding (string fields) + boxed-query filters,
             // matching the `find_by` derived-query surface (#805).
             let table_name_str = table_ident.to_string();
@@ -11491,9 +14634,26 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let fname = name.to_string();
                 if spec.string_fields.contains(&fname) {
                     let enc_ident = format_ident!("__autumn_foc_{name}");
+                    let norm_ident = format_ident!("__autumn_focn_{name}");
+                    // #2586: canonicalize the lookup argument on a `#[normalize]`
+                    // column, the same probe the derived `find_by_*` finders use.
+                    // The insert normalizes its payload, so a raw lookup would
+                    // miss the row it just wrote: the next identical call would
+                    // conflict on insert and then miss the re-lookup too, which
+                    // surfaces as the "no matching row on re-lookup" 500 rather
+                    // than the existing row. Runs before the encrypted-column
+                    // encoder, matching the finder order.
                     encode_lets.push(quote! {
+                        let #norm_ident = {
+                            #[allow(unused_imports)]
+                            use ::autumn_web::normalize::{SpezLookupNo as _, SpezLookupYes as _};
+                            ::autumn_web::normalize::SpezLookup::<#model_name>(
+                                ::core::marker::PhantomData, #fname, &#name,
+                            )
+                            .spez_lookup()
+                        };
                         let #enc_ident = ::autumn_web::encryption::encode_derived_query_param(
-                            #table_name_str, #fname, &#name,
+                            #table_name_str, #fname, &#norm_ident,
                         )
                         .map_err(|__e| ::autumn_web::AutumnError::internal_server_error_msg(
                             __e.to_string(),
@@ -11531,6 +14691,28 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             let step1_lookup = make_lookup(quote! { &mut __rconn });
             let relookup = make_lookup(quote! { &mut conn });
+            // #2586: the create half runs the model's `#[validate]` rules, but a
+            // refusal must not overtake the found path. Step 1 is
+            // replica-eligible, so it can miss a row the primary already has
+            // (and a concurrent caller can insert one after it ran); this call
+            // would then insert nothing, which is exactly the case the rules do
+            // not govern. Confirm on the primary before refusing, so the answer
+            // does not depend on replication lag.
+            let validate_or_found = {
+                let primary_lookup = make_lookup(quote! { &mut __autumn_vconn });
+                let call = maybe_validate_insert(&quote! { new });
+                quote! {
+                    if let ::core::result::Result::Err(__autumn_invalid) = #call {
+                        let mut __autumn_vconn = self.__autumn_acquire_conn().await?;
+                        let __autumn_existing: ::core::option::Option<#model_name> =
+                            #primary_lookup;
+                        if let ::core::option::Option::Some(__autumn_row) = __autumn_existing {
+                            return ::core::result::Result::Ok((__autumn_row, false));
+                        }
+                        return ::core::result::Result::Err(__autumn_invalid);
+                    }
+                }
+            };
             let none_branch_msg = if config.soft_delete {
                 "find_or_create_by: the insert hit a unique conflict but no matching \
                  row was found on re-lookup. Two causes are possible: (1) the lookup \
@@ -11730,6 +14912,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // matching rows on other shards go unseen. Same guard used by
                     // save/update/delete; a no-op token on non-sharded repos.
                     #cross_shard_write_guard
+                    #(#confidential_guards)*
                     #(#encode_lets)*
                     // Step 1: preliminary lookup on the read path (replica-eligible).
                     {
@@ -11739,6 +14922,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             return ::core::result::Result::Ok((__row, false));
                         }
                     }
+                    // #2586: the row is about to be created, so normalize and
+                    // then run the model's `#[validate]` rules — the same
+                    // insert-path contract `save` has. Deliberately after the
+                    // lookup: a found row is returned unchanged, because this
+                    // call inserts nothing.
+                    #[allow(unused_imports)]
+                    use ::autumn_web::normalize::{SpezNormalizeNo as _, SpezNormalizeYes as _};
+                    #[allow(unused_imports)]
+                    use ::std::borrow::Borrow as _;
+                    let __autumn_normalized =
+                        ::autumn_web::normalize::SpezNormalize(new).spez_normalize();
+                    let new: &#new_name = __autumn_normalized.borrow();
+                    #validate_or_found
                     // Step 2: create on the primary with ON CONFLICT DO NOTHING.
                     #step2
                 }
@@ -11787,6 +14983,26 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // ── Build API handlers (when `api = "/path"` is present) ────────────
     let api_handlers = if let Some(ref api_path) = config.api_path {
         let prefix = to_snake_case(&model_name.to_string());
+
+        // #1654: the generated CRUD handlers return the model through `Json`.
+        // If the model carries a `#[classified]` column it is not `JsonSink`, so
+        // the handlers cannot compile -- but the failure surfaces as axum's
+        // `Handler` bound, which swallows autumn's own diagnostic. Assert the
+        // obligation directly first so the developer reads the message that says
+        // what is wrong and what to do. This is a call-site obligation, not a
+        // trivial where-clause, so it costs nothing for an unclassified model.
+        let api_sink_assertion = quote! {
+            const _: () = {
+                fn __autumn_api_response_must_be_releasable<
+                    __T: ::autumn_web::classify::JsonSink,
+                >() {
+                }
+                #[allow(dead_code)]
+                fn __autumn_assert_api_response_is_releasable() {
+                    __autumn_api_response_must_be_releasable::<#model_name>();
+                }
+            };
+        };
 
         let list_fn = format_ident!("{prefix}_api_list");
         let get_fn = format_ident!("{prefix}_api_get");
@@ -11954,16 +15170,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         // List endpoint behavior, in order of precedence:
         //
-        // 1. `scope = SomeScope`: invoke the registered scope (the
-        //    most efficient form ΓÇö the scope filters at the SQL level
-        //    via Diesel).
-        // 2. `policy = SomePolicy` without `scope`: load every
-        //    record, then filter through `Policy::can_show` per row.
-        //    Slower than (1) for large tables, but closes the
-        //    "policy guards show/update/delete but list returns
-        //    everything" data-exposure path. Users who care about
-        //    perf should also set `scope = SomeScope`.
-        // 3. Neither: plain `repo.find_all()` (public list).
+        // 1. `scope = SomeScope`: invoke the registered scope. The most efficient
+        //    form — the scope filters at the SQL level via Diesel.
+        // 2. `policy = SomePolicy` without `scope`: load every record, then filter
+        //    through `Policy::can_show` per row. Slower than (1) on large tables,
+        //    but it closes the "policy guards show/update/delete but list returns
+        //    everything" exposure path. Set `scope = SomeScope` too if performance
+        //    matters.
+        // 3. Neither: plain `repo.find_all()`, a public list.
         let scope_list_body = if config.scope_type.is_some() {
             // Scope filters at the SQL level, but the filtered set is still
             // returned in full — window it in memory so the response stays
@@ -12150,17 +15364,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! { ::core::option::Option::None }
         };
-        // Companion probe for `scope = ...`. ONLY attached to the
-        // `_api_list` route's metadata ΓÇö the other auto-generated
-        // routes (`*_api_get` / `*_api_create` / `*_api_update` /
-        // `*_api_delete`) never call `scope.list`, so flagging them
-        // for missing scope registration would fire the prod fail-
-        // fast even when the user intentionally mounted only
-        // non-list endpoints with `scope = ...` configured (the
-        // app's reads happen via custom queries, but the scope is
-        // still declared so `Note::scope(&ctx)` works in hand-
-        // written list handlers). The non-list routes below get
-        // `scope_check: None` regardless.
+        // Companion probe for `scope = ...`, attached only to the `_api_list`
+        // route's metadata. The other auto-generated routes (`*_api_get`,
+        // `*_api_create`, `*_api_update`, `*_api_delete`) never call `scope.list`,
+        // so flagging them for missing scope registration would fire the prod
+        // fail-fast even when the user deliberately mounted only non-list endpoints
+        // with `scope = ...` configured — reads happen via custom queries, but the
+        // scope is still declared so `Note::scope(&ctx)` works in hand-written list
+        // handlers. The non-list routes get `scope_check: None` regardless.
         let list_scope_check_fn = if config.scope_type.is_some() {
             quote! {
                 ::core::option::Option::Some(
@@ -12185,16 +15396,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         // #1253: run the model's `#[validate(...)]` rules on the decoded write
-        // payload before it reaches the DB, returning a 422 Problem Details
-        // with the per-field `errors` map on failure. Uses autoref
-        // specialization (`MaybeValidate`) so a payload type that does not
-        // implement `validator::Validate` (e.g. a `NewModel` with no
-        // `#[validate]` fields, or a hand-written insert type) compiles to a
-        // no-op — no migration burden for existing repositories.
+        // payload before it reaches the DB, returning a 422 Problem Details with the
+        // per-field `errors` map on failure. Autoref specialization (`MaybeValidate`)
+        // makes a payload type that does not implement `validator::Validate` — a
+        // `NewModel` with no `#[validate]` fields, or a hand-written insert type —
+        // compile to a no-op, so existing repositories need no migration.
         //
-        // `?`-flavoured for the plain `AutumnResult` handlers; the policy-backed
-        // handlers return `IdempotencyReplayOr`, so they get an explicit
-        // early-return that wraps the error in `Inner`.
+        // `?`-flavoured for the plain `AutumnResult` handlers. The policy-backed
+        // handlers return `IdempotencyReplayOr`, so they get an explicit early return
+        // that wraps the error in `Inner`.
         let validate_new = quote! {
             {
                 // Both traits must be in scope for autoref resolution to
@@ -12352,23 +15562,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             } else {
                 let draft_ext_trait = format_ident!("{}DraftExt", model_name);
                 quote! {
-                    // #1801: also validate the effective merged model (existing
-                    // row ∪ patch) so the full validator set runs against
-                    // concrete values, matching the hooked-repo precedent
-                    // (#1804). Runs after 404/403/patch-422 and reuses the
-                    // already-loaded `__existing` (no extra query). We only want
-                    // the 422 side-effect, so the draft is discarded and the
-                    // blind `repo.update` below is unchanged. Wrapped (not `?`)
-                    // because this handler returns `IdempotencyReplayOr`; sits
+                    // #1801: also validate the effective merged model (existing row
+                    // plus patch), so the full validator set runs against concrete
+                    // values, matching the hooked-repo precedent (#1804). Runs after
+                    // the 404, 403, and patch-422 checks and reuses the already-loaded
+                    // `__existing`, so there is no extra query. Only the 422 side
+                    // effect is wanted, so the draft is discarded and the blind
+                    // `repo.update` below is unchanged. Wrapped rather than `?`
+                    // because this handler returns `IdempotencyReplayOr`, and it sits
                     // with the other pure pre-replay checks so it cannot affect
                     // idempotency replay semantics.
                     //
-                    // Concurrency (known, deliberate): this is point-in-time —
-                    // it validates against the `__existing` snapshot loaded for
-                    // the 404/policy gate, not under a row lock held through
-                    // `repo.update`, so it is best-effort under concurrent writes
-                    // for the same reason as the blind path above (deliberate,
-                    // given the always-on zero-extra-query design).
+                    // Concurrency: this is point-in-time. It validates against the
+                    // `__existing` snapshot loaded for the 404/policy gate, not under
+                    // a row lock held through `repo.update`, so it is best-effort
+                    // under concurrent writes — the same deliberate trade-off as the
+                    // blind path above, given the zero-extra-query design.
                     if let ::core::result::Result::Err(err) =
                         <::autumn_web::hooks::UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&__existing, &patch)
                     {
@@ -12574,6 +15783,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             // ── Auto-generated REST API handlers ─────────────────
 
+            #api_sink_assertion
             #policy_type_assertion
             #scope_type_assertion
 
@@ -12637,6 +15847,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }),
                     idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
                     timeout: ::autumn_web::RouteTimeout::Inherit,
+                    seo: ::autumn_web::seo::SeoRouteDefaults::EMPTY,
                     api_version: ::core::option::Option::None,
                     sunset_opt_out: false,
                 }
@@ -12693,6 +15904,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }),
                     idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
                     timeout: ::autumn_web::RouteTimeout::Inherit,
+                    seo: ::autumn_web::seo::SeoRouteDefaults::EMPTY,
                     api_version: ::core::option::Option::None,
                     sunset_opt_out: false,
                 }
@@ -12749,6 +15961,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }),
                     idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
                     timeout: ::autumn_web::RouteTimeout::Inherit,
+                    seo: ::autumn_web::seo::SeoRouteDefaults::EMPTY,
                     api_version: ::core::option::Option::None,
                     sunset_opt_out: false,
                 }
@@ -12807,6 +16020,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }),
                     idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
                     timeout: ::autumn_web::RouteTimeout::Inherit,
+                    seo: ::autumn_web::seo::SeoRouteDefaults::EMPTY,
                     api_version: ::core::option::Option::None,
                     sunset_opt_out: false,
                 }
@@ -12846,6 +16060,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }),
                     idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
                     timeout: ::autumn_web::RouteTimeout::Inherit,
+                    seo: ::autumn_web::seo::SeoRouteDefaults::EMPTY,
                     api_version: ::core::option::Option::None,
                     sunset_opt_out: false,
                 }
@@ -12883,10 +16098,24 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // Soft-delete extra trait/impl methods: restore, purge, with_deleted, only_deleted.
+    //
+    // #1699: `purge` is soft-delete's hard-delete escape hatch — it issues a raw
+    // `DELETE FROM` and writes no history at all. On a `ledgered` repository that
+    // is precisely the history-bypassing write the ledger exists to prevent, so
+    // the method is not declared and not implemented: calling it does not
+    // compile. `delete_by_id` (which records a delete revision) and `restore`
+    // remain the whole delete surface.
+    let purge_trait_method = if config.ledgered {
+        quote! {}
+    } else {
+        quote! {
+            fn purge(&self, id: i64) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
+        }
+    };
     let soft_delete_trait_methods = if config.soft_delete {
         quote! {
             fn restore(&self, id: i64) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
-            fn purge(&self, id: i64) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
+            #purge_trait_method
             fn with_deleted(&self) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
             fn only_deleted(&self) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
             fn page_only_deleted(&self, req: &::autumn_web::pagination::PageRequest) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>>> + Send;
@@ -13000,6 +16229,96 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             (quote! {}, quote! {}, quote! {})
         };
 
+    // #1325: `restore` and `purge` are single-statement (transaction-free) by
+    // design. A counter-cached model needs the counter to move with them:
+    // `restore` re-increments (guarded on the row still being soft-deleted, so
+    // restoring a live row is a no-op), and `purge` decrements only when the row
+    // is still live — a purge of an already-soft-deleted row must not
+    // double-decrement, since the soft delete already did.
+    let cc_restore_tenant_wrap = cc_tx_wrap(
+        &quote! { () },
+        &quote! {
+            #cc_before_restore
+            let query = #table_ident::table.find(id);
+            let __count = if let ::core::option::Option::Some(ref t) = tenant_id {
+                ::autumn_web::reexports::diesel::update(query.filter(#table_ident::tenant_id.eq(t)))
+                    .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
+                    .execute(conn)
+                    .await
+            } else {
+                ::autumn_web::reexports::diesel::update(query)
+                    .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
+                    .execute(conn)
+                    .await
+            }
+            .map_err(::autumn_web::AutumnError::from)?;
+            if __count == 0 {
+                return Err(::autumn_web::AutumnError::not_found_msg(
+                    format!("{} with id {} not found", stringify!(#model_name), id)
+                ));
+            }
+            Ok(())
+        },
+    );
+    let cc_restore_plain_wrap = cc_tx_wrap(
+        &quote! { () },
+        &quote! {
+            #cc_before_restore
+            let query = #table_ident::table.find(id);
+            let __count = ::autumn_web::reexports::diesel::update(query)
+                .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
+                .execute(conn)
+                .await
+                .map_err(::autumn_web::AutumnError::from)?;
+            if __count == 0 {
+                return Err(::autumn_web::AutumnError::not_found_msg(
+                    format!("{} with id {} not found", stringify!(#model_name), id)
+                ));
+            }
+            Ok(())
+        },
+    );
+    let cc_purge_tenant_wrap = cc_tx_wrap(
+        &quote! { () },
+        &quote! {
+            #cc_before_delete
+            let query = #table_ident::table.find(id);
+            let __count = if let ::core::option::Option::Some(ref t) = tenant_id {
+                ::autumn_web::reexports::diesel::delete(query.filter(#table_ident::tenant_id.eq(t)))
+                    .execute(conn)
+                    .await
+            } else {
+                ::autumn_web::reexports::diesel::delete(query)
+                    .execute(conn)
+                    .await
+            }
+            .map_err(::autumn_web::AutumnError::from)?;
+            if __count == 0 {
+                return Err(::autumn_web::AutumnError::not_found_msg(
+                    format!("{} with id {} not found", stringify!(#model_name), id)
+                ));
+            }
+            Ok(())
+        },
+    );
+    let cc_purge_plain_wrap = cc_tx_wrap(
+        &quote! { () },
+        &quote! {
+            #cc_before_delete
+            let query = #table_ident::table.find(id);
+            let __count = ::autumn_web::reexports::diesel::delete(query)
+                .execute(conn)
+                .await
+                .map_err(::autumn_web::AutumnError::from)?;
+            if __count == 0 {
+                return Err(::autumn_web::AutumnError::not_found_msg(
+                    format!("{} with id {} not found", stringify!(#model_name), id)
+                ));
+            }
+            Ok(())
+        },
+    );
+
     let soft_delete_impl_methods = if config.soft_delete {
         if config.tenant_scoped {
             let tenant_id_setup = quote! {
@@ -13012,62 +16331,107 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 };
             };
 
-            quote! {
-                async fn restore(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
-                    use ::autumn_web::reexports::diesel::prelude::*;
-                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    // §1d: restore is a write; reject cross-shard across_tenants
-                    // (per-shard ids are ambiguous, like delete/purge).
-                    #cross_shard_write_guard
-                    #tenant_id_setup
-                    let mut conn = self.__autumn_acquire_conn().await?;
-                    let query = #table_ident::table.find(id);
-                    let __count = if let ::core::option::Option::Some(ref t) = tenant_id {
-                        ::autumn_web::reexports::diesel::update(query.filter(#table_ident::tenant_id.eq(t)))
-                            .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
-                            .execute(&mut conn)
-                            .await
-                    } else {
-                        ::autumn_web::reexports::diesel::update(query)
-                            .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
-                            .execute(&mut conn)
-                            .await
+            // #1699: `restore` is the one remaining write on a ledgered
+            // repository's mandatory surface that would otherwise change
+            // `deleted_at` without appending a revision — leaving `ledger_as_of`
+            // reporting a deleted row that the table shows as live, permanently,
+            // with `ledger_verify` none the wiser. The ledgered arm runs the same
+            // load-lock-write-record shape `delete_by_id` uses, recording the
+            // undelete as an update revision.
+            let restore_impl_method = if config.ledgered {
+                let vh_restore = vh_insert_ts(
+                    table_name,
+                    "update",
+                    false,
+                    &quote! { __restored },
+                    Some(&quote! { record }),
+                    &quote! { conn },
+                    model_name,
+                    config.ledgered,
+                );
+                quote! {
+                    async fn restore(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
+                        use ::autumn_web::reexports::diesel::prelude::*;
+                        use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                        use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                        use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                        #cross_shard_write_guard
+                        #tenant_id_setup
+                        let mut conn = self.__autumn_acquire_conn().await?;
+                        ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
+                            #cc_before_restore
+                            let load_query = #table_ident::table.find(id);
+                            let record = if let ::core::option::Option::Some(ref t) = tenant_id {
+                                ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
+                            } else {
+                                ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
+                            }
+                            .optional()
+                            .map_err(::autumn_web::AutumnError::from)?
+                            .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                                format!("{} with id {} not found", stringify!(#model_name), id)
+                            ))?;
+                            let update_query = #table_ident::table.find(id);
+                            let __restored = if let ::core::option::Option::Some(ref t) = tenant_id {
+                                ::autumn_web::reexports::diesel::update(update_query.filter(#table_ident::tenant_id.eq(t)))
+                                    .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                            } else {
+                                ::autumn_web::reexports::diesel::update(update_query)
+                                    .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                            }
+                            .optional()
+                            .map_err(::autumn_web::AutumnError::from)?
+                            .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                                format!("{} with id {} not found", stringify!(#model_name), id)
+                            ))?;
+                            #vh_restore
+                            Ok(())
+                        }.scope_boxed())
+                        .await
                     }
-                    .map_err(::autumn_web::AutumnError::from)?;
-                    if __count == 0 {
-                        return Err(::autumn_web::AutumnError::not_found_msg(
-                            format!("{} with id {} not found", stringify!(#model_name), id)
-                        ));
-                    }
-                    Ok(())
                 }
+            } else {
+                quote! {
+                    async fn restore(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
+                        use ::autumn_web::reexports::diesel::prelude::*;
+                        use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                        // §1d: restore is a write; reject cross-shard across_tenants
+                        // (per-shard ids are ambiguous, like delete/purge).
+                        #cross_shard_write_guard
+                        #tenant_id_setup
+                        let mut conn = self.__autumn_acquire_conn().await?;
+                        #cc_restore_tenant_wrap
+                    }
+                }
+            };
 
-                async fn purge(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
-                    use ::autumn_web::reexports::diesel::prelude::*;
-                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    // §1d: purge is a hard delete; reject cross-shard across_tenants
-                    // (per-shard ids are ambiguous and could purge another tenant's row).
-                    #cross_shard_write_guard
-                    #tenant_id_setup
-                    let mut conn = self.__autumn_acquire_conn().await?;
-                    let query = #table_ident::table.find(id);
-                    let __count = if let ::core::option::Option::Some(ref t) = tenant_id {
-                        ::autumn_web::reexports::diesel::delete(query.filter(#table_ident::tenant_id.eq(t)))
-                            .execute(&mut conn)
-                            .await
-                    } else {
-                        ::autumn_web::reexports::diesel::delete(query)
-                            .execute(&mut conn)
-                            .await
+            // #1699: see `purge_trait_method` — a ledgered repository has no
+            // hard-delete method to implement.
+            let purge_impl_method = if config.ledgered {
+                quote! {}
+            } else {
+                quote! {
+                    async fn purge(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
+                        use ::autumn_web::reexports::diesel::prelude::*;
+                        use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                        // §1d: purge is a hard delete; reject cross-shard across_tenants
+                        // (per-shard ids are ambiguous and could purge another tenant's row).
+                        #cross_shard_write_guard
+                        #tenant_id_setup
+                        let mut conn = self.__autumn_acquire_conn().await?;
+                        #cc_purge_tenant_wrap
                     }
-                    .map_err(::autumn_web::AutumnError::from)?;
-                    if __count == 0 {
-                        return Err(::autumn_web::AutumnError::not_found_msg(
-                            format!("{} with id {} not found", stringify!(#model_name), id)
-                        ));
-                    }
-                    Ok(())
                 }
+            };
+
+            quote! {
+                #restore_impl_method
+
+                #purge_impl_method
 
                 async fn with_deleted(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
@@ -13159,41 +16523,80 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
         } else {
-            quote! {
-                async fn restore(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
-                    use ::autumn_web::reexports::diesel::prelude::*;
-                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    let mut conn = self.__autumn_acquire_conn().await?;
-                    let query = #table_ident::table.find(id);
-                    let __count = ::autumn_web::reexports::diesel::update(query)
-                        .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
-                        .execute(&mut conn)
+            // #1699: see the tenant-scoped arm — `restore` must record the
+            // undelete, or the ledger permanently disagrees with the table.
+            let restore_impl_method = if config.ledgered {
+                let vh_restore = vh_insert_ts(
+                    table_name,
+                    "update",
+                    false,
+                    &quote! { __restored },
+                    Some(&quote! { record }),
+                    &quote! { conn },
+                    model_name,
+                    config.ledgered,
+                );
+                quote! {
+                    async fn restore(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
+                        use ::autumn_web::reexports::diesel::prelude::*;
+                        use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                        use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                        use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                        let mut conn = self.__autumn_acquire_conn().await?;
+                        ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
+                            #cc_before_restore
+                            let record = ::autumn_web::maybe_for_update!(#table_ident::table.find(id))
+                                .first::<#model_name>(conn)
+                                .await
+                                .optional()
+                                .map_err(::autumn_web::AutumnError::from)?
+                                .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                                    format!("{} with id {} not found", stringify!(#model_name), id)
+                                ))?;
+                            let __restored = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                                .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
+                                .get_result::<#model_name>(conn)
+                                .await
+                                .optional()
+                                .map_err(::autumn_web::AutumnError::from)?
+                                .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                                    format!("{} with id {} not found", stringify!(#model_name), id)
+                                ))?;
+                            #vh_restore
+                            Ok(())
+                        }.scope_boxed())
                         .await
-                        .map_err(::autumn_web::AutumnError::from)?;
-                    if __count == 0 {
-                        return Err(::autumn_web::AutumnError::not_found_msg(
-                            format!("{} with id {} not found", stringify!(#model_name), id)
-                        ));
                     }
-                    Ok(())
                 }
+            } else {
+                quote! {
+                    async fn restore(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
+                        use ::autumn_web::reexports::diesel::prelude::*;
+                        use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                        let mut conn = self.__autumn_acquire_conn().await?;
+                        #cc_restore_plain_wrap
+                    }
+                }
+            };
 
-                async fn purge(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
-                    use ::autumn_web::reexports::diesel::prelude::*;
-                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    let mut conn = self.__autumn_acquire_conn().await?;
-                    let query = #table_ident::table.find(id);
-                    let __count = ::autumn_web::reexports::diesel::delete(query)
-                        .execute(&mut conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)?;
-                    if __count == 0 {
-                        return Err(::autumn_web::AutumnError::not_found_msg(
-                            format!("{} with id {} not found", stringify!(#model_name), id)
-                        ));
+            // #1699: see `purge_trait_method`.
+            let purge_impl_method = if config.ledgered {
+                quote! {}
+            } else {
+                quote! {
+                    async fn purge(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
+                        use ::autumn_web::reexports::diesel::prelude::*;
+                        use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                        let mut conn = self.__autumn_acquire_conn().await?;
+                        #cc_purge_plain_wrap
                     }
-                    Ok(())
                 }
+            };
+
+            quote! {
+                #restore_impl_method
+
+                #purge_impl_method
 
                 async fn with_deleted(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
@@ -13318,31 +16721,28 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    // §1d: when sharded + tenant_scoped, fan out across all shards concurrently
-    // for across_tenants reads.  Uses ShardSet::fan_out_shards for concurrent
-    // execution.  The sub-repo is built with `__autumn_for_shard`, which honors
-    // each shard's read routing and the parent request context and sets
-    // `__autumn_shards = None`, preventing recursion.
-    // §1d: fan out `find_all` across all shards for `across_tenants()`. The
-    // per-shard work runs through the inherent `__autumn_find_all_one_shard`
-    // helper (emitted below) rather than the trait method, so `find_all`'s
-    // RPITIT future never transitively names its own opaque type — which would
-    // make its `Send` auto-trait unprovable once hooks/versioning add captured
-    // state to the future.
+    // §1d: when sharded and tenant-scoped, fan `find_all` out across all shards
+    // concurrently for `across_tenants()` reads, via `ShardSet::fan_out_shards`. The
+    // sub-repo is built with `__autumn_for_shard`, which honors each shard's read
+    // routing and the parent request context and sets `__autumn_shards = None` to
+    // prevent recursion. The per-shard work runs through the inherent
+    // `__autumn_find_all_one_shard` helper below rather than the trait method, so
+    // `find_all`'s RPITIT future never transitively names its own opaque type —
+    // which would make its `Send` auto-trait unprovable once hooks or versioning add
+    // captured state to the future.
     let (find_all_impl, find_all_one_shard_helper) = if config.sharded && config.tenant_scoped {
         let base = find_all_impl;
         let dispatch = quote! {
-            // Dispatch the cross-shard fan-out BEFORE acquiring any connection:
-            // no routed-shard connection is held here, so a dead parent replica
-            // or exhausted parent pool can't fail the fan-out. Each shard's own
-            // read route/fallback is chosen by `__autumn_for_shard` (#1d).
+            // Dispatch the cross-shard fan-out before acquiring any connection: no
+            // routed-shard connection is held here, so a dead parent replica or an
+            // exhausted parent pool cannot fail the fan-out. `__autumn_for_shard`
+            // chooses each shard's own read route and fallback (§1d).
             //
-            // Without a shard set (e.g. a repo built via `with_pool_untracked`,
-            // where `__autumn_shards` is `None`), an across-tenant read would
-            // bind a NULL tenant predicate and silently return a PARTIAL result
-            // over only the current pool, so we reject rather than fall through
-            // to the single-pool query — mirroring the `count` guard (#1692,
-            // #1741).
+            // Without a shard set — a repo built via `with_pool_untracked`, where
+            // `__autumn_shards` is `None` — an across-tenant read would bind a NULL
+            // tenant predicate and silently return a partial result over the current
+            // pool alone, so reject rather than fall through to the single-pool
+            // query, mirroring the `count` guard (#1692, #1741).
             if self.across_tenants {
                 let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
                     return ::core::result::Result::Err(
@@ -13737,23 +17137,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
-        // #1910 SQLite FTS5 full-text search. Postgres uses tsvector ranked
-        // search (`websearch_to_tsquery`/`ts_rank_cd`); SQLite has no tsvector, so
-        // the `backend_select!` sqlite arm below queries an external-content FTS5
-        // virtual table (`"<table>__fts"`, tokenized with `unicode61`) that the
-        // `AddSearch` migration creates and keeps in sync with triggers. The id
-        // SELECT joins that FTS table to the base table (so the tenant /
-        // soft-delete / owner predicates still filter the BASE table exactly as
-        // the pg arm does), matches with `WHERE "<table>__fts" MATCH ?`, and ranks
-        // with `ORDER BY bm25("<table>__fts", <weights>)` — per-column weights
-        // derived from the `#[searchable(weight=...)]` priorities (A→10, B→5, C→2,
-        // else 1), so a higher-priority field sorts first (bm25 returns lower =
-        // better, so a larger weight yields a more-negative score). `unicode61`
-        // folds case for the full Unicode range (fixing the old ASCII-only `lower`
-        // limitation — e.g. `äpfel` now matches `Äpfel`). This fragment builds the
+        // #1910 SQLite FTS5 full-text search. Postgres uses tsvector ranked search
+        // (`websearch_to_tsquery`/`ts_rank_cd`); SQLite has no tsvector, so the
+        // `backend_select!` sqlite arm below queries an external-content FTS5 virtual
+        // table (`"<table>__fts"`, tokenized with `unicode61`) that the `AddSearch`
+        // migration creates and keeps in sync with triggers. The id SELECT joins that
+        // FTS table to the base table, so the tenant, soft-delete, and owner
+        // predicates still filter the base table exactly as the pg arm does; it
+        // matches with `WHERE "<table>__fts" MATCH ?` and ranks with `ORDER BY
+        // bm25("<table>__fts", <weights>)`. The per-column weights come from the
+        // `#[searchable(weight=...)]` priorities (A→10, B→5, C→2, else 1), so a
+        // higher-priority field sorts first: bm25 scores lower as better, and a larger
+        // weight yields a more negative score. `unicode61` folds case across the full
+        // Unicode range, so `äpfel` now matches `Äpfel`. This fragment builds the
         // trusted `__autumn_bm25_weights` literal list and the fail-closed
-        // `__autumn_fts_match_opt` (see `sqlite_fts5_match_query`); it is spliced
-        // into each sqlite arm (never the pg arm), so it is only built where used.
+        // `__autumn_fts_match_opt` (see `sqlite_fts5_match_query`), and is spliced
+        // into each sqlite arm only.
         let sqlite_fts_setup = quote! {
             // Trusted per-column bm25 weights from the developer-declared
             // SEARCH_FIELDS priorities — never request input, so spliced as SQL
@@ -14220,14 +17619,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // ── #1841: owner-scoped full-text search (`search_page_scoped`) ──────
     //
-    // Emitted only when the repository is BOTH `searchable` AND `owner =`
-    // scoped. It clones `search_page` and adds the owner filter to ALL THREE
-    // query phases — the COUNT raw SQL, the id-SELECT raw SQL, and the typed
-    // hydration query — so `total`, the paged id set, and the hydrated rows all
-    // agree and none can leak another user's rows. The owner id is bound as a
-    // positional parameter (never string-interpolated); the parameter index
-    // shifts by one when tenant scoping already occupies `$3`, mirroring the
-    // tenant code's `$3/$4/$5` arity handling.
+    // Emitted only when the repository is both `searchable` and `owner =` scoped. It
+    // clones `search_page` and adds the owner filter to all three query phases — the
+    // COUNT raw SQL, the id-SELECT raw SQL, and the typed hydration query — so
+    // `total`, the paged id set, and the hydrated rows agree and none can leak
+    // another user's rows. The owner id is bound as a positional parameter, never
+    // string-interpolated; the parameter index shifts by one when tenant scoping
+    // already occupies `$3`, mirroring the tenant code's `$3/$4/$5` arity handling.
     let (search_page_scoped_trait_method, search_page_scoped_impl_method) = if let (
         true,
         ::core::option::Option::Some(owner_col),
@@ -14632,6 +18030,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             Ok(cols) => cols,
             Err(err) => return err.to_compile_error(),
         };
+        // #1699: the ledger promises that as-of reconstruction is byte-for-byte
+        // identical to what a live query would have returned. A redacted column
+        // cannot be reconstructed, so the promise would be unprovable — reject
+        // the combination rather than ship a guarantee with a silent hole.
+        if config.ledgered && !sensitive_cols.is_empty() {
+            return syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "#[version_history(sensitive = [...])] is incompatible with ledgered = true: \
+                 a ledgered entity's as-of reconstruction must be byte-for-byte identical to \
+                 what a live query would have returned, and a redacted column cannot be \
+                 reconstructed. Drop `ledgered = true` to keep redaction, or drop the \
+                 `sensitive` list and keep the column out of the model (or behind at-rest \
+                 encryption, which the ledger snapshots as ciphertext)",
+            )
+            .to_compile_error();
+        }
         let sensitive_ts = if sensitive_cols.is_empty() {
             quote! { &[] }
         } else {
@@ -14680,11 +18094,40 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 #table_name,
                                 &mut cols,
                             );
+                            // #1771: a confidential column is sensitive too, so a
+                            // revision records that it changed, never the envelope.
+                            ::autumn_web::confidential::merge_confidential_columns_for_table(
+                                #table_name,
+                                &mut cols,
+                            );
                             cols
                         })
                         .as_slice()
                 }
                 #tenant_id_method
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    // ── LedgeredRecord impl (issue #1699) ────────────────────────
+    // Carries the model's valid-time source. Everything else the ledger needs
+    // comes from `VersionedRecord`, which `ledgered` implies.
+    let ledgered_record_impl = if config.ledgered {
+        let valid_from_method = config.ledger_valid_time.as_ref().map(|column| {
+            let column_ident = format_ident!("{}", column);
+            quote! {
+                fn ledger_valid_from(&self) -> ::core::option::Option<
+                    ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>
+                > {
+                    ::autumn_web::ledger::LedgerValidTimeValue::ledger_valid_from(&self.#column_ident)
+                }
+            }
+        });
+        quote! {
+            impl ::autumn_web::ledger::LedgeredRecord for #model_name {
+                #valid_from_method
             }
         }
     } else {
@@ -14729,18 +18172,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
-    // #1996: version-history read fork. The Postgres and SQLite arms differ in
-    // three ways that must be forked through `backend_select!` (each arm names
-    // its own diesel types / SQL so the unselected arm is never type-checked):
+    // #1996: version-history read fork. The Postgres and SQLite arms differ in three
+    // ways that must be forked through `backend_select!`, so each arm names its own
+    // diesel types and SQL and the unselected arm is never type-checked:
     //   1. the `recorded_at` column type — Postgres `Timestamptz` has no
-    //      `FromSql<_, Sqlite>`; SQLite must use `TimestamptzSqlite`;
-    //   2. the raw SQL casts — `COUNT(*)::bigint`, `$n::text`, `$n::timestamptz`
+    //      `FromSql<_, Sqlite>`, so SQLite uses `TimestamptzSqlite`;
+    //   2. the raw SQL casts — `COUNT(*)::bigint`, `$n::text`, `$n::timestamptz`,
     //      and `changes::text` are Postgres-only and SQLite rejects them;
-    //   3. the timestamp-filter bind types (`Nullable<Timestamptz>` vs
+    //   3. the timestamp-filter bind types (`Nullable<Timestamptz>` against
     //      `Nullable<TimestamptzSqlite>`).
-    // The count row struct and the row→`VersionEntry` mapping are backend-agnostic
-    // (the SQLite `recorded_at` still deserializes into `DateTime<Utc>`), so they
-    // are built once here and spliced into both arms.
+    // The count row struct and the row-to-`VersionEntry` mapping are
+    // backend-agnostic, so they are built once here and spliced into both arms.
     let vh_count_struct = quote! {
         #[derive(::autumn_web::reexports::diesel::QueryableByName)]
         struct __AutumnVersionHistoryCount {
@@ -14772,6 +18214,1295 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             })
             .collect::<Vec<::autumn_web::version_history::VersionEntry>>()
+    };
+
+    // ── Ledger query surface (issue #1699) ───────────────────────
+    // `ledger_revisions` is the one SQL read; as-of, diff, verify and head are
+    // pure functions over its result, so every one of them sees the same
+    // ordering, tenant scope and shard rules by construction.
+    let ledger_tenant_setup = if config.tenant_scoped {
+        quote! {
+            let __ledger_tenant_id = if self.across_tenants {
+                ::core::option::Option::None
+            } else {
+                let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                    .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
+                ::core::option::Option::Some(t)
+            };
+            let __ledger_tenant_id = __ledger_tenant_id.as_deref();
+        }
+    } else {
+        quote! {
+            let __ledger_tenant_id: ::core::option::Option<&str> = ::core::option::Option::None;
+        }
+    };
+    // A chain is per (tenant, record): two tenants' rows can share a `record_id`,
+    // and an unscoped read would interleave their revisions into one sequence —
+    // 1,1,2,2,… — which `verify_chain` correctly reports as `DuplicateSeq` on
+    // history nobody touched. Refuse the read rather than manufacture tamper
+    // evidence. Same reasoning as the shard guard below, one level up.
+    let ledger_cross_tenant_guard = if config.tenant_scoped {
+        quote! {
+            if self.across_tenants {
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::bad_request_msg(
+                        "cross-tenant ledger reads are not supported: a revision chain \
+                         is per (tenant, record), and two tenants' rows may share a \
+                         record id, so an unscoped read would interleave their chains. \
+                         Read the ledger inside a tenant scope instead"
+                    )
+                );
+            }
+        }
+    } else {
+        quote! {}
+    };
+    let ledger_cross_shard_guard = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.__autumn_shards.is_some() && self.across_tenants {
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::bad_request_msg(
+                        "cross-shard ledger reads are not supported: \
+                         record ids are unique only within a shard; \
+                         query a specific shard instead"
+                    )
+                );
+            }
+        }
+    } else {
+        quote! {}
+    };
+    let ledger_map_rows = quote! {
+        {
+            let mut __out: ::std::vec::Vec<::autumn_web::ledger::LedgerRevision> =
+                ::std::vec::Vec::with_capacity(raw_rows.len());
+            for row in raw_rows {
+                let op = match row.op.as_str() {
+                    "insert" => ::autumn_web::version_history::VersionOp::Insert,
+                    "delete" => ::autumn_web::version_history::VersionOp::Delete,
+                    _ => ::autumn_web::version_history::VersionOp::Update,
+                };
+                // A snapshot that no longer parses is itself evidence the row was
+                // tampered with, so it is an error rather than a silent default:
+                // returning `{}` here would let `ledger_as_of` reconstruct an
+                // empty record and call it history.
+                let snapshot: ::autumn_web::reexports::serde_json::Value =
+                    ::autumn_web::reexports::serde_json::from_str(&row.snapshot)
+                        .map_err(|err| ::autumn_web::AutumnError::internal_server_error(
+                            ::autumn_web::ledger::LedgerError::ChainUnreadable {
+                                table: #table_name.to_string(),
+                                record_id,
+                                detail: format!("revision {} has an unreadable snapshot: {err}", row.seq),
+                            },
+                        ))?;
+                __out.push(::autumn_web::ledger::LedgerRevision {
+                    id: row.id,
+                    table_name: row.table_name,
+                    tenant_id: row.tenant_id,
+                    record_id: row.record_id,
+                    seq: row.seq,
+                    op,
+                    actor: row.actor,
+                    request_id: row.request_id,
+                    snapshot,
+                    valid_from: row.valid_from,
+                    recorded_at: row.recorded_at,
+                    prev_hash: row.prev_hash,
+                    hash: row.hash,
+                });
+            }
+            __out
+        }
+    };
+    // Single-row counterpart of `ledger_map_rows`, for the bounded
+    // `__autumn_ledger_revision_at` lookup: the same per-row mapping (op
+    // decode, snapshot parse-or-error), applied to at most one `raw_row`
+    // instead of folded over a whole `raw_rows` chain.
+    let ledger_map_row_opt = quote! {
+        match raw_row {
+            ::core::option::Option::None => ::core::option::Option::None,
+            ::core::option::Option::Some(row) => {
+                let op = match row.op.as_str() {
+                    "insert" => ::autumn_web::version_history::VersionOp::Insert,
+                    "delete" => ::autumn_web::version_history::VersionOp::Delete,
+                    _ => ::autumn_web::version_history::VersionOp::Update,
+                };
+                let snapshot: ::autumn_web::reexports::serde_json::Value =
+                    ::autumn_web::reexports::serde_json::from_str(&row.snapshot)
+                        .map_err(|err| ::autumn_web::AutumnError::internal_server_error(
+                            ::autumn_web::ledger::LedgerError::ChainUnreadable {
+                                table: #table_name.to_string(),
+                                record_id,
+                                detail: format!("revision {} has an unreadable snapshot: {err}", row.seq),
+                            },
+                        ))?;
+                ::core::option::Option::Some(::autumn_web::ledger::LedgerRevision {
+                    id: row.id,
+                    table_name: row.table_name,
+                    tenant_id: row.tenant_id,
+                    record_id: row.record_id,
+                    seq: row.seq,
+                    op,
+                    actor: row.actor,
+                    request_id: row.request_id,
+                    snapshot,
+                    valid_from: row.valid_from,
+                    recorded_at: row.recorded_at,
+                    prev_hash: row.prev_hash,
+                    hash: row.hash,
+                })
+            }
+        }
+    };
+    // Maps the tagged UNION ALL result of the diff's paired bounded lookup
+    // (`__autumn_ledger_diff_revisions_at`) back to (from, to) — same per-row
+    // mapping as `ledger_map_row_opt`, keyed by the `which` discriminator
+    // column instead of relying on result order (a `UNION ALL` gives no
+    // ordering guarantee across its arms).
+    let ledger_map_diff_rows = quote! {
+        {
+            let mut __from: ::core::option::Option<::autumn_web::ledger::LedgerRevision> =
+                ::core::option::Option::None;
+            let mut __to: ::core::option::Option<::autumn_web::ledger::LedgerRevision> =
+                ::core::option::Option::None;
+            for row in raw_rows {
+                let op = match row.op.as_str() {
+                    "insert" => ::autumn_web::version_history::VersionOp::Insert,
+                    "delete" => ::autumn_web::version_history::VersionOp::Delete,
+                    _ => ::autumn_web::version_history::VersionOp::Update,
+                };
+                let snapshot: ::autumn_web::reexports::serde_json::Value =
+                    ::autumn_web::reexports::serde_json::from_str(&row.snapshot)
+                        .map_err(|err| ::autumn_web::AutumnError::internal_server_error(
+                            ::autumn_web::ledger::LedgerError::ChainUnreadable {
+                                table: #table_name.to_string(),
+                                record_id,
+                                detail: format!("revision {} has an unreadable snapshot: {err}", row.seq),
+                            },
+                        ))?;
+                let revision = ::autumn_web::ledger::LedgerRevision {
+                    id: row.id,
+                    table_name: row.table_name,
+                    tenant_id: row.tenant_id,
+                    record_id: row.record_id,
+                    seq: row.seq,
+                    op,
+                    actor: row.actor,
+                    request_id: row.request_id,
+                    snapshot,
+                    valid_from: row.valid_from,
+                    recorded_at: row.recorded_at,
+                    prev_hash: row.prev_hash,
+                    hash: row.hash,
+                };
+                if row.which == "from" {
+                    __from = ::core::option::Option::Some(revision);
+                } else {
+                    __to = ::core::option::Option::Some(revision);
+                }
+            }
+            (__from, __to)
+        }
+    };
+
+    // The live-row read is tenant-filtered only on a tenant-scoped repository:
+    // a plain model has no `tenant_id` column to name.
+    let ledger_live_row_query = if config.tenant_scoped {
+        quote! {
+            {
+                let query = #table_ident::table.find(record_id);
+                if let ::core::option::Option::Some(t) = __ledger_tenant_id {
+                    query
+                        .filter(#table_ident::tenant_id.eq(t))
+                        .first::<#model_name>(&mut conn)
+                        .await
+                } else {
+                    query.first::<#model_name>(&mut conn).await
+                }
+            }
+        }
+    } else {
+        quote! {
+            {
+                let _ = __ledger_tenant_id;
+                #table_ident::table
+                    .find(record_id)
+                    .first::<#model_name>(&mut conn)
+                    .await
+            }
+        }
+    };
+
+    let ledger_query_impl = if config.ledgered {
+        quote! {
+            impl #pg_name {
+                /// Every stored revision of one record, oldest first.
+                ///
+                /// Generated automatically for a `ledgered = true` repository.
+                /// This is the raw chain: [`ledger_as_of`](Self::ledger_as_of),
+                /// [`ledger_diff`](Self::ledger_diff),
+                /// [`ledger_verify`](Self::ledger_verify) and
+                /// [`ledger_head`](Self::ledger_head) are computed from it.
+                ///
+                /// # Errors
+                ///
+                /// Returns an error if the ledger table cannot be read, or if a
+                /// stored snapshot is no longer valid JSON — which is itself
+                /// evidence of out-of-band tampering.
+                pub async fn ledger_revisions(
+                    &self,
+                    record_id: i64,
+                ) -> ::autumn_web::AutumnResult<::std::vec::Vec<::autumn_web::ledger::LedgerRevision>> {
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+
+                    #ledger_cross_shard_guard
+                    #ledger_cross_tenant_guard
+                    #ledger_tenant_setup
+
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
+
+                    // #1996-style backend fork: the Postgres arm keeps the
+                    // `::text` / `$3::text` casts and `Timestamptz`; the SQLite
+                    // arm drops every cast and uses `TimestamptzSqlite` (there
+                    // is no `FromSql<Timestamptz, Sqlite>`). The row struct lives
+                    // inside each arm so only the selected arm is type-checked.
+                    let revisions: ::std::vec::Vec<::autumn_web::ledger::LedgerRevision> =
+                        ::autumn_web::backend_select! {
+                            pg => {{
+                                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                                struct __AutumnLedgerRow {
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    table_name: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    tenant_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    record_id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    seq: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    op: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    actor: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    request_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    snapshot: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
+                                    valid_from: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
+                                    recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    prev_hash: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    hash: ::std::string::String,
+                                }
+
+                                let raw_rows: ::std::vec::Vec<__AutumnLedgerRow> =
+                                    ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT id, table_name, tenant_id, record_id, seq, op, actor, \
+                                         request_id, snapshot, valid_from, \
+                                         recorded_at, prev_hash, hash \
+                                         FROM _autumn_ledger_revisions \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3::text IS NULL OR tenant_id = $3) \
+                                         ORDER BY seq ASC"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__ledger_tenant_id)
+                                    .get_results::<__AutumnLedgerRow>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+
+                                #ledger_map_rows
+                            }},
+                            sqlite => {{
+                                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                                struct __AutumnLedgerRow {
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    table_name: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    tenant_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    record_id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    seq: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    op: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    actor: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    request_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    snapshot: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
+                                    valid_from: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
+                                    recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    prev_hash: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    hash: ::std::string::String,
+                                }
+
+                                let raw_rows: ::std::vec::Vec<__AutumnLedgerRow> =
+                                    ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT id, table_name, tenant_id, record_id, seq, op, actor, \
+                                         request_id, snapshot, valid_from, \
+                                         recorded_at, prev_hash, hash \
+                                         FROM _autumn_ledger_revisions \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3 IS NULL OR tenant_id = $3) \
+                                         ORDER BY seq ASC"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__ledger_tenant_id)
+                                    .get_results::<__AutumnLedgerRow>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+
+                                #ledger_map_rows
+                            }},
+                        };
+
+                    ::core::result::Result::Ok(revisions)
+                }
+
+                /// The single revision in force at a bitemporal instant,
+                /// fetched directly rather than through
+                /// [`ledger_revisions`](Self::ledger_revisions).
+                ///
+                /// `ledger_revisions` reads every stored revision — and every
+                /// stored snapshot, the largest column in the table — to
+                /// answer a question that has exactly one answer. This issues
+                /// one indexed, bounded lookup instead: `ORDER BY seq DESC
+                /// LIMIT 1` against `idx_autumn_ledger_revisions_record`,
+                /// with the same `None`-is-unbounded predicate
+                /// [`snapshot_as_of`](crate::ledger::snapshot_as_of) applies
+                /// in memory, now evaluated by the database. Picking the
+                /// greatest surviving `seq` via `ORDER BY ... LIMIT 1` is
+                /// `max_by_key(seq)` over the qualifying rows — the same
+                /// selection, computed the same way, just without
+                /// materializing the rows that lose.
+                ///
+                /// `recorded_at` is monotonic non-decreasing in `seq` (see
+                /// [`monotonic_recorded_at`](crate::ledger::monotonic_recorded_at)),
+                /// so a transaction-time bound — what
+                /// [`ledger_as_of`](Self::ledger_as_of) and
+                /// [`ledger_diff`](Self::ledger_diff) use — lets the scan
+                /// stop at the first qualifying row: only the revisions newer
+                /// than the answer are read, never the whole chain. A
+                /// valid-time bound alone has no such guarantee (a
+                /// back-dated correction can land anywhere in `seq` order),
+                /// so it can still read back to the front of the chain in the
+                /// worst case — exactly what `ledger_revisions` always did,
+                /// never worse.
+                ///
+                /// # Errors
+                ///
+                /// Returns an error if the ledger table cannot be read, or if
+                /// the matching revision's stored snapshot is no longer valid
+                /// JSON.
+                #[doc(hidden)]
+                async fn __autumn_ledger_revision_at(
+                    &self,
+                    record_id: i64,
+                    as_of: ::autumn_web::ledger::LedgerAsOf,
+                ) -> ::autumn_web::AutumnResult<::core::option::Option<::autumn_web::ledger::LedgerRevision>> {
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+
+                    #ledger_cross_shard_guard
+                    #ledger_cross_tenant_guard
+                    #ledger_tenant_setup
+
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
+                    let __ledger_transaction_bound = as_of.transaction;
+                    let __ledger_valid_bound = as_of.valid;
+
+                    let revision: ::core::option::Option<::autumn_web::ledger::LedgerRevision> =
+                        ::autumn_web::backend_select! {
+                            pg => {{
+                                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                                struct __AutumnLedgerRow {
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    table_name: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    tenant_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    record_id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    seq: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    op: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    actor: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    request_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    snapshot: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
+                                    valid_from: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
+                                    recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    prev_hash: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    hash: ::std::string::String,
+                                }
+
+                                let raw_row: ::core::option::Option<__AutumnLedgerRow> =
+                                    ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT id, table_name, tenant_id, record_id, seq, op, actor, \
+                                         request_id, snapshot, valid_from, \
+                                         recorded_at, prev_hash, hash \
+                                         FROM _autumn_ledger_revisions \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3::text IS NULL OR tenant_id = $3) \
+                                         AND ($4::timestamptz IS NULL OR recorded_at <= $4) \
+                                         AND ($5::timestamptz IS NULL OR valid_from <= $5) \
+                                         ORDER BY seq DESC LIMIT 1"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__ledger_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(__ledger_transaction_bound)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(__ledger_valid_bound)
+                                    .get_results::<__AutumnLedgerRow>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                                    .into_iter()
+                                    .next();
+
+                                #ledger_map_row_opt
+                            }},
+                            sqlite => {{
+                                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                                struct __AutumnLedgerRow {
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    table_name: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    tenant_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    record_id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    seq: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    op: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    actor: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    request_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    snapshot: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
+                                    valid_from: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
+                                    recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    prev_hash: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    hash: ::std::string::String,
+                                }
+
+                                let raw_row: ::core::option::Option<__AutumnLedgerRow> =
+                                    ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT id, table_name, tenant_id, record_id, seq, op, actor, \
+                                         request_id, snapshot, valid_from, \
+                                         recorded_at, prev_hash, hash \
+                                         FROM _autumn_ledger_revisions \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3 IS NULL OR tenant_id = $3) \
+                                         AND ($4 IS NULL OR recorded_at <= $4) \
+                                         AND ($5 IS NULL OR valid_from <= $5) \
+                                         ORDER BY seq DESC LIMIT 1"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__ledger_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(__ledger_transaction_bound)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(__ledger_valid_bound)
+                                    .get_results::<__AutumnLedgerRow>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                                    .into_iter()
+                                    .next();
+
+                                #ledger_map_row_opt
+                            }},
+                        };
+
+                    ::core::result::Result::Ok(revision)
+                }
+
+                /// Both endpoints of a [`ledger_diff_at`](Self::ledger_diff_at)
+                /// window, resolved from **one statement** on **one
+                /// connection**.
+                ///
+                /// Two independent calls to
+                /// [`__autumn_ledger_revision_at`](Self::__autumn_ledger_revision_at)
+                /// — one per endpoint — would each take their own snapshot: a
+                /// write landing between them (or, on a routed read replica,
+                /// replica lag advancing between them) could resolve `from`
+                /// and `to` against two different database states, reporting
+                /// a phantom change on an unchanged window or missing one
+                /// that happened. The single full-chain `ledger_revisions`
+                /// read this replaced never had that problem — one read, one
+                /// snapshot, both endpoints computed from it in memory — so
+                /// this restores the same guarantee: a `UNION ALL` of the two
+                /// bounded lookups is one SQL command, and Postgres assigns
+                /// one snapshot per top-level command (even under `READ
+                /// COMMITTED`), so both arms see the identical database
+                /// state. Each arm keeps its own `ORDER BY seq DESC LIMIT 1`,
+                /// so the bounded-scan property
+                /// [`__autumn_ledger_revision_at`](Self::__autumn_ledger_revision_at)
+                /// exists for is unaffected — this is strictly one statement
+                /// where the naive two-call version was two.
+                ///
+                /// # Errors
+                ///
+                /// Returns an error if the ledger table cannot be read, or if
+                /// a matching revision's stored snapshot is no longer valid
+                /// JSON.
+                #[doc(hidden)]
+                async fn __autumn_ledger_diff_revisions_at(
+                    &self,
+                    record_id: i64,
+                    from: ::autumn_web::ledger::LedgerAsOf,
+                    to: ::autumn_web::ledger::LedgerAsOf,
+                ) -> ::autumn_web::AutumnResult<(
+                    ::core::option::Option<::autumn_web::ledger::LedgerRevision>,
+                    ::core::option::Option<::autumn_web::ledger::LedgerRevision>,
+                )> {
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+
+                    #ledger_cross_shard_guard
+                    #ledger_cross_tenant_guard
+                    #ledger_tenant_setup
+
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
+                    let __ledger_from_transaction_bound = from.transaction;
+                    let __ledger_from_valid_bound = from.valid;
+                    let __ledger_to_transaction_bound = to.transaction;
+                    let __ledger_to_valid_bound = to.valid;
+
+                    let (from_revision, to_revision): (
+                        ::core::option::Option<::autumn_web::ledger::LedgerRevision>,
+                        ::core::option::Option<::autumn_web::ledger::LedgerRevision>,
+                    ) = ::autumn_web::backend_select! {
+                        pg => {{
+                            #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                            struct __AutumnLedgerDiffRow {
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                which: ::std::string::String,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                id: i64,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                table_name: ::std::string::String,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                tenant_id: ::core::option::Option<::std::string::String>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                record_id: i64,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                seq: i64,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                op: ::std::string::String,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                actor: ::std::string::String,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                request_id: ::core::option::Option<::std::string::String>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                snapshot: ::std::string::String,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
+                                valid_from: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
+                                recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                prev_hash: ::core::option::Option<::std::string::String>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                hash: ::std::string::String,
+                            }
+
+                            let raw_rows: ::std::vec::Vec<__AutumnLedgerDiffRow> =
+                                ::autumn_web::reexports::diesel::sql_query(
+                                    "SELECT * FROM ( \
+                                     SELECT 'from' AS which, id, table_name, tenant_id, record_id, seq, op, actor, \
+                                     request_id, snapshot, valid_from, recorded_at, prev_hash, hash \
+                                     FROM _autumn_ledger_revisions \
+                                     WHERE table_name = $1 AND record_id = $2 \
+                                     AND ($3::text IS NULL OR tenant_id = $3) \
+                                     AND ($4::timestamptz IS NULL OR recorded_at <= $4) \
+                                     AND ($5::timestamptz IS NULL OR valid_from <= $5) \
+                                     ORDER BY seq DESC LIMIT 1 \
+                                     ) AS __from_rev \
+                                     UNION ALL \
+                                     SELECT * FROM ( \
+                                     SELECT 'to' AS which, id, table_name, tenant_id, record_id, seq, op, actor, \
+                                     request_id, snapshot, valid_from, recorded_at, prev_hash, hash \
+                                     FROM _autumn_ledger_revisions \
+                                     WHERE table_name = $1 AND record_id = $2 \
+                                     AND ($3::text IS NULL OR tenant_id = $3) \
+                                     AND ($6::timestamptz IS NULL OR recorded_at <= $6) \
+                                     AND ($7::timestamptz IS NULL OR valid_from <= $7) \
+                                     ORDER BY seq DESC LIMIT 1 \
+                                     ) AS __to_rev"
+                                )
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__ledger_tenant_id)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(__ledger_from_transaction_bound)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(__ledger_from_valid_bound)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(__ledger_to_transaction_bound)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(__ledger_to_valid_bound)
+                                .get_results::<__AutumnLedgerDiffRow>(&mut conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+
+                            #ledger_map_diff_rows
+                        }},
+                        sqlite => {{
+                            #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                            struct __AutumnLedgerDiffRow {
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                which: ::std::string::String,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                id: i64,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                table_name: ::std::string::String,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                tenant_id: ::core::option::Option<::std::string::String>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                record_id: i64,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                seq: i64,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                op: ::std::string::String,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                actor: ::std::string::String,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                request_id: ::core::option::Option<::std::string::String>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                snapshot: ::std::string::String,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
+                                valid_from: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
+                                recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                prev_hash: ::core::option::Option<::std::string::String>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                hash: ::std::string::String,
+                            }
+
+                            let raw_rows: ::std::vec::Vec<__AutumnLedgerDiffRow> =
+                                ::autumn_web::reexports::diesel::sql_query(
+                                    "SELECT * FROM ( \
+                                     SELECT 'from' AS which, id, table_name, tenant_id, record_id, seq, op, actor, \
+                                     request_id, snapshot, valid_from, recorded_at, prev_hash, hash \
+                                     FROM _autumn_ledger_revisions \
+                                     WHERE table_name = $1 AND record_id = $2 \
+                                     AND ($3 IS NULL OR tenant_id = $3) \
+                                     AND ($4 IS NULL OR recorded_at <= $4) \
+                                     AND ($5 IS NULL OR valid_from <= $5) \
+                                     ORDER BY seq DESC LIMIT 1 \
+                                     ) AS __from_rev \
+                                     UNION ALL \
+                                     SELECT * FROM ( \
+                                     SELECT 'to' AS which, id, table_name, tenant_id, record_id, seq, op, actor, \
+                                     request_id, snapshot, valid_from, recorded_at, prev_hash, hash \
+                                     FROM _autumn_ledger_revisions \
+                                     WHERE table_name = $1 AND record_id = $2 \
+                                     AND ($3 IS NULL OR tenant_id = $3) \
+                                     AND ($6 IS NULL OR recorded_at <= $6) \
+                                     AND ($7 IS NULL OR valid_from <= $7) \
+                                     ORDER BY seq DESC LIMIT 1 \
+                                     ) AS __to_rev"
+                                )
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__ledger_tenant_id)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(__ledger_from_transaction_bound)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(__ledger_from_valid_bound)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(__ledger_to_transaction_bound)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(__ledger_to_valid_bound)
+                                .get_results::<__AutumnLedgerDiffRow>(&mut conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+
+                            #ledger_map_diff_rows
+                        }},
+                    };
+
+                    ::core::result::Result::Ok((from_revision, to_revision))
+                }
+
+                /// The record's exact state at a past **transaction** instant —
+                /// what a plain query would have returned at that moment.
+                ///
+                /// Returns `None` when the record did not exist yet. A ledgered
+                /// entity is `soft_delete`, so a deleted record still resolves:
+                /// the reconstructed model carries the `deleted_at` a live query
+                /// would have shown, and live-only callers check it exactly as
+                /// they would against the table.
+                ///
+                /// # Errors
+                ///
+                /// Propagates read errors from
+                /// [`ledger_revisions`](Self::ledger_revisions), and fails if a
+                /// snapshot cannot be deserialized back into the model.
+                pub async fn ledger_as_of(
+                    &self,
+                    record_id: i64,
+                    at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                ) -> ::autumn_web::AutumnResult<::core::option::Option<#model_name>> {
+                    self.ledger_as_of_at(record_id, ::autumn_web::ledger::LedgerAsOf::transaction(at)).await
+                }
+
+                /// The record's exact state at a bitemporal instant.
+                ///
+                /// See [`LedgerAsOf`](::autumn_web::ledger::LedgerAsOf) for how
+                /// the transaction-time and valid-time bounds combine.
+                ///
+                /// # Errors
+                ///
+                /// Propagates read errors from
+                /// [`__autumn_ledger_revision_at`](Self::__autumn_ledger_revision_at),
+                /// and fails if a snapshot cannot be deserialized back into
+                /// the model.
+                pub async fn ledger_as_of_at(
+                    &self,
+                    record_id: i64,
+                    as_of: ::autumn_web::ledger::LedgerAsOf,
+                ) -> ::autumn_web::AutumnResult<::core::option::Option<#model_name>> {
+                    let ::core::option::Option::Some(revision) =
+                        self.__autumn_ledger_revision_at(record_id, as_of).await?
+                    else {
+                        return ::core::result::Result::Ok(::core::option::Option::None);
+                    };
+                    let model = Self::__autumn_ledger_model_from_snapshot(record_id, &revision)?;
+                    ::core::result::Result::Ok(::core::option::Option::Some(model))
+                }
+
+                /// The field-level delta of one record between two transaction
+                /// instants.
+                ///
+                /// Columns that were added or removed between the two instants
+                /// are reported alongside changed ones. A record that did not
+                /// exist at `from` reports every column as added.
+                ///
+                /// # Errors
+                ///
+                /// Propagates read errors from
+                /// [`ledger_revisions`](Self::ledger_revisions).
+                pub async fn ledger_diff(
+                    &self,
+                    record_id: i64,
+                    from: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                    to: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                ) -> ::autumn_web::AutumnResult<::autumn_web::ledger::LedgerDiff> {
+                    self.ledger_diff_at(
+                        record_id,
+                        ::autumn_web::ledger::LedgerAsOf::transaction(from),
+                        ::autumn_web::ledger::LedgerAsOf::transaction(to),
+                    )
+                    .await
+                }
+
+                /// The field-level delta of one record between two bitemporal
+                /// instants.
+                ///
+                /// # Errors
+                ///
+                /// Propagates read errors from
+                /// [`__autumn_ledger_diff_revisions_at`](Self::__autumn_ledger_diff_revisions_at).
+                pub async fn ledger_diff_at(
+                    &self,
+                    record_id: i64,
+                    from: ::autumn_web::ledger::LedgerAsOf,
+                    to: ::autumn_web::ledger::LedgerAsOf,
+                ) -> ::autumn_web::AutumnResult<::autumn_web::ledger::LedgerDiff> {
+                    let (from_rev, to_rev) =
+                        self.__autumn_ledger_diff_revisions_at(record_id, from, to).await?;
+                    let from_seq = from_rev.as_ref().map(|r| r.seq);
+                    let to_seq = to_rev.as_ref().map(|r| r.seq);
+                    // Diffing stored snapshots directly would compare the
+                    // ciphertext of `#[encrypted]` columns, which carries a fresh
+                    // nonce per write and so always differs even when the
+                    // plaintext did not. Reconstruct each side and diff the
+                    // model's own view instead.
+                    let empty = ::autumn_web::reexports::serde_json::Value::Object(
+                        ::autumn_web::reexports::serde_json::Map::new(),
+                    );
+                    let before = match &from_rev {
+                        ::core::option::Option::None => empty.clone(),
+                        ::core::option::Option::Some(revision) =>
+                            Self::__autumn_ledger_view_of(record_id, revision)?,
+                    };
+                    let after = match &to_rev {
+                        ::core::option::Option::None => empty,
+                        ::core::option::Option::Some(revision) =>
+                            Self::__autumn_ledger_view_of(record_id, revision)?,
+                    };
+                    ::core::result::Result::Ok(::autumn_web::ledger::LedgerDiff {
+                        record_id,
+                        from_seq,
+                        to_seq,
+                        changes: ::autumn_web::ledger::diff_snapshots(&before, &after),
+                    })
+                }
+
+                /// Reconstruct the model a revision describes.
+                #[doc(hidden)]
+                fn __autumn_ledger_model_from_snapshot(
+                    record_id: i64,
+                    revision: &::autumn_web::ledger::LedgerRevision,
+                ) -> ::autumn_web::AutumnResult<#model_name> {
+                    #model_name::__autumn_commit_hook_from_value(revision.snapshot.clone())
+                        .map_err(|err| ::autumn_web::AutumnError::internal_server_error(
+                            ::autumn_web::ledger::LedgerError::ChainUnreadable {
+                                table: #table_name.to_string(),
+                                record_id,
+                                detail: format!(
+                                    "revision {} does not reconstruct into {}: {err}",
+                                    revision.seq,
+                                    stringify!(#model_name),
+                                ),
+                            },
+                        ))
+                }
+
+                /// A revision's model, in the same public projection
+                /// `__autumn_ledger_live_view` produces for the live row — so a
+                /// diff and the live-state cross-check compare like with like.
+                #[doc(hidden)]
+                fn __autumn_ledger_view_of(
+                    record_id: i64,
+                    revision: &::autumn_web::ledger::LedgerRevision,
+                ) -> ::autumn_web::AutumnResult<::autumn_web::reexports::serde_json::Value> {
+                    let model = Self::__autumn_ledger_model_from_snapshot(record_id, revision)?;
+                    ::core::result::Result::Ok(
+                        ::autumn_web::reexports::serde_json::to_value(&model).unwrap_or(
+                            ::autumn_web::reexports::serde_json::Value::Object(
+                                ::autumn_web::reexports::serde_json::Map::new(),
+                            ),
+                        ),
+                    )
+                }
+
+                /// Verify that the record's stored history was never rewritten.
+                ///
+                /// Detects mutation, insertion, deletion and re-linking of stored
+                /// revisions and reports the first broken link. An intact report
+                /// carries the head hash — pin it outside the database to detect
+                /// a wholesale chain rewrite too.
+                ///
+                /// # Errors
+                ///
+                /// Propagates read errors from
+                /// [`ledger_revisions`](Self::ledger_revisions).
+                pub async fn ledger_verify(
+                    &self,
+                    record_id: i64,
+                ) -> ::autumn_web::AutumnResult<::autumn_web::ledger::LedgerVerification> {
+                    // The chain alone cannot see a truncated tail — lopping the
+                    // last revisions off leaves something internally perfect — nor
+                    // a write that reached the table without appending a revision.
+                    // Cross-checking the head against the live row closes both.
+                    //
+                    // Both reads are taken twice: a write landing between them
+                    // would look exactly like a divergence, and this routine
+                    // exists to produce trustworthy accusations. If the chain head
+                    // moved under us, the live comparison is skipped rather than
+                    // reported — a concurrent write is not tampering.
+                    let revisions = self.ledger_revisions(record_id).await?;
+                    let live = self.__autumn_ledger_live_view(record_id).await?;
+                    // Head and mark in ONE statement: read separately they could
+                    // come from differently-lagged replicas, and a fresh mark
+                    // against a stale head is indistinguishable from a truncated
+                    // tail. This routine exists to produce trustworthy
+                    // accusations, so it does not manufacture that one.
+                    let ::autumn_web::ledger::LedgerPin {
+                        head: settled_head,
+                        high_water,
+                    } = self.__autumn_ledger_settled_state(record_id).await?;
+                    let stable = settled_head.as_ref().map(|h| h.seq)
+                        == revisions.last().map(|r| r.seq);
+
+                    let live_state = if stable {
+                        match (revisions.last(), live.as_ref()) {
+                            (_, ::core::option::Option::None) =>
+                                ::autumn_web::ledger::LedgerLiveState::Absent,
+                            (::core::option::Option::None, ::core::option::Option::Some(_)) =>
+                                ::autumn_web::ledger::LedgerLiveState::Diverged,
+                            (
+                                ::core::option::Option::Some(head),
+                                ::core::option::Option::Some(live_value),
+                            ) => {
+                                // Both sides are codec-shaped: the stored snapshot
+                                // already is, and the live row was re-encoded
+                                // through the same codec. Decrypted before
+                                // comparison — see the helper.
+                                if Self::__autumn_ledger_live_matches(&head.snapshot, live_value) {
+                                    ::autumn_web::ledger::LedgerLiveState::Matches
+                                } else {
+                                    ::autumn_web::ledger::LedgerLiveState::Diverged
+                                }
+                            }
+                        }
+                    } else {
+                        ::autumn_web::ledger::LedgerLiveState::NotChecked
+                    };
+
+                    // #2323: the high-water mark is read under the same
+                    // stability gate as the live row. It is not authoritative —
+                    // `verify_chain_with_high_water` reports the two
+                    // disagreeing in either direction — but a mark read while a
+                    // write was landing would look exactly like a truncation, so
+                    // a moving head skips it rather than accusing.
+                    let high_water_state = if stable {
+                        match high_water.as_ref() {
+                            ::core::option::Option::Some(mark) =>
+                                ::autumn_web::ledger::LedgerHighWaterState::Present(mark),
+                            ::core::option::Option::None =>
+                                ::autumn_web::ledger::LedgerHighWaterState::Absent,
+                        }
+                    } else {
+                        ::autumn_web::ledger::LedgerHighWaterState::NotChecked
+                    };
+
+                    ::core::result::Result::Ok(
+                        ::autumn_web::ledger::verify_chain_with_high_water(
+                            record_id,
+                            &revisions,
+                            live_state,
+                            high_water_state,
+                        ),
+                    )
+                }
+
+                /// Whether the head revision describes the row the table holds.
+                ///
+                /// Both sides are the model's durable per-field codec output —
+                /// which carries `#[private]` and `#[encrypted]` columns that the
+                /// model's public JSON omits — decrypted before comparison.
+                ///
+                /// Decryption is what makes this comparison meaningful. Raw
+                /// ciphertext is never comparable between a stored snapshot and a
+                /// freshly encoded live row (randomized mode draws a fresh nonce
+                /// per write; deterministic mode is stable only while the key is),
+                /// but the plaintext underneath is — so a revision whose only
+                /// change was to an encrypted column is still visible here, and a
+                /// key rotation is not mistaken for tampering: each envelope
+                /// carries the `key_id` that encrypted it, so a retired key still
+                /// decrypts.
+                ///
+                /// A column whose key is gone entirely cannot be compared at all;
+                /// it is dropped from **both** sides rather than read as a
+                /// divergence. Only that residue is invisible to the cross-check,
+                /// and the revision hash still covers it.
+                #[doc(hidden)]
+                fn __autumn_ledger_live_matches(
+                    head: &::autumn_web::reexports::serde_json::Value,
+                    live: &::autumn_web::reexports::serde_json::Value,
+                ) -> bool {
+                    let mut head = head.clone();
+                    let mut live = live.clone();
+                    let mut unrecoverable =
+                        ::autumn_web::encryption::decrypt_snapshot_columns(#table_name, &mut head);
+                    unrecoverable.extend(
+                        ::autumn_web::encryption::decrypt_snapshot_columns(#table_name, &mut live),
+                    );
+                    for column in unrecoverable {
+                        if let ::core::option::Option::Some(object) = head.as_object_mut() {
+                            object.remove(column);
+                        }
+                        if let ::core::option::Option::Some(object) = live.as_object_mut() {
+                            object.remove(column);
+                        }
+                    }
+                    ::autumn_web::ledger::canonical_json(&head)
+                        == ::autumn_web::ledger::canonical_json(&live)
+                }
+
+                /// The live row encoded through the model's durable codec, or
+                /// `None` when the record has no row at all.
+                ///
+                /// Reads with soft-deleted rows included: a ledgered delete leaves
+                /// the row in place, so "absent" here means erased out of band.
+                /// See [`__autumn_ledger_live_matches`](Self::__autumn_ledger_live_matches)
+                /// for how it is compared against a stored snapshot.
+                #[doc(hidden)]
+                async fn __autumn_ledger_live_view(
+                    &self,
+                    record_id: i64,
+                ) -> ::autumn_web::AutumnResult<::core::option::Option<::autumn_web::reexports::serde_json::Value>> {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+
+                    #ledger_cross_shard_guard
+                    #ledger_cross_tenant_guard
+                    #ledger_tenant_setup
+
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
+                    let row: ::core::option::Option<#model_name> = #ledger_live_row_query
+                        .optional()
+                        .map_err(::autumn_web::AutumnError::from)?;
+
+                    match row {
+                        ::core::option::Option::None =>
+                            ::core::result::Result::Ok(::core::option::Option::None),
+                        ::core::option::Option::Some(model) => {
+                            ::core::result::Result::Ok(::core::option::Option::Some(
+                                model.__autumn_commit_hook_to_value()?,
+                            ))
+                        }
+                    }
+                }
+
+                /// The record's chain head and high-water mark, read in one
+                /// statement on one connection (issue #2323).
+                ///
+                /// One statement on purpose. `ledger_verify` cross-checks the
+                /// two against each other, and a mark read from a *different*
+                /// connection than the head can come from a differently-lagged
+                /// replica — which would look exactly like a truncated tail
+                /// (`MissingRevision`) or a rolled-back mark
+                /// (`HighWaterBehind`) on a chain nobody touched. Reading both
+                /// from one snapshot makes that class of false accusation
+                /// impossible rather than unlikely.
+                ///
+                /// The `(SELECT 1)` anchor is what keeps the row coming back
+                /// when neither side has anything, so "no head" and "no mark"
+                /// are distinguishable from "no row".
+                ///
+                /// # Errors
+                ///
+                /// Returns an error if either table cannot be read.
+                #[doc(hidden)]
+                pub async fn __autumn_ledger_settled_state(
+                    &self,
+                    record_id: i64,
+                ) -> ::autumn_web::AutumnResult<::autumn_web::ledger::LedgerPin> {
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+
+                    // Two indexed single-row lookups. Pinning a head is something an
+                    // operator polls on a schedule, so it must not cost a scan and a
+                    // JSON parse of every revision the record ever had.
+                    //
+                    // The two tenant predicates are spelled differently on purpose.
+                    // The head leg keeps `($3 IS NULL OR tenant_id = $3)`,
+                    // byte-for-byte what `ledger_revisions` uses, so the head this
+                    // returns is always the head of the chain that routine walks. The
+                    // mark leg uses `COALESCE($3, '')`, the key the append writes and
+                    // the migration backfills, because `tenant_key` is NOT NULL. They
+                    // agree for every reachable configuration:
+                    // `ledger_cross_tenant_guard` above rejects `across_tenants`, so a
+                    // tenant-scoped repository always binds `Some`, and an unscoped
+                    // one always wrote `tenant_id IS NULL` / `tenant_key = ''`.
+                    #ledger_cross_shard_guard
+                    #ledger_cross_tenant_guard
+                    #ledger_tenant_setup
+
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
+                    let settled = ::autumn_web::backend_select! {
+                        pg => {{
+                            #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                            struct __AutumnLedgerSettled {
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::BigInt>)]
+                                head_seq: ::core::option::Option<i64>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                head_hash: ::core::option::Option<::std::string::String>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>)]
+                                head_recorded_at: ::core::option::Option<::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::BigInt>)]
+                                mark_seq: ::core::option::Option<i64>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                mark_hash: ::core::option::Option<::std::string::String>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>)]
+                                mark_recorded_at: ::core::option::Option<::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>>,
+                            }
+                            ::autumn_web::reexports::diesel::sql_query(
+                                "SELECT __head.seq AS head_seq, \
+                                        __head.hash AS head_hash, \
+                                        __head.recorded_at AS head_recorded_at, \
+                                        __mark.high_seq AS mark_seq, \
+                                        __mark.head_hash AS mark_hash, \
+                                        __mark.recorded_at AS mark_recorded_at \
+                                 FROM (SELECT 1 AS anchor) AS __anchor \
+                                 LEFT JOIN ( \
+                                     SELECT seq, hash, recorded_at FROM _autumn_ledger_revisions \
+                                     WHERE table_name = $1 AND record_id = $2 \
+                                     AND ($3::text IS NULL OR tenant_id = $3) \
+                                     ORDER BY seq DESC LIMIT 1 \
+                                 ) AS __head ON 1 = 1 \
+                                 LEFT JOIN _autumn_ledger_high_water AS __mark \
+                                 ON __mark.table_name = $1 AND __mark.record_id = $2 \
+                                 AND __mark.tenant_key = COALESCE($3::text, '')"
+                            )
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__ledger_tenant_id)
+                            .get_results::<__AutumnLedgerSettled>(&mut conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?
+                            .into_iter()
+                            .next()
+                            .map(|row| ::autumn_web::ledger::LedgerPin {
+                                head: row.head_seq.zip(row.head_hash).zip(row.head_recorded_at).map(
+                                    |((seq, hash), recorded_at)| ::autumn_web::ledger::LedgerHead {
+                                        record_id, seq, hash, recorded_at,
+                                    },
+                                ),
+                                high_water: row.mark_seq.zip(row.mark_hash).zip(row.mark_recorded_at).map(
+                                    |((seq, hash), recorded_at)| ::autumn_web::ledger::LedgerHighWater {
+                                        record_id, seq, hash, recorded_at,
+                                    },
+                                ),
+                            })
+                        }},
+                        sqlite => {{
+                            #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                            struct __AutumnLedgerSettled {
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::BigInt>)]
+                                head_seq: ::core::option::Option<i64>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                head_hash: ::core::option::Option<::std::string::String>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>)]
+                                head_recorded_at: ::core::option::Option<::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::BigInt>)]
+                                mark_seq: ::core::option::Option<i64>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                mark_hash: ::core::option::Option<::std::string::String>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>)]
+                                mark_recorded_at: ::core::option::Option<::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>>,
+                            }
+                            ::autumn_web::reexports::diesel::sql_query(
+                                "SELECT __head.seq AS head_seq, \
+                                        __head.hash AS head_hash, \
+                                        __head.recorded_at AS head_recorded_at, \
+                                        __mark.high_seq AS mark_seq, \
+                                        __mark.head_hash AS mark_hash, \
+                                        __mark.recorded_at AS mark_recorded_at \
+                                 FROM (SELECT 1 AS anchor) AS __anchor \
+                                 LEFT JOIN ( \
+                                     SELECT seq, hash, recorded_at FROM _autumn_ledger_revisions \
+                                     WHERE table_name = $1 AND record_id = $2 \
+                                     AND ($3 IS NULL OR tenant_id = $3) \
+                                     ORDER BY seq DESC LIMIT 1 \
+                                 ) AS __head ON 1 = 1 \
+                                 LEFT JOIN _autumn_ledger_high_water AS __mark \
+                                 ON __mark.table_name = $1 AND __mark.record_id = $2 \
+                                 AND __mark.tenant_key = COALESCE($3, '')"
+                            )
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__ledger_tenant_id)
+                            .get_results::<__AutumnLedgerSettled>(&mut conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?
+                            .into_iter()
+                            .next()
+                            .map(|row| ::autumn_web::ledger::LedgerPin {
+                                head: row.head_seq.zip(row.head_hash).zip(row.head_recorded_at).map(
+                                    |((seq, hash), recorded_at)| ::autumn_web::ledger::LedgerHead {
+                                        record_id, seq, hash, recorded_at,
+                                    },
+                                ),
+                                high_water: row.mark_seq.zip(row.mark_hash).zip(row.mark_recorded_at).map(
+                                    |((seq, hash), recorded_at)| ::autumn_web::ledger::LedgerHighWater {
+                                        record_id, seq, hash, recorded_at,
+                                    },
+                                ),
+                            })
+                        }},
+                    };
+                    ::core::result::Result::Ok(settled.unwrap_or(
+                        ::autumn_web::ledger::LedgerPin {
+                            head: ::core::option::Option::None,
+                            high_water: ::core::option::Option::None,
+                        },
+                    ))
+                }
+
+                /// The record's chain head and high-water mark, from **one**
+                /// statement and one snapshot — what an audit posture pins
+                /// outside the database (issue #2323).
+                ///
+                /// Prefer this over calling
+                /// [`ledger_head`](Self::ledger_head) and
+                /// [`ledger_high_water`](Self::ledger_high_water) in
+                /// sequence. Those take a snapshot each, so an ordinary append
+                /// landing between them hands you a head at sequence `N`
+                /// beside a mark at `N+1` — which reads exactly like the
+                /// truncation the mark exists to expose. The two are only
+                /// meaningful as a pair; read them as one.
+                ///
+                /// # Errors
+                ///
+                /// Returns an error if either ledger table cannot be read.
+                pub async fn ledger_pin(
+                    &self,
+                    record_id: i64,
+                ) -> ::autumn_web::AutumnResult<::autumn_web::ledger::LedgerPin> {
+                    self.__autumn_ledger_settled_state(record_id).await
+                }
+
+                /// The head of the record's chain, for pinning outside the
+                /// database.
+                ///
+                /// Returns `None` for a record with no revisions. The head is
+                /// reported whether or not the chain verifies — pair it with
+                /// [`ledger_verify`](Self::ledger_verify) when you need both.
+                ///
+                /// # Errors
+                ///
+                /// Propagates read errors from
+                /// [`ledger_revisions`](Self::ledger_revisions).
+                pub async fn ledger_head(
+                    &self,
+                    record_id: i64,
+                ) -> ::autumn_web::AutumnResult<::core::option::Option<::autumn_web::ledger::LedgerHead>> {
+                    ::core::result::Result::Ok(
+                        self.__autumn_ledger_settled_state(record_id).await?.head,
+                    )
+                }
+
+                /// The record's out-of-band high-water mark (issue #2323).
+                ///
+                /// The highest sequence number the record's chain has ever
+                /// reached, kept in `_autumn_ledger_high_water` rather than
+                /// among the revisions themselves — so deleting the newest
+                /// revision no longer lets an ordinary write re-use its
+                /// sequence number.
+                ///
+                /// Returns `None` for a record that has no mark: one that was
+                /// never written, or whose mark row was removed.
+                /// [`ledger_verify`](Self::ledger_verify) is what turns the
+                /// second case into an accusation — a mark on its own proves
+                /// nothing, and this method deliberately does not judge.
+                ///
+                /// # Errors
+                ///
+                /// Returns an error if the mark table cannot be read.
+                pub async fn ledger_high_water(
+                    &self,
+                    record_id: i64,
+                ) -> ::autumn_web::AutumnResult<::core::option::Option<::autumn_web::ledger::LedgerHighWater>> {
+                    ::core::result::Result::Ok(
+                        self.__autumn_ledger_settled_state(record_id).await?.high_water,
+                    )
+                }
+            }
+        }
+    } else {
+        quote! {}
     };
 
     let versioned_history_impl = if config.versioned {
@@ -15184,7 +19915,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { let mut conn = self.__autumn_acquire_read_conn().await?; }
     };
 
+    // #1716: publish this repository's write surface (and any declared
+    // invalidation edges) so the build can prove no write strands a cached read.
+    let coherence_items = match generate_coherence_items(&config, &trait_def, &pg_name) {
+        Ok(items) => items,
+        Err(err) => return err.to_compile_error(),
+    };
+
     quote! {
+        #coherence_items
+
         /// Generated repository trait with CRUD + derived queries.
         #vis trait #trait_name: Send + Sync {
             fn find_by_id(&self, id: i64) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Option<#model_name>>> + Send;
@@ -15244,15 +19984,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             async fn save(&self, new: &#new_name) -> ::autumn_web::AutumnResult<#model_name> {
-                // #1379: normalize `#[normalize]` columns on the insert path,
-                // before the `before_create` hook and the DB write, so
-                // validators and the database observe the canonical value.
-                // Dispatches through the autoref-specialization probe: the `Yes`
-                // arm clones and canonicalizes only for models whose `New*`
-                // implements `Normalize`; the `No` arm hands back the caller's
-                // borrow unchanged, so models with no `#[normalize]` columns (and
-                // hand-written `New*` types that don't implement `Normalize`) pay
-                // no clone. `Borrow` unifies the owned/borrowed arms to `&#new_name`.
+                // #1379: normalize `#[normalize]` columns on the insert path, before
+                // the `before_create` hook and the DB write, so validators and the
+                // database see the canonical value. Dispatches through the
+                // autoref-specialization probe: the `Yes` arm clones and canonicalizes
+                // only for models whose `New*` implements `Normalize`, and the `No`
+                // arm hands back the caller's borrow unchanged, so a model with no
+                // `#[normalize]` columns pays no clone. `Borrow` unifies the owned and
+                // borrowed arms to `&#new_name`.
                 #[allow(unused_imports)]
                 use ::autumn_web::normalize::{SpezNormalizeNo as _, SpezNormalizeYes as _};
                 #[allow(unused_imports)]
@@ -15307,6 +20046,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             async fn save_many_skip_invalid(&self, new: &[#new_name]) -> ::autumn_web::AutumnResult<(Vec<#model_name>, Vec<(usize, ::autumn_web::AutumnError)>)> {
+                // #2586: normalize before the per-row `#[validate]` pass inside
+                // the body, so a skip-invalid import judges — and stores — the
+                // same canonical value `save_many` does.
+                //
+                // #2634: no clone when there is nothing to normalize. `#[model]`
+                // emits `impl Normalize` for the `New*` only when the model
+                // declares `#[normalize]` columns, so the probe's `Yes` arm wins
+                // exactly when normalization can change something; otherwise the
+                // borrowed `No` arm hands the caller's slice back untouched.
+                #[allow(unused_imports)]
+                use ::autumn_web::normalize::{SpezNormalizeManyNo as _, SpezNormalizeManyYes as _};
+                #[allow(unused_imports)]
+                use ::std::borrow::Borrow as _;
+                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize_many();
+                let new: &[#new_name] = __autumn_normalized.borrow();
                 #save_many_skip_invalid_body
             }
 
@@ -15335,8 +20089,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#soft_delete_one_shard_helpers)*
             #search_one_shard_helpers
             #with_pool_method
+            #counter_cache_recompute_methods
             #hook_support_methods
             #dependent_child_helper
+            #retention_sweep_methods
+            #position_impl_methods_ts
 
             /// Returns a clone of this repository whose generated read
             /// methods are pinned to the primary pool for the rest of the
@@ -15390,15 +20147,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ///     for comment in post.comments()? { /* ... */ }
             /// }
             /// ```
-            // Generic over the record + spec types so the `Preloadable` bound
-            // rests on a *generic* parameter, not the concrete model. A bound
-            // on a concrete type that has no `Preloadable` impl is rejected
-            // eagerly; a bound on a generic type parameter is only checked at
-            // call sites. This keeps the method available on repositories whose
-            // model is hand-written (not via `#[model]`, e.g. zero-column test
-            // models) — they simply never call `preload`. In normal use the
-            // record type is inferred from the finder result, i.e. this
-            // repository's model.
+            // Generic over the record and spec types so the `Preloadable` bound rests
+            // on a generic parameter, not the concrete model. A bound on a concrete
+            // type with no `Preloadable` impl is rejected eagerly; a bound on a
+            // generic parameter is checked only at call sites. That keeps the method
+            // available on repositories whose model is hand-written rather than
+            // `#[model]`-generated — zero-column test models, say — which simply never
+            // call `preload`. In normal use the record type is inferred from the
+            // finder result, this repository's model.
             pub async fn preload<__Model, __Spec>(
                 &self,
                 records: ::std::vec::Vec<__Model>,
@@ -15583,21 +20339,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // Postgres statement_timeout is a signed 32-bit integer; cap to be safe.
                 let timeout_ms = timeout_ms.min(i32::MAX as u64);
 
-                // `SET statement_timeout` is Postgres session syntax; SQLite
-                // rejects it ("near \"SET\": syntax error"). SQLite also cannot
-                // enforce a per-statement wall-clock timeout at all through the
-                // async connection wrapper (diesel's SqliteConnection exposes no
-                // interrupt/progress-handler hook), so this arm CANNOT honor a
-                // configured `database.statement_timeout`. Rather than silently
-                // ignore it here, autumn-web fails the boot fast whenever a
-                // non-zero `statement_timeout` is configured under the sqlite
-                // backend (`reject_sqlite_statement_timeout`, called from
-                // `create_pool` / `create_topology` / `create_shard_topology` in
-                // db.rs). That boot guard guarantees `timeout_ms` is always 0 by
-                // the time it reaches this arm, so the no-op below is correct and
-                // reachable-with-a-real-timeout never happens — not a silent gap.
-                // `busy_timeout` (installed at connection setup) still bounds lock
-                // waits; a real statement timeout is tracked by #1996/#1910.
+                // `SET statement_timeout` is Postgres session syntax; SQLite rejects
+                // it ("near \"SET\": syntax error"). SQLite also cannot enforce a
+                // per-statement wall-clock timeout through the async connection
+                // wrapper, because diesel's `SqliteConnection` exposes no interrupt or
+                // progress-handler hook, so this arm cannot honor a configured
+                // `database.statement_timeout`. Rather than ignore it silently,
+                // autumn-web fails the boot fast whenever a non-zero
+                // `statement_timeout` is configured under the sqlite backend
+                // (`reject_sqlite_statement_timeout`, called from `create_pool`,
+                // `create_topology`, and `create_shard_topology` in db.rs). That guard
+                // means `timeout_ms` is always 0 by the time it reaches this arm, so
+                // the no-op below is correct rather than a silent gap. `busy_timeout`,
+                // installed at connection setup, still bounds lock waits; a real
+                // statement timeout is tracked by #1996/#1910.
                 ::autumn_web::backend_select! {
                     pg => {{
                         ::autumn_web::reexports::diesel::sql_query(
@@ -15680,6 +20435,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #hook_inventory_registration
         #versioned_inventory_registration
+        #sharded_inventory_registration
+        #position_claim_registration
+        #graph_inventory_registration
+        #retention_inventory_registration
 
         #api_handlers
 
@@ -15693,7 +20452,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #versioned_record_impl
 
+        #ledgered_record_impl
+
         #versioned_history_impl
+
+        #ledger_query_impl
 
         #search_compile_check
 
@@ -15748,6 +20511,561 @@ mod tests {
     #[test]
     fn mixed_and_or_returns_none() {
         assert!(parse_query_name("find_by_a_and_b_or_c").is_none());
+    }
+
+    // ── #1716: cache-coherence mutation surface ──────────────────────
+
+    #[test]
+    fn parse_repo_args_parses_trait_level_invalidates() {
+        let attr: TokenStream =
+            quote! { Post, invalidates(crate::views::recent_posts, home::sidebar) };
+        let config = parse_repo_args(attr).unwrap();
+        let rendered: Vec<String> = config
+            .invalidates
+            .iter()
+            .map(|p| quote!(#p).to_string().replace(' ', ""))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec!["crate::views::recent_posts", "home::sidebar"]
+        );
+    }
+
+    // ── #2429: version-history codegen hands over owned values ───────
+
+    /// Render `vh_insert_ts` for one op with a whitespace-normalized body, so
+    /// the assertions below read like the code they are checking.
+    fn vh_tokens(op: &str) -> String {
+        let record_expr = quote! { __rec };
+        let before_expr = quote! { __before };
+        let conn_ident = quote! { conn };
+        let model_ident: proc_macro2::Ident = syn::parse_quote!(Post);
+        vh_insert_ts(
+            "posts",
+            op,
+            false,
+            &record_expr,
+            Some(&before_expr),
+            &conn_ident,
+            &model_ident,
+            false,
+        )
+        .to_string()
+        .replace(' ', "")
+    }
+
+    #[test]
+    fn vh_codegen_moves_the_disposable_value_into_compute_insert_changes() {
+        let ts = vh_tokens("insert");
+        assert!(
+            ts.contains("compute_insert_changes_owned(__vh_json,"),
+            "insert codegen must move `__vh_json` into the owned entry point: {ts}"
+        );
+        assert!(
+            !ts.contains("compute_insert_changes(&__vh_json"),
+            "insert codegen must not keep borrowing `__vh_json`: {ts}"
+        );
+    }
+
+    #[test]
+    fn vh_codegen_moves_the_disposable_value_into_compute_delete_changes() {
+        let ts = vh_tokens("delete");
+        assert!(
+            ts.contains("compute_delete_changes_owned(__vh_json,"),
+            "delete codegen must move `__vh_json` into the owned entry point: {ts}"
+        );
+        assert!(
+            !ts.contains("compute_delete_changes(&__vh_json"),
+            "delete codegen must not keep borrowing `__vh_json`: {ts}"
+        );
+    }
+
+    #[test]
+    fn vh_codegen_moves_both_disposable_values_into_compute_diff() {
+        let ts = vh_tokens("update");
+        assert!(
+            ts.contains("compute_diff_owned(__vh_before_json,__vh_after_json,"),
+            "update codegen must move both values into the owned entry point: {ts}"
+        );
+        assert!(
+            !ts.contains("compute_diff(&__vh_before_json"),
+            "update codegen must not keep borrowing the before/after values: {ts}"
+        );
+    }
+
+    #[test]
+    fn vh_codegen_still_serializes_each_record_exactly_once() {
+        // Moving the value into the diff must not tempt a second
+        // `version_column_values()` call: that would double the serialization
+        // cost the change is meant to reduce, and — for a model whose
+        // serialization is not pure — could record a different snapshot than
+        // the one that was written.
+        for (op, expected) in [("insert", 1), ("delete", 1), ("update", 2)] {
+            let ts = vh_tokens(op);
+            assert_eq!(
+                ts.matches("version_column_values()").count(),
+                expected,
+                "{op} codegen must call version_column_values() {expected}x: {ts}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_repo_args_invalidates_defaults_empty() {
+        let config = parse_repo_args(quote! { Post }).unwrap();
+        assert!(config.invalidates.is_empty());
+        assert!(config.acknowledge_stale.is_none());
+    }
+
+    #[test]
+    fn parse_repo_args_rejects_empty_invalidates() {
+        assert!(parse_repo_args(quote! { Post, invalidates() }).is_err());
+    }
+
+    #[test]
+    fn parse_repo_args_acknowledge_stale_requires_a_reason() {
+        let ok = parse_repo_args(quote! { Post, acknowledge_stale = "seed-only writes" }).unwrap();
+        assert_eq!(ok.acknowledge_stale.as_deref(), Some("seed-only writes"));
+        assert!(parse_repo_args(quote! { Post, acknowledge_stale = "" }).is_err());
+        assert!(parse_repo_args(quote! { Post, acknowledge_stale = "  " }).is_err());
+    }
+
+    #[test]
+    fn write_methods_cover_the_always_generated_crud_surface() {
+        let config = parse_repo_args(quote! { Post }).unwrap();
+        let trait_def: ItemTrait = syn::parse_quote! { pub trait PostRepository {} };
+        let names = write_method_names(&config, &trait_def);
+        for expected in [
+            "save",
+            "update",
+            "delete_by_id",
+            "save_many",
+            "save_many_skip_invalid",
+            "update_many",
+            "delete_many",
+            "upsert_many",
+        ] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "missing {expected} in {names:?}"
+            );
+        }
+        assert!(!names.contains(&"restore".to_string()));
+        assert!(!names.contains(&"find_all".to_string()));
+    }
+
+    #[test]
+    fn write_methods_include_soft_delete_and_derived_deletes() {
+        let config = parse_repo_args(quote! { Post, soft_delete }).unwrap();
+        let trait_def: ItemTrait = syn::parse_quote! {
+            pub trait PostRepository {
+                async fn find_by_title(&self, title: &str) -> Vec<Post>;
+                async fn delete_by_author_id(&self, author_id: i64) -> ();
+            }
+        };
+        let names = write_method_names(&config, &trait_def);
+        assert!(names.contains(&"restore".to_string()));
+        assert!(names.contains(&"purge".to_string()));
+        assert!(names.contains(&"delete_by_author_id".to_string()));
+        assert!(!names.contains(&"find_by_title".to_string()));
+    }
+
+    #[test]
+    fn write_methods_exclude_purge_on_a_ledgered_repository() {
+        // A ledgered repository never generates `purge`: a hard DELETE would
+        // erase the row the ledger reconstructs.
+        let config =
+            parse_repo_args(quote! { Post, soft_delete, ledgered, versioned = true }).unwrap();
+        let trait_def: ItemTrait = syn::parse_quote! { pub trait PostRepository {} };
+        let names = write_method_names(&config, &trait_def);
+        assert!(names.contains(&"restore".to_string()));
+        assert!(!names.contains(&"purge".to_string()));
+    }
+
+    #[test]
+    fn write_methods_include_position_moves_when_declared() {
+        let config = parse_repo_args(quote! { Post, position }).unwrap();
+        let trait_def: ItemTrait = syn::parse_quote! { pub trait PostRepository {} };
+        let names = write_method_names(&config, &trait_def);
+        assert!(names.contains(&"move_to".to_string()));
+        assert!(names.contains(&"move_up".to_string()));
+    }
+
+    #[test]
+    fn method_level_invalidates_is_read_off_the_trait() {
+        let trait_def: ItemTrait = syn::parse_quote! {
+            pub trait PostRepository {
+                #[invalidates(crate::views::recent_posts)]
+                async fn delete_by_author_id(&self, author_id: i64) -> ();
+            }
+        };
+        let overrides = parse_method_coherence_attrs(&trait_def).unwrap();
+        let entry = overrides.get("delete_by_author_id").unwrap();
+        assert_eq!(entry.invalidates.len(), 1);
+        assert!(entry.acknowledge_stale.is_none());
+    }
+
+    #[test]
+    fn method_level_acknowledge_stale_requires_a_reason() {
+        let bad: ItemTrait = syn::parse_quote! {
+            pub trait PostRepository {
+                #[acknowledge_stale(reason = "")]
+                async fn delete_by_author_id(&self, author_id: i64) -> ();
+            }
+        };
+        assert!(parse_method_coherence_attrs(&bad).is_err());
+
+        let good: ItemTrait = syn::parse_quote! {
+            pub trait PostRepository {
+                #[acknowledge_stale(reason = "admin-only backfill")]
+                async fn delete_by_author_id(&self, author_id: i64) -> ();
+            }
+        };
+        let overrides = parse_method_coherence_attrs(&good).unwrap();
+        assert_eq!(
+            overrides
+                .get("delete_by_author_id")
+                .unwrap()
+                .acknowledge_stale
+                .as_deref(),
+            Some("admin-only backfill")
+        );
+    }
+
+    #[test]
+    fn repository_registers_a_mutation_descriptor_per_write_method() {
+        let out =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        assert!(out.contains("MutationDescriptor"), "{out}");
+        assert!(out.contains("method : \"save\""), "{out}");
+        assert!(out.contains("method : \"delete_by_id\""), "{out}");
+        assert!(out.contains("repository : \"PostRepository\""), "{out}");
+        assert!(out.contains("table : \"posts\""), "{out}");
+        // A read must never be registered as a mutation.
+        assert!(!out.contains("method : \"find_all\""), "{out}");
+    }
+
+    #[test]
+    fn repository_wires_declared_invalidation_edges_into_every_write() {
+        let out = repository_macro(
+            quote! { Post, invalidates(crate::views::recent_posts) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            out.contains("crate :: views :: __AUTUMN_CACHE_READ_ID__recent_posts"),
+            "the edge must resolve to the cached read's own id constant: {out}"
+        );
+        assert!(
+            out.contains("invalidate_declared_caches"),
+            "a declared edge must come with a callable invalidator: {out}"
+        );
+        assert!(
+            out.contains(
+                "invalidate_namespace (crate :: views :: __AUTUMN_CACHE_READ_ID__recent_posts)"
+            ),
+            "the invalidator must resolve through the same id constant, so a mistyped edge \
+             yields ONE error naming the user's own path: {out}"
+        );
+    }
+
+    #[test]
+    fn a_method_level_edge_also_reaches_the_invalidator() {
+        // An edge that discharges the gate but has no callable counterpart is
+        // exactly the paperwork this feature exists to prevent.
+        let out = repository_macro(
+            quote! { Post },
+            quote! {
+                pub trait PostRepository {
+                    #[invalidates(crate::views::by_author)]
+                    async fn delete_by_author_id(&self, author_id: i64) -> ();
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            out.contains(
+                "invalidate_namespace (crate :: views :: __AUTUMN_CACHE_READ_ID__by_author)"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_coherence_attribute_on_a_non_write_method_is_an_error() {
+        // The trait is regenerated from scratch, so an attribute the macro does
+        // not consume would vanish without a trace.
+        let out = repository_macro(
+            quote! { Post },
+            quote! {
+                pub trait PostRepository {
+                    #[invalidates(crate::views::by_author)]
+                    async fn find_by_author_id(&self, author_id: i64) -> Vec<Post>;
+                }
+            },
+        )
+        .to_string();
+        assert!(out.contains("compile_error"), "{out}");
+        assert!(out.contains("is not a write method"), "{out}");
+    }
+
+    #[test]
+    fn the_invalidator_is_must_use() {
+        let out = repository_macro(
+            quote! { Post, invalidates(crate::views::recent_posts) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(out.contains("must_use"), "{out}");
+    }
+
+    #[test]
+    fn write_methods_drop_upsert_many_when_it_is_not_generated() {
+        // Mirrors `upsert_many_trait_method`'s own condition; a name listed here
+        // but never generated would put a phantom mutation in the manifest.
+        let trait_def: ItemTrait = syn::parse_quote! { pub trait PostRepository {} };
+        let hooked = parse_repo_args(quote! { Post, hooks = PostHooks }).unwrap();
+        assert!(!write_method_names(&hooked, &trait_def).contains(&"upsert_many".to_string()));
+        let no_upsert = parse_repo_args(quote! { Post, no_upsert_trait }).unwrap();
+        assert!(!write_method_names(&no_upsert, &trait_def).contains(&"upsert_many".to_string()));
+    }
+
+    #[test]
+    fn trait_level_and_method_level_edges_union_rather_than_replace() {
+        let out = repository_macro(
+            quote! { Post, invalidates(crate::views::recent_posts) },
+            quote! {
+                pub trait PostRepository {
+                    #[invalidates(crate::views::by_author)]
+                    async fn delete_by_author_id(&self, author_id: i64) -> ();
+                }
+            },
+        )
+        .to_string();
+        // The annotated method carries BOTH edges...
+        assert!(
+            out.contains(
+                "method : \"delete_by_author_id\" , model : || :: core :: any :: type_name :: < Post > () , table : \"posts\" , invalidates : & [crate :: views :: __AUTUMN_CACHE_READ_ID__recent_posts , crate :: views :: __AUTUMN_CACHE_READ_ID__by_author]"
+            ),
+            "{out}"
+        );
+        // ...and the others keep the trait-level one.
+        assert!(
+            out.contains(
+                "method : \"save\" , model : || :: core :: any :: type_name :: < Post > () , table : \"posts\" , invalidates : & [crate :: views :: __AUTUMN_CACHE_READ_ID__recent_posts]"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_method_level_acknowledgement_overrides_the_repository_wide_one() {
+        let out = repository_macro(
+            quote! { Post, acknowledge_stale = "repository-wide reason" },
+            quote! {
+                pub trait PostRepository {
+                    #[acknowledge_stale(reason = "this one method only")]
+                    async fn delete_by_author_id(&self, author_id: i64) -> ();
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            out.contains(
+                "method : \"delete_by_author_id\" , model : || :: core :: any :: type_name :: < Post > () , table : \"posts\" , invalidates : & [] , acknowledged_stale : :: core :: option :: Option :: Some (\"this one method only\")"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "method : \"save\" , model : || :: core :: any :: type_name :: < Post > () , table : \"posts\" , invalidates : & [] , acknowledged_stale : :: core :: option :: Option :: Some (\"repository-wide reason\")"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn method_level_acknowledge_stale_rejects_an_unknown_key() {
+        let bad: ItemTrait = syn::parse_quote! {
+            pub trait PostRepository {
+                #[acknowledge_stale(why = "nope")]
+                async fn delete_by_author_id(&self, author_id: i64) -> ();
+            }
+        };
+        assert!(parse_method_coherence_attrs(&bad).is_err());
+
+        let missing: ItemTrait = syn::parse_quote! {
+            pub trait PostRepository {
+                #[acknowledge_stale]
+                async fn delete_by_author_id(&self, author_id: i64) -> ();
+            }
+        };
+        assert!(parse_method_coherence_attrs(&missing).is_err());
+    }
+
+    #[test]
+    fn method_level_invalidates_rejects_an_empty_list() {
+        let empty: ItemTrait = syn::parse_quote! {
+            pub trait PostRepository {
+                #[invalidates()]
+                async fn delete_by_author_id(&self, author_id: i64) -> ();
+            }
+        };
+        assert!(parse_method_coherence_attrs(&empty).is_err());
+    }
+
+    #[test]
+    fn repository_without_invalidations_emits_no_invalidator() {
+        let out =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        assert!(!out.contains("invalidate_declared_caches"), "{out}");
+    }
+
+    #[test]
+    fn repository_method_level_edges_apply_only_to_that_method() {
+        let out = repository_macro(
+            quote! { Post },
+            quote! {
+                pub trait PostRepository {
+                    #[invalidates(crate::views::by_author)]
+                    async fn delete_by_author_id(&self, author_id: i64) -> ();
+                }
+            },
+        )
+        .to_string();
+        // The descriptor for the annotated method carries the edge...
+        assert!(
+            out.contains("method : \"delete_by_author_id\" , model : || :: core :: any :: type_name :: < Post > () , table : \"posts\" , invalidates : & [crate :: views :: __AUTUMN_CACHE_READ_ID__by_author]"),
+            "{out}"
+        );
+        // ...and `save` does not.
+        assert!(
+            out.contains("method : \"save\" , model : || :: core :: any :: type_name :: < Post > () , table : \"posts\" , invalidates : & [] ,"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn repository_acknowledged_stale_reaches_the_descriptor() {
+        let out = repository_macro(
+            quote! { Post, acknowledge_stale = "import path only" },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(out.contains("import path only"), "{out}");
+    }
+
+    #[test]
+    fn a_dependent_cascade_registers_a_write_against_the_child_model() {
+        // `PostRepository::delete_by_id` really does delete `Comment` rows, so
+        // a cached read derived from `Comment` is stranded by it. Registering
+        // only the parent model here would be a false pass.
+        let out = repository_macro(
+            quote! {
+                Post,
+                dependent(PgCommentRepository, fk = "post_id", on_delete = destroy)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            out.contains(
+                "method : \"delete_by_id\" , model : < PgCommentRepository > :: __AUTUMN_MODEL_NAME"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "method : \"delete_many\" , model : < PgCommentRepository > :: __AUTUMN_MODEL_NAME"
+            ),
+            "{out}"
+        );
+        // A non-cascading write must NOT claim to touch the child.
+        assert!(
+            !out.contains(
+                "method : \"save\" , model : < PgCommentRepository > :: __AUTUMN_MODEL_NAME"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_cascade_names_the_childs_own_model_not_its_repository_name() {
+        // The supported escape hatch: `#[repository(Comment)] trait
+        // ModerationRepository`. Inferring `Moderation` from the repository's
+        // name would intersect nothing, and the audit would report clean while
+        // the cascade really does delete `Comment` rows.
+        let out = repository_macro(
+            quote! {
+                Post,
+                dependent(PgModerationRepository, fk = "post_id", on_delete = destroy)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            out.contains("model : < PgModerationRepository > :: __AUTUMN_MODEL_NAME"),
+            "{out}"
+        );
+        assert!(!out.contains("\"Moderation\""), "no name guessing: {out}");
+    }
+
+    #[test]
+    fn a_repository_publishes_its_own_model_for_a_parents_cascade() {
+        let out =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        assert!(
+            out.contains(
+                "pub const __AUTUMN_MODEL_NAME : fn () -> & 'static :: core :: primitive :: str = || :: core :: any :: type_name :: < Post > ()"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_restrict_only_dependent_registers_no_cascade_write() {
+        // `on_delete = restrict` probes for child rows and then either rejects
+        // the parent delete or proceeds when there are none; it never writes the
+        // child's table. Registering it would fail CI over a read that cannot go
+        // stale.
+        let out = repository_macro(
+            quote! {
+                Post,
+                dependent(PgCommentRepository, fk = "post_id", on_delete = restrict)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            !out.contains("< PgCommentRepository > :: __AUTUMN_MODEL_NAME"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_cascade_write_inherits_the_repositorys_invalidation_edges() {
+        let out = repository_macro(
+            quote! {
+                Post,
+                invalidates(crate::views::recent_comments),
+                dependent(PgCommentRepository, fk = "post_id", on_delete = nullify)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            out.contains(
+                "method : \"delete_by_id\" , model : < PgCommentRepository > :: __AUTUMN_MODEL_NAME , table : \"\" , invalidates : & [crate :: views :: __AUTUMN_CACHE_READ_ID__recent_comments]"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_repository_without_dependents_registers_no_cascade_writes() {
+        let out =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        assert!(!out.contains("table : \"\""), "{out}");
     }
 
     #[test]
@@ -15935,6 +21253,59 @@ mod tests {
             !guard_cond.contains("__autumn_shards . is_some")
                 && !guard_cond.contains("__autumn_shards.is_some"),
             "aggregate guard condition must not depend on __autumn_shards being Some: {guard_cond}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_m2m_tenant_scope_rejects_across_tenants_on_sharded_repo() {
+        // PR #2177: `#[votable]`'s `react()`/`reaction_of()` resolve their tenant
+        // scope through `M2mConnSource::__autumn_m2m_tenant_scope()` before acquiring
+        // any connection. On a sharded repository there is no single right shard for
+        // an `across_tenants()` reaction: a write would mutate whichever shard backs
+        // the routed pool, and a read would silently return `None` for edges on other
+        // shards. The scope method must therefore reject, keyed off the runtime
+        // `across_tenants` flag alone — no `__autumn_shards` conjunct, or
+        // `with_pool_untracked` repos slip past.
+        let generated = repository_macro(
+            quote! { Event, table = "events", tenant_scoped, sharded },
+            quote! {
+                pub trait EventRepository {}
+            },
+        )
+        .to_string();
+
+        let pos = generated
+            .find("fn __autumn_m2m_tenant_scope")
+            .expect("sharded+tenant_scoped repo must implement __autumn_m2m_tenant_scope");
+        let section = &generated[pos..];
+        let guard_end = section
+            .find("cross-shard reactions are not supported")
+            .expect("sharded+tenant_scoped tenant scope must carry the cross-shard reject");
+        let guard_cond = &section[..guard_end];
+        assert!(
+            guard_cond.contains("across_tenants"),
+            "reaction guard must key off the across_tenants flag: {guard_cond}"
+        );
+        assert!(
+            !guard_cond.contains("__autumn_shards . is_some")
+                && !guard_cond.contains("__autumn_shards.is_some"),
+            "reaction guard condition must not depend on __autumn_shards being \
+             Some: {guard_cond}"
+        );
+
+        // A non-sharded tenant_scoped repo must NOT carry the reject — its
+        // across_tenants() mode legitimately reads/writes the single pool.
+        let unsharded = repository_macro(
+            quote! { Event, table = "events", tenant_scoped },
+            quote! {
+                pub trait EventRepository {}
+            },
+        )
+        .to_string();
+        assert!(
+            !unsharded.contains("cross-shard reactions are not supported"),
+            "non-sharded tenant_scoped repo must not reject across_tenants \
+             reactions"
         );
     }
 
@@ -16236,17 +21607,15 @@ mod tests {
 
     #[test]
     fn repository_macro_grouped_aggregate_guards_encrypted_columns() {
-        // §1364 encryption correctness: whether a column is `#[encrypted(...)]`
-        // is declared on the model and is only known at runtime (the repository
-        // macro sees the trait, not the model's fields — see
-        // `encode_derived_query_param`), so a `compile_error!` cannot name the
-        // encrypted column. Instead the generated grouped-aggregate method emits
-        // a runtime guard against the SAME `is_encrypted_column` registry the
-        // `find_by` surface consults, rejecting both the group column and the
-        // aggregated numeric column before running any SQL. It fires only for
-        // columns that are actually encrypted, so non-encrypted grouping is
-        // unchanged (asserted separately by the other grouped-aggregate tests,
-        // whose generated bodies never early-return).
+        // §1364 encryption correctness: whether a column is `#[encrypted(...)]` is
+        // declared on the model and known only at runtime — the repository macro sees
+        // the trait, not the model's fields — so a `compile_error!` cannot name the
+        // encrypted column. The generated grouped-aggregate method instead emits a
+        // runtime guard against the same `is_encrypted_column` registry the `find_by`
+        // surface consults, rejecting both the group column and the aggregated
+        // numeric column before running any SQL. It fires only for genuinely
+        // encrypted columns, so non-encrypted grouping is unchanged, as the other
+        // grouped-aggregate tests assert.
         let generated = repository_macro(
             quote! { Event, table = "events" },
             quote! {
@@ -16463,6 +21832,243 @@ mod tests {
         assert!(
             generated.contains("\"page\"") && generated.contains("\"size\""),
             "the query schema must document page and size params"
+        );
+    }
+
+    /// Slice `generated` from `start` up to `end` (or the end of the string).
+    fn section_between<'a>(generated: &'a str, start: &str, end: &str) -> &'a str {
+        let from = generated
+            .find(start)
+            .unwrap_or_else(|| panic!("missing `{start}` in generated code"));
+        let rest = &generated[from..];
+        let to = rest.find(end).unwrap_or(rest.len());
+        &rest[..to]
+    }
+
+    #[test]
+    fn repository_macro_save_validates_after_normalize_before_insert() {
+        // #2586: `save` runs the model's `#[validate]` rules on every caller —
+        // a job, a seed, a resolver — not only the generated REST handlers.
+        // Order: normalize, then validate, then insert.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let section = section_between(&generated, "async fn save (", "async fn update (");
+
+        let normalize_at = section
+            .find("spez_normalize ()")
+            .expect("save must normalize the payload");
+        // Pinned to the exact emitted form: `new` is already a `&New*`, so an
+        // extra borrow would validate only via `validator`'s blanket
+        // `impl Validate for &T`. Assert the shape that does not rely on it.
+        let validate_at = section
+            .find("MaybeValidate (new)")
+            .expect("save must validate the payload");
+        let insert_at = section.find("insert_into").expect("save must insert");
+        assert!(
+            normalize_at < validate_at && validate_at < insert_at,
+            "save must normalize, then validate, then insert: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_save_validates_on_every_config_branch() {
+        // #2586 names four `save` bodies — blind, hooked, tenant-scoped and
+        // versioned. The splice sits at the one point they are composed, so
+        // prove that rather than trusting it.
+        for attr in [
+            quote! { Post },
+            quote! { Post, hooks = PostHooks },
+            quote! { Post, tenant_scoped },
+            quote! { Post, versioned = true },
+            quote! { Post, tenant_scoped, sharded },
+        ] {
+            let label = attr.to_string();
+            let generated =
+                repository_macro(attr, quote! { pub trait PostRepository {} }).to_string();
+            let section = section_between(&generated, "async fn save (", "async fn update (");
+            assert!(
+                section.contains("MaybeValidate (new)"),
+                "`{label}` must validate on the insert path: {section}"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_macro_hooked_save_validates_before_before_create() {
+        // #2586: on a hooked repository the rules run before `before_create`,
+        // as `docs/guide/forms.md` states.
+        let generated = repository_macro(
+            quote! { Post, hooks = PostHooks },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = section_between(&generated, "async fn save (", "async fn update (");
+
+        let validate_at = section
+            .find("MaybeValidate (new)")
+            .expect("hooked save must validate the payload");
+        let hook_at = section
+            .find("before_create")
+            .expect("hooked save must run before_create");
+        assert!(
+            validate_at < hook_at,
+            "validation must run before the before_create hook: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_save_many_validates_each_row_before_insert() {
+        // #2586: the bulk insert path validates every row before writing any.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let section = section_between(
+            &generated,
+            "async fn save_many (",
+            "async fn save_many_skip_invalid (",
+        );
+
+        let validate_at = section
+            .find("MaybeValidate (__autumn_row)")
+            .expect("save_many must validate each row");
+        let insert_at = section.find("insert_into").expect("save_many must insert");
+        assert!(
+            validate_at < insert_at,
+            "every row must be validated before the batch insert: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_save_many_skip_invalid_normalizes_and_reports_rows() {
+        // #2586: skip-invalid keeps its partial-success contract — a row the
+        // model rejects is reported by index, not raised. It also normalizes
+        // first, so validators see the same canonical value `save` gives them.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let section = section_between(
+            &generated,
+            "async fn save_many_skip_invalid (",
+            "async fn update_many (",
+        );
+
+        let normalize_at = section
+            .find("spez_normalize_many ()")
+            .expect("skip-invalid must normalize rows");
+        let validate_at = section
+            .find("MaybeValidate (__autumn_row)")
+            .expect("skip-invalid must validate rows");
+        assert!(
+            normalize_at < validate_at,
+            "rows must be normalized before validation: {section}"
+        );
+        // Reported, not raised: the rejected index is pushed onto `failures`
+        // rather than `?`-propagated. `failures . push` alone would pass on the
+        // unchanged code (hook and constraint failures already use it), so pin
+        // the arm the validation pass writes.
+        assert!(
+            section.contains("::core::result::Result::Err (err) => failures . push ((idx , err))")
+                || section.contains(
+                    ":: core :: result :: Result :: Err (err) => failures . push ((idx , err))"
+                ),
+            "an invalid row must be reported by index, not raised: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_hooked_save_many_skip_invalid_validates_before_hook() {
+        // #2586: same contract on the hooked skip-invalid path.
+        let generated = repository_macro(
+            quote! { Post, hooks = PostHooks },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = section_between(
+            &generated,
+            "async fn save_many_skip_invalid (",
+            "async fn update_many (",
+        );
+
+        let validate_at = section
+            .find("MaybeValidate (& item)")
+            .expect("hooked skip-invalid must validate rows");
+        let hook_at = section
+            .find("before_create")
+            .expect("hooked skip-invalid must run before_create");
+        assert!(
+            validate_at < hook_at,
+            "validation must run before before_create: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_find_or_create_by_validates_before_insert() {
+        // #2586: the get-or-insert path validates only when it is about to
+        // insert, so an existing row is still returned for a payload the model
+        // would reject.
+        let generated = repository_macro(
+            quote! { Post },
+            quote! {
+                pub trait PostRepository {
+                    fn find_or_create_by_slug(&self, slug: String, new: &NewPost);
+                }
+            },
+        )
+        .to_string();
+        // Bound on the next generated item. `HasTenantIdColumn` is emitted only
+        // for a tenant_scoped repository, so it would never match here and the
+        // "section" would run to the end of the output.
+        let section = section_between(
+            &generated,
+            "pub async fn find_or_create_by_slug",
+            "pub async fn preload",
+        );
+
+        let lookup_at = section
+            .find("__autumn_acquire_read_conn")
+            .expect("get-or-insert must look up first");
+        let validate_at = section
+            .find("MaybeValidate (new)")
+            .expect("get-or-insert must validate the payload");
+        let insert_at = section
+            .find("insert_into")
+            .expect("get-or-insert must insert");
+        assert!(
+            lookup_at < validate_at && validate_at < insert_at,
+            "validation must sit between the lookup and the insert: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_upsert_many_stays_unvalidated() {
+        // #2586 guard rail: `upsert_many` takes whole models and Postgres
+        // decides per row whether the statement inserts or updates, so there is
+        // no insert to hang the rule on. `docs/guide/forms.md` documents the
+        // carve-out; pin it so it cannot drift silently.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        // Bounded on the inherent impl that follows the trait impl. Note
+        // `impl PostRepository for PgPostRepository` does not match this needle.
+        let section = section_between(
+            &generated,
+            "async fn upsert_many (",
+            "impl PgPostRepository",
+        );
+        assert!(
+            !section.contains("MaybeValidate"),
+            "upsert_many is a documented carve-out: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_blind_update_still_validates_nothing() {
+        // #2586 guard rail: the fix is insert-only. A no-hooks, no-knob
+        // repository keeps the documented blind update path.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let section = section_between(&generated, "async fn update (", "async fn delete_by_id (");
+
+        assert!(
+            !section.contains("MaybeValidate"),
+            "the blind update path must stay unvalidated: {section}"
         );
     }
 
@@ -17251,7 +22857,7 @@ mod tests {
             .find("let chunk_inserted =")
             .expect("hooked save_many should insert chunks");
         let history_pos = section
-            .find("INSERT INTO _autumn_version_history")
+            .find("append_version_history")
             .expect("hooked versioned save_many must write create history");
         let extend_pos = section
             .find("inserted . extend (chunk_inserted)")
@@ -17283,7 +22889,7 @@ mod tests {
             .find("let chunk_inserted =")
             .expect("commit-hook save_many should insert chunks");
         let history_pos = section
-            .find("INSERT INTO _autumn_version_history")
+            .find("append_version_history")
             .expect("commit-hook versioned save_many must write create history");
         let enqueue_pos = section
             .find("enqueue_repository_commit_hooks_pending_bulk_on_conn")
@@ -17309,7 +22915,7 @@ mod tests {
         let section = &generated[delete_many_pos..];
 
         let history_pos = section
-            .find("INSERT INTO _autumn_version_history")
+            .find("append_version_history")
             .expect("hooked versioned delete_many must write delete history");
 
         let delete_pos = section
@@ -17333,7 +22939,7 @@ mod tests {
             .find("async fn delete_by_id")
             .expect("repository must generate delete_by_id");
         let rest = &generated[start + "async fn delete_by_id".len()..];
-        let end = rest.find("async fn ").map_or(rest.len(), |p| p);
+        let end = rest.find("async fn ").unwrap_or(rest.len());
         &rest[..end]
     }
 
@@ -17344,7 +22950,7 @@ mod tests {
             .find("async fn delete_many")
             .expect("repository must generate delete_many");
         let rest = &generated[start + "async fn delete_many".len()..];
-        let end = rest.find("async fn ").map_or(rest.len(), |p| p);
+        let end = rest.find("async fn ").unwrap_or(rest.len());
         &rest[..end]
     }
 
@@ -17357,7 +22963,7 @@ mod tests {
             .find(needle)
             .expect("repository must generate update");
         let rest = &generated[start + needle.len()..];
-        let end = rest.find("async fn ").map_or(rest.len(), |p| p);
+        let end = rest.find("async fn ").unwrap_or(rest.len());
         &rest[..end]
     }
 
@@ -17410,7 +23016,7 @@ mod tests {
             .find("async fn find_by_id")
             .expect("repository must generate find_by_id");
         let rest = &generated[find_start + "async fn find_by_id".len()..];
-        let find_by_id = &rest[..rest.find("async fn ").map_or(rest.len(), |p| p)];
+        let find_by_id = &rest[..rest.find("async fn ").unwrap_or(rest.len())];
         assert!(
             !find_by_id.contains("scoped_immediate_transaction"),
             "find_by_id (read) must not open an immediate write transaction: {find_by_id}"
@@ -17682,16 +23288,15 @@ mod tests {
 
     #[test]
     fn repository_macro_delete_many_uses_path_and_deleted_not_monotonic_preseed() {
-        // Codex round-5-B: the bulk `delete_many` cascade must NOT use a single
-        // monotonic visited set that pre-seeds a batch root before it is deleted
-        // (that made an ancestor's cascade skip a still-referenced descendant batch
-        // root and trip an IMMEDIATE FK). The old `__autumn_visited` set is gone,
-        // replaced by TWO structures: an ACTIVE-path stack (`__autumn_path`, pushed
-        // then popped around each root's own cascade — cycle-break only) and a
-        // monotonic `__autumn_deleted` set of rows actually removed. Phase 2 must
-        // (a) push the current root onto the path before its mutating cascade,
-        // (b) pop it right after, and (c) skip a root already in `__autumn_deleted`
-        // (cascade-deleted as another root's descendant) — never a pre-seed.
+        // Codex round-5-B: the bulk `delete_many` cascade must not use a single
+        // monotonic visited set that pre-seeds a batch root before it is deleted —
+        // that made an ancestor's cascade skip a still-referenced descendant root and
+        // trip an immediate FK. `__autumn_visited` is replaced by two structures: an
+        // active-path stack (`__autumn_path`, pushed and popped around each root's own
+        // cascade, for cycle-breaking only) and a monotonic `__autumn_deleted` set of
+        // rows actually removed. Phase 2 must push the current root onto the path
+        // before its mutating cascade, pop it right after, and skip a root already in
+        // `__autumn_deleted` — never pre-seed.
         let generated = repository_macro(
             quote! { Node, dependent(PgNodeRepository, fk = "parent_id", on_delete = destroy) },
             quote! { pub trait NodeRepository {} },
@@ -17841,7 +23446,7 @@ mod tests {
             "restrict must produce a typed conflict error"
         );
         assert!(
-            generated.contains("SELECT EXISTS"),
+            generated.contains("dependent_restrict"),
             "restrict must probe for existing children"
         );
         // Non-soft-delete child: the EXISTS probe carries no live filter
@@ -17866,7 +23471,7 @@ mod tests {
         .to_string();
         let restrict_arm = dependent_restrict_arm(&generated);
         assert!(
-            restrict_arm.contains("SELECT EXISTS"),
+            restrict_arm.contains("dependent_restrict"),
             "restrict must probe for existing children: {restrict_arm}"
         );
         // The live filter is a runtime `if __parent_soft { \" AND ...deleted_at.. IS NULL\" } else { \"\" }`.
@@ -17888,7 +23493,7 @@ mod tests {
         )
         .to_string();
         assert!(
-            generated.contains("= NULL WHERE"),
+            generated.contains("dependent_nullify"),
             "nullify must UPDATE the child FK column to NULL"
         );
     }
@@ -17901,8 +23506,118 @@ mod tests {
         )
         .to_string();
         assert!(
-            generated.contains("DELETE FROM"),
+            generated.contains("dependent_delete_all"),
             "delete_all must issue a bulk DELETE"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_leaf_takes_batched_fast_path() {
+        // Ledger: a plain leaf child (no hooks, not soft-delete, no
+        // dependent(...) of its own) routes the Destroy arm through the same
+        // dependent_delete_all() helper on_delete = delete_all already uses,
+        // guarded by a runtime check that the model has no *model-attribute*
+        // (#[has_many(dependent = ...)]) grandchildren either. This checks
+        // Comment's OWN generated `__autumn_apply_dependent_on_conn` (used
+        // when something ELSE destroys Comment as its child), so Comment must
+        // declare no `dependent(...)` of its own here -- a repository that
+        // itself has `dependent(...)` is the "has grandchildren" case tested
+        // separately below and must NOT take this fast path.
+        let generated = repository_macro(
+            quote! { Comment },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("dependent_delete_all"),
+            "a hookless, non-soft-delete, dependent-free leaf must take the \
+             batched dependent_delete_all fast path: {destroy_arm}"
+        );
+        assert!(
+            destroy_arm.contains("dependents") && destroy_arm.contains("is_empty"),
+            "the fast path must still guard on the model's own runtime \
+             dependents() being empty: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_with_own_dependents_skips_fast_path() {
+        // A child that itself declares dependent(...) (repo-attribute
+        // grandchildren) must keep the per-row loop -- dependent_delete_all()
+        // has no way to recurse into a grandchild cascade.
+        let generated = repository_macro(
+            quote! { Comment, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            !destroy_arm.contains("dependent_delete_all"),
+            "a child with its own repository-attribute dependent(...) \
+             grandchildren must never take the batched fast path: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_with_hooks_skips_fast_path() {
+        // A child with hooks must keep the exact per-row loop -- the fast
+        // path's dependent_delete_all() call never fires before_delete.
+        let generated = repository_macro(
+            quote! { Comment, hooks = CommentHooks, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            !destroy_arm.contains("dependent_delete_all"),
+            "a child with before_delete hooks must never take the batched \
+             fast path (it would skip the hook): {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_soft_delete_skips_fast_path() {
+        // A soft-delete child must keep the per-row loop too --
+        // dependent_delete_all() only ever hard-deletes.
+        let generated = repository_macro(
+            quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            !destroy_arm.contains("dependent_delete_all"),
+            "a soft-delete child must never take the hard-delete-only batched \
+             fast path: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_positioned_skips_fast_path() {
+        // Codex review, PR #2647: a `position(...)` child must keep the
+        // per-row loop even though it has none of the other disqualifiers --
+        // dependent_delete_all()'s bulk multi-row DELETE removes several
+        // same-scope siblings in one statement, but the row-level compaction
+        // triggers position(...) installs only ever see one departing row at
+        // a time (see this file's `delete_chunk_size` guard, which forces
+        // single-row chunks for the identical reason), so a batched delete
+        // here would leave the survivors' ranks gapped or duplicated.
+        // `position(...)` does not yet support a repo's OWN `dependent(...)`
+        // (an unrelated, pre-existing restriction), so this checks the
+        // unconditionally-generated Destroy arm on a bare `position` leaf
+        // instead of pairing it with grandchildren like the sibling tests
+        // above do.
+        let generated = repository_macro(
+            quote! { Comment, position },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            !destroy_arm.contains("dependent_delete_all"),
+            "a position(...) child must never take the batched fast path \
+             (it would corrupt the ordering): {destroy_arm}"
         );
     }
 
@@ -18013,15 +23728,14 @@ mod tests {
 
     #[test]
     fn repository_macro_dependent_destroy_reload_does_not_filter_deleted_at() {
-        // #1369 (second live-filter site): the per-ID reload that fetches each
-        // selected child must NOT re-apply `deleted_at IS NULL`. The id-selection
-        // is already parent-soft-gated, so on a HARD parent delete it returns
-        // already-soft-deleted children too; a live-only reload would return
-        // `None`, skip the hard delete, and leave the FK to fail the parent
-        // DELETE. Assert the reload loads the selected id straight into the
-        // `maybe_for_update!` lock seam (`FOR UPDATE` on Postgres, a plain read
-        // on `SQLite`) with no intervening `deleted_at` filter, even for a
-        // soft_delete child.
+        // #1369 (second live-filter site): the per-id reload fetching each selected
+        // child must not re-apply `deleted_at IS NULL`. The id selection is already
+        // parent-soft-gated, so on a hard parent delete it returns already-soft-deleted
+        // children too; a live-only reload would return `None`, skip the hard delete,
+        // and leave the FK to fail the parent DELETE. Assert the reload loads the
+        // selected id straight into the `maybe_for_update!` lock seam — `FOR UPDATE`
+        // on Postgres, a plain read on SQLite — with no intervening `deleted_at`
+        // filter, even for a soft_delete child.
         let generated = repository_macro(
             quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
             quote! { pub trait CommentRepository {} },
@@ -18199,25 +23913,23 @@ mod tests {
 
     #[test]
     fn repository_macro_destroy_arm_locks_child_ids_before_restrict_prescan() {
-        // Codex P2 ("Lock children before the restrict pre-scan"): the child-id
-        // selection that feeds the sibling restrict PRE-SCAN must acquire
-        // `FOR UPDATE` on the selected child rows. Otherwise, under READ
-        // COMMITTED, a concurrent FK insert of a `restrict` grandchild can commit
-        // AFTER this EXISTS pass and BEFORE the Phase-2 `for_update` child reload,
-        // so the child `before_delete` hook still fires and the hard delete falls
-        // through to a raw FK error (or a soft delete proceeds despite a live
-        // restrict dependent). Holding `FOR UPDATE` on the child row blocks the
-        // concurrent grandchild insert's `FOR KEY SHARE` on that referenced row,
-        // closing the TOCTOU window between probe and hook/delete.
+        // Codex P2, "lock children before the restrict pre-scan": the child-id
+        // selection feeding the sibling restrict pre-scan must take `FOR UPDATE` on
+        // the selected child rows. Otherwise, under READ COMMITTED, a concurrent FK
+        // insert of a `restrict` grandchild can commit after this EXISTS pass and
+        // before the Phase-2 `for_update` child reload, so the child `before_delete`
+        // hook still fires and the hard delete falls through to a raw FK error — or a
+        // soft delete proceeds despite a live restrict dependent. Holding `FOR UPDATE`
+        // on the child row blocks the concurrent insert's `FOR KEY SHARE` on that
+        // referenced row, closing the TOCTOU window between probe and hook or delete.
         //
-        // The child-id SELECT now appends a backend-gated lock suffix rather than
-        // a hard-coded `FOR UPDATE`: `... ORDER BY id{}` where the `{}` binding
-        // (`__for_update`) is `" FOR UPDATE"` on Postgres and `""` on `SQLite`
-        // (which rejects `SELECT … FOR UPDATE`), selected in autumn-web's
-        // compilation via `backend_select!`. The Postgres SQL is byte-identical to
-        // before. Structurally: the backend-gated `FOR UPDATE` lock must still be
-        // applied to the `SELECT id ... ORDER BY id` query, which must precede the
-        // `for __row in & __ids` pre-scan loop.
+        // The child-id SELECT appends a backend-gated lock suffix rather than a
+        // hard-coded `FOR UPDATE`: `... ORDER BY id{}`, where `__for_update` binds
+        // `" FOR UPDATE"` on Postgres and `""` on SQLite, which rejects `SELECT …
+        // FOR UPDATE`, selected in autumn-web's compilation via `backend_select!`.
+        // The Postgres SQL is byte-identical to before. Structurally, the lock must
+        // still apply to the `SELECT id ... ORDER BY id` query, which must precede
+        // the `for __row in & __ids` pre-scan loop.
         let generated = repository_macro(
             quote! {
                 Comment,
@@ -18375,17 +24087,16 @@ mod tests {
 
     #[test]
     fn repository_macro_grandchild_restrict_prescan_skip_uses_physical_not_handled_set() {
-        // #1800 (Codex "Re-probe restricts on hard revisits"): the grandchild
-        // `restrict` PRE-SCAN skip must consult the PHYSICAL-delete set, NOT the
-        // "all handled" `__deleted` set. In a mixed soft/hard diamond a row that was
-        // soft-deleted on an earlier (soft-parent) path sits in `__deleted` but not
-        // in `__physical`. The Phase-2 mutating loop keys its revisit-skip on
-        // `__physical`, so it still hard-deletes that row on a later hard-delete
-        // path; the pre-scan MUST therefore also key on `__physical` so it re-runs
-        // the restrict probe on that hard revisit. If it kept keying on `__deleted`
-        // the probe would be skipped while the hard delete proceeds — firing the
-        // child hook and falling through to a raw FK failure instead of the typed
-        // 409 when the row has a soft-deleted restrict dependent.
+        // #1800, "re-probe restricts on hard revisits": the grandchild `restrict`
+        // pre-scan skip must consult the physical-delete set, not the all-handled
+        // `__deleted` set. In a mixed soft/hard diamond, a row soft-deleted on an
+        // earlier soft-parent path sits in `__deleted` but not in `__physical`. The
+        // Phase-2 mutating loop keys its revisit-skip on `__physical` and still
+        // hard-deletes that row on a later hard path, so the pre-scan must key on
+        // `__physical` too and re-run the restrict probe. Keyed on `__deleted` the
+        // probe would be skipped while the hard delete proceeds — firing the child
+        // hook and falling through to a raw FK failure instead of the typed 409 when
+        // the row has a soft-deleted restrict dependent.
         let generated = repository_macro(
             quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = restrict) },
             quote! { pub trait CommentRepository {} },
@@ -18629,8 +24340,10 @@ mod tests {
     #[test]
     fn parse_repo_args_with_owner() {
         // #1841: `owner = <column>` is parsed onto `RepoConfig::owner_column`.
-        let tokens: proc_macro2::TokenStream =
-            r#"Post, api = "/api/posts", owner = author_id"#.parse().unwrap();
+        // No `api = "..."` here: paired with `api` and no `policy`/`scope`,
+        // `owner` alone is now a hard compile error (Warden 2026-09-13) — see
+        // `repository_owner_api_without_policy_or_scope_is_rejected` below.
+        let tokens: proc_macro2::TokenStream = r"Post, owner = author_id".parse().unwrap();
         let config = parse_repo_args(tokens).unwrap();
         assert_eq!(
             config.owner_column.as_deref(),
@@ -18645,8 +24358,13 @@ mod tests {
         // applied to BOTH the COUNT and the page query, before the allowlisted
         // sort/filter helpers, so `total` and the returned rows can never be
         // widened past the owner's rows.
+        //
+        // No `api = "..."` here (Warden 2026-09-13): `list_scoped` generation
+        // is gated purely on `owner_column`, not on `api`, and `api` +
+        // `owner` with no `policy`/`scope` is now a compile error — see
+        // `repository_owner_api_without_policy_or_scope_is_rejected` below.
         let generated = repository_macro(
-            quote! { Post, api = "/api/posts", owner = author_id },
+            quote! { Post, owner = author_id },
             quote! { pub trait PostRepository {} },
         )
         .to_string();
@@ -18680,8 +24398,13 @@ mod tests {
         // that filters the COUNT raw SQL, the id-SELECT raw SQL, AND the typed
         // hydration query by owner — all three, or `total`/rows would disagree
         // and the endpoint could leak another user's rows.
+        //
+        // No `api = "..."` here (Warden 2026-09-13): `search_page_scoped`
+        // generation is gated on `owner_column` + `searchable`, not on `api`,
+        // and `api` + `owner` with no `policy`/`scope` is now a compile error
+        // — see `repository_owner_api_without_policy_or_scope_is_rejected`.
         let generated = repository_macro(
-            quote! { Post, api = "/api/posts", owner = author_id, searchable },
+            quote! { Post, owner = author_id, searchable },
             quote! { pub trait PostRepository {} },
         )
         .to_string();
@@ -18715,6 +24438,104 @@ mod tests {
                 "records_query = records_query . filter (posts :: author_id . eq (owner_id))"
             ),
             "search_page_scoped hydration query must filter by owner: {body}"
+        );
+    }
+
+    // Warden 2026-09-13: `owner = <column>` never gated the generated
+    // `api = "..."` CRUD routes — only the opt-in `list_scoped`/
+    // `search_page_scoped` methods a hand-written handler must call
+    // explicitly. `#[repository(api = "...", owner = author_id)]` with no
+    // `policy`/`scope` therefore compiled to a fully public REST API (every
+    // row readable via `GET <api>`, any single row readable/overwritable/
+    // deletable by id via `GET`/`PUT`/`DELETE <api>/{id}`) despite reading,
+    // at the declaration site, like a per-owner-scoped one. Reject the
+    // combination at compile time instead of silently shipping it.
+    #[test]
+    fn repository_owner_api_without_policy_or_scope_is_rejected() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", owner = author_id"#.parse().unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!(
+                "owner = <column> next to api = \"...\" with no policy/scope must be rejected: \
+                 it silently ships an unscoped CRUD API"
+            );
+        };
+        assert!(
+            err.to_string().contains("owner = <column> has no effect"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn repository_owner_api_with_policy_is_accepted() {
+        // Adding `policy = Type` alongside `owner` + `api` is the documented
+        // way out: the auto-API's `has_policy` branch (`__check_policy_scoped`)
+        // actually gates `show`/`update`/`delete`, and a `policy`-aware list
+        // body gates `GET <api>` too. `owner_column` still drives
+        // `list_scoped`/`search_page_scoped` for any hand-written route that
+        // wants the cheaper SQL-level filter instead.
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", owner = author_id, policy = PostPolicy"#
+                .parse()
+                .unwrap();
+        assert!(
+            parse_repo_args(tokens).is_ok(),
+            "owner = <column> + policy = Type alongside api = \"...\" must be accepted"
+        );
+    }
+
+    #[test]
+    fn repository_owner_api_with_scope_but_no_policy_is_rejected() {
+        // `scope = Type` alone must NOT satisfy the gate: it only filters the
+        // list endpoint's SQL query (`scope_list_body`'s `scope_type.is_some()`
+        // arm). `_api_get`/`_api_update`/`_api_delete` have no `scope`-driven
+        // equivalent — only `has_policy` gates them
+        // (`policy_check_show`/`policy_check_update_pre`/
+        // `policy_check_delete_pre`) — so accepting `scope` on its own would
+        // leave every single-record route fully unguarded. Caught in review
+        // (Codex, PR #2770) on the first cut of this fix, which wrongly
+        // accepted `scope` as an alternative to `policy`.
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", owner = author_id, scope = PostScope"#
+                .parse()
+                .unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!(
+                "owner = <column> + scope = Type (no policy) next to api = \"...\" must be \
+                 rejected: scope only filters the list endpoint, leaving show/update/delete open"
+            );
+        };
+        assert!(
+            err.to_string().contains("owner = <column> has no effect"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn repository_owner_api_with_policy_and_scope_is_accepted() {
+        // The full, efficient combination: `policy` gates every single-record
+        // route and (absent a faster `scope`) the list endpoint too;
+        // `scope` on top gives the list endpoint a cheaper SQL-level filter
+        // instead of the in-memory `can_show` sweep.
+        let tokens: proc_macro2::TokenStream = r#"Post, api = "/api/posts", owner = author_id, policy = PostPolicy, scope = PostScope"#
+            .parse()
+            .unwrap();
+        assert!(
+            parse_repo_args(tokens).is_ok(),
+            "owner = <column> + policy = Type + scope = Type alongside api = \"...\" must be accepted"
+        );
+    }
+
+    #[test]
+    fn repository_owner_without_api_is_accepted() {
+        // `owner =` with no `api =` at all is unaffected: it only emits the
+        // opt-in `list_scoped`/`search_page_scoped` methods for a
+        // hand-written route to call, and generates no HTTP surface of its
+        // own to leave unscoped.
+        let tokens: proc_macro2::TokenStream = r"Post, owner = author_id".parse().unwrap();
+        assert!(
+            parse_repo_args(tokens).is_ok(),
+            "owner = <column> with no api = \"...\" must be accepted"
         );
     }
 
@@ -19100,6 +24921,168 @@ mod tests {
         );
     }
 
+    /// The generated text for one `async fn`, from its signature to the start of
+    /// the next one (or end of input).
+    ///
+    /// Assertions used to slice a fixed byte count after the signature, which
+    /// made them depend on how much *unrelated* text (attributes, `use` lines)
+    /// the expansion happened to emit first — adding a justified `#[allow(...)]`
+    /// silently pushed the asserted token out of the window and failed a test
+    /// whose subject had not changed. Scope by function instead.
+    fn generated_fn<'a>(generated: &'a str, signature: &str) -> &'a str {
+        let start = generated
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} must be generated"));
+        let rest = &generated[start + signature.len()..];
+        let end = rest
+            .find("async fn ")
+            .map_or(generated.len(), |off| start + signature.len() + off);
+        &generated[start..end]
+    }
+
+    // ── #1325 counter caches ──────────────────────────────────────────────
+    //
+    // Whether a model has a counter cache is a runtime fact, since `#[model]` and
+    // `#[repository]` are separate proc-macro invocations, so the maintenance calls
+    // are emitted unconditionally and resolve to a no-op for a model without one.
+    // These assertions pin that they are emitted at all, on the right method, and —
+    // for the paths that were transaction-free — that the transactional twin sits
+    // behind the `HAS_COUNTER_CACHES` const, so the single-statement path stays
+    // reachable.
+
+    #[test]
+    fn save_increments_after_the_insert() {
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let section = generated_fn(&generated, "async fn save (");
+        assert!(
+            section.contains("counter_cache_after_insert"),
+            "save must maintain counter caches: {section}"
+        );
+        assert!(
+            section.contains("HAS_COUNTER_CACHES"),
+            "the transaction-free save path must still consult the const: {section}"
+        );
+        assert!(
+            section.contains("maybe_immediate_transaction"),
+            "the counter-cached save path must open a transaction only when the const \
+             is set, through one shared body: {section}"
+        );
+    }
+
+    #[test]
+    fn update_captures_before_and_moves_after() {
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let section = generated_fn(&generated, "async fn update (");
+        assert!(
+            section.contains("counter_cache_capture_fks"),
+            "update must snapshot the foreign keys before the UPDATE: {section}"
+        );
+        assert!(
+            section.contains("counter_cache_after_update"),
+            "update must move the counters after the UPDATE: {section}"
+        );
+    }
+
+    #[test]
+    fn delete_by_id_decrements_before_the_delete() {
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let section = generated_fn(&generated, "async fn delete_by_id");
+        let decrement = section
+            .find("counter_cache_before_delete_by_id")
+            .expect("delete_by_id must decrement counter caches");
+        let delete = section
+            .find("diesel :: delete")
+            .expect("delete_by_id must issue a DELETE");
+        assert!(
+            decrement < delete,
+            "the decrement must run BEFORE the row is removed — it resolves the \
+             parent from the still-present child row: {section}"
+        );
+    }
+
+    #[test]
+    fn soft_delete_repositories_maintain_counters_on_delete_and_restore() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated_fn(&generated, "async fn delete_by_id")
+                .contains("counter_cache_before_delete_by_id"),
+            "a soft delete decrements too"
+        );
+        assert!(
+            generated_fn(&generated, "async fn restore")
+                .contains("counter_cache_before_restore_by_id"),
+            "restore puts the count back"
+        );
+        assert!(
+            generated_fn(&generated, "async fn purge")
+                .contains("counter_cache_before_delete_by_id"),
+            "purge decrements, guarded so a purge after a soft delete does not double-count"
+        );
+    }
+
+    #[test]
+    fn bulk_methods_maintain_counters() {
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        assert!(
+            generated_fn(&generated, "async fn save_many (")
+                .contains("counter_cache_after_insert_many"),
+            "save_many folds each chunk into one delta per parent"
+        );
+        assert!(
+            generated_fn(&generated, "async fn delete_many")
+                .contains("counter_cache_before_delete_many"),
+            "delete_many decrements every affected parent"
+        );
+        let update_many = generated_fn(&generated, "async fn update_many");
+        assert!(
+            update_many.contains("counter_cache_capture_fks_many")
+                && update_many.contains("counter_cache_after_update_many"),
+            "update_many captures the batch's foreign keys and diffs each record: {update_many}"
+        );
+    }
+
+    #[test]
+    fn the_dependent_cascade_maintains_the_children_own_counters() {
+        let generated = repository_macro(
+            quote! { Comment, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        // The cascade removes THIS model's rows on a parent's behalf; those rows
+        // may be counter-cached children of some other parent.
+        assert!(
+            generated.contains("counter_cache_before_delete_by_id"),
+            "the destroy cascade must move each child's own counters"
+        );
+        assert!(
+            generated.contains("counter_cache_before_delete_many"),
+            "delete_all / nullify resolve the ids first and decrement in bulk"
+        );
+    }
+
+    #[test]
+    fn recompute_methods_are_always_generated() {
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        assert!(
+            generated.contains("recompute_counter_caches")
+                && generated.contains("recompute_counter_caches_for"),
+            "the repair surface is emitted for every repository (a no-op without specs)"
+        );
+        assert!(
+            generated.contains("counter_cache_recompute"),
+            "recompute must delegate to the runtime helper"
+        );
+    }
+
     #[test]
     fn repository_macro_soft_delete_delete_by_id_targets_only_non_deleted() {
         let generated = repository_macro(
@@ -19108,10 +25091,7 @@ mod tests {
         )
         .to_string();
 
-        let delete_pos = generated
-            .find("async fn delete_by_id")
-            .expect("delete_by_id must be generated");
-        let section = &generated[delete_pos..delete_pos + 600];
+        let section = generated_fn(&generated, "async fn delete_by_id");
         assert!(
             section.contains("is_null"),
             "delete_by_id soft-delete UPDATE must add deleted_at IS NULL guard: {section}"
@@ -19154,10 +25134,7 @@ mod tests {
 
         // The derived delete_by_title impl (not the trait signature) must be
         // an UPDATE that sets deleted_at, not a hard DELETE FROM.
-        let impl_delete = generated
-            .find("async fn delete_by_title")
-            .expect("delete_by_title impl must be generated");
-        let section = &generated[impl_delete..impl_delete + 1200];
+        let section = generated_fn(&generated, "async fn delete_by_title");
         assert!(
             section.contains("deleted_at"),
             "derived delete_by_title must reference deleted_at in soft-delete mode: {section}"
@@ -19201,6 +25178,32 @@ mod tests {
     }
 
     #[test]
+    fn repository_macro_after_hook_failure_records_message_not_display() {
+        // #2596: an immediate after-hook failure stores the hook's `AutumnError`
+        // via `message()` (the bare title, e.g. "Validation failed"), matching
+        // the deferred commit-hook worker path — not via `Display`, which
+        // appends the field list for validation errors and would store a
+        // different string for the same logical failure. The recording sites
+        // only exist with `commit_hooks = true`, so both configs enable it.
+        for attr in [
+            quote! { Post, hooks = PostHooks, commit_hooks = true },
+            quote! { Post, hooks = PostHooks, commit_hooks = true, tenant_scoped },
+        ] {
+            let label = attr.to_string();
+            let generated =
+                repository_macro(attr, quote! { pub trait PostRepository {} }).to_string();
+            assert!(
+                generated.contains("__autumn_error . message ()"),
+                "`{label}` must record the hook failure with message(): {generated}"
+            );
+            assert!(
+                !generated.contains("format ! (\"{__autumn_error}\")"),
+                "`{label}` must not stringify the hook error with Display: {generated}"
+            );
+        }
+    }
+
+    #[test]
     fn repository_macro_soft_delete_cursor_page_applies_sd_filter() {
         let generated = repository_macro(
             quote! { Post, soft_delete, cursor_key = created_at },
@@ -19211,7 +25214,13 @@ mod tests {
         let cursor_pos = generated
             .find("async fn cursor_page")
             .expect("cursor_page impl must be generated");
-        let section = &generated[cursor_pos..cursor_pos + 800];
+        // Scope to the method body: the next `async fn` ends it. A fixed-width
+        // window breaks when the body gains a long item, such as the #1771
+        // confidential-column assertion.
+        let body = &generated[cursor_pos..];
+        let section = body[1..]
+            .find("async fn ")
+            .map_or(body, |end| &body[..=end]);
         assert!(
             section.contains("is_null"),
             "cursor_page impl must apply deleted_at IS NULL filter in soft-delete mode: {section}"
@@ -19358,7 +25367,7 @@ mod tests {
         .to_string();
 
         assert!(
-            generated.contains("tenant_id, record_id")
+            generated.contains("tenant_id : __vh_tenant_id")
                 && generated.contains("__vh_tenant_id")
                 && generated.contains("version_tenant_id"),
             "tenant-scoped history writes must persist tenant_id for fail-closed history reads: {generated}"
@@ -19405,34 +25414,35 @@ mod tests {
         );
 
         // ── Write path ────────────────────────────────────────────────
-        // Postgres keeps the jsonb cast; SQLite drops it and binds recorded_at.
+        // The INSERT itself — and with it the pg/sqlite fork that keeps the
+        // `$7::jsonb` cast on Postgres and binds `recorded_at` explicitly on
+        // SQLite — now lives in `autumn_web::version_history`, so it is compiled
+        // once rather than at each of this macro's ~30 write sites. What the
+        // generated code still owes is the call.
         let write_pos = generated
-            .find("INSERT INTO _autumn_version_history")
+            .find("append_version_history")
             .expect("versioned repository must write history");
         let write_section = &generated[write_pos..];
-        assert!(
-            write_section.contains("$7 :: jsonb") || write_section.contains("$7::jsonb"),
-            "the Postgres write arm must keep the $7::jsonb cast: {write_section}"
-        );
-        // The SQLite insert names all eight columns (recorded_at bound
-        // explicitly) and uses uncast $1..$8 placeholders. The literal preserves
-        // its `\`-continuations, so the column list and the VALUES clause are on
-        // separate source lines — assert each single-line fragment independently.
-        assert!(
-            generated.contains(
-                "(table_name, tenant_id, record_id, op, actor, request_id, changes, recorded_at)"
-            ),
-            "the SQLite write arm must bind recorded_at as an 8th column: {generated}"
-        );
-        assert!(
-            generated.contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"),
-            "the SQLite write arm must use uncast $1..$8 placeholders: {generated}"
-        );
-        // The SQLite write arm binds the explicit timestamp via chrono Utc::now().
-        assert!(
-            generated.contains("Utc :: now ())"),
-            "the SQLite write arm must bind recorded_at explicitly (Utc::now()): {generated}"
-        );
+        // The call has to carry everything the row needs, computed from the
+        // model: the table, the tenant, the record id, the op, the actor, the
+        // request id, and the serialized column diff. The statement's own shape
+        // — the `$7::jsonb` cast on Postgres, the explicit eighth `recorded_at`
+        // bind on SQLite — is asserted in `autumn_web::version_history`'s own
+        // tests, next to the SQL it describes.
+        for field in [
+            "table_name : \"posts\"",
+            "tenant_id : __vh_tenant_id",
+            "record_id : __vh_record_id",
+            "op : :: autumn_web :: version_history :: VersionOp :: Insert",
+            "actor : __vh_actor . as_str ()",
+            "request_id : __vh_request_id",
+            "changes_json : __vh_changes_str . as_str ()",
+        ] {
+            assert!(
+                write_section.contains(field),
+                "the version-history call must pass `{field}`: {write_section}"
+            );
+        }
 
         // ── Read path (SQLite arm drops every Postgres cast) ──────────
         assert!(
@@ -19621,7 +25631,7 @@ mod tests {
             .find(". first :: < Post >")
             .expect("versioned update should load the row before applying the update");
         let history_pos = section
-            .find("INSERT INTO _autumn_version_history")
+            .find("append_version_history")
             .expect("versioned update should write history");
 
         assert!(
@@ -19649,7 +25659,7 @@ mod tests {
             .find("let __vh_before_map")
             .expect("versioned upsert_many should snapshot before images for history");
         let history_pos = upsert_section
-            .find("INSERT INTO _autumn_version_history")
+            .find("append_version_history")
             .expect("versioned upsert_many should write history entries");
 
         assert!(
@@ -20450,6 +26460,1538 @@ mod tests {
         assert!(
             !generated.contains("cross-shard writes are not supported"),
             "sharded-only repo must not contain cross-shard write guard: {generated}"
+        );
+    }
+
+    // ── #1342: declarative retention sweeps ─────────────────────────────
+
+    #[test]
+    fn retention_age_based_parses_after_and_basis() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, retention(after = \"30d\", basis = created_at)"
+                .parse()
+                .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        let retention = config.retention.expect("retention should be parsed");
+        assert_eq!(retention.after.as_deref(), Some("30d"));
+        assert_eq!(
+            retention.basis.as_ref().map(ToString::to_string).as_deref(),
+            Some("created_at")
+        );
+        assert!(retention.purge_deleted_after.is_none());
+    }
+
+    #[test]
+    fn retention_purge_deleted_after_requires_soft_delete() {
+        let tokens: proc_macro2::TokenStream = "Post, retention(purge_deleted_after = \"90d\")"
+            .parse()
+            .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("purge_deleted_after without soft_delete must be rejected");
+        };
+        assert!(
+            error.to_string().contains("soft_delete"),
+            "purge_deleted_after without soft_delete must error mentioning soft_delete: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_purge_deleted_after_with_soft_delete_parses() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, soft_delete, retention(purge_deleted_after = \"90d\")"
+                .parse()
+                .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        let retention = config.retention.expect("retention should be parsed");
+        assert_eq!(retention.purge_deleted_after.as_deref(), Some("90d"));
+    }
+
+    #[test]
+    fn retention_after_requires_basis() {
+        let tokens: proc_macro2::TokenStream = "Post, retention(after = \"30d\")".parse().unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("after without basis must be rejected");
+        };
+        assert!(
+            error.to_string().contains("basis"),
+            "after without basis must error mentioning basis: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_requires_after_or_purge_deleted_after() {
+        // Empty `retention()` is a syn nested-meta-list parse error (there is
+        // nothing to iterate), not our own validation — still a compile
+        // error pointing at the empty parens, just not our custom wording.
+        let tokens: proc_macro2::TokenStream = "Post, retention()".parse().unwrap();
+        assert!(
+            parse_repo_args(tokens).is_err(),
+            "empty retention(...) must be rejected"
+        );
+
+        // `retention(batch_size = 10)` alone (no after/purge_deleted_after)
+        // reaches our own validation and must name both real options.
+        let tokens: proc_macro2::TokenStream = "Post, retention(batch_size = 10)".parse().unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("retention(...) with no after/purge_deleted_after must be rejected");
+        };
+        assert!(
+            error.to_string().contains("after")
+                && error.to_string().contains("purge_deleted_after"),
+            "retention(...) missing both options must error naming both: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_duplicate_after() {
+        // Regression (#1342 review round 21, P1): a repeated key used to
+        // silently keep the LAST value with no error —
+        // retention(after = "90d", after = "7d", basis = created_at) would
+        // compile and hard-delete rows after 7 days, not the presumably
+        // intended 90. Since retention(...) controls irreversible
+        // deletion, this must fail loudly instead.
+        let tokens: proc_macro2::TokenStream =
+            "Post, retention(after = \"90d\", after = \"7d\", basis = created_at)"
+                .parse()
+                .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("duplicate `after = ...` must be rejected");
+        };
+        assert!(
+            error.to_string().contains("duplicate") && error.to_string().contains("after"),
+            "the error must mention the duplicate `after` key: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_duplicate_basis() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, retention(after = \"30d\", basis = created_at, basis = updated_at)"
+                .parse()
+                .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("duplicate `basis = ...` must be rejected");
+        };
+        assert!(
+            error.to_string().contains("duplicate") && error.to_string().contains("basis"),
+            "the error must mention the duplicate `basis` key: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_duplicate_purge_deleted_after() {
+        let tokens: proc_macro2::TokenStream = "Post, soft_delete, \
+             retention(purge_deleted_after = \"90d\", purge_deleted_after = \"7d\")"
+            .parse()
+            .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("duplicate `purge_deleted_after = ...` must be rejected");
+        };
+        assert!(
+            error.to_string().contains("duplicate")
+                && error.to_string().contains("purge_deleted_after"),
+            "the error must mention the duplicate `purge_deleted_after` key: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_duplicate_batch_size() {
+        let tokens: proc_macro2::TokenStream = "Post, \
+             retention(after = \"30d\", basis = created_at, batch_size = 10, batch_size = 20)"
+            .parse()
+            .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("duplicate `batch_size = ...` must be rejected");
+        };
+        assert!(
+            error.to_string().contains("duplicate") && error.to_string().contains("batch_size"),
+            "the error must mention the duplicate `batch_size` key: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_duplicate_every() {
+        let tokens: proc_macro2::TokenStream = "Post, \
+             retention(after = \"30d\", basis = created_at, every = \"1h\", every = \"5m\")"
+            .parse()
+            .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("duplicate `every = ...` must be rejected");
+        };
+        assert!(
+            error.to_string().contains("duplicate") && error.to_string().contains("every"),
+            "the error must mention the duplicate `every` key: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_repeated_retention_clause() {
+        // Regression (#1342 review round 22, P1): round 21 caught a
+        // repeated KEY within one retention(...) clause, but repeating the
+        // ENTIRE clause still silently overwrote the first policy with the
+        // second, no error — e.g. retention(after = "90d", basis =
+        // created_at), retention(after = "7d", basis = created_at) would
+        // compile with the seven-day policy despite declaring 90 days
+        // first. Since retention(...) controls irreversible deletion, this
+        // must fail loudly too.
+        let tokens: proc_macro2::TokenStream = "Post, \
+             retention(after = \"90d\", basis = created_at), \
+             retention(after = \"7d\", basis = created_at)"
+            .parse()
+            .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("a repeated retention(...) clause must be rejected");
+        };
+        assert!(
+            error.to_string().contains("duplicate") && error.to_string().contains("retention"),
+            "the error must mention the duplicate retention(...) clause: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_sharded() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, sharded, retention(after = \"30d\", basis = created_at)"
+                .parse()
+                .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("retention + sharded must be rejected");
+        };
+        assert!(
+            error.to_string().contains("sharded"),
+            "retention + sharded must be rejected: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_versioned() {
+        // Regression (#1342 review round 4): the sweep mutates rows
+        // directly and does not run the version-history-writing delete
+        // path delete_by_id/delete_many use, so a swept row would vanish
+        // with no audit record. Reject rather than silently drop history.
+        let tokens: proc_macro2::TokenStream =
+            "Post, versioned = true, retention(after = \"30d\", basis = created_at)"
+                .parse()
+                .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("retention + versioned = true must be rejected");
+        };
+        assert!(
+            error.to_string().contains("versioned"),
+            "retention + versioned = true must be rejected: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_hooks() {
+        // Regression (#1342 review round 5): the sweep mutates rows
+        // directly and does not run the hook-aware delete path
+        // delete_by_id/delete_many use, so a before_delete hook that
+        // rejects deletion (e.g. a published-record guard) cannot protect
+        // a row from the scheduled sweep, and post-delete side effects
+        // never run. Reject rather than silently skip hooks.
+        let tokens: proc_macro2::TokenStream =
+            "Post, hooks = PostHooks, retention(after = \"30d\", basis = created_at)"
+                .parse()
+                .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("retention + hooks = Type must be rejected");
+        };
+        assert!(
+            error.to_string().contains("hooks"),
+            "retention + hooks = Type must be rejected: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_broadcasts() {
+        // Regression (#1342 review round 9): the scaffolded-live broadcast
+        // hook (`broadcasts = true` without an explicit hooks type) is
+        // installed later in repository_macro, past the point where the
+        // retention validation block runs — so `hooks_type.is_some()` alone
+        // doesn't see it. The sweep still mutates rows directly and skips
+        // the inline delete broadcast, leaving realtime subscribers with a
+        // stale record after a sweep. Reject the combination explicitly.
+        let tokens: proc_macro2::TokenStream =
+            "Post, broadcasts = true, retention(after = \"30d\", basis = created_at)"
+                .parse()
+                .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("retention + broadcasts = true must be rejected");
+        };
+        assert!(
+            error.to_string().contains("broadcasts"),
+            "retention + broadcasts = true must be rejected: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_position() {
+        // #2240: the sweep batches many rows into one DELETE/UPDATE statement.
+        // A position-scoped table's per-row compaction trigger only sees its
+        // own pre-statement OLD position, so sweeping several live rows from
+        // the same scope in one statement can leave a gap (same root cause
+        // already fixed for delete_many/update_many). Reject rather than
+        // silently corrupt the ordered sequence.
+        let tokens: proc_macro2::TokenStream =
+            "Post, position, retention(after = \"30d\", basis = created_at)"
+                .parse()
+                .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("retention + position(...) must be rejected");
+        };
+        assert!(
+            error.to_string().contains("position"),
+            "retention + position(...) must be rejected: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_dependent() {
+        // Regression (#1342 review): the sweep mutates rows directly and
+        // does not run the cascade-aware delete path dependent(...)
+        // generates, so it must be rejected rather than silently orphaning
+        // (or leaving active) children.
+        let tokens: proc_macro2::TokenStream =
+            "Post, dependent(PgCommentRepository, fk = \"post_id\", on_delete = destroy), \
+             retention(after = \"30d\", basis = created_at)"
+                .parse()
+                .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("retention + dependent(...) must be rejected");
+        };
+        assert!(
+            error.to_string().contains("dependent"),
+            "retention + dependent(...) must be rejected: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_accepts_batch_size_and_every() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, retention(after = \"30d\", basis = created_at, batch_size = 250, every = \"15m\")"
+                .parse()
+                .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        let retention = config.retention.expect("retention should be parsed");
+        assert_eq!(retention.batch_size, Some(250));
+        assert_eq!(retention.every.as_deref(), Some("15m"));
+    }
+
+    #[test]
+    fn retention_rejects_zero_batch_size() {
+        // batch_size = 0 would SELECT ... LIMIT 0 every run forever: the
+        // sweep reports success with rows_swept = 0 and never deletes
+        // anything, with no error signal (issue #1342 review finding).
+        let tokens: proc_macro2::TokenStream =
+            "Post, retention(after = \"30d\", basis = created_at, batch_size = 0)"
+                .parse()
+                .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("batch_size = 0 must be rejected");
+        };
+        assert!(
+            error.to_string().contains("batch_size"),
+            "batch_size = 0 must error mentioning batch_size: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_deleted_at_as_soft_delete_age_basis() {
+        // Regression (#1342 review round 17): on a soft_delete repository,
+        // the age branch's query always combines `basis < cutoff` with the
+        // generated `deleted_at IS NULL` filter. If `basis = deleted_at`,
+        // SQL's NULL semantics mean no live row (deleted_at IS NULL) can
+        // ever also satisfy `deleted_at < cutoff` — the age sweep silently
+        // sweeps nothing forever, with no error signal.
+        let tokens: proc_macro2::TokenStream =
+            "Post, soft_delete, retention(after = \"30d\", basis = deleted_at)"
+                .parse()
+                .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("basis = deleted_at on a soft_delete repository must be rejected");
+        };
+        assert!(
+            error.to_string().contains("deleted_at"),
+            "the error must mention deleted_at: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_accepts_deleted_at_basis_without_soft_delete() {
+        // `basis = deleted_at` is only a trap on a soft_delete repository —
+        // without soft_delete there is no generated `deleted_at IS NULL`
+        // filter to collide with, and a plain hard-delete table happening
+        // to have its own `deleted_at` column (e.g. from an external
+        // system) is a legitimate age basis.
+        let tokens: proc_macro2::TokenStream =
+            "Post, retention(after = \"30d\", basis = deleted_at)"
+                .parse()
+                .unwrap();
+        assert!(
+            parse_repo_args(tokens).is_ok(),
+            "basis = deleted_at without soft_delete must be accepted"
+        );
+    }
+
+    #[test]
+    fn retention_rejects_batch_size_too_large() {
+        // Regression (#1342 review round 2): batch_size must fit in a
+        // Postgres LIMIT (i64). A value above i64::MAX would wrap to a
+        // negative LIMIT and every sweep query would fail at runtime, with
+        // no signal until the first scheduled tick.
+        let tokens: proc_macro2::TokenStream = format!(
+            "Post, retention(after = \"30d\", basis = created_at, batch_size = {})",
+            i64::MAX as u64 + 1
+        )
+        .parse()
+        .unwrap();
+        let Err(error) = parse_repo_args(tokens) else {
+            panic!("batch_size > i64::MAX must be rejected");
+        };
+        assert!(
+            error.to_string().contains("batch_size"),
+            "batch_size > i64::MAX must error mentioning batch_size: {error}"
+        );
+    }
+
+    #[test]
+    fn retention_accepts_batch_size_at_i64_max() {
+        let tokens: proc_macro2::TokenStream = format!(
+            "Post, retention(after = \"30d\", basis = created_at, batch_size = {})",
+            i64::MAX as u64
+        )
+        .parse()
+        .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(
+            config
+                .retention
+                .expect("retention should be parsed")
+                .batch_size,
+            Some(i64::MAX as u64)
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_task_name_is_table_qualified_not_model_qualified() {
+        // Regression (#1342 review round 2): two models named the same in
+        // different modules would collide on a model-derived task name.
+        // Table names are schema-unique, so the sweep task name must be
+        // derived from `table`, not from the model identifier.
+        let generated = repository_macro(
+            quote! { Post, table = "custom_posts_table", retention(after = "30d", basis = created_at) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("retention-sweep-custom_posts_table"),
+            "task name must be derived from the table name, not the model name: {generated}"
+        );
+        assert!(
+            !generated.contains("retention-sweep-post\""),
+            "task name must not be derived from the model name: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_task_name_preserves_table_case() {
+        // Regression (#1342 review round 6): Postgres allows distinct
+        // quoted tables that differ only in case ("Events" vs "events").
+        // Lowercasing the table name for the task name would collide them
+        // on one coordination lock — the exact bug the table-qualified
+        // task name was introduced to prevent. The table name must be used
+        // verbatim.
+        let generated = repository_macro(
+            quote! { Post, table = "Events", retention(after = "30d", basis = created_at) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("retention-sweep-Events"),
+            "task name must preserve the table name's original case: {generated}"
+        );
+        assert!(
+            !generated.contains("retention-sweep-events"),
+            "task name must not be lowercased: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_uses_boxed_query_with_optional_cursor() {
+        // Regression (#1342 review round 2): the sweep must page with an
+        // Option<i64> cursor (None on the first page, Some(id) afterward)
+        // rather than a sentinel floor like i64::MIN, which would silently
+        // exclude a row whose id is exactly i64::MIN. into_boxed() is what
+        // lets the cursor filter be applied conditionally.
+        let generated = repository_macro(
+            quote! { Post, retention(after = "30d", basis = created_at) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("into_boxed"),
+            "sweep query must use into_boxed() to conditionally apply the cursor filter: {generated}"
+        );
+        assert!(
+            !generated.contains("i64 :: MIN"),
+            "sweep must not use an i64::MIN sentinel cursor: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_maintains_counter_cache_before_mutating() {
+        // A counter-cached model swept by `retention(...)` must move its parent's
+        // counter, mirroring `delete_many`'s `cc_before_delete_chunk`. Every mutation
+        // site — the age branch's soft-delete UPDATE and the purge branch's hard
+        // DELETE — must call `counter_cache_before_delete_many` before applying the
+        // mutation. Scoped to the retention_run section via `generated_fn`, the helper
+        // the #1325 counter-cache tests use, so this does not just count the base CRUD
+        // trait's unrelated `delete_many` occurrences of the same name (#1342).
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let retention_run = generated_fn(&generated, "async fn __autumn_retention_run");
+        assert_eq!(
+            retention_run
+                .matches("counter_cache_before_delete_many")
+                .count(),
+            // Three call sites, not two: the age branch's mutation is
+            // spliced into both the primary pass and the round-13 reclaim
+            // pass (which shares the same apply_stmt fragment), plus the
+            // purge branch's own single call site.
+            3,
+            "the age branch's primary pass, its round-13 reclaim pass, and the purge \
+             (hard-delete) branch must all call counter_cache_before_delete_many: \
+             {retention_run}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_counter_cache_uses_immediate_transaction() {
+        // On SQLite, `maybe_for_update!` degrades to a plain read, so a deferred
+        // `scoped_transaction` would not take a write lock until the first write,
+        // leaving a window for a concurrent writer to commit between the locked-ids
+        // SELECT and that write — which SQLite reports as `SQLITE_BUSY_SNAPSHOT`
+        // rather than waiting on the busy timeout. Every counter-cache sweep
+        // transaction must use `scoped_immediate_transaction` instead, matching every
+        // other generated read-then-write mutation path (#1342).
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let retention_run = generated_fn(&generated, "async fn __autumn_retention_run");
+        assert_eq!(
+            retention_run
+                .matches("scoped_immediate_transaction")
+                .count(),
+            // Three call sites, not two: the age branch's mutation is
+            // spliced into both the primary pass and the round-13 reclaim
+            // pass (which shares the same apply_stmt fragment), plus the
+            // purge branch's own single call site.
+            3,
+            "the age branch's primary pass, its round-13 reclaim pass, and the purge \
+             (hard-delete) branch must all use scoped_immediate_transaction: {retention_run}"
+        );
+        assert!(
+            !retention_run.contains("scoped_transaction ::"),
+            "counter-cache sweep transactions must not use the deferred \
+             scoped_transaction: {retention_run}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_counter_cache_locks_ordered_by_id() {
+        // On Postgres a counter-cached sweep's `FOR UPDATE` lock query raced a
+        // concurrent `delete_many` locking an overlapping batch of the same children.
+        // `delete_many`'s own `counter_cache_before_delete_many` locks ascending by id
+        // to avoid a deadlock, but that only helps if every locker does the same:
+        // without an explicit `order()` here too, the two transactions could take the
+        // same rows in opposite orders and one would be aborted. Applies to all three
+        // mutation sites — age soft-delete, age hard-delete, purge hard-delete (#1342).
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let retention_run = generated_fn(&generated, "async fn __autumn_retention_run");
+
+        // Distinguishes the FOR UPDATE lock queries from the unrelated
+        // (and already-ordered) batch-select queries: the lock queries end
+        // `.select(id))` — the extra `)` closing `maybe_for_update!(...)`
+        // — immediately followed by `.load`, whereas the batch-select
+        // queries continue with `.limit(...)` first.
+        assert_eq!(
+            retention_run
+                .matches("id . asc ()) . select (posts :: id)) . load")
+                .count(),
+            3,
+            "each of the three FOR UPDATE lock queries (age primary pass, age reclaim pass, \
+             purge) must order by id ascending before locking: {retention_run}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_mutations_serialize_self_reference_before_any_row_lock() {
+        // A counter-cache hook takes the per-table advisory lock that serializes
+        // mutations on a self-referential table, but the delete family row-locks
+        // before its hook runs: the hooked delete loads the row `FOR UPDATE` for
+        // `before_delete`, `delete_many` preloads its rows, and a retention sweep
+        // locks its batch. Each of those transactions therefore takes the lock
+        // first, or two of them holding each other's parent row deadlock on the
+        // way to it (Codex review, PR #2632).
+        let serialize = "counter_cache_serialize_self_referential";
+
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let retention_run = generated_fn(&generated, "async fn __autumn_retention_run");
+        let mut rest = retention_run;
+        let mut locks = 0;
+        while let Some(lock) = rest.find("let __locked_ids") {
+            let taken = rest[..lock]
+                .rfind(serialize)
+                .expect("every retention lock query is preceded by the serialization lock");
+            assert!(
+                !rest[taken..lock].contains("maybe_for_update !"),
+                "the serialization lock must come before the batch lock, not after: {retention_run}"
+            );
+            rest = &rest[lock + "let __locked_ids".len()..];
+            locks += 1;
+        }
+        assert_eq!(locks, 3, "three retention lock sites: {retention_run}");
+
+        // The hooked delete loads the row `FOR UPDATE` for `before_delete`, and
+        // the hooked `delete_many` preloads its rows the same way.
+        let hooked = durable_hook_repository_tokens();
+        for signature in ["async fn delete_by_id", "async fn delete_many"] {
+            let body = generated_fn(&hooked, signature);
+            let taken = body
+                .find(serialize)
+                .unwrap_or_else(|| panic!("{signature} takes the serialization lock: {body}"));
+            let lock = body
+                .find("maybe_for_update !")
+                .unwrap_or_else(|| panic!("{signature} row-locks: {body}"));
+            assert!(
+                taken < lock,
+                "{signature} must take the serialization lock before its first row lock: {body}"
+            );
+        }
+        // An inserted row is locked to a foreign-key check from the moment it
+        // is inserted, so a save takes the lock before its insert, with and
+        // without hooks.
+        let plain =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        for (label, generated) in [("hooked", &hooked), ("plain", &plain)] {
+            for signature in ["async fn save (", "async fn save_many ("] {
+                let body = generated_fn(generated, signature);
+                let taken = body.find(serialize).unwrap_or_else(|| {
+                    panic!("{label} {signature} takes the serialization lock: {body}")
+                });
+                let insert = body
+                    .find("insert_into")
+                    .unwrap_or_else(|| panic!("{label} {signature} inserts: {body}"));
+                assert!(
+                    taken < insert,
+                    "{label} {signature} must take the serialization lock before its insert: {body}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repository_without_retention_has_no_retention_spec() {
+        let tokens: proc_macro2::TokenStream = "Post".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(config.retention.is_none());
+    }
+
+    #[test]
+    fn repository_macro_retention_report_carries_table_identity() {
+        // Regression (#1342 review round 5): descriptor filtering was
+        // disambiguated by table (round 4), but the generated report still
+        // only carried `model` — an unfiltered dry run on two same-named
+        // models would print indistinguishable rows and merge their
+        // metrics. The report (and the metrics label) must carry `table`
+        // too.
+        let generated = repository_macro(
+            quote! { Post, table = "custom_posts_table", retention(after = "30d", basis = created_at) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("table : \"custom_posts_table\" . to_string ()"),
+            "generated RetentionSweepReport must carry the table name: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_generates_sweep_and_task_info() {
+        let generated = repository_macro(
+            quote! { Post, retention(after = "30d", basis = created_at) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("__autumn_retention_sweep"),
+            "retention(...) must generate a sweep method: {generated}"
+        );
+        assert!(
+            generated.contains("__autumn_retention_dry_run"),
+            "retention(...) must generate a dry-run method: {generated}"
+        );
+        assert!(
+            generated.contains("RetentionSweepDescriptor"),
+            "retention(...) must register an inventory descriptor: {generated}"
+        );
+        assert!(
+            generated.contains("TaskCoordination :: Fleet"),
+            "retention sweeps must use fleet coordination for multi-replica safety: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_validates_after_duration_inside_task_info_builder() {
+        // Regression (#1342 review): `after`/`purge_deleted_after` must be
+        // validated eagerly at task-registration time (inside
+        // __autumn_retention_task_info, which collect_retention_tasks()
+        // calls at boot) — matching `every` — rather than lazily inside
+        // __autumn_retention_run, where a typo'd duration would only panic
+        // on the sweep's first scheduled tick.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let task_info_start = generated
+            .find("fn __autumn_retention_task_info")
+            .expect("task_info builder present");
+        let task_info_region =
+            &generated[task_info_start..(task_info_start + 5000).min(generated.len())];
+
+        assert!(
+            task_info_region.matches("parse_duration").count() >= 3,
+            "task_info builder must validate `after`, `purge_deleted_after`, AND `every` \
+             up front (three parse_duration calls): {task_info_region}"
+        );
+        assert!(
+            task_info_region.contains("\"30d\""),
+            "task_info builder must validate the `after` duration string: {task_info_region}"
+        );
+        assert!(
+            task_info_region.contains("\"90d\""),
+            "task_info builder must validate the `purge_deleted_after` duration string: {task_info_region}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_validates_chrono_cutoff_range_at_boot() {
+        // Regression (#1342 review round 15): `parse_duration` only
+        // validates that a duration string parses to a `std::time::Duration`
+        // — a value that parses fine there (e.g. a huge second count like
+        // "18446744073709551615s") can still overflow `chrono::Duration`'s
+        // range, which the sweep loop converts to in order to compute the
+        // cutoff. Before this fix, that class of error only panicked on the
+        // sweep's first scheduled tick; the task_info builder must also run
+        // the `chrono::Duration::from_std` conversion up front.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let task_info_start = generated
+            .find("fn __autumn_retention_task_info")
+            .expect("task_info builder present");
+        let task_info_region =
+            &generated[task_info_start..(task_info_start + 5000).min(generated.len())];
+
+        assert!(
+            task_info_region
+                .matches("chrono :: Duration :: from_std")
+                .count()
+                >= 2,
+            "task_info builder must validate both `after` and `purge_deleted_after` convert to \
+             a chrono::Duration up front (two from_std calls): {task_info_region}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_validates_cutoff_arithmetic_at_boot() {
+        // Regression (#1342 review round 16): fitting `chrono::Duration`'s
+        // range (round 15's fix) doesn't mean subtracting it from a clock
+        // reading stays inside `NaiveDateTime`'s representable range — e.g.
+        // `after = "100000000d"` (~274,000 years) still panics the sweep's
+        // first scheduled tick at `now - duration`. The task_info builder
+        // must also perform the checked cutoff subtraction against the real
+        // wall clock up front, for both `after` and `purge_deleted_after`.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let task_info_start = generated
+            .find("fn __autumn_retention_task_info")
+            .expect("task_info builder present");
+        let task_info_region =
+            &generated[task_info_start..(task_info_start + 5000).min(generated.len())];
+
+        assert!(
+            task_info_region.matches("checked_sub_signed").count() >= 2,
+            "task_info builder must validate checked cutoff arithmetic for both `after` and \
+             `purge_deleted_after` up front: {task_info_region}"
+        );
+        assert!(
+            task_info_region.contains("chrono :: Utc :: now"),
+            "boot-time cutoff validation must use the real wall clock, since task_info() has \
+             no state/ClockSource parameter: {task_info_region}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_runtime_cutoff_uses_checked_subtraction() {
+        // Regression (#1342 review round 16): the sweep loop computed the
+        // cutoff with plain `-`, which panics on overflow. A boot-validated
+        // duration doesn't guarantee this stays safe against every possible
+        // clock reading (e.g. a custom/test clock near NaiveDateTime::MIN),
+        // so the runtime computation must also use checked subtraction, not
+        // just boot-time validation against the wall clock.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let retention_run = generated_fn(&generated, "async fn __autumn_retention_run");
+
+        assert!(
+            retention_run.matches("checked_sub_signed").count() >= 2,
+            "the age and purge branches must both compute their cutoff with checked \
+             subtraction, not plain `-`: {retention_run}"
+        );
+        assert!(
+            !retention_run.contains(". naive_utc () - __age_chrono")
+                && !retention_run.contains(". naive_utc () - __purge_chrono"),
+            "the runtime cutoff computation must not use plain `-`, which panics on overflow: \
+             {retention_run}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_logs_partial_sweep_before_propagating_error() {
+        // Regression (#1342 review round 16): each batch commits
+        // independently (no transaction spans the whole run), so a mid-run
+        // failure still leaves earlier batches' mutations committed. Before
+        // this fix, a bare `?` inside the age/purge loops returned straight
+        // out of __autumn_retention_run, skipping the report construction
+        // entirely — so log_retention_sweep (which bumps
+        // retention_sweep_rows_total) never saw the partial rows_swept, and
+        // no structured report recorded the partial work.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let retention_run = generated_fn(&generated, "async fn __autumn_retention_run");
+
+        assert!(
+            retention_run.contains("__sweep_result"),
+            "the sweep's Result must be captured rather than propagated with a bare `?`, so \
+             partial progress can still be logged: {retention_run}"
+        );
+        assert!(
+            retention_run.contains("log_retention_sweep (& report)"),
+            "the error path must call log_retention_sweep with the partial report before \
+             propagating: {retention_run}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_rejects_model_declared_dependents_at_boot() {
+        // `parse_repo_args`'s `dependents.is_empty()` check sees only
+        // repository-attribute `dependent(...)`. It cannot see a model-declared
+        // `#[has_many(..., dependent = ...)]` or `#[has_one(...)]`, resolved only at
+        // runtime via `Model::dependents()` from the separate `#[model]` invocation.
+        // The generated `task_info` builder must assert that runtime slice is empty at
+        // boot, for the same reason the compile-time rejection exists: the sweep
+        // mutates rows directly and never drives the cascade-aware delete path
+        // `Model::dependents()` feeds (#1342).
+        let generated = repository_macro(
+            quote! { Post, retention(after = "30d", basis = created_at) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let task_info_start = generated
+            .find("fn __autumn_retention_task_info")
+            .expect("task_info builder present");
+        let task_info_region =
+            &generated[task_info_start..(task_info_start + 4000).min(generated.len())];
+
+        assert!(
+            task_info_region.contains("AutumnDependents")
+                && task_info_region.contains("dependents"),
+            "task_info builder must assert Model::dependents() is empty at boot: {task_info_region}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_rejects_oversized_batch_for_bind_limit_at_boot() {
+        // Regression (#1342 review round 11): parse_repo_args only rejects
+        // batch_size values that overflow i64 (the Postgres LIMIT bound).
+        // Whether SQLite's much lower MAX_BIND_PARAMS (32766) applies
+        // depends on the *consuming* crate's active backend feature, which
+        // this proc macro can't see — so the check has to be a boot-time
+        // assert against `autumn_web::repository::MAX_BIND_PARAMS` (a
+        // per-backend const resolved in the consuming crate), not a
+        // compile-time syn::Error here.
+        let generated = repository_macro(
+            quote! { Post, retention(after = "30d", basis = created_at, batch_size = 50000) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let task_info_start = generated
+            .find("fn __autumn_retention_task_info")
+            .expect("task_info builder present");
+        let task_info_region =
+            &generated[task_info_start..(task_info_start + 4000).min(generated.len())];
+
+        assert!(
+            task_info_region.contains("MAX_BIND_PARAMS") && task_info_region.contains("50000"),
+            "task_info builder must assert batch_size fits under MAX_BIND_PARAMS at boot: \
+             {task_info_region}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_purge_borrows_unused_age_batch_capacity() {
+        // Regression (#1342 review round 11): a fixed 50/50 split between
+        // the age and purge phases wasted budget whenever one phase's
+        // backlog was small — e.g. one stale live row plus a 600-batch
+        // purge backlog used to cap purge at exactly half the budget even
+        // though the age phase left hundreds of batches unused. The purge
+        // phase's cap must now be computed at runtime as the total budget
+        // minus however many batches the age phase actually used, not a
+        // macro-time literal half-share.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("saturating_sub (__age_batches)"),
+            "purge phase must borrow the age phase's unused batch capacity at runtime: \
+             {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_age_reclaims_unused_purge_batch_capacity() {
+        // Round 11 let only the purge phase borrow the age phase's unused capacity.
+        // The reverse — a large age backlog with a small or empty purge backlog — was
+        // still capped at a fixed half-budget for age, with no way to reclaim what
+        // purge left unused. Age's reclaim pass must be generated: gated on whether
+        // the primary pass hit its cap (`__age_capped`), sized from the budget minus
+        // purge's actual usage (`__purge_batches_used`), and resuming from the shared
+        // cursor and counter state the primary pass left behind (#1342).
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("if __age_capped")
+                && generated.contains("saturating_sub (__purge_batches_used)")
+                && generated.contains("__age_last_id")
+                && generated.contains("__age_batches"),
+            "age phase must be able to reclaim the purge phase's unused batch capacity, \
+             resuming from its own cursor: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_retention_single_branch_has_no_batch_borrowing_scaffolding() {
+        // A single-branch policy (only `after`, no `purge_deleted_after`)
+        // has nothing to borrow from or share with, so none of the
+        // bidirectional borrowing plumbing (#1342 review rounds 11 and 13)
+        // should be generated — it would be dead code and, since it's only
+        // ever written inside an absent purge block, an unused-variable
+        // warning under `-D warnings`.
+        let generated = repository_macro(
+            quote! { Post, retention(after = "30d", basis = created_at) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("__age_capped")
+                && !generated.contains("__purge_batches_used")
+                && !generated.contains("saturating_sub"),
+            "single-branch retention must not generate unused batch-borrowing scaffolding: \
+             {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_purge_delete_rechecks_deleted_at_at_delete_time() {
+        // The purge branch's DELETE must re-check `deleted_at < cutoff`, not just
+        // `id`, so a row concurrently `restore()`d between the SELECT and this DELETE
+        // survives instead of being purged out from under the restore. Before the fix
+        // `deleted_at . lt` appeared exactly once in the generated code, in the
+        // SELECT's WHERE clause; after it appears twice — in the SELECT and as the
+        // DELETE's second `.filter(...)` (#1342).
+        let generated = repository_macro(
+            quote! { Post, soft_delete, retention(purge_deleted_after = "90d") },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("diesel :: delete"),
+            "purge_deleted_after must generate a DELETE: {generated}"
+        );
+
+        // Isolate the sweep-runner body: a soft_delete repository also
+        // generates restore()/purge()/only_deleted() and soft-delete-aware
+        // finder filters elsewhere, which reference `deleted_at` many times
+        // and would make a whole-output count meaningless.
+        let run_start = generated
+            .find("fn __autumn_retention_run")
+            .expect("__autumn_retention_run present");
+        let run_region = &generated[run_start..(run_start + 4000).min(generated.len())];
+
+        let deleted_at_count = run_region.matches("deleted_at").count();
+        assert!(
+            deleted_at_count >= 2,
+            "the sweep body must reference deleted_at in both the SELECT and the DELETE's \
+             re-check filter (found {deleted_at_count} time(s) in the sweep body): {run_region}"
+        );
+        // `__applied` proves the DELETE's actual affected-row count (not the
+        // SELECT's candidate count) is what's added to rows_swept, so a row
+        // excluded by the re-check filter isn't over-reported as swept.
+        assert!(
+            run_region.contains("__applied"),
+            "rows_swept must be driven by the statement's actual affected-row count: {run_region}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_without_retention_generates_no_sweep() {
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+
+        assert!(
+            !generated.contains("__autumn_retention_sweep"),
+            "a repository with no retention(...) must not generate a sweep method: {generated}"
+        );
+        assert!(
+            !generated.contains("RetentionSweepDescriptor"),
+            "a repository with no retention(...) must not register a descriptor: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_soft_delete_retention_age_based_soft_deletes() {
+        // Age-based retention on a soft-delete model must SET deleted_at, not
+        // hard-delete: AC "soft-delete-aware" (issue #1342).
+        let generated = repository_macro(
+            quote! { Post, soft_delete, retention(after = "30d", basis = created_at) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("__autumn_retention_sweep"),
+            "retention(...) must generate a sweep method: {generated}"
+        );
+        // The generated sweep body must reference deleted_at (soft-delete path).
+        let sweep_start = generated
+            .find("__autumn_retention_sweep")
+            .expect("sweep method present");
+        let sweep_region = &generated[sweep_start..(sweep_start + 4000).min(generated.len())];
+        assert!(
+            sweep_region.contains("deleted_at"),
+            "soft-delete age-based sweep must reference deleted_at: {sweep_region}"
+        );
+    }
+
+    // ── Ledgered entities (issue #1699) ──────────────────────────────
+
+    #[test]
+    fn ledgered_implies_versioned() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, soft_delete, ledgered = true".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(config.ledgered, "ledgered = true must set the flag");
+        assert!(
+            config.versioned,
+            "ledgered must imply versioned so the write paths append revisions"
+        );
+    }
+
+    #[test]
+    fn ledgered_accepts_the_bare_marker() {
+        let tokens: proc_macro2::TokenStream = "Post, soft_delete, ledgered".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(config.ledgered);
+        assert!(config.versioned);
+    }
+
+    #[test]
+    fn ledgered_requires_soft_delete() {
+        let tokens: proc_macro2::TokenStream = "Post, ledgered = true".parse().unwrap();
+        let msg = parse_repo_args(tokens)
+            .err()
+            .expect("ledgered without soft_delete must be rejected")
+            .to_string();
+        assert!(
+            msg.contains("soft_delete"),
+            "the diagnostic must name soft_delete: {msg}"
+        );
+        assert!(
+            msg.contains("hard"),
+            "the diagnostic must explain that a hard delete erases ledgered history: {msg}"
+        );
+    }
+
+    #[test]
+    fn ledgered_rejects_no_versioned_record_impl() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, soft_delete, ledgered = true, no_versioned_record_impl"
+                .parse()
+                .unwrap();
+        let msg = parse_repo_args(tokens)
+            .err()
+            .expect("ledgered needs the generated record impl")
+            .to_string();
+        assert!(msg.contains("no_versioned_record_impl"), "{msg}");
+    }
+
+    #[test]
+    fn ledgered_parses_a_valid_time_column() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, soft_delete, ledgered(valid_time = \"effective_at\")"
+                .parse()
+                .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(config.ledgered);
+        assert_eq!(config.ledger_valid_time.as_deref(), Some("effective_at"));
+    }
+
+    #[test]
+    fn ledgered_defaults_valid_time_to_transaction_time() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, soft_delete, ledgered = true".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.ledger_valid_time, None);
+    }
+
+    #[test]
+    fn repository_macro_ledgered_omits_purge() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("fn purge"),
+            "a ledgered repository must not expose the hard-delete escape hatch: {generated}"
+        );
+        assert!(
+            generated.contains("fn restore"),
+            "a ledgered repository keeps the soft-delete surface: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_ledgered_writes_revisions_on_every_write_path() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("ledger :: append_revision"),
+            "a ledgered repository must append revisions: {generated}"
+        );
+        // Parity, not a floor: the ledger append is emitted from the same token
+        // builder as the version-history write, so every history write site must
+        // carry exactly one ledger append. A `>= 2` check would pass with 27 of
+        // 28 write paths silently unledgered.
+        let ledger_appends = generated.matches("ledger :: append_revision").count();
+        let history_appends = generated
+            .matches("version_history :: append_version_history")
+            .count();
+        assert_eq!(
+            ledger_appends, history_appends,
+            "every version-history write site must also append a ledger revision \
+             ({ledger_appends} ledger vs {history_appends} history)"
+        );
+        assert!(history_appends > 0, "sanity: history writes are emitted");
+        // What each append then does — read the database clock, the chain head, and
+        // the high-water mark in one statement, allocate past the greater of head and
+        // mark, insert the revision, and raise the mark in the same transaction
+        // (#2323) — is no longer something this macro can get wrong per write path.
+        // It is one runtime function, `ledger::append_revision`, covered by that
+        // module's own tests. This macro's remaining obligation is the one asserted
+        // above: that no write path skips it. The call must also carry the model-side
+        // inputs the runtime cannot derive on its own.
+        for field in [
+            "table_name : \"posts\"",
+            "record_id : __lg_record_id",
+            "tenant_id : __lg_tenant_id",
+            "snapshot : __lg_snapshot",
+            "valid_from : __lg_valid_from",
+        ] {
+            assert!(
+                generated.contains(field),
+                "the ledger append must pass `{field}`: {generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_macro_ledgered_restore_records_the_undelete() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // `restore` is the inverse of a ledgered delete, so it must append a
+        // revision — otherwise as-of reports a deleted row that the table shows
+        // as live, permanently, with `ledger_verify` none the wiser.
+        let restore_body = generated_fn(&generated, "async fn restore");
+        assert!(
+            restore_body.contains("ledger :: append_revision"),
+            "a ledgered restore must append a revision: {restore_body}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_unledgered_restore_is_unchanged() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete, versioned = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let restore_body = generated_fn(&generated, "async fn restore");
+        assert!(
+            !restore_body.contains("_autumn_ledger_revisions"),
+            "an unledgered restore must be byte-for-byte as before: {restore_body}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_ledgered_generates_the_query_surface() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        for method in [
+            "ledger_revisions",
+            "ledger_as_of",
+            "ledger_as_of_at",
+            "ledger_diff",
+            "ledger_verify",
+            "ledger_head",
+            "ledger_high_water",
+            "ledger_pin",
+        ] {
+            assert!(
+                generated.contains(method),
+                "a ledgered repository must generate {method}(): {generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_macro_ledgered_generates_the_record_impl() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("impl :: autumn_web :: ledger :: LedgeredRecord for Post"),
+            "a ledgered repository must implement LedgeredRecord for the model: {generated}"
+        );
+        assert!(
+            !generated.contains("fn ledger_valid_from"),
+            "without valid_time = \"...\" the model takes the default \
+             (valid time == transaction time): {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_ledgered_valid_time_reads_the_declared_column() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete, ledgered(valid_time = "effective_at") },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("fn ledger_valid_from"),
+            "valid_time = \"...\" must override the default: {generated}"
+        );
+        assert!(
+            generated.contains("self . effective_at"),
+            "the override must read the declared column: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_ledgered_soft_delete_records_a_delete_revision() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // The soft-delete write path must reach the ledger too: a delete is a
+        // revision, not an absence of one. Match the `op:` field of the hash
+        // input specifically — the bare `VersionOp :: Delete` token is also
+        // emitted by the version-history row mapper, which every `versioned`
+        // repository generates, so asserting on it would pass with the entire
+        // ledger delete path removed.
+        assert!(
+            generated.contains("op : :: autumn_web :: version_history :: VersionOp :: Delete"),
+            "a ledgered soft-delete must hash a delete revision: {generated}"
+        );
+        // And the snapshot it hashes must be the post-delete state: version
+        // history's delete entry records the pre-delete load, which would make
+        // as-of after a delete report `deleted_at: null`.
+        assert!(
+            generated.contains("\"deleted_at\" . to_string ()"),
+            "a ledgered delete revision must snapshot the stored deleted_at: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_ledgered_rejects_sensitive_columns() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! {
+                #[version_history(sensitive = ["secret"])]
+                pub trait PostRepository {}
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "redacting a column on a ledgered entity must not compile: {generated}"
+        );
+        assert!(
+            generated.contains("sensitive"),
+            "the diagnostic must name the offending option: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_versioned_alone_emits_no_ledger_tokens() {
+        let generated = repository_macro(
+            quote! { Post, versioned = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("_autumn_ledger_revisions"),
+            "an unledgered versioned repository must be byte-for-byte unaffected: {generated}"
+        );
+        assert!(
+            !generated.contains("ledger_as_of"),
+            "an unledgered versioned repository gains no ledger surface: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_plain_repository_emits_no_ledger_tokens() {
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+
+        assert!(
+            !generated.contains("_autumn_ledger_revisions"),
+            "{generated}"
+        );
+        assert!(!generated.contains("LedgeredRecord"), "{generated}");
+    }
+
+    /// Expansion-size budget for `#[repository]` (issue #2309 follow-up).
+    ///
+    /// The generated source a repository contributes to its crate is a real,
+    /// measurable build cost — `#[repository]` costs roughly three times what
+    /// `#[model]` does in a release build, and autumn's own consolidated
+    /// `integration_tests` binary compiles 60 of them. Before the write paths
+    /// were hoisted into `autumn_web::{version_history, ledger, repository}`, a
+    /// `ledgered` repository expanded to just over 500 KB of Rust, because the
+    /// whole ledger append — two `QueryableByName` derives and a chain-state
+    /// struct included — was re-emitted at each of `vh_insert_ts`'s ~30 call
+    /// sites.
+    ///
+    /// These ceilings are deliberately loose (roughly 15% of headroom over the
+    /// measured sizes): the point is to catch a *structural* regression — a
+    /// statement inlined back into a per-call-site fragment — not to force an
+    /// edit for every added method. Raise a number when the growth is
+    /// understood and intended; do not raise it to make a red build green.
+    #[test]
+    fn repository_expansion_stays_within_budget() {
+        // (label, attribute args, ceiling in bytes of `TokenStream::to_string`)
+        let budgets: Vec<(&str, proc_macro2::TokenStream, usize)> = vec![
+            ("plain", quote! { Post }, 80_000),
+            ("soft_delete", quote! { Post, soft_delete }, 89_000),
+            ("tenant_scoped", quote! { Post, tenant_scoped }, 103_000),
+            ("api", quote! { Post, api = "/posts" }, 95_000),
+            ("searchable", quote! { Post, searchable }, 98_000),
+            ("versioned", quote! { Post, versioned = true }, 128_000),
+            // Raised from 201_000 (#2490): `ledger_as_of_at`/`ledger_diff_at`
+            // moved off a full-chain `ledger_revisions` read onto two new
+            // bounded-lookup methods (`__autumn_ledger_revision_at`,
+            // `__autumn_ledger_diff_revisions_at` — each carries its own
+            // `QueryableByName` row struct per backend arm), so the ledgered
+            // case grew from ~180 KB to 203,169 bytes. Understood and
+            // intended; ~15% headroom kept over the new measured size.
+            ("ledgered", quote! { Post, ledgered, soft_delete }, 234_000),
+        ];
+
+        for (label, attr, ceiling) in budgets {
+            let generated =
+                repository_macro(attr, quote! { pub trait PostRepository {} }).to_string();
+            assert!(
+                !generated.contains("compile_error"),
+                "the `{label}` budget case must expand cleanly: {generated}"
+            );
+            assert!(
+                generated.len() <= ceiling,
+                "`{label}` expands to {} bytes, over its {ceiling}-byte budget. Something \
+                 that used to be one runtime call is being emitted per call site again — \
+                 see `vh_insert_ts` / `ledger_append_ts` / the `dependent(...)` cascade \
+                 arms. Raise the ceiling only if the growth is understood and intended.",
+                generated.len(),
+            );
+        }
+    }
+
+    #[test]
+    fn repository_macro_positioned_upsert_many_forces_single_row_chunks() {
+        // #2240: `upsert_many` sends one `INSERT ... ON CONFLICT DO UPDATE`
+        // per chunk (up to 1000 rows). If the changeset reassigns a scoped
+        // `position` field, several same-scope rows can be rescoped in one
+        // statement -- each row's compaction trigger only sees its own
+        // pre-statement OLD position, so ranks can end up gapped or
+        // duplicated (same root cause already fixed for update_many's scope
+        // reassignment). Cap the chunk size at 1 whenever `position(...)` is
+        // declared.
+        let generated = repository_macro(
+            quote! { Post, position },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let anchor = generated
+            .find("AutumnUpsertExecutionExt")
+            .expect("upsert_many must still be generated for a position(...) repository");
+        let chunk_def_pos = generated[anchor..]
+            .find("let chunk_size")
+            .expect("upsert_many must set chunk_size")
+            + anchor;
+        let chunk_def = &generated[chunk_def_pos..chunk_def_pos + 60];
+        assert!(
+            chunk_def.contains(": usize = 1 ;"),
+            "position(...) must force upsert_many chunk size to a plain 1 row constant: {chunk_def}"
+        );
+        assert!(
+            !chunk_def.contains("1000"),
+            "position(...) must not leave a 1000-row upsert chunk cap in place: {chunk_def}"
+        );
+        let upsert_body_window = &generated[anchor..(anchor + 4000).min(generated.len())];
+        assert!(
+            !upsert_body_window.contains("__autumn_column_count"),
+            "position(...) must skip the bind-param-based chunk cap entirely, not just cap it \
+             at 1 -- clippy's min_max lint flags a `.min(1).max(1)` chain as dead code: \
+             {upsert_body_window}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_non_positioned_upsert_many_keeps_bulk_chunk_cap() {
+        // Sibling of the test above: a repository without `position(...)`
+        // must keep the original 1000-row chunk cap, i.e. this fix must not
+        // regress bulk upsert throughput for ordinary repositories.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let anchor = generated
+            .find("AutumnUpsertExecutionExt")
+            .expect("upsert_many must be generated");
+        let chunk_def_pos = generated[anchor..]
+            .find("let chunk_size = if cols")
+            .expect("upsert_many must compute chunk_size from cols")
+            + anchor;
+        let chunk_def = &generated[chunk_def_pos..chunk_def_pos + 160];
+        assert!(
+            chunk_def.contains("1000"),
+            "a non-position repository must keep the bulk 1000-row upsert chunk cap: {chunk_def}"
         );
     }
 }

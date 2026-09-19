@@ -1,0 +1,80 @@
+From: a@b.example
+Subject: nest
+Content-Type: multipart/mixed; boundary="b0"
+
+--b0
+Content-Type: multipart/mixed; boundary="b1"
+
+--b1
+Content-Type: multipart/mixed; boundary="b2"
+
+--b2
+Content-Type: multipart/mixed; boundary="b3"
+
+--b3
+Content-Type: multipart/mixed; boundary="b4"
+
+--b4
+Content-Type: multipart/mixed; boundary="b5"
+
+--b5
+Content-Type: multipart/mixed; boundary="b6"
+
+--b6
+Content-Type: multipart/mixed; boundary="b7"
+
+--b7
+Content-Type: multipart/mixed; boundary="b8"
+
+--b8
+Content-Type: multipart/mixed; boundary="b9"
+
+--b9
+Content-Type: multipart/mixed; boundary="b10"
+
+--b10
+Content-Type: multipart/mixed; boundary="b11"
+
+--b11
+Content-Type: multipart/mixed; boundary="b12"
+
+--b12
+Content-Type: multipart/mixed; boundary="b13"
+
+--b13
+Content-Type: multipart/mixed; boundary="b14"
+
+--b14
+Content-Type: multipart/mixed; boundary="b15"
+
+--b15
+Content-Type: multipart/mixed; boundary="b16"
+
+--b16
+Content-Type: multipart/mixed; boundary="b17"
+
+--b17
+Content-Type: multipart/mixed; boundary="b18"
+
+--b18
+Content-Type: multipart/mixed; boundary="b19"
+
+--b19
+Content-Type: multipart/mixed; boundary="b20"
+
+--b20
+Content-Type: multipart/mixed; boundary="b21"
+
+--b21
+Content-Type: multipart/mixed; boundary="b22"
+
+--b22
+Content-Type: multipart/mixed; boundary="b23"
+
+--b23
+Content-Type: multipart/mixed; boundary="b24"
+
+--b24
+Content-Type: text/plain
+
+innermost

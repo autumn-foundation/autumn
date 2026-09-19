@@ -15,7 +15,7 @@ Enable both the `storage` and `variants` features on `autumn-web`:
 
 ```toml
 [dependencies]
-autumn-web = { version = "0.5", features = ["storage", "multipart", "variants"] }
+autumn-web = { version = "0.7", features = ["storage", "multipart", "variants"] }
 ```
 
 The `variants` feature pulls in the `image` crate (JPEG, PNG, WebP codecs)

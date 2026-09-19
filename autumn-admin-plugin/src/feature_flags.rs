@@ -14,6 +14,14 @@ use crate::{
 
 /// Admin panel model for feature flags.
 ///
+/// # Postgres only
+///
+/// This model reads and writes `autumn_feature_flags`. That table is Postgres-only.
+/// Its SQL uses `ILIKE`, `::type` casts and writable CTEs, which `SQLite` does
+/// not have. On `SQLite` every method refuses with an error that names this
+/// model. The plugin core is backend-agnostic: register your own
+/// [`AdminModel`](crate::AdminModel)s there instead. See the crate README.
+///
 /// Register this model with the admin plugin to get a flag management UI
 /// at `/admin/feature-flags/`:
 ///
@@ -117,22 +125,14 @@ impl AdminModel for FeatureFlagAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("FeatureFlagAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
                 .map_err(|e| AdminError::Database(e.to_string()))?;
 
             let per_page = params.per_page;
-            let offset = if per_page == 0 {
-                0
-            } else {
-                params.page.saturating_sub(1) * per_page
-            };
-            let limit = if per_page == 0 {
-                i64::MAX
-            } else {
-                i64::try_from(per_page).unwrap_or(i64::MAX)
-            };
+            let (offset, limit) = params.sql_offset_limit();
 
             // Parameterized search — `%` alone matches everything (no search case).
             let search_pattern = format!("%{}%", params.search.as_deref().unwrap_or(""));
@@ -156,7 +156,7 @@ impl AdminModel for FeatureFlagAdminModel {
             )
             .bind::<diesel::sql_types::Text, _>(&search_pattern)
             .bind::<diesel::sql_types::BigInt, _>(limit)
-            .bind::<diesel::sql_types::BigInt, _>(i64::try_from(offset).unwrap_or(0))
+            .bind::<diesel::sql_types::BigInt, _>(offset)
             .load::<FlagRow>(&mut conn)
             .await
             .map(|rows| rows.into_iter().map(FlagRow::into_json).collect())
@@ -181,6 +181,7 @@ impl AdminModel for FeatureFlagAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("FeatureFlagAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -209,6 +210,7 @@ impl AdminModel for FeatureFlagAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("FeatureFlagAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -316,6 +318,7 @@ impl AdminModel for FeatureFlagAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("FeatureFlagAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -420,6 +423,7 @@ impl AdminModel for FeatureFlagAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("FeatureFlagAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -447,6 +451,84 @@ impl AdminModel for FeatureFlagAdminModel {
         })
     }
 
+    fn execute_action(
+        &self,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
+        action: &str,
+        ids: Vec<i64>,
+    ) -> AdminFuture<'_, u64> {
+        // `FeatureFlagAdminModel` never declares soft delete
+        // (`supports_soft_delete()` is the trait default, `false`), so
+        // `actions()` (traits.rs) only ever offers `"delete"` — the admin UI
+        // can't reach `"restore"` or `"purge"` for this model. Only `"delete"`
+        // needs the batched fast path below; `"restore"`, `"purge"`, and any
+        // other action name fall through to the shared
+        // `dispatch_restore_purge_or_unhandled` helper (traits.rs), which a
+        // direct or out-of-band `execute_action` call still reaches for the
+        // same "does not support soft delete" (or "unhandled action") error
+        // it always got.
+        if action == "delete" {
+            let pool = pool.clone();
+            return Box::pin(async move {
+                // The batched form binds a Postgres array. SQLite has no array
+                // bind type. `backend_select!` keeps one arm and drops the
+                // other, so the array never reaches the SQLite type-checker
+                // (issue #2108).
+                //
+                // The SQLite arm keeps the crate compiling, and refuses.
+                // FeatureFlagAdminModel is Postgres-only, so there is no
+                // correct SQLite statement to fall back to.
+                ::autumn_web::backend_select! {
+                    pg => {{
+                        use diesel_async::RunQueryDsl;
+
+                        // Batch every id into ONE round trip instead of the trait
+                        // default's one-CTE-per-id loop (an operator selecting
+                        // hundreds of stale flags in the admin list and clicking
+                        // "Delete selected" otherwise costs one statement, and one
+                        // connection checkout, per flag). Same CTE shape as the
+                        // single-row `delete()`: the audit INSERT's `SELECT key,
+                        // 'deleted', NULL FROM deleted` already fans out to one row
+                        // per id the `DELETE ... RETURNING key` actually removed, so
+                        // widening the predicate to `id = ANY($1)` is enough — an id
+                        // that doesn't exist contributes no row to `deleted` and so
+                        // no audit row either, exactly like the loop it replaces.
+                        //
+                        // The returned count matches the *ids submitted*, not rows
+                        // actually deleted, exactly like the loop this replaces
+                        // (which incremented its counter once per id regardless of
+                        // whether that id matched a row).
+                        let mut conn = pool
+                            .get()
+                            .await
+                            .map_err(|e| AdminError::Database(e.to_string()))?;
+                        diesel::sql_query(
+                            "WITH deleted AS ( \
+                                 DELETE FROM autumn_feature_flags WHERE id = ANY($1) RETURNING key \
+                             ), \
+                             _audit AS ( \
+                                 INSERT INTO feature_flag_changes (key, mutation, actor) \
+                                 SELECT key, 'deleted', NULL FROM deleted \
+                             ) \
+                             SELECT COUNT(*) AS count FROM deleted",
+                        )
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&ids)
+                        .get_result::<CountRow>(&mut conn)
+                        .await
+                        .map_err(|e| AdminError::Database(e.to_string()))?;
+                        Ok(u64::try_from(ids.len()).unwrap_or(u64::MAX))
+                    }},
+                    sqlite => {{
+                        let _ = (&pool, &ids);
+                        crate::traits::require_postgres("FeatureFlagAdminModel").map(|()| 0)
+                    }},
+                }
+            });
+        }
+
+        crate::traits::dispatch_restore_purge_or_unhandled(self, pool, action, ids)
+    }
+
     fn has_history(&self) -> bool {
         true
     }
@@ -463,6 +545,7 @@ impl AdminModel for FeatureFlagAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("FeatureFlagAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -532,7 +615,7 @@ impl AdminModel for FeatureFlagAdminModel {
                 op: r.op,
                 request_id: None,
                 changes: vec![],
-                recorded_at: r.changed_at,
+                recorded_at: r.changed_at.and_utc(),
             })
             .collect();
 
@@ -602,8 +685,8 @@ struct FlagRow {
     actor_allowlist: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     group_allowlist: String,
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    updated_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(sql_type = diesel::sql_types::Timestamp)]
+    updated_at: chrono::NaiveDateTime,
 }
 
 impl FlagRow {
@@ -616,7 +699,7 @@ impl FlagRow {
             "rollout_pct": self.rollout_pct,
             "actor_allowlist": self.actor_allowlist,
             "group_allowlist": self.group_allowlist,
-            "updated_at": self.updated_at.to_rfc3339(),
+            "updated_at": self.updated_at.and_utc().to_rfc3339(),
         })
     }
 }
@@ -629,8 +712,8 @@ struct HistoryRow {
     op: String,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     actor: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    changed_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(sql_type = diesel::sql_types::Timestamp)]
+    changed_at: chrono::NaiveDateTime,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -796,5 +879,67 @@ mod tests {
         // Re-serialisation removes extra whitespace and produces canonical JSON.
         let result = validate_string_array(r#"[ "user:1" ,  "user:2" ]"#, "actor_allowlist");
         assert_eq!(result.unwrap(), r#"["user:1","user:2"]"#);
+    }
+
+    // ── execute_action fallthrough (restore/purge/unhandled) ──────────
+    //
+    // FeatureFlagAdminModel never supports soft delete, so these three
+    // branches always error on the first id without touching the pool —
+    // characterizing them pins the exact error text ahead of routing them
+    // through the shared trait helper (Echo merge with TokenAdminModel).
+
+    fn dummy_pool()
+    -> diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection> {
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+        use diesel_async::pooled_connection::deadpool::Pool;
+        let mgr = AsyncDieselConnectionManager::<::autumn_web::RuntimeConnection>::new(
+            "postgresql://test",
+        );
+        Pool::builder(mgr).build().expect("build pool")
+    }
+
+    #[tokio::test]
+    async fn execute_action_restore_errors_soft_delete_unsupported() {
+        let model = FeatureFlagAdminModel;
+        let pool = dummy_pool();
+        let err = model
+            .execute_action(&pool, "restore", vec![1, 2])
+            .await
+            .expect_err("restore must fail: model does not support soft delete");
+        assert!(
+            matches!(err, AdminError::Other(_)),
+            "must be AdminError::Other: {err:?}"
+        );
+        assert!(format!("{err:?}").contains("does not support soft delete"));
+    }
+
+    #[tokio::test]
+    async fn execute_action_purge_errors_soft_delete_unsupported() {
+        let model = FeatureFlagAdminModel;
+        let pool = dummy_pool();
+        let err = model
+            .execute_action(&pool, "purge", vec![1])
+            .await
+            .expect_err("purge must fail: model does not support soft delete");
+        assert!(
+            matches!(err, AdminError::Other(_)),
+            "must be AdminError::Other: {err:?}"
+        );
+        assert!(format!("{err:?}").contains("does not support soft delete"));
+    }
+
+    #[tokio::test]
+    async fn execute_action_unhandled_action_errors_with_action_name() {
+        let model = FeatureFlagAdminModel;
+        let pool = dummy_pool();
+        let err = model
+            .execute_action(&pool, "archive", vec![1])
+            .await
+            .expect_err("unknown action must error");
+        assert!(
+            matches!(err, AdminError::Other(_)),
+            "must be AdminError::Other: {err:?}"
+        );
+        assert!(format!("{err:?}").contains("unhandled bulk action 'archive'"));
     }
 }

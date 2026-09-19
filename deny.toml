@@ -6,6 +6,11 @@
 # source registry will fail CI. `bans` (duplicate versions) is intentionally not
 # run in CI — see the [bans] note below.
 #
+# This is the ROOT workspace's graph only. `fuzz/` and `examples/island-flock/`
+# are each their own excluded workspace root with their own `Cargo.lock` and
+# their own narrower `deny.toml` (advisories + sources; see those files'
+# headers) — audited by `scripts/check-advisories.sh`'s `audit_satellite_graphs`.
+#
 # ── Handling a supply-chain check that fails CI ────────────────────────────
 # When the `supply-chain` job fails on a PR:
 #   1. Read the RUSTSEC id / license / source and the dependency path cargo-deny
@@ -35,7 +40,7 @@
 # pass (see below).
 all-features = false
 no-default-features = false
-features = ["autumn-web/ws", "autumn-web/presence", "autumn-web/flash", "autumn-web/cache-moka", "autumn-web/maud", "autumn-web/htmx", "autumn-web/multipart", "autumn-web/tailwind", "autumn-web/http-client", "autumn-web/oauth2", "autumn-web/webauthn", "autumn-web/openapi", "autumn-web/mcp", "autumn-web/markdown", "autumn-web/db", "autumn-web/offline-sync", "autumn-web/test-support", "autumn-web/telemetry-otlp", "autumn-web/redis", "autumn-web/i18n", "autumn-web/embed-assets", "autumn-web/storage", "autumn-web/variants", "autumn-web/reporting", "autumn-web/mail", "autumn-web/inbound-mail", "autumn-web/inbound-mailgun", "autumn-web/inbound-ses", "autumn-web/seed", "autumn-web/system-info", "autumn-web/csv", "autumn-web/system-tests", "autumn-web/managed-pg", "autumn-web/managed-pg-bundled", "autumn-web/tls", "autumn-web/acme"]
+features = ["autumn-web/ws", "autumn-web/presence", "autumn-web/flash", "autumn-web/cache-moka", "autumn-web/maud", "autumn-web/htmx", "autumn-web/multipart", "autumn-web/tailwind", "autumn-web/http-client", "autumn-web/oauth2", "autumn-web/webauthn", "autumn-web/openapi", "autumn-web/mcp", "autumn-web/markdown", "autumn-web/db", "autumn-web/offline-sync", "autumn-web/test-support", "autumn-web/telemetry-otlp", "autumn-web/redis", "autumn-web/i18n", "autumn-web/embed-assets", "autumn-web/storage", "autumn-web/variants", "autumn-web/reporting", "autumn-web/mail", "autumn-web/inbound-mail", "autumn-web/inbound-mailgun", "autumn-web/inbound-ses", "autumn-web/seed", "autumn-web/system-info", "autumn-web/csv", "autumn-web/pdf", "autumn-web/system-tests", "autumn-web/managed-pg", "autumn-web/managed-pg-bundled", "autumn-web/tls", "autumn-web/acme", "autumn-web/edge", "autumn-web/plugin-sandbox"]
 
 [advisories]
 # RustSec advisory database. Cover the ENTIRE resolved dependency graph
@@ -43,7 +48,7 @@ features = ["autumn-web/ws", "autumn-web/presence", "autumn-web/flash", "autumn-
 # always denied, and unmaintained + unsound are set explicitly to "all" rather
 # than relying on cargo-deny's version-dependent default scope, so no advisory
 # anywhere in the tree can slip past this gate. Yanked crates stay at the
-# default `warn` (currently spin 0.9.8 / 0.10.0, transitive) — tracked but
+# default `warn` (currently chacha20 0.10.1, transitive) — tracked but
 # non-blocking.
 unmaintained = "all"
 unsound = "all"
@@ -56,17 +61,39 @@ ignore = [
     # RSA private-key decryption oracle, so real exposure is limited. Tracked by
     # issue #1600. Review-by: 2026-10-01 (or when a fixed rsa ships).
     { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release; RSA-JWT path only via jsonwebtoken; tracked in #1600; review-by 2026-10-01" },
-    # RUSTSEC-2026-0173 — proc-macro-error2 unmaintained. Build-time proc-macro
-    # only, pulled transitively by validator_derive -> validator 0.20. Not a
-    # runtime vulnerability and no safe upgrade. Review-by: 2026-10-01 (drop when
-    # validator ships a release that migrates off proc-macro-error2).
-    { id = "RUSTSEC-2026-0173", reason = "unmaintained build-time proc-macro via validator 0.20; no safe upgrade; review-by 2026-10-01" },
     # RUSTSEC-2024-0384 — instant unmaintained. Build-time, transitive, and only
     # pulled in by the managed-pg-bundled feature scanned above:
     # instant -> parking_lot -> reqwest-retry -> postgresql_archive ->
     # (build) postgresql_embedded -> autumn-web. Not a runtime vulnerability and no
     # safe upgrade (author recommends web-time). Review-by: 2026-10-01.
     { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive via postgresql_embedded (managed-pg-bundled feature); no safe upgrade; review-by 2026-10-01" },
+    # RUSTSEC-2026-0253 — `lru`'s `LruCache::pop()` is not panic-safe: a stored
+    # key whose `Drop` panics mid-pop skips `detach()` and leaves a dangling
+    # pointer for a later eviction to write through.
+    #
+    # FIXED, not ignored, for the copy Autumn controls: the workspace's own `lru`
+    # moved 0.18.1 -> 0.18.2 (the advisory's fixed release) in this same commit.
+    # This entry covers only the SECOND copy in the graph, lru 0.16.4, which
+    # arrives through aws-sdk-s3 1.122. That SDK is deliberately pinned
+    # (`>=1.122, <1.123` in autumn-storage-s3 / autumn-media-plugin) because
+    # 1.122 is the last release compatible with this workspace's 1.88.0 MSRV and
+    # the aws-smithy-* ceilings beside it, and the advisory's only fix is
+    # `>=0.18.2` — there is no patched 0.16.x. So the choice is this ignore or
+    # dropping the MSRV floor, which is a much larger decision than one advisory.
+    #
+    # Exposure is nil rather than merely limited, on two INDEPENDENT counts, both
+    # checked against the vendored 1.122 source (`src/s3_express.rs`):
+    #   1. The advisory's UB requires a key type with a potentially-panicking
+    #      `Drop`. The only `lru` use in the SDK is `S3ExpressIdentityCache`,
+    #      whose key is `CacheKey(String)`; `String`'s `Drop` cannot panic.
+    #   2. The unsound function is `pop()`. That cache never calls it — its only
+    #      mutating operation is `get_or_insert_mut()`.
+    # Neither precondition holds, so the dangling-pointer state the advisory
+    # describes is unreachable through this path. It is also S3 Express One Zone
+    # (directory buckets) only, which nothing in the workspace exercises by
+    # default. Review-by: 2026-10-01, or whenever the MSRV floor rises far enough
+    # to take an aws-sdk-s3 that resolves a fixed `lru`.
+    { id = "RUSTSEC-2026-0253", reason = "lru 0.16.4 only, via MSRV-pinned aws-sdk-s3 1.122 (no patched 0.16.x exists; workspace's own lru is fixed at 0.18.2); S3 Express cache keys are String and pop() is never called, so neither UB precondition holds; review-by 2026-10-01" },
 ]
 
 [licenses]

@@ -1,0 +1,5 @@
+error: `#[votable]` requires `by = <ReactorModel>` (e.g. `#[votable(by = User)]`)
+  --> tests/compile-fail/model_votable_missing_by.rs:15:1
+   |
+15 | #[votable(aggregate = sum)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^

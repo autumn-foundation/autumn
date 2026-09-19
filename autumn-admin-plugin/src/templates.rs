@@ -236,7 +236,8 @@ const ADMIN_CSS: &str = "
         transition: border-color 0.15s;
     }
     .form-input:focus {
-        outline: none;
+        outline: 2px solid var(--primary);
+        outline-offset: 2px;
         border-color: var(--primary);
         box-shadow: 0 0 0 3px var(--primary-light);
     }
@@ -270,7 +271,8 @@ const ADMIN_CSS: &str = "
         font-size: 0.875rem;
     }
     .search-bar input:focus {
-        outline: none;
+        outline: 2px solid var(--primary);
+        outline-offset: 2px;
         border-color: var(--primary);
         box-shadow: 0 0 0 3px var(--primary-light);
     }
@@ -351,6 +353,10 @@ const ADMIN_CSS: &str = "
         padding: 0.5rem;
         max-width: 32rem;
     }
+    .job-blocked {
+        color: var(--warning-text);
+        font-weight: 600;
+    }
     .job-actions {
         display: flex;
         gap: 0.375rem;
@@ -397,6 +403,163 @@ const ADMIN_CSS: &str = "
     }
     ";
 
+// ── Impersonation banner ────────────────────────────────────────────
+
+/// Styles for the impersonation banner ([`impersonation_banner`]).
+///
+/// The admin layout already includes these. An application that embeds the
+/// banner in its **own** layout — the surface an operator actually sees while
+/// impersonating a non-admin user — should drop this into its stylesheet or a
+/// `<style>` block. Deliberately class-based rather than inline `style`
+/// attributes, so it survives a nonce-based `style-src` CSP.
+pub const IMPERSONATION_BANNER_CSS: &str = "
+    .autumn-impersonation-banner {
+        position: sticky;
+        top: 0;
+        z-index: 1000;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.6rem 1rem;
+        background: #b45309;
+        color: #fff;
+        font: 500 0.9rem/1.4 system-ui, -apple-system, sans-serif;
+        box-shadow: 0 1px 3px rgb(0 0 0 / 25%);
+    }
+    .autumn-impersonation-banner__text { margin: 0; }
+    .autumn-impersonation-banner__who { font-weight: 700; }
+    .autumn-impersonation-banner__form { margin: 0; }
+    .autumn-impersonation-banner__stop {
+        padding: 0.35rem 0.85rem;
+        border: 1px solid rgb(255 255 255 / 60%);
+        border-radius: 4px;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        cursor: pointer;
+    }
+    .autumn-impersonation-banner__stop:hover { background: rgb(255 255 255 / 15%); }
+    .autumn-impersonation-banner__stop:focus-visible {
+        outline: 2px solid #fff;
+        outline-offset: 2px;
+    }
+";
+
+/// Everything the impersonation banner needs to render.
+///
+/// Built from an [`ImpersonationState`](autumn_web::auth::impersonation::ImpersonationState)
+/// plus the request's CSRF token; see
+/// [`impersonation_banner_for`](crate::impersonation_banner_for) for the
+/// one-call version that reads both from the request.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ImpersonationBanner {
+    /// The user the session is currently acting as.
+    pub effective_user_id: String,
+    /// The real operator behind the session.
+    pub impersonator_id: String,
+    /// Prefix the admin plugin is mounted at; the revert form posts to
+    /// `{admin_prefix}/impersonate/stop`.
+    pub admin_prefix: String,
+    /// CSRF token for that form. Empty when no `CsrfLayer` is installed, in
+    /// which case the hidden field is omitted entirely.
+    pub csrf_token: String,
+    /// Configured CSRF form-field name (defaults to `_csrf` when empty).
+    pub csrf_form_field: String,
+    /// Path the browser returns to after reverting. Empty means "the admin
+    /// panel"; the revert route re-validates it as a same-origin relative path
+    /// either way, so it can never become an open redirect.
+    pub return_to: String,
+}
+
+impl ImpersonationBanner {
+    /// Build the banner view-model for an active impersonation.
+    #[must_use]
+    pub fn new(
+        state: &autumn_web::auth::impersonation::ImpersonationState,
+        admin_prefix: &str,
+        csrf_token: &str,
+        csrf_form_field: &str,
+    ) -> Self {
+        Self {
+            effective_user_id: state.effective_user_id.clone(),
+            impersonator_id: state.impersonator_id.clone(),
+            admin_prefix: admin_prefix.to_owned(),
+            csrf_token: csrf_token.to_owned(),
+            csrf_form_field: csrf_form_field.to_owned(),
+            return_to: String::new(),
+        }
+    }
+
+    /// Return the operator to `path` after reverting, instead of to the admin
+    /// panel. Worth setting when the banner is embedded in the application's
+    /// own layout. Re-validated server-side on the revert route.
+    #[must_use]
+    pub fn returning_to(mut self, path: impl Into<String>) -> Self {
+        self.return_to = path.into();
+        self
+    }
+
+    /// The CSRF field name to render, defaulting to Autumn's `_csrf`.
+    fn csrf_field(&self) -> &str {
+        if self.csrf_form_field.is_empty() {
+            "_csrf"
+        } else {
+            &self.csrf_form_field
+        }
+    }
+}
+
+/// Render the persistent "Viewing as … — Stop impersonating" banner.
+///
+/// The revert is a single `POST` to the plugin's stop route, which is mounted
+/// **outside** the admin role gate — so an operator impersonating a user
+/// without the admin role can always get back to their own session.
+///
+/// Embed it at the top of `<body>` in your application's layout:
+///
+/// ```rust,ignore
+/// let banner = autumn_admin_plugin::impersonation_banner_for(
+///     &state, &session, "/admin", csrf.token(), csrf.form_field(),
+/// ).await;
+/// html! {
+///     body {
+///         @if let Some(banner) = banner { (banner) }
+///         main { (content) }
+///     }
+/// }
+/// ```
+#[must_use]
+pub fn impersonation_banner(banner: &ImpersonationBanner) -> Markup {
+    let stop_action = format!(
+        "{}/impersonate/stop",
+        banner.admin_prefix.trim_end_matches('/')
+    );
+    html! {
+        div class="autumn-impersonation-banner" role="status" aria-live="polite" {
+            p class="autumn-impersonation-banner__text" {
+                "Viewing as "
+                span class="autumn-impersonation-banner__who" { (banner.effective_user_id) }
+                " — impersonated by "
+                span class="autumn-impersonation-banner__who" { (banner.impersonator_id) }
+            }
+            form class="autumn-impersonation-banner__form" method="post" action=(stop_action) {
+                @if !banner.csrf_token.is_empty() {
+                    input type="hidden" name=(banner.csrf_field()) value=(banner.csrf_token);
+                }
+                @if !banner.return_to.is_empty() {
+                    input type="hidden" name="return_to" value=(banner.return_to);
+                }
+                button type="submit" class="autumn-impersonation-banner__stop" {
+                    "Stop impersonating"
+                }
+            }
+        }
+    }
+}
+
 // ── Layout ──────────────────────────────────────────────────────────
 
 /// Render the full admin page layout with sidebar navigation.
@@ -411,6 +574,7 @@ pub fn admin_layout(
     csrf_token_header: &str,
     messages: &[FlashMessage],
     show_config: bool,
+    impersonation: Option<&ImpersonationBanner>,
     content: &Markup,
 ) -> Markup {
     // Each nav item's href is computed once here and reused both to
@@ -476,11 +640,17 @@ pub fn admin_layout(
                     (PreEscaped(TOKENS_CSS))
                     (PreEscaped(FLASH_CSS))
                     (PreEscaped(ADMIN_CSS))
+                    (PreEscaped(IMPERSONATION_BANNER_CSS))
                 }
             }
             body {
                 // Skip-to-content link — first focusable element for keyboard users.
                 a href="#admin-main" class="admin-skip-link" { "Skip to main content" }
+                // Persistent impersonation banner (#1394): rendered above the
+                // whole layout so it is on every admin page the operator loads.
+                @if let Some(banner) = impersonation {
+                    (impersonation_banner(banner))
+                }
                 div class="admin-layout" {
                     // Sidebar navigation landmark
                     header role="banner" {
@@ -517,6 +687,7 @@ pub fn jobs_page(
     prefix: &str,
     actuator_prefix: &str,
     show_config: bool,
+    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
     let content = html! {
         div class="breadcrumbs" {
@@ -533,7 +704,7 @@ pub fn jobs_page(
 
         (job_list_card(
             "Enqueued",
-            "Work waiting for a worker.",
+            "Work waiting for a worker, including jobs waiting on a concurrency slot.",
             &snapshot.enqueued,
             "enqueued_page",
             csrf_token,
@@ -594,6 +765,7 @@ pub fn jobs_page(
         csrf_token_header,
         messages,
         show_config,
+        impersonation,
         &content,
     )
 }
@@ -695,7 +867,11 @@ fn job_row(
             td {
                 strong { (record.name) }
                 div style="font-size: 0.75rem; color: var(--text-muted);" {
-                    (record.status.label()) " · queue " (record.queue) " · " (record.id)
+                    (record.status.label())
+                    @if record.blocked_on_concurrency {
+                        " · " span class="job-blocked" { "waiting on a concurrency slot" }
+                    }
+                    " · queue " (record.queue) " · " (record.id)
                     @if let Some(due) = record.scheduled_for.as_deref() {
                         " · due " (due)
                     }
@@ -840,6 +1016,7 @@ pub fn dashboard_page(
     prefix: &str,
     actuator_prefix: &str,
     show_config: bool,
+    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
     let content = html! {
         h1 style="font-size: 1.5rem; font-weight: 700; margin-bottom: 1.5rem;" {
@@ -875,6 +1052,7 @@ pub fn dashboard_page(
         csrf_token_header,
         messages,
         show_config,
+        impersonation,
         &content,
     )
 }
@@ -906,6 +1084,7 @@ pub fn model_list_page(
     show_config: bool,
     supports_csv_export: bool,
     supports_csv_import: bool,
+    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
     // Password fields are documented as write-only — never surface their
     // values (raw or hashed) in the index view. Hidden fields are
@@ -1142,6 +1321,7 @@ pub fn model_list_page(
         csrf_token_header,
         messages,
         show_config,
+        impersonation,
         &content,
     )
 }
@@ -1161,6 +1341,7 @@ pub fn model_import_form_page(
     prefix: &str,
     actuator_prefix: &str,
     show_config: bool,
+    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
     let content = html! {
         div class="breadcrumbs" {
@@ -1241,6 +1422,7 @@ pub fn model_import_form_page(
         csrf_token_header,
         messages,
         show_config,
+        impersonation,
         &content,
     )
 }
@@ -1259,6 +1441,7 @@ pub fn model_import_result_page(
     prefix: &str,
     actuator_prefix: &str,
     show_config: bool,
+    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
     let mode_label = match mode {
         CsvImportMode::DryRun => "Dry Run",
@@ -1355,6 +1538,7 @@ pub fn model_import_result_page(
         csrf_token_header,
         messages,
         show_config,
+        impersonation,
         &content,
     )
 }
@@ -1383,6 +1567,7 @@ pub fn model_detail_page(
     actuator_prefix: &str,
     has_history: bool,
     show_config: bool,
+    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
     let content = html! {
         div class="breadcrumbs" {
@@ -1445,6 +1630,7 @@ pub fn model_detail_page(
         csrf_token_header,
         messages,
         show_config,
+        impersonation,
         &content,
     )
 }
@@ -1463,6 +1649,12 @@ pub fn model_form_page(
     // Path-based ID from the handler on edit pages (`None` when rendering
     // the "new" form). Never trust the JSON payload for mutation routing.
     id: Option<i64>,
+    // Names of fields in `record` whose value is raw, unvalidated form
+    // input from a failed submission rather than a genuine stored/coerced
+    // value — see `render_form_widget`. Empty for every ordinary render
+    // (fresh "new" form, a real stored record, or a resubmission that
+    // failed for a reason unrelated to that field's own syntax).
+    raw_fields: &[&str],
     messages: &[FlashMessage],
     csrf_token: &str,
     csrf_form_field: &str,
@@ -1470,6 +1662,7 @@ pub fn model_form_page(
     prefix: &str,
     actuator_prefix: &str,
     show_config: bool,
+    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
     let is_edit = id.is_some();
     let title = if is_edit {
@@ -1514,7 +1707,7 @@ pub fn model_form_page(
                                 // so the admin can see it but cannot change it.
                                 (render_readonly_display(field, record))
                             } @else {
-                                (render_form_widget(field, record))
+                                (render_form_widget(field, record, is_edit, raw_fields))
                             }
                         }
                     }
@@ -1542,6 +1735,7 @@ pub fn model_form_page(
         csrf_token_header,
         messages,
         show_config,
+        impersonation,
         &content,
     )
 }
@@ -1559,6 +1753,7 @@ pub fn config_page(
     csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
+    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
     let content = html! {
         div class="breadcrumbs" {
@@ -1618,7 +1813,7 @@ pub fn config_page(
                                 }
                                 td {
                                     @if entry.is_overridden {
-                                        span style="color: var(--warning); font-size: 0.8125rem; font-weight: 500;" {
+                                        span style="color: var(--warning-text); font-size: 0.8125rem; font-weight: 500;" {
                                             "overridden"
                                         }
                                     } @else {
@@ -1667,6 +1862,7 @@ pub fn config_page(
         csrf_token_header,
         messages,
         true,
+        impersonation,
         &content,
     )
 }
@@ -1682,6 +1878,7 @@ pub fn config_history_page(
     csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
+    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
     let title = format!("History: {key}");
     let content = html! {
@@ -1764,6 +1961,7 @@ pub fn config_history_page(
         csrf_token_header,
         messages,
         true,
+        impersonation,
         &content,
     )
 }
@@ -1795,6 +1993,13 @@ fn render_cell_value(record: &Value, field: &AdminField) -> Markup {
     if field.encrypted && !field.encrypted_visible {
         return html! { span title="encrypted at rest" { "••••••••" } };
     }
+    // #1771: a `#[confidential]` column holds an envelope the operator cannot
+    // open, so the admin shows a mask rather than base64 nobody can read. The
+    // lookup is by column name, which errs toward privacy: a same-named column
+    // on another table is masked too.
+    if ::autumn_web::confidential::is_confidential_column_name(field.name) {
+        return html! { span title="sealed for its owner" { "••••••••" } };
+    }
     let val = record.get(field.name);
     match val {
         None | Some(Value::Null) => html! {
@@ -1802,7 +2007,7 @@ fn render_cell_value(record: &Value, field: &AdminField) -> Markup {
         },
         Some(Value::Bool(b)) => html! {
             @if *b {
-                span style="color: var(--success);" { "✓" }
+                span style="color: var(--success-text);" { "✓" }
             } @else {
                 span style="color: var(--text-muted);" { "✗" }
             }
@@ -1923,6 +2128,13 @@ fn render_detail_value(record: &Value, field: &AdminField) -> Markup {
     if field.encrypted && !field.encrypted_visible {
         return html! { span title="encrypted at rest" { "••••••••" } };
     }
+    // #1771: a `#[confidential]` column holds an envelope the operator cannot
+    // open, so the admin shows a mask rather than base64 nobody can read. The
+    // lookup is by column name, which errs toward privacy: a same-named column
+    // on another table is masked too.
+    if ::autumn_web::confidential::is_confidential_column_name(field.name) {
+        return html! { span title="sealed for its owner" { "••••••••" } };
+    }
     let val = record.get(field.name);
     match val {
         None | Some(Value::Null) => html! {
@@ -1960,6 +2172,19 @@ fn render_detail_value(record: &Value, field: &AdminField) -> Markup {
 /// Shows the current value as static text with no form control so the admin
 /// can see it but cannot alter it (and it is never submitted to the server).
 fn render_readonly_display(field: &AdminField, record: Option<&Value>) -> Markup {
+    // #1771: a `create_only` column reaches this instead of `render_form_widget`
+    // on EDIT, so the mask has to be here too. Redacting in the renderer rather
+    // than at the one call site keeps a future caller from reopening the hole.
+    if ::autumn_web::confidential::is_confidential_column_name(field.name) {
+        return html! {
+            p class="form-static-value" style="margin: 0; padding: 0.375rem 0; color: #555;" {
+                span title="sealed for its owner" { "••••••••" }
+            }
+            small class="form-help" style="color: #888;" {
+                "This field cannot be changed after creation."
+            }
+        };
+    }
     let value = record
         .and_then(|r| r.get(field.name))
         .map(|v| match v {
@@ -1978,25 +2203,63 @@ fn render_readonly_display(field: &AdminField, record: Option<&Value>) -> Markup
 }
 
 /// Render a form widget for a field.
-fn render_form_widget(field: &AdminField, record: Option<&Value>) -> Markup {
-    // Encrypted columns (#805). On EDIT (`record` is `Some`) we must never reveal
-    // or overwrite the stored ciphertext, so render a disabled, redacted control
-    // with no `name`: the plaintext never reaches the HTML and a save never
-    // submits (and thus never overwrites) it. On CREATE (`record` is `None`) there
-    // is no stored secret to protect and the generated `New*` DTO requires the
-    // value, so fall through to a normal editable input that captures the initial
-    // plaintext (the wrapper encrypts it on insert). The flag is per-field, so an
+///
+/// `is_edit` is the CREATE-vs-EDIT signal, taken from the caller's `id`
+/// (`None` on create) rather than inferred from `record.is_some()`: a
+/// validation-failure redisplay on CREATE passes `Some(record)` (the
+/// resubmitted values) with no `id`, which must still be treated as create
+/// for the encrypted-field branch below (Codex review, PR #2422).
+///
+/// `raw_fields` names the fields (by `AdminField::name`) whose `record`
+/// value is unvalidated form input straight from a failed submission —
+/// e.g. text that failed `Json` parsing — rather than a genuinely typed
+/// value from storage or a successful coercion. Only the `Json` branch
+/// consults it, to skip the JSON-round-trip serialization and show the raw
+/// text the admin typed instead (Codex review, PR #2422).
+#[allow(clippy::too_many_lines)]
+fn render_form_widget(
+    field: &AdminField,
+    record: Option<&Value>,
+    is_edit: bool,
+    raw_fields: &[&str],
+) -> Markup {
+    // Encrypted columns (#805). On EDIT we must never reveal or overwrite the
+    // stored ciphertext, so render a disabled, redacted control with no
+    // `name`: the plaintext never reaches the HTML and a save never submits
+    // (and thus never overwrites) it. On CREATE there is no stored secret to
+    // protect and the generated `New*` DTO requires the value, so fall
+    // through to a normal editable input that captures the initial plaintext
+    // (the wrapper encrypts it on insert). The flag is per-field, so an
     // unrelated same-named plaintext column stays editable.
-    if field.encrypted && record.is_some() {
+    // #1771: a confidential column is never editable from the admin, on create
+    // or on edit: sealing needs the owner's key, which the server never holds.
+    if ::autumn_web::confidential::is_confidential_column_name(field.name) {
+        return html! {
+            input type="text" class="form-input" value="••••••••" disabled
+                title="Sealed for its owner — the server cannot read or write it";
+        };
+    }
+    if field.encrypted && is_edit {
         return html! {
             input type="text" class="form-input" value="••••••••" disabled
                 title="Encrypted at rest — managed outside the admin";
         };
     }
-    let current_value = record
-        .and_then(|r| r.get(field.name))
-        .cloned()
-        .unwrap_or(Value::Null);
+    // An encrypted field that reaches here is CREATE (the EDIT branch above
+    // already returned). A create-validation-failure redisplay still passes
+    // `Some(record)` with the admin's just-typed plaintext in it — never
+    // echo that back into the response body; keep the control enabled and
+    // submittable (unlike EDIT) but blank, so the admin retypes it rather
+    // than the secret round-tripping through server-rendered HTML a second
+    // time (Codex review, PR #2422).
+    let current_value = if field.encrypted {
+        Value::Null
+    } else {
+        record
+            .and_then(|r| r.get(field.name))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
     let str_val = match &current_value {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
@@ -2070,13 +2333,61 @@ fn render_form_widget(field: &AdminField, record: Option<&Value>) -> Markup {
                 placeholder="Leave blank to keep current"
                 autocomplete="new-password";
         },
-        AdminFieldKind::Json => html! {
-            textarea class="form-input" name=(field.name) id=(field.name)
-                style="font-family: monospace; min-height: 150px;"
-                required[field.required] {
-                (str_val)
+        AdminFieldKind::Json => {
+            // `str_val` above unwraps a `Value::String` to its raw text (right
+            // for Text/TextArea, where the stored value *is* plain text), but a
+            // JSON textarea round-trips through `coerce_form_value`'s
+            // `serde_json::from_str`, which needs JSON syntax back — a stored
+            // top-level string like `"hello"` must render WITH its quotes, or a
+            // pure no-op resave either fails to parse (`hello` isn't valid JSON)
+            // or silently changes type (a stored string `"true"`/`"42"` reparses
+            // as a bool/number).
+            //
+            // `current_value` collapses two different situations into the same
+            // `Value::Null` — no `record` at all (CREATE: nothing to prefill,
+            // must always render blank regardless of required-ness) and a
+            // REQUIRED column's genuinely-stored JSON scalar `null` (EDIT: a
+            // NOT NULL JSONB column can still hold `null` — it just can't be
+            // SQL NULL — so blank would be wrong: it'd let the browser's
+            // `required` attribute block saving any OTHER field without the
+            // admin re-typing `null` by hand, and a programmatic blank
+            // submission would coerce into the string `""` instead of
+            // round-tripping back to `Value::Null`). So this reads `record`
+            // directly instead of reusing `current_value`, matching only a
+            // genuinely nullable-and-null EDIT to blank (Codex review finding
+            // on #1341).
+            // A field named in `raw_fields` holds the exact text the admin
+            // typed, which failed to parse as JSON — show it verbatim so
+            // they can see and fix the mistake, rather than round-tripping
+            // it through `Value::to_string()` (which would wrap it in an
+            // extra pair of quotes, turning `{broken` into the seemingly
+            // valid JSON string `"{broken"` and risking a silent resave of
+            // the wrong data — Codex review, PR #2422).
+            let json_val = if raw_fields.contains(&field.name) || field.encrypted {
+                // `field.encrypted`: this arm otherwise reads `record`
+                // directly (see the #1341 comment above) rather than the
+                // already-cleared `current_value`/`str_val`, which would
+                // still leak an encrypted JSON field's submitted plaintext
+                // on a create-failure redisplay (Codex review, PR #2422).
+                // `str_val` is `""` here in both cases: it comes from
+                // `current_value`, which is already forced to `Value::Null`
+                // for every encrypted field above.
+                str_val
+            } else {
+                match record.and_then(|r| r.get(field.name)) {
+                    None => String::new(),
+                    Some(Value::Null) if !field.required => String::new(),
+                    Some(v) => v.to_string(),
+                }
+            };
+            html! {
+                textarea class="form-input" name=(field.name) id=(field.name)
+                    style="font-family: monospace; min-height: 150px;"
+                    required[field.required] {
+                    (json_val)
+                }
             }
-        },
+        }
     }
 }
 
@@ -2179,6 +2490,7 @@ pub fn model_history_page(
     actuator_prefix: &str,
     csrf_token_header: &str,
     show_config: bool,
+    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
     let record_display = format!("{model_name} #{record_id_val}");
     let history_page_href = |page: u64| {
@@ -2305,6 +2617,7 @@ pub fn model_history_page(
         csrf_token_header,
         empty_messages,
         show_config,
+        impersonation,
         &content,
     )
 }
@@ -2312,6 +2625,171 @@ pub fn model_history_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // WCAG 1.4.3 (contrast minimum) relative-luminance / contrast-ratio
+    // formulas, applied to the admin plugin's own `tokens.css` color pairs.
+    // `#RRGGBB` only — every color literal in `tokens.css` is that shape.
+    fn hex_channel(hex: &str, i: usize) -> f64 {
+        f64::from(u8::from_str_radix(&hex[1 + i * 2..3 + i * 2], 16).unwrap()) / 255.0
+    }
+
+    fn relative_luminance(hex: &str) -> f64 {
+        let f = |c: f64| {
+            if c <= 0.039_28 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.0722f64.mul_add(
+            f(hex_channel(hex, 2)),
+            0.2126f64.mul_add(f(hex_channel(hex, 0)), 0.7152 * f(hex_channel(hex, 1))),
+        )
+    }
+
+    fn contrast_ratio(a: &str, b: &str) -> f64 {
+        let (la, lb) = (relative_luminance(a), relative_luminance(b));
+        let (lighter, darker) = if la >= lb { (la, lb) } else { (lb, la) };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    // Audited 2026-09-04 (Wayfinder). The core admin CRUD loop (list → create
+    // → edit, the reason the plugin exists — every registered model routes
+    // through it) removed `:focus`'s outline on every text/select/textarea/
+    // date input and the list page's search box, replacing it with
+    // `border-color` + `box-shadow` only. `box-shadow` (and often
+    // `border-color`) is suppressed under forced-colors mode (Windows High
+    // Contrast and equivalent OS/browser settings), so a keyboard user in
+    // that mode tabbing through the create/edit form saw *no* focus
+    // indicator at all on any field — a WCAG 2.4.7 (Focus Visible) failure,
+    // and exactly the "style away focus outlines without an equal-or-better
+    // replacement" anti-pattern this persona is instructed never to ship.
+    // The framework already has a real convention for this everywhere else
+    // (`autumn/src/ui/widgets.css` uses `outline: 2px solid var(--primary);
+    // outline-offset: 2px;` on 8 separate focus states, and this same file's
+    // skip-link at line ~53 does too) — these two rules were the outliers.
+    // Fix: restore that same outline (forced-colors mode renders any
+    // non-`none` outline using the system's own focus color, so it can't be
+    // silently stripped) alongside the existing border/box-shadow, which
+    // keeps the current visual treatment in normal rendering.
+    #[test]
+    fn form_and_search_input_focus_keeps_a_visible_outline() {
+        assert!(
+            !ADMIN_CSS.contains("outline: none"),
+            "a form/search input :focus rule dropped its outline with no \
+             equal-or-better replacement — box-shadow/border-color alone are \
+             stripped under forced-colors mode, leaving keyboard users with \
+             no visible focus indicator: {ADMIN_CSS}"
+        );
+        for selector in [".form-input:focus", ".search-bar input:focus"] {
+            let start = ADMIN_CSS
+                .find(selector)
+                .unwrap_or_else(|| panic!("missing `{selector}` rule in ADMIN_CSS"));
+            let block_end = ADMIN_CSS[start..]
+                .find('}')
+                .map_or(ADMIN_CSS.len(), |i| start + i);
+            let block = &ADMIN_CSS[start..block_end];
+            assert!(
+                block.contains("outline: 2px solid var(--primary)"),
+                "`{selector}` must keep a visible outline: {block}"
+            );
+        }
+    }
+
+    // Audited 2026-09-02 (Wayfinder). Config page (100% of admin-plugin
+    // deployments that register runtime-config keys) and every model list
+    // page's boolean columns both rendered their status text straight from
+    // `--warning`/`--success` on `--surface`: 3.19:1 and 3.77:1, both below
+    // WCAG AA's 4.5:1 normal-text threshold (the raw tokens are calibrated
+    // for the 3:1 large-text/border/icon uses they already had, not small
+    // foreground text). `--warning-text`/`--success-text` are the same hue
+    // darkened to the framework's existing flash-message foreground shade,
+    // reused here rather than inventing a new color.
+    const SURFACE: &str = "#ffffff";
+    const WARNING: &str = "#d97706";
+    const WARNING_TEXT: &str = "#92400e";
+    const SUCCESS: &str = "#059669";
+    const SUCCESS_TEXT: &str = "#065f46";
+
+    #[test]
+    fn raw_warning_and_success_tokens_fail_wcag_aa_text_contrast_on_surface() {
+        // Documents why `--warning`/`--success` may not be used directly as
+        // small/normal foreground text — the defect `-text` variants fix.
+        assert!(
+            contrast_ratio(WARNING, SURFACE) < 4.5,
+            "if this now passes, --warning's hex changed and the -text variant may be redundant"
+        );
+        assert!(
+            contrast_ratio(SUCCESS, SURFACE) < 4.5,
+            "if this now passes, --success's hex changed and the -text variant may be redundant"
+        );
+    }
+
+    #[test]
+    fn text_safe_warning_and_success_tokens_meet_wcag_aa_contrast_on_surface() {
+        assert!(
+            contrast_ratio(WARNING_TEXT, SURFACE) >= 4.5,
+            "--warning-text on --surface must clear WCAG AA 4.5:1"
+        );
+        assert!(
+            contrast_ratio(SUCCESS_TEXT, SURFACE) >= 4.5,
+            "--success-text on --surface must clear WCAG AA 4.5:1"
+        );
+        // tokens.css is the source of truth; keep these hex literals honest.
+        let css = include_str!("tokens.css");
+        assert!(
+            css.contains(&format!("--warning-text: {WARNING_TEXT}")),
+            "{css}"
+        );
+        assert!(
+            css.contains(&format!("--success-text: {SUCCESS_TEXT}")),
+            "{css}"
+        );
+    }
+
+    #[test]
+    fn config_page_overridden_status_uses_text_safe_warning_token() {
+        use autumn_web::runtime_config::{ConfigEntry, ConfigValue, ConfigValueType};
+
+        let r = dummy_registry();
+        let entries = vec![ConfigEntry {
+            name: "rate_limit".to_owned(),
+            value_type: ConfigValueType::Int,
+            current: ConfigValue::Int(200),
+            default: ConfigValue::Int(100),
+            is_overridden: true,
+            description: None,
+        }];
+        let html = config_page(
+            &r,
+            &entries,
+            &[],
+            "tok",
+            "_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+            None,
+        )
+        .into_string();
+        assert!(
+            html.contains("color: var(--warning-text)"),
+            "overridden status must use the text-safe warning token, not raw --warning: {html}"
+        );
+        assert!(!html.contains("color: var(--warning);"), "{html}");
+    }
+
+    #[test]
+    fn boolean_true_cell_uses_text_safe_success_token() {
+        let record = serde_json::json!({ "active": true });
+        let field = AdminField::new("active", AdminFieldKind::Boolean);
+        let cell = render_cell_value(&record, &field).into_string();
+        assert!(
+            cell.contains("color: var(--success-text)"),
+            "boolean-true cell must use the text-safe success token, not raw --success: {cell}"
+        );
+        assert!(!cell.contains("color: var(--success);"), "{cell}");
+    }
 
     // A model with at-rest encrypted columns (#805): `ssn` is redacted by default;
     // `audit_note` opts into `admin_visible` (shown in read views). The per-field
@@ -2333,6 +2811,68 @@ mod tests {
         );
         assert!(cell.contains("••••••••"));
         assert!(detail.contains("••••••••"));
+    }
+
+    // #1771: a confidential column is registered process-wide, so the admin can
+    // mask it by name on every surface. Registered here directly rather than
+    // through a `#[model]`, which would need a database schema this crate has no
+    // reason to carry.
+    autumn_web::reexports::inventory::submit! {
+        autumn_web::confidential::ConfidentialColumnDescriptor {
+            model: "AdminSealedNote",
+            table: "admin_sealed_notes",
+            column: "admin_sealed_body",
+            blind_index: ::core::option::Option::Some("admin_sealed_body_bidx"),
+        }
+    }
+
+    /// The envelope and the token are masked in the list, the detail view and
+    /// the editable control.
+    #[test]
+    fn confidential_columns_are_masked_across_admin_views() {
+        let record = serde_json::json!({
+            "id": 1,
+            "admin_sealed_body": "z0BAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "admin_sealed_body_bidx": "0123456789abcdef0123456789abcdef",
+        });
+        for name in ["admin_sealed_body", "admin_sealed_body_bidx"] {
+            let field = AdminField::new(name, AdminFieldKind::Text);
+            let value = record.get(name).and_then(Value::as_str).unwrap();
+            for (what, rendered) in [
+                (
+                    "list cell",
+                    render_cell_value(&record, &field).into_string(),
+                ),
+                ("detail", render_detail_value(&record, &field).into_string()),
+                (
+                    "form widget",
+                    render_form_widget(&field, Some(&record), true, &[]).into_string(),
+                ),
+            ] {
+                assert!(
+                    !rendered.contains(value),
+                    "{what} leaked `{name}`: {rendered}"
+                );
+                assert!(rendered.contains("••••••••"), "{what}: {rendered}");
+            }
+        }
+    }
+
+    /// A `create_only` column reaches `render_readonly_display` on EDIT instead
+    /// of `render_form_widget`, so the mask has to live in the renderer.
+    #[test]
+    fn a_create_only_confidential_column_is_masked_on_the_edit_form() {
+        let record = serde_json::json!({
+            "id": 1,
+            "admin_sealed_body": "z0BAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        });
+        let field = AdminField::new("admin_sealed_body", AdminFieldKind::Text);
+        let rendered = render_readonly_display(&field, Some(&record)).into_string();
+        assert!(
+            !rendered.contains("z0BAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            "the read-only display leaked the envelope: {rendered}"
+        );
+        assert!(rendered.contains("••••••••"), "{rendered}");
     }
 
     #[test]
@@ -2360,7 +2900,7 @@ mod tests {
             AdminField::new("audit_note", AdminFieldKind::Text).encrypted_visible(),
         ] {
             let col = field.name;
-            let form = render_form_widget(&field, Some(&record)).into_string();
+            let form = render_form_widget(&field, Some(&record), true, &[]).into_string();
             assert!(
                 !form.contains("123-45-6789") && !form.contains("visible-note"),
                 "edit form must not pre-fill encrypted plaintext for {col}: {form}"
@@ -2382,7 +2922,7 @@ mod tests {
         // submittable, empty input — otherwise the default "New" flow can't create
         // a record with a required encrypted column (#805).
         let field = AdminField::new("ssn", AdminFieldKind::Text).encrypted();
-        let form = render_form_widget(&field, None).into_string();
+        let form = render_form_widget(&field, None, false, &[]).into_string();
         assert!(
             form.contains("name=\"ssn\""),
             "create control must submit the value: {form}"
@@ -2394,6 +2934,112 @@ mod tests {
         assert!(
             !form.contains("••••••••"),
             "create control is an empty input, not the redaction mask: {form}"
+        );
+    }
+
+    #[test]
+    fn create_failure_redisplay_never_echoes_encrypted_plaintext() {
+        // Codex review, PR #2422: a create-validation-failure redisplay
+        // passes `Some(record)` holding the admin's just-typed values
+        // (`is_edit` stays `false`, so this isn't the EDIT-only redacted
+        // branch) — an encrypted field must still never echo that plaintext
+        // back into the response, in any widget kind, including `Json`
+        // (which has its own record lookup, separate from the shared
+        // `current_value` guard, for the #1341 stored-null case).
+        let record = serde_json::json!({
+            "ssn": "123-45-6789",
+            "secret_config": {"token": "sk-live-999"},
+        });
+        for field in [
+            AdminField::new("ssn", AdminFieldKind::Text).encrypted(),
+            AdminField::new("secret_config", AdminFieldKind::Json).encrypted(),
+        ] {
+            let name = field.name;
+            let form = render_form_widget(&field, Some(&record), false, &[]).into_string();
+            assert!(
+                form.contains(&format!("name=\"{name}\"")),
+                "create control must stay submittable for {name}: {form}"
+            );
+            assert!(
+                !form.contains("123-45-6789") && !form.contains("sk-live-999"),
+                "encrypted {name} must not echo the submitted plaintext on a create failure: {form}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_edit_form_prefills_a_stored_string_scalar_with_its_quotes() {
+        // Issue #1341 review: a stored top-level JSON string like `"hello"`
+        // must render WITH its quotes in the edit textarea. Without them, a
+        // pure no-op resave either fails `coerce_form_value`'s JSON parse
+        // (`hello` isn't valid JSON) or, worse, silently changes the value's
+        // type (a stored `"true"`/`"42"` string would reparse as a bool/number).
+        let field = AdminField::new("config", AdminFieldKind::Json);
+
+        let record = serde_json::json!({ "config": "hello" });
+        let form = render_form_widget(&field, Some(&record), true, &[]).into_string();
+        assert!(
+            form.contains("&quot;hello&quot;") || form.contains("\"hello\""),
+            "stored JSON string must render with its quotes intact: {form}"
+        );
+
+        // A string that looks like another JSON literal must round-trip as
+        // the SAME string, not silently become that other type.
+        let record = serde_json::json!({ "config": "true" });
+        let form = render_form_widget(&field, Some(&record), true, &[]).into_string();
+        assert!(
+            form.contains("&quot;true&quot;") || form.contains("\"true\""),
+            "a stored JSON string \"true\" must not render as the bare word true: {form}"
+        );
+
+        // Object/array values were already correct — no regression.
+        let record = serde_json::json!({ "config": {"a": 1} });
+        let form = render_form_widget(&field, Some(&record), true, &[]).into_string();
+        assert!(
+            form.contains("{&quot;a&quot;:1}") || form.contains(r#"{"a":1}"#),
+            "object values still render as JSON: {form}"
+        );
+
+        // A NULL value on an OPTIONAL field renders as a blank textarea,
+        // matching the existing "blank means no value" convention.
+        let optional_field = AdminField::new("config", AdminFieldKind::Json).optional();
+        let record = serde_json::json!({ "config": null });
+        let form = render_form_widget(&optional_field, Some(&record), true, &[]).into_string();
+        assert!(
+            !form.contains("null"),
+            "an optional NULL json value should render blank, not the literal word null: {form}"
+        );
+
+        // A NULL value on a REQUIRED field is the legitimate JSON scalar
+        // `null` (a NOT NULL JSONB column can still hold the JSON literal
+        // `null` — it just can't be SQL NULL), not an absent value, and must
+        // render as the literal text `null`. Rendering it blank would let the
+        // browser's `required` attribute block saving any other field on the
+        // record without the admin re-typing `null` by hand, and a
+        // programmatic blank submission would coerce into `""` instead of
+        // round-tripping back to `Value::Null` (Codex review finding on
+        // #1341).
+        let form = render_form_widget(&field, Some(&record), true, &[]).into_string();
+        assert!(
+            form.contains(">null<") || form.contains("null"),
+            "a required NULL json value must render the literal `null`, not blank: {form}"
+        );
+    }
+
+    #[test]
+    fn json_create_form_starts_blank_even_when_required() {
+        // Issue #1341 review follow-up: `record: None` means CREATE — there is
+        // no stored value to prefill at all, which must NOT be conflated with
+        // a required field's genuinely-stored `Value::Null` (tested above).
+        // Both collapse to the same `current_value` if read through the
+        // shared default, so the widget must distinguish "no record" from "a
+        // null value in the record" directly.
+        let field = AdminField::new("config", AdminFieldKind::Json);
+        let form = render_form_widget(&field, None, false, &[]).into_string();
+        assert!(
+            !form.contains("null"),
+            "a brand-new required json field on the CREATE form must start blank, \
+             not prefilled with the literal word null: {form}"
         );
     }
 
@@ -2593,6 +3239,7 @@ mod tests {
             "/ops",
             "X-CSRF-Token",
             false,
+            None,
         )
         .into_string();
 
@@ -2618,6 +3265,7 @@ mod tests {
             "/admin",
             "/ops",
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -2633,8 +3281,18 @@ mod tests {
     #[test]
     fn dashboard_uses_configured_actuator_prefix() {
         let r = dummy_registry();
-        let html = dashboard_page(&r, &[], &[], "tok", "X-CSRF-Token", "/admin", "/ops", false)
-            .into_string();
+        let html = dashboard_page(
+            &r,
+            &[],
+            &[],
+            "tok",
+            "X-CSRF-Token",
+            "/admin",
+            "/ops",
+            false,
+            None,
+        )
+        .into_string();
         assert!(
             html.contains(r#"href="/ops/ui""#),
             "sidebar link wrong: {html}"
@@ -2673,6 +3331,7 @@ mod tests {
                     last_error: None,
                     principal_id: Some("42".to_owned()),
                     correlation_id: Some("req-123".to_owned()),
+                    blocked_on_concurrency: false,
                 }],
                 1,
                 1,
@@ -2693,6 +3352,7 @@ mod tests {
                     last_error: None,
                     principal_id: None,
                     correlation_id: None,
+                    blocked_on_concurrency: false,
                 }],
                 1,
                 1,
@@ -2713,6 +3373,7 @@ mod tests {
                     last_error: None,
                     principal_id: None,
                     correlation_id: None,
+                    blocked_on_concurrency: false,
                 }],
                 1,
                 1,
@@ -2733,6 +3394,7 @@ mod tests {
                     last_error: None,
                     principal_id: None,
                     correlation_id: None,
+                    blocked_on_concurrency: false,
                 }],
                 1,
                 1,
@@ -2753,6 +3415,7 @@ mod tests {
                     last_error: Some("smtp refused recipient".repeat(6)),
                     principal_id: Some("7".to_owned()),
                     correlation_id: None,
+                    blocked_on_concurrency: false,
                 }],
                 1,
                 1,
@@ -2777,6 +3440,7 @@ mod tests {
             "/admin",
             "/actuator",
             false,
+            None,
         )
         .into_string();
         assert!(html.contains("Jobs"));
@@ -2799,6 +3463,71 @@ mod tests {
         assert!(html.contains(r#"hx-get="/admin/jobs/counters""#));
         assert!(html.contains(r#"hx-trigger="load, every 2s""#));
         assert!(html.contains("send-digest"));
+    }
+
+    /// The parked-row marker is small foreground text on `--surface`, so it
+    /// must use the text-safe token, not raw `--warning` (3.19:1, below
+    /// WCAG AA). The rule lives in `ADMIN_CSS`, so assert the rule body —
+    /// `job_row_flags_a_concurrency_parked_job` only sees the phrase.
+    #[test]
+    fn job_blocked_marker_uses_the_text_safe_warning_token() {
+        let start = ADMIN_CSS
+            .find(".job-blocked")
+            .expect("missing `.job-blocked` rule in ADMIN_CSS");
+        let block_end = ADMIN_CSS[start..]
+            .find('}')
+            .map_or(ADMIN_CSS.len(), |i| start + i);
+        let block = &ADMIN_CSS[start..block_end];
+        assert!(
+            block.contains("color: var(--warning-text)"),
+            "`.job-blocked` must use --warning-text: {block}"
+        );
+        assert!(
+            !block.contains("var(--warning)"),
+            "raw --warning fails WCAG AA as normal text on --surface: {block}"
+        );
+    }
+
+    /// #1186: the Redis enqueued tab lists concurrency-parked jobs, so a row
+    /// must say whether it is waiting on a slot or ready to claim.
+    #[test]
+    fn job_row_flags_a_concurrency_parked_job() {
+        use autumn_web::job::{JobAdminRecord, JobAdminStatus};
+
+        let mut record = JobAdminRecord {
+            id: "job-parked".to_owned(),
+            name: "recalculate".to_owned(),
+            queue: "default".to_owned(),
+            status: JobAdminStatus::Enqueued,
+            enqueued_at: Some("2026-05-07T10:00:00Z".to_owned()),
+            scheduled_for: None,
+            started_at: None,
+            finished_at: None,
+            attempt: 1,
+            max_attempts: 5,
+            last_error: None,
+            principal_id: None,
+            correlation_id: None,
+            blocked_on_concurrency: true,
+        };
+
+        let parked = job_row(&record, "tok", "authenticity_token", "/admin").into_string();
+        assert!(
+            parked.contains("waiting on a concurrency slot"),
+            "parked row must be annotated: {parked}"
+        );
+        // A parked job has not started, so the operator can still cancel it.
+        assert!(
+            parked.contains(r#"action="/admin/jobs/job-parked/cancel""#),
+            "parked row must keep its Cancel action: {parked}"
+        );
+
+        record.blocked_on_concurrency = false;
+        let ready = job_row(&record, "tok", "authenticity_token", "/admin").into_string();
+        assert!(
+            !ready.contains("waiting on a concurrency slot"),
+            "a ready row must not be annotated: {ready}"
+        );
     }
 
     #[test]
@@ -2825,12 +3554,14 @@ mod tests {
             None,
             None,
             &[],
+            &[],
             "tok-xyz",
             "authenticity_token",
             "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -2855,12 +3586,14 @@ mod tests {
             Some(&record),
             Some(1),
             &[],
+            &[],
             "t",
             "_csrf",
             "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -2889,12 +3622,14 @@ mod tests {
             Some(&record),
             Some(42),
             &[],
+            &[],
             "t",
             "_csrf",
             "X-CSRF-Token",
             "/admin",
             "/actuator",
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -2929,6 +3664,7 @@ mod tests {
             "/actuator",
             false,
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -2980,6 +3716,7 @@ mod tests {
             "/actuator",
             false,
             false,
+            None,
         )
         .into_string();
         assert!(!html.contains("hx-confirm"), "{html}");
@@ -3022,6 +3759,7 @@ mod tests {
             "/actuator",
             false,
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -3061,6 +3799,7 @@ mod tests {
             "/actuator",
             false,
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -3089,6 +3828,7 @@ mod tests {
             "/admin",
             "/actuator",
             false,
+            None,
         )
         .into_string();
         let expected = format!(r#"src="/admin{}""#, &**ADMIN_JS_PATH);
@@ -3153,6 +3893,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -3205,6 +3946,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -3254,6 +3996,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         // Row with id renders working links and a checkbox.
@@ -3315,6 +4058,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         // Sort header link carries both filters.
@@ -3371,6 +4115,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -3428,6 +4173,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -3481,6 +4227,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         // Form posts to the bulk-action endpoint with the CSRF token.
@@ -3560,6 +4307,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -3599,6 +4347,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -3641,6 +4390,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         // Sortable field gets a sort link.
@@ -3692,6 +4442,7 @@ mod tests {
             false, // show_config
             true,  // supports_csv_export
             false, // supports_csv_import
+            None,
         )
         .into_string();
         assert!(
@@ -3735,6 +4486,7 @@ mod tests {
             false, // show_config
             false, // supports_csv_export
             true,  // supports_csv_import
+            None,
         )
         .into_string();
         assert!(
@@ -3778,6 +4530,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -3976,6 +4729,7 @@ mod tests {
             "X-CSRF-Token",
             "/admin",
             "/actuator",
+            None,
         )
         .into_string();
         assert!(
@@ -4010,6 +4764,7 @@ mod tests {
             "X-CSRF-Token",
             "/admin",
             "/actuator",
+            None,
         )
         .into_string();
         assert!(html.contains("max_upload_mb"), "key name missing: {html}");
@@ -4049,6 +4804,7 @@ mod tests {
             "X-CSRF-Token",
             "/admin",
             "/actuator",
+            None,
         )
         .into_string();
         assert!(
@@ -4079,6 +4835,7 @@ mod tests {
             "X-CSRF-Token",
             "/admin",
             "/actuator",
+            None,
         )
         .into_string();
         assert!(
@@ -4109,6 +4866,7 @@ mod tests {
             "X-CSRF-Token",
             "/admin",
             "/actuator",
+            None,
         )
         .into_string();
         assert!(
@@ -4139,6 +4897,7 @@ mod tests {
             "X-CSRF-Token",
             "/admin",
             "/actuator",
+            None,
         )
         .into_string();
         assert!(
@@ -4159,6 +4918,7 @@ mod tests {
             "X-CSRF-Token",
             "/admin",
             "/actuator",
+            None,
         )
         .into_string();
         assert!(
@@ -4189,6 +4949,7 @@ mod tests {
             "X-CSRF-Token",
             "/admin",
             "/actuator",
+            None,
         )
         .into_string();
         assert!(html.contains("rate_limit"), "key name missing: {html}");
@@ -4218,6 +4979,7 @@ mod tests {
             "X-CSRF-Token",
             "/admin",
             "/actuator",
+            None,
         )
         .into_string();
         assert!(html.contains("flag"), "key name missing: {html}");
@@ -4238,6 +5000,102 @@ mod tests {
         assert!(s.contains("2023"), "expected 2023 in formatted output: {s}");
     }
 
+    // ── Impersonation banner (#1394) ─────────────────────────────────────
+
+    fn banner_state(target: &str, operator: &str) -> ImpersonationBanner {
+        ImpersonationBanner {
+            effective_user_id: target.to_owned(),
+            impersonator_id: operator.to_owned(),
+            admin_prefix: "/admin".to_owned(),
+            csrf_token: String::new(),
+            csrf_form_field: String::new(),
+            return_to: String::new(),
+        }
+    }
+
+    #[test]
+    fn banner_names_both_parties_and_offers_a_revert() {
+        let html = impersonation_banner(&banner_state("user-9", "admin-1")).into_string();
+        assert!(html.contains("Viewing as"), "{html}");
+        assert!(html.contains("user-9"), "{html}");
+        assert!(html.contains("admin-1"), "{html}");
+        assert!(html.contains("Stop impersonating"), "{html}");
+        assert!(
+            html.contains(r#"action="/admin/impersonate/stop""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"method="post""#), "{html}");
+    }
+
+    #[test]
+    fn banner_omits_the_csrf_field_when_no_token_is_available() {
+        // `CsrfLayer` is off outside the prod profile; rendering `name="" value=""`
+        // would be a broken field rather than an absent one.
+        let html = impersonation_banner(&banner_state("user-9", "admin-1")).into_string();
+        assert!(!html.contains(r#"type="hidden""#), "{html}");
+    }
+
+    #[test]
+    fn banner_renders_the_csrf_field_with_the_configured_name() {
+        let mut banner = banner_state("user-9", "admin-1");
+        banner.csrf_token = "tok-123".to_owned();
+        banner.csrf_form_field = "authenticity_token".to_owned();
+        let html = impersonation_banner(&banner).into_string();
+        assert!(
+            html.contains(r#"name="authenticity_token" value="tok-123""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn banner_falls_back_to_the_default_csrf_field_name() {
+        let mut banner = banner_state("user-9", "admin-1");
+        banner.csrf_token = "tok-123".to_owned();
+        let html = impersonation_banner(&banner).into_string();
+        assert!(html.contains(r#"name="_csrf" value="tok-123""#), "{html}");
+    }
+
+    #[test]
+    fn banner_action_survives_a_trailing_slash_on_the_prefix() {
+        let mut banner = banner_state("user-9", "admin-1");
+        banner.admin_prefix = "/back-office/".to_owned();
+        let html = impersonation_banner(&banner).into_string();
+        assert!(
+            html.contains(r#"action="/back-office/impersonate/stop""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn banner_carries_return_to_only_when_set() {
+        let plain = impersonation_banner(&banner_state("user-9", "admin-1")).into_string();
+        assert!(!plain.contains("return_to"), "{plain}");
+
+        let with_return =
+            impersonation_banner(&banner_state("user-9", "admin-1").returning_to("/dashboard"))
+                .into_string();
+        assert!(
+            with_return.contains(r#"name="return_to" value="/dashboard""#),
+            "{with_return}"
+        );
+    }
+
+    #[test]
+    fn banner_escapes_the_user_ids_it_renders() {
+        let html = impersonation_banner(&banner_state("<script>alert(1)</script>", "admin-1"))
+            .into_string();
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
+    #[test]
+    fn the_admin_layout_ships_the_banner_styles() {
+        assert!(
+            IMPERSONATION_BANNER_CSS.contains(".autumn-impersonation-banner"),
+            "{IMPERSONATION_BANNER_CSS}"
+        );
+    }
+
     // ── admin_layout nav (#1134) ─────────────────────────────────────────
 
     fn render_layout(active_slug: Option<&str>) -> String {
@@ -4252,6 +5110,7 @@ mod tests {
             "X-CSRF-Token",
             &[],
             true,
+            None,
             &html! {},
         )
         .into_string()
@@ -4314,6 +5173,7 @@ mod tests {
             "X-CSRF-Token",
             &[],
             true,
+            None,
             &html! {},
         )
         .into_string()
@@ -4431,6 +5291,7 @@ mod tests {
             "X-CSRF-Token",
             &messages,
             true,
+            None,
             &html! {},
         )
         .into_string();

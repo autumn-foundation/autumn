@@ -60,6 +60,22 @@ Production config validation fails when a configured endpoint has no secret or
 uses a weak/template value. Apps with no configured signed webhooks are
 unchanged.
 
+## Scaffold an endpoint
+
+`autumn generate webhook <provider> <Name>` wires all of the above up for you —
+the route, the `[[security.webhooks.endpoints]]` config (`secret_env`, replay
+protection on), the CSRF/CAPTCHA path exemptions, an event-dispatch skeleton,
+and tests covering the valid / missing / invalid / replayed delivery cases:
+
+```bash
+autumn generate webhook stripe Payments
+autumn generate webhook github Repo
+autumn generate webhook slack Events
+autumn generate webhook generic Partner --secret-env PARTNER_WEBHOOK_SECRET
+```
+
+See `docs/guide/generators.md` for the full generator contract.
+
 ## Write a handler
 
 ```rust,ignore

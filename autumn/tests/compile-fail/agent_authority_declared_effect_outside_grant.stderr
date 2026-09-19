@@ -1,0 +1,7 @@
+error[E0080]: evaluation panicked: agent authority: `draft` declares (via `#[agent_effect]`) that it writes `Payout`, which grant `RefundDrafter` does not allow.
+
+              Add `Payout` to the grant's `writes: [...]`, or drop the declaration — the hatch declares an effect, it never grants one. See docs/guide/agent-authority.md.
+  --> tests/compile-fail/agent_authority_declared_effect_outside_grant.rs:33:5
+   |
+33 |     #[agent_effect(writes(Payout), reason = "issue() performs the payout write")]
+   |     ^ evaluation of `_` failed here

@@ -1,0 +1,13 @@
+=== BEFORE: full-table label load (current codegen) ===
+                                                            QUERY PLAN                                                            
+----------------------------------------------------------------------------------------------------------------------------------
+ Index Scan using posts_pkey on public.posts  (cost=0.28..199.28 rows=5000 width=52) (actual time=0.015..0.578 rows=5000 loops=1)
+   Output: id, title
+   Buffers: shared hit=72
+ Query Identifier: 5584427728823830915
+ Planning:
+   Buffers: shared hit=96
+ Planning Time: 0.318 ms
+ Execution Time: 0.796 ms
+(8 rows)
+

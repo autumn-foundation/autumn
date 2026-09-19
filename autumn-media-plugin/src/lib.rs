@@ -66,10 +66,11 @@ pub use retention::{
     sweep_recordings_root, within_root,
 };
 pub use rooms::{
-    InMemoryRoomStore, JoinRecord, JoinRequest, JoinResponse, LeaveRequest, ParticipantView,
-    PublishTarget, ReapFuture, ReapStats, RoomError, RoomLeaveResponse, RoomService, RoomSnapshot,
-    RoomStore, RoomStoreFuture, SessionToken, SubscribeTarget, room_participant_path,
-    room_route_infos, room_router, spawn_room_reaper_loop, validate_room_segment,
+    HeartbeatRequest, HeartbeatResponse, InMemoryRoomStore, JoinRecord, JoinRequest, JoinResponse,
+    LeaveRequest, ParticipantView, PublishTarget, ReapFuture, ReapStats, RoomError,
+    RoomLeaveResponse, RoomService, RoomSnapshot, RoomStore, RoomStoreFuture, SessionToken,
+    SubscribeTarget, room_participant_path, room_route_infos, room_router, spawn_room_reaper_loop,
+    validate_room_segment,
 };
 pub use rooms_db::DbRoomStore;
 pub use sink::{
@@ -106,8 +107,8 @@ pub mod prelude {
         newest_recording_files_since, recording_segments_covering_window, slugify,
     };
     pub use crate::{
-        InMemoryRoomStore, JoinRecord, JoinResponse, ParticipantView, ReapStats, RoomError,
-        RoomService, RoomSnapshot, RoomStore, SessionToken, room_participant_path,
+        HeartbeatResponse, InMemoryRoomStore, JoinRecord, JoinResponse, ParticipantView, ReapStats,
+        RoomError, RoomService, RoomSnapshot, RoomStore, SessionToken, room_participant_path,
         room_route_infos, room_router, spawn_room_reaper_loop, validate_room_segment,
     };
     pub use crate::{
@@ -361,6 +362,15 @@ impl Default for MediaPlugin {
 }
 
 impl Plugin for MediaPlugin {
+    /// This plugin ships in lockstep with `autumn-web` — see
+    /// [`lockstep_contract`](autumn_web::plugin_contract::lockstep_contract).
+    fn contract(&self) -> Option<autumn_web::plugin_contract::PluginContract> {
+        Some(autumn_web::plugin_contract::lockstep_contract(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ))
+    }
+
     fn name(&self) -> Cow<'static, str> {
         Cow::Borrowed("autumn-media-plugin")
     }
@@ -696,6 +706,27 @@ fn arroyo_recordings_root(env: &HashMap<String, String>) -> PathBuf {
         )
 }
 
+#[cfg(test)]
+mod contract_tests {
+    use super::MediaPlugin;
+    use autumn_web::plugin::Plugin;
+
+    #[test]
+    fn contract_declares_lockstep_with_own_crate() {
+        let contract = MediaPlugin::new().contract().expect("a contract");
+        assert_eq!(contract.plugin, env!("CARGO_PKG_NAME"));
+        assert_eq!(
+            contract.plugin_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            contract.autumn_web.as_deref(),
+            Some(autumn_web::plugin_contract::lockstep_range(env!("CARGO_PKG_VERSION")).as_str())
+        );
+        assert!(contract.experimental_surfaces.is_empty());
+    }
+}
+
 // ── Arroyo migration shim (slice 5) ─────────────────────────────────────────
 
 #[cfg(test)]
@@ -984,9 +1015,9 @@ mod conformance_tests {
     }
 
     #[test]
-    fn build_declares_the_four_room_routes_when_rooms_enabled() {
+    fn build_declares_the_five_room_routes_when_rooms_enabled() {
         let routes = super::rooms::room_route_infos(API_PREFIX);
-        assert_eq!(routes.len(), 4, "rooms declare exactly four routes");
+        assert_eq!(routes.len(), 5, "rooms declare exactly five routes");
         assert!(
             routes
                 .iter()

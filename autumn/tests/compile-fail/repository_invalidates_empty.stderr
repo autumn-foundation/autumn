@@ -1,0 +1,5 @@
+error: `invalidates()` must name at least one #[cached] function, e.g. `invalidates(crate::views::recent_posts)`; omit it entirely if this repository's writes cannot strand a cached read
+  --> tests/compile-fail/repository_invalidates_empty.rs:21:35
+   |
+21 | #[autumn_web::repository(Article, invalidates())]
+   |                                   ^^^^^^^^^^^^^

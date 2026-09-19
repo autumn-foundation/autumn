@@ -1,0 +1,10 @@
+$ cargo test -p autumn-web --test integration_tests session_tenancy_public_path_alias_stays_tenantless -- --nocapture
+
+running 1 test
+
+thread 'integration::idempotency_tenant_scope::session_tenancy_public_path_alias_stays_tenantless' panicked at autumn/tests/integration/idempotency_tenant_scope.rs:293:5:
+assertion `left == right` failed: a retry to an always-exempt public path must replay the cached login, not re-run it
+  left: "logged-in-2"
+ right: "logged-in-1"
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1790 filtered out; finished in 0.31s

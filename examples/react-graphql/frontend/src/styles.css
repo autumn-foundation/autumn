@@ -1,0 +1,50 @@
+:root {
+  color-scheme: light dark;
+  --bg: #fafaf7;
+  --fg: #1f1d1a;
+  --muted: #6b665f;
+  --card: #ffffff;
+  --line: #e2ddd4;
+  --accent: #b5541c;
+  --accent-soft: #fbe9dc;
+  --danger: #a32d2d;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  line-height: 1.5;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #171513;
+    --fg: #ece7df;
+    --muted: #a39d93;
+    --card: #221f1c;
+    --line: #37322c;
+    --accent: #e08a4f;
+    --accent-soft: #3a2517;
+    --danger: #e26b6b;
+  }
+}
+body { margin: 0; background: var(--bg); color: var(--fg); }
+.app { max-width: 42rem; margin: 0 auto; padding: 2rem 1.25rem 3rem; }
+header h1 { margin: 0 0 .25rem; font-size: 1.9rem; }
+.tagline { margin: 0 0 1.5rem; color: var(--muted); }
+h2 { font-size: 1.05rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 1.5rem 0 .5rem; }
+.composer { display: grid; gap: .75rem; padding: 1rem; background: var(--card); border: 1px solid var(--line); border-radius: .75rem; }
+.composer label { display: grid; gap: .25rem; font-size: .9rem; font-weight: 600; }
+.composer input, .composer textarea { font: inherit; padding: .5rem .65rem; border: 1px solid var(--line); border-radius: .5rem; background: var(--bg); color: var(--fg); }
+.composer textarea { resize: vertical; }
+button { font: inherit; padding: .45rem .9rem; border-radius: .5rem; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
+button[type="submit"] { justify-self: start; background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+button:disabled { opacity: .55; cursor: default; }
+button.danger { color: var(--danger); }
+.notes { list-style: none; margin: 0; padding: 0; display: grid; gap: .6rem; }
+.note { background: var(--card); border: 1px solid var(--line); border-radius: .75rem; padding: .85rem 1rem; }
+.note.pinned { border-color: var(--accent); background: var(--accent-soft); }
+.note-head { display: flex; justify-content: space-between; gap: 1rem; align-items: baseline; }
+.note-head h3 { margin: 0; font-size: 1.05rem; }
+.note-head time { color: var(--muted); font-size: .8rem; white-space: nowrap; }
+.note-body { margin: .35rem 0 0; white-space: pre-wrap; }
+.note-actions { display: flex; gap: .5rem; margin-top: .6rem; }
+.muted { color: var(--muted); }
+.error { color: var(--danger); font-weight: 600; }
+footer { margin-top: 2.5rem; border-top: 1px solid var(--line); padding-top: 1rem; font-size: .85rem; }
+code { background: var(--line); padding: .1em .35em; border-radius: 4px; font-size: .9em; }

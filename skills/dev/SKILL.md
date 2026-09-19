@@ -57,6 +57,29 @@ On trunk-dev (unreleased — not in the published 0.5.0 CLI) there is also
 local Postgres. See `docs/guide/daemon.md`. Do not suggest it to users on the
 published 0.5.0 CLI.
 
+**The daemon runs natively on Windows** (unreleased — trunk-dev, issue #1639).
+It was Tier 2/WSL2 until then; do not tell a user to reach for WSL2 for it any
+more. The contract is the same on both platforms — single-instance guard,
+readiness-gated start, `serve.addr` discovery file, `status` exit codes 0/3 —
+with three differences worth knowing:
+
+- **Transport.** No Unix socket, so a Windows daemon binds its configured
+  `server.host`/`server.port` and `serve.addr` records `transport = "tcp"`.
+- **Stop.** No `SIGTERM`, so `stop` requests the drain through a file the daemon
+  watches. It runs the identical graceful sequence, so shutdown hooks and a
+  managed-Postgres teardown still happen. `stop` reports which of drained /
+  force-stopped after overrun / never asked actually occurred — read it, because
+  only the first means the hooks ran.
+- **Service.** `autumn serve install-service` registers the daemon as a Windows
+  service that starts at boot and restarts after a crash;
+  `autumn serve uninstall-service` removes it and keeps the database. Both need
+  an elevated (Administrator) shell. The service hosts the same app, so `status`
+  and `stop` keep working against it.
+
+State lives under `%LOCALAPPDATA%` with an owner-only ACL, and the daemon
+refuses to start if that cannot be applied. See `docs/guide/daemon.md` and
+`docs/guide/platform-support.md`.
+
 ## What gets served
 
 Once running, tell the user what's available:
@@ -76,6 +99,27 @@ If `autumn-admin-plugin` is installed:
 If the `mail` feature is enabled:
 | `http://localhost:3000/_autumn/mail` | Mailer preview (dev profile only) |
 
+## Dependency findings on startup (unreleased — trunk-dev, issue #1633)
+
+`autumn dev` reports dependency-policy findings once per run, and only the ones
+that turn CI red — findings the app's `deny.toml` **denies**:
+
+```
+  ⚠️  1 blocking dependency finding (worst: high) — run `autumn doctor` for detail.
+```
+
+A critical advisory gets a startup banner naming the ids instead. Everything
+else is silent by design: a clean tree, a fully waived tree, a tree with only
+warn-level findings (duplicate or yanked crates), and every state where the
+policy could not be evaluated (no cargo-deny, no advisory database, no
+`deny.toml`) all print nothing. `autumn doctor` is where those are reported.
+
+Do not read silence as "no audit ran". The audit starts after the initial
+build — running it alongside makes its `cargo metadata` contend with Cargo's
+package-cache lock — and the watch loop polls for the result without ever
+blocking, so nothing here delays startup or a rebuild. The line can therefore
+appear a second or two after the server does.
+
 ## Hot reload behavior
 
 `autumn dev` watches `src/`, `templates/`, and `static/` for changes and
@@ -88,6 +132,26 @@ On trunk-dev (unreleased — not in the published 0.5.0 CLI), when a rebuild
 clears on the next successful rebuild (issue #1115). See
 `docs/guide/dev-error-overlay.md`.
 
+### On Windows (unreleased — trunk-dev, issue #1616)
+
+Two behaviours differ, both deliberate:
+
+- **The app is stopped before the rebuild, not after.** A running
+  `target\debug\<app>.exe` is locked on Windows, so `cargo build` cannot relink
+  over it. The tradeoff is that a failed rebuild leaves the app down, so the
+  compile-error overlay above is not available there and the browser falls back
+  to a normal reconnect.
+- **The stop is cooperative, not a kill.** Windows has no `SIGTERM`, so
+  `autumn dev` sets `AUTUMN_SHUTDOWN_SIGNAL_FILE` and creates that file to
+  request a drain; the runtime then runs the same graceful shutdown a signal
+  triggers on Unix, so `on_shutdown` hooks — including managed Postgres teardown
+  — actually run. The wait is the app's own configured budget
+  (`prestop_grace_secs + shutdown_timeout_secs`) plus headroom for the hooks
+  that run after the drain, not a fixed constant. If the app misses it,
+  `autumn dev` force-stops it and prints a warning saying the hooks may not have
+  run. If a user reports that warning, the app is genuinely hanging in shutdown;
+  it is not a false alarm. The variable is honored on non-Unix targets only.
+
 ## Common failures
 
 | Symptom | Fix |
@@ -96,6 +160,8 @@ clears on the next successful rebuild (issue #1115). See
 | `Error: connection refused` | Database is not running. Start Postgres first. |
 | Compile error shown in terminal | Fix the Rust error; `autumn dev` will retry on next save. |
 | `autumn setup` not found | Run `cargo install autumn-cli --version 0.5.0` |
+| On Windows: `autumn deploy up` refuses with "Tier 2 (WSL2)" | Working as designed (trunk-dev, issue #1616) — it reaches a host over `ssh` and stages secrets with Unix file modes. Run it from a WSL2 shell; see `docs/guide/platform-support.md`. `autumn serve --daemon` is **no longer** in that set (issue #1639) — it runs natively. |
+| On Windows: `autumn serve install-service` fails with an access error | It registers an OS service, so it needs an elevated (Administrator) shell. `autumn doctor`'s `daemon_service` check says so before you hit it. |
 
 ## Stopping
 

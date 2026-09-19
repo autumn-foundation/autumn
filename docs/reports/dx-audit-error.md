@@ -1,5 +1,9 @@
 # Echo: DX Audit Complaint & Fix
 
+> **Resolved.** `AutumnError::internal_server_error` and
+> `AutumnError::internal_server_error_msg` already exist
+> (autumn/src/error.rs), matching `not_found`/`bad_request`/`unprocessable`.
+
 ## Experience (Walkthrough)
 
 I was trying to write an endpoint that could return a 500 error manually if some condition failed.

@@ -1,0 +1,1549 @@
+# Migrating to the next Autumn release (rolling draft)
+
+> **Rolling draft.** This is the in-flight guide for the changes that are not
+> released yet. Every PR that lands a breaking change appends a section here
+> and links this file from its changelog note — which is a file under
+> [`changelog.d/`](../../changelog.d/README.md), not a line in
+> [`CHANGELOG.md`](../../CHANGELOG.md). At release time the file is renamed to
+> `docs/migrations/<version>.md`, its version placeholders are filled in, and
+> the index in [`README.md`](README.md) is updated — see
+> [`docs/release-checklist.md`](../release-checklist.md), *Migration Guide
+> Gate*.
+>
+> The `{X.Y.Z}` placeholders below are deliberate: the gate treats `next.md` as
+> a draft and accepts them (and empty sections) here, so nothing has to be
+> invented for a release that has no changes yet.
+
+## At a glance
+
+- **Old version:** `autumn-web {X.Y.Z}`
+- **New version:** `autumn-web {X.Z.0}`
+- **Expected upgrade effort:** {S / M / L — one paragraph of context}
+- **MSRV delta:** `{old MSRV}` → `{new MSRV}` ({reason, or "unchanged"})
+- **Carried dependency majors:** {e.g. `axum 0.8 → 0.9`, `diesel 2 → 3`,
+  or "none"}
+
+## Summary
+
+One paragraph describing *why* this release is major. Prefer "we want
+these properties, and they required breaking change `X`" over a list of
+unrelated removals.
+
+Link to the [CHANGELOG entry](../../CHANGELOG.md) for the release for the
+full commit-level picture.
+
+## Before you start
+
+- Pin your existing version (`autumn-web = "={X.Y.Z}"`) and commit.
+- Run `cargo update` *before* the upgrade so the subsequent diff is just
+  the major bump.
+- Make sure your test suite is green on the old version. You will want
+  the safety net.
+
+## Step-by-step
+
+1. **Run `autumn upgrade`** — *before* the dependency bump. The release it
+   migrates from is the one your `Cargo.toml` still records, so bumping first
+   leaves nothing in range. It previews every mechanical change this release
+   can apply to your own source — a per-file diff plus a count of affected
+   sites — and writes nothing; re-run with `--apply` to take them. Anything it
+   cannot safely rewrite is listed with `file:line` and a link to the guide
+   section that explains it.
+
+   ```bash
+   cargo install autumn-cli --version {X.Z.0}
+   autumn upgrade            # preview
+   autumn upgrade --apply    # take it
+   ```
+
+2. **Bump the dependency.**
+   ```toml
+   # Cargo.toml
+   [dependencies]
+   autumn-web = "{(X+1).0}"
+   ```
+
+3. **Run `cargo check`.** Work through the compiler errors section by
+   section using the cheat sheet below. Only the changes labelled `review` or
+   `manual` above should still need you.
+
+4. **Apply configuration changes** (see
+   [Configuration changes](#configuration-changes)).
+
+5. **Run the test suite.**
+
+6. **Run the application locally** and exercise each feature at least
+   once. Pay attention to the [Behavior changes](#behavior-changes)
+   section.
+
+## Breaking changes
+
+Repeat the block below for each breaking change. Keep changes grouped by
+area (routing / config / database / …) so readers can skip to what they
+care about.
+
+### {Area}: {Short description}
+
+**Why:** One or two sentences on the motivation.
+
+**Before (`{X.Y}`):**
+
+```rust
+// paste a minimal, compiling example from the old version
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+// paste the equivalent on the new version
+```
+
+**Automation:** `manual` — {why no codemod applies: it needs new arguments, it
+is a configuration or behaviour change, it is only reachable inside a macro, ….
+For a change `autumn upgrade` *does* rewrite, use `auto` (safe by construction:
+renames and import moves) or `review` (rewritten, every site flagged for a
+human) instead, and name the shipped codemod id from
+`autumn-cli/src/upgrade/migrations.rs` in this paragraph.}
+
+Every breaking change carries this label — `scripts/check-migration-guides.sh`
+fails without it, and fails an `auto`/`review` label that names no shipped
+codemod, or a rename-level change left `manual` with no reason (issue #1629).
+
+### TLS: `TlsConfig`, `TlsError` and `SecurityDump` gain mTLS members (#1640)
+
+**Why:** mutual TLS needs a trust store in `[server.tls]`, error variants that
+name what went wrong with it, and a posture-manifest field for the routes that
+require it. Each is additive at the *config* and *document* level — an absent
+`[server.tls.client_auth]` section and a v3 manifest both behave exactly as
+before — but each also widens a Rust type that user code can name.
+
+Three types moved. You are affected only if your code constructs or matches one
+of them exhaustively; none of them changes meaning.
+
+**The `tls` feature does not exempt you from two of the three.** `TlsConfig`
+(`autumn_web::config`) and `SecurityDump` (`autumn_web::route_listing`) live in
+modules that are always compiled, and their new `client_auth` fields are
+unconditional — so an app that has never enabled `tls` and constructs either
+struct literally still gets `E0063: missing field client_auth` after
+upgrading. Only `TlsError` below is behind the non-default `tls` feature; that
+one snippet needs `features = ["tls"]` to compile at all.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::config::TlsConfig;
+
+let tls = TlsConfig {
+    cert_path: Some("fullchain.pem".into()),
+    key_path: Some("privkey.pem".into()),
+    reload_interval_secs: 60,
+    handshake_timeout_secs: 10,
+    acme: None,
+};
+
+match tls_error {
+    autumn_web::tls::TlsError::Expired { .. } => …,
+    // an exhaustive match over every variant
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::config::TlsConfig;
+
+let tls = TlsConfig {
+    cert_path: Some("fullchain.pem".into()),
+    key_path: Some("privkey.pem".into()),
+    reload_interval_secs: 60,
+    handshake_timeout_secs: 10,
+    acme: None,
+    client_auth: None,   // new: no client-certificate verification
+};
+
+match tls_error {
+    autumn_web::tls::TlsError::Expired { .. } => …,
+    // `TlsError` is now `#[non_exhaustive]`; add a catch-all arm
+    _ => …,
+}
+```
+
+`autumn_web::route_listing::SecurityDump` gains `client_auth`, the snapshot the
+security-posture manifest reads. Fill it with `ClientAuthDump::off()` unless you
+are modelling an mTLS deployment. The type exists to carry the dump across the
+`autumn routes audit` boundary, so a literal construction is rare outside tests.
+
+`TlsError`, `ClientAuthMode`, `RejectionReason`, `CaInspection` and
+`CrlInspection` are all `#[non_exhaustive]` from this release, so the next
+variant or field added to any of them will not break you again.
+
+**Automation:** `manual` — the fix is a field initializer or a match arm whose
+correct value depends on what the surrounding code is modelling, so no codemod
+can choose it. Both shapes surface as a compiler error (`E0063` for the missing
+field, `E0004` for the non-exhaustive match), never as a silent behaviour change.
+
+### Audit: `AuditEvent` gains a `metadata` field
+
+**Why:** A retention sweep has to record three facts — which dataset, what
+cutoff, and how many rows it removed (issue #1605) — and `AuditEvent` had
+nowhere to put them. `metadata` is a flat `BTreeMap<String, String>` rather
+than arbitrary JSON so `AuditEvent` keeps `Eq` and a deterministic,
+key-ordered serialization, which is the shape SIEM ingestion expects. It is
+`#[serde(default)]` and skipped when empty, so **archives written before this
+release still deserialize and existing archive lines are unchanged.**
+
+Only code that constructs or destructures `AuditEvent` *by struct literal* has
+to change. `AuditEvent::new(...)` is unaffected, and so is every read of an
+existing field.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::audit::{AuditEvent, AuditStatus};
+
+let event = AuditEvent {
+    timestamp: chrono::Utc::now(),
+    actor_id: "admin-1".into(),
+    action: "user.role.update".into(),
+    target_resource_id: "user-99".into(),
+    ip_address: None,
+    status: AuditStatus::Success,
+};
+```
+
+**After (`{X.Z}`):**
+
+```rust
+use autumn_web::audit::{AuditEvent, AuditStatus};
+
+// Preferred: the constructor, which fills `metadata` with an empty map.
+let event = AuditEvent::new(
+    "admin-1",
+    "user.role.update",
+    "user-99",
+    None,
+    AuditStatus::Success,
+);
+
+// …and, where the extra detail is useful:
+let event = event.with_metadata("reason", "promoted by support ticket 4412");
+```
+
+A struct literal still works if you add `metadata: Default::default()`, but
+prefer the constructor — it is the form that survives the next field.
+
+**Automation:** `manual` — this needs a value for a new field (or a switch to
+the constructor), which no mechanical rewrite can choose safely.
+
+Also additive, and requiring no change: `AuditSink` gains a **provided**
+`purge_before(cutoff, dry_run)` method that defaults to reporting
+"unsupported". Existing sinks keep compiling untouched. Override it if your
+sink stores audit events somewhere that can be pruned in place and you want
+`retention.audit_archives` to reach it — see
+[Data Retention for Framework-Owned Data](../guide/data-retention.md).
+
+### openapi: `Parameter` gains a `description` field
+
+**Why:** A `Query<T>` field that decodes as an array of objects
+(`?items[0][sku]=A-1`) has no OpenAPI `style` that describes it — neither
+RFC 6570 nor OAS 3.x define one. `Parameter` now carries a `description` so
+the generated spec names that encoding instead of staying silent about it
+(issue #2251).
+
+Only code that constructs a `Parameter` *by struct literal*, outside this
+crate, has to change. Every route macro and the OpenAPI generator itself
+already build one field at a time and are unaffected. `Parameter` is behind the
+non-default `openapi` feature, so an app that does not enable it is unaffected
+— the module `autumn_web::openapi` compiles either way, but the type does not
+exist without `features = ["openapi"]`.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::openapi::Parameter;
+
+let param = Parameter {
+    name: "id".to_owned(),
+    location: "path".to_owned(),
+    required: true,
+    schema: serde_json::json!({ "type": "string" }),
+    style: None,
+    explode: None,
+};
+```
+
+**After (`{X.Z}`):**
+
+```rust
+use autumn_web::openapi::Parameter;
+
+let param = Parameter {
+    name: "id".to_owned(),
+    location: "path".to_owned(),
+    required: true,
+    schema: serde_json::json!({ "type": "string" }),
+    style: None,
+    explode: None,
+    description: None,
+};
+
+// …or, now that `Parameter` derives `Default`:
+let param = Parameter {
+    name: "id".to_owned(),
+    location: "path".to_owned(),
+    required: true,
+    schema: serde_json::json!({ "type": "string" }),
+    ..Default::default()
+};
+```
+
+**Automation:** `manual` — this needs a value for a new field (or a switch to
+`..Default::default()`), which no mechanical rewrite can choose safely.
+
+### SSG: `ManifestEntry` / `StaticManifest` are `#[non_exhaustive]`, and generated pages carry their declared `Content-Type`
+
+**Why:** The static-first serve path used to reverse-engineer each cached page's
+`Content-Type` at request time from the route slug and the served file name.
+Because every non-root route is stored as `<route>/index.html`, both clues lie,
+and the heuristic needed three consecutive corrections during review of #1819.
+`autumn build` now records the type each handler declares into
+`dist/manifest.json` and the middleware serves it verbatim (issue #1832). The
+manifest types were sealed in the same release so a future field cannot break
+callers again.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::static_gen::{ManifestEntry, StaticManifest};
+
+let entry = ManifestEntry {
+    file: "about/index.html".to_owned(),
+    revalidate: Some(3600),
+};
+let manifest = StaticManifest {
+    generated_at: timestamp(),
+    autumn_version: "{X.Y.Z}".to_owned(),
+    routes,
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::static_gen::{ManifestEntry, StaticManifest};
+
+let entry = ManifestEntry::new("about/index.html")
+    .with_revalidate(Some(3600))
+    .with_content_type(Some("text/html; charset=utf-8".to_owned()));
+// `new` stamps `generated_at` (Unix-epoch seconds) and `autumn_version` for
+// you; chain `.with_generated_at(fixed)` to pin a reproducible timestamp.
+let manifest = StaticManifest::new(routes);
+```
+
+Exhaustive *destructuring* is sealed too, not just literals — `let
+ManifestEntry { file, revalidate } = entry;` now fails with E0638. Add `..` to
+the pattern (`let ManifestEntry { file, revalidate, .. } = entry;`) or read the
+fields directly.
+
+The on-disk JSON is unaffected in both directions: an existing `dist/` loads
+with `content_type` absent and keeps its previous derived types, and a manifest
+written by this release still carries every key a pre-#1832 runtime requires, so
+a rollback or a rolling deploy sharing one `dist/` volume keeps serving
+statically.
+
+**Automation:** `manual` — the rewrite is not a rename or an import move. A
+struct literal has to become a constructor call plus a variable number of
+`with_*` setters chosen from which fields the literal actually set, and
+`StaticManifest::new` *drops* two of the fields the old literal supplied
+(stamping them itself), so no purely syntactic rewrite is correct. Both types
+are niche (only an app that reads or writes `dist/manifest.json` itself touches
+them), so `cargo check` pointing at each E0639/E0063 is enough.
+
+#### Behaviour change: extensionless `#[static_get]` routes returning `String`
+
+Nothing is recorded unless the handler *deliberately* declared a type, so
+routes that name their own extension are unaffected: `/theme.css` returning a
+`String` still serves `text/css`, because axum's `text/plain; charset=utf-8` is
+a default from the return type rather than a statement about the page.
+
+That check is by value, because axum's inferred default and a hand-written
+declaration of the same type produce byte-identical responses. Only axum's two
+exact spellings are treated as inferred, so if you deliberately want
+`text/plain` or `application/octet-stream` on a route whose extension is in
+Autumn's asset table, declare it distinctly — bare `text/plain`, or
+`application/octet-stream` with a parameter — and it is recorded. Prefer
+`Content-Disposition: attachment` for downloads. Extensions outside the asset
+table (`.pdf`, `.zip`) always keep the declared type.
+
+An **extensionless** route is the one visible change. `#[static_get("/about")]
+async fn about() -> String { html }` has no extension to fall back on, so it is
+now served as the `text/plain; charset=utf-8` axum declares, instead of the
+`text/html` the old heuristic assumed — the same thing that route already served
+on the dynamic path (in dev, or on a manifest miss). Return `Markup` or
+`Html<String>` and the page is `text/html` on both paths:
+
+```rust
+#[static_get("/about")]
+async fn about() -> Markup { html! { h1 { "About" } } }   // text/html
+```
+
+For a non-HTML route, declare the type explicitly — this is now the whole
+contract, and it is what makes types the old heuristic could never produce
+(`application/rss+xml` from `/feed`) work at all:
+
+```rust
+#[static_get("/feed")]
+async fn feed() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "application/rss+xml")], build_feed())
+}
+```
+
+An existing `dist/` records nothing and keeps its previous derived behaviour
+until the next `autumn build`.
+
+One operational note: ISR does not rewrite the manifest, so a regeneration whose
+handler declares a *different* type than was recorded is refused (logged at
+`error`, with the previous page still served) rather than writing bytes the
+recorded header would mislabel. Re-run `autumn build` after changing a static
+route's `Content-Type`.
+
+### Failure capsules: `capsule::execute` takes `ReplayFixtures`, and the capsule format is version 3
+
+**Why:** Capsules now record every framework effect a failing run produced —
+outbound HTTP, job enqueues, cache reads and writes, mail sends, the resolved
+tenant, and the random bytes it drew (issue #1634) — and replay serves all of
+them from the capsule. A replay is only deterministic if the clock, the entropy
+source and the effect tape all come from the *same* capsule, so `execute` takes
+one value that bundles them instead of a loose clock.
+
+Two consequences beyond the signature. The document's `format_version` bumps
+`2 → 3`, so **capsules recorded by an older Autumn are refused** rather than
+replayed with every new seam empty — a reader that tolerated them would report a
+verdict on an application shape production never ran. And an outbound HTTP call
+during replay is now *served from the capsule* instead of failing closed; a call
+the capsule never recorded is still refused, and is reported as a divergence.
+
+**Before:**
+
+```rust
+let clock = ReplayClock::new(capsule.clock.clone(), fallback);
+let outcome = capsule::execute(router, &capsule, divergences, Some(&clock)).await;
+```
+
+**After:**
+
+```rust
+let fixtures = ReplayFixtures::from_capsule(&capsule);
+// The router is now built *through* the fixtures, so the clock and the
+// entropy source it serves come from the same capsule the verdict judges.
+let router = TestApp::new()
+    .routes(routes![charge])
+    .with_clock(fixtures.clock())
+    .with_entropy(fixtures.entropy())
+    .build()
+    .into_router();
+let outcome = capsule::execute(router, &capsule, divergences, &fixtures).await;
+```
+
+Two smaller source breaks travel with it, both from added fields on
+non-`#[non_exhaustive]` types, so only struct-literal construction and
+wildcard-less `match`es are affected:
+
+* `ClientError` gains `ReplayedRequestFailure(String)` — a recorded outbound
+  transport failure, reproduced as a failure rather than downgraded to a
+  status. A `match` on `ClientError` without a `_` arm needs it.
+* `Capsule` gains `effects` and `job`, and `ReplayOutcome` gains
+  `effect_divergences`. Build capsules with
+  `capsule::schema::test_support::capsule(...)` (behind `test-support`) rather
+  than a struct literal, or add `..Default::default()`-style fields explicitly.
+
+One behaviour change worth knowing even though it does not break compilation:
+during a replay an outbound HTTP call is now **served from the capsule**
+instead of failing closed. A call the capsule never recorded is still refused,
+and is reported as an effect divergence rather than silently dialling. The
+recording answers a call only when its method, URL, caller-set headers *and*
+body match — the same endpoint with a different payload is a divergence — and
+a mail send is compared against its recorded body as well as its recipients
+and subject — and against its sender when the replayed run chose one, since a
+message that sets no `from` inherits `[mail] from` at send time and a replay
+boots without mail configuration.
+
+Three situations now produce a refusal or an incomplete capsule where an
+earlier build would have graded the run. A **job capsule whose payload was
+masked** by `[log] filter_parameters` is refused: a handler is handed its
+payload verbatim, so it would parse the `[FILTERED]` placeholder rather than
+the value production ran on. A run that **enqueued inside its own
+transaction** (`enqueue_on_conn`) marks its capsule incomplete, because that
+enqueue is also a job-row INSERT on the database tape which replay can serve
+but never issue. And an **effect whose future was cancelled** before it
+finished — a losing `tokio::select!` branch, a timeout — does the same rather
+than persist an outcome the run never had. Each case previously produced a
+verdict; each now says why it cannot.
+
+Two API changes come with the sharper failure reproduction. `ClientError` gains
+`ReplayedRequestFailure` and `MailError` gains `ReplayedFailure`, both of which
+print their recorded text and nothing else; a `match` on either enum without a
+`_` arm needs the new variant. Recorded failures are otherwise rebuilt as the
+variant production produced, so code branching on
+`ClientError::CircuitBreakerOpen` or `MailError::AllRecipientsSuppressed`
+behaves during replay as it did live.
+
+A **panicking job** now leaves a capsule on whatever attempt it panicked on.
+All three backends dead-letter a panic immediately regardless of remaining
+attempts, so a job configured with `max_attempts = 25` that panics on its
+first attempt never reaches a "final" one — and under the previous gate never
+produced a capsule at all. Ordinary failures are unchanged: still captured on
+the final attempt only.
+
+Capsules already on disk are not migrated: replay them with the version that
+wrote them, or re-record the failure. A committed regression corpus is
+re-recorded and re-converted the same way — `autumn capsule verify` reports
+every stale capsule as `UNREADABLE` and exits non-zero, deliberately, so a
+corpus cannot quietly stop testing anything. See
+[Failure Capsules › Compatibility across Autumn versions](../guide/failure-capsules.md).
+
+**Automation:** `manual` — the new argument is a value the caller has to
+construct from the capsule, and there is no textual rewrite that can invent it;
+`autumn upgrade` ships no codemod for this. Direct callers of `capsule::execute`
+are limited to code that drives replay itself, which is rare outside the
+framework.
+
+---
+
+### Config: `AutumnConfig` gains a `replication` field
+
+**Why:** Continuous SQLite replication (issue #1628) needs its own configuration
+section, and `AutumnConfig` has all-public fields with no `#[non_exhaustive]`, so
+adding one is a breaking change for anyone constructing the struct literally.
+Almost nobody does — `AutumnConfig::default()` and `..Default::default()` are the
+documented ways to build one, and both keep compiling.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::config::AutumnConfig;
+
+let config = AutumnConfig {
+    server: my_server_config,
+    database: my_database_config,
+    // …every other field spelled out…
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::config::AutumnConfig;
+
+let config = AutumnConfig {
+    server: my_server_config,
+    database: my_database_config,
+    ..AutumnConfig::default()
+};
+```
+
+The new field is `pub replication: Option<Box<ReplicationConfig>>`, `None` by
+default, so `..Default::default()` needs no other change. Nothing about an app
+that does not configure `[replication]` behaves differently.
+
+**Automation:** `manual` — a struct-literal expression can only be rewritten by
+knowing which fields the caller meant to leave defaulted, which a codemod cannot
+infer; the fix is the one-line `..AutumnConfig::default()` above.
+
+### Config: `JobConfig` gains a `sqlite` field, and `SchedulerBackend` gains a `Sqlite` variant
+
+**Why:** Durable jobs and a single-host scheduler on SQLite (issue #1907) need
+their own configuration. `JobConfig` has all-public fields and `SchedulerBackend`
+is not `#[non_exhaustive]`, so both additions are breaking for anyone who
+constructs the struct literally or matches the enum exhaustively.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::config::{JobConfig, SchedulerBackend};
+
+let jobs = JobConfig {
+    backend: "postgres".to_owned(),
+    workers: 4,
+    // …every other field spelled out…
+};
+
+let label = match config.scheduler.backend {
+    SchedulerBackend::InProcess => "single process",
+    SchedulerBackend::Postgres => "fleet",
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::config::{JobConfig, SchedulerBackend};
+
+let jobs = JobConfig {
+    backend: "postgres".to_owned(),
+    workers: 4,
+    ..JobConfig::default()
+};
+
+let label = match config.scheduler.backend {
+    SchedulerBackend::InProcess => "single process",
+    SchedulerBackend::Postgres => "fleet",
+    SchedulerBackend::Sqlite => "processes on one host",
+    _ => "unknown",
+};
+```
+
+The new field is `pub sqlite: JobSqliteConfig`, whose `Default` is a 30-second
+visibility timeout and a 250ms poll interval, so `..Default::default()` needs no
+other change. `SchedulerBackend::Sqlite` reports `is_fleet_distributed() == true`
+— it coordinates several processes, on one host.
+
+Nothing changes for an app that keeps `jobs.backend` and `scheduler.backend` as
+they are.
+
+**Automation:** `manual` — a struct literal can only be rewritten by knowing
+which fields the caller meant to default, and a match arm needs a decision about
+what the new variant means for that call site.
+
+### Media rooms: `RoomStore` gains a required `heartbeat` method
+
+Mesh-room participants can now hold a seat with an explicit heartbeat, not only
+by polling the roster (see
+[the media guide](../guide/media.md)). `autumn_media_plugin::rooms::RoomStore` is
+the documented swap seam for a custom room-state backend, so the new operation is
+a required trait method with no default body: an out-of-tree `impl RoomStore`
+stops compiling until it implements
+
+```rust
+fn heartbeat<'a>(
+    &'a self,
+    namespace: &'a str,
+    room_id: &'a str,
+    participant_id: &'a str,
+    token: &'a str,
+    token_ttl: Duration,
+) -> RoomStoreFuture<'a, DateTime<Utc>>;
+```
+
+It must verify `token` against `participant_id` in constant time and by value,
+set that participant's `last_seen_at` to now, renew `token_expires_at` to
+`now + token_ttl` **without rotating the token value**, and return the renewed
+expiry. Every miss — unknown room, namespace mismatch, unknown participant,
+wrong token — returns `RoomError::RoomNotFound`, so a heartbeat cannot probe room
+existence or membership. `InMemoryRoomStore` and `DbRoomStore` are the reference
+implementations. There is no default body on purpose: a store that silently did
+nothing would let the reaper evict live participants.
+
+**Automation:** `manual` — the body depends on how the store holds its state.
+
+### admin-plugin: `ExperimentChange::changed_at` is now `NaiveDateTime`
+
+`autumn-admin-plugin` could not compile at all under the `autumn-web/sqlite`
+backend (#2108). One cause was the `Timestamptz` SQL type, which diesel
+implements for `Pg` only. `autumn_admin_plugin::experiments::ExperimentChange`
+is public, and the Rust field type decides which SQL type the generated DSL
+binds, so the field had to change:
+
+```diff
+ pub struct ExperimentChange {
+     …
+-    pub changed_at: chrono::DateTime<chrono::Utc>,
++    pub changed_at: chrono::NaiveDateTime,
+ }
+```
+
+Three things change for code that names the type:
+
+- **The field type.** Call `.and_utc()` on the field to get the old
+  `DateTime<Utc>` back. The value is the same instant.
+- **The `Serialize` output.** `changed_at` now serializes as
+  `"2024-01-15T12:34:56"`, with no `Z`. A consumer that parses strict RFC 3339
+  needs the offset added back, or a `serde` attribute of its own.
+- **The derived OpenAPI schema.** The property loses
+  `"format": "date-time"` and stays `"type": "string"`, so a generated client
+  gets a plain string where it had a timestamp.
+
+Nothing changes on the database. The `autumn_experiment_changes.changed_at`
+column stays `timestamptz`, and no migration is needed. Postgres sends
+`timestamp` and `timestamptz` in the same binary form — microseconds from
+2000-01-01 UTC — so the value read is identical, whatever the session time
+zone. `autumn-admin-plugin/tests/experiment_admin_db.rs` asserts that on a
+non-UTC session.
+
+**Automation:** `manual` — one call to `.and_utc()` at each use site.
+
+### Capacity contracts: three metadata structs gain fields
+
+Deploys can now carry a proven capacity contract (`autumn calibrate` →
+`capacity.lock` → `[server] capacity_contract`; see
+[the guide](../guide/capacity-contracts.md)). Nothing about existing behaviour
+changes — an app that configures no contract sheds exactly as before — but the
+feature adds fields to three public, non-`#[non_exhaustive]` structs, so
+**struct-literal construction** of them no longer compiles:
+
+* `openapi::ApiDoc` gains `pools: &'static [&'static str]` — the pool tags a
+  handler's declared extractors prove it holds.
+* `route_listing::RouteInfo` gains `resource_shape: ResourceShape` and
+  `pools: Vec<String>`.
+* `config::ServerConfig` gains `capacity_contract: Option<String>`.
+
+All three derive `Default`, so the fix is to end the literal with
+`..Default::default()` — which is what every construction site inside the
+workspace already does, and what the route macros emit. Field access, pattern
+matching with a `..` rest, and deserialization of an older routes dump are all
+unaffected: the two `RouteInfo` fields are `#[serde(default)]`.
+
+**Automation:** `manual` — `autumn upgrade` ships no codemod for this. The edit
+is mechanical (end the literal with `..Default::default()`), but a rewrite
+cannot tell an exhaustive struct literal that *wants* to name every field from
+one that simply predates these three, and appending a rest pattern to the wrong
+literal would silently paper over a genuinely missing value on a later field
+addition. Direct struct-literal construction of all three types is rare outside
+the framework: `ApiDoc` and `RouteInfo` are macro-emitted, and `ServerConfig` is
+normally deserialized from `autumn.toml`.
+
+### Jobs: `JobAdminRecord` gains a `blocked_on_concurrency` field
+
+**Why:** On the Redis backend a job that waits for a free concurrency slot is
+parked in a `{prefix}:blocked` zset and promoted back to its queue every
+~100 ms. The `/admin/jobs` enqueued tab read the queue lists only, so a parked
+job blinked in and out of the table (issue #1186). The tab now lists the queues
+and the parked set as one page, and the new field tells the two apart, so the
+dashboard can mark a row "waiting on a concurrency slot" instead of showing it
+as ready to claim.
+
+`JobAdminRecord` is public and not `#[non_exhaustive]`, so **struct-literal
+construction** of it no longer compiles. Only a custom `JobAdminBackend` builds
+one; reading a field, and every built-in backend, are unaffected. The built-in
+local, Postgres and SQLite backends report `false`: they keep an over-cap job in
+`enqueued` status, so it never leaves the tab in the first place.
+
+`JobAdminRecord` now derives `Default`, so the fix is to end the literal with
+`..Default::default()` — and that form survives the next field too.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::job::{JobAdminRecord, JobAdminStatus};
+
+let record = JobAdminRecord {
+    id: "job-1".to_owned(),
+    name: "send_email".to_owned(),
+    queue: "default".to_owned(),
+    status: JobAdminStatus::Enqueued,
+    enqueued_at: None,
+    scheduled_for: None,
+    started_at: None,
+    finished_at: None,
+    attempt: 1,
+    max_attempts: 5,
+    last_error: None,
+    principal_id: None,
+    correlation_id: None,
+};
+```
+
+**After (`{X.Z}`):**
+
+```rust
+use autumn_web::job::{JobAdminRecord, JobAdminStatus};
+
+let record = JobAdminRecord {
+    id: "job-1".to_owned(),
+    name: "send_email".to_owned(),
+    queue: "default".to_owned(),
+    status: JobAdminStatus::Enqueued,
+    attempt: 1,
+    max_attempts: 5,
+    // Set it to `true` only for a job your backend parks on a full
+    // concurrency slot.
+    blocked_on_concurrency: false,
+    ..Default::default()
+};
+```
+
+`JobAdminStatus` also derives `Default` now (`Enqueued`), which is what makes
+the spread work. Both derives are additive.
+
+**Automation:** `manual` — `autumn upgrade` ships no codemod for this. The edit
+is mechanical, but a rewrite cannot tell a literal that means to name every
+field from one that simply predates this one, and appending a rest pattern to
+the wrong literal would hide a genuinely missing value on a later field
+addition.
+
+### Scrub: a `DELETE` trigger or rule on a table `autumn db scrub` empties is refused
+
+`[framework] purge` and `[sample] never_include` both promise a table ends up
+empty, and both are enforced by a pass that runs **after** the column rewrites —
+it has to, or an audit trigger firing during those rewrites re-fills the table
+with the very PII being removed.
+
+The cost is that this pass's own `DELETE`s are the run's last write. An archive
+trigger on one of those tables therefore fires after every rewrite, and can copy
+the rows it is removing into an ordinary classified table that has already been
+scrubbed — leaving real values in a table the run reports as clean, and in any
+`--output` artifact taken from it.
+
+No ordering avoids this: the trigger graph decides where each write lands, and
+it can be cyclic. No postcondition catches it either, because a trigger body can
+write anywhere the scrub never looks. So the run refuses before writing
+anything, `--check` and `--dry-run` included:
+
+```text
+✗ 1 table(s) this run empties carry a user-defined trigger or rewrite rule that fires on `DELETE`:
+    - audit_logs
+```
+
+**Who is affected.** Only a target whose purged or `never_include` tables carry
+a user-defined `DELETE` trigger or an `ON DELETE` rewrite rule that can fire — a
+trigger declared on a leaf partition of such a table counts, since
+`DELETE FROM parent` fires it, while a rule does not, because a rule fires only
+on the relation the statement names. `INSERT`/`UPDATE`-only triggers are
+unaffected and still merely warn, a trigger or rule disabled with
+`ALTER TABLE ... DISABLE TRIGGER` / `ALTER RULE` does not count, and a target
+with neither behaves exactly as before. This reaches an unsampled
+`autumn db scrub` too, wherever `[framework] purge` names a table with one.
+
+A session already running under `session_replication_role = replica` is refused
+separately and for the same reason: that setting inverts which triggers fire, so
+the set the run inspected is not the set that would run.
+
+**The fix.** Drop or disable the trigger on the copy before scrubbing — which is
+already the advice the scrub's trigger warning gives:
+
+```sql
+ALTER TABLE audit_logs DISABLE TRIGGER audit_archive;
+-- or, for a rewrite rule
+DROP RULE audit_archive ON audit_logs;
+```
+
+Scrub a restored copy rather than a live database, and this costs nothing: the
+trigger exists for the production system's audit trail, which the copy does not
+need.
+
+**Automation:** `manual` — `autumn upgrade` ships no codemod for this, and could
+not: the change is a refusal against the shape of the *target database*, not
+against anything in your source tree, so there is no code for a rewrite to find.
+Whether a given trigger may be dropped on the copy is a judgement about that
+copy's purpose, and the refusal names the exact tables when it fires.
+
+### ACME: `AcmeRenewalTask` gains `dns` and `recovery`, `AcmeConfig` gains `dns`
+
+Wildcard certificates over the DNS-01 challenge
+([the guide](../guide/tls.md#wildcard-certificates-via-dns-01-servertlsacmedns))
+add two fields to `acme::renewal::AcmeRenewalTask` and one to
+`config::AcmeConfig`. Everything here is behind the off-by-default `acme`
+feature, and an app that configures no `[server.tls.acme.dns]` section behaves
+exactly as before — HTTP-01, unchanged.
+
+* `AcmeRenewalTask::dns: Option<acme::renewal::DnsChallenge>` — the DNS-01
+  wiring. `None` keeps issuance on the HTTP-01 path.
+* `AcmeRenewalTask::recovery: Option<acme::renewal::RecoveryFn>` — invoked after
+  an issuance that succeeded following a recorded failure, so the app can clear
+  the operator alert its reporter raised.
+* `AcmeConfig::dns: Option<config::AcmeDnsConfig>` — the deserialized
+  `[server.tls.acme.dns]` section.
+
+Only **struct-literal construction** is affected, which in practice means test
+harnesses: the framework builds `AcmeRenewalTask` itself, and `AcmeConfig` is
+deserialized from `autumn.toml`. Neither type derives `Default`, so the fix is
+to name the fields.
+
+**Before (`{X.Y}`):**
+
+```rust
+let task = AcmeRenewalTask {
+    resolver,
+    provider,
+    store,
+    cert_id,
+    tokens,
+    status,
+    config,
+    serving_stored_cert: false,
+    leadership_degraded: false,
+    renew_window_misconfigured: AtomicBool::new(false),
+};
+```
+
+**After (`{X.Z}`):**
+
+```rust
+let task = AcmeRenewalTask {
+    // …unchanged fields…
+    renew_window_misconfigured: AtomicBool::new(false),
+    dns: None,      // Some(DnsChallenge { .. }) to issue over DNS-01
+    recovery: None, // Some(callback) to clear an operator alert on recovery
+};
+```
+
+The new **output** types in `acme::dns` — the parsed DNS answer, its records,
+the propagation-timeout detail, the credential, and the HTTP request/response —
+are `#[non_exhaustive]` from the start, so fields can be added to those without
+a break. `AcmeConfig`, `AcmeDnsConfig`, `AcmeRenewalTask` and `DnsChallenge`
+deliberately are not: callers construct them by struct literal and they have no constructor, so
+sealing them would make them unbuildable outside this crate. That is the same
+trade-off `config::ServerConfig` makes.
+
+**Automation:** `manual` — `autumn upgrade` ships no codemod. The edit is two
+lines in a test harness, and a rewrite cannot tell an `AcmeRenewalTask` literal
+that means "HTTP-01" from one whose author intended to configure DNS-01;
+defaulting to `None` silently would be right in the first case and wrong in the
+second, which is exactly the choice a human should make.
+
+### Authorize: aliased `#[authorize]` and ambiguous attribute shapes are now a compile error
+
+**Why:** A security review (🛡 Warden) found that `#[authorize]` reached
+through `use ::autumn_web::authorize as x;` was invisible to the
+macro-expansion-time checks that decide who serves a cached
+`.idempotent()` reply — because a proc-macro attribute only ever sees the
+tokens of the item it annotates, never the enclosing module's `use`
+declarations. That let an idempotency-replay cache serve a stale "allowed"
+response after the requester's authorization was revoked, skipping
+`#[authorize]`'s policy re-check entirely. A syntactic heuristic (detecting
+`#[authorize]` by its argument *shape* instead of its literal name) was
+tried and found unsafe in the *other* direction during review: it could
+misclassify an unrelated attribute that happens to share the same argument
+grammar, silently breaking `.idempotent()`'s dedup guarantee instead. No
+heuristic can resolve the ambiguity correctly in both directions, so Autumn
+now refuses to compile it.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::authorize as authz; // or any other alias
+
+#[autumn_web::post("/notes/{id}")]
+#[authz("update", resource = Note)]
+async fn update_note(note: Note) -> AutumnResult<&'static str> {
+    // ...
+}
+```
+
+This compiled — and, with `AppBuilder::idempotent()` turned on, was
+vulnerable to the stale-replay bypass above.
+
+This refusal fires when the aliased or shape-alike attribute is still
+present, unexpanded, at the point a route/guard macro (`#[post]`,
+`#[secured]`, `#[step_up]`, `#[throttle]`, `#[feature_flag]`) expands and
+scans for it — which is always true for the documented, natural attribute
+order shown above (`#[post(...)]` above `#[authz(...)]`, so `#[post]`
+expands first and sees the alias still raw below it). Written the other way
+around — the aliased or shape-alike attribute *above* the route macro — it
+expands first on its own and is gone from the attribute list by the time
+any Autumn macro runs, so this specific refusal never fires for it. That
+ordering doesn't reopen a gap, though: a genuine aliased `#[authorize]`
+positioned there still runs for real and leaves its own recognizable
+in-body check, which every route/guard macro's fallback body-scan already
+detects (the same mechanism that makes a *literal* `#[authorize]` above
+`#[post]` work correctly); an unrelated, non-Autumn attribute positioned
+there just expands as whatever it actually is and leaves nothing
+authorize-shaped behind, so the route is correctly treated as unguarded
+rather than falsely protected.
+
+**After (`{X.Z}`):**
+
+```rust
+use autumn_web::authorize; // spell it by its real name — no alias
+
+#[autumn_web::post("/notes/{id}")]
+#[authorize("update", resource = Note)]
+async fn update_note(note: Note) -> AutumnResult<&'static str> {
+    // ...
+}
+```
+
+`#[authorize]` used under its literal name and applied unconditionally,
+exactly as every other Autumn macro normally is, is unaffected — this only
+closes the alias case. This includes a literal `#[authorize(...)]` reached
+through `#[cfg_attr(predicate, authorize(...))]`: the compiler resolves
+`cfg_attr` before Autumn's route/guard macros ever see the attribute, so it
+behaves exactly like any other `cfg_attr`-conditional attribute (fully
+present or fully absent depending on the predicate, decided by the
+compiler, not guessed at by a macro) — nothing new to migrate there. An
+*aliased* name behind `cfg_attr` is still caught by this same change, since
+by the time it reaches Autumn's ambiguity check the wrapper is already gone
+and it's indistinguishable from an ordinary aliased `#[authorize]`.
+
+If instead the compile error fires on an attribute that is genuinely
+**not** `#[authorize]` (a custom or third-party attribute that happens to
+share its `"action", resource = Type[, from = ident]` argument grammar —
+an `#[audit("update", resource = Note)]`, say), rename that attribute so
+its shape no longer collides. Autumn cannot tell the two cases apart from
+tokens alone, which is exactly why it refuses both rather than guessing.
+
+**Automation:** `manual` — the fix is a `use` statement and an attribute
+spelling change, or renaming an unrelated attribute, which depends on which
+of the two cases above applies; no mechanical rewrite can tell them apart.
+See
+[`docs/security/2026-09-08-aliased-authorize-idempotency-bypass/`](../security/2026-09-08-aliased-authorize-idempotency-bypass/README.md)
+for the full threat model and review history.
+
+### static_get: `#[feature_flag]` is now a compile error
+
+**Why:** Found while reviewing the `#[authorize]` fix above. A
+`#[static_get]` route's cache hits are served by the static-first
+middleware before the inner router — and the handler along with it — is
+ever reached, which is exactly why `#[secured]`/`#[step_up]`/`#[throttle]`/
+`#[authorize]` are already refused in combination with it (see
+`static_route.rs`'s existing `INCOMPATIBLE_GUARD_MSG`). `#[feature_flag]`'s
+pre-body gate has the identical shape but was never added to that refusal,
+so a `#[feature_flag]`-gated `#[static_get]` route compiled successfully
+while silently not working the way it looked: once a page was cached, a
+later-disabled flag no longer hid it — the cache kept serving the
+pre-rendered content regardless of the flag's live value.
+
+**Before (`{X.Y}`):**
+
+```rust
+#[autumn_web::static_get("/beta-page")]
+#[autumn_web::feature_flag("beta_page")]
+async fn beta_page() -> &'static str {
+    "..."
+}
+```
+
+This compiled, and pre-rendered/cached the page at build time; disabling
+`beta_page` afterward did not stop the cached page from being served.
+
+**After (`{X.Z}`):**
+
+```rust
+use autumn_web::feature_flags::{FeatureFlagService, InMemoryFlagStore};
+use axum::{extract::{Request, State}, http::StatusCode, middleware::Next, response::Response};
+use std::sync::Arc;
+
+// AppBuilder::static_gate runs a Tower/axum layer before a cache hit, so
+// -- unlike a #[feature_flag] attribute on the handler -- it can actually
+// gate a pre-rendered page. It runs outside the app's own router, before
+// AppState exists, so the flag service can't be pulled from there the way
+// #[feature_flag]'s extractor does -- construct and share it explicitly
+// instead, and register the *same* store with the app via
+// `.with_flag_store(...)` so both see the same flag state.
+async fn beta_page_gate(
+    State(flags): State<FeatureFlagService>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if req.uri().path() == "/beta-page" && !flags.is_enabled("beta_page", None) {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(axum::body::Body::empty())
+            .unwrap();
+    }
+    next.run(req).await
+}
+
+let store = Arc::new(InMemoryFlagStore::new());
+let flags = FeatureFlagService::new(store.clone());
+
+let app = autumn_web::app()
+    .static_gate(axum::middleware::from_fn_with_state(flags, beta_page_gate))
+    .with_flag_store(store);
+
+#[autumn_web::static_get("/beta-page")]
+async fn beta_page() -> &'static str {
+    "..."
+}
+```
+
+**Automation:** `manual` — moving the gate from an attribute to
+`AppBuilder::static_gate` is a structural change no codemod can make safely
+(it needs the app's `AppBuilder` chain, not just the handler function).
+
+### repository: `owner = column` next to `api = "..."` now requires `policy`
+
+**Why:** Found during a Warden security review of `#[repository]`'s
+auto-generated CRUD API. `owner = <column>` only ever emitted opt-in
+`list_scoped(owner_id, ..)` / `search_page_scoped(owner_id, ..)` repository
+methods for a hand-written handler to call with an explicit owner id — the
+generated `api = "..."` HTTP handlers never called them. Declared on its own
+next to `api = "..."`, `owner` therefore compiled to a fully public REST API
+that read, at the declaration site, like a per-owner-scoped one: `GET <api>`
+returned every user's rows, and `GET`/`PUT`/`DELETE <api>/{id}` let any
+authenticated caller read, overwrite, or delete any other user's row by id.
+
+`scope = Type` does not close this on its own either: it only filters `GET
+<api>`'s SQL query (a performance optimization for the list endpoint), and
+has no effect on `_api_get`/`_api_update`/`_api_delete` — only `policy =
+Type` gates those (`can_show`/`can_update`/`can_delete`). An initial version
+of this fix accepted `scope` as an alternative to `policy`, which still left
+every single-record route unguarded; that gap was caught in review before
+merge, so the gate now requires `policy` unconditionally.
+
+**Before (`{X.Y}`):**
+
+```rust
+#[autumn_web::repository(Note, table = "notes", api = "/api/notes", owner = author_id)]
+pub trait NoteRepository {}
+```
+
+This compiled, and `GET /api/notes/{id}` (also `PUT`/`DELETE`) served or
+mutated *any* note by id, and `GET /api/notes` returned every user's notes —
+`owner = author_id` had no effect on any of the five generated routes. So
+did adding `scope = Type` alone: the list endpoint would then filter
+correctly, but `GET`/`PUT`/`DELETE /api/notes/{id}` stayed wide open.
+
+**After (`{X.Z}`):** add `policy = Type`, comparing `ctx.user_id_i64()`
+against the owner column in `can_show`/`can_update`/`can_delete`:
+
+```rust
+#[autumn_web::repository(
+    Note, table = "notes", api = "/api/notes",
+    owner = author_id, policy = NotePolicy,
+)]
+pub trait NoteRepository {}
+
+impl autumn_web::authorization::Policy<Note> for NotePolicy {
+    // can_show/can_update/can_delete compare ctx.user_id_i64() against
+    // note.author_id (or ctx.has_role("admin")); see
+    // autumn/tests/integration/repository_authorization.rs for a worked example.
+}
+```
+
+Keep `scope = Type` alongside `policy` if you also want the list endpoint's
+cheaper SQL-level filter instead of `policy`'s in-memory `can_show` sweep —
+`scope` is accepted as an addition to `policy`, never as a replacement for
+it. Or drop `api = "..."` entirely and call the generated
+`list_scoped`/`search_page_scoped` methods from your own hand-written,
+owner-checked routes.
+
+**Automation:** `manual` — what the policy actually checks is an application
+decision no codemod can make.
+
+### Lifecycle: an unsound `#[lifecycle]` graph is now a compile error
+
+**Why:** `#[lifecycle]` proved its *endpoints* — every `initial`, `terminal` and
+transition endpoint is a real variant, and a terminal has no outgoing edge — but
+never the shape of the graph those edges form. Two structural faults still
+compiled: a state unreachable from `initial`, which no machine can ever enter,
+and a reachable non-terminal state with no path to a terminal, which traps a
+machine that enters it.
+
+`autumn lifecycle check` reported both, but it scans source rather than
+resolving it: a `#[lifecycle]` reached through a cross-file alias or a glob
+re-export is skipped (#1925), so an unsound lifecycle spelled that way passed
+the gate and shipped. The macro sees every declaration however it is spelled, so
+the proof belongs there.
+
+**Before (`{X.Y}`):**
+
+```rust
+#[lifecycle(
+    initial = Pending,
+    terminal(Delivered),
+    transitions(
+        Pending -> OnHold,
+        Pending -> Paid,
+        Paid -> Delivered,
+    )
+)]
+pub enum OrderState {
+    Pending,
+    OnHold,     // reachable, non-terminal, no way out
+    Paid,
+    Delivered,
+    Refunded,   // no transition targets it
+}
+```
+
+This compiled. `autumn lifecycle check` failed on it — unless the attribute was
+spelled through a cross-file alias, in which case nothing caught it.
+
+**After (`{X.Z}`):**
+
+```text
+error: state `Refunded` is unreachable from initial state `Pending` of lifecycle `OrderState` — add a transition into it, or remove the variant
+error: state `OnHold` is a non-terminal dead-end of lifecycle `OrderState`: no declared transition path reaches a terminal state — add an outgoing transition, or declare it terminal
+```
+
+Fix each named state one of three ways: add the missing transition, drop the
+variant, or declare the state terminal.
+
+**One case needs a different fix.** An enum bound to a persisted column with
+`#[state_machine(lifecycle = <Enum>)]` may carry a state that exists only as an
+*entry* state for created rows — an `Imported` or `Migrated` value no edge
+targets. `#[lifecycle]` declares one entry point, `initial`, so such a state now
+reads as unreachable. Either give it an edge from `initial`, or drop
+`#[lifecycle]` for that field and declare the table inline with
+`#[state_machine(transitions(...))]`, which is runtime-checked and applies no
+reachability rule. See
+[Declarative State Machines](../guide/state-machines.md).
+
+**Automation:** `manual` — the fix depends on which state the author meant to be
+reachable, which no codemod can infer.
+
+### OpenApiSchema: `#[serde(skip_serializing_if)]` now needs `#[serde(default)]`
+
+**Why:** `skip_serializing_if` governs serialization alone — a response may omit
+the field, while serde still rejects a *request* that omits it. The derive used
+to accept the attribute whenever the field was spelled `Option<T>`, treating
+that as proof omission is valid on the way in. It is only proof for `std`'s
+`Option`, and a proc macro cannot tell: it sees the tokens as written, so an
+application's own type named `Option` reads identically and *is* required on the
+way in. For such a type neither answer is right — marking the property
+`required` lets a response omit what the schema demands, marking it optional
+lets a client omit what serde rejects — so the shape is refused rather than
+guessed. `#[serde(default)]` is what actually makes omission valid in both
+directions, and it is a no-op on a real `Option<T>`, which serde already fills
+with `None` when the field is missing.
+
+**Before (`0.7`):**
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, autumn_web::openapi::OpenApiSchema)]
+struct Profile {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nickname: Option<String>,
+}
+```
+
+**After (`0.8`):**
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, autumn_web::openapi::OpenApiSchema)]
+struct Profile {
+    name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nickname: Option<String>,
+}
+```
+
+**Automation:** `manual` — the fix is one attribute, but deciding it is the
+right fix is not mechanical. On a genuine `Option<T>` adding `#[serde(default)]`
+changes nothing and is always correct; on any other type it changes what serde
+accepts, so a codemod that added it everywhere would silently widen a request
+contract. `#[model]` is unaffected: its read schema describes a response only,
+so a conditionally-skipped column there stays sound without the attribute.
+
+## Plugin authors
+
+This release **adds** plugin-facing surface and removes none, so no plugin that
+compiles today stops compiling. Two things do change for you: `autumn
+plugin-check` gains a check your plugin has to satisfy (see the end of this
+section), and `ConformanceConfig` is now `#[non_exhaustive]`.
+
+See [`docs/plugins.md`](../plugins.md#the-plugin-api-contract) for the full
+contract and [`STABILITY.md`](../../STABILITY.md#the-plugin-api-surface-issue-1601)
+for the policy.
+
+- **Stable surface changed:** one, and only for a construction style nothing
+  in this repository used. **Breaking:** `plugin_conformance::ConformanceConfig`
+  gains a `contract` field and is now `#[non_exhaustive]`, so a struct literal
+  (`ConformanceConfig { plugin_name, expected_prefix, .. }`) no longer compiles.
+  Build it the documented way instead — the fluent constructors are unchanged:
+
+  ```rust,ignore
+  let config = ConformanceConfig::new("autumn-plugin-mine")
+      .prefix("/mine")
+      .sensitive_route("/mine", "Role: admin required");
+  ```
+
+  `#[non_exhaustive]` lands with the field on purpose: it is what lets a later
+  release add a check's configuration without doing this to you twice. See the
+  [migration guide](next.md).
+
+  Nothing else was removed, renamed, or re-signatured. The surface that already
+  existed is now *declared* stable in
+  `autumn_web::plugin_contract::PLUGIN_SURFACES` and compiled on every commit by
+  the pinned `autumn-plugin-reference` crate.
+- **Experimental surface changed:** none. `AppBuilder::with_edge_kv` and
+  `autumn_edge::host` are now labelled experimental, matching what
+  `STABILITY.md` already said about the edge capsule lane (issue #1790).
+- **New stable surface:**
+  - `Plugin::contract` — declare the `autumn-web` range your plugin supports.
+    Defaults to `None`, so implementing it is optional.
+  - `autumn_web::plugin_contract` — `PluginContract`, `PLUGIN_SURFACES`,
+    `SurfaceTier`, `evaluate`, `lockstep_range`, `lockstep_contract`, and the
+    `PLUGIN_CONTRACT_MARKER` dump protocol.
+  - `AppBuilder::plugin_contracts()` — the contracts declared by the plugins
+    mounted on a builder.
+  - `ConformanceConfig::contract(...)` and
+    `plugin_conformance::check_experimental_surface(...)` — the
+    `experimental-surface` check, runnable from your own test suite.
+  - `autumn_web::db::Pool` and `autumn_web::reexports::diesel_migrations` — so a
+    plugin implementing `DatabasePoolProvider` or shipping migrations through
+    `AppBuilder::plugin_migrations` can name what those seams need without
+    taking its own `diesel-async` / `diesel-migrations` dependency. (Both were
+    found by writing the reference plugin: the seams were declared plugin-facing
+    and were not reachable from stable API.)
+- **Declared range to move to:** `autumn-web {X.Y}` — add
+  `.autumn_web("{X.Y}")` to your `Plugin::contract` and re-run
+  `autumn plugin-check --plugin-name <your-plugin>`. A plugin that releases in
+  lockstep with the framework can write
+  `.autumn_web(lockstep_range(env!("CARGO_PKG_VERSION")))` instead and never
+  touch the literal again — or write the whole `Plugin::contract` body in one
+  call with the new `lockstep_contract(env!("CARGO_PKG_NAME"),
+  env!("CARGO_PKG_VERSION"))`, which every first-party plugin in this
+  repository now does (previously each wrote out the three-call construction
+  by hand).
+
+**Breaking for the `plugin-check` command, and only for it.** Two checks join
+the report. `plugin-contract` **fails** when the plugin under check declares no
+usable `autumn-web` range; `experimental-surface` reports what the plugin
+declares and fails only on a name that cannot be resolved against the registry.
+
+So: your plugin still *compiles and runs* unchanged whether or not it declares
+a contract — that part is genuinely additive. But if your CI runs
+`autumn plugin-check --plugin-name <your-plugin>`, it goes red until you
+implement `Plugin::contract`. That is deliberate: this is the author-facing
+gate, and "you have not said which framework versions you support" is exactly
+what it exists to say. Implementing the four-line `contract()` above clears it.
+
+Both checks **skip** against a host binary built on an `autumn-web` that
+predates the contract dump, so an older host app does not turn them red — but
+`--deny-experimental` fails closed in that case rather than silently passing,
+because a flag that forbids something must not quietly become a no-op.
+
+`autumn generate plugin` now scaffolds `Plugin::contract` and a conformance
+test that passes it, so a freshly generated plugin is green out of the box.
+
+## Compiler error cheat sheet
+
+Paste the most common errors a user will hit and the fix. This is the
+single most valuable section of the guide — keep it factual and short.
+
+| Error message (truncated) | Where you see it | Fix |
+|---------------------------|------------------|-----|
+| `error[E0432]: unresolved import \`autumn_web::foo\`` | module reorganized | `use autumn_web::<new path>;` |
+| `error[E0061]: this function takes 2 arguments but 1 was supplied` | `App::run` added a parameter | see [Breaking changes › {Area}] |
+
+## Configuration changes
+
+**New `[server.tls.client_auth]` section** (additive; absent means the listener
+requests no client certificate, exactly as before). It turns #1603's TLS
+listener into a mutual-TLS one, verifying the caller against a PEM bundle of
+client CAs:
+
+```toml
+[server.tls.client_auth]
+mode           = "required"                          # off (default) | optional | required
+ca_bundle_path = "/etc/autumn/tls/client-ca.pem"     # one or more PEM CAs
+crl_path       = "/etc/autumn/tls/client-ca.crl.pem" # optional revocation list
+required_paths = ["/internal/"]                      # routes that demand a certificate
+```
+
+Startup fails, naming the path, when the bundle or CRL is missing, unparseable
+or empty; when `mode` is not `off` and no `ca_bundle_path` is set; and when
+`required_paths` is non-empty under `mode = "off"` (those routes would reject
+every request). Like the sibling `[server.tls.acme]` table, these keys have no
+`AUTUMN_SERVER__TLS__*` environment override. See the
+[TLS guide](../guide/tls.md#mutual-tls-verifying-client-certificates-servertlsclient_auth).
+
+**New `[server.tls.acme.dns]` section** (additive; absent means HTTP-01, exactly
+as before). It names a DNS provider and the *credentials-store key* holding that
+provider's API credential — never the credential itself. The section is
+`deny_unknown_fields`, so an `api_token = "..."` written into `autumn.toml` is a
+startup error naming the key rather than a plaintext secret nobody notices:
+
+```toml
+[server.tls.acme]
+domains = ["myapp.com", "*.myapp.com"]   # a wildcard is now accepted…
+contact_email = "ops@myapp.com"
+
+[server.tls.acme.dns]                    # …when this section is present
+provider = "cloudflare"                  # cloudflare | route53 | exec
+```
+
+A wildcard entry in `[server.tls.acme] domains` is rejected at startup **unless**
+this section is configured, because no CA validates a wildcard identifier over
+HTTP-01.
+
+**New environment variables**, which override the encrypted credentials store
+field for field:
+
+| Variable | Field |
+|---|---|
+| `AUTUMN_ACME_DNS_API_TOKEN` | `api_token` (Cloudflare) |
+| `AUTUMN_ACME_DNS_ACCESS_KEY_ID` | `access_key_id` (Route 53) |
+| `AUTUMN_ACME_DNS_SECRET_ACCESS_KEY` | `secret_access_key` (Route 53) |
+| `AUTUMN_ACME_DNS_SESSION_TOKEN` | `session_token` (Route 53) |
+| `AUTUMN_ACME_DNS_HOSTED_ZONE_ID` | `hosted_zone_id` (Route 53) |
+| `AUTUMN_ACME_DNS_REGION` | `region` (Route 53) |
+
+### New: `[replication]` (continuous SQLite replication)
+
+Optional and off by default; an app that does not add the section is unaffected.
+Every key has an `AUTUMN_REPLICATION__*` environment override, and credentials
+are named by environment variable rather than inlined — the same posture as
+`[backup.offsite]`. See
+[SQLite in production → Durability](../guide/sqlite-in-production.md#durability-continuous-replication-and-point-in-time-restore).
+
+When `[replication] enabled = true`, pooled SQLite connections are created with
+`PRAGMA wal_autocheckpoint = 0` so the replicator is the only component that
+checkpoints. That is a deliberate behaviour change for replicating apps and is
+described in the guide; apps without the section keep SQLite's default
+auto-checkpointing.
+
+### New: `[jobs.sqlite]` (durable SQLite job queue)
+
+Read only when `jobs.backend = "sqlite"`; every other backend ignores it. Two
+keys, both with `AUTUMN_JOBS__SQLITE__*` environment overrides:
+`visibility_timeout_ms` (default 30 000) bounds how long a claim a crashed
+worker left behind stays unreclaimed, and `poll_interval_ms` (default 250) sets
+how fast an idle worker sees work another process enqueued. See
+[SQLite in production → Durable jobs without Redis](../guide/sqlite-in-production.md#durable-jobs-without-redis).
+
+`scheduler.backend = "sqlite"` needs no new section: it reuses
+`scheduler.lease_ttl_secs` and `scheduler.key_prefix`.
+
+## Behavior changes
+
+### HTTPS: the listener's connect-info type changed (#1640)
+
+Only the **in-process TLS listener** (`[server.tls]`) is affected; the plain-TCP
+and Unix-socket paths are untouched.
+
+The HTTPS serve arm now hands axum a `TlsConnectInfo` (peer address plus the
+verified client identity, when there is one) instead of a bare `SocketAddr`, and
+a new framework layer immediately re-stamps `ConnectInfo<SocketAddr>` from it.
+So `ClientAddr`, trusted-proxy resolution, IP-keyed rate limiting, SSE and
+`wss://` all behave exactly as before, and a handler extracting
+`ConnectInfo<SocketAddr>` keeps compiling and keeps resolving the real peer.
+
+One case needs a change: a handler that extracted the HTTPS connect-info by some
+other route — say a custom layer reading `ConnectInfo<SocketAddr>` *outside* the
+framework stack, or a test that wires `axum::serve` over
+`autumn_web::tls::TlsListener` by hand. Wire such a test the way the framework
+does:
+
+```rust
+use autumn_web::tls::{TlsConnectInfo, client_auth::ClientIdentityLayer};
+
+let service = tower::Layer::layer(&ClientIdentityLayer, router);
+let make_service =
+    axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
+        TlsConnectInfo,
+    >(service);
+```
+
+The previous `listener.tap_io(|_io| {})` wrapper is no longer needed.
+
+### CI: `autumn upgrade` adds a blocking dependency audit — add `deny.toml` with it
+
+`.github/workflows/ci.yml` is framework-owned, so `autumn upgrade --apply`
+reconciles it and your project picks up the new dependency-advisory gate
+(issue #1600): it runs `cargo deny check advisories` on every push and fails
+the build on a known RustSec advisory.
+
+That audit reads a `deny.toml` at your project root, which `autumn new` writes
+for new projects and the upgrade deliberately does **not** create — its waiver
+list is yours, and a file you are asked to edit must never come back as an
+upgrade conflict. Add it in the same commit as the upgrade:
+
+Generate a throwaway project with the release you are upgrading to, **using the
+same flags you originally scaffolded with**, and copy its policy in. The flags
+matter: `--bundled-pg` apps pull the embedded-Postgres build stack, so their
+policy carries a second waiver (`RUSTSEC-2024-0384`, `instant`) that other
+flavors deliberately do not ship. A donor generated without your flags installs
+a policy that fails your first audit.
+
+```bash
+cd /tmp
+autumn new policy-donor          # add your original flags here, e.g. --bundled-pg
+cd -
+cp /tmp/policy-donor/deny.toml ./deny.toml
+rm -rf /tmp/policy-donor
+git add deny.toml
+```
+
+Without it the audit step stops before auditing and tells you exactly this —
+it does not fall back to an unwaived default policy and fail on an advisory
+Autumn has already triaged (`rsa`/RUSTSEC-2023-0071, which reaches every
+Autumn app through `jsonwebtoken` and has no patched release).
+
+Then read [the advisory gate](../guide/supply-chain.md#part-3a--the-advisory-gate-known-vulnerable-dependencies)
+for how to read a failure and how to waive an advisory. Never disable the step
+to get green: an edited `ci.yml` becomes a conflict on every later upgrade.
+
+Other changes that still compile but behave differently at runtime. Examples:
+
+- Error responses adopted a new JSON shape.
+- A default middleware is now ordered differently.
+- A scheduled task now runs on a different worker.
+
+## Deprecations retained from `{X.Y}`
+
+Items that were deprecated during the `{X.Y}` line and have now been
+removed. Link each to the release where the deprecation notice first
+appeared so users can see how much warning they had.
+
+### Config-key removals
+
+Config keys removed in this major release were registered in
+`DEPRECATED_CONFIG_KEYS` (`autumn/src/config.rs`) with `remove_in = "{X+1}.0.0"`.
+Startup issued a `WARN` log entry for each deprecated key detected in the config
+(via `since = "{X.Y}"`), and `autumn doctor` surfaced them in the
+`deprecated_keys` check.
+
+For each removed config key, fill in the table below:
+
+| Removed key (TOML / env var) | Replacement | Deprecated since | References |
+|------------------------------|-------------|------------------|------------|
+| `section.old_key` / `AUTUMN_SECTION__OLD_KEY` | `section.new_key` | `{X.Y}.0` | (link to changelog) |
+
+If no config keys were removed, delete this subsection.
+
+## Upstream dependency updates
+
+For each major dependency bump carried with this release:
+
+- Link to that project's upstream migration notes.
+- Call out any of their changes that leak through Autumn's public API.
+
+If no majors were carried, delete this section.
+
+## How to verify
+
+The reader's proof the upgrade landed. Keep it to concrete, checkable steps —
+commands with expected output, not "make sure everything works". Required by
+`scripts/check-migration-guides.sh`.
+
+1. `cargo check` — clean, with none of the errors in the cheat sheet above.
+2. `cargo test` — the suite is green on the new version.
+3. `autumn doctor --strict` — no findings.
+4. {one step per breaking change: the observable behaviour that proves the fix
+   was applied, e.g. "hit `/x` and confirm the response carries `Y`"}
+
+### Guide-only upgrade walkthrough
+
+(The heading keeps its historical name; the walk-through itself is
+codemod-first.) Upgrade an app scaffolded with `autumn new` on the **previous** release
+**codemod-first** — `autumn upgrade` before any manual step — using only this
+guide for what remains, and record the result here before publishing to
+crates.io. See [`docs/release-checklist.md`](../release-checklist.md),
+*Migration Guide Gate*.
+
+- **Codemod:** {the `autumn upgrade` invocation the walk-through ran first, and
+  what it covered. Required once this release ships any `auto`/`review`
+  codemod; the remaining manual steps below must be only the `review`/`manual`
+  changes.}
+- **Status:** pending
+  {the value must *begin* with `performed YYYY-MM-DD` once the walk-through is
+  done, or `backfilled` for a guide written after its release shipped;
+  `pending` is accepted only while this file is still `next.md`}
+- **From → to:** `autumn-cli {X.Y.Z}` app upgraded to `autumn-web {X.Z.0}`
+- **Elapsed:** {minutes — the budget is under 30 for a guide-only
+  walk-through, and under 10 once `autumn upgrade` covers this release's
+  rename-level changes (issue #1629)}
+- **Gaps found and fixed in this guide:** {none, or what the walk-through
+  exposed}
+
+## Troubleshooting
+
+Known rough edges, workarounds, and known-good version combinations
+(e.g. "use `diesel 2.2.5+` — earlier `2.2.x` releases have a known
+`pq-sys` linkage issue on macOS").
+
+## Reporting problems
+
+If you hit something not covered here, please open an issue at
+<https://github.com/autumn-foundation/autumn/issues> with:
+
+- The error message or unexpected behavior.
+- The old version you upgraded from.
+- A minimal reproduction if possible.
+
+Migration guides are living documents — we update them based on user
+reports for the first few months after a major release.

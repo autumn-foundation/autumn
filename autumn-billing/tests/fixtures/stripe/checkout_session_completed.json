@@ -1,0 +1,37 @@
+{
+  "id": "evt_test_checkout_1",
+  "object": "event",
+  "api_version": "2025-08-27.basil",
+  "created": 1788998400,
+  "livemode": false,
+  "pending_webhooks": 1,
+  "request": { "id": "req_test_checkout_1", "idempotency_key": null },
+  "type": "checkout.session.completed",
+  "data": {
+    "object": {
+      "id": "cs_test_1",
+      "object": "checkout.session",
+      "cancel_url": "https://app.test/billing/cancel",
+      "client_reference_id": "local-customer-1",
+      "created": 1788998100,
+      "currency": "usd",
+      "customer": "cus_test_1",
+      "customer_details": {
+        "address": null,
+        "email": "buyer@example.com",
+        "name": "Test Buyer",
+        "phone": null,
+        "tax_exempt": "none"
+      },
+      "expires_at": 1789084500,
+      "livemode": false,
+      "metadata": {},
+      "mode": "subscription",
+      "payment_status": "paid",
+      "status": "complete",
+      "subscription": "sub_test_1",
+      "success_url": "https://app.test/billing/success",
+      "url": null
+    }
+  }
+}

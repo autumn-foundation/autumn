@@ -8,10 +8,18 @@
 //! Because the merged model's fields are concrete `T` (not `Patch<T>`), this
 //! path enforces the validators that hit hard `E0119` trait-coherence walls on
 //! `Patch<T>` — `ip` on an `Option<_>` column and `does_not_contain` — and the
-//! cross-field / struct-level ones (`custom`) that no single-field `Patch<T>`
-//! trait can express. All of them are still (correctly) dropped from the
-//! `Update{Model}` `Patch<T>` fields by the denylist, so the *only* thing that
-//! rejects an invalid-once-merged patch here is the merged-model check.
+//! cross-field / struct-level ones (`custom`, `must_match`) that no
+//! single-field `Patch<T>` trait can express. All of them are still
+//! (correctly) dropped from the `Update{Model}` `Patch<T>` fields by the
+//! denylist, so the *only* thing that rejects an invalid-once-merged patch
+//! here is the merged-model check. (The last item of #1751's residual list,
+//! `nested`, is not exercised in this file: it would be enforced here through
+//! the same generic mechanism as `custom`, but it also carries a separate,
+//! `ValidateExt`-collision hazard -- scoped to the model's own defining
+//! module -- that has nothing to do with merged-model validation itself. See
+//! `ValidateExt`'s doc comment in `autumn/src/validation.rs` and the
+//! `tests/compile-fail/validate_nested_collides_with_validate_ext.rs` /
+//! `tests/compile-pass/validate_nested_without_validate_ext.rs` fixture pair.)
 //!
 //! Living in the consolidated `integration_tests` binary makes
 //! `cargo build --tests -p autumn-web` the compile-time regression guard: the
@@ -157,6 +165,91 @@ fn from_patch_rejects_custom_invalid_once_merged() {
         err.status(),
         autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY
     );
+}
+
+// ── `must_match` (issue #1751 residual gap) ─────────────────────────────────
+//
+// `must_match` is cross-field: validator's `validate_must_match<T: Eq>(a, b)`
+// only needs `Eq`, which `Patch<T>` derives, so it DOES compile on a
+// `Patch<T>` field pair -- like `ip`/`does_not_contain`, it compiles with the
+// wrong semantics rather than failing to compile at all. Comparing the raw
+// `Patch<T>` values means `Set(v)` on one side against `Unchanged`/`Clear` on
+// the other (whenever only one of the pair is touched by the patch) would
+// spuriously fail even though nothing invalid was submitted. So it is dropped
+// from the `Update{Model}` patch field the same way `custom` is, and enforced
+// here on the merged concrete struct, where `password`/`password_confirm` are
+// ordinary `String`s being compared to each other, not to a tri-state
+// sentinel.
+
+mod cross_field_schema {
+    autumn_web::reexports::diesel::table! {
+        cross_field_hosts (id) {
+            id -> Int8,
+            password -> Text,
+            password_confirm -> Text,
+        }
+    }
+}
+use cross_field_schema::cross_field_hosts;
+
+#[autumn_web::model(table = "cross_field_hosts")]
+pub struct CrossFieldHost {
+    #[id]
+    pub id: i64,
+    #[validate(must_match(other = "password_confirm"))]
+    pub password: String,
+    pub password_confirm: String,
+}
+
+fn valid_cross_field_current() -> CrossFieldHost {
+    CrossFieldHost {
+        id: 1,
+        password: "secret1".to_string(),
+        password_confirm: "secret1".to_string(),
+    }
+}
+
+#[test]
+fn update_model_patch_struct_still_drops_must_match() {
+    let patch = UpdateCrossFieldHost {
+        password: Patch::Set("new-secret".to_string()),
+        password_confirm: Patch::Set("does-not-match".to_string()),
+    };
+    // `must_match` is create-only on the patch struct — a mismatched pair
+    // validates cleanly there. The merged model (below) is what enforces it.
+    assert!(
+        patch.validate().is_ok(),
+        "must_match must remain create-only on the patch struct"
+    );
+}
+
+#[test]
+fn from_patch_rejects_must_match_invalid_once_merged() {
+    let current = valid_cross_field_current();
+    let patch = UpdateCrossFieldHost {
+        password: Patch::Set("new-secret".to_string()),
+        ..Default::default()
+    };
+    let err = <UpdateDraft<CrossFieldHost> as CrossFieldHostDraftExt>::from_patch(&current, &patch)
+        .expect_err("a merged password/password_confirm mismatch must be rejected");
+    assert_eq!(
+        err.status(),
+        autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY,
+        "merged-model must_match failures must surface as 422"
+    );
+}
+
+#[test]
+fn from_patch_accepts_must_match_valid_once_merged() {
+    let current = valid_cross_field_current();
+    let patch = UpdateCrossFieldHost {
+        password: Patch::Set("secret2".to_string()),
+        password_confirm: Patch::Set("secret2".to_string()),
+    };
+    let draft =
+        <UpdateDraft<CrossFieldHost> as CrossFieldHostDraftExt>::from_patch(&current, &patch)
+            .expect("a matching password/password_confirm merge must pass validation");
+    assert_eq!(draft.after().password, "secret2");
 }
 
 #[test]

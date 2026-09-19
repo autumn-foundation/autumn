@@ -49,6 +49,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
+use std::fmt::Write as _;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -168,6 +169,10 @@ struct McpTool {
     /// (e.g. an HTML handler tagged `status = 204`) can't leak its body into
     /// the tool result.
     empty_body: bool,
+    /// The handler's build-time authority envelope (#1691), or `None` for an
+    /// ungoverned tool. Drives the invocation's audit record and the
+    /// reversibility-derived `destructiveHint`.
+    agent_authority: Option<&'static crate::agent_authority::AgentAuthority>,
 }
 
 impl McpTool {
@@ -213,6 +218,10 @@ pub(crate) struct McpWiring {
     /// marked [`LoadShedExempt`](crate::middleware::LoadShedExempt) to avoid
     /// consuming a second slot for the same logical request.
     pub envelope_load_shed: bool,
+    /// The application state, so `tools/call` can reach the installed
+    /// [`AuditLogger`](crate::audit::AuditLogger) and the injected entropy seam
+    /// without any per-handler wiring (#1691).
+    pub state: crate::state::AppState,
 }
 
 /// The shared MCP server state attached to the endpoint handler. Holds the
@@ -252,6 +261,10 @@ pub struct McpServer {
     /// replayed `tools/call` dispatch from double-counting against the same
     /// shared `LoadShedLayer` instance.
     envelope_load_shed: bool,
+    /// The application state. `tools/call` writes its agent-authority audit
+    /// records through this (#1691); an app with no `AuditLogger` installed
+    /// makes those writes a no-op, so nothing here is conditional on one.
+    state: crate::state::AppState,
     server_name: String,
     server_version: String,
 }
@@ -355,13 +368,18 @@ fn default_port(scheme: &str) -> Option<&'static str> {
 
 /// Decide whether a route's `ApiDoc` should be projected as a tool.
 ///
+/// `pub(crate)` for one reason: `agent_authority::manifest` carries an
+/// unconditional copy of this rule (it must report the agent surface even when
+/// the `mcp` feature is off), and a unit test there pins the copy equal to this
+/// original so the two cannot drift.
+///
 /// Eligibility (JSON-out) gates everything: HTML/Maud routes have no response
 /// schema and are silently ineligible. On top of that:
 /// * `mcp_exclude` always wins.
 /// * an explicit `mcp` opt-in always exposes (any verb).
 /// * under the whole-API hatch, un-tagged `GET`s are auto-included but
 ///   mutating verbs are not.
-fn should_expose(doc: &ApiDoc, expose_all: bool) -> bool {
+pub(crate) fn should_expose(doc: &ApiDoc, expose_all: bool) -> bool {
     if doc.hidden || doc.mcp_exclude {
         return false;
     }
@@ -414,15 +432,41 @@ const fn has_empty_body_contract(status: u16) -> bool {
     matches!(status, 204 | 205)
 }
 
-/// MCP safety annotations derived purely from the HTTP verb.
-fn annotations_for(method: &str, title: &str) -> Value {
+/// MCP safety annotations for a derived tool.
+///
+/// `readOnlyHint` is a statement about the HTTP verb and nothing else.
+///
+/// `destructiveHint` takes the verb as a **floor**, never as a fallback the
+/// grant can talk its way under. A declared
+/// [`Reversibility`](crate::agent_authority::Reversibility) can only ever *add*
+/// the warning: it raises a `POST`/`PATCH` that the verb alone says nothing
+/// about, and it cannot clear the one `DELETE` already carries.
+///
+/// That asymmetry is deliberate. `reversible` means the compiler proved the
+/// effect set is bounded writes only — it does **not** mean the application can
+/// put the row back, and nothing here checks for soft-delete or versioning. An
+/// MCP client skips its confirmation prompt on `destructiveHint: false`, so
+/// letting one unproved adjective in a grant clear a `DELETE`'s warning would
+/// trade a real signal for an unverified claim (issue #1691 review, P2-1).
+fn annotations_for(
+    method: &str,
+    title: &str,
+    authority: Option<&'static crate::agent_authority::AgentAuthority>,
+) -> Value {
+    use crate::agent_authority::Reversibility;
+
     let upper = method.to_ascii_uppercase();
     let read_only = is_read_only(&upper);
     let mut obj = serde_json::Map::new();
     obj.insert("title".into(), json!(title));
     obj.insert("readOnlyHint".into(), json!(read_only));
     // DELETE is the destructive verb; flag it so agents/UIs can warn.
-    if upper == "DELETE" {
+    let verb_is_destructive = upper == "DELETE";
+    if let Some(authority) = authority {
+        let destructive =
+            authority.grant.reversibility != Reversibility::Reversible || verb_is_destructive;
+        obj.insert("destructiveHint".into(), json!(destructive));
+    } else if verb_is_destructive {
         obj.insert("destructiveHint".into(), json!(true));
     }
     Value::Object(obj)
@@ -543,10 +587,6 @@ enum SchemaDegradation {
     /// The `body` property resolved to a bare `{"type":"object"}` placeholder,
     /// so the tool advertises no body fields.
     OpaqueBody,
-    /// A `query` field is itself a nested object (or an array of objects) — a
-    /// shape `serde_urlencoded` (which `Query<T>` delegates to) cannot parse,
-    /// so dispatch of such an argument could never round-trip to the handler.
-    NestedQuery,
 }
 
 /// Resolve a schema node through a single `#/$defs/X` indirection (the form
@@ -563,57 +603,6 @@ fn resolve_local_ref<'a>(root: &'a Value, node: &'a Value) -> &'a Value {
     node
 }
 
-/// True when `schema` is the opaque object placeholder the spec generator emits
-/// for a type with no real `OpenApiSchema` (`{"type":"object","title":…}` with
-/// no `properties`). A derived/registered object always carries a `properties`
-/// key (even if empty), so a legitimately field-less struct is not flagged.
-fn is_opaque_object(schema: &Value) -> bool {
-    schema.get("type").and_then(Value::as_str) == Some("object")
-        && schema
-            .as_object()
-            .is_none_or(|map| !map.contains_key("properties"))
-}
-
-/// True when a `oneOf`/`anyOf` branch is the `{"type":"null"}` arm the
-/// `OpenApiSchema` derive emits for the `None` case of an `Option<T>` field.
-fn is_null_branch(branch: &Value) -> bool {
-    branch.get("type").and_then(Value::as_str) == Some("null")
-}
-
-/// True when `schema` (already ref-resolved) is a nested object or an array of
-/// objects — the shapes flat `serde_urlencoded` query decoding cannot handle.
-///
-/// A nullable query field (`Option<Struct>`, `Option<Vec<Struct>>`) derives to a
-/// `oneOf`/`anyOf` with the nested-shape branch plus a `{"type":"null"}` branch
-/// and therefore carries no top-level `type`; unwrap those wrappers and treat the
-/// field as nested when ANY non-null branch is itself nested, so a nullable
-/// structured query field warns exactly like its non-nullable form (issue #1972).
-fn is_nested_query_shape(root: &Value, schema: &Value) -> bool {
-    if let Some(branches) = schema
-        .get("oneOf")
-        .or_else(|| schema.get("anyOf"))
-        .and_then(Value::as_array)
-    {
-        return branches
-            .iter()
-            .filter(|branch| !is_null_branch(branch))
-            .map(|branch| resolve_local_ref(root, branch))
-            .any(|branch| is_nested_query_shape(root, branch));
-    }
-
-    match schema.get("type").and_then(Value::as_str) {
-        // A non-placeholder object nested under a query field.
-        Some("object") => schema
-            .as_object()
-            .is_some_and(|map| map.contains_key("properties")),
-        Some("array") => schema
-            .get("items")
-            .map(|items| resolve_local_ref(root, items))
-            .is_some_and(|items| is_nested_query_shape(root, items)),
-        _ => false,
-    }
-}
-
 /// Inspect a built `inputSchema` for the degradations in [`SchemaDegradation`].
 ///
 /// Pure and self-contained (no logging) so it is unit-testable; [`derive_tools`]
@@ -628,26 +617,19 @@ fn detect_schema_degradations(
 
     if has_body
         && let Some(body) = props.and_then(|p| p.get("body"))
-        && is_opaque_object(resolve_local_ref(input_schema, body))
+        && crate::openapi::is_opaque_object_schema(resolve_local_ref(input_schema, body))
     {
         out.push(SchemaDegradation::OpaqueBody);
     }
 
-    if has_query && let Some(query) = props.and_then(|p| p.get("query")) {
-        let resolved = resolve_local_ref(input_schema, query);
-        if is_opaque_object(resolved) {
-            out.push(SchemaDegradation::OpaqueQuery);
-        } else if let Some(fields) = resolved.get("properties").and_then(Value::as_object) {
-            // A `Query<T>` whose schema is real but has a nested/object-of-array
-            // field can't round-trip through `serde_urlencoded`.
-            let nested = fields
-                .values()
-                .map(|field| resolve_local_ref(input_schema, field))
-                .any(|field| is_nested_query_shape(input_schema, field));
-            if nested {
-                out.push(SchemaDegradation::NestedQuery);
-            }
-        }
+    // A nested/array query field is NOT a degradation: `Query<T>` decodes the
+    // bracketed dialect `build_request` renders it into (issue #1972), so the
+    // advertised structure round-trips. Only a missing field-level schema is.
+    if has_query
+        && let Some(query) = props.and_then(|p| p.get("query"))
+        && crate::openapi::is_opaque_object_schema(resolve_local_ref(input_schema, query))
+    {
+        out.push(SchemaDegradation::OpaqueQuery);
     }
 
     out
@@ -677,15 +659,6 @@ fn warn_on_degraded_input_schema(doc: &ApiDoc, input_schema: &Value) {
                 "MCP tool query has no field-level schema (opaque object); derive or \
                  impl `OpenApiSchema` on the `Query<T>` type so the tool advertises \
                  its real query parameters instead of a bare `{{\"type\":\"object\"}}` placeholder"
-            ),
-            SchemaDegradation::NestedQuery => tracing::warn!(
-                operation_id = doc.operation_id,
-                method = doc.method,
-                path = doc.path,
-                "MCP tool query advertises a nested object/array-of-object field; \
-                 `Query<T>` decodes with `serde_urlencoded`, which is strictly flat and \
-                 cannot parse nested query parameters — move the structured input to a \
-                 JSON request body (`Json<T>`) so it round-trips losslessly"
             ),
         }
     }
@@ -773,7 +746,7 @@ pub fn derive_tools(
             name: doc.operation_id.to_owned(),
             description: doc.description.or(doc.summary).map(str::to_owned),
             input_schema,
-            annotations: annotations_for(doc.method, title),
+            annotations: annotations_for(doc.method, title, doc.agent_authority),
             method: doc.method.to_owned(),
             path_template: doc.path.to_owned(),
             path_params: doc.path_params.iter().map(|p| (*p).to_owned()).collect(),
@@ -783,6 +756,7 @@ pub fn derive_tools(
             empty_body: doc.response.is_none()
                 && has_empty_body_contract(doc.success_status)
                 && !doc.mcp_stream,
+            agent_authority: doc.agent_authority,
         });
     }
     tools
@@ -805,6 +779,7 @@ pub struct McpToolInfo {
     has_query: bool,
     streams: bool,
     empty_body: bool,
+    agent_authority: Option<&'static crate::agent_authority::AgentAuthority>,
 }
 
 impl McpToolInfo {
@@ -852,6 +827,19 @@ impl McpToolInfo {
     pub const fn streams(&self) -> bool {
         self.streams
     }
+
+    /// The build-time authority envelope proved for the handler behind this
+    /// tool by `#[agent_operable(grant = ...)]` (issue #1691), or `None` for an
+    /// **ungoverned** tool — one exposed to agents with no grant declared.
+    ///
+    /// Copied verbatim from [`ApiDoc::agent_authority`], so a tool is governed
+    /// exactly when its handler is. `tools/call` reads it to record the
+    /// compile-known grant and reversibility on the invocation's audit events,
+    /// and the manifest reads it to tell `actions` from `ungoverned_tools`.
+    #[must_use]
+    pub const fn agent_authority(&self) -> Option<&'static crate::agent_authority::AgentAuthority> {
+        self.agent_authority
+    }
 }
 
 impl McpServer {
@@ -873,6 +861,7 @@ impl McpServer {
                 has_query: t.has_query,
                 streams: t.streams,
                 empty_body: t.empty_body,
+                agent_authority: t.agent_authority,
             })
             .collect();
         let by_name = tools
@@ -890,6 +879,7 @@ impl McpServer {
             csrf_header: wiring.csrf_header,
             envelope_rate_limited: wiring.envelope_rate_limited,
             envelope_load_shed: wiring.envelope_load_shed,
+            state: wiring.state,
             server_name: "autumn-mcp".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
@@ -1107,20 +1097,24 @@ struct ReplayContext<'a> {
     headers: &'a HeaderMap,
     identity: Option<&'a crate::security::ResolvedClientIdentity>,
     peer: Option<std::net::SocketAddr>,
+    /// The verified mTLS client identity of the connection the `/mcp` envelope
+    /// arrived on (#1640), when there is one.
+    #[cfg(feature = "tls")]
+    client_cert: Option<std::sync::Arc<crate::tls::client_auth::ClientIdentity>>,
 }
 
 /// Reject an untrusted `Host`/`:authority` or a disallowed browser `Origin`
 /// before the request body is buffered.
 ///
 /// The `/mcp` envelope is merged after `apply_middleware`, so it does not pass
-/// through the global [`trusted_host_middleware`](crate::router) every direct
+/// through the global `TrustedHostLayer` in [`crate::router`] that every direct
 /// route runs; this layer restores that gate for the endpoint. Running as a
 /// layer (rather than inside `serve_mcp`) means a bad-`Host` request is rejected
 /// before the handler's `Bytes` extractor reads up to the configured
 /// `max_request_size_bytes`, exactly as a direct route rejects in middleware
 /// before handler extraction.
 ///
-/// Host resolution mirrors `trusted_host_middleware`: the proxy-resolved
+/// Host resolution mirrors `TrustedHostService`: the proxy-resolved
 /// identity first (honouring `X-Forwarded-Host` from trusted upstreams), then
 /// the HTTP/2 `:authority` carried in the request URI, then the `Host` header —
 /// so an HTTP/2 client that sends `:authority` without a `Host` header is not
@@ -1185,10 +1179,18 @@ async fn serve_mcp(
     connect_info: Option<
         axum::extract::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     >,
+    // The verified mTLS client identity of this connection (#1640), stamped by
+    // `ClientIdentityLayer`. Read as an `Extension` for the same
+    // optional-friendly reason `connect_info` is.
+    #[cfg(feature = "tls")] client_cert: Option<
+        axum::extract::Extension<std::sync::Arc<crate::tls::client_auth::ClientIdentity>>,
+    >,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let identity = identity.as_ref().map(|ext| &ext.0);
+    #[cfg(feature = "tls")]
+    let client_cert = client_cert.map(|ext| ext.0);
 
     // Capture the request `Origin` (if any) so the actual JSON-RPC response can
     // carry the matching CORS grant, mirroring the `OPTIONS` preflight.
@@ -1201,7 +1203,7 @@ async fn serve_mcp(
     // `mcp_host_origin_guard` layer (applied in `build_mcp_router`) rather than
     // here, so an untrusted Host or disallowed Origin is rejected *before* this
     // handler buffers `body` up to the configured `max_request_size_bytes` —
-    // mirroring how direct routes reject in `trusted_host_middleware` before
+    // mirroring how direct routes reject in `TrustedHostService` before
     // handler extraction.
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -1218,6 +1220,8 @@ async fn serve_mcp(
         headers: &headers,
         identity,
         peer: connect_info.map(|ext| (ext.0).0),
+        #[cfg(feature = "tls")]
+        client_cert,
     };
 
     let mut response = match parsed {
@@ -1424,6 +1428,710 @@ fn single_tools_call(msg: &Value) -> Option<(Value, Value)> {
     Some((id.clone(), params))
 }
 
+// ──────────────────────────────────────────────────────────────────
+// Agent-authority audit (#1691)
+// ──────────────────────────────────────────────────────────────────
+
+/// Most effects recorded on an agent audit event. An action with more than this
+/// is already far outside what a reviewer reads inline; the manifest holds the
+/// complete set.
+const MAX_AUDITED_EFFECTS: usize = 16;
+
+/// Byte cap on the `argument_names` metadata value, so a pathological argument
+/// object cannot bloat every row it touches.
+const MAX_ARGUMENT_NAMES_BYTES: usize = 512;
+
+/// Actor recorded when no principal was resolved for the call. Never empty: an
+/// audit row that cannot name who acted is still a row that must be greppable.
+const ANONYMOUS_AGENT: &str = "agent:anonymous";
+
+/// The tool error returned when a non-reversible action cannot be recorded.
+const UNAUDITABLE_REFUSAL: &str =
+    "audit attempt record could not be written; refusing a non-reversible action";
+
+/// Deadline for the pre-dispatch audit write.
+///
+/// This write sits inline on the request path, ahead of the handler, so a sink
+/// that hangs — a saturated DB pool, a remote collector that accepted the
+/// connection and went quiet — would otherwise stall every `tools/call` until
+/// the envelope's `request_timeout_ms` fires. Expiry is treated as a write
+/// failure, which means a non-reversible action is refused rather than served
+/// unrecorded (issue #1691 review, P3-6).
+const AUDIT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Everything both of an invocation's audit events share, resolved once before
+/// dispatch.
+///
+/// `Clone` so a streaming projection's drop guard can hand a copy to a spawned
+/// task: `Drop` cannot await, and the outcome of an aborted stream still has to
+/// reach the sink.
+///
+/// Two events are written per `tools/call` — `agent.tool.<name>.attempt` before
+/// dispatch and `agent.tool.<name>` after it — because an invocation that never
+/// returns (a panic, a hang, a killed process) must still leave evidence that
+/// an agent reached for the action. They share a correlation id, minted here so
+/// it exists before anything can go wrong.
+#[derive(Clone)]
+struct AgentAudit {
+    tool: String,
+    path_template: String,
+    correlation_id: String,
+    reversibility: Option<crate::agent_authority::Reversibility>,
+    grant: Option<&'static str>,
+    actor: String,
+    ip: Option<std::net::IpAddr>,
+    /// Metadata common to both events. Deliberately built once: the pair must
+    /// agree field for field, or joining them is guesswork.
+    shared: std::collections::BTreeMap<String, String>,
+}
+
+impl AgentAudit {
+    /// Resolve the invocation's audit context from the tool's compile-time
+    /// authority and the call's *shape*.
+    fn new(server: &McpServer, tool: &McpTool, arguments: &Value, ctx: &ReplayContext<'_>) -> Self {
+        let authority = tool.agent_authority;
+        let grant = authority.map(|a| a.grant.name);
+        let reversibility = authority.map(|a| a.grant.reversibility);
+        let correlation_id = server.state.entropy().uuid_v4().to_string();
+
+        let mut shared = std::collections::BTreeMap::new();
+        shared.insert("correlation_id".to_owned(), correlation_id.clone());
+        shared.insert("transport".to_owned(), "mcp".to_owned());
+        shared.insert("tool".to_owned(), tool.name.clone());
+        if let Some(grant) = grant {
+            shared.insert("grant".to_owned(), grant.to_owned());
+        }
+        // "unknown" rather than a guess: an ungoverned tool's blast radius is
+        // exactly what nobody has established, and calling it `reversible`
+        // would be the one wrong answer.
+        shared.insert(
+            "reversibility".to_owned(),
+            reversibility.map_or_else(|| "unknown".to_owned(), |r| r.as_str().to_owned()),
+        );
+        if let Some(authority) = authority {
+            shared.insert("effects".to_owned(), render_effects(authority.effects));
+        }
+        shared.insert("argument_names".to_owned(), argument_names(tool, arguments));
+
+        Self {
+            tool: tool.name.clone(),
+            path_template: tool.path_template.clone(),
+            correlation_id,
+            reversibility,
+            grant,
+            // The principal the *envelope* resolved, if any. `Current` is set by
+            // the auth layer on the request scope, so a `secure_mcp` app names
+            // its caller and an open one falls back rather than recording "".
+            actor: crate::current::Current::scoped_actor()
+                .unwrap_or_else(|| ANONYMOUS_AGENT.to_owned()),
+            ip: ctx.peer.map(|peer| peer.ip()),
+            shared,
+        }
+    }
+
+    /// The extension handlers read via `Extension<AgentInvocation>`.
+    fn invocation(&self) -> crate::agent_authority::AgentInvocation {
+        crate::agent_authority::AgentInvocation {
+            correlation_id: self.correlation_id.clone(),
+            tool: self.tool.clone(),
+            grant: self.grant,
+            reversibility: self.reversibility,
+        }
+    }
+
+    /// Whether a lost audit record is grounds for refusing the action.
+    ///
+    /// Only a *proved* `reversible` grant earns the benefit of the doubt.
+    /// Ungoverned (`None`) counts as non-reversible: the whole point of the
+    /// unknown marker is that we do not get to assume.
+    fn refuse_when_unauditable(&self) -> bool {
+        self.reversibility != Some(crate::agent_authority::Reversibility::Reversible)
+    }
+
+    /// Build one of this invocation's events.
+    ///
+    /// `phase` is what tells the three rows apart once they are in the sink:
+    /// `attempt` is written before anything runs, `outcome` after the handler
+    /// returned, and `refused` when the attempt could not be recorded and the
+    /// action was therefore not taken. Without it an operator filtering on
+    /// `status` alone cannot distinguish "an attempt was logged" from "the call
+    /// succeeded" — the attempt is deliberately `Success` (the *write*
+    /// succeeded; nothing has been tried yet) — nor a refusal from a 5xx.
+    fn event(
+        &self,
+        action: String,
+        status: crate::audit::AuditStatus,
+        phase: &str,
+    ) -> crate::audit::AuditEvent {
+        let mut event = crate::audit::AuditEvent::new(
+            self.actor.clone(),
+            action,
+            self.path_template.clone(),
+            self.ip,
+            status,
+        );
+        event.metadata = self.shared.clone();
+        event.metadata.insert("phase".to_owned(), phase.to_owned());
+        event
+    }
+
+    /// Write one event under [`AUDIT_WRITE_TIMEOUT`], flattening an expiry into
+    /// the same `Err` shape a sink failure produces.
+    ///
+    /// Takes the state rather than the server because the streaming drop guard
+    /// outlives the borrow of `McpServer` — it writes from a spawned task.
+    async fn write_bounded(
+        state: &crate::state::AppState,
+        event: crate::audit::AuditEvent,
+    ) -> Result<(), String> {
+        match tokio::time::timeout(
+            AUDIT_WRITE_TIMEOUT,
+            crate::audit::write_from_state(state, event),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(_elapsed) => Err(format!(
+                "audit sink did not respond within {AUDIT_WRITE_TIMEOUT:?}"
+            )),
+        }
+    }
+
+    /// The fields every `autumn.agent` line carries, so the attempt and the
+    /// outcome lines describe one invocation in the same vocabulary.
+    fn reversibility_field(&self) -> Option<&str> {
+        self.shared.get("reversibility").map(String::as_str)
+    }
+
+    /// Record the attempt, before anything has run.
+    ///
+    /// `Err` carries the tool-error text: the record could not be written and
+    /// the action is not reversible, so it must not happen at all.
+    async fn record_attempt(&self, state: &crate::state::AppState) -> Result<(), &'static str> {
+        let event = self.event(
+            format!("agent.tool.{}.attempt", self.tool),
+            // The *write* is what succeeded here; `phase` carries the fact that
+            // nothing has been attempted yet.
+            crate::audit::AuditStatus::Success,
+            "attempt",
+        );
+        let Err(error) = Self::write_bounded(state, event).await else {
+            // Mirrored to the trace so an app with no sink installed still sees
+            // both halves of every invocation, not just the outcome.
+            tracing::info!(
+                target: "autumn.agent",
+                tool = %self.tool,
+                correlation_id = %self.correlation_id,
+                transport = "mcp",
+                phase = "attempt",
+                grant = self.grant,
+                reversibility = self.reversibility_field(),
+                effects = self.shared.get("effects").map(String::as_str),
+                argument_names = self.shared.get("argument_names").map(String::as_str),
+                actor = %self.actor,
+                target = %self.path_template,
+                "agent tool call attempted"
+            );
+            return Ok(());
+        };
+        if self.refuse_when_unauditable() {
+            tracing::error!(
+                target: "autumn.agent",
+                tool = %self.tool,
+                correlation_id = %self.correlation_id,
+                transport = "mcp",
+                phase = "refused",
+                grant = self.grant,
+                reversibility = self.reversibility_field(),
+                actor = %self.actor,
+                target = %self.path_template,
+                error = %error,
+                "refusing an agent tool call: its attempt record could not be written \
+                 and the action is not reversible"
+            );
+            self.record_refusal(state, &error).await;
+            return Err(UNAUDITABLE_REFUSAL);
+        }
+        tracing::warn!(
+            target: "autumn.agent",
+            tool = %self.tool,
+            correlation_id = %self.correlation_id,
+            phase = "attempt",
+            error = %error,
+            "agent tool attempt record could not be written; the action is reversible, \
+             so the call proceeds"
+        );
+        Ok(())
+    }
+
+    /// Best-effort record that the invocation was refused for want of an audit
+    /// trail.
+    ///
+    /// The write that just failed was an aggregate across every configured sink
+    /// ([`AuditLogger::write`](crate::audit::AuditLogger::write) attempts them
+    /// all and joins the errors), so one broken sink fails the whole call —
+    /// while the healthy ones would happily have taken the row. Retrying here
+    /// gives them the refusal, which is the single most interesting thing that
+    /// happened. Its own failure is ignored on purpose: there is nowhere left to
+    /// report it, the `tracing::error!` above already fired, and the refusal
+    /// itself does not depend on this landing.
+    async fn record_refusal(&self, state: &crate::state::AppState, error: &str) {
+        let mut event = self.event(
+            // Its own action, not the outcome action with a different `phase`:
+            // a refusal and a completed call are different things, and an
+            // operator filtering for one should not have to parse metadata to
+            // exclude the other.
+            format!("agent.tool.{}.refused", self.tool),
+            crate::audit::AuditStatus::Failure,
+            "refused",
+        );
+        // No `http_status`: nothing was dispatched.
+        event
+            .metadata
+            .insert("refused_reason".to_owned(), error.to_owned());
+        let _ = Self::write_bounded(state, event).await;
+    }
+
+    /// Record how the invocation ended. Never alters the tool result: a broken
+    /// sink is an operational problem, not a reason to fail a call that already
+    /// happened.
+    async fn record_outcome(
+        &self,
+        state: &crate::state::AppState,
+        status: StatusCode,
+        request_id: Option<&str>,
+        disposition: Disposition,
+    ) {
+        // The status line alone is not the verdict: a streaming tool answers
+        // `200` before it has done anything, and a buffered tool can answer
+        // `200` and then fail to hand its body over. `disposition` carries what
+        // actually became of the action.
+        let succeeded = status.is_success() && disposition.is_success();
+        let audit_status = if succeeded {
+            crate::audit::AuditStatus::Success
+        } else {
+            crate::audit::AuditStatus::Failure
+        };
+        let mut event = self.event(format!("agent.tool.{}", self.tool), audit_status, "outcome");
+        event
+            .metadata
+            .insert("http_status".to_owned(), status.as_u16().to_string());
+        if let Some(stream) = disposition.stream_state() {
+            event
+                .metadata
+                .insert("stream_state".to_owned(), stream.to_owned());
+        }
+        if let Some(result) = disposition.result() {
+            event
+                .metadata
+                .insert("result".to_owned(), result.to_owned());
+        }
+        // The replayed pipeline's own id, so an audit row joins to the access
+        // log line and the traces for the same dispatch.
+        if let Some(request_id) = request_id {
+            event
+                .metadata
+                .insert("request_id".to_owned(), request_id.to_owned());
+        }
+        // Emitted whether or not a sink is installed, so an app that configured
+        // none still has a trace of every agent action it served.
+        tracing::info!(
+            target: "autumn.agent",
+            tool = %self.tool,
+            correlation_id = %self.correlation_id,
+            transport = "mcp",
+            phase = "outcome",
+            grant = self.grant,
+            reversibility = self.reversibility_field(),
+            effects = self.shared.get("effects").map(String::as_str),
+            argument_names = self.shared.get("argument_names").map(String::as_str),
+            actor = %self.actor,
+            target = %self.path_template,
+            http_status = status.as_u16(),
+            stream_state = disposition.stream_state(),
+            result = disposition.result(),
+            request_id = request_id,
+            "agent tool call"
+        );
+        // Bounded like the attempt write: the handler has already run, so a
+        // hanging sink here cannot change what happened — but it can still hold
+        // the response open, and the caller is owed one.
+        if let Err(error) = Self::write_bounded(state, event).await {
+            tracing::warn!(
+                target: "autumn.agent",
+                tool = %self.tool,
+                correlation_id = %self.correlation_id,
+                phase = "outcome",
+                error = %error,
+                "agent tool outcome record could not be written"
+            );
+        }
+    }
+}
+
+/// Why the buffered path could not hand the handler's body to the agent.
+///
+/// The buffered branch answers the agent from a body it has to read *after* the
+/// handler's status is known, so a `200` is not yet proof the call succeeded
+/// (issue #1691 review round 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BufferedFailure {
+    /// The body exceeded [`MAX_TOOL_RESPONSE_BYTES`].
+    Overflow,
+    /// The body stream itself errored part-way through.
+    BodyError,
+}
+
+impl BufferedFailure {
+    /// Classify what [`axum::body::to_bytes`] returned.
+    ///
+    /// It collects through `http_body_util::Limited`, so a `LengthLimitError`
+    /// anywhere in the source chain means the cap was hit; anything else is a
+    /// transport failure on the body itself.
+    fn classify(error: &axum::Error) -> Self {
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+        while let Some(err) = source {
+            if err.is::<http_body_util::LengthLimitError>() {
+                return Self::Overflow;
+            }
+            source = err.source();
+        }
+        Self::BodyError
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Overflow => "body_overflow",
+            Self::BodyError => "body_error",
+        }
+    }
+}
+
+/// What became of an invocation once its HTTP status was known.
+///
+/// The status line is necessary but not sufficient: both the streaming and the
+/// buffered branch can still fail the agent after a `200`, and an audit row
+/// that only reflected the status would claim a success neither delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    /// The handler answered and its result reached the agent unaltered — the
+    /// status line is the whole story.
+    Settled,
+    /// A streaming projection ended this way.
+    Stream(StreamState),
+    /// The buffered path could not deliver the handler's body.
+    Buffered(BufferedFailure),
+}
+
+impl Disposition {
+    /// Whether this disposition permits the outcome to be recorded as a
+    /// success (the HTTP status still has to agree).
+    const fn is_success(self) -> bool {
+        match self {
+            Self::Settled => true,
+            Self::Stream(state) => state.is_success(),
+            Self::Buffered(_) => false,
+        }
+    }
+
+    const fn stream_state(self) -> Option<&'static str> {
+        match self {
+            Self::Stream(state) => Some(state.as_str()),
+            _ => None,
+        }
+    }
+
+    const fn result(self) -> Option<&'static str> {
+        match self {
+            Self::Buffered(failure) => Some(failure.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// How a streaming tool's projection ended.
+///
+/// A streaming handler returns `200` before it has produced anything, so the
+/// status line says nothing about whether the work happened. Recording the
+/// outcome up front would durably claim success for a stream that then errored
+/// or was cut off by a client disconnect, with no later event to correct it
+/// (issue #1691 review round 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamState {
+    /// The handler's body ended normally: everything it meant to emit, it
+    /// emitted.
+    Completed,
+    /// The projection was dropped before the handler's body ended — a client
+    /// disconnect, or the response being discarded mid-flight.
+    Aborted,
+    /// The handler's body yielded a transport error part-way through.
+    Errored,
+}
+
+impl StreamState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Aborted => "aborted",
+            Self::Errored => "errored",
+        }
+    }
+
+    /// Only a stream that ran to the end counts as a successful action.
+    const fn is_success(self) -> bool {
+        matches!(self, Self::Completed)
+    }
+}
+
+/// Owns the one outcome record a streaming `tools/call` still owes.
+///
+/// The record is written when the projection reaches a terminal state — which
+/// may be "never", if the client hangs up. `Drop` is therefore the backstop:
+/// it cannot await, so it spawns the write instead. `recorded` makes the two
+/// paths mutually exclusive, so exactly one outcome reaches the sink per call.
+struct StreamAudit {
+    audit: AgentAudit,
+    state: crate::state::AppState,
+    status: StatusCode,
+    request_id: Option<String>,
+    recorded: bool,
+}
+
+impl StreamAudit {
+    /// Record the outcome inline, from the projection's own async context.
+    async fn record(&mut self, stream: StreamState) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        self.audit
+            .record_outcome(
+                &self.state,
+                self.status,
+                self.request_id.as_deref(),
+                Disposition::Stream(stream),
+            )
+            .await;
+    }
+}
+
+impl Drop for StreamAudit {
+    fn drop(&mut self) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        // The projection never reached an end: the response body was dropped
+        // while the handler still had output to give. That is an aborted
+        // action, and the trail has to say so rather than stay silent.
+        let audit = self.audit.clone();
+        let state = self.state.clone();
+        let status = self.status;
+        let request_id = self.request_id.clone();
+        // `try_current` rather than `spawn`: during runtime shutdown there is
+        // no reactor left to spawn onto, and a panic in `Drop` would be far
+        // worse than a missing row on a process that is already going away.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                audit
+                    .record_outcome(
+                        &state,
+                        status,
+                        request_id.as_deref(),
+                        Disposition::Stream(StreamState::Aborted),
+                    )
+                    .await;
+            });
+        }
+    }
+}
+
+/// Render an authority's proved effects as `kind:subject`, comma-joined.
+fn render_effects(effects: &[crate::agent_authority::Effect]) -> String {
+    let mut out = String::new();
+    for effect in effects.iter().take(MAX_AUDITED_EFFECTS) {
+        if !out.is_empty() {
+            out.push(',');
+        }
+        out.push_str(effect.kind.as_str());
+        out.push(':');
+        out.push_str(effect.subject);
+    }
+    if effects.len() > MAX_AUDITED_EFFECTS {
+        out.push_str(",…");
+    }
+    out
+}
+
+/// The call's top-level argument **names**, sorted and comma-joined, followed
+/// by a count of the ones this tool does not recognise.
+///
+/// Names only, never values: an audit sink is a long-lived, widely-readable
+/// store, and the arguments of an agent call routinely carry exactly the
+/// payloads that must not be duplicated into one. The shape of a call is what
+/// makes a row reviewable; its contents are the handler's business.
+///
+/// Only names drawn from the tool's own argument surface — the reserved
+/// `body`/`query` keys and its declared path params — are echoed verbatim.
+/// Everything else is counted, never quoted (`body,id,+2 unknown`).
+///
+/// The caller chooses those keys and nothing validates them against the
+/// advertised schema, so an un-intersected name list is an
+/// attacker-controlled string landing in a durable audit row *and* in the
+/// `autumn.agent` trace line, where an embedded newline forges a log entry and
+/// a key like `ssn-123-45-6789` smuggles the very payload the names-only rule
+/// exists to keep out (issue #1691 review, P2-2). Counting the unknowns keeps
+/// the useful signal — "this call carried arguments the tool ignores" — without
+/// reproducing a single byte the caller wrote.
+fn argument_names(tool: &McpTool, arguments: &Value) -> String {
+    let Some(object) = arguments.as_object() else {
+        return String::new();
+    };
+
+    // The keys `build_request` actually reads. Catch-all params (`{*rest}`)
+    // surface from `ApiDoc` with a leading `*` but are addressed by the bare
+    // name, exactly as `build_request` strips it.
+    let is_known = |name: &str| {
+        name == "body"
+            || name == "query"
+            || tool
+                .path_params
+                .iter()
+                .any(|param| param.strip_prefix('*').unwrap_or(param) == name)
+    };
+
+    let mut known: Vec<&str> = Vec::new();
+    let mut unknown: usize = 0;
+    for name in object.keys() {
+        if is_known(name) {
+            known.push(name);
+        } else {
+            unknown += 1;
+        }
+    }
+    known.sort_unstable();
+
+    let mut out = String::new();
+    for name in known {
+        // +1 for the separator this name would need.
+        if out.len() + name.len() + 1 > MAX_ARGUMENT_NAMES_BYTES {
+            out.push_str(",…");
+            break;
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        out.push_str(name);
+    }
+    if unknown > 0 {
+        if !out.is_empty() {
+            out.push(',');
+        }
+        // A count, not the names: the whole point is that these are the ones
+        // nobody vouched for.
+        let _ = write!(out, "+{unknown} unknown");
+    }
+    out
+}
+
+/// Carry the envelope's context onto the request the `tools/call` replays.
+///
+/// Everything here exists because the replay traverses the *real* pipeline: it
+/// has to look to that pipeline like the direct HTTP call it stands in for,
+/// while not being double-charged for work the envelope already did.
+fn apply_replay_extensions(
+    request: &mut axum::extract::Request,
+    server: &McpServer,
+    ctx: &ReplayContext<'_>,
+    audit: &AgentAudit,
+) {
+    let extensions = request.extensions_mut();
+
+    // Inserted for EVERY tool — a handler is entitled to know it is being
+    // driven by an agent whether or not anyone declared a grant for it.
+    extensions.insert(audit.invocation());
+
+    // The caller's resolved identity and connection peer, so the dispatch
+    // pipeline attributes the call like a direct request would — the
+    // proxy-aware tenancy host and the IP-keyed rate limiter both read these.
+    if let Some(identity) = ctx.identity {
+        extensions.insert(identity.clone());
+    }
+    if let Some(peer) = ctx.peer {
+        extensions.insert(axum::extract::ConnectInfo(peer));
+    }
+    // The verified client certificate of the envelope's own connection (#1640).
+    // The replay traverses the router's `RequireClientCert` layer, so without
+    // this a legitimately-certified caller would be refused on an mTLS-only
+    // tool — and `ClientCert` would disagree with the `PolicyContext`, which
+    // reads the ambient scope and therefore already sees it.
+    #[cfg(feature = "tls")]
+    if let Some(client_cert) = &ctx.client_cert {
+        extensions.insert(std::sync::Arc::clone(client_cert));
+    }
+    // When the `/mcp` envelope is itself rate-limited, this call was already
+    // counted there; mark the replay envelope-counted so the framework-default
+    // limiter (which shares the envelope bucket) doesn't charge a second token
+    // for the same tool call. User/per-route limiters (path overrides,
+    // `#[throttle]`) don't share that bucket and still charge the replay.
+    if server.envelope_rate_limited {
+        extensions.insert(crate::security::RateLimitEnvelopeCounted);
+    }
+    // Likewise for load shedding: the envelope and the dispatch pipeline share
+    // the SAME `LoadShedLayer` instance (same `Arc` in-flight counter), so
+    // without this a `tools/call` would acquire one slot at the envelope and a
+    // second at this replay for the same logical request — silently halving the
+    // effective ceiling for MCP traffic.
+    if server.envelope_load_shed {
+        extensions.insert(crate::middleware::LoadShedExempt);
+    }
+}
+
+/// What must be read off a dispatched response *before* its body is consumed or
+/// handed to the SSE projection.
+///
+/// Grouped because they share one deadline, not one purpose: once the body is
+/// taken, the response is gone and none of these can be recovered.
+struct Dispatched {
+    status: StatusCode,
+    /// The replayed pipeline's own `x-request-id`, so the audit row joins to
+    /// the access log line for the same dispatch.
+    request_id: Option<String>,
+    /// Whether the handler answered with `text/event-stream`.
+    is_event_stream: bool,
+    /// Any `Set-Cookie` the inner handler or middleware set (session renewal,
+    /// CSRF-cookie refresh, login), replayed onto the outer HTTP response so a
+    /// tool call sends what the equivalent direct call would have.
+    cookies: Vec<HeaderValue>,
+}
+
+impl Dispatched {
+    fn inspect(response: &Response) -> Self {
+        let headers = response.headers();
+        Self {
+            status: response.status(),
+            request_id: headers
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+            is_event_stream: headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|c| {
+                    c.trim_start()
+                        .to_ascii_lowercase()
+                        .starts_with("text/event-stream")
+                }),
+            cookies: headers
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
 /// Dispatch a `tools/call` through the real router and shape the response as an
 /// MCP tool result — buffered JSON for an ordinary tool, or a progressive SSE
 /// stream for a `#[api_doc(mcp, stream)]` tool whose handler returns `Sse`.
@@ -1458,69 +2166,43 @@ async fn serve_tools_call(
         Err(message) => return json_response(&error(id, -32602, &message)),
     };
 
-    // Carry the caller's resolved identity and connection peer into the replay
-    // so the dispatch pipeline attributes it like a direct request would — the
-    // proxy-aware tenancy host and the IP-keyed rate limiter both read these.
-    if let Some(identity) = ctx.identity {
-        request.extensions_mut().insert(identity.clone());
-    }
-    if let Some(peer) = ctx.peer {
-        request
-            .extensions_mut()
-            .insert(axum::extract::ConnectInfo(peer));
-    }
-    // When the `/mcp` envelope is itself rate-limited, this call was already
-    // counted there; mark the replay envelope-counted so the framework-default
-    // limiter (which shares the envelope bucket) doesn't charge a second token
-    // for the same tool call. User/per-route limiters (path overrides,
-    // `#[throttle]`) don't share that bucket and still charge the replay.
-    if server.envelope_rate_limited {
-        request
-            .extensions_mut()
-            .insert(crate::security::RateLimitEnvelopeCounted);
-    }
-    // Likewise for load shedding: the envelope and the dispatch pipeline
-    // share the SAME `LoadShedLayer` instance (same `Arc` in-flight
-    // counter), so without this a `tools/call` would acquire one slot at the
-    // envelope and a second at this replay for the same logical request —
-    // silently halving the effective ceiling for MCP traffic.
-    if server.envelope_load_shed {
-        request
-            .extensions_mut()
-            .insert(crate::middleware::LoadShedExempt);
+    // Agent-authority envelope (#1691). Resolved before dispatch so the
+    // correlation id exists ahead of anything that can go wrong.
+    let audit = AgentAudit::new(server, tool, &arguments, ctx);
+    apply_replay_extensions(&mut request, server, ctx, &audit);
+
+    // The last thing before the action runs: if this record cannot be written
+    // and the action is not provably reversible, it does not run.
+    if let Err(refusal) = audit.record_attempt(&server.state).await {
+        return json_response(&success(id, tool_error(refusal)));
     }
 
     let response = match server.dispatch.clone().oneshot(request).await {
         Ok(resp) => resp,
         Err(e) => {
+            audit
+                .record_outcome(
+                    &server.state,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    None,
+                    Disposition::Settled,
+                )
+                .await;
             return json_response(&success(id, tool_error(&format!("dispatch failed: {e}"))));
         }
     };
 
-    let status = response.status();
-    let is_event_stream = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|c| {
-            c.trim_start()
-                .to_ascii_lowercase()
-                .starts_with("text/event-stream")
-        });
+    let Dispatched {
+        status,
+        request_id,
+        is_event_stream,
+        cookies,
+    } = Dispatched::inspect(&response);
     let client_accepts_sse = ctx
         .headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .is_some_and(accept_includes_event_stream);
-
-    // Capture any `Set-Cookie` the inner handler/middleware set (session
-    // renewal, CSRF-cookie refresh, login) before the body is consumed, so a
-    // single call replays them onto the outer HTTP response — matching what the
-    // equivalent direct call would have sent.
-    let mut cookies: Vec<HeaderValue> = Vec::new();
-    for value in response.headers().get_all(header::SET_COOKIE) {
-        cookies.push(value.clone());
-    }
 
     // A streaming tool whose handler streamed (text/event-stream) and whose
     // client can read SSE: project the stream onto the MCP SSE channel. This is
@@ -1529,9 +2211,53 @@ async fn serve_tools_call(
     // read SSE) falls through to the buffered branch below — so the base #1117
     // path and non-SSE clients are entirely unaffected.
     if tool.streams && status.is_success() && is_event_stream && client_accepts_sse {
-        return stream_tool_result(id, &params, response, cookies);
+        // The outcome is NOT recorded here. A streaming handler answers `200`
+        // before it has produced anything, so recording now would durably claim
+        // success for a stream that then errors or is cut off by a client
+        // disconnect — with no later event to correct it. The guard travels
+        // with the projection and writes exactly one outcome when it reaches a
+        // terminal state, or from its `Drop` if the client hangs up first.
+        let stream_audit = StreamAudit {
+            audit,
+            state: server.state.clone(),
+            status,
+            request_id,
+            recorded: false,
+        };
+        return stream_tool_result(id, &params, response, cookies, stream_audit);
     }
 
+    // Buffered path: the outcome is recorded only once the body has actually
+    // been read and packaged. A `200` here is not yet proof the agent got
+    // anything — the body can still overflow the tool-result cap or error
+    // mid-read, and the agent would then see a tool error while the audit row
+    // claimed success (issue #1691 review round 2).
+    let (resp, failure) =
+        buffered_tool_response(tool, id, status, is_event_stream, cookies, response).await;
+    let disposition = failure.map_or(Disposition::Settled, Disposition::Buffered);
+    audit
+        .record_outcome(&server.state, status, request_id.as_deref(), disposition)
+        .await;
+    resp
+}
+
+/// Repackage a fully-buffered handler response as the JSON-RPC tool result.
+///
+/// Split out of [`serve_tools_call`] so that function stays readable (and under
+/// clippy's `too_many_lines` ceiling): everything here runs only on the
+/// buffered path.
+///
+/// Returns the response to send plus, when the handler's body could not be
+/// delivered at all, why — the caller records that as the invocation's outcome,
+/// so a tool error never sits behind an audit row claiming success.
+async fn buffered_tool_response(
+    tool: &McpTool,
+    id: Value,
+    status: StatusCode,
+    is_event_stream: bool,
+    cookies: Vec<HeaderValue>,
+    response: Response,
+) -> (Response, Option<BufferedFailure>) {
     // Capture the dispatch clone's `Server-Timing` header (#1348) so its
     // non-`total` metrics can be forwarded onto the rebuilt response. The clone
     // runs the primary `ServerTimingLayer`, which builds the full metric set —
@@ -1540,8 +2266,8 @@ async fn serve_tools_call(
     // forwarding, a DB-backed `tools/call` would lose the query count. Only the
     // non-`total` metrics are forwarded (see the append below); the inner
     // `total` measured the dispatch clone alone and is dropped in favour of the
-    // outer fallback's real `/mcp` `total`. Captured before the body is
-    // consumed, like `Set-Cookie` above.
+    // outer fallback's real `/mcp` `total`. Captured before this function
+    // consumes the body, exactly as the caller captured `Set-Cookie`.
     let mut server_timings: Vec<HeaderValue> = Vec::new();
     for value in response.headers().get_all(&SERVER_TIMING) {
         server_timings.push(value.clone());
@@ -1551,14 +2277,25 @@ async fn serve_tools_call(
     // path buffers the whole body to repackage it as a tool result. Cap that
     // buffer so a runaway handler can't OOM the process; report an overflow as
     // an explicit tool error rather than silently truncating to an empty body.
-    let Ok(bytes) = axum::body::to_bytes(response.into_body(), MAX_TOOL_RESPONSE_BYTES).await
-    else {
-        return json_response(&success(
-            id,
-            tool_error(&format!(
-                "handler response exceeded the {MAX_TOOL_RESPONSE_BYTES}-byte MCP tool-result limit"
-            )),
-        ));
+    let bytes = match axum::body::to_bytes(response.into_body(), MAX_TOOL_RESPONSE_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            // The agent gets a tool error, so the audit row must record one
+            // too: the call did not deliver what the handler produced.
+            let failure = BufferedFailure::classify(&error);
+            let message = match failure {
+                BufferedFailure::Overflow => format!(
+                    "handler response exceeded the {MAX_TOOL_RESPONSE_BYTES}-byte MCP tool-result limit"
+                ),
+                BufferedFailure::BodyError => {
+                    format!("handler response body failed mid-read: {error}")
+                }
+            };
+            return (
+                json_response(&success(id, tool_error(&message))),
+                Some(failure),
+            );
+        }
     };
     // A streaming handler buffered for a non-SSE client: collapse the SSE wire
     // frames into their concatenated data payload so the client still receives a
@@ -1593,7 +2330,7 @@ async fn serve_tools_call(
             resp.headers_mut().append(SERVER_TIMING.clone(), hv);
         }
     }
-    resp
+    (resp, None)
 }
 
 /// Strip the `total` metric from a `Server-Timing` header value, returning the
@@ -1744,6 +2481,10 @@ struct StreamProjection {
     /// them to distinguish the final payload from incremental progress.
     result_parts: Vec<String>,
     phase: ProjectionPhase,
+    /// The invocation's outstanding outcome record. Dropped with the rest of
+    /// the projection when the client hangs up, which is how an aborted stream
+    /// still gets a row (#1691).
+    audit: StreamAudit,
 }
 
 /// Project a streaming handler's `Sse` response onto the MCP SSE channel.
@@ -1758,6 +2499,7 @@ fn stream_tool_result(
     params: &Value,
     response: Response,
     cookies: Vec<HeaderValue>,
+    audit: StreamAudit,
 ) -> Response {
     let progress_token = params
         .get("_meta")
@@ -1774,6 +2516,7 @@ fn stream_tool_result(
         progress_parts: Vec::new(),
         result_parts: Vec::new(),
         phase: ProjectionPhase::Streaming,
+        audit,
     };
 
     let stream = futures::stream::unfold(state, project_next);
@@ -1808,18 +2551,29 @@ async fn project_next(
                 st.phase = ProjectionPhase::Done;
                 return Some((Ok(Event::default().data(value.to_string())), st));
             }
-            ProjectionPhase::Streaming => {
-                if let Some(Ok(bytes)) = st.body.next().await {
+            ProjectionPhase::Streaming => match st.body.next().await {
+                Some(Ok(bytes)) => {
                     let events = st.parser.push(&bytes);
                     enqueue_projected(&mut st, events);
-                } else {
-                    // End of stream (or a body error): flush any trailing frame
-                    // and move on to the terminating result.
+                }
+                // The handler's body is finished — cleanly (`None`) or with a
+                // transport error (`Some(Err)`, the only `Some` left here).
+                // Either way this is the action's terminal state, so the
+                // outcome is recorded now rather than left to the drop guard:
+                // whatever the client does with the remaining projection, the
+                // handler has already done everything it was going to do.
+                terminal => {
+                    let outcome = if terminal.is_some() {
+                        StreamState::Errored
+                    } else {
+                        StreamState::Completed
+                    };
                     let trailing = st.parser.finish();
                     enqueue_projected(&mut st, trailing);
                     st.phase = ProjectionPhase::Final;
+                    st.audit.record(outcome).await;
                 }
-            }
+            },
         }
     }
 }
@@ -2021,22 +2775,19 @@ fn build_request(
         let Value::Object(map) = query else {
             return Err("`query` must be a JSON object".to_owned());
         };
-        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut pairs = QueryPairs::new();
         for (key, value) in map {
-            match value {
-                // Form/explode semantics: an array field expands to repeated
-                // keys (`tags=a&tags=b`), matching the OpenAPI query model the
-                // tool schema advertises — not a single `tags=["a","b"]`.
-                Value::Array(items) => {
-                    for item in items {
-                        pairs.push((key.clone(), query_scalar(item)));
-                    }
-                }
-                other => pairs.push((key.clone(), query_scalar(other))),
+            // The tool's own `query` property names get the same rule its
+            // nested object fields do — a dynamic query object can carry an
+            // arbitrary key here, and `filter[x]` would otherwise reach the
+            // decoder as structure rather than as the name the caller sent.
+            if !is_expressible_field_name(key) {
+                return Err(inexpressible_field_name("query"));
             }
+            encode_query_arg(key, value, 1, &mut pairs)?;
         }
-        if !pairs.is_empty() {
-            let qs = serde_urlencoded::to_string(&pairs)
+        if !pairs.pairs.is_empty() {
+            let qs = serde_urlencoded::to_string(&pairs.pairs)
                 .map_err(|e| format!("invalid query arguments: {e}"))?;
             path = format!("{path}?{qs}");
         }
@@ -2102,6 +2853,259 @@ fn query_scalar(value: &Value) -> String {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     }
+}
+
+/// Upper bound on the pairs one tool call may expand its `query` object into.
+///
+/// `tools/call` arguments are client-supplied and only bounded by the request
+/// body limit (32 MiB by default), while building a bracketed key copies its
+/// whole prefix per child — quadratic in the argument size. Both this and
+/// [`MAX_QUERY_BYTES`] bail out long before that matters, and well inside the
+/// 64 KiB `http::Uri` limit the assembled request would hit anyway.
+const MAX_QUERY_PAIRS: usize = 1024;
+
+/// Upper bound on the total key+value bytes one tool call may expand into.
+const MAX_QUERY_BYTES: usize = 8 * 1024;
+
+/// Accumulator for the `key=value` pairs a tool call's `query` object expands
+/// Ceiling on **nodes visited** while flattening, whether or not a node emits a
+/// pair.
+///
+/// [`MAX_QUERY_PAIRS`] / [`MAX_QUERY_BYTES`] bound only what reaches the wire,
+/// so a container of hundreds of thousands of `null` fields paid nothing: each
+/// one still cost a formatted child key (copying the parent), and the all-null
+/// check that rejects it runs only *after* the whole subtree is walked. Charging
+/// every visit stops that traversal at a fixed bound instead, so a body inside
+/// the documented limit cannot amplify into unbounded key-copying work.
+const MAX_QUERY_NODES: usize = 4 * MAX_QUERY_PAIRS;
+
+/// into, enforcing [`MAX_QUERY_PAIRS`] / [`MAX_QUERY_BYTES`].
+struct QueryPairs {
+    pairs: Vec<(String, String)>,
+    bytes: usize,
+    nodes: usize,
+}
+
+impl QueryPairs {
+    const fn new() -> Self {
+        Self {
+            pairs: Vec::new(),
+            bytes: 0,
+            nodes: 0,
+        }
+    }
+
+    /// Charge one visited node against [`MAX_QUERY_NODES`].
+    ///
+    /// Called for every node the encoder descends into — including the ones
+    /// that emit nothing (`null`, and containers before their leaves are
+    /// known) — so traversal cost is bounded independently of output size.
+    fn visit(&mut self) -> Result<(), String> {
+        self.nodes += 1;
+        if self.nodes > MAX_QUERY_NODES {
+            return Err(format!(
+                "query arguments traverse more than {MAX_QUERY_NODES} values; \
+                 move the field to a JSON body"
+            ));
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, key: &str, value: String) -> Result<(), String> {
+        self.bytes = self
+            .bytes
+            .saturating_add(key.len())
+            .saturating_add(value.len());
+        if self.pairs.len() >= MAX_QUERY_PAIRS || self.bytes > MAX_QUERY_BYTES {
+            return Err(format!(
+                "query arguments expand past the dispatch limit of {MAX_QUERY_PAIRS} \
+                 parameters / {MAX_QUERY_BYTES} bytes"
+            ));
+        }
+        self.pairs.push((key.to_owned(), value));
+        Ok(())
+    }
+}
+
+/// True when a JSON field name survives the bracketed query encoding.
+///
+/// `[` and `]` are structure in that encoding and an empty name addresses the
+/// append position, so a field called any of those cannot be carried: emitting
+/// it verbatim would invent, move, or lose a nesting level on the way back in.
+/// Applied to every name the encoder introduces — the tool's top-level `query`
+/// properties as well as nested object fields.
+fn is_expressible_field_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('[') && !name.contains(']')
+}
+
+/// The error for a field name [`is_expressible_field_name`] rejects.
+fn inexpressible_field_name(owner: &str) -> String {
+    format!(
+        "query argument `{owner}` has a field name that a query string cannot carry: a name \
+         may not be empty or contain `[` or `]`, which are structure in the query encoding"
+    )
+}
+
+/// Flatten one `query` argument into the `key=value` pairs the
+/// [`Query<T>`](crate::extract::Query) extractor decodes (issue #1972).
+///
+/// The wire format is the extractor's own dialect
+/// ([`query_string`](crate::query_string)), so a tool's advertised
+/// `inputSchema` and the request dispatch actually agree:
+///
+/// * scalars render flat (`page=2`);
+/// * an array of scalars expands to repeated keys (`tags=a&tags=b`) — the
+///   `OpenAPI` `form`/`explode` shape;
+/// * an array containing any container uses explicit positions
+///   (`items[0][sku]=A-1`), so element order survives;
+/// * an object nests by key (`filter[status]=open`).
+///
+/// A `null` **field** renders no pair at all: a query string has no null, and
+/// emitting the literal text `null` would fail the handler's coercion instead
+/// of decoding as the absent/`None` the caller meant.
+///
+/// # Errors
+///
+/// Refuses, rather than silently dispatching something the caller did not ask
+/// for, when the argument cannot be expressed in a query string:
+///
+/// * an **empty** array or object — dropping it would turn a present-but-empty
+///   value into an absent one (and 400 a required field downstream);
+/// * a `null` **array element** — dropping it would shorten the sequence and
+///   shift every later element;
+/// * an object field name that is empty or contains `[` / `]` — those are
+///   structure in the bracketed dialect, so interpolating one would invent or
+///   lose a nesting level;
+/// * nesting past
+///   [`query_string::MAX_DEPTH`](crate::query_string::MAX_DEPTH), or an
+///   expansion past [`MAX_QUERY_PAIRS`] / [`MAX_QUERY_BYTES`].
+fn encode_query_arg(
+    key: &str,
+    value: &Value,
+    depth: usize,
+    out: &mut QueryPairs,
+) -> Result<(), String> {
+    if depth > crate::query_string::MAX_DEPTH {
+        return Err(format!(
+            "query argument `{key}` nests deeper than the maximum of {}",
+            crate::query_string::MAX_DEPTH
+        ));
+    }
+    // Bail before formatting any child key: a single absurd key would otherwise
+    // be copied once per descendant.
+    if key.len() > MAX_QUERY_BYTES {
+        return Err(format!(
+            "query argument key exceeds {MAX_QUERY_BYTES} bytes"
+        ));
+    }
+    // Before descending, and so before any child key is formatted: a `null`
+    // leaf emits no pair, so without this it would pay nothing for the parent
+    // key its sibling count forces the encoder to copy.
+    out.visit()?;
+    let is_container = matches!(value, Value::Array(_) | Value::Object(_));
+    let before = out.pairs.len();
+    match value {
+        Value::Null => {}
+        Value::Array(items) if items.is_empty() => {
+            return Err(format!(
+                "query argument `{key}` is an empty array; a query string cannot express an \
+                 empty sequence — omit the argument, or move the field to a JSON body"
+            ));
+        }
+        Value::Array(items) => {
+            if let Some(position) = items.iter().position(Value::is_null) {
+                return Err(format!(
+                    "query argument `{key}[{position}]` is null; a query string cannot \
+                     express a null element — omit it, or move the field to a JSON body"
+                ));
+            }
+            let all_scalar = items
+                .iter()
+                .all(|item| !matches!(item, Value::Array(_) | Value::Object(_)));
+            if all_scalar {
+                if let [only] = items.as_slice() {
+                    // Repeated keys carry a sequence only from the *second*
+                    // occurrence on: one `tags=only` pair is indistinguishable
+                    // from a scalar, so `deserialize_any` (an untyped
+                    // `serde_json::Value` target) would yield `"only"` for the
+                    // `["only"]` the caller sent — and the field would turn
+                    // back into an array on gaining a second element. The
+                    // explicit position pins the kind. A typed `Vec` target
+                    // decodes either form identically.
+                    out.push(&format!("{key}[0]"), query_scalar(only))?;
+                } else {
+                    for item in items {
+                        out.push(key, query_scalar(item))?;
+                    }
+                }
+            } else {
+                for (index, item) in items.iter().enumerate() {
+                    encode_query_arg(&format!("{key}[{index}]"), item, depth + 1, out)?;
+                }
+            }
+        }
+        Value::Object(fields) if fields.is_empty() => {
+            return Err(format!(
+                "query argument `{key}` is an empty object; a query string cannot express an \
+                 empty object — omit the argument, or move the field to a JSON body"
+            ));
+        }
+        // Every key digit-only means every segment decodes as a *position*
+        // (`query_string::classify_segment`), so the tree comes back a sequence
+        // and an untyped target (`serde_json::Value`, which takes whatever
+        // `deserialize_any` yields) receives an array where the caller sent an
+        // object — with the tell that adding one named key silently flips it
+        // back. A typed map target is unaffected, but the encoder cannot see
+        // the target, so it refuses the shape rather than dispatch a value the
+        // caller did not ask for. Mixed keys are fine: the named one forces the
+        // decoder to promote the whole node to a map.
+        // A `null` field emits no pair, so it cannot disambiguate anything: it
+        // is invisible to the decoder. Judging the shape on *declared* keys let
+        // `{"0": 5, "kind": null}` through, which reaches the wire as the bare
+        // `counts[0]=5` this arm exists to refuse. So the check runs over the
+        // fields that actually emit. An all-null object is left to fall through
+        // to the collapse check below, which describes it better.
+        Value::Object(fields)
+            if {
+                let mut emitting = fields
+                    .iter()
+                    .filter(|(_, value)| !value.is_null())
+                    .peekable();
+                emitting.peek().is_some()
+                    && emitting.all(|(field, _)| {
+                        !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit())
+                    })
+            } =>
+        {
+            return Err(format!(
+                "query argument `{key}` is an object whose field names are all numeric; a \
+                 query string cannot tell that from a sequence — rename a field, or move the \
+                 field to a JSON body"
+            ));
+        }
+        Value::Object(fields) => {
+            for (field, nested) in fields {
+                if !is_expressible_field_name(field) {
+                    return Err(inexpressible_field_name(key));
+                }
+                encode_query_arg(&format!("{key}[{field}]"), nested, depth + 1, out)?;
+            }
+        }
+        scalar => out.push(key, query_scalar(scalar))?,
+    }
+    // A container every one of whose leaves is `null` emits no pair at all.
+    // Left alone it would vanish — and inside an array the decoder would then
+    // compact the gap, shortening the sequence. That is the same silent
+    // alteration the empty-container and null-element checks above prevent, so
+    // it is refused here rather than dispatched. A `null` **field** is exempt by
+    // construction: it is not a container, so it stays the absent marker.
+    if is_container && out.pairs.len() == before {
+        return Err(format!(
+            "query argument `{key}` carries no value; a query string cannot express a \
+             container whose every field is null — omit it, or move the field to a JSON body"
+        ));
+    }
+    Ok(())
 }
 
 /// Replace a single `{name}` / `{name:regex}` capture in a path template.
@@ -2293,6 +3297,363 @@ mod tests {
         assert_eq!(tools.len(), 1, "opted-in 205 route must derive a tool");
     }
 
+    // ── Agent authority carried onto derived tools (#1691) ──────────────────
+    //
+    // The authority envelope is what makes a `tools/call` auditable with a
+    // *compile-known* blast radius: the grant name, the effect set, and the
+    // reversibility all come from the const assertions the macro already made
+    // against the handler body. Losing it between `ApiDoc` and `McpToolInfo`
+    // would silently downgrade a governed tool to `reversibility=unknown` in
+    // the audit trail and to `ungoverned_tools` in the manifest.
+
+    /// One construction site for the test grants, so the shape of
+    /// [`crate::agent_authority::Grant`] is pinned in exactly one place here.
+    const fn test_grant(
+        name: &'static str,
+        reversibility: crate::agent_authority::Reversibility,
+    ) -> crate::agent_authority::Grant {
+        crate::agent_authority::Grant {
+            name,
+            writes: &[],
+            unbounded_writes: &[],
+            tenant_scope: crate::agent_authority::TenantScope::Scoped,
+            outbound: &[],
+            webhooks: &[],
+            jobs: &[],
+            rate: None,
+            spend: None,
+            reversibility,
+            location: "autumn/src/mcp.rs",
+        }
+    }
+
+    /// Likewise for [`crate::agent_authority::AgentAuthority`].
+    const fn test_authority(
+        action: &'static str,
+        grant: &'static crate::agent_authority::Grant,
+    ) -> crate::agent_authority::AgentAuthority {
+        crate::agent_authority::AgentAuthority {
+            action,
+            module_path: "autumn_web::mcp::tests",
+            location: "autumn/src/mcp.rs",
+            grant,
+            effects: &[],
+            asserted_effect_free_sites: 0,
+            asserted_effect_free: &[],
+        }
+    }
+
+    static REVERSIBLE_GRANT: crate::agent_authority::Grant = test_grant(
+        "DraftOnly",
+        crate::agent_authority::Reversibility::Reversible,
+    );
+    static COMPENSABLE_GRANT: crate::agent_authority::Grant = test_grant(
+        "RefundDrafter",
+        crate::agent_authority::Reversibility::Compensable,
+    );
+    static IRREVERSIBLE_GRANT: crate::agent_authority::Grant = test_grant(
+        "PayoutSender",
+        crate::agent_authority::Reversibility::Irreversible,
+    );
+
+    static REVERSIBLE_AUTHORITY: crate::agent_authority::AgentAuthority =
+        test_authority("draft_note", &REVERSIBLE_GRANT);
+    static COMPENSABLE_AUTHORITY: crate::agent_authority::AgentAuthority =
+        test_authority("draft_refund", &COMPENSABLE_GRANT);
+    static IRREVERSIBLE_AUTHORITY: crate::agent_authority::AgentAuthority =
+        test_authority("send_payout", &IRREVERSIBLE_GRANT);
+
+    /// An opted-in tool doc carrying (or not carrying) an authority.
+    fn governed_doc(
+        method: &'static str,
+        op: &'static str,
+        authority: Option<&'static crate::agent_authority::AgentAuthority>,
+    ) -> ApiDoc {
+        let mut d = doc(method, "/api/refunds", op);
+        d.mcp_tool = true;
+        d.agent_authority = authority;
+        d
+    }
+
+    #[test]
+    fn derive_tools_carries_the_handler_authority_onto_the_tool() {
+        let tools = derive_tools(
+            &[governed_doc(
+                "POST",
+                "draft_refund",
+                Some(&COMPENSABLE_AUTHORITY),
+            )],
+            false,
+            None,
+        );
+        assert_eq!(tools.len(), 1, "the opted-in route must derive a tool");
+        let authority = tools[0]
+            .agent_authority()
+            .expect("a governed handler's tool must carry its authority envelope");
+        assert_eq!(authority.grant.name, "RefundDrafter");
+        assert_eq!(
+            authority.grant.reversibility,
+            crate::agent_authority::Reversibility::Compensable
+        );
+        assert_eq!(authority.action, "draft_refund");
+    }
+
+    #[test]
+    fn derive_tools_leaves_an_ungoverned_tool_without_an_authority() {
+        // `None` must stay `None`: it is the signal the manifest uses to list a
+        // mutating tool under `ungoverned_tools`, so inventing one here would
+        // hide exactly the gap that check exists to find.
+        let tools = derive_tools(&[governed_doc("POST", "draft_refund", None)], false, None);
+        assert_eq!(tools.len(), 1);
+        assert!(
+            tools[0].agent_authority().is_none(),
+            "a handler with no #[agent_operable] derives an ungoverned tool"
+        );
+    }
+
+    #[test]
+    fn destructive_hint_follows_declared_reversibility() {
+        let hint = |op, authority| {
+            let tools = derive_tools(&[governed_doc("POST", op, authority)], false, None);
+            tools[0].annotations().get("destructiveHint").cloned()
+        };
+
+        // A declared authority can *raise* the warning on a verb that says
+        // nothing by itself.
+        assert_eq!(
+            hint("send_payout", Some(&IRREVERSIBLE_AUTHORITY)),
+            Some(json!(true)),
+            "an irreversible action is destructive"
+        );
+        assert_eq!(
+            hint("draft_refund", Some(&COMPENSABLE_AUTHORITY)),
+            Some(json!(true)),
+            "a compensable action still needs a compensating step, so warn"
+        );
+        assert_eq!(
+            hint("draft_note", Some(&REVERSIBLE_AUTHORITY)),
+            Some(json!(false)),
+            "a POST proved to be bounded writes only is explicitly NOT destructive"
+        );
+    }
+
+    #[test]
+    fn destructive_hint_falls_back_to_the_verb_rule_when_ungoverned() {
+        // Nothing changes for the ungoverned majority: POST carries no hint and
+        // DELETE stays flagged, exactly as before #1691.
+        let post = derive_tools(&[governed_doc("POST", "draft_refund", None)], false, None);
+        assert!(
+            post[0].annotations().get("destructiveHint").is_none(),
+            "an ungoverned POST keeps the verb rule's silence: {:?}",
+            post[0].annotations()
+        );
+
+        let delete = derive_tools(
+            &[governed_doc("DELETE", "delete_refund", None)],
+            false,
+            None,
+        );
+        assert_eq!(
+            delete[0].annotations().get("destructiveHint"),
+            Some(&json!(true)),
+            "DELETE stays the destructive verb when no authority is declared"
+        );
+    }
+
+    #[test]
+    fn the_delete_verb_is_a_floor_a_reversible_grant_cannot_clear() {
+        // `reversible` means the analyser proved the effect set is bounded
+        // writes only — and `delete_by_id` IS a bounded write, so a hard row
+        // delete reaches this shape. It does not mean the row can be put back;
+        // nothing checks for soft-delete or versioning. Since an MCP client
+        // skips its confirmation prompt on `destructiveHint: false`, the verb
+        // stays a floor: the grant may add the warning, never remove it
+        // (issue #1691 review, P2-1).
+        let tools = derive_tools(
+            &[governed_doc(
+                "DELETE",
+                "archive_note",
+                Some(&REVERSIBLE_AUTHORITY),
+            )],
+            false,
+            None,
+        );
+        assert_eq!(
+            tools[0].annotations().get("destructiveHint"),
+            Some(&json!(true)),
+            "one unproved adjective in a grant must not clear a DELETE's warning: {:?}",
+            tools[0].annotations()
+        );
+    }
+
+    // ── Argument names are intersected with the tool's surface (#1691 P2-2) ──
+
+    /// A tool with one path param plus a body, so all three name categories
+    /// (path param, reserved key, unknown) are reachable.
+    fn tool_with_path_param() -> McpTool {
+        let mut t = tool("POST", "/api/refunds/{id}", true, false);
+        t.path_params = vec!["id".to_owned()];
+        t
+    }
+
+    #[test]
+    fn argument_names_records_the_tools_own_surface_verbatim() {
+        let names = argument_names(
+            &tool_with_path_param(),
+            &json!({ "body": {}, "id": "7", "query": {} }),
+        );
+        assert_eq!(names, "body,id,query", "sorted, and no unknown count");
+    }
+
+    #[test]
+    fn argument_names_counts_unrecognised_keys_instead_of_quoting_them() {
+        // `build_request` reads only `body`/`query`/the path params and ignores
+        // everything else, and nothing rejects extra properties — so every other
+        // key is caller-authored text that must never reach a durable row.
+        let hostile = "\n2026-09-02T00:00:00Z INFO agent tool call actor=admin";
+        let mut args = serde_json::Map::new();
+        args.insert("body".to_owned(), json!({}));
+        args.insert(hostile.to_owned(), json!(1));
+        args.insert("ssn-123-45-6789".to_owned(), json!(2));
+        let names = argument_names(&tool_with_path_param(), &Value::Object(args));
+        assert_eq!(names, "body,+2 unknown");
+        assert!(
+            !names.contains('\n') && !names.contains("ssn-"),
+            "no caller-chosen byte may appear: {names}"
+        );
+    }
+
+    #[test]
+    fn argument_names_of_an_all_unknown_call_is_only_a_count() {
+        let names = argument_names(
+            &tool_with_path_param(),
+            &json!({ "\u{1f648}": 1, "../../etc": 2 }),
+        );
+        assert_eq!(names, "+2 unknown");
+    }
+
+    #[test]
+    fn argument_names_addresses_a_catch_all_param_by_its_bare_name() {
+        // `ApiDoc` surfaces `/files/{*rest}` as `*rest`; clients send `rest`,
+        // and `build_request` strips the star to match. The audit view must
+        // strip it the same way or a legitimate param reads as unknown.
+        let mut t = tool("GET", "/files/{*rest}", false, false);
+        t.path_params = vec!["*rest".to_owned()];
+        assert_eq!(argument_names(&t, &json!({ "rest": "a/b" })), "rest");
+    }
+
+    #[test]
+    fn argument_names_of_a_non_object_is_empty() {
+        assert_eq!(argument_names(&tool_with_path_param(), &json!(null)), "");
+    }
+
+    #[test]
+    fn render_effects_caps_the_list_and_marks_the_truncation() {
+        use crate::agent_authority::{Effect, EffectKind, EffectProvenance};
+
+        const fn effect(subject: &'static str) -> Effect {
+            Effect {
+                kind: EffectKind::Write,
+                subject,
+                location: "mcp.rs:0",
+                provenance: EffectProvenance::Syntactic,
+            }
+        }
+        // One over the cap, so the elision is exercised rather than the
+        // boundary being silently the whole list.
+        const EFFECTS: [Effect; MAX_AUDITED_EFFECTS + 1] =
+            [effect("Refund"); MAX_AUDITED_EFFECTS + 1];
+
+        let rendered = render_effects(&EFFECTS);
+        assert_eq!(
+            rendered.matches("write:Refund").count(),
+            MAX_AUDITED_EFFECTS,
+            "an oversized effect set is capped, not spilled into every row: {rendered}"
+        );
+        assert!(
+            rendered.ends_with(",\u{2026}"),
+            "the cap must be visible in the row, not silent: {rendered}"
+        );
+        assert_eq!(render_effects(&EFFECTS[..1]), "write:Refund");
+        assert_eq!(render_effects(&[]), "");
+    }
+
+    #[test]
+    fn only_a_completed_stream_and_an_intact_body_count_as_success() {
+        // The disposition is the half of the verdict the status line cannot
+        // supply: a streaming tool answers `200` before it has done anything,
+        // and a buffered one can answer `200` and then fail to hand its body
+        // over (issue #1691 review rounds 1 and 2).
+        assert!(Disposition::Settled.is_success());
+        assert!(Disposition::Stream(StreamState::Completed).is_success());
+        assert!(!Disposition::Stream(StreamState::Aborted).is_success());
+        assert!(!Disposition::Stream(StreamState::Errored).is_success());
+        assert!(!Disposition::Buffered(BufferedFailure::Overflow).is_success());
+        assert!(!Disposition::Buffered(BufferedFailure::BodyError).is_success());
+
+        // Each failing ending names itself in exactly one metadata key, so a
+        // sink can tell the three stream endings apart from a lost body.
+        assert_eq!(
+            Disposition::Stream(StreamState::Aborted).stream_state(),
+            Some("aborted")
+        );
+        assert_eq!(Disposition::Stream(StreamState::Aborted).result(), None);
+        assert_eq!(
+            Disposition::Buffered(BufferedFailure::Overflow).result(),
+            Some("body_overflow")
+        );
+        assert_eq!(
+            Disposition::Buffered(BufferedFailure::BodyError).result(),
+            Some("body_error")
+        );
+        assert_eq!(
+            Disposition::Buffered(BufferedFailure::Overflow).stream_state(),
+            None
+        );
+        assert_eq!(Disposition::Settled.stream_state(), None);
+        assert_eq!(Disposition::Settled.result(), None);
+    }
+
+    #[tokio::test]
+    async fn a_length_limit_anywhere_in_the_source_chain_is_an_overflow() {
+        // `to_bytes` collects through `http_body_util::Limited`, which reports
+        // the cap as a `LengthLimitError` *nested* inside the error it hands
+        // back. Classifying on the outer type alone would record every overflow
+        // as a generic `body_error` — so the error under test is produced by the
+        // very call the buffered path makes, not by a hand-built stand-in.
+        let overflow = axum::body::to_bytes(axum::body::Body::from(vec![0_u8; 32]), 8)
+            .await
+            .expect_err("a body past the cap must not collect");
+        assert_eq!(
+            BufferedFailure::classify(&overflow),
+            BufferedFailure::Overflow
+        );
+        assert_eq!(BufferedFailure::Overflow.as_str(), "body_overflow");
+
+        let other = axum::Error::new(std::io::Error::other("peer went away"));
+        assert_eq!(
+            BufferedFailure::classify(&other),
+            BufferedFailure::BodyError
+        );
+        assert_eq!(BufferedFailure::BodyError.as_str(), "body_error");
+    }
+
+    #[test]
+    fn read_only_hint_is_unaffected_by_the_authority() {
+        // `readOnlyHint` is a statement about the HTTP verb, not about how hard
+        // the effect is to undo — the two hints must not be conflated.
+        let tools = derive_tools(
+            &[governed_doc(
+                "POST",
+                "draft_refund",
+                Some(&REVERSIBLE_AUTHORITY),
+            )],
+            false,
+            None,
+        );
+        assert_eq!(tools[0].annotations()["readOnlyHint"], json!(false));
+    }
+
     #[test]
     fn opted_in_202_is_skipped_not_exposed() {
         // 202 Accepted does not guarantee an empty body, so a schema-less 202
@@ -2445,14 +3806,20 @@ mod tests {
 
     #[test]
     fn annotations_track_method() {
-        assert_eq!(annotations_for("GET", "t")["readOnlyHint"], json!(true));
-        assert_eq!(annotations_for("POST", "t")["readOnlyHint"], json!(false));
         assert_eq!(
-            annotations_for("DELETE", "t")["destructiveHint"],
+            annotations_for("GET", "t", None)["readOnlyHint"],
+            json!(true)
+        );
+        assert_eq!(
+            annotations_for("POST", "t", None)["readOnlyHint"],
+            json!(false)
+        );
+        assert_eq!(
+            annotations_for("DELETE", "t", None)["destructiveHint"],
             json!(true)
         );
         assert!(
-            annotations_for("POST", "t")
+            annotations_for("POST", "t", None)
                 .get("destructiveHint")
                 .is_none()
         );
@@ -2493,7 +3860,6 @@ mod tests {
         let degradations = detect_schema_degradations(&schema, true, true);
         assert!(degradations.contains(&SchemaDegradation::OpaqueQuery));
         assert!(degradations.contains(&SchemaDegradation::OpaqueBody));
-        assert!(!degradations.contains(&SchemaDegradation::NestedQuery));
     }
 
     #[test]
@@ -2514,9 +3880,11 @@ mod tests {
     }
 
     #[test]
-    fn detect_degradation_flags_nested_query_object_and_array() {
-        // A query field that is itself an object → nested (flat-encoding cannot
-        // round-trip). Also cover an array-of-objects field.
+    fn detect_degradation_accepts_structured_query_fields() {
+        // Nested objects, arrays of objects, `$ref`s and their nullable
+        // (`oneOf [.., {"type":"null"}]`) forms are all round-trippable now that
+        // `Query<T>` decodes the bracketed dialect `build_request` emits
+        // (issue #1972), so none of them may be reported as a degradation.
         let schema = json!({
             "type": "object",
             "properties": {
@@ -2525,69 +3893,9 @@ mod tests {
                     "properties": {
                         "filter": { "type": "object", "properties": { "min": { "type": "integer" } } },
                         "rows": { "type": "array", "items": { "type": "object", "properties": { "k": { "type": "string" } } } },
-                    },
-                },
-            },
-        });
-        let degradations = detect_schema_degradations(&schema, true, false);
-        assert!(degradations.contains(&SchemaDegradation::NestedQuery));
-        assert!(!degradations.contains(&SchemaDegradation::OpaqueQuery));
-    }
-
-    #[test]
-    fn detect_degradation_flags_nested_query_via_ref() {
-        // A query field that is a `$ref` to an object def is still nested.
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "object",
-                    "properties": { "filter": { "$ref": "#/$defs/Filter" } },
-                },
-            },
-            "$defs": { "Filter": { "type": "object", "properties": { "min": { "type": "integer" } } } },
-        });
-        assert!(
-            detect_schema_degradations(&schema, true, false)
-                .contains(&SchemaDegradation::NestedQuery)
-        );
-    }
-
-    #[test]
-    fn detect_degradation_flags_nullable_nested_query_field() {
-        // `filter: Option<Filter>` derives to a nullable `oneOf` (the nested
-        // object branch + a `{"type":"null"}` branch) with no top-level `type`.
-        // The detector must still flag it — `serde_urlencoded` cannot decode the
-        // structured value whether or not the field is optional (issue #1972).
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "object",
-                    "properties": {
-                        "filter": { "oneOf": [ { "$ref": "#/$defs/Filter" }, { "type": "null" } ] },
-                    },
-                },
-            },
-            "$defs": { "Filter": { "type": "object", "properties": { "min": { "type": "integer" } } } },
-        });
-        let degradations = detect_schema_degradations(&schema, true, false);
-        assert!(
-            degradations.contains(&SchemaDegradation::NestedQuery),
-            "nullable nested query field must warn: {degradations:?}"
-        );
-    }
-
-    #[test]
-    fn detect_degradation_flags_nullable_array_of_objects_query_field() {
-        // `filter: Option<Vec<Filter>>` → `oneOf[{array of $ref}, {null}]`.
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "object",
-                    "properties": {
-                        "filters": { "oneOf": [
+                        "ref_filter": { "$ref": "#/$defs/Filter" },
+                        "maybe_filter": { "oneOf": [ { "$ref": "#/$defs/Filter" }, { "type": "null" } ] },
+                        "maybe_rows": { "oneOf": [
                             { "type": "array", "items": { "$ref": "#/$defs/Filter" } },
                             { "type": "null" },
                         ] },
@@ -2597,37 +3905,251 @@ mod tests {
             "$defs": { "Filter": { "type": "object", "properties": { "min": { "type": "integer" } } } },
         });
         assert!(
-            detect_schema_degradations(&schema, true, false)
-                .contains(&SchemaDegradation::NestedQuery),
-            "nullable array-of-objects query field must warn"
+            detect_schema_degradations(&schema, true, false).is_empty(),
+            "structured query fields are honored, not degraded"
         );
     }
 
     #[test]
-    fn detect_degradation_ignores_nullable_scalar_query_field() {
-        // `q: Option<String>` → `oneOf[{type:string}, {type:null}]` and
-        // `tags: Option<Vec<String>>` → `oneOf[{array of scalar}, {null}]`: both
-        // are flat-encodable, so neither may produce a false positive.
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "object",
-                    "properties": {
-                        "q": { "oneOf": [ { "type": "string" }, { "type": "null" } ] },
-                        "tags": { "oneOf": [
-                            { "type": "array", "items": { "type": "string" } },
-                            { "type": "null" },
-                        ] },
-                    },
-                },
-            },
-        });
-        assert!(
-            !detect_schema_degradations(&schema, true, false)
-                .contains(&SchemaDegradation::NestedQuery),
-            "nullable scalar / scalar-array query fields must NOT warn"
+    fn encode_query_arg_renders_the_extractor_dialect() {
+        let mut pairs = QueryPairs::new();
+        encode_query_arg("page", &json!(2), 1, &mut pairs).expect("scalar");
+        encode_query_arg("tags", &json!(["a", "b"]), 1, &mut pairs).expect("scalar array");
+        encode_query_arg("filter", &json!({ "status": "open" }), 1, &mut pairs).expect("object");
+        encode_query_arg("items", &json!([{ "sku": "A" }]), 1, &mut pairs).expect("object array");
+        assert_eq!(
+            pairs.pairs,
+            vec![
+                ("page".to_owned(), "2".to_owned()),
+                ("tags".to_owned(), "a".to_owned()),
+                ("tags".to_owned(), "b".to_owned()),
+                ("filter[status]".to_owned(), "open".to_owned()),
+                ("items[0][sku]".to_owned(), "A".to_owned()),
+            ]
         );
+    }
+
+    #[test]
+    fn encode_query_arg_omits_null_fields_rather_than_stringifying_them() {
+        // A null argument is the documented "absent" marker: no pair, no error.
+        let mut pairs = QueryPairs::new();
+        encode_query_arg("page", &json!(null), 1, &mut pairs).expect("null");
+        assert!(
+            pairs.pairs.is_empty(),
+            "a null argument renders no pair: {:?}",
+            pairs.pairs
+        );
+
+        // The same holds for a null field alongside a carried one — only a
+        // container that collapses ENTIRELY is refused (see the collapse test).
+        let mut pairs = QueryPairs::new();
+        encode_query_arg(
+            "filter",
+            &json!({ "status": null, "kind": "a" }),
+            1,
+            &mut pairs,
+        )
+        .expect("null field beside a carried one");
+        assert_eq!(
+            pairs.pairs,
+            vec![("filter[kind]".to_owned(), "a".to_owned())]
+        );
+    }
+
+    #[test]
+    fn encode_query_arg_refuses_values_a_query_string_cannot_carry() {
+        // Each of these would otherwise dispatch something the caller did not
+        // ask for: a vanished field, a shortened sequence, or an invented
+        // nesting level (issue #1972 review follow-ups).
+        for (label, value) in [
+            ("empty array", json!({ "tags": [] })),
+            ("empty object", json!({ "filter": {} })),
+            ("empty nested array", json!({ "matrix": [[1], []] })),
+            ("null array element", json!({ "tags": ["a", null] })),
+            (
+                "null object-array element",
+                json!({ "items": [null, { "sku": "A" }] }),
+            ),
+            ("bracket in field name", json!({ "filter": { "a[b]": 1 } })),
+            ("empty field name", json!({ "filter": { "": 1 } })),
+        ] {
+            let mut pairs = QueryPairs::new();
+            let Value::Object(fields) = &value else {
+                unreachable!()
+            };
+            let result = fields
+                .iter()
+                .try_for_each(|(key, v)| encode_query_arg(key, v, 1, &mut pairs));
+            assert!(
+                result.is_err(),
+                "{label} must be refused, not silently dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_query_arg_refuses_containers_that_collapse_to_nothing() {
+        // Codex P2: every field of an element being null emits no pair, so the
+        // element would vanish and the decoder would compact the gap — the same
+        // silent shortening a direct null element is already refused for.
+        let mut pairs = QueryPairs::new();
+        assert!(
+            encode_query_arg(
+                "items",
+                &json!([{ "note": null }, { "note": "x" }]),
+                1,
+                &mut pairs
+            )
+            .is_err(),
+            "an all-null element must not silently shorten the sequence"
+        );
+
+        // Same one level up, for an object-typed field.
+        let mut pairs = QueryPairs::new();
+        assert!(encode_query_arg("filter", &json!({ "note": null }), 1, &mut pairs).is_err());
+
+        // A `null` FIELD is still the documented absent marker, not a collapse.
+        let mut pairs = QueryPairs::new();
+        encode_query_arg("filter", &json!({ "a": 1, "b": null }), 1, &mut pairs).expect("partial");
+        assert_eq!(pairs.pairs, vec![("filter[a]".to_owned(), "1".to_owned())]);
+    }
+
+    #[test]
+    fn top_level_query_keys_are_validated_like_nested_field_names() {
+        // Codex P2: a dynamic query object can carry an arbitrary top-level
+        // key, and `filter[x]` would otherwise reach the decoder as structure.
+        assert!(!is_expressible_field_name("filter[x]"));
+        assert!(!is_expressible_field_name(""));
+        assert!(!is_expressible_field_name("a]b"));
+        assert!(is_expressible_field_name("filter"));
+        assert!(is_expressible_field_name("sort_by"));
+    }
+
+    #[test]
+    fn encode_query_arg_bounds_its_expansion() {
+        // A wide array cannot be turned into an unbounded pair list: expansion
+        // stops at the dispatch limit instead of building a giant URI.
+        let wide: Vec<Value> = (0..(MAX_QUERY_PAIRS * 2)).map(|i| json!(i)).collect();
+        let mut pairs = QueryPairs::new();
+        assert!(encode_query_arg("tags", &Value::Array(wide), 1, &mut pairs).is_err());
+
+        // A single absurd key is refused before any child key is formatted.
+        let mut pairs = QueryPairs::new();
+        let huge = "k".repeat(MAX_QUERY_BYTES + 1);
+        assert!(encode_query_arg(&huge, &json!({ "a": 1 }), 1, &mut pairs).is_err());
+    }
+
+    #[test]
+    fn encode_query_arg_charges_null_leaves_for_the_traversal_they_cost() {
+        // Codex P2: `null` emits no pair, so a container of them paid nothing
+        // against the pair/byte limits while still forcing one formatted child
+        // key per field — the all-null check only fires after the full walk.
+        // The traversal budget now stops it early.
+        let nulls: serde_json::Map<String, Value> = (0..(MAX_QUERY_NODES * 2))
+            .map(|i| (format!("f{i}"), Value::Null))
+            .collect();
+        let mut pairs = QueryPairs::new();
+        let err = encode_query_arg("root", &Value::Object(nulls), 1, &mut pairs)
+            .expect_err("a traversal this wide must be refused");
+        assert!(err.contains("traverse"), "{err}");
+        assert!(
+            pairs.nodes <= MAX_QUERY_NODES + 1,
+            "traversal must stop at the bound, visited {}",
+            pairs.nodes
+        );
+
+        // The budget is generous enough that ordinary nesting is unaffected.
+        let mut pairs = QueryPairs::new();
+        encode_query_arg(
+            "filter",
+            &json!({ "status": "open", "tag": null }),
+            1,
+            &mut pairs,
+        )
+        .expect("a small object still encodes");
+    }
+
+    #[test]
+    fn encode_query_arg_refuses_an_all_numeric_keyed_object() {
+        // Codex P2: every key digit-only decodes as a sequence, so an untyped
+        // target would receive an array where the caller sent an object.
+        let mut pairs = QueryPairs::new();
+        let err = encode_query_arg("counts", &json!({ "0": 5, "1": 6 }), 1, &mut pairs)
+            .expect_err("an all-numeric-keyed object is ambiguous on the wire");
+        assert!(err.contains("all numeric"), "{err}");
+
+        // One named key is enough to force map promotion on the way back in,
+        // so the mixed shape stays expressible.
+        let mut pairs = QueryPairs::new();
+        encode_query_arg("counts", &json!({ "0": 5, "total": 6 }), 1, &mut pairs)
+            .expect("a mixed-key object round-trips as a map");
+
+        // The check is per-object, so it also catches a nested one.
+        let mut pairs = QueryPairs::new();
+        assert!(encode_query_arg("filter", &json!({ "by": { "7": "x" } }), 1, &mut pairs).is_err());
+
+        // An empty field name still gets its own, more specific error.
+        let mut pairs = QueryPairs::new();
+        let err = encode_query_arg("counts", &json!({ "": 1 }), 1, &mut pairs)
+            .expect_err("an empty field name is inexpressible");
+        assert!(err.contains("may not be empty"), "{err}");
+    }
+
+    #[test]
+    fn a_singleton_scalar_array_keeps_its_container_kind() {
+        // Codex P2: one repeated key is indistinguishable from a scalar, so a
+        // one-element array must use the explicit position instead.
+        let mut pairs = QueryPairs::new();
+        encode_query_arg("tags", &json!(["only"]), 1, &mut pairs).expect("encodes");
+        assert_eq!(
+            pairs.pairs,
+            vec![("tags[0]".to_owned(), "only".to_owned())],
+            "a singleton must pin its kind"
+        );
+
+        // Two or more still use the repeated-key (OpenAPI form/explode) shape.
+        let mut pairs = QueryPairs::new();
+        encode_query_arg("tags", &json!(["a", "b"]), 1, &mut pairs).expect("encodes");
+        assert_eq!(
+            pairs.pairs,
+            vec![
+                ("tags".to_owned(), "a".to_owned()),
+                ("tags".to_owned(), "b".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn the_numeric_object_check_ignores_fields_that_emit_nothing() {
+        // Codex P2: a `null` field emits no pair, so it cannot disambiguate —
+        // judging on declared keys let this reach the wire as bare `counts[0]=5`.
+        let mut pairs = QueryPairs::new();
+        let err = encode_query_arg("counts", &json!({ "0": 5, "kind": null }), 1, &mut pairs)
+            .expect_err("the null field cannot disambiguate");
+        assert!(err.contains("all numeric"), "{err}");
+
+        // A named field that *does* emit still disambiguates, as before.
+        let mut pairs = QueryPairs::new();
+        encode_query_arg("counts", &json!({ "0": 5, "kind": "x" }), 1, &mut pairs)
+            .expect("an emitting named key resolves the shape");
+
+        // An all-null object keeps its own, more specific collapse error.
+        let mut pairs = QueryPairs::new();
+        let err = encode_query_arg("counts", &json!({ "0": null }), 1, &mut pairs)
+            .expect_err("an all-null object carries no value");
+        assert!(err.contains("carries no value"), "{err}");
+    }
+
+    #[test]
+    fn encode_query_arg_rejects_nesting_past_the_decoder_cap() {
+        // Build an object nested one level deeper than the decoder accepts, so
+        // the encoder refuses instead of emitting keys the extractor rejects.
+        let mut value = json!("leaf");
+        for _ in 0..crate::query_string::MAX_DEPTH {
+            value = json!({ "deeper": value });
+        }
+        let mut pairs = QueryPairs::new();
+        assert!(encode_query_arg("root", &value, 1, &mut pairs).is_err());
     }
 
     #[test]
@@ -2653,6 +4175,7 @@ mod tests {
             has_query,
             streams: false,
             empty_body: false,
+            agent_authority: None,
         }
     }
 
@@ -2887,6 +4410,7 @@ mod tests {
                 csrf_header: "x-csrf-token".to_owned(),
                 envelope_rate_limited: false,
                 envelope_load_shed: false,
+                state: crate::AppState::for_test(),
             },
         )
     }

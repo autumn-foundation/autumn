@@ -1,0 +1,5 @@
+error: `#[edge]` handlers cannot take `Extension<...>` — the capsule installs no request extensions (the `EdgeCache` seam is the one mediated capability), so a missing extension would be served as a 500 instead of falling through; use `EdgeCache`, or serve this route from the origin
+  --> tests/compile-fail/edge_with_extension.rs:16:3
+   |
+16 | #[edge]
+   |   ^^^^

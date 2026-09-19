@@ -1,0 +1,11 @@
+error[E0063]: missing field `upgrades` in initializer of `Stats`
+  --> tests/compile-fail/state_migration_missing_field.rs:28:1
+   |
+28 | / state_migration! {
+29 | |     from StatsV1 as old => Stats {
+30 | |         hits: old.hits,
+...  |
+33 | | }
+   | |_^ missing `upgrades`
+   |
+   = note: this error originates in the macro `state_migration` (in Nightly builds, run with -Z macro-backtrace for more info)

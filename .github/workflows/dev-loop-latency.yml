@@ -46,6 +46,13 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # `Cli::try_parse_from` builds this CLI's entire clap command tree inside a
+  # single `Commands::augment_subcommands` frame, which is close enough to the
+  # 2 MiB default thread stack that adding one subcommand can overflow it — and
+  # the margin differs per platform, so it surfaces on Windows first. The tests
+  # are correct; only the stack they run on is marginal. Raise it explicitly
+  # rather than leaving the suite one variant away from aborting.
+  RUST_MIN_STACK: 8388608
 
 jobs:
   # ── Budget table smoke-check (runs on every PR, no live server) ────────────

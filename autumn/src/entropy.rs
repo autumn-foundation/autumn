@@ -29,6 +29,14 @@
 //! }
 //! ```
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::sync::{Arc, Mutex};
 
 use rand::{RngCore, SeedableRng};
@@ -145,6 +153,33 @@ pub(crate) fn derive_uuid_from(seed: u64, purpose_tag: &[u8]) -> Uuid {
     let mut bytes = [0u8; 16];
     rng.fill_bytes(&mut bytes);
     uuid_v4_from_bytes(bytes)
+}
+
+/// A shared entropy handle is itself an entropy source.
+///
+/// The [`ClockSource`](crate::time::ClockSource) sibling of this impl exists
+/// for the same reason: a capsule replay hands its already-`Arc`ed source
+/// straight to `TestApp::with_entropy`, with no forwarding newtype in between.
+impl Entropy for std::sync::Arc<dyn Entropy> {
+    fn next_u64(&self) -> u64 {
+        (**self).next_u64()
+    }
+
+    fn fill_bytes(&self, dest: &mut [u8]) {
+        (**self).fill_bytes(dest);
+    }
+
+    // The *provided* methods are forwarded too, not left to the default. A
+    // source that overrides `uuid_v4`/`uuid_v7` would otherwise have its
+    // override silently dropped the moment it was handed through an `Arc`,
+    // which is precisely how this impl is used.
+    fn uuid_v4(&self) -> Uuid {
+        (**self).uuid_v4()
+    }
+
+    fn uuid_v7(&self, unix_millis: u64) -> Uuid {
+        (**self).uuid_v7(unix_millis)
+    }
 }
 
 // ── OS (real) entropy ─────────────────────────────────────────────────────────

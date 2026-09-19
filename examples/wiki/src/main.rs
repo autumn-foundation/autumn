@@ -8,7 +8,6 @@ mod models;
 mod repositories;
 mod routes;
 mod schema;
-mod slugify;
 
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::prelude::*;

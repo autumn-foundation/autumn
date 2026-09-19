@@ -1,0 +1,5 @@
+error: empty `seo(...)`. Declare at least one key, e.g. `seo(title = "…")`. Supported keys: `title`, `description`, `canonical`, `og_title`, `og_description`, `og_image`, `og_type`, `og_url`, `twitter_card`, `twitter_title`, `twitter_description`, `twitter_image`, `robots`.
+ --> tests/compile-fail/route_seo_empty_group.rs:3:20
+  |
+3 | #[get("/about", seo())]
+  |                    ^

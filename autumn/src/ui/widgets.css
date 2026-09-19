@@ -157,6 +157,117 @@
     margin: 0;
 }
 
+/* Currently stored file shown above an attachment column's file input, and the
+   type/size annotation beside a rendered attachment link — issue #1236. A file
+   input can't be repopulated, so this line is the only signal that the record
+   already holds a blob. */
+.autumn-field__current {
+    font-size: 0.875rem;
+    margin: 0 0 0.25rem;
+}
+
+.autumn-attachment__meta {
+    font-size: 0.8125rem;
+    color: var(--text-muted);
+}
+
+/* ── Rich text (autumn-rich-text) — issue #1255 ───────────────────────────── */
+
+.autumn-rich-text {
+    gap: 0.375rem;
+}
+
+.autumn-rich-text__toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    padding: 0.375rem 0.5rem;
+    border: 1px solid var(--border);
+    border-bottom: none;
+    border-radius: var(--radius) var(--radius) 0 0;
+    background-color: var(--surface);
+}
+
+.autumn-rich-text__toolbar-item {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.25rem;
+    font-size: 0.75rem;
+}
+
+.autumn-rich-text__toolbar-label {
+    color: var(--text-muted);
+}
+
+.autumn-rich-text__toolbar-syntax {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    color: var(--text);
+}
+
+/* The toolbar sits directly on top of the editor, so they read as one control. */
+.autumn-rich-text__toolbar + .autumn-rich-text__editor {
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+}
+
+.autumn-rich-text__editor {
+    min-height: 12rem;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    resize: vertical;
+}
+
+.autumn-rich-text__hint {
+    font-size: 0.8125rem;
+    color: var(--text-muted);
+    margin: 0;
+}
+
+.autumn-rich-text__preview-wrapper {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    margin-top: 0.5rem;
+}
+
+.autumn-rich-text__preview-label {
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--text);
+}
+
+.autumn-rich-text__preview {
+    padding: 0.75rem;
+    border: 1px dashed var(--border);
+    border-radius: var(--radius);
+    background-color: var(--surface);
+    color: var(--text);
+    font-size: 0.875rem;
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+}
+
+.autumn-rich-text__preview > :first-child {
+    margin-top: 0;
+}
+
+.autumn-rich-text__preview > :last-child {
+    margin-bottom: 0;
+}
+
+.autumn-rich-text__preview pre {
+    overflow-x: auto;
+}
+
+.autumn-rich-text__preview table {
+    border-collapse: collapse;
+}
+
+.autumn-rich-text__preview th,
+.autumn-rich-text__preview td {
+    border: 1px solid var(--border);
+    padding: 0.25rem 0.5rem;
+}
+
 /* ── Submit button (autumn-submit) ────────────────────────────────────────── */
 
 .autumn-submit {
@@ -403,6 +514,28 @@
         flex-direction: column;
         align-items: flex-start;
     }
+}
+
+/* ── Locale switcher (autumn-locale-switcher, issue #1251) ───────────────────── */
+
+.autumn-locale-switcher {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.autumn-locale-switcher a {
+    color: var(--text);
+    text-decoration: none;
+}
+
+.autumn-locale-switcher a:hover {
+    color: var(--primary);
+}
+
+.autumn-locale-switcher__current {
+    font-weight: 600;
+    color: var(--text-muted);
 }
 
 /* ── Breadcrumb (autumn-breadcrumb) ───────────────────────────────────────── */
@@ -1270,6 +1403,209 @@
     cursor: not-allowed;
 }
 
+/* ── Reaction controls (autumn-reaction-*, issue #1362) ───────────────────── */
+
+/* The `role="group"` container holds one no-JS POST form per direction with
+   the aggregate between them. A column stacks up / count / down into the
+   familiar vote-arrow strip; `likes` mode simply renders one form and the
+   count, so the same rule serves both. */
+.autumn-reaction-controls {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.125rem;
+}
+
+/* Each direction is its own form so it can be submitted without JS; strip the
+   default block-level margin so the arrows sit tight against the count. */
+.autumn-reaction {
+    display: inline-flex;
+    margin: 0;
+}
+
+/* The direction modifiers carry no geometry of their own -- they exist as
+   styling/targeting hooks so an app can re-colour a single direction (e.g. a
+   warm upvote, a cool downvote) without forking the base rules. */
+.autumn-reaction-up {
+    color: inherit;
+}
+
+.autumn-reaction-down {
+    color: inherit;
+}
+
+.autumn-reaction-like {
+    color: inherit;
+}
+
+/* Borderless icon button: the glyph is the affordance, so no chrome until
+   hover/focus. `color: inherit` keeps the resting arrow the same weight as
+   surrounding text; `--text-muted` would drop below 3:1 on `--surface`. */
+.autumn-reaction-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.125rem 0.375rem;
+    border: 1px solid transparent;
+    border-radius: var(--radius);
+    background-color: transparent;
+    color: var(--text);
+    font: inherit;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.autumn-reaction-button:hover {
+    background-color: var(--surface);
+    border-color: var(--border);
+}
+
+.autumn-reaction-button:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+/* The viewer's own reaction (`aria-pressed="true"`). Colour is a redundant
+   cue only -- `aria-pressed` is the machine-readable state -- so this never
+   has to carry the meaning alone. */
+.autumn-reaction-active {
+    color: var(--primary);
+    border-color: var(--primary);
+}
+
+/* The aggregate, announced via `aria-live="polite"` after an htmx swap.
+   `tabular-nums` stops the strip from reflowing as the score changes width. */
+.autumn-reaction-count {
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+}
+
+/* ── Cookie-consent banner (issue #1214) ──────────────────────────────────── */
+
+/* `position: sticky` (not `fixed`) deliberately: the banner is spliced right
+   before `</body>`, so as the last element in normal document flow it always
+   reserves exactly its own real, responsive height -- however many lines the
+   message/buttons wrap to on a narrow viewport or at increased text zoom --
+   with no separate CSS reservation hack that could fall out of sync and let
+   a `fixed` banner permanently cover page content (e.g. a `<footer>`)
+   underneath it. It still behaves like a persistent bottom bar (not a
+   full-screen overlay, not a blocking modal) on any page taller than the
+   viewport, which is the common case; on a very short page it simply settles
+   in flow just after the content rather than pinned to the visual bottom of
+   the screen. `--text-muted` (not `--border`, which is only ~1.2:1 against
+   `--surface`) gives the boundary the ~3:1 contrast WCAG 1.4.11 requires for
+   a UI-component edge; `--shadow` reinforces it. */
+.autumn-consent-banner {
+    position: sticky;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 1000;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 1rem 1.5rem;
+    background-color: var(--surface);
+    border-top: 1px solid var(--text-muted);
+    box-shadow: var(--shadow);
+    color: var(--text);
+}
+
+.autumn-consent-banner__message {
+    margin: 0;
+    flex: 1 1 20rem;
+    font-size: 0.9rem;
+}
+
+.autumn-consent-banner__actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin: 0;
+}
+
+/* Reject and Accept share this one base class — and no other sizing/color
+   rule distinguishes them — so rejecting is exactly as easy (same size,
+   same prominence) as accepting. Do not add a `--reject`/`--accept`-only
+   rule that changes size, weight, or fill; that would recreate the
+   dark-pattern "big Accept button, buried Reject link" this widget exists
+   to avoid. */
+.autumn-consent-banner__button {
+    padding: 0.5rem 1rem;
+    border: 1px solid var(--text-muted);
+    border-radius: var(--radius);
+    background-color: var(--surface);
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+}
+
+.autumn-consent-banner__button:hover {
+    border-color: var(--primary);
+}
+
+.autumn-consent-banner__button:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+/* ── Bulk actions (autumn-bulk-*, issue #1312) ────────────────────────────── */
+
+/* The wrapping `<form method="post">` around a list and its toolbar. It carries
+   no geometry of its own: it must not disturb the layout of whatever list it
+   wraps (a `data_table`, a `<ul>`, a card grid), so it stays a plain block and
+   only strips the default form margin. */
+.autumn-bulk-form {
+    margin: 0;
+}
+
+/* The `role="group"` holding the submit button, below the list it applies to.
+   Aligned to the start so it reads as an action on the selection above rather
+   than as page-level navigation. */
+.autumn-bulk-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: center;
+    margin-top: 0.75rem;
+}
+
+.autumn-bulk-actions button {
+    padding: 0.5rem 1rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background-color: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+}
+
+.autumn-bulk-actions button:hover {
+    border-color: var(--primary);
+}
+
+.autumn-bulk-actions button:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+/* One per row, in the list's leading cell. Sized up slightly from the browser
+   default: this is the primary hit target for the whole flow, and a row is
+   selected by hitting a single small checkbox. */
+.autumn-bulk-select {
+    width: 1rem;
+    height: 1rem;
+    cursor: pointer;
+    vertical-align: middle;
+}
+
+.autumn-bulk-select:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
 /* Visually hidden but still exposed to assistive technology — the standard
    clip pattern (never `display:none`, which removes it from the a11y tree). */
 .autumn-visually-hidden {
@@ -1282,4 +1618,156 @@
     clip-path: inset(50%);
     white-space: nowrap;
     border: 0;
+}
+
+/* ── Comment threads (autumn-comment-*, issue #1367) ──────────────────────── */
+
+/* The region landmark wrapping the whole thread. It is also the htmx swap
+   target, so it must not itself be positioned or transformed -- an outerHTML
+   swap replaces this element wholesale. */
+.autumn-comments {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+/* Every nesting level is an `<ol>`: the order is meaningful (chronological),
+   and a list is what a screen reader announces the depth of. The list markers
+   are suppressed; the indent guide below is the visual cue instead. */
+.autumn-comment-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+/* A nested level indents behind a rule, which is what makes depth legible
+   without a per-level class (the widget renders arbitrarily deep). The
+   `border-inline-start` is logical, so it flips for RTL locales. */
+.autumn-comment .autumn-comment-list {
+    margin-block-start: 0.75rem;
+    padding-inline-start: 0.875rem;
+    border-inline-start: 2px solid var(--border);
+}
+
+.autumn-comment {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+}
+
+.autumn-comment-meta {
+    font-size: 0.8125rem;
+    color: var(--text-muted);
+}
+
+.autumn-comment-author {
+    font-weight: 600;
+    color: var(--text);
+}
+
+/* `tabular-nums` keeps a column of timestamps from shifting as digits change. */
+.autumn-comment-time {
+    font-variant-numeric: tabular-nums;
+}
+
+/* `overflow-wrap` rather than `word-break`: a pasted URL has to wrap, but
+   ordinary prose must still break on spaces. */
+.autumn-comment-body {
+    color: var(--text);
+    overflow-wrap: anywhere;
+}
+
+.autumn-comment-body p {
+    margin: 0 0 0.5rem;
+}
+
+.autumn-comment-body p:last-child {
+    margin-bottom: 0;
+}
+
+/* `<details>`/`<summary>` gives progressive disclosure with no JavaScript at
+   all -- the reply form is in the DOM and reachable by keyboard whether or not
+   htmx (or any script) loaded. */
+.autumn-comment-reply {
+    font-size: 0.875rem;
+}
+
+.autumn-comment-reply-toggle {
+    cursor: pointer;
+    color: var(--primary);
+    width: fit-content;
+}
+
+.autumn-comment-reply-toggle:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.autumn-comment-form {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+    margin: 0.5rem 0 0;
+}
+
+/* The label doubles as the visible prompt, so it is not visually hidden -- a
+   placeholder alone is not an accessible name. */
+.autumn-comment-label {
+    font-size: 0.8125rem;
+    color: var(--text-muted);
+}
+
+.autumn-comment-input {
+    width: 100%;
+    padding: 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background-color: var(--surface);
+    color: var(--text);
+    font: inherit;
+    resize: vertical;
+}
+
+.autumn-comment-input:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 1px;
+}
+
+.autumn-comment-submit {
+    align-self: flex-start;
+    padding: 0.375rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background-color: var(--surface);
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+}
+
+.autumn-comment-submit:hover {
+    border-color: var(--primary);
+}
+
+.autumn-comment-submit:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.autumn-comments-empty,
+.autumn-comments-prompt {
+    margin: 0;
+    color: var(--text-muted);
+}
+
+/* A rejected comment, announced via `role="alert"`. Colour is a redundant cue
+   only -- the role is the machine-readable state. */
+.autumn-comments-error {
+    margin: 0;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--danger, #b3261e);
+    border-radius: var(--radius);
+    color: var(--danger, #b3261e);
 }

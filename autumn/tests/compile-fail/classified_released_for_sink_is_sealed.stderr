@@ -1,0 +1,18 @@
+error[E0277]: the trait bound `CustomerEmailClassified: classify::sealed::NeverReleased` is not satisfied
+  --> tests/compile-fail/classified_released_for_sink_is_sealed.rs:19:48
+   |
+19 | impl autumn_web::classify::ReleasedForSink for CustomerEmailClassified {}
+   |                                                ^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `classify::sealed::NeverReleased` is not implemented for `CustomerEmailClassified`
+  --> tests/compile-fail/classified_released_for_sink_is_sealed.rs:12:1
+   |
+12 | #[autumn_web::model(table = "customers")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `ReleasedForSink`
+  --> src/classify/mod.rs
+   |
+   | pub trait ReleasedForSink: sealed::NeverReleased {}
+   |                            ^^^^^^^^^^^^^^^^^^^^^ required by this bound in `ReleasedForSink`
+   = note: `ReleasedForSink` is a "sealed trait", because to implement it you also need to implement `autumn_web::classify::sealed::NeverReleased`, which is not accessible; this is usually done to force you to use one of the provided types that already implement it
+   = note: this error originates in the attribute macro `autumn_web::model` (in Nightly builds, run with -Z macro-backtrace for more info)

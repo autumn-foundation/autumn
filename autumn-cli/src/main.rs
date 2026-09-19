@@ -1,26 +1,38 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod a11y;
+mod agents;
 mod alert;
 mod assets;
 mod build;
+mod cache_audit;
 mod canary;
+mod capacity;
+mod capacity_driver;
+mod capsule;
 mod check;
 mod cold_start_driver;
 mod config;
+mod console;
 mod credentials;
 mod data;
+mod data_flow;
 mod db;
 mod db_pull;
 mod deploy;
+mod deps;
 mod dev;
 mod dev_loop_bench;
 mod dev_loop_scaling;
 mod doctor;
+mod edge_scan;
 mod experiments;
 mod export;
 mod flags;
 mod generate;
+mod graph;
 mod http;
 mod i18n;
 mod jobs;
@@ -29,18 +41,29 @@ mod maintenance;
 mod migrate;
 mod monitor;
 mod new;
+mod openapi;
 mod overload_driver;
 mod paths;
 mod pg;
+mod platform;
+mod plugin;
 mod plugin_check;
+mod plugin_sandbox;
+mod posture;
 mod process;
 mod release;
+mod replay;
+mod retention;
 mod routes;
 mod routes_audit;
+mod rust_source;
+mod sbom;
 mod scaling_driver;
 mod schema;
+mod search;
 mod seed;
 mod serve;
+mod service;
 mod setup;
 mod shard;
 mod starters;
@@ -48,6 +71,7 @@ mod task;
 mod test_cmd;
 mod text_width;
 mod token;
+mod upgrade;
 mod webhook;
 /// Subcommands for `autumn check`.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
@@ -91,6 +115,419 @@ pub enum RoutesSubcommands {
         #[arg(long)]
         strict: bool,
     },
+    /// Diff, acknowledge, and verify security posture across commits (#1624).
+    ///
+    /// `routes audit` proves what the security surface *is*; `routes posture`
+    /// answers what a change *did to it*, and whether a human agreed.
+    ///
+    ///   autumn routes posture diff --base base.json --head posture.json
+    ///   autumn routes posture digest --manifest security-posture.json
+    ///   autumn routes posture verify --manifest security-posture.json \
+    ///     --expect-digest <digest> --repo owner/repo
+    #[command(subcommand, verbatim_doc_comment)]
+    Posture(PostureSubcommands),
+}
+
+/// Subcommands for `autumn routes posture` (issue #1624).
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum PostureSubcommands {
+    /// Diff two security posture manifests and gate on surface widening.
+    ///
+    /// Exits 0 when nothing widened (or the widening is acknowledged), 1 when a
+    /// widening is unacknowledged, and 2 on a usage or I/O problem — so CI can
+    /// tell "this PR widens the surface" from "the tool could not run".
+    ///
+    /// A widening blocks until someone comments the marker the report prints:
+    ///
+    ///   /ack-posture <digest>  optional reason
+    ///
+    /// The digest binds the acknowledgment to that exact set of widenings, so
+    /// pushing unrelated commits keeps it valid while a *new* widening
+    /// re-blocks.
+    #[command(verbatim_doc_comment)]
+    Diff {
+        /// The previously accepted manifest (e.g. the base branch's copy).
+        #[arg(long, value_name = "PATH")]
+        base: String,
+        /// The manifest for this commit, as built by `autumn routes audit`.
+        #[arg(long, value_name = "PATH")]
+        head: String,
+        /// Output format: `markdown` (default), `text`, or `json`.
+        #[arg(long, default_value = "markdown", value_name = "FORMAT")]
+        format: String,
+        /// Also write the rendered report to this path.
+        #[arg(long, value_name = "PATH")]
+        output: Option<String>,
+        /// An acknowledgment digest, without the comment ceremony (repeatable).
+        #[arg(long, value_name = "DIGEST")]
+        ack: Vec<String>,
+        /// File of pull-request text to scan for `/ack-posture` markers.
+        ///
+        /// The workflow harvests it from comments whose author is an OWNER,
+        /// MEMBER or COLLABORATOR: this command trusts what it is given and
+        /// enforces no authorization of its own.
+        #[arg(long, value_name = "PATH")]
+        ack_file: Option<String>,
+        /// Treat a missing base manifest as "no baseline yet" (exit 0) instead
+        /// of an error. What a repository enabling the gate wants on its first
+        /// run.
+        #[arg(long)]
+        allow_missing_base: bool,
+    },
+    /// Print a manifest's posture digest — the number a release records.
+    ///
+    /// Computed over the manifest's security-relevant content only, so a
+    /// handler rename or a moved line does not change it.
+    Digest {
+        /// Manifest to digest.
+        #[arg(long, value_name = "PATH")]
+        manifest: String,
+        /// Output format: `text` (default) or `json`.
+        #[arg(long, default_value = "text", value_name = "FORMAT")]
+        format: String,
+    },
+    /// Verify a shipped manifest is the acknowledged one, and genuinely signed.
+    ///
+    /// Two checks: the posture digest matches what CI acknowledged, and
+    /// `gh attestation verify` accepts the file (the same keyless Sigstore
+    /// pipeline the rest of the supply chain uses — see
+    /// docs/guide/supply-chain.md).
+    Verify {
+        /// Manifest to verify.
+        #[arg(long, value_name = "PATH")]
+        manifest: String,
+        /// The digest recorded when the posture was acknowledged.
+        #[arg(long, value_name = "DIGEST")]
+        expect_digest: Option<String>,
+        /// `owner/repo` whose CI minted the attestation.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Skip the signature check. Air-gapped hosts only — it is reported as
+        /// waived, never as passed.
+        #[arg(long)]
+        skip_signature: bool,
+    },
+}
+
+/// Arguments for [`CacheSubcommands::Audit`].
+///
+/// A separate `Args` struct rather than inline variant fields, for the same
+/// reason as `UpgradeArgs`: clap's derive builds every inline field of every
+/// variant inside one `Commands::augment_subcommands` frame, and that frame is
+/// already within a kilobyte of libtest's 2 MiB thread stack. Five more inline
+/// fields is exactly the kind of increment that decides whether the
+/// argument-parsing tests overflow, so this command keeps its share out of the
+/// shared frame: an `Args` struct gets its own `CacheAuditArgs::augment_args`
+/// frame, which pops before the next variant is built.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
+pub struct CacheAuditArgs {
+    /// Package to inspect (for workspaces).
+    #[arg(short, long)]
+    package: Option<String>,
+    /// Binary target to inspect (for packages with multiple bin targets).
+    #[arg(long, value_name = "BIN")]
+    bin: Option<String>,
+    /// Write the JSON cache-coherence manifest to this file path.
+    #[arg(long, value_name = "PATH")]
+    manifest: Option<String>,
+    /// Emit the JSON manifest to stdout instead of the human report.
+    #[arg(long)]
+    json: bool,
+    /// Also fail when a cached read's dependency set could not be established
+    /// (the default only warns, so the gate never cries wolf).
+    #[arg(long)]
+    strict: bool,
+    /// Cargo features to build the audited binary with (repeatable; a
+    /// comma-separated list also works). A `#[cached]` read or `#[repository]`
+    /// write behind a feature the build does not enable is not compiled in, so
+    /// it cannot appear in the manifest — audit the feature set you deploy.
+    #[arg(long, value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build the audited binary with all Cargo features enabled.
+    #[arg(long)]
+    all_features: bool,
+    /// Build the audited binary without default Cargo features.
+    #[arg(long)]
+    no_default_features: bool,
+}
+
+/// Arguments for `autumn data-flow`.
+///
+/// A separate `Args` struct for the same reason as [`CacheAuditArgs`]: clap's
+/// derive builds every inline variant field inside one
+/// `Commands::augment_subcommands` frame, which is already close to libtest's
+/// thread-stack limit.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
+pub struct DataFlowArgs {
+    /// Package to inspect (for workspaces).
+    #[arg(short, long)]
+    package: Option<String>,
+    /// Binary target to inspect (for packages with multiple bin targets).
+    #[arg(long, value_name = "BIN")]
+    bin: Option<String>,
+    /// Write the JSON data-flow manifest to this file path.
+    #[arg(long, value_name = "PATH")]
+    manifest: Option<String>,
+    /// Emit the JSON manifest to stdout instead of the human report.
+    #[arg(long)]
+    json: bool,
+    /// Compare against a committed manifest and exit non-zero on drift, so a
+    /// new release edge has to be reviewed rather than merged silently.
+    #[arg(long, value_name = "PATH")]
+    check: Option<String>,
+    /// Cargo features to build the inspected binary with (repeatable; a
+    /// comma-separated list also works). A `#[classified]` column or a
+    /// declassification boundary behind a feature the build does not enable is
+    /// not compiled in, so it cannot appear in the manifest.
+    #[arg(long, value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build the inspected binary with all Cargo features enabled.
+    #[arg(long)]
+    all_features: bool,
+    /// Build the inspected binary without default Cargo features.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Audit the release binary rather than the debug one.
+    ///
+    /// The manifest describes the binary that produced it, and a debug binary
+    /// is not the one that ships: a classified column or a declassification
+    /// boundary behind `#[cfg(not(debug_assertions))]` exists only in the
+    /// release build. Run `--check` in CI under the profile you deploy.
+    #[arg(long)]
+    release: bool,
+}
+
+/// Arguments for `autumn agents manifest`.
+///
+/// A separate `Args` struct for the same reason as [`DataFlowArgs`]: clap's
+/// derive builds every inline variant field inside one
+/// `Commands::augment_subcommands` frame, which is already close to libtest's
+/// thread-stack limit.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
+pub struct AgentsManifestArgs {
+    /// Package to inspect (for workspaces).
+    #[arg(short, long)]
+    package: Option<String>,
+    /// Binary target to inspect (for packages with multiple bin targets).
+    #[arg(long, value_name = "BIN")]
+    bin: Option<String>,
+    /// Write the JSON agent-authority manifest to this file path.
+    #[arg(long, value_name = "PATH")]
+    manifest: Option<String>,
+    /// Emit the JSON manifest to stdout instead of the human report.
+    #[arg(long)]
+    json: bool,
+    /// Compare against a committed manifest and exit non-zero on drift, so a
+    /// widened authority envelope has to be reviewed rather than merged
+    /// silently.
+    ///
+    /// This is the CI gate. Every check this command performs beyond the
+    /// compiler's own — drift, mutating tools with no envelope, actions nothing
+    /// can undo and nothing records, and routes naming an authority nothing
+    /// registered — runs only under `--check`. Without it the command reports
+    /// and warns but never fails, so a run that does not pass `--check` proves
+    /// nothing. Wire `autumn agents manifest --check <path>` into CI next to
+    /// `autumn data-flow --check`, and commit the manifest it writes with
+    /// `--manifest <path>`.
+    #[arg(long, value_name = "PATH")]
+    check: Option<String>,
+    /// Let `--check` pass with MCP-exposed mutating tools that carry no
+    /// authority envelope.
+    ///
+    /// Adoption is incremental and `#[repository(api, mcp)]` generates CRUD
+    /// tools with no annotation site, so the hatch exists — but it is a flag,
+    /// never a default: a mutating tool an agent can call with nothing declared
+    /// about it is what this command exists to surface. Allowed tools are still
+    /// listed.
+    ///
+    /// `requires = "check"`: the gate it relaxes only runs under `--check`, so
+    /// passing it alone means nothing. Saying so is better than accepting it
+    /// silently and leaving the author believing a gate was waived.
+    #[arg(long, requires = "check")]
+    allow_ungoverned: bool,
+    /// Let `--check` pass when no agent audit sink is configured even though
+    /// the binary can take an action nothing can undo.
+    ///
+    /// The one combination the runtime cannot catch: with no sink installed the
+    /// audit write trivially succeeds, so the fail-closed refusal never fires
+    /// and the invocation leaves no trace at all. A development binary
+    /// legitimately has no sink, so the hatch exists — but the default is to
+    /// fail, because "irreversible and unrecorded" is not a state to discover
+    /// afterwards.
+    ///
+    /// `requires = "check"`, for the same reason as `--allow-ungoverned`.
+    #[arg(long, requires = "check")]
+    allow_unaudited: bool,
+    /// Cargo features to build the inspected binary with (repeatable; a
+    /// comma-separated list also works). An `#[agent_operable]` action or a
+    /// grant behind a feature the build does not enable is not compiled in, so
+    /// it cannot appear in the manifest.
+    #[arg(long, value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build the inspected binary with all Cargo features enabled.
+    #[arg(long)]
+    all_features: bool,
+    /// Build the inspected binary without default Cargo features.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Audit the release binary rather than the debug one.
+    ///
+    /// The manifest describes the binary that produced it, and a debug binary
+    /// is not the one that ships: an action or a grant behind
+    /// `#[cfg(not(debug_assertions))]` exists only in the release build. Run
+    /// `--check` in CI under the profile you deploy.
+    #[arg(long)]
+    release: bool,
+}
+
+/// Arguments for `autumn graph` (issue #1747).
+///
+/// A separate `Args` struct for the same reason as [`AgentsManifestArgs`]:
+/// clap's derive builds every inline variant field inside one
+/// `Commands::augment_subcommands` frame, which is already close to libtest's
+/// thread-stack limit.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
+pub struct GraphArgs {
+    /// Package to inspect (for workspaces).
+    #[arg(short, long)]
+    package: Option<String>,
+    /// Binary target to inspect (for packages with multiple bin targets).
+    #[arg(long, value_name = "BIN")]
+    bin: Option<String>,
+    /// Write the JSON architecture graph to this file path.
+    #[arg(long, value_name = "PATH")]
+    manifest: Option<String>,
+    /// Emit the JSON graph to stdout instead of the human report.
+    ///
+    /// Only meaningful for `show`: `touches` and `impact` are answers, not
+    /// documents.
+    #[arg(long)]
+    json: bool,
+    /// Compare against a committed graph and exit non-zero on drift, so a
+    /// route that quietly lost its access to a table — or a declared element
+    /// that vanished from the graph — has to be reviewed rather than merged
+    /// silently. This is the CI gate.
+    #[arg(long, value_name = "PATH")]
+    check: Option<String>,
+    /// Cargo features to build the inspected binary with (repeatable; a
+    /// comma-separated list also works). A model, route or job behind a
+    /// feature the build does not enable is not compiled in, so it cannot
+    /// appear in the graph.
+    #[arg(long, value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build the inspected binary with all Cargo features enabled.
+    #[arg(long)]
+    all_features: bool,
+    /// Build the inspected binary without default Cargo features.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Inspect the release binary rather than the debug one.
+    ///
+    /// The graph describes the binary that produced it, and a debug binary is
+    /// not the one that ships: an element behind `#[cfg(not(debug_assertions))]`
+    /// exists only in the release build. Run `--check` in CI under the profile
+    /// you deploy.
+    #[arg(long)]
+    release: bool,
+}
+
+/// Subcommands for `autumn graph`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum GraphSubcommands {
+    /// Print the whole architecture graph.
+    Show(GraphArgs),
+    /// Which routes and jobs touch a model, table or repository.
+    Touches {
+        /// Model name, table name, repository trait, or generated `Pg*` type.
+        name: String,
+        #[command(flatten)]
+        args: GraphArgs,
+    },
+    /// What a change to a model, table or repository would affect.
+    Impact {
+        /// Model name, table name, repository trait, or generated `Pg*` type.
+        name: String,
+        #[command(flatten)]
+        args: GraphArgs,
+    },
+}
+
+/// Arguments for `autumn openapi export`.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
+pub struct OpenApiExportArgs {
+    /// Package to inspect (for workspaces).
+    #[arg(short, long)]
+    package: Option<String>,
+    /// Binary target to inspect (for packages with multiple bin targets).
+    #[arg(long, value_name = "BIN")]
+    bin: Option<String>,
+    /// Write the document to this path instead of stdout.
+    #[arg(long, value_name = "PATH")]
+    out: Option<PathBuf>,
+    /// Compare a fresh export against this committed document and exit
+    /// non-zero on drift, so an unreviewed contract change fails CI.
+    ///
+    /// Comparison is on parsed JSON, not bytes, so reindenting the committed
+    /// file is not a failure. Takes precedence over `--out`.
+    #[arg(long, value_name = "PATH")]
+    check: Option<PathBuf>,
+    /// Fail when any component schema exports as an opaque `{"type":"object"}`.
+    ///
+    /// Those are the types with no `#[derive(OpenApiSchema)]` and no registered
+    /// schema: they reach a generated client as `unknown`/`serde_json::Value`,
+    /// so a spec meant to drive codegen should not contain them. Reported
+    /// either way; this makes it a gate.
+    #[arg(long)]
+    strict: bool,
+    /// Cargo features to build the app with (repeatable).
+    #[arg(long = "features", value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build with `--all-features`.
+    #[arg(long)]
+    all_features: bool,
+    /// Build with `--no-default-features`.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Export from the release build rather than the debug one.
+    ///
+    /// A route or schema gated behind `#[cfg(not(debug_assertions))]` exists
+    /// only in the release binary, so a debug export can describe a contract
+    /// the deployed build does not serve. Use this wherever `--check` is
+    /// gating the shipped artifact.
+    #[arg(long)]
+    release: bool,
+}
+
+/// Subcommands for `autumn openapi`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum OpenApiSubcommands {
+    /// Emit the app's `OpenAPI` 3.1 document without booting it.
+    Export(OpenApiExportArgs),
+}
+
+/// Subcommands for `autumn agents`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum AgentsSubcommands {
+    /// Emit the agent-authority manifest (#1691) and check it for drift.
+    Manifest(AgentsManifestArgs),
+}
+
+/// Subcommands for `autumn cache`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum CacheSubcommands {
+    /// Prove cached reads are never left stale by a repository write (#1716).
+    ///
+    /// Compiles the app, reads back the cache-coherence manifest the framework
+    /// assembles from every `#[cached]` read and every `#[repository]` write it
+    /// links, and exits non-zero when a mutation's model appears in a cached
+    /// read's dependency set with no invalidation covering the pair — naming
+    /// the read, the mutation and the shared model. This is the CI gate.
+    Audit(CacheAuditArgs),
 }
 
 /// Subcommands for `autumn i18n`.
@@ -140,10 +577,14 @@ pub enum LifecycleSubcommands {
     /// can reach some terminal state. Exits non-zero when any lifecycle is
     /// unsound (CI-friendly).
     ///
+    /// The `#[lifecycle]` macro proves the same properties at compile time. This
+    /// pass adds a whole-workspace report without a build, and the
+    /// machine-readable artifact behind `--format json`.
+    ///
     /// Note: this is a best-effort source scanner — it resolves bare, qualified,
     /// and same-module-aliased `#[lifecycle]` attributes, but not cross-file or
-    /// glob-reexport aliases (tracked in #1925). The compile-time typestate is
-    /// the by-construction guarantee.
+    /// glob-reexport aliases (tracked in #1925). A lifecycle it skips is still
+    /// proven by the compiler.
     Check {
         /// Project root to scan (defaults to the current directory).
         #[arg(value_name = "PATH", default_value = ".")]
@@ -165,6 +606,184 @@ pub enum LifecycleSubcommands {
         /// Write the diagram(s) to this file instead of stdout.
         #[arg(long, value_name = "FILE")]
         out: Option<String>,
+    },
+}
+
+/// Subcommands for `autumn search`.
+#[derive(Subcommand)]
+pub enum SearchSubcommands {
+    /// Rebuild search indexes from the system of record.
+    ///
+    /// Runs the application binary with `AUTUMN_SEARCH_BACKFILL` set, which
+    /// makes `autumn-search`'s startup hook run a full backfill and exit
+    /// instead of serving traffic. Only the app knows which models are
+    /// searchable and which backend/embedder are installed, so the reindex has
+    /// to run inside it — the same technique `autumn jobs manifest` uses.
+    ///
+    /// # Examples
+    ///
+    ///   autumn search reindex
+    ///   autumn search reindex --index articles
+    ///   autumn search reindex --purge
+    ///   autumn search reindex --profile prod
+    #[command(verbatim_doc_comment)]
+    Reindex {
+        /// Index to rebuild. Omit to rebuild every registered index.
+        #[arg(long)]
+        index: Option<String>,
+
+        /// Profile whose `[search]` configuration to rebuild against
+        /// (`dev`, `prod`, or a custom name).
+        ///
+        /// The reindex runs the application binary, and that binary resolves
+        /// its own `[search]` section — including `[profile.<name>.search]`.
+        /// The CLI builds a DEBUG binary, which core reads as `dev` when no
+        /// selector is set, so rebuilding a production index requires saying
+        /// so. Forwarded as `AUTUMN_ENV`.
+        #[arg(long)]
+        profile: Option<String>,
+
+        /// Clear each index before rebuilding it.
+        ///
+        /// Use after a schema change, when documents the source no longer
+        /// produces would otherwise survive. Searches return nothing until the
+        /// rebuild finishes.
+        #[arg(long)]
+        purge: bool,
+
+        /// Package to run (for workspaces).
+        #[arg(long)]
+        package: Option<String>,
+
+        /// Binary target to run (for packages with multiple bin targets).
+        #[arg(long)]
+        bin: Option<String>,
+    },
+}
+
+/// Subcommands for `autumn plugin` — both plugin lanes.
+///
+/// `list`/`add` are consumer-facing discovery and install for a native plugin
+/// crate (issue #1606); `package`/`inspect` build and review a
+/// `.autumn-plugin` artifact for the capability-sandboxed lane (issue #1609).
+/// The author-facing conformance gate for a native plugin stays at
+/// `autumn plugin-check`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum PluginSubcommands {
+    /// List installable plugins with the version compatible with this app.
+    ///
+    /// Covers every first-party plugin plus community crates discoverable on
+    /// crates.io through the documented `autumn-plugin-<name>` convention.
+    List {
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+        /// Do not query crates.io; list the first-party catalog only.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Add a plugin: dependency, builder-chain mount, and post-install steps.
+    Add {
+        /// Plugin crate name, e.g. `autumn-admin-plugin`.
+        name: String,
+        /// Print what would change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not query crates.io. First-party plugins install normally;
+        /// a community crate cannot have its version resolved and is refused.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Remove a plugin: dependency and builder-chain mount. Never the database.
+    ///
+    /// The exact reverse of `add`, and safe in the same ways: it refuses to
+    /// edit a builder chain it cannot read (printing the lines to delete
+    /// instead), keeps a dependency the app still names elsewhere, and never
+    /// touches the database — it lists what the plugin owns there and leaves
+    /// it in place unless `--drop-data` is given.
+    ///
+    /// Examples:
+    ///   autumn plugin remove autumn-admin-plugin
+    ///   autumn plugin remove autumn-media-plugin --dry-run
+    ///   autumn plugin remove autumn-media-plugin --drop-data --yes
+    Remove {
+        /// Plugin crate name, e.g. `autumn-admin-plugin`.
+        name: String,
+        /// Print every file edit and every data consequence without writing
+        /// anything. Exits 3 when there is something to change, 0 when there
+        /// is not.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also revert the plugin's declared migrations and drop the tables it
+        /// owns. Destructive and irreversible; asks for confirmation first.
+        #[arg(long)]
+        drop_data: bool,
+        /// Answer the `--drop-data` confirmation with "yes". Required to drop
+        /// data non-interactively.
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Bind a manifest to a `wasm32-wasip1` module and write a
+    /// `.autumn-plugin` artifact.
+    ///
+    /// The module's SHA-256 is computed here and stamped into the manifest, so
+    /// an author never types the digest and can never ship one that describes
+    /// different bytes. The module is loaded into the same sandbox the runtime
+    /// uses before anything is written: an artifact that could not run is
+    /// refused at the author's desk rather than at the operator's boot.
+    ///
+    /// # Examples
+    ///
+    ///   autumn plugin package --manifest plugin.toml \
+    ///       --module target/wasm32-wasip1/release/plugin.wasm \
+    ///       --out hello.autumn-plugin
+    #[command(verbatim_doc_comment)]
+    Package {
+        /// The authored manifest, as TOML.
+        #[arg(long, value_name = "FILE")]
+        manifest: String,
+        /// The `wasm32-wasip1` module the manifest describes.
+        #[arg(long, value_name = "FILE")]
+        module: String,
+        /// Where to write the artifact.
+        #[arg(long, value_name = "FILE")]
+        out: String,
+    },
+
+    /// Review a `.autumn-plugin` artifact before installing it.
+    ///
+    /// Prints the capability grant, the routes it may serve, the module digest
+    /// that was reviewed, every host function it imports, and the classes of
+    /// authority the sandbox denies unconditionally. Then it loads the module
+    /// into this build's sandbox and runs the same route-conformance checks
+    /// `autumn plugin-check` runs against a native plugin — with no binary to
+    /// build and no process to start. Exits 1 if the artifact is not fit to
+    /// install.
+    ///
+    /// # Examples
+    ///
+    ///   autumn plugin inspect hello.autumn-plugin
+    ///   autumn plugin inspect hello.autumn-plugin --format json
+    #[command(verbatim_doc_comment)]
+    Inspect {
+        /// The artifact to review.
+        #[arg(value_name = "ARTIFACT")]
+        artifact: String,
+        /// Output format: `text` (default) or `json`.
+        #[arg(long, default_value = "text", value_name = "FORMAT")]
+        format: String,
+        /// The artifact currently installed, to review this one as an *upgrade*
+        /// (issue #1632).
+        ///
+        /// An upgrade is the moment a plugin's authority can grow without
+        /// anybody looking. With this, `inspect` prints exactly what the new
+        /// manifest asks for that the approved one did not — new capabilities,
+        /// new hosts, tables, job types, render slots, raised quotas — and
+        /// exits non-zero when there is anything, so an unattended install
+        /// stops rather than consenting on the operator's behalf.
+        #[arg(long, value_name = "ARTIFACT")]
+        against: Option<String>,
     },
 }
 
@@ -192,12 +811,95 @@ pub enum JobsSubcommands {
     },
 }
 
+/// Subcommands for `autumn capsule`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum CapsuleCommands {
+    /// Convert one capsule into a committed regression test.
+    ///
+    /// Copies the capsule's bytes verbatim into `<tests-dir>/capsules/` — so
+    /// whatever redaction removed stays removed — writes a `#[tokio::test]`
+    /// beside it in `<tests-dir>/integration/`, registers both in that
+    /// directory's `mod.rs`, and scaffolds the shared router hook the first
+    /// time. The generated test runs under plain `cargo test` with no network,
+    /// database or queue.
+    Test {
+        /// Path to the capsule JSON file to convert.
+        #[arg(value_name = "CAPSULE")]
+        capsule: String,
+        /// Name for the generated test and fixture. Defaults to a slug of the
+        /// capsule's id.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// The crate's tests directory.
+        #[arg(long, value_name = "DIR", default_value = "tests")]
+        tests_dir: String,
+        /// Overwrite an existing fixture and test of the same name.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Replay the whole committed corpus.
+    ///
+    /// First checks every committed capsule is still readable and replayable by
+    /// this build — the question an Autumn upgrade raises — then runs the
+    /// generated tests with `cargo test capsule_`. An empty corpus is reported
+    /// as a failure, never as a pass.
+    Verify {
+        /// Directory holding the committed capsules.
+        #[arg(long, value_name = "DIR", default_value = "tests/capsules")]
+        dir: String,
+        /// Report on the corpus without running the generated tests.
+        #[arg(long)]
+        check_only: bool,
+    },
+}
+
 /// The Autumn web framework CLI.
 #[derive(Parser)]
 #[command(name = "autumn", version, about = "The Autumn web framework CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Arguments for [`Commands::Upgrade`].
+///
+/// A separate `Args` struct rather than inline variant fields, deliberately.
+/// clap's derive builds every inline field of every variant inside one
+/// `Commands::augment_subcommands` frame, and with this many subcommands that
+/// frame is within a kilobyte of libtest's 2 MiB thread stack — close enough
+/// that a codegen difference between two rustc builds decides whether the
+/// argument-parsing tests overflow. An `Args` struct moves this command's share
+/// into `UpgradeArgs::augment_args`, which gets its own frame and pops.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(clap::Args, Debug)]
+struct UpgradeArgs {
+    /// Project directory to migrate (defaults to the current directory).
+    #[arg(value_name = "PATH", default_value = ".")]
+    path: String,
+    /// Release this app is upgrading from. Defaults to the `autumn-web`
+    /// requirement recorded in the project's `Cargo.toml`.
+    #[arg(long, value_name = "VERSION")]
+    from: Option<String>,
+    /// Release to upgrade to. Defaults to this CLI's own version.
+    #[arg(long, value_name = "VERSION")]
+    to: Option<String>,
+    /// Write the rewrites. Without it the command only previews them.
+    #[arg(long)]
+    apply: bool,
+    /// Emit the machine-readable report instead of the human one.
+    #[arg(long)]
+    json: bool,
+    /// List the shipped app-code migrations and exit without scanning.
+    #[arg(long = "list-migrations")]
+    list_migrations: bool,
+    /// Report framework-owned scaffold files that have drifted from this
+    /// release and exit 3 if any have. Writes nothing; for CI.
+    #[arg(long, conflicts_with = "apply")]
+    check: bool,
+    /// Record a framework-owned file as yours, so reconciliation leaves it
+    /// alone from now on. Repeatable. Writes only the provenance manifest.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["apply", "check"])]
+    accept: Vec<String>,
 }
 
 /// Available subcommands.
@@ -246,6 +948,14 @@ enum Commands {
         /// and --with-seed; not combinable with --daemon or --bundled-pg.
         #[arg(long)]
         api: bool,
+        /// Scaffold the app with this plugin already wired (repeatable).
+        ///
+        /// Takes the same names as `autumn plugin add`: a first-party plugin,
+        /// or a community `autumn-plugin-<name>` crate. Every name is resolved
+        /// and version-checked BEFORE any file is written, so an unknown or
+        /// incompatible plugin leaves no half-scaffolded project behind.
+        #[arg(long = "with", value_name = "PLUGIN", conflicts_with = "list_starters")]
+        with: Vec<String>,
     },
     /// Pre-render static routes to dist/
     Build {
@@ -268,6 +978,23 @@ enum Commands {
         /// `autumn-web/managed-pg-bundled` are active throughout all build steps.
         #[arg(long, value_name = "FEATURES")]
         features: Option<String>,
+        /// Also compile the `#[edge]` routes into a `wasm32-wasip1` edge
+        /// capsule. Release builds do this automatically when the project has
+        /// `#[edge]` routes; pass `--edge` to build it from a `--debug` build
+        /// too (the capsule itself is always compiled in release profile).
+        /// Errors when the project has no `#[edge]` routes.
+        #[arg(long)]
+        edge: bool,
+        /// Compile through `cargo auditable`, embedding the resolved dependency
+        /// list into the binary.
+        ///
+        /// The binary can then report exactly which crate versions are inside
+        /// it with no source tree and no lockfile — `autumn sbom --binary
+        /// <path>`. Requires `cargo-auditable` on PATH (`cargo install
+        /// --locked cargo-auditable`); the production Dockerfile `autumn
+        /// release init` generates installs it and passes this flag.
+        #[arg(long)]
+        auditable: bool,
     },
     /// Start the dev server with hot reload (watch mode)
     Dev {
@@ -305,6 +1032,14 @@ enum Commands {
         /// combined (default) does both.
         #[arg(long, value_enum)]
         role: Option<ServeRole>,
+        /// Pin this process to a subset of job queues (issue #1623). Repeatable
+        /// and comma-separated: `--pin critical,default` or `--pin critical
+        /// --pin default`. A pinned process never claims jobs from queues
+        /// outside the subset, on every backend. Forwarded to the app binary as
+        /// `AUTUMN_JOBS__PIN`; omit it to let the app read `[jobs] pin` from its
+        /// own config (the default: drain every configured queue).
+        #[arg(long, value_delimiter = ',', value_name = "QUEUE")]
+        pin: Vec<String>,
     },
     /// Download and configure external tools (Tailwind CSS)
     Setup {
@@ -312,11 +1047,111 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Generate or verify a `CycloneDX` Software Bill of Materials.
+    ///
+    /// With no flags, reads `cargo metadata` for the project in the current
+    /// directory and writes a deterministic `CycloneDX` 1.5 document to stdout.
+    ///
+    ///   autumn sbom --output sbom.cdx.json
+    ///     Write the SBOM for this source tree to a file.
+    ///
+    ///   autumn sbom --verify sbom.cdx.json --locked
+    ///     Regenerate from the source tree and fail if the file drifted. This
+    ///     is the release gate: it reports which components were added,
+    ///     removed, or changed rather than a byte diff.
+    ///
+    ///   autumn sbom --binary /usr/local/bin/my-app
+    ///     Report the exact crate versions compiled into a binary, using the
+    ///     dependency list cargo-auditable embeds — no source tree, no
+    ///     lockfile, no network. See docs/guide/supply-chain.md.
+    Sbom {
+        /// Path to a `Cargo.toml` to describe (defaults to the current directory).
+        #[arg(long, value_name = "PATH")]
+        manifest_path: Option<PathBuf>,
+        /// Write the SBOM here instead of stdout.
+        #[arg(long, short, value_name = "FILE", conflicts_with = "verify")]
+        output: Option<PathBuf>,
+        /// Regenerate and compare against this SBOM; exit non-zero if it drifted.
+        #[arg(long, value_name = "FILE")]
+        verify: Option<PathBuf>,
+        /// Read the embedded dependency list out of an already-compiled binary.
+        ///
+        /// Mutually exclusive with every flag that only means something when
+        /// reading a source tree — a compiled binary has no manifest, no
+        /// lockfile and no feature set to resolve.
+        #[arg(
+            long,
+            value_name = "FILE",
+            conflicts_with_all = ["manifest_path", "locked", "all_features", "verify"]
+        )]
+        binary: Option<PathBuf>,
+        /// Pass `--locked` to `cargo metadata`, failing if `Cargo.lock` is stale.
+        #[arg(long)]
+        locked: bool,
+        /// Resolve with every optional feature enabled.
+        ///
+        /// Off by default: the default feature set is what a build actually
+        /// links, so it is what the document should describe.
+        #[arg(long, conflicts_with = "binary")]
+        all_features: bool,
+        /// Extra Cargo features to enable, comma-separated.
+        ///
+        /// Pass the same features the binary was built with, so the SBOM
+        /// describes the crates that are actually linked. The generated
+        /// production Dockerfile does this for `embed-assets` builds.
+        #[arg(long, value_name = "FEATURES", conflicts_with = "binary")]
+        features: Option<String>,
+        /// Restrict resolution to one target triple.
+        ///
+        /// Without it the document lists target-specific dependencies for
+        /// every platform — the whole `windows-*` family in a Linux image.
+        /// The generated production Dockerfile passes the builder's host
+        /// triple. Leave unset for a source release consumed on every
+        /// platform, which is why it is not the default.
+        #[arg(long, value_name = "TRIPLE", conflicts_with = "binary")]
+        filter_platform: Option<String>,
+        /// Require the SBOM's top-level component to be exactly this version.
+        ///
+        /// The release gate passes the tag being released, so an SBOM that is
+        /// internally consistent but describes the wrong source tree still fails.
+        #[arg(long, value_name = "VERSION")]
+        expect_version: Option<String>,
+    },
     /// Pin, vendor, and integrity-verify JS dependencies
     Assets {
         #[command(subcommand)]
         action: AssetsCommands,
     },
+    /// Bring an app up to a release: its own code, and its scaffold files.
+    ///
+    /// For each release between the `autumn-web` version this app records and
+    /// the target, `autumn upgrade` applies that release's machine-applyable
+    /// migrations -- today, API renames -- to the app's own Rust code. In the
+    /// same run it reconciles the project's framework-owned files (Dockerfile,
+    /// build.rs, autumn.toml, the toolchain/style configs, the CI workflow)
+    /// against the current release's scaffold. Application source under src/ is
+    /// out of bounds for that half.
+    ///
+    /// It writes nothing by default: a bare `autumn upgrade` prints a per-file
+    /// diff plus a count of affected sites, and `--apply` is the explicit write
+    /// step. Anything it cannot safely rewrite (a call site inside a macro
+    /// invocation, or a change with no mechanical form) is listed with its
+    /// location and a link to the guide section, never guessed at. A scaffold
+    /// file you have edited since it was generated is reported as a conflict
+    /// with its diff, never overwritten.
+    ///
+    /// Run it BEFORE bumping the `autumn-web` dependency: the release it
+    /// migrates *from* is the one the project manifest records. If the bump
+    /// already happened, pass `--from <previous-version>`.
+    ///
+    ///   autumn upgrade                     # preview
+    ///   autumn upgrade --apply             # write the rewrites
+    ///   autumn upgrade --check             # CI gate: exit 3 on scaffold drift
+    ///   autumn upgrade --accept Dockerfile # this file is mine; stop offering it
+    ///   autumn upgrade --list-migrations   # what ships today
+    #[allow(clippy::doc_markdown)]
+    #[command(verbatim_doc_comment)]
+    Upgrade(UpgradeArgs),
     /// Run or inspect database migrations
     Migrate {
         #[command(subcommand)]
@@ -454,6 +1289,43 @@ enum Commands {
     #[command(subcommand, verbatim_doc_comment, name = "data")]
     Data(DataCommands),
 
+    /// Run a pre-wired data playground against the project's database.
+    ///
+    /// Autumn's answer to `rails console` / `manage.py shell`. Rust has no
+    /// stable `eval`, so instead of a line-by-line REPL this scaffolds an
+    /// editable binary — `src/bin/playground.rs` — already wired with the same
+    /// config and database-URL resolution `autumn dev` and `autumn seed` use
+    /// (`AUTUMN_DATABASE__*` → `DATABASE_URL` → `autumn.toml`), a constructed
+    /// async pool, and a checked-out connection. Put a query in the marked
+    /// region, re-run `autumn console`, and it compiles and executes against
+    /// the live database.
+    ///
+    /// An existing playground is never overwritten; pass `--force` to
+    /// regenerate it from the template.
+    ///
+    /// # Examples
+    ///
+    ///   autumn console
+    ///   autumn console --profile demo
+    ///   autumn console --force
+    #[command(visible_alias = "c", verbatim_doc_comment)]
+    Console {
+        /// Profile forwarded to the playground via `AUTUMN_ENV`
+        /// (default: `dev`).
+        #[arg(long, default_value = "dev")]
+        profile: String,
+        /// Package to run (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Overwrite an existing playground with a fresh copy of the template.
+        #[arg(long)]
+        force: bool,
+        /// Scaffold and wire the playground, then stop without building or
+        /// running it.
+        #[arg(long)]
+        scaffold_only: bool,
+    },
+
     /// Run the project's seed binary to populate the database with representative data.
     ///
     /// Requires `src/bin/seed.rs` (a Cargo binary named `seed`) to exist.
@@ -461,6 +1333,9 @@ enum Commands {
     ///
     /// `autumn seed` checks for pending migrations before running and exits 1
     /// if any are found — run `autumn migrate` first.
+    ///
+    /// A `--count`/`--model` fake-seed request against a `prod`/`production`
+    /// profile is blocked unless `--yes-i-mean-prod` is also given.
     Seed {
         /// Profile forwarded to the seed binary via `AUTUMN_ENV`
         /// (default: `dev`).
@@ -479,6 +1354,90 @@ enum Commands {
         /// Model to fake rows for (e.g. `Post`). Requires --count.
         #[arg(long, requires = "count")]
         model: Option<String>,
+        /// Confirm generating faked rows (`--count`/`--model`) against a
+        /// `prod`/`production` profile. Required to bypass the production
+        /// guard; has no effect otherwise.
+        #[arg(long)]
+        yes_i_mean_prod: bool,
+    },
+    /// Convert failure capsules into committed regression tests, and check a
+    /// committed corpus.
+    ///
+    /// `autumn replay` answers "is this bug still there?" once. This answers
+    /// "can it ever come back?": the capsule is copied into `tests/capsules/`
+    /// and a `#[tokio::test]` is generated beside it, so `cargo test` re-checks
+    /// the failure from then on — with no network, database or queue.
+    ///
+    /// Nothing is committed for you: the files land in the working tree for
+    /// review, and the generated router hook is scaffolded once and then left
+    /// alone.
+    ///
+    /// # Examples
+    ///
+    ///   autumn capsule test tmp/autumn-capsules/01JB2K7Q.json
+    ///   autumn capsule test tmp/autumn-capsules/01JB2K7Q.json --name `checkout_500`
+    ///   autumn capsule verify
+    #[command(verbatim_doc_comment)]
+    Capsule {
+        #[command(subcommand)]
+        command: CapsuleCommands,
+    },
+    /// Replay a recorded failure capsule against the application.
+    ///
+    /// A capsule is written by `[failure_capture] enabled = true` whenever a
+    /// request fails (a 5xx or a caught panic). Replaying one rebuilds the app
+    /// offline — the clock and the database are served from the capsule, no
+    /// socket is opened — drives the recorded request through it, and reports
+    /// whether the failure still happens.
+    ///
+    /// Exit codes: 0 the failure reproduced, 1 it did not (a mismatch, or the
+    /// code left the recorded database tape), 2 the capsule was refused and
+    /// nothing was replayed.
+    ///
+    /// # Examples
+    ///
+    ///   autumn replay tmp/autumn-capsules/01JB2K7Q.json
+    ///   autumn replay --package api tmp/autumn-capsules/01JB2K7Q.json
+    #[command(verbatim_doc_comment)]
+    Replay {
+        /// Path to the capsule JSON file to replay.
+        capsule: String,
+        /// Package to run (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to run (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
+        /// Profile forwarded to the app binary via `AUTUMN_ENV`.
+        ///
+        /// Defaults to the profile the capsule recorded, so profile-gated
+        /// routes and configuration match the failing run; falls back to
+        /// `dev` for capsules that recorded none.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Compile the replay binary with `cargo build --release`.
+        ///
+        /// Defaults to the build kind the capsule recorded, so
+        /// `cfg(debug_assertions)`-gated code and release-only behaviour
+        /// match the failing run; falls back to a debug build for capsules
+        /// that recorded none.
+        #[arg(long, conflicts_with = "debug")]
+        release: bool,
+        /// Compile the replay binary as a debug build, even when the capsule
+        /// was recorded by a release build.
+        #[arg(long)]
+        debug: bool,
+        /// Cargo features to compile the replay binary with (forwarded to
+        /// `cargo build --features`).
+        ///
+        /// The capsule does not record the recording binary's feature set;
+        /// pass the features the failing binary was built with when they
+        /// gate code the failure depends on.
+        #[arg(long, value_name = "FEATURES")]
+        features: Option<String>,
+        /// Compile without default features (forwarded to `cargo build`).
+        #[arg(long)]
+        no_default_features: bool,
     },
     /// Run or list one-off operational tasks registered by the application.
     Task {
@@ -504,6 +1463,38 @@ enum Commands {
         )]
         args: Vec<String>,
     },
+    /// Report what declared `#[repository(..., retention(...))]` policies
+    /// would sweep, without deleting anything.
+    ///
+    /// Validates a policy before it runs for real: every recurring sweep a
+    /// declared policy registers is otherwise fully automatic (issue #1342).
+    ///
+    /// # Examples
+    ///
+    ///   autumn retention --dry-run
+    ///   autumn retention --dry-run --model Session
+    #[command(verbatim_doc_comment)]
+    Retention {
+        /// Package to run (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to run (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
+        /// Profile forwarded to the app binary via `AUTUMN_ENV`.
+        #[arg(long, default_value = "dev")]
+        profile: String,
+        /// Report what would be swept without deleting anything. Currently
+        /// required — there is no separate command to trigger a real sweep.
+        #[arg(long)]
+        dry_run: bool,
+        /// Narrow the report to a single model's policy. Accepts either the
+        /// model name or the table name; if two different modules declare
+        /// same-named models with their own policy, the model name is
+        /// ambiguous and the table name is required instead.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+    },
     /// Scaffold models, migrations, and CRUD code for a new resource.
     ///
     /// Four subcommands collapse the repetitive five-file dance of adding
@@ -525,9 +1516,22 @@ enum Commands {
     ///   decimal{precision,scale}     (NUMERIC, default {12,2})
     ///   Option<...>                  (any of the above, nullable)
     ///
+    /// # Field modifiers
+    ///
+    ///   String{encrypted}                    at-rest encrypted column
+    ///   String{encrypted:deterministic}      ...and equality-queryable
+    ///
+    /// `{encrypted}` emits `#[encrypted]` on the generated model field, so the
+    /// column is stored as an opaque base64 ciphertext envelope (unbounded
+    /// TEXT) and is redacted in the generated admin. Use
+    /// `{encrypted:deterministic}` when the column still needs
+    /// `find_by`/`exists_by` lookups or a UNIQUE index. Requires key material
+    /// under `[active_record_encryption]` — run `autumn credentials edit`.
+    ///
     /// # Example
     ///
     ///   autumn generate scaffold Post title:String body:Text published:bool
+    ///   autumn generate scaffold Account 'token:String{encrypted}'
     #[command(subcommand, verbatim_doc_comment)]
     Generate(GenerateCommands),
 
@@ -570,22 +1574,47 @@ enum Commands {
     ///   autumn release init --force
     ///   autumn release init --target fly
     ///   autumn release init --target docker-compose
+    ///   autumn release init --target azure-container-apps
+    ///   autumn release init --target gcp-cloud-run
     #[command(subcommand, verbatim_doc_comment)]
     Release(ReleaseCommands),
 
-    /// Push-button, zero-downtime deploys to a VPS (issue #1607).
+    /// Push-button, zero-downtime deploys to a VPS or a fleet (issues #1607, #1621).
     ///
-    /// Run from the project root. `check` runs a local preflight, `plan` and
-    /// `rollback` print dry-run plans, and `up` performs a real first deploy over
-    /// SSH (cutover/rollback land in follow-ups). Configure the target under
-    /// `[deploy]` in autumn.toml.
+    /// Run from the project root. `check` runs a preflight against every configured
+    /// host, `plan` prints the dry-run plan, `up` performs a real rolling deploy over
+    /// SSH, and `rollback` returns the fleet to its previous release. Configure the
+    /// target under `[deploy] host` (one server) or `[deploy] hosts` (a fleet, in
+    /// rollout order) in autumn.toml.
+    ///
+    /// Fleet flags:
+    ///   --only <HOST>   repeatable; restrict `up`/`rollback` to these hosts. A
+    ///                   REPAIR LEVER: it leaves the skipped hosts on their current
+    ///                   release, so the fleet may end up mixed.
+    ///   --no-rollback   on `up`, halt and FREEZE a failed rollout for inspection
+    ///                   instead of automatically rolling the cut-over hosts back.
+    ///
+    /// Fleet visibility and control (issue #1621):
+    ///   status          read-only per-host state (release, readiness, maintenance,
+    ///                   proxy) plus version/state drift; `--json` for machines,
+    ///                   `--strict` exits non-zero on drift (cron-alertable).
+    ///   maintenance     turn maintenance mode on|off on EVERY configured host over
+    ///                   SSH (the local `autumn maintenance` only writes this
+    ///                   machine's working directory). NOTE: maintenance does not
+    ///                   drain a host from your load balancer — /ready stays 200.
     ///
     /// # Examples
     ///
     ///   autumn deploy check
     ///   autumn deploy plan
     ///   autumn deploy rollback
+    ///   autumn deploy rollback --only web-2.example.com
     ///   autumn deploy up
+    ///   autumn deploy up --only web-2.example.com
+    ///   autumn deploy up --no-rollback
+    ///   autumn deploy status --json --strict
+    ///   autumn deploy maintenance on --message "Upgrading database schema"
+    ///   autumn deploy maintenance off
     #[command(subcommand, verbatim_doc_comment)]
     Deploy(DeployCommands),
 
@@ -712,11 +1741,13 @@ enum Commands {
 
     /// Statically audit accessibility of raw `html!` markup at build time.
     ///
-    /// The typed `autumn_web::a11y` primitives (`Img`, `Button`, `Link`,
-    /// `MenuItem`, `TextField`) prove accessible-name obligations at compile
-    /// time. `autumn a11y verify` covers the escape hatch they cannot see: raw
+    /// The typed `autumn_web::a11y` primitives prove accessible-name
+    /// obligations at compile time. `autumn a11y verify` covers the escape
+    /// hatch they cannot see: raw
     /// markup written directly in `html!` blocks. It scans the project's `.rs`
     /// files, reports WCAG-keyed findings, and exits non-zero when any exist.
+    /// Findings are keyed to the routes that reach them, and rolled up per
+    /// WCAG success criterion.
     ///
     /// # Examples
     ///
@@ -730,14 +1761,15 @@ enum Commands {
     },
 
     /// Verify the soundness of `#[lifecycle]` state machines and render their
-    /// lifecycle diagrams at build time.
+    /// lifecycle diagrams.
     ///
-    /// The `#[lifecycle]` macro proves that transition endpoints are real
-    /// variants and that only declared edges are callable. `autumn lifecycle
-    /// check` closes the remaining gap by verifying the *shape* of the
-    /// reachability graph: every referenced state exists, every state is
-    /// reachable from the initial state, and every reachable non-terminal state
-    /// can reach some terminal. Exits non-zero when any lifecycle is unsound.
+    /// The `#[lifecycle]` macro proves the same properties at compile time:
+    /// every referenced state exists, a terminal has no exit, no edge is
+    /// declared twice, every state is reachable from the initial state, and
+    /// every reachable non-terminal state can reach some terminal. `autumn lifecycle check` re-proves them by
+    /// scanning source, which reports a whole workspace without a build and
+    /// emits a machine-readable artifact. Exits non-zero when any lifecycle is
+    /// unsound.
     ///
     /// # Examples
     ///
@@ -756,17 +1788,66 @@ enum Commands {
         action: JobsSubcommands,
     },
 
+    /// Operate the application's search indexes (`autumn-search`).
+    Search {
+        #[command(subcommand)]
+        action: SearchSubcommands,
+    },
+
+    /// Discover, install, package and review Autumn plugins.
+    ///
+    /// `list` shows every installable plugin with the version compatible with
+    /// this app (querying crates.io for community crates unless `--offline`);
+    /// `add` writes the dependency, mounts the plugin in the
+    /// `autumn_web::app()` builder chain, and prints the post-install steps.
+    ///
+    /// `package` and `inspect` are the capability-sandboxed lane: a sandboxed
+    /// plugin runs as a `wasm32-wasip1` module inside a deny-by-default
+    /// sandbox, serving HTTP under the one prefix its manifest declares with no
+    /// filesystem, no network, no environment and no database. See
+    /// `docs/guide/sandboxed-plugins.md`.
+    ///
+    /// Writing a native plugin instead? `autumn generate plugin`. Auditing one
+    /// you wrote? `autumn plugin-check`.
+    ///
+    /// # Examples
+    ///
+    ///   autumn plugin list
+    ///   autumn plugin list --json --offline
+    ///   autumn plugin add autumn-admin-plugin
+    ///   autumn plugin add autumn-cache-redis --dry-run
+    ///   autumn plugin package --manifest plugin.toml --module hello.wasm \
+    ///       --out hello.autumn-plugin
+    ///   autumn plugin inspect hello.autumn-plugin
+    #[command(verbatim_doc_comment)]
+    Plugin {
+        /// The plugin subcommand to run.
+        #[command(subcommand)]
+        action: PluginSubcommands,
+    },
+
     /// Run conformance checks against a plugin's route contributions.
     ///
     /// Compiles the application (debug profile), introspects its route table,
-    /// and verifies that the named plugin satisfies five checks: installability,
-    /// route attribution, route prefix, route collision, and sensitive-surface
-    /// gating.  Exits 0 on pass, 1 on failure.
+    /// and verifies that the named plugin satisfies eight checks: installability,
+    /// route attribution, route prefix, route collision, sensitive-surface
+    /// gating, duplicate registration, and — from the contract the binary dumps
+    /// (issue #1601) — that the plugin declares a usable `autumn-web` range and
+    /// which experimental surface it depends on.  Exits 0 on pass, 1 on failure.
+    ///
+    /// This is the AUTHOR-facing gate. To discover and install a plugin as a
+    /// consumer, use `autumn plugin list` / `autumn plugin add`.
+    ///
+    /// A *sandboxed* plugin is checked with `autumn plugin inspect` instead,
+    /// which runs these same checks over its manifest with no binary to build.
+    /// A sandboxed plugin mounted into an app also passes this command's
+    /// route-attribution and route-prefix checks unchanged.
     ///
     /// # Examples
     ///
     ///   autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin \
     ///       --sensitive-route /admin:"Role: admin required"
+    ///   autumn plugin-check --plugin-name autumn-admin-plugin --deny-experimental
     #[command(verbatim_doc_comment)]
     PluginCheck {
         /// Package to build (for workspaces).
@@ -789,6 +1870,14 @@ enum Commands {
         /// Output format: `text` (default) or `json`.
         #[arg(long, default_value = "text", value_name = "FORMAT")]
         format: String,
+        /// Fail the run when the plugin declares any dependency on
+        /// experimental plugin surface (issue #1601).
+        ///
+        /// Off by default: the `experimental-surface` check reports what a
+        /// plugin leans on, and leaning on it is an informed choice. Set this
+        /// in a plugin's own CI to forbid it.
+        #[arg(long)]
+        deny_experimental: bool,
     },
 
     /// Inspect and mutate live runtime configuration values.
@@ -833,6 +1922,11 @@ enum Commands {
     /// 500 ms. Within one second every replica responds 503 to non-bypassed
     /// HTTP traffic while health-check routes stay green.
     ///
+    /// LOCAL only: the flag lands in THIS working directory. For servers
+    /// managed by `autumn deploy` (`[deploy] host`/`hosts`), use
+    /// `autumn deploy maintenance on|off`, which fans the same flag out to
+    /// every host over SSH (issue #1621).
+    ///
     /// # Examples
     ///
     ///   autumn maintenance on --message "Migrating database"
@@ -858,6 +1952,163 @@ enum Commands {
     #[command(subcommand, verbatim_doc_comment)]
     Canary(CanaryCommands),
 
+    /// Agent-authority tooling — what an agent-operable handler may do (#1691).
+    ///
+    /// `autumn agents manifest` compiles the application, reads back the
+    /// manifest the framework assembles from every `#[agent_operable]` action
+    /// and every declared `authority_grant!`, joins it against the route table,
+    /// and writes the diffable record. `--check` is the CI gate: it fails on
+    /// drift, on an MCP-exposed *mutating* tool with no envelope, on a binary
+    /// that can act irreversibly with no audit sink, and on a route naming an
+    /// authority nothing registered — none of which the compiler can catch,
+    /// because a tool with no grant has no assertion to fail.
+    ///
+    /// # Examples
+    ///
+    ///   autumn agents manifest
+    ///   autumn agents manifest --manifest agent-authority.json
+    ///   autumn agents manifest --check agent-authority.json --release
+    #[command(subcommand, verbatim_doc_comment)]
+    Agents(AgentsSubcommands),
+
+    /// Cache-coherence tooling — prove no write can leave a cached read stale.
+    ///
+    /// `autumn cache audit` compiles the application, reads back the
+    /// cache-coherence manifest the framework assembles from every `#[cached]`
+    /// read and every `#[repository]` write it links, and exits non-zero when a
+    /// write can strand a cached value with no invalidation covering the pair.
+    ///
+    /// # Examples
+    ///
+    ///   autumn cache audit
+    ///   autumn cache audit --manifest target/cache-coherence.json
+    ///   autumn cache audit --strict -p blog
+    #[command(subcommand, verbatim_doc_comment)]
+    Cache(CacheSubcommands),
+
+    /// `OpenAPI` tooling — get the contract out of the app.
+    ///
+    /// `autumn openapi export` compiles the app, runs it in a dump mode that
+    /// binds no port and touches no database, and writes the same `OpenAPI` 3.1
+    /// document `/openapi.json` serves. That document is the input the standard
+    /// generators want, so a typed client is one pipe away:
+    ///
+    ///   autumn openapi export --out openapi.json
+    ///   npx openapi-typescript openapi.json -o src/api.d.ts
+    ///
+    /// It also reports every component schema that degraded to an opaque
+    /// `{"type":"object"}` — the types a generated client can only see as
+    /// `unknown` — and `--strict` turns that report into a gate.
+    ///
+    /// # Examples
+    ///
+    ///   autumn openapi export
+    ///   autumn openapi export --out openapi.json
+    ///   autumn openapi export --check openapi.json --strict
+    #[command(subcommand, verbatim_doc_comment)]
+    Openapi(OpenApiSubcommands),
+    /// Emit the classified-data flow manifest (#1654).
+    ///
+    /// Compiles the app and reads back the manifest the framework assembles from
+    /// every `#[classified]` column and every declared declassification
+    /// boundary: one row per classified column, listing every sink it is proven
+    /// reachable to. An empty reachable set means the column cannot leave the
+    /// process through a gated sink. The compiler is the gate; this is the
+    /// diffable record, and `--check` fails when it drifts from the committed
+    /// copy.
+    #[command(name = "data-flow")]
+    DataFlow(DataFlowArgs),
+
+    /// Query the application's architecture graph (#1747).
+    ///
+    /// Compiles the app and reads back the graph the framework derives from its
+    /// macros: a node for every `#[route]`/`#[static_get]`, `#[model]`,
+    /// `#[repository]` and `#[job]`/`#[scheduled]`/`#[task]`, and an edge for
+    /// every repository→model declaration and every model, table or repository
+    /// a route or job names. Because the elements are declared through macros
+    /// autumn owns, no declared element can be missing.
+    ///
+    /// # Examples
+    ///
+    ///   autumn graph show
+    ///   autumn graph touches posts
+    ///   autumn graph impact Post
+    ///   autumn graph show --manifest architecture-graph.json
+    ///   autumn graph show --check architecture-graph.json --release
+    #[command(subcommand, verbatim_doc_comment)]
+    Graph(GraphSubcommands),
+
+    /// Derive and enforce this build's capacity contract (issue #1733).
+    ///
+    /// Builds the app in release mode, reads its route graph, walks a seeded
+    /// concurrency ladder against it, and records the saturation envelope in
+    /// `capacity.lock`. With `--check`, compares a rebuild against the
+    /// committed contract instead of writing one — the CI gate.
+    Calibrate {
+        /// Package to calibrate (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to calibrate (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
+        /// Path of the capacity contract to write, or to check against.
+        #[arg(long, default_value = autumn_web::capacity::CONTRACT_FILE_NAME, value_name = "PATH")]
+        contract: String,
+        /// Gate mode: fail with a diff when this build regresses beyond
+        /// tolerance versus the committed contract. Writes nothing.
+        #[arg(long)]
+        check: bool,
+        /// Autumn profile to calibrate under — the configuration the contract
+        /// will govern.
+        /// [default: prod; with --check, the committed contract's own profile]
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Cargo features for the calibrated build (repeatable; comma- or
+        /// space-separated inside one). Measure the binary you deploy.
+        #[arg(long, value_name = "FEATURES")]
+        features: Vec<String>,
+        /// Build the calibrated binary with `--all-features`.
+        #[arg(long)]
+        all_features: bool,
+        /// Build the calibrated binary with `--no-default-features`.
+        #[arg(long)]
+        no_default_features: bool,
+        /// Drive load against these paths instead of the discovered ones
+        /// (repeatable). Use when a route needs query parameters or headers
+        /// the driver cannot invent.
+        #[arg(long = "target", value_name = "PATH")]
+        targets: Vec<String>,
+        /// Seed for the request profile, so a calibration is replayable.
+        /// [default: 1733; with --check, the committed contract's own seed]
+        #[arg(long, value_name = "SEED")]
+        seed: Option<u64>,
+        /// Concurrency ladder to walk (comma-separated).
+        /// [default: 1,2,4,8,16,32,64; with --check, the committed ladder]
+        #[arg(long, value_delimiter = ',', value_name = "N")]
+        concurrency: Vec<usize>,
+        /// Milliseconds to hold each rung of the ladder.
+        /// [default: 2000; with --check, the committed value]
+        #[arg(long, value_name = "MS")]
+        rung_ms: Option<u64>,
+        /// Milliseconds of discarded warmup before the ladder.
+        /// [default: 1000; with --check, the committed value]
+        #[arg(long, value_name = "MS")]
+        warmup_ms: Option<u64>,
+        /// Measurements per rung; the median is recorded. Raise it on a noisy
+        /// machine.
+        /// [default: 3; with --check, the committed value]
+        #[arg(long, value_name = "N")]
+        runs: Option<u32>,
+        /// Fractional sustained-throughput drop `--check` tolerates.
+        #[arg(long, default_value_t = crate::capacity::DEFAULT_RPS_TOLERANCE, value_name = "FRACTION")]
+        tolerance_rps: f64,
+        /// Fractional P99-latency rise `--check` tolerates.
+        #[arg(long, default_value_t = crate::capacity::DEFAULT_P99_TOLERANCE, value_name = "FRACTION")]
+        tolerance_p99: f64,
+        /// Also emit the measured contract as JSON on stdout.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print every mounted route — method, path, handler, source, middleware.
     ///
     /// Compiles the application (debug profile) and introspects its route
@@ -1243,9 +2494,161 @@ enum DbCommands {
         #[arg(long)]
         offsite: bool,
     },
+    /// Anonymize a database (or a backup artifact) for non-production use.
+    ///
+    /// Rewrites every PII-classified column with deterministic, constraint-valid
+    /// fake values so a production copy is safe on a laptop or a shared staging
+    /// box. Classification is fail-closed: `#[encrypted]` model columns and
+    /// tables registered with the GDPR anonymize strategy are classified
+    /// automatically, everything else must be declared in `scrub.toml`, and a
+    /// column that is neither PII nor explicitly `safe` aborts the scrub — so a
+    /// newly added column can never silently pass through with real data.
+    ///
+    /// Refuses to run outside the `dev`/`test` profile without `--force`, the
+    /// same guard as `autumn db drop`.
+    ///
+    /// # Examples
+    ///
+    ///   # Refresh staging from a production backup:
+    ///   `AUTUMN_ENV=staging` autumn db scrub --artifact backups/prod/latest-run --force
+    ///
+    ///   # Prove the classification is complete (CI):
+    ///   autumn db scrub --check
+    #[command(verbatim_doc_comment)]
+    Scrub {
+        /// Resolve the connection through a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Restore this backup run directory (or artifact file) into the
+        /// resolved database(s) before scrubbing.
+        #[arg(long, value_name = "ARTIFACT")]
+        artifact: Option<std::path::PathBuf>,
+        /// After a successful scrub, write a fresh (scrubbed) backup run here.
+        #[arg(long, value_name = "DIR")]
+        output: Option<std::path::PathBuf>,
+        /// Path to the PII declaration file (default: `./scrub.toml`).
+        #[arg(long, value_name = "PATH")]
+        config: Option<std::path::PathBuf>,
+        /// Classify only: report the plan (or the unclassified columns) and
+        /// write nothing. Exits non-zero when any column is unclassified.
+        #[arg(long, conflicts_with_all = ["artifact", "output", "dry_run"])]
+        check: bool,
+        /// Print the exact SQL the scrub would run and write nothing.
+        #[arg(long, conflicts_with_all = ["artifact", "output"])]
+        dry_run: bool,
+        /// Allow the scrub against a non-dev/test (e.g. production) profile.
+        #[arg(long)]
+        force: bool,
+        /// Allow writing over the database an artifact's own (non-dev/test)
+        /// profile config file declares. Separate from `--force`, which the
+        /// staging drill always passes.
+        #[arg(long)]
+        allow_source_overwrite: bool,
+        /// Emit a referentially-intact SUBSET instead of the whole copy.
+        ///
+        /// Roots the subset on this many rows of TABLE — `--sample users=1%` or
+        /// `--sample users=500` — and repeats for more than one root. Every row
+        /// the selected roots relate to is carried along, so every foreign key
+        /// still resolves, and the subset is scrubbed in the same pass.
+        /// Per-table `always_include` / `never_include` rules live in
+        /// `[sample]` in `scrub.toml`.
+        ///
+        /// The amount applies PER TARGET: with shards configured,
+        /// `--sample users=500` selects up to 500 rows from each database.
+        /// After a successful run every subsetted table is rewritten with
+        /// `VACUUM (FULL, ANALYZE)`, which takes an exclusive lock and needs
+        /// room for a second copy of the table while it runs.
+        #[arg(long, value_name = "TABLE=COUNT|PERCENT%")]
+        sample: Vec<String>,
+        /// The seed `--sample` derives its row selection from. The same seed
+        /// against the same source data reproduces the identical subset, so a
+        /// teammate can rebuild the exact rows that exhibit a bug.
+        #[arg(long, value_name = "N", default_value_t = 0, requires = "sample")]
+        seed: u64,
+    },
+    /// Report, dry-run, or enforce the retention policy for framework-owned data.
+    ///
+    /// Autumn creates and fills persistent stores your app never asked for —
+    /// the job queue and its tracking records, idempotency replay records,
+    /// sticky experiment assignments, webhook replay markers, sessions, audit
+    /// archives. This reports every one of them: the retention window in
+    /// effect, which setting produced it, how it is enforced, and how many
+    /// rows are eligible for purge right now.
+    ///
+    /// Windows are declared in the `[retention]` section of `autumn.toml` and
+    /// are enforced automatically on a recurring in-process sweep — this
+    /// command is for inspecting the policy and for running it on demand, not
+    /// a cron replacement.
+    ///
+    /// Runs your application binary (compiling it first if needed) so the
+    /// report reflects the app's own resolved config, GDPR legal holds, and
+    /// audit sinks.
+    ///
+    /// # Examples
+    ///
+    ///   # What is kept, and how much is eligible right now:
+    ///   autumn db retention
+    ///
+    ///   # What a sweep would delete, without deleting it:
+    ///   autumn db retention --dry-run
+    ///
+    ///   # Enforce the policy now, for one dataset:
+    ///   autumn db retention --purge --dataset `job_history`
+    #[command(verbatim_doc_comment)]
+    Retention {
+        /// Package to run (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to run (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
+        /// Profile forwarded to the app binary via `AUTUMN_ENV`.
+        #[arg(long, default_value = "dev")]
+        profile: String,
+        /// Restrict to one dataset. Rejected up front if it is not one of the
+        /// framework-owned dataset keys, so a typo cannot silently sweep
+        /// nothing.
+        #[arg(long, value_name = "DATASET", value_parser = RETENTION_DATASET_KEYS)]
+        dataset: Option<String>,
+        /// Report what a sweep would remove, without removing anything.
+        #[arg(long, conflicts_with = "purge")]
+        dry_run: bool,
+        /// Enforce the configured policy immediately.
+        ///
+        /// Deletes data. Against a non-dev/test profile this additionally
+        /// requires `--force`, the same guard `autumn db drop` and
+        /// `autumn db scrub` apply.
+        #[arg(long)]
+        purge: bool,
+        /// Allow `--purge` against a non-dev/test (e.g. production) profile.
+        #[arg(long)]
+        force: bool,
+        /// Print the raw JSON report instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect the offsite backup destination ([backup.offsite], issue #1619).
     #[command(subcommand)]
     Offsite(OffsiteCommands),
+    /// Restore, inspect or verify a continuously replicated `SQLite` database.
+    ///
+    /// `[replication]` ships this app's `SQLite` write-ahead log to an offsite
+    /// destination as it is written (issue #1628). These commands are the other
+    /// half: rebuilding the database on a fresh machine that has nothing but
+    /// this binary, autumn.toml and the destination credentials.
+    ///
+    /// # Examples
+    ///
+    ///   # Fresh box, latest replicated state:
+    ///   autumn db replica restore --profile prod
+    ///
+    ///   # Point-in-time, over the existing database:
+    ///   autumn db replica restore --timestamp 2026-09-02T14:29:00Z --force --overwrite
+    ///
+    ///   # How fresh is the replica right now?
+    ///   autumn db replica status
+    #[command(subcommand, verbatim_doc_comment)]
+    Replica(ReplicaCommands),
 }
 
 /// Subcommands for `autumn db offsite` (issue #1619).
@@ -1259,18 +2662,101 @@ enum OffsiteCommands {
     },
 }
 
+/// Subcommands of `autumn db replica` (issue #1628).
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+enum ReplicaCommands {
+    /// Rebuild the database from the replica, optionally at a point in time.
+    ///
+    /// Verifies the whole chain before anything is written: a hole in the
+    /// segment sequence, a payload whose digest does not match, or a rebuilt
+    /// database that fails `PRAGMA integrity_check` is refused rather than
+    /// restored. Gated by the same production guard as `autumn db restore`, and
+    /// overwriting an existing database always needs `--force`.
+    #[command(verbatim_doc_comment)]
+    Restore {
+        /// Resolve the destination under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Restore to this RFC 3339 instant instead of the latest state.
+        #[arg(long, value_name = "RFC3339")]
+        timestamp: Option<String>,
+        /// Write the database here instead of the configured database.url.
+        ///
+        /// A restore to an explicit path writes nothing the app uses, so it is
+        /// not subject to the production guard (the overwrite guard still applies).
+        #[arg(long, value_name = "PATH")]
+        output: Option<std::path::PathBuf>,
+        /// Allow the restore against a non-dev/test (e.g. production) profile.
+        #[arg(long)]
+        force: bool,
+        /// Allow replacing a database file that already exists.
+        ///
+        /// Separate from `--force`, which is about the profile: a drill that
+        /// always passes `--force` must not silently also destroy a database.
+        #[arg(long)]
+        overwrite: bool,
+    },
+    /// Report the replica's current generation, segment count and lag.
+    Status {
+        /// Resolve the destination under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Print the report as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Prove the replica restorable by restoring it into a scratch directory.
+    Verify {
+        /// Resolve the destination under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+    },
+}
+
+impl ReplicaCommands {
+    /// Translate the parsed CLI shape into the `db::replica` command.
+    fn into_command(self) -> db::replica::ReplicaCommand {
+        match self {
+            Self::Restore {
+                profile,
+                timestamp,
+                output,
+                force,
+                overwrite,
+            } => db::replica::ReplicaCommand::Restore {
+                profile,
+                timestamp,
+                output,
+                force,
+                overwrite,
+            },
+            Self::Status { profile, json } => db::replica::ReplicaCommand::Status { profile, json },
+            Self::Verify { profile } => db::replica::ReplicaCommand::Verify { profile },
+        }
+    }
+}
+
 impl DbCommands {
     /// Translate a lifecycle subcommand (`create`/`drop`/`reset`) into the `db`
     /// module's command and the optional profile override the connection should
-    /// be resolved under. `pull`/`backup`/`restore` are dispatched separately
-    /// (they do not map onto [`db::DbCommand`]).
+    /// be resolved under. `pull`/`backup`/`restore`/`scrub` are dispatched
+    /// separately (they do not map onto [`db::DbCommand`]).
     fn into_command(self) -> (db::DbCommand, Option<String>) {
         match self {
             Self::Create { profile } => (db::DbCommand::Create, profile),
             Self::Drop { profile, force } => (db::DbCommand::Drop { force }, profile),
             Self::Reset { profile, force } => (db::DbCommand::Reset { force }, profile),
-            Self::Pull { .. } | Self::Backup { .. } | Self::Restore { .. } | Self::Offsite(_) => {
-                unreachable!("db pull/backup/restore/offsite are dispatched before into_command")
+            Self::Pull { .. }
+            | Self::Backup { .. }
+            | Self::Restore { .. }
+            | Self::Scrub { .. }
+            | Self::Retention { .. }
+            | Self::Offsite(_)
+            | Self::Replica(_) => {
+                unreachable!(
+                    "db pull/backup/restore/scrub/retention/offsite/replica are dispatched \
+                     before into_command"
+                )
             }
         }
     }
@@ -1285,6 +2771,44 @@ enum ServeCommands {
     Status,
     /// Stop the daemon (if running) and start it again in the background.
     Restart,
+    /// Windows only: build the app and register it as a Windows service that
+    /// starts at boot and restarts after a crash.
+    ///
+    /// The service runs the same app `--daemon` runs and leaves the same
+    /// pidfile, address file and logs, so `autumn serve status` and
+    /// `autumn serve stop` keep working against it. It is an ordinary entry in
+    /// `services.msc` and `sc.exe`.
+    InstallService,
+    /// Windows only: stop the registered service, deregister it, and remove the
+    /// daemon's state. The managed-Postgres data directory is kept.
+    UninstallService,
+    /// Internal: run as the Windows Service Control Manager's hosted process.
+    ///
+    /// Registered as the service's command line by `install-service`; running it
+    /// by hand does nothing useful.
+    #[command(hide = true)]
+    RunService {
+        /// Path to the record `install-service` wrote.
+        #[arg(long = "service-record")]
+        service_record: Option<std::path::PathBuf>,
+    },
+}
+
+/// Normalize a repeated/comma-separated `--pin` into what the app parses.
+///
+/// No `--pin` at all leaves `AUTUMN_JOBS__PIN` untouched so the child reads
+/// `[jobs] pin` from its own config; `--pin ""` is a deliberate unpin and must
+/// stay distinguishable from that, so presence is carried by the `Option`, not
+/// by the list being non-empty. Trimming and dropping blanks here means the pin
+/// `serve restart` recovers and the pin the app parses are the same list.
+fn normalize_pin(pin: &[String]) -> Option<Vec<String>> {
+    (!pin.is_empty()).then(|| {
+        pin.iter()
+            .map(|q| q.trim())
+            .filter(|q| !q.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
 }
 
 /// Process role selector for `autumn serve --role`.
@@ -1627,6 +3151,15 @@ enum WebhookCommands {
         /// The payload to send in the request body.
         #[arg(long)]
         payload: String,
+        /// Event type to announce, for the providers that carry it in a header
+        /// (github: `X-GitHub-Event`, generic: `X-Webhook-Event`).
+        ///
+        /// Defaults to `sim.event`, which no real handler dispatches on — pass
+        /// the event your handler expects (e.g. `--event push`) to exercise it.
+        /// Stripe and Slack read their event type from the payload's `type`
+        /// field instead, so this is ignored for those two.
+        #[arg(long, value_name = "TYPE")]
+        event: Option<String>,
     },
 }
 
@@ -1859,13 +3392,29 @@ enum ReleaseCommands {
     /// Emit production-ready deployment files at the project root.
     ///
     /// Default (no --target): Dockerfile + .dockerignore + autumn.production.toml.example.
-    /// --target fly        : also emits fly.toml.
-    /// --target docker-compose : also emits docker-compose.yml with app + Postgres.
+    /// --target fly                    : also emits fly.toml.
+    /// --target docker-compose         : also emits docker-compose.yml with app + Postgres.
+    /// --target azure-container-apps   : also emits main.tf, variables.tf, outputs.tf,
+    ///                                   terraform.tfvars.example, and
+    ///                                   .github/workflows/azure-deploy.yml.
+    /// --target aws-app-runner         : also emits main.tf, variables.tf, outputs.tf, and
+    ///                                   terraform.tfvars.example (ECR + App Runner + RDS,
+    ///                                   no CI workflow — fast/minimal path).
+    /// --target aws-ecs                : also emits main.tf, variables.tf, outputs.tf,
+    ///                                   terraform.tfvars.example, and
+    ///                                   .github/workflows/aws-deploy.yml (VPC/ALB/ECS
+    ///                                   Fargate/RDS — production path).
+    /// --target gcp-cloud-run          : also emits main.tf, variables.tf, outputs.tf,
+    ///                                   terraform.tfvars.example, and
+    ///                                   .github/workflows/gcp-deploy.yml (Artifact
+    ///                                   Registry + Cloud Run + Cloud SQL behind a VPC
+    ///                                   connector, opt-in Memorystore Redis).
     Init {
         /// Overwrite existing files instead of erroring on collision.
         #[arg(long)]
         force: bool,
-        /// Deployment target: fly | docker-compose (omit for bare Dockerfile).
+        /// Deployment target: fly | docker-compose | azure-container-apps | aws-app-runner |
+        /// aws-ecs | gcp-cloud-run (omit for bare Dockerfile).
         #[arg(long, value_name = "TARGET")]
         target: Option<String>,
         /// Scaffold a separate worker-role service in the generated
@@ -1898,7 +3447,18 @@ enum DeployCommands {
     /// Resolves the previous release on the target, brings its slot back up,
     /// flips the proxy back to it, repoints `current`, and re-probes `/ready`.
     /// Fails loudly (non-zero) when there is no previous release to roll back to.
-    Rollback,
+    ///
+    /// With `[deploy] hosts` this rolls back EVERY host, newest first, continuing
+    /// past a host that fails (each is reported) and exiting non-zero if any host
+    /// did not come back.
+    Rollback {
+        /// Roll back only this host; repeat the flag for several (issue #1621).
+        ///
+        /// Each value must appear in `[deploy] hosts`. The hosts left out keep
+        /// running whatever they are running now, so the fleet may end up mixed.
+        #[arg(long, value_name = "HOST")]
+        only: Vec<String>,
+    },
 
     /// Run the preflight, then perform a REAL deploy over SSH.
     ///
@@ -1908,7 +3468,100 @@ enum DeployCommands {
     /// installs the proxy and stands the release up behind it; a redeploy runs a
     /// zero-downtime cutover and auto-rolls-back the candidate on a pre-cutover
     /// failure.
-    Up,
+    ///
+    /// With `[deploy] hosts` the hosts are replaced ONE AT A TIME in declaration
+    /// order, migrations run exactly once, and a mid-rollout failure halts the
+    /// rollout and rolls the hosts that already cut over back.
+    Up {
+        /// Deploy only this host; repeat the flag for several (issue #1621).
+        ///
+        /// Each value must appear in `[deploy] hosts`. A REPAIR LEVER, not a faster
+        /// deploy: the skipped hosts keep their current release, so finish with a
+        /// full `autumn deploy up` to converge the fleet.
+        #[arg(long, value_name = "HOST")]
+        only: Vec<String>,
+
+        /// Halt and FREEZE a failed rollout instead of rolling the cut-over hosts
+        /// back (issue #1621).
+        ///
+        /// Every host is left exactly as it is — including the ones already on the
+        /// new release — and named in the final state table, so the failure can be
+        /// inspected before anything else moves.
+        #[arg(long)]
+        no_rollback: bool,
+    },
+
+    /// Report every configured host's deploy state, read-only (issue #1621).
+    ///
+    /// One row per `[deploy] hosts` entry: mode, deployed release (from the
+    /// `current` symlink), live slot, /ready status, maintenance flag, and proxy
+    /// port — plus version drift (hosts on different releases) and state drift
+    /// (per-host marker damage that will fail the NEXT deploy closed). Touches
+    /// nothing; safe mid-incident.
+    Status {
+        /// Emit the stable JSON report on stdout instead of the table.
+        #[arg(long)]
+        json: bool,
+        /// Exit non-zero when ANY drift is detected, so drift is alertable from
+        /// cron. The default exits 0 — status is a report, not a judgement.
+        #[arg(long)]
+        strict: bool,
+    },
+
+    /// Fleet-wide maintenance mode over SSH (issue #1621).
+    ///
+    /// Applies to the DEPLOY-CONFIGURED host(s) — `[deploy] host` or `[deploy]
+    /// hosts` — unlike the top-level `autumn maintenance`, which only writes this
+    /// machine's own working directory. Best-effort: every host is attempted, the
+    /// per-host table names what changed, and the command exits non-zero if any
+    /// host failed (the changed hosts are NOT reversed).
+    ///
+    /// Maintenance mode does NOT drain a host from your load balancer: /ready
+    /// stays 200 by design, so a maintained host keeps taking traffic and answers
+    /// it with 503. Drain at the load balancer if you need a host out of rotation.
+    #[command(subcommand)]
+    Maintenance(DeployMaintenanceCommands),
+}
+
+/// Subcommands for `autumn deploy maintenance` (issue #1621).
+#[derive(Subcommand)]
+enum DeployMaintenanceCommands {
+    /// Enable maintenance mode on every configured deploy host.
+    ///
+    /// Writes the same flag file the local `autumn maintenance on` writes, to the
+    /// per-app shared dir on each host (and, for hosts still running pre-#1621
+    /// units, to the current release's tmp/ dir), so running apps react within
+    /// 500 ms without a restart.
+    ///
+    /// # Examples
+    ///
+    ///   autumn deploy maintenance on
+    ///   autumn deploy maintenance on --message "Upgrading database schema"
+    ///   autumn deploy maintenance on --readonly
+    ///   autumn deploy maintenance on --allow-ips 10.0.0.0/8 --bypass-header X-Dev-Bypass:mytoken
+    #[command(verbatim_doc_comment)]
+    On {
+        /// Human-readable message shown to users in the 503 response body.
+        #[arg(long, value_name = "MSG")]
+        message: Option<String>,
+        /// CIDR block or IP address whose requests bypass maintenance.
+        /// Repeatable: `--allow-ips 10.0.0.0/8 --allow-ips 172.16.0.1`
+        #[arg(long, value_name = "CIDR")]
+        allow_ips: Vec<String>,
+        /// Allow GET, HEAD, OPTIONS through while blocking writes.
+        #[arg(long)]
+        readonly: bool,
+        /// Bypass header in NAME:VALUE format.
+        /// Requests carrying this header+value bypass the 503.
+        /// Example: `--bypass-header X-Autumn-Maintenance-Bypass:mytoken`
+        #[arg(long, value_name = "NAME:VALUE")]
+        bypass_header: Option<String>,
+    },
+    /// Disable maintenance mode on every configured deploy host.
+    ///
+    /// Removes the flag file(s); a host where maintenance was already off is a
+    /// success, not an error.
+    Off,
 }
 
 /// Subcommands for `autumn generate`.
@@ -1942,12 +3595,23 @@ enum GenerateCommands {
     /// Each `from -> to` edge may carry an optional `: guard` plain method
     /// name. Quote the token in bash/zsh so the shell doesn't split it.
     ///
+    /// `field:String{encrypted}` stores the column encrypted at rest: it emits
+    /// `#[encrypted]` on the model field, so the value is a base64 AES-256-GCM
+    /// envelope on disk and a plain `String` in Rust. Use
+    /// `{encrypted:deterministic}` when the column still needs
+    /// `find_by`/`exists_by` lookups or a UNIQUE index — randomized ciphertext
+    /// can never match an equality predicate, so those combinations are
+    /// refused at generate time. `String`/`Text` and non-null only. Requires
+    /// key material under `[active_record_encryption]`: run
+    /// `autumn credentials edit`. Quote the token in bash/zsh (brace expansion).
+    ///
     /// Examples:
     ///
     ///   autumn generate model Post title:String body:Text published:bool
     ///   autumn generate model Comment body:Text post:references
     ///   autumn generate model Post 'status:enum{draft,published,archived}'
     ///   autumn generate model User email:String:unique
+    ///   autumn generate model Account 'token:String{encrypted}'
     ///   autumn generate model Page 'status:String:states(draft -> published, published -> archived)'
     #[command(verbatim_doc_comment)]
     Model {
@@ -2116,6 +3780,40 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Generate team membership: organizations, roles (Owner/Admin/Member),
+    /// and email invitations (issue #1261).
+    ///
+    /// Composes already-stable primitives — `#[repository(tenant_scoped)]`
+    /// (issue #695), the session `"role"` key (issue #496), and the Mail
+    /// stack (`#[mailer]`) — rather than introducing a new authorization
+    /// mechanism. Takes no name: it always emits the same fixed
+    /// `Organization`/`Membership`/`Invitation` set.
+    ///
+    /// Creates:
+    ///   - `src/teams/`              — models, schema, repositories, role
+    ///     guard, invitation mailer, and route handlers
+    ///   - `migrations/<timestamp>_create_teams/` — organizations,
+    ///     memberships, invitations tables
+    ///   - `src/main.rs`             — `mod teams;` + routes wired into the
+    ///     app builder
+    ///   - `Cargo.toml`              — `"mail"` feature added to `autumn-web`
+    ///
+    /// Does NOT generate `routes/auth.rs` — your app's own login/signup
+    /// already exists. See `docs/generate-teams.md` for the two-line
+    /// integration seam, or `examples/teams` for a fully-wired reference app.
+    ///
+    /// Example:
+    ///
+    ///   autumn generate teams
+    #[command(verbatim_doc_comment)]
+    Teams {
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Scaffold a real-time channel: a pub/sub handler over the built-in
     /// `Channels` API, an htmx SSE live view (default) or a raw `#[ws]`
     /// socket handler, `main.rs` route wiring, and an in-process smoke test.
@@ -2147,6 +3845,38 @@ enum GenerateCommands {
         /// Emit a raw `#[ws]` WebSocket handler instead of the SSE view.
         #[arg(long)]
         ws: bool,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Scaffold the in-app notification feed: a `notifications` table
+    /// migration, notify/feed/unread-count/mark-read routes over the built-in
+    /// `Notifications` extractor, `main.rs` route wiring, and an in-process
+    /// smoke test.
+    ///
+    /// Notifications are a fixed, single-instance resource (the framework's
+    /// `Notifications` extractor reads one conventional `notifications`
+    /// table), so this command takes no name argument.
+    ///
+    /// Creates:
+    ///
+    /// - `migrations/<ts>_create_notifications/` — backend-aware table DDL
+    /// - `src/notifications.rs`  — notify / feed / unread-count / mark-read /
+    ///   mark-all-read route handlers
+    /// - `src/main.rs`           — `mod notifications;` + route registration
+    /// - `tests/notifications_feed.rs` — smoke test over the in-process
+    ///   `TestApp` (no database needed: memory-store fallback)
+    /// - `Cargo.toml`            — `serde`/`serde_json` deps and the tokio
+    ///   dev-dependency test features
+    ///
+    /// Example:
+    ///
+    ///   autumn generate notifications
+    #[command(verbatim_doc_comment)]
+    Notifications {
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -2271,6 +4001,45 @@ enum GenerateCommands {
     InboundMail {
         /// Handler name (`PascalCase` or `snake_case`, e.g. `Support`).
         name: String,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Generate a signed, replay-protected inbound webhook endpoint for a
+    /// third-party provider (Stripe, GitHub, Slack, or a generic HMAC source).
+    ///
+    /// The handler takes the shipped `SignedWebhook` extractor — signature
+    /// verification, raw-body capture, timestamp tolerance, replay rejection,
+    /// and secret rotation are the framework's, never hand-rolled.
+    ///
+    /// Creates:
+    ///   - `src/webhooks/<snake>.rs` — `#[post]` handler, event dispatch, and tests
+    ///   - `src/webhooks/mod.rs`     — created/updated with `pub mod`
+    ///   - `src/main.rs`             — `mod webhooks;` + the route in `routes![...]`
+    ///   - `autumn.toml`             — endpoint stub, replay backend, exemptions
+    ///   - `Cargo.toml`              — `serde_json` + tokio test features
+    ///
+    /// Example:
+    ///
+    ///   autumn generate webhook stripe Payments
+    ///   autumn generate webhook github Repo --path /hooks/github
+    ///   autumn generate webhook stripe Payments --dry-run
+    #[command(verbatim_doc_comment)]
+    Webhook {
+        /// Provider preset: `stripe`, `github`, `slack`, or `generic`.
+        provider: String,
+        /// Endpoint name (`PascalCase` or `snake_case`, e.g. `Payments`).
+        name: String,
+        /// Route path for the endpoint (default: `/webhooks/<provider>`).
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
+        /// Environment variable holding the signing secret
+        /// (default: `<PROVIDER>_WEBHOOK_SECRET`).
+        #[arg(long, value_name = "VAR")]
+        secret_env: Option<String>,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -2496,6 +4265,23 @@ enum GenerateCommands {
     /// UNIQUE INDEX` and the `find_by_<field>` lookup, but its JSON CRUD
     /// routes are auto-generated by `#[repository]`, and a duplicate
     /// create/update there still 500s (out of scope for this slice).
+    ///
+    /// `field:String{encrypted}` scaffolds an at-rest encrypted column: the
+    /// model field gets `#[encrypted]`, so the value is a base64 AES-256-GCM
+    /// envelope on disk and a plain `String` in Rust; the migration column is
+    /// unbounded `TEXT`, sized for the envelope. Use
+    /// `{encrypted:deterministic}` when the column still needs
+    /// `find_by`/`exists_by` lookups or a UNIQUE index — randomized ciphertext
+    /// can never match an equality predicate, so pairing it with
+    /// `:unique`/`--unique`/`--query`/`--index` is refused at generate time.
+    /// The generated admin redacts the column, the index list renders
+    /// `••••••••` (unsorted) and the CSV export omits it; the show view and
+    /// edit form still render the value. `String`/`Text` and non-null only.
+    /// Requires key material under `[active_record_encryption]`: run
+    /// `autumn credentials edit`. Quote the token in bash/zsh (brace
+    /// expansion), e.g.
+    /// `autumn generate scaffold Account 'api_token:String{encrypted}'` or
+    /// `autumn generate scaffold Account 'email:String{encrypted:deterministic}:unique'`.
     Scaffold {
         /// Resource name (`PascalCase` or `snake_case`, e.g. `Post`).
         name: String,
@@ -2555,12 +4341,64 @@ enum GenerateCommands {
         /// `--api` scaffolds, which never generate a policy.
         #[arg(long)]
         no_policy: bool,
+        /// Bind this resource to a parent as its child (issue #1323), e.g.
+        /// `--belongs-to Post` alongside a `post:references` column. Adds a
+        /// nested read route (`GET /posts/{post_id}/comments`), a nested create
+        /// route that takes the foreign key from the path instead of the
+        /// submitted body, a children list + inline "add" form on the parent's
+        /// generated show view, and back-links in both directions. The parent
+        /// must already be scaffolded, and must be an `id`-keyed resource whose
+        /// `show` view is the one the flat scaffold generated (not `slug`-keyed,
+        /// not carrying a `:states(...)` column, not hand-rewritten). Not
+        /// supported with `--api`, `--live`, `--live-validation`, `--sharded`,
+        /// an `Attachment` column, or a nullable/self-referential parent
+        /// reference.
+        #[arg(long, value_name = "PARENT")]
+        belongs_to: Option<String>,
+        /// Maintain a `{child}_count` column on the parent (issue #1325).
+        /// Requires `--belongs-to`. Adds `counter_cache` to the generated
+        /// child model's `#[belongs_to(...)]`, so the child repository keeps
+        /// `{parent}.{child}_count` current atomically and in the same
+        /// transaction as each insert/delete, and emits a migration adding
+        /// `{child}_count BIGINT NOT NULL DEFAULT 0` to the parent's table.
+        #[arg(long)]
+        counter_cache: bool,
         /// Make these text fields full-text searchable (issue #1319): comma-
         /// separated or repeatable, e.g. `--searchable title,body`. Adds
         /// `#[searchable]` to the model, `searchable` to the repository, a
         /// `search_vector` migration, and a wired search box in the index view.
         #[arg(long, value_name = "FIELD,FIELD", value_delimiter = ',')]
         searchable: Vec<String>,
+        /// Emit i18n-ready views (issue #1349): every page title, heading,
+        /// button, link, and field label in the generated HTML views becomes a
+        /// `t!(locale, "key")` lookup, each view handler takes the `Locale`
+        /// extractor, and the referenced keys are written to `i18n/en.ftl` with
+        /// their English values — so an `en` app renders identically and adding
+        /// a locale means translating a `.ftl`, not editing Rust. Also enables
+        /// autumn-web's `i18n` feature, adds `[i18n]` to `autumn.toml`, and
+        /// wires `.i18n_auto()` into `main.rs`. Composes with `--searchable`,
+        /// `--soft-delete`, and `--sharded`; `--api` scaffolds render no labels,
+        /// so the flag is a no-op there. Not supported with `--live`,
+        /// `--live-validation`, or `--belongs-to`.
+        #[arg(long)]
+        i18n: bool,
+        /// Emit a CSV import surface (issue #1393): a `GET /<plural>/import`
+        /// upload form and a `POST /<plural>/import` handler that parses the
+        /// uploaded multipart CSV, previews it with `import_csv` in
+        /// `ImportMode::DryRun` — reporting total rows, rows that would
+        /// insert, and a per-row error list with line numbers — and only
+        /// writes when the submit explicitly confirms a commit, through the
+        /// repository's transactional `save_many_skip_invalid`. Decodes rows
+        /// against the same `CsvSchema` impl the CSV export emits, so it is
+        /// honoured wherever that export is: not for `--api`, `--live`,
+        /// `--sharded`, an owner-scoped `--live-validation` scaffold, or a model
+        /// with an at-rest `#[encrypted]` column (the export omits that column
+        /// but the form requires it) — the generator warns and emits nothing
+        /// there. Composes with `--i18n`, `--searchable`, `--soft-delete`,
+        /// `--belongs-to` and `--counter-cache`, and enables autumn-web's
+        /// `multipart` feature. Insert-only: every row becomes a NEW record.
+        #[arg(long)]
+        import: bool,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -2610,12 +4448,16 @@ fn run_command(command: Commands) {
             bin,
             embed,
             features,
+            edge,
+            auditable,
         } => build::run(
             debug,
             embed,
+            edge,
             package.as_deref(),
             bin.as_deref(),
             features.as_deref(),
+            auditable,
         ),
         Commands::Dev {
             package,
@@ -2628,28 +4470,41 @@ fn run_command(command: Commands) {
             bundled_pg,
             package,
             role,
+            pin,
         } => {
-            let action = action.map(|a| match a {
-                ServeCommands::Stop => serve::ServeAction::Stop,
-                ServeCommands::Status => serve::ServeAction::Status,
-                ServeCommands::Restart => serve::ServeAction::Restart,
-            });
-            serve::run(
-                action,
-                &serve::ServeOptions {
-                    package,
-                    // --bundled-pg implies --daemon.
-                    daemon: daemon || bundled_pg,
-                    release,
-                    bundled_pg,
-                    // Normal start: the child inherits this shell's env. Only
-                    // `restart` sets this, to restore a lost profile.
-                    profile: None,
-                    // Forwarded to the app binary via `AUTUMN_ROLE`. `None` lets
-                    // the child pick its default (combined) or read its own env.
-                    role: role.map(|r| r.as_str().to_owned()),
-                },
-            );
+            // The service journeys are their own command family: they build
+            // and register rather than start, so they never reach `serve::run`.
+            let service_action = match action {
+                Some(ServeCommands::InstallService) => Some(service::ServiceAction::Install),
+                Some(ServeCommands::UninstallService) => Some(service::ServiceAction::Uninstall),
+                Some(ServeCommands::RunService { .. }) => Some(service::ServiceAction::Run),
+                _ => None,
+            };
+            let lifecycle = match action {
+                Some(ServeCommands::Stop) => Some(serve::ServeAction::Stop),
+                Some(ServeCommands::Status) => Some(serve::ServeAction::Status),
+                Some(ServeCommands::Restart) => Some(serve::ServeAction::Restart),
+                _ => None,
+            };
+            let opts = serve::ServeOptions {
+                package,
+                // --bundled-pg implies --daemon, and a service always hosts one.
+                daemon: daemon || bundled_pg || service_action.is_some(),
+                release,
+                bundled_pg,
+                // Normal start: the child inherits this shell's env. Only
+                // `restart` sets this, to restore a lost profile.
+                profile: None,
+                // Forwarded to the app binary via `AUTUMN_ROLE`. `None` lets
+                // the child pick its default (combined) or read its own env.
+                role: role.map(|r| r.as_str().to_owned()),
+                // Forwarded via `AUTUMN_JOBS__PIN` (#1623, AC3).
+                pin: normalize_pin(&pin),
+            };
+            if let Some(service_action) = service_action {
+                std::process::exit(service::run(service_action, &opts));
+            }
+            serve::run(lifecycle, &opts);
         }
         Commands::Schema { action } => schema::run(action),
         Commands::Migrate {
@@ -2743,9 +4598,51 @@ fn run_command(command: Commands) {
                 shard,
                 offsite,
             }),
+            DbCommands::Scrub {
+                profile,
+                artifact,
+                output,
+                config,
+                check,
+                dry_run,
+                force,
+                allow_source_overwrite,
+                sample,
+                seed,
+            } => db::scrub::run(&db::scrub::ScrubArgs {
+                profile,
+                artifact,
+                output,
+                config,
+                check,
+                dry_run,
+                force,
+                allow_source_overwrite,
+                sample,
+                seed,
+            }),
+            DbCommands::Retention {
+                package,
+                bin,
+                profile,
+                dataset,
+                dry_run,
+                purge,
+                force,
+                json,
+            } => db::retention::run(&db::retention::RetentionOptions {
+                package: package.as_deref(),
+                bin: bin.as_deref(),
+                profile: &profile,
+                mode: db_retention_mode(dry_run, purge),
+                dataset: dataset.as_deref(),
+                force,
+                json,
+            }),
             DbCommands::Offsite(OffsiteCommands::List { profile }) => {
                 db::backup::run_offsite_list(profile.as_deref());
             }
+            DbCommands::Replica(cmd) => db::replica::run(&cmd.into_command()),
             other => {
                 let (command, profile) = other.into_command();
                 db::run(&command, profile.as_deref());
@@ -2850,6 +4747,7 @@ fn run_command(command: Commands) {
             daemon,
             bundled_pg,
             api,
+            with,
         } => {
             if list_starters {
                 starters::print_list();
@@ -2873,6 +4771,10 @@ fn run_command(command: Commands) {
                     );
                     std::process::exit(1);
                 }
+                // AC #6: every `--with` name is resolved and version-checked
+                // BEFORE the scaffold writes a byte, so a typo or an
+                // incompatible plugin never leaves a half-built project behind.
+                let plugins = resolve_scaffold_plugins(&with, None);
                 starters::run(
                     &name,
                     &starter,
@@ -2880,7 +4782,9 @@ fn run_command(command: Commands) {
                     yes,
                     generate::Flags::default(),
                 );
+                wire_scaffold_plugins_into(&name, &plugins);
             } else {
+                let plugins = resolve_scaffold_plugins(&with, Some(plugin::first_party_version()));
                 new::run(
                     &name,
                     new::GenerateOptions {
@@ -2892,6 +4796,7 @@ fn run_command(command: Commands) {
                         with_api: api,
                     },
                 );
+                wire_scaffold_plugins_into(&name, &plugins);
             }
         }
 
@@ -2900,14 +4805,69 @@ fn run_command(command: Commands) {
             url,
             secret,
             payload,
-        }) => webhook::run_sim(&provider, &url, &secret, &payload),
+            event,
+        }) => webhook::run_sim(&provider, &url, &secret, &payload, event.as_deref()),
         Commands::Alert(AlertCommands::Test { channel }) => alert::run_test(channel.as_deref()),
+        Commands::Console {
+            profile,
+            package,
+            force,
+            scaffold_only,
+        } => console::run(&profile, package.as_deref(), force, scaffold_only),
         Commands::Seed {
             profile,
             package,
             count,
             model,
-        } => seed::run(&profile, package.as_deref(), count, model.as_deref()),
+            yes_i_mean_prod,
+        } => seed::run(
+            &profile,
+            package.as_deref(),
+            count,
+            model.as_deref(),
+            yes_i_mean_prod,
+        ),
+        Commands::Capsule { command } => match command {
+            CapsuleCommands::Test {
+                capsule: path,
+                name,
+                tests_dir,
+                force,
+            } => capsule::generate(&capsule::GenerateOptions {
+                capsule: &path,
+                name: name.as_deref(),
+                tests_dir: &tests_dir,
+                force,
+            }),
+            CapsuleCommands::Verify { dir, check_only } => {
+                capsule::verify(&capsule::VerifyOptions {
+                    dir: &dir,
+                    check_only,
+                });
+            }
+        },
+        Commands::Replay {
+            capsule,
+            package,
+            bin,
+            profile,
+            release,
+            debug,
+            features,
+            no_default_features,
+        } => run_replay_command(
+            &capsule,
+            package.as_deref(),
+            bin.as_deref(),
+            profile.as_deref(),
+            match (release, debug) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            },
+            features.as_deref(),
+            no_default_features,
+        ),
         Commands::Task {
             package,
             bin,
@@ -2923,7 +4883,41 @@ fn run_command(command: Commands) {
             name.as_deref(),
             &args,
         ),
+        Commands::Retention {
+            package,
+            bin,
+            profile,
+            dry_run,
+            model,
+        } => retention::run(&retention::RetentionOptions {
+            package: package.as_deref(),
+            bin: bin.as_deref(),
+            profile: &profile,
+            dry_run,
+            model: model.as_deref(),
+        }),
         Commands::Setup { force } => setup::run(force),
+        Commands::Sbom {
+            manifest_path,
+            output,
+            verify,
+            binary,
+            locked,
+            all_features,
+            features,
+            filter_platform,
+            expect_version,
+        } => sbom::run(&sbom::SbomOptions {
+            manifest_path,
+            output,
+            verify,
+            binary,
+            locked,
+            all_features,
+            features,
+            filter_platform,
+            expect_version,
+        }),
         Commands::Assets { action } => match action {
             AssetsCommands::Add { spec, url } => assets::run_add(&spec, url.as_deref()),
             AssetsCommands::List => assets::run_list(),
@@ -2934,6 +4928,140 @@ fn run_command(command: Commands) {
                 assets::run_verify(&manifest_path, &static_dir);
             }
         },
+        Commands::Agents(AgentsSubcommands::Manifest(args)) => {
+            let features = routes::CargoFeatures {
+                features: args.features,
+                all: args.all_features,
+                no_default: args.no_default_features,
+            };
+            agents::run(&agents::AgentsManifestOptions {
+                package: args.package.as_deref(),
+                bin: args.bin.as_deref(),
+                manifest: args.manifest.as_deref(),
+                json: args.json,
+                check: args.check.as_deref(),
+                allow_ungoverned: args.allow_ungoverned,
+                allow_unaudited: args.allow_unaudited,
+                features,
+                release: args.release,
+            });
+        }
+        Commands::Cache(CacheSubcommands::Audit(args)) => {
+            let features = routes::CargoFeatures {
+                features: args.features,
+                all: args.all_features,
+                no_default: args.no_default_features,
+            };
+            cache_audit::run(&cache_audit::CacheAuditOptions {
+                package: args.package.as_deref(),
+                bin: args.bin.as_deref(),
+                manifest: args.manifest.as_deref(),
+                json: args.json,
+                strict: args.strict,
+                features,
+            });
+        }
+        Commands::Openapi(OpenApiSubcommands::Export(args)) => {
+            let features = routes::CargoFeatures {
+                features: args.features,
+                all: args.all_features,
+                no_default: args.no_default_features,
+            };
+            openapi::run(&openapi::ExportOptions {
+                package: args.package.as_deref(),
+                bin: args.bin.as_deref(),
+                out: args.out.as_deref(),
+                check: args.check.as_deref(),
+                strict: args.strict,
+                features,
+                release: args.release,
+            });
+        }
+        Commands::Graph(command) => {
+            let (query, args) = match command {
+                GraphSubcommands::Show(args) => (graph::Query::Show, args),
+                GraphSubcommands::Touches { name, args } => (graph::Query::Touches(name), args),
+                GraphSubcommands::Impact { name, args } => (graph::Query::Impact(name), args),
+            };
+            let features = routes::CargoFeatures {
+                features: args.features,
+                all: args.all_features,
+                no_default: args.no_default_features,
+            };
+            graph::run(&graph::GraphOptions {
+                query,
+                package: args.package.as_deref(),
+                bin: args.bin.as_deref(),
+                manifest: args.manifest.as_deref(),
+                json: args.json,
+                check: args.check.as_deref(),
+                features,
+                release: args.release,
+            });
+        }
+        Commands::DataFlow(args) => {
+            let features = routes::CargoFeatures {
+                features: args.features,
+                all: args.all_features,
+                no_default: args.no_default_features,
+            };
+            data_flow::run(&data_flow::DataFlowOptions {
+                package: args.package.as_deref(),
+                bin: args.bin.as_deref(),
+                manifest: args.manifest.as_deref(),
+                json: args.json,
+                check: args.check.as_deref(),
+                features,
+                release: args.release,
+            });
+        }
+        Commands::Calibrate {
+            package,
+            bin,
+            contract,
+            check,
+            profile,
+            features,
+            all_features,
+            no_default_features,
+            targets,
+            seed,
+            concurrency,
+            rung_ms,
+            warmup_ms,
+            runs,
+            tolerance_rps,
+            tolerance_p99,
+            json,
+        } => {
+            let exit_code = capacity_driver::run(&capacity_driver::CalibrateOptions {
+                package: package.as_deref(),
+                bin: bin.as_deref(),
+                contract_path: &contract,
+                check,
+                profile,
+                named_features: !features.is_empty() || all_features || no_default_features,
+                features: routes::CargoFeatures {
+                    features,
+                    all: all_features,
+                    no_default: no_default_features,
+                },
+                targets,
+                seed,
+                concurrency,
+                rung_ms,
+                warmup_ms,
+                runs,
+                tolerances: capacity::Tolerances {
+                    rps: tolerance_rps,
+                    p99: tolerance_p99,
+                },
+                json,
+            });
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+        }
         Commands::Routes {
             package,
             bin,
@@ -2963,6 +5091,42 @@ fn run_command(command: Commands) {
                     json,
                     strict,
                 });
+            }
+            Some(RoutesSubcommands::Posture(command)) => {
+                let code = match &command {
+                    PostureSubcommands::Diff {
+                        base,
+                        head,
+                        format,
+                        output,
+                        ack,
+                        ack_file,
+                        allow_missing_base,
+                    } => posture::run_diff(&posture::DiffOptions {
+                        base,
+                        head,
+                        format,
+                        output: output.as_deref(),
+                        acks: ack,
+                        ack_file: ack_file.as_deref(),
+                        allow_missing_base: *allow_missing_base,
+                    }),
+                    PostureSubcommands::Digest { manifest, format } => {
+                        posture::run_digest(manifest, format)
+                    }
+                    PostureSubcommands::Verify {
+                        manifest,
+                        expect_digest,
+                        repo,
+                        skip_signature,
+                    } => posture::run_verify(&posture::verify::VerifyOptions {
+                        manifest,
+                        expect_digest: expect_digest.as_deref(),
+                        repo: repo.as_deref(),
+                        skip_signature: *skip_signature,
+                    }),
+                };
+                std::process::exit(code);
             }
             None => run_routes_command(
                 package.as_deref(),
@@ -3036,6 +5200,30 @@ fn run_command(command: Commands) {
                 );
                 std::process::exit(1);
             }
+        }
+        Commands::Upgrade(UpgradeArgs {
+            path,
+            from,
+            to,
+            apply,
+            json,
+            list_migrations,
+            check,
+            accept,
+        }) => {
+            let code = upgrade::run_in(
+                std::path::Path::new(&path),
+                &upgrade::UpgradeOptions {
+                    from,
+                    to,
+                    apply,
+                    json,
+                    list: list_migrations,
+                    check,
+                    accept,
+                },
+            );
+            std::process::exit(code);
         }
         Commands::Doctor {
             json,
@@ -3134,6 +5322,88 @@ fn run_command(command: Commands) {
                 });
             }
         },
+        Commands::Search { action } => match action {
+            SearchSubcommands::Reindex {
+                index,
+                profile,
+                purge,
+                package,
+                bin,
+            } => {
+                search::run(&search::ReindexOptions {
+                    package: package.as_deref(),
+                    bin: bin.as_deref(),
+                    index: index.as_deref(),
+                    profile: profile.as_deref(),
+                    purge,
+                });
+            }
+        },
+        Commands::Plugin { action } => {
+            let root = std::path::Path::new(".");
+            let code = match action {
+                PluginSubcommands::List { json, offline } => {
+                    plugin::run_list(&plugin::ListOptions {
+                        root,
+                        json,
+                        offline,
+                    })
+                }
+                PluginSubcommands::Add {
+                    name,
+                    dry_run,
+                    offline,
+                } => plugin::run_add(&plugin::AddOptions {
+                    root,
+                    name: &name,
+                    dry_run,
+                    offline,
+                }),
+                PluginSubcommands::Remove {
+                    name,
+                    dry_run,
+                    drop_data,
+                    yes,
+                } => plugin::run_remove(&plugin::RemoveOptions {
+                    root,
+                    name: &name,
+                    dry_run,
+                    drop_data,
+                    yes,
+                }),
+                PluginSubcommands::Package {
+                    manifest,
+                    module,
+                    out,
+                } => {
+                    plugin_sandbox::run_package(&plugin_sandbox::PackageOptions {
+                        manifest: std::path::Path::new(&manifest),
+                        module: std::path::Path::new(&module),
+                        out: std::path::Path::new(&out),
+                    });
+                    0
+                }
+                PluginSubcommands::Inspect {
+                    artifact,
+                    format,
+                    against,
+                } => {
+                    let format = format.parse().unwrap_or_else(|e| {
+                        eprintln!("autumn plugin inspect: {e}");
+                        std::process::exit(1);
+                    });
+                    plugin_sandbox::run_inspect(
+                        std::path::Path::new(&artifact),
+                        &format,
+                        against.as_deref().map(std::path::Path::new),
+                    );
+                    0
+                }
+            };
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
         Commands::PluginCheck {
             package,
             bin,
@@ -3141,6 +5411,7 @@ fn run_command(command: Commands) {
             prefix,
             sensitive_route,
             format,
+            deny_experimental,
         } => {
             run_plugin_check_command(
                 package.as_deref(),
@@ -3149,6 +5420,7 @@ fn run_command(command: Commands) {
                 prefix.as_deref(),
                 &sensitive_route,
                 &format,
+                deny_experimental,
             );
         }
         Commands::Generate(cmd) => run_generate_command(cmd, ApplyMode::Generate),
@@ -3305,6 +5577,59 @@ fn run_command(command: Commands) {
     }
 }
 
+fn run_replay_command(
+    capsule: &str,
+    package: Option<&str>,
+    bin: Option<&str>,
+    profile: Option<&str>,
+    build: Option<bool>,
+    features: Option<&str>,
+    no_default_features: bool,
+) {
+    replay::run(&replay::ReplayOptions {
+        capsule,
+        package,
+        bin,
+        profile,
+        build,
+        features,
+        no_default_features,
+    });
+}
+
+/// Map the `--dry-run` / `--purge` flags onto a [`db::retention::RetentionMode`]
+/// (issue #1605).
+///
+/// Neither flag means "report": the default is always read-only. Clap already
+/// rejects passing both, but the ordering here makes the safe direction the
+/// fallback rather than a coincidence — a future flag-handling change can only
+/// ever fail towards *not* deleting.
+/// The valid `autumn db retention --dataset` values, mirroring
+/// `autumn_web::data_retention::RETENTION_DATASETS` (issue #1605).
+///
+/// A clap `value_parser` so a typo is rejected before the app binary is even
+/// compiled, rather than after a full build-and-boot round trip.
+const RETENTION_DATASET_KEYS: [&str; 8] = [
+    "job_history",
+    "commit_hooks",
+    "job_tracking",
+    "idempotency",
+    "experiment_assignments",
+    "webhook_replay",
+    "sessions",
+    "audit_archives",
+];
+
+const fn db_retention_mode(dry_run: bool, purge: bool) -> db::retention::RetentionMode {
+    if purge {
+        db::retention::RetentionMode::Purge
+    } else if dry_run {
+        db::retention::RetentionMode::DryRun
+    } else {
+        db::retention::RetentionMode::Report
+    }
+}
+
 fn run_task_command(
     package: Option<&str>,
     bin: Option<&str>,
@@ -3323,6 +5648,57 @@ fn run_task_command(
     });
 }
 
+/// Resolve every `autumn new --with` name, exiting before the scaffold runs if
+/// any of them cannot be installed (issue #1631, AC #6).
+///
+/// The whole point of doing this here is ordering: `autumn new` creates a
+/// directory tree, and a project that exists but is missing the plugin the user
+/// asked for is worse than no project at all.
+///
+/// `scaffold_autumn_web` is the `autumn-web` the scaffold will pin, or `None`
+/// when that is not knowable yet. `autumn new`'s own template pins this CLI's
+/// version, so the gate is exact there. A `--starter` brings its own manifest,
+/// which does not exist until the starter is fetched — so only the half that
+/// IS knowable (does this name resolve at all, and to what version) runs
+/// before the write, and the compatibility answer comes from
+/// `plugin::wire_scaffold_plugins` reading the starter's real manifest
+/// afterwards.
+fn resolve_scaffold_plugins(
+    names: &[String],
+    scaffold_autumn_web: Option<&str>,
+) -> Vec<plugin::ScaffoldPlugin> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+    match plugin::preflight_scaffold_plugins(
+        names,
+        scaffold_autumn_web,
+        plugin::registry::latest_version,
+    ) {
+        Ok(plugins) => plugins,
+        Err(err) => {
+            eprintln!("autumn new: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Wire the preflighted plugins into the project `autumn new` just created.
+fn wire_scaffold_plugins_into(project_name: &str, plugins: &[plugin::ScaffoldPlugin]) {
+    if plugins.is_empty() {
+        return;
+    }
+    // Built the same way the scaffolders build it (`new::run` joins onto
+    // `current_dir`), rather than leaning on the process CWD staying put.
+    let root = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(project_name);
+    let code = plugin::wire_scaffold_plugins(&root, plugins);
+    if code != 0 {
+        std::process::exit(code);
+    }
+}
+
 fn run_plugin_check_command(
     package: Option<&str>,
     bin: Option<&str>,
@@ -3330,6 +5706,7 @@ fn run_plugin_check_command(
     prefix: Option<&str>,
     sensitive_route_args: &[String],
     format: &str,
+    deny_experimental: bool,
 ) {
     let fmt = format.parse().unwrap_or_else(|e| {
         eprintln!("autumn plugin-check: {e}");
@@ -3358,6 +5735,9 @@ fn run_plugin_check_command(
         expected_prefix: prefix,
         sensitive_routes: &sensitive_routes,
         format: fmt,
+        // Populated by `run` from the built binary's contract dump.
+        contracts: &plugin_check::ContractDump::Absent,
+        deny_experimental,
     });
 }
 
@@ -3490,14 +5870,81 @@ fn run_release_command(cmd: ReleaseCommands) {
     }
 }
 
+/// Map a `deploy` subcommand onto the (action, options) pair `deploy::run` takes.
+///
+/// [`deploy::DeployAction`] stays a fieldless `Copy` enum and the flags travel
+/// beside it in [`deploy::DeployOptions`] (issue #1621, §3.1), so adding a flag
+/// never ripples through the action enum or its call sites. Every construction here
+/// spreads `..Default::default()` for the same reason.
 fn run_deploy_command(cmd: &DeployCommands) {
-    let action = match cmd {
-        DeployCommands::Check => deploy::DeployAction::Check,
-        DeployCommands::Plan => deploy::DeployAction::Plan,
-        DeployCommands::Rollback => deploy::DeployAction::Rollback,
-        DeployCommands::Up => deploy::DeployAction::Up,
+    let (action, options) = match cmd {
+        DeployCommands::Check => (
+            deploy::DeployAction::Check,
+            deploy::DeployOptions::default(),
+        ),
+        DeployCommands::Plan => (deploy::DeployAction::Plan, deploy::DeployOptions::default()),
+        DeployCommands::Rollback { only } => (
+            deploy::DeployAction::Rollback,
+            deploy::DeployOptions {
+                only: only.clone(),
+                ..deploy::DeployOptions::default()
+            },
+        ),
+        DeployCommands::Up { only, no_rollback } => (
+            deploy::DeployAction::Up,
+            deploy::DeployOptions {
+                only: only.clone(),
+                no_rollback: *no_rollback,
+                ..deploy::DeployOptions::default()
+            },
+        ),
+        DeployCommands::Status { json, strict } => (
+            deploy::DeployAction::Status,
+            deploy::DeployOptions {
+                json: *json,
+                strict: *strict,
+                ..deploy::DeployOptions::default()
+            },
+        ),
+        DeployCommands::Maintenance(cmd) => match cmd {
+            DeployMaintenanceCommands::On {
+                message,
+                allow_ips,
+                readonly,
+                bypass_header,
+            } => {
+                // Same parse (and same failure behavior) as the local
+                // `autumn maintenance on`, so the two surfaces reject a malformed
+                // NAME:VALUE identically.
+                let parsed_bypass = bypass_header.as_deref().map(|s| {
+                    maintenance::parse_bypass_header(s).map_or_else(
+                        |e| {
+                            eprintln!("autumn deploy maintenance on: {e}");
+                            std::process::exit(1);
+                        },
+                        |(name, value)| (name.to_owned(), value.to_owned()),
+                    )
+                });
+                (
+                    deploy::DeployAction::MaintenanceOn,
+                    deploy::DeployOptions {
+                        maintenance: Some(deploy::MaintenanceOnArgs {
+                            message: message.clone(),
+                            allow_ips: allow_ips.clone(),
+                            readonly: *readonly,
+                            bypass_header: parsed_bypass,
+                        }),
+                        ..deploy::DeployOptions::default()
+                    },
+                )
+            }
+            DeployMaintenanceCommands::Off => (
+                deploy::DeployAction::MaintenanceOff,
+                deploy::DeployOptions::default(),
+            ),
+        },
     };
-    if let Err(e) = deploy::run(action) {
+    if let Err(e) = deploy::run(action, &options) {
         eprintln!("autumn deploy: {e}");
         std::process::exit(1);
     }
@@ -3594,13 +6041,27 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 ..Default::default()
             };
             let timestamp = generate::timestamp_now();
-            let plan = generate::model::plan_model_with_options(
-                &std::env::current_dir().unwrap_or_default(),
-                &name,
-                &fields,
-                &timestamp,
-                &options,
-            );
+            // `destroy model` recomputes the plan it is about to revert, so it
+            // must not be blocked by generation-only semantic checks: a model
+            // created before those checks existed still has to be removable, and
+            // the refusal would land before `Plan::revert` ever sees `--force`.
+            let project_root = std::env::current_dir().unwrap_or_default();
+            let plan = match mode {
+                ApplyMode::Generate => generate::model::plan_model_with_options(
+                    &project_root,
+                    &name,
+                    &fields,
+                    &timestamp,
+                    &options,
+                ),
+                ApplyMode::Destroy => generate::model::plan_model_with_options_for_revert(
+                    &project_root,
+                    &name,
+                    &fields,
+                    &timestamp,
+                    &options,
+                ),
+            };
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Migration {
@@ -3695,6 +6156,14 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 generate::policy::plan_policy(&resolve_cwd(), &name, mode == ApplyMode::Destroy);
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
+        GenerateCommands::Teams { dry_run, force } => {
+            let plan = generate::teams::plan_teams(
+                &resolve_cwd(),
+                &generate::timestamp_now(),
+                mode == ApplyMode::Destroy,
+            );
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
         GenerateCommands::Channel {
             name,
             sse: _,
@@ -3710,6 +6179,10 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             let plan = generate::channel::plan_channel(&resolve_cwd(), &name, transport);
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
+        GenerateCommands::Notifications { dry_run, force } => {
+            let plan = generate::notifications::plan_notifications(&resolve_cwd());
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
         GenerateCommands::InboundMail {
             name,
             dry_run,
@@ -3717,6 +6190,41 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
         } => {
             let plan = generate::inbound_mail::plan_inbound_mail(&resolve_cwd(), &name);
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
+        GenerateCommands::Webhook {
+            provider,
+            name,
+            path,
+            secret_env,
+            dry_run,
+            force,
+        } => {
+            let options = generate::webhook::WebhookOptions { path, secret_env };
+            let project_root = resolve_cwd();
+            // `destroy` recovers a `--path`/`--secret-env` it was not given from
+            // the endpoint block `generate` recorded, so cleanup does not depend
+            // on the user repeating flags (issue #1366, Codex review).
+            let plan = match mode {
+                ApplyMode::Generate => {
+                    generate::webhook::plan_webhook(&project_root, &provider, &name, &options)
+                }
+                ApplyMode::Destroy => generate::webhook::plan_webhook_for_revert(
+                    &project_root,
+                    &provider,
+                    &name,
+                    &options,
+                ),
+            };
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+            // Printed after the file list, and only for a real generate run:
+            // `apply_plan` exits on failure, and neither a dry run nor a
+            // destroy has next steps to take (issue #1366 AC #5).
+            if mode == ApplyMode::Generate
+                && !dry_run
+                && let Some(steps) = generate::webhook::next_steps(&provider, &name, &options)
+            {
+                println!("{steps}");
+            }
         }
         GenerateCommands::SystemTest {
             name,
@@ -3954,7 +6462,11 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             live,
             live_validation,
             no_policy,
+            belongs_to,
+            counter_cache,
             searchable,
+            i18n,
+            import,
             dry_run,
             force,
         } => {
@@ -4012,7 +6524,11 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 id.as_deref(),
                 live_validation,
                 no_policy,
+                belongs_to.as_deref(),
+                counter_cache,
                 &searchable,
+                i18n,
+                import,
             ) {
                 Ok(result) => result,
                 Err(e) => {
@@ -4130,6 +6646,8 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[test]
@@ -4271,6 +6789,159 @@ mod tests {
     }
 
     #[test]
+    fn parse_sbom_defaults_to_stdout() {
+        let cli = Cli::try_parse_from(["autumn", "sbom"]).unwrap();
+        let Commands::Sbom {
+            output,
+            verify,
+            binary,
+            locked,
+            manifest_path,
+            expect_version,
+            all_features,
+            features,
+            filter_platform,
+        } = cli.command
+        else {
+            panic!("expected Sbom command");
+        };
+        assert!(output.is_none());
+        assert!(verify.is_none());
+        assert!(binary.is_none());
+        assert!(manifest_path.is_none());
+        assert!(expect_version.is_none());
+        assert!(
+            !locked,
+            "--locked must be opt-in so a stale app lockfile still builds"
+        );
+        assert!(
+            !all_features,
+            "the default feature set is what a build actually links, so it is \
+             what the document describes by default"
+        );
+        assert!(features.is_none());
+        assert!(
+            filter_platform.is_none(),
+            "a source release is consumed on every platform, so no filter by default"
+        );
+    }
+
+    #[test]
+    fn parse_sbom_filter_platform() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "sbom",
+            "--filter-platform",
+            "aarch64-unknown-linux-gnu",
+        ])
+        .unwrap();
+        let Commands::Sbom {
+            filter_platform, ..
+        } = cli.command
+        else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(
+            filter_platform.as_deref(),
+            Some("aarch64-unknown-linux-gnu")
+        );
+    }
+
+    #[test]
+    fn parse_sbom_features() {
+        let cli = Cli::try_parse_from(["autumn", "sbom", "--features", "embed-assets"]).unwrap();
+        let Commands::Sbom { features, .. } = cli.command else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(features.as_deref(), Some("embed-assets"));
+    }
+
+    #[test]
+    fn parse_sbom_output_and_locked() {
+        let cli = Cli::try_parse_from(["autumn", "sbom", "--output", "sbom.cdx.json", "--locked"])
+            .unwrap();
+        let Commands::Sbom { output, locked, .. } = cli.command else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(output.unwrap().to_str().unwrap(), "sbom.cdx.json");
+        assert!(locked);
+    }
+
+    #[test]
+    fn parse_sbom_expect_version() {
+        let cli = Cli::try_parse_from(["autumn", "sbom", "--expect-version", "0.7.0"]).unwrap();
+        let Commands::Sbom { expect_version, .. } = cli.command else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(expect_version.as_deref(), Some("0.7.0"));
+    }
+
+    #[test]
+    fn parse_sbom_verify() {
+        let cli = Cli::try_parse_from(["autumn", "sbom", "--verify", "sbom.cdx.json"]).unwrap();
+        let Commands::Sbom { verify, .. } = cli.command else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(verify.unwrap().to_str().unwrap(), "sbom.cdx.json");
+    }
+
+    #[test]
+    fn parse_sbom_binary() {
+        let cli =
+            Cli::try_parse_from(["autumn", "sbom", "--binary", "/usr/local/bin/app"]).unwrap();
+        let Commands::Sbom { binary, .. } = cli.command else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(binary.unwrap().to_str().unwrap(), "/usr/local/bin/app");
+    }
+
+    #[test]
+    fn sbom_rejects_verifying_and_writing_at_once() {
+        // Both would be silently contradictory: `--verify` never writes.
+        assert!(
+            Cli::try_parse_from(["autumn", "sbom", "--verify", "a.json", "--output", "b.json"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn sbom_rejects_a_binary_combined_with_source_tree_flags() {
+        // Each of these only means something when resolving a manifest; with
+        // `--binary` they would be silently ignored.
+        for flag in [
+            vec!["--locked"],
+            vec!["--all-features"],
+            vec!["--features", "embed-assets"],
+            vec!["--filter-platform", "x86_64-unknown-linux-gnu"],
+            vec!["--verify", "sbom.cdx.json"],
+        ] {
+            let mut args = vec!["autumn", "sbom", "--binary", "app"];
+            args.extend(flag.iter().copied());
+            assert!(
+                Cli::try_parse_from(&args).is_err(),
+                "`autumn sbom --binary` must reject {flag:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sbom_rejects_a_binary_and_a_manifest_at_once() {
+        // `--binary` reads a compiled artifact; a manifest path is meaningless
+        // there and would quietly be ignored.
+        assert!(
+            Cli::try_parse_from([
+                "autumn",
+                "sbom",
+                "--binary",
+                "app",
+                "--manifest-path",
+                "Cargo.toml"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn new_rejects_removed_wasm_flag() {
         assert!(Cli::try_parse_from(["autumn", "new", "my-app", "--wasm"]).is_err());
     }
@@ -4339,6 +7010,23 @@ mod tests {
                 bin: None,
                 embed: false,
                 features: None,
+                edge: false,
+                auditable: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_build_auditable() {
+        // The production Dockerfile passes this so the shipped binary carries
+        // its own dependency list (issue #1615).
+        let cli = Cli::try_parse_from(["autumn", "build", "--embed", "--auditable"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Build {
+                embed: true,
+                auditable: true,
+                ..
             }
         ));
     }
@@ -4354,6 +7042,22 @@ mod tests {
                 bin: None,
                 embed: false,
                 features: None,
+                edge: false,
+                auditable: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_build_edge_flag() {
+        let cli = Cli::try_parse_from(["autumn", "build", "--edge"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Build {
+                debug: false,
+                embed: false,
+                edge: true,
+                ..
             }
         ));
     }
@@ -4466,6 +7170,89 @@ mod tests {
     }
 
     #[test]
+    fn serve_service_subcommands_parse() {
+        for (argv, expected) in [
+            (["autumn", "serve", "install-service"].as_slice(), "install"),
+            (
+                ["autumn", "serve", "uninstall-service"].as_slice(),
+                "uninstall",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            match cli.command {
+                Commands::Serve { action, .. } => {
+                    let got = match action {
+                        Some(ServeCommands::InstallService) => "install",
+                        Some(ServeCommands::UninstallService) => "uninstall",
+                        _ => "other",
+                    };
+                    assert_eq!(got, expected, "{argv:?}");
+                }
+                _ => panic!("expected Serve for {argv:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn serve_flags_belong_to_serve_not_to_the_service_subcommand() {
+        // clap gives everything after a subcommand NAME to that subcommand, and
+        // `install-service` takes no arguments — so `serve install-service
+        // --bundled-pg` is a parse error, not a bundled install. The supported
+        // spelling puts the flag before the subcommand, exactly as `--pin` and
+        // `--role` already do for `restart`. Pinned here because the failure is
+        // silent in a script: exit 2 with a usage message.
+        let cli = Cli::try_parse_from(["autumn", "serve", "--bundled-pg", "install-service"])
+            .expect("flags before the subcommand must parse");
+        match cli.command {
+            Commands::Serve {
+                action, bundled_pg, ..
+            } => {
+                assert!(matches!(action, Some(ServeCommands::InstallService)));
+                assert!(bundled_pg);
+            }
+            _ => panic!("expected Serve"),
+        }
+        assert!(
+            Cli::try_parse_from(["autumn", "serve", "install-service", "--bundled-pg"]).is_err(),
+            "a flag after the subcommand is a parse error, so callers must not \
+             be told that spelling works"
+        );
+    }
+
+    #[test]
+    fn run_service_carries_the_record_path_the_scm_was_registered_with() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "serve",
+            "run-service",
+            "--service-record",
+            "C:\\state\\serve.service.toml",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Serve { action, .. } => assert!(matches!(
+                action,
+                Some(ServeCommands::RunService {
+                    service_record: Some(_)
+                })
+            )),
+            _ => panic!("expected Serve"),
+        }
+    }
+
+    #[test]
+    fn normalize_pin_distinguishes_unpinned_from_absent() {
+        // `--pin ""` is a deliberate unpin and must stay distinguishable from no
+        // `--pin` at all, which leaves the app reading `[jobs] pin` itself.
+        assert_eq!(normalize_pin(&[]), None);
+        assert_eq!(normalize_pin(&[String::new()]), Some(vec![]));
+        assert_eq!(
+            normalize_pin(&[" critical ".to_owned(), String::new(), "default".to_owned()]),
+            Some(vec!["critical".to_owned(), "default".to_owned()])
+        );
+    }
+
+    #[test]
     fn serve_stop_subcommand_parses() {
         let cli = Cli::try_parse_from(["autumn", "serve", "stop"]).unwrap();
         assert!(matches!(
@@ -4499,6 +7286,53 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Issue #1623, AC3: a worker-role process must be pinnable to a subset of
+    /// queues "via config/flags". `autumn serve --pin` is the flag half; it
+    /// accepts a comma-separated list (matching `AUTUMN_JOBS__PIN`, which it
+    /// forwards) and may be repeated.
+    #[test]
+    fn serve_parses_pin_as_a_comma_separated_list() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "serve",
+            "--role",
+            "worker",
+            "--pin",
+            "critical,default",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Serve { pin, .. } => {
+                assert_eq!(pin, vec!["critical".to_owned(), "default".to_owned()]);
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn serve_pin_can_be_repeated() {
+        let cli =
+            Cli::try_parse_from(["autumn", "serve", "--pin", "critical", "--pin", "bulk"]).unwrap();
+        match cli.command {
+            Commands::Serve { pin, .. } => {
+                assert_eq!(pin, vec!["critical".to_owned(), "bulk".to_owned()]);
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    /// AC4: an app that configures nothing new keeps today's behavior, so a bare
+    /// `autumn serve` must produce an empty pin (the CLI then leaves
+    /// `AUTUMN_JOBS__PIN` untouched and the child reads its own config).
+    #[test]
+    fn serve_pin_defaults_to_empty() {
+        let cli = Cli::try_parse_from(["autumn", "serve"]).unwrap();
+        match cli.command {
+            Commands::Serve { pin, .. } => assert!(pin.is_empty()),
+            _ => panic!("expected Serve command"),
+        }
     }
 
     #[test]
@@ -5207,6 +8041,283 @@ mod tests {
         assert_eq!(profile.as_deref(), Some("prod"));
     }
 
+    // ── autumn db retention tests (issue #1605) ────────────────────────────
+
+    #[test]
+    fn parse_db_retention_defaults_to_a_read_only_report() {
+        let cli = Cli::try_parse_from(["autumn", "db", "retention"]).unwrap();
+        let Commands::Db(DbCommands::Retention {
+            profile,
+            dataset,
+            dry_run,
+            purge,
+            json,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected db retention");
+        };
+        assert_eq!(profile, "dev");
+        assert_eq!(dataset, None);
+        assert!(!dry_run);
+        assert!(!purge, "the bare command must never delete anything");
+        assert!(!json);
+        assert_eq!(
+            db_retention_mode(dry_run, purge),
+            db::retention::RetentionMode::Report
+        );
+    }
+
+    #[test]
+    fn parse_db_retention_with_dataset_and_purge() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "db",
+            "retention",
+            "--purge",
+            "--dataset",
+            "job_history",
+            "--profile",
+            "prod",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Db(DbCommands::Retention {
+            profile,
+            dataset,
+            dry_run,
+            purge,
+            json,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected db retention");
+        };
+        assert_eq!(profile, "prod");
+        assert_eq!(dataset.as_deref(), Some("job_history"));
+        assert!(!dry_run);
+        assert!(purge);
+        assert!(json);
+        assert_eq!(
+            db_retention_mode(dry_run, purge),
+            db::retention::RetentionMode::Purge
+        );
+    }
+
+    #[test]
+    fn parse_db_retention_dry_run_conflicts_with_purge() {
+        assert!(
+            Cli::try_parse_from(["autumn", "db", "retention", "--dry-run", "--purge"]).is_err(),
+            "--dry-run and --purge are contradictory and must not both be accepted"
+        );
+    }
+
+    #[test]
+    fn db_retention_mode_falls_back_to_report() {
+        assert_eq!(
+            db_retention_mode(false, false),
+            db::retention::RetentionMode::Report
+        );
+        assert_eq!(
+            db_retention_mode(true, false),
+            db::retention::RetentionMode::DryRun
+        );
+    }
+
+    // ── autumn db scrub tests (issue #1602) ────────────────────────────────
+
+    #[test]
+    fn parse_db_scrub_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "db", "scrub"]).unwrap();
+        let Commands::Db(DbCommands::Scrub {
+            profile,
+            artifact,
+            output,
+            config,
+            check,
+            dry_run,
+            force,
+            allow_source_overwrite,
+            sample,
+            seed,
+        }) = cli.command
+        else {
+            panic!("expected db scrub");
+        };
+        assert!(!allow_source_overwrite);
+        assert!(profile.is_none());
+        assert!(artifact.is_none());
+        assert!(output.is_none());
+        assert!(config.is_none());
+        assert!(!check);
+        assert!(!dry_run);
+        assert!(!force);
+        assert!(sample.is_empty(), "sampling is opt-in");
+        assert_eq!(seed, 0);
+    }
+
+    #[test]
+    fn parse_db_scrub_with_artifact_output_and_force() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "db",
+            "scrub",
+            "--profile",
+            "staging",
+            "--artifact",
+            "backups/prod/20260101T000000Z",
+            "--output",
+            "scrubbed",
+            "--config",
+            "config/scrub.toml",
+            "--force",
+        ])
+        .unwrap();
+        let Commands::Db(DbCommands::Scrub {
+            profile,
+            artifact,
+            output,
+            config,
+            check,
+            dry_run,
+            force,
+            allow_source_overwrite,
+            sample: _,
+            seed: _,
+        }) = cli.command
+        else {
+            panic!("expected db scrub");
+        };
+        assert!(!allow_source_overwrite);
+        assert_eq!(profile.as_deref(), Some("staging"));
+        assert_eq!(
+            artifact.as_deref(),
+            Some(std::path::Path::new("backups/prod/20260101T000000Z"))
+        );
+        assert_eq!(output.as_deref(), Some(std::path::Path::new("scrubbed")));
+        assert_eq!(
+            config.as_deref(),
+            Some(std::path::Path::new("config/scrub.toml"))
+        );
+        assert!(!check);
+        assert!(!dry_run);
+        assert!(force);
+    }
+
+    // ── autumn db scrub --sample tests (issue #1636) ───────────────────────
+
+    #[test]
+    fn parse_db_scrub_with_repeated_sample_roots_and_a_seed() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "db",
+            "scrub",
+            "--sample",
+            "users=1%",
+            "--sample",
+            "orders=500",
+            "--seed",
+            "42",
+        ])
+        .unwrap();
+        let Commands::Db(DbCommands::Scrub { sample, seed, .. }) = cli.command else {
+            panic!("expected db scrub");
+        };
+        assert_eq!(sample, vec!["users=1%".to_owned(), "orders=500".to_owned()]);
+        assert_eq!(seed, 42);
+    }
+
+    #[test]
+    fn parse_db_scrub_seed_requires_sample() {
+        // A seed with nothing to seed is a mistyped command, not a no-op: it
+        // reads as "this run is reproducible" when nothing was subsetted.
+        assert!(
+            Cli::try_parse_from(["autumn", "db", "scrub", "--seed", "42"]).is_err(),
+            "--seed only means something alongside --sample"
+        );
+    }
+
+    #[test]
+    fn parse_db_scrub_sample_works_with_check_and_dry_run() {
+        // Both write nothing, and both must still be able to prove the sample
+        // plan is complete — that is the CI gate for a graph gap.
+        for mode in ["--check", "--dry-run"] {
+            assert!(
+                Cli::try_parse_from(["autumn", "db", "scrub", "--sample", "users=1%", mode])
+                    .is_ok(),
+                "--sample must be inspectable with {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_db_scrub_check_conflicts_with_dry_run() {
+        assert!(
+            Cli::try_parse_from(["autumn", "db", "scrub", "--check", "--dry-run"]).is_err(),
+            "--check and --dry-run are two different no-write modes; asking for both is a mistake"
+        );
+    }
+
+    // ── autumn console tests (issue #1039) ─────────────────────────────────
+
+    #[test]
+    fn parse_console_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "console"]).unwrap();
+        match cli.command {
+            Commands::Console {
+                profile,
+                package,
+                force,
+                scaffold_only,
+            } => {
+                assert_eq!(profile, "dev");
+                assert!(package.is_none());
+                assert!(!force);
+                assert!(!scaffold_only);
+            }
+            _ => panic!("expected Console command"),
+        }
+    }
+
+    #[test]
+    fn parse_console_short_alias_c() {
+        let cli = Cli::try_parse_from(["autumn", "c"]).unwrap();
+        assert!(matches!(cli.command, Commands::Console { .. }));
+    }
+
+    #[test]
+    fn parse_console_with_force() {
+        let cli = Cli::try_parse_from(["autumn", "console", "--force"]).unwrap();
+        match cli.command {
+            Commands::Console { force, .. } => assert!(force),
+            _ => panic!("expected Console command"),
+        }
+    }
+
+    #[test]
+    fn parse_console_with_scaffold_only() {
+        let cli = Cli::try_parse_from(["autumn", "console", "--scaffold-only"]).unwrap();
+        match cli.command {
+            Commands::Console { scaffold_only, .. } => assert!(scaffold_only),
+            _ => panic!("expected Console command"),
+        }
+    }
+
+    #[test]
+    fn parse_console_with_profile_and_package() {
+        let cli = Cli::try_parse_from(["autumn", "console", "--profile", "demo", "-p", "my-app"])
+            .unwrap();
+        match cli.command {
+            Commands::Console {
+                profile, package, ..
+            } => {
+                assert_eq!(profile, "demo");
+                assert_eq!(package.as_deref(), Some("my-app"));
+            }
+            _ => panic!("expected Console command"),
+        }
+    }
+
     // ── autumn seed tests ──────────────────────────────────────────────────
 
     #[test]
@@ -5218,12 +8329,36 @@ mod tests {
                 package,
                 count,
                 model,
+                yes_i_mean_prod,
             } => {
                 assert_eq!(profile, "dev");
                 assert!(package.is_none());
                 assert!(count.is_none());
                 assert!(model.is_none());
+                assert!(!yes_i_mean_prod);
             }
+            _ => panic!("expected Seed command"),
+        }
+    }
+
+    #[test]
+    fn parse_seed_with_yes_i_mean_prod() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "seed",
+            "--count",
+            "200",
+            "--model",
+            "Post",
+            "--profile",
+            "prod",
+            "--yes-i-mean-prod",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Seed {
+                yes_i_mean_prod, ..
+            } => assert!(yes_i_mean_prod),
             _ => panic!("expected Seed command"),
         }
     }
@@ -5669,6 +8804,206 @@ mod tests {
         }
     }
 
+    // ── autumn openapi export tests (#802) ─────────────────────────────────
+
+    #[test]
+    fn parse_openapi_export_defaults_to_stdout() {
+        let cli = Cli::try_parse_from(["autumn", "openapi", "export"]).unwrap();
+        match cli.command {
+            Commands::Openapi(OpenApiSubcommands::Export(args)) => {
+                assert!(args.out.is_none(), "no --out means stdout");
+                assert!(args.check.is_none());
+                assert!(!args.strict);
+                assert!(args.package.is_none());
+                assert!(args.features.is_empty());
+            }
+            _ => panic!("expected Openapi export subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_openapi_export_out_and_strict() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "openapi",
+            "export",
+            "--out",
+            "openapi.json",
+            "--strict",
+            "-p",
+            "bookmarks",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Openapi(OpenApiSubcommands::Export(args)) => {
+                assert_eq!(args.out.as_deref(), Some(Path::new("openapi.json")));
+                assert!(args.strict);
+                assert!(!args.release, "debug is the default profile");
+                assert_eq!(args.package.as_deref(), Some("bookmarks"));
+            }
+            _ => panic!("expected Openapi export subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_openapi_export_check_and_features() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "openapi",
+            "export",
+            "--check",
+            "contract/openapi.json",
+            "--features",
+            "openapi,mcp",
+            "--no-default-features",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Openapi(OpenApiSubcommands::Export(args)) => {
+                assert_eq!(
+                    args.check.as_deref(),
+                    Some(Path::new("contract/openapi.json"))
+                );
+                assert_eq!(args.features, vec!["openapi,mcp".to_owned()]);
+                assert!(args.no_default_features);
+                assert!(!args.all_features);
+            }
+            _ => panic!("expected Openapi export subcommand"),
+        }
+    }
+
+    // ── autumn cache audit tests (#1716) ───────────────────────────────────
+
+    #[test]
+    fn parse_cache_audit_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "cache", "audit"]).unwrap();
+        match cli.command {
+            Commands::Cache(CacheSubcommands::Audit(args)) => {
+                assert!(args.package.is_none());
+                assert!(args.bin.is_none());
+                assert!(args.manifest.is_none());
+                assert!(!args.json);
+                // The default gate never fails on what it merely could not
+                // read; `--strict` is opt-in.
+                assert!(!args.strict);
+                assert!(args.features.is_empty());
+                assert!(!args.all_features);
+                assert!(!args.no_default_features);
+            }
+            _ => panic!("expected Cache audit subcommand"),
+        }
+    }
+
+    /// The manifest describes the binary that produced it, so the audited
+    /// build has to be the one that ships. A read or a repository behind a
+    /// non-default feature is not compiled into a default build at all — it
+    /// cannot appear in the manifest, and the gate exits green on a
+    /// configuration it never looked at.
+    #[test]
+    fn parse_cache_audit_forwards_the_cargo_feature_selection() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "cache",
+            "audit",
+            "--no-default-features",
+            "--features",
+            "db,cache-moka",
+            "--features",
+            "redis",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Cache(CacheSubcommands::Audit(args)) => {
+                assert_eq!(args.features, vec!["db,cache-moka", "redis"]);
+                assert!(args.no_default_features);
+                assert!(!args.all_features);
+            }
+            _ => panic!("expected Cache audit subcommand"),
+        }
+
+        let all = Cli::try_parse_from(["autumn", "cache", "audit", "--all-features"]).unwrap();
+        match all.command {
+            Commands::Cache(CacheSubcommands::Audit(args)) => assert!(args.all_features),
+            _ => panic!("expected Cache audit subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_cache_audit_flags() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "cache",
+            "audit",
+            "-p",
+            "blog",
+            "--bin",
+            "server",
+            "--manifest",
+            "target/cache-coherence.json",
+            "--json",
+            "--strict",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Cache(CacheSubcommands::Audit(args)) => {
+                assert_eq!(args.package.as_deref(), Some("blog"));
+                assert_eq!(args.bin.as_deref(), Some("server"));
+                assert_eq!(
+                    args.manifest.as_deref(),
+                    Some("target/cache-coherence.json")
+                );
+                assert!(args.json);
+                assert!(args.strict);
+            }
+            _ => panic!("expected Cache audit subcommand"),
+        }
+    }
+
+    #[test]
+    fn cache_requires_a_subcommand() {
+        assert!(Cli::try_parse_from(["autumn", "cache"]).is_err());
+    }
+
+    /// A variant inserted between a doc comment and the variant it documents
+    /// silently steals that help text and leaves the other with none — which is
+    /// exactly what happened to `routes` when `cache` was added.
+    ///
+    /// Runs on its own 16 MiB thread for the reason documented on
+    /// [`UpgradeArgs`]: building the whole `Command` tree walks
+    /// `Commands::augment_subcommands`, whose stack frame is already close to
+    /// libtest's 2 MiB per-test stack. This is the only test that materializes
+    /// it, so it brings its own headroom rather than making the suite depend on
+    /// `RUST_MIN_STACK`.
+    #[test]
+    fn every_command_has_its_own_help_text() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                use clap::CommandFactory as _;
+                let cmd = Cli::command();
+                for name in ["cache", "routes"] {
+                    let sub = cmd
+                        .get_subcommands()
+                        .find(|s| s.get_name() == name)
+                        .unwrap_or_else(|| panic!("`{name}` subcommand must exist"));
+                    let about = sub
+                        .get_about()
+                        .unwrap_or_else(|| panic!("`{name}` must have help text"))
+                        .to_string();
+                    assert!(!about.trim().is_empty(), "`{name}` has empty help text");
+                    assert!(
+                        !about.contains("mounted route") || name == "routes",
+                        "`{name}` is showing another command's help: {about}"
+                    );
+                }
+                // And clap itself is satisfied with the whole definition.
+                cmd.debug_assert();
+            })
+            .expect("spawn help-text check thread")
+            .join()
+            .expect("help-text check panicked");
+    }
+
     // ── autumn doctor tests ────────────────────────────────────────────────
 
     #[test]
@@ -5850,6 +9185,52 @@ mod tests {
             panic!("expected release init");
         };
         assert_eq!(target.as_deref(), Some("docker-compose"));
+    }
+
+    #[test]
+    fn parse_release_init_with_azure_container_apps_target() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "release",
+            "init",
+            "--target",
+            "azure-container-apps",
+        ])
+        .unwrap();
+        let Commands::Release(ReleaseCommands::Init { target, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert_eq!(target.as_deref(), Some("azure-container-apps"));
+    }
+
+    #[test]
+    fn parse_release_init_with_aws_app_runner_target() {
+        let cli = Cli::try_parse_from(["autumn", "release", "init", "--target", "aws-app-runner"])
+            .unwrap();
+        let Commands::Release(ReleaseCommands::Init { target, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert_eq!(target.as_deref(), Some("aws-app-runner"));
+    }
+
+    #[test]
+    fn parse_release_init_with_aws_ecs_target() {
+        let cli =
+            Cli::try_parse_from(["autumn", "release", "init", "--target", "aws-ecs"]).unwrap();
+        let Commands::Release(ReleaseCommands::Init { target, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert_eq!(target.as_deref(), Some("aws-ecs"));
+    }
+
+    #[test]
+    fn parse_release_init_with_gcp_cloud_run_target() {
+        let cli = Cli::try_parse_from(["autumn", "release", "init", "--target", "gcp-cloud-run"])
+            .unwrap();
+        let Commands::Release(ReleaseCommands::Init { target, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert_eq!(target.as_deref(), Some("gcp-cloud-run"));
     }
 
     #[test]
@@ -6046,6 +9427,174 @@ mod tests {
         assert!(Cli::try_parse_from(["autumn", "token", "revoke"]).is_err());
     }
 
+    // ── autumn plugin (sandboxed) tests ────────────────────────────────────
+
+    #[test]
+    fn parse_plugin_package_requires_all_three_paths() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin",
+            "package",
+            "--manifest",
+            "plugin.toml",
+            "--module",
+            "plugin.wasm",
+            "--out",
+            "hello.autumn-plugin",
+        ])
+        .expect("parses");
+        match cli.command {
+            Commands::Plugin {
+                action:
+                    PluginSubcommands::Package {
+                        manifest,
+                        module,
+                        out,
+                    },
+            } => {
+                assert_eq!(manifest, "plugin.toml");
+                assert_eq!(module, "plugin.wasm");
+                assert_eq!(out, "hello.autumn-plugin");
+            }
+            _ => panic!("expected plugin package"),
+        }
+        assert!(
+            Cli::try_parse_from(["autumn", "plugin", "package", "--manifest", "plugin.toml"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_plugin_inspect_defaults_to_text() {
+        let cli = Cli::try_parse_from(["autumn", "plugin", "inspect", "hello.autumn-plugin"])
+            .expect("parses");
+        match cli.command {
+            Commands::Plugin {
+                action:
+                    PluginSubcommands::Inspect {
+                        artifact,
+                        format,
+                        against,
+                    },
+            } => {
+                assert_eq!(artifact, "hello.autumn-plugin");
+                assert_eq!(format, "text");
+                // No `--against`: reviewing an artifact on its own, not as an
+                // upgrade. The upgrade gate must not fire when nobody asked
+                // for it (issue #1632).
+                assert_eq!(against, None);
+            }
+            _ => panic!("expected plugin inspect"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_inspect_accepts_an_upgrade_baseline() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin",
+            "inspect",
+            "shop-0.2.autumn-plugin",
+            "--against",
+            "shop-0.1.autumn-plugin",
+        ])
+        .expect("parses");
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::Inspect { against, .. },
+            } => {
+                assert_eq!(against.as_deref(), Some("shop-0.1.autumn-plugin"));
+            }
+            _ => panic!("expected plugin inspect"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_inspect_accepts_json() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin",
+            "inspect",
+            "hello.autumn-plugin",
+            "--format",
+            "json",
+        ])
+        .expect("parses");
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::Inspect { format, .. },
+            } => {
+                assert_eq!(format, "json");
+            }
+            _ => panic!("expected plugin inspect"),
+        }
+    }
+
+    // ── autumn plugin (list/add) tests ─────────────────────────────────────
+
+    #[test]
+    fn parse_plugin_list_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "plugin", "list"]).unwrap();
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::List { json, offline },
+            } => {
+                assert!(!json);
+                assert!(!offline);
+            }
+            _ => panic!("expected plugin list"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_list_json_and_offline() {
+        let cli = Cli::try_parse_from(["autumn", "plugin", "list", "--json", "--offline"]).unwrap();
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::List { json, offline },
+            } => {
+                assert!(json);
+                assert!(offline);
+            }
+            _ => panic!("expected plugin list"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_add_requires_a_name() {
+        assert!(Cli::try_parse_from(["autumn", "plugin", "add"]).is_err());
+    }
+
+    #[test]
+    fn parse_plugin_add_with_dry_run() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin",
+            "add",
+            "autumn-admin-plugin",
+            "--dry-run",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::Add { name, dry_run, .. },
+            } => {
+                assert_eq!(name, "autumn-admin-plugin");
+                assert!(dry_run);
+            }
+            _ => panic!("expected plugin add"),
+        }
+    }
+
+    /// `autumn plugin-check` predates `autumn plugin` and must keep working
+    /// as its own top-level command.
+    #[test]
+    fn plugin_and_plugin_check_are_distinct_commands() {
+        let check =
+            Cli::try_parse_from(["autumn", "plugin-check", "--plugin-name", "myplugin"]).unwrap();
+        assert!(matches!(check.command, Commands::PluginCheck { .. }));
+    }
+
     // ── autumn plugin-check tests ──────────────────────────────────────────
 
     #[test]
@@ -6123,6 +9672,38 @@ mod tests {
             Commands::PluginCheck { format, .. } => {
                 assert_eq!(format, "json");
             }
+            _ => panic!("expected PluginCheck"),
+        }
+    }
+
+    /// `--deny-experimental` turns the `experimental-surface` report into a
+    /// gate (issue #1601). It has to be opt-in, so the default is asserted too.
+    #[test]
+    fn parse_plugin_check_deny_experimental_flag() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin-check",
+            "--plugin-name",
+            "myplugin",
+            "--deny-experimental",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::PluginCheck {
+                deny_experimental, ..
+            } => assert!(deny_experimental),
+            _ => panic!("expected PluginCheck"),
+        }
+
+        let default =
+            Cli::try_parse_from(["autumn", "plugin-check", "--plugin-name", "myplugin"]).unwrap();
+        match default.command {
+            Commands::PluginCheck {
+                deny_experimental, ..
+            } => assert!(
+                !deny_experimental,
+                "experimental use is reported, not gated"
+            ),
             _ => panic!("expected PluginCheck"),
         }
     }
@@ -6229,7 +9810,9 @@ mod tests {
                 prefix,
                 sensitive_route,
                 format,
+                deny_experimental,
             } => {
+                assert!(!deny_experimental, "the flag defaults off");
                 assert_eq!(package.as_deref(), Some("my-app"));
                 assert_eq!(bin.as_deref(), Some("server"));
                 assert_eq!(plugin_name, "autumn-admin-plugin");
@@ -6542,6 +10125,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_generate_scaffold_belongs_to_flag() {
+        // Default: flat scaffold, no parent.
+        let cli = Cli::try_parse_from(["autumn", "generate", "scaffold", "Comment", "body:Text"])
+            .unwrap();
+        let Commands::Generate(GenerateCommands::Scaffold { belongs_to, .. }) = cli.command else {
+            panic!("expected generate scaffold");
+        };
+        assert_eq!(belongs_to, None, "flat scaffolds have no parent");
+
+        // `--belongs-to Post` binds the child to its parent resource.
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "scaffold",
+            "Comment",
+            "body:Text",
+            "post:references",
+            "--belongs-to",
+            "Post",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Scaffold { belongs_to, .. }) = cli.command else {
+            panic!("expected generate scaffold");
+        };
+        assert_eq!(belongs_to.as_deref(), Some("Post"));
+    }
+
+    #[test]
     fn parse_generate_mailer_without_name_is_error() {
         assert!(Cli::try_parse_from(["autumn", "generate", "mailer"]).is_err());
     }
@@ -6566,6 +10177,87 @@ mod tests {
     }
 
     // ── autumn generate channel tests ──────────────────────────────────────
+
+    #[test]
+    fn parse_generate_webhook_defaults() {
+        let cli =
+            Cli::try_parse_from(["autumn", "generate", "webhook", "stripe", "Payments"]).unwrap();
+        let Commands::Generate(GenerateCommands::Webhook {
+            provider,
+            name,
+            path,
+            secret_env,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected generate webhook");
+        };
+        assert_eq!(provider, "stripe");
+        assert_eq!(name, "Payments");
+        assert!(path.is_none(), "--path defaults to /webhooks/<provider>");
+        assert!(
+            secret_env.is_none(),
+            "--secret-env defaults to <PROVIDER>_WEBHOOK_SECRET"
+        );
+        assert!(!dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_webhook_with_path_and_secret_env() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "webhook",
+            "generic",
+            "Partner",
+            "--path",
+            "/hooks/partner",
+            "--secret-env",
+            "PARTNER_WEBHOOK_SECRET",
+            "--dry-run",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Webhook {
+            provider,
+            path,
+            secret_env,
+            dry_run,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected generate webhook");
+        };
+        assert_eq!(provider, "generic");
+        assert_eq!(path.as_deref(), Some("/hooks/partner"));
+        assert_eq!(secret_env.as_deref(), Some("PARTNER_WEBHOOK_SECRET"));
+        assert!(dry_run);
+    }
+
+    #[test]
+    fn parse_generate_webhook_requires_both_provider_and_name() {
+        assert!(
+            Cli::try_parse_from(["autumn", "generate", "webhook", "stripe"]).is_err(),
+            "the endpoint name is required"
+        );
+        assert!(
+            Cli::try_parse_from(["autumn", "generate", "webhook"]).is_err(),
+            "the provider preset is required"
+        );
+    }
+
+    #[test]
+    fn parse_destroy_webhook() {
+        let cli =
+            Cli::try_parse_from(["autumn", "destroy", "webhook", "stripe", "Payments"]).unwrap();
+        let Commands::Destroy(GenerateCommands::Webhook { provider, name, .. }) = cli.command
+        else {
+            panic!("expected destroy webhook");
+        };
+        assert_eq!(provider, "stripe");
+        assert_eq!(name, "Payments");
+    }
 
     #[test]
     fn parse_generate_channel_with_pascal_name() {
@@ -6650,6 +10342,48 @@ mod tests {
     #[test]
     fn parse_generate_channel_without_name_is_error() {
         assert!(Cli::try_parse_from(["autumn", "generate", "channel"]).is_err());
+    }
+
+    // ── autumn generate notifications tests ────────────────────────────────
+
+    #[test]
+    fn parse_generate_notifications_takes_no_name() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "notifications"]).unwrap();
+        let Commands::Generate(GenerateCommands::Notifications { dry_run, force }) = cli.command
+        else {
+            panic!("expected generate notifications");
+        };
+        assert!(!dry_run);
+        assert!(!force);
+        // A fixed resource: a stray name argument must be rejected.
+        assert!(Cli::try_parse_from(["autumn", "generate", "notifications", "Feed"]).is_err());
+    }
+
+    #[test]
+    fn parse_generate_notifications_with_dry_run_and_force() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "notifications",
+            "--dry-run",
+            "--force",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Notifications { dry_run, force }) = cli.command
+        else {
+            panic!("expected generate notifications");
+        };
+        assert!(dry_run);
+        assert!(force);
+    }
+
+    #[test]
+    fn parse_destroy_notifications() {
+        let cli = Cli::try_parse_from(["autumn", "destroy", "notifications"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Destroy(GenerateCommands::Notifications { .. })
+        ));
     }
 
     // ── autumn maintenance tests ───────────────────────────────────────────────
@@ -7048,6 +10782,78 @@ mod tests {
         };
         assert_eq!(example, "examples/todo-app");
         assert_eq!(runs, 10);
+    }
+
+    // ── autumn calibrate (#1733) ────────────────────────────────────
+
+    #[test]
+    fn parse_calibrate_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "calibrate"]).unwrap();
+        let Commands::Calibrate {
+            contract,
+            check,
+            seed,
+            concurrency,
+            rung_ms,
+            warmup_ms,
+            tolerance_rps,
+            tolerance_p99,
+            ..
+        } = cli.command
+        else {
+            panic!("expected calibrate");
+        };
+        assert_eq!(contract, "capacity.lock");
+        assert!(
+            !check,
+            "calibrate writes a contract unless --check is passed"
+        );
+        // Unspecified, so `--check` can replay whatever the committed
+        // contract recorded rather than this invocation's defaults.
+        assert_eq!(seed, None);
+        assert!(concurrency.is_empty());
+        assert_eq!(rung_ms, None);
+        assert_eq!(warmup_ms, None);
+        assert!((tolerance_rps - capacity::DEFAULT_RPS_TOLERANCE).abs() < f64::EPSILON);
+        assert!((tolerance_p99 - capacity::DEFAULT_P99_TOLERANCE).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_calibrate_check_mode_with_custom_ladder_and_tolerances() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "calibrate",
+            "--check",
+            "-p",
+            "blog",
+            "--contract",
+            "deploy/capacity.lock",
+            "--concurrency",
+            "1,8,64,256",
+            "--tolerance-rps",
+            "0.1",
+            "--tolerance-p99",
+            "0.3",
+        ])
+        .unwrap();
+        let Commands::Calibrate {
+            package,
+            contract,
+            check,
+            concurrency,
+            tolerance_rps,
+            tolerance_p99,
+            ..
+        } = cli.command
+        else {
+            panic!("expected calibrate");
+        };
+        assert!(check);
+        assert_eq!(package.as_deref(), Some("blog"));
+        assert_eq!(contract, "deploy/capacity.lock");
+        assert_eq!(concurrency, vec![1, 8, 64, 256]);
+        assert!((tolerance_rps - 0.1).abs() < f64::EPSILON);
+        assert!((tolerance_p99 - 0.3).abs() < f64::EPSILON);
     }
 
     #[test]

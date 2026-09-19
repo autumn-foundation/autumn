@@ -425,8 +425,12 @@ where
         // Self-exclusion: don't record requests to the inspector's own subtree.
         // Use exact match or subtree prefix ("/prefix/") to avoid false-excluding
         // unrelated routes that share the same string prefix (e.g. "/_autumn/inspector").
-        let is_inspector = path == self.inspector_path_prefix
-            || path.starts_with(&format!("{}/", self.inspector_path_prefix));
+        // `strip_prefix` + a boundary check gets the same semantics as
+        // `format!("{prefix}/")` + `starts_with` without allocating a String
+        // on every request.
+        let is_inspector = path
+            .strip_prefix(self.inspector_path_prefix.as_str())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
         if is_inspector {
             let fut = self.inner.call(req);
             return Box::pin(fut);
@@ -525,16 +529,29 @@ fn extract_session_id(headers: &axum::http::HeaderMap, cookie_name: &str) -> Opt
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
 
+/// Every path [`inspector_router`] mounts, given the configured base `path`.
+///
+/// The router mounts two routes, not one — the index and a detail template —
+/// so anything needing to know what the inspector claims (the router's
+/// collision preflight, for one) derives both from here rather than assuming
+/// the configured path is the whole story. Issue #2355: an inspector
+/// configured outside `/_autumn` left `{path}/requests/{id}` unclaimed, and a
+/// plugin declaring that shape panicked at startup.
+#[must_use]
+pub fn inspector_endpoint_paths(path: &str) -> [String; 2] {
+    [path.to_owned(), format!("{path}/requests/{{id}}")]
+}
+
 /// Build the router for the inspector UI.
 ///
-/// Mounts:
+/// Mounts, per [`inspector_endpoint_paths`]:
 /// * `GET {path}` — request list (newest-first)
 /// * `GET {path}/requests/{id}` — request detail
 pub fn inspector_router<S>(buffer: InspectorBuffer, path: &str) -> axum::Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    let detail_path = format!("{path}/requests/{{id}}");
+    let [_, detail_path] = inspector_endpoint_paths(path);
     let buf_index = buffer.clone();
     let buf_detail = buffer;
     let path_for_index = path.to_owned();

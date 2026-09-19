@@ -3,7 +3,7 @@ FROM rust:1.88-bookworm AS builder
 WORKDIR /workspace
 
 COPY . .
-RUN cargo build --release -p bookmarks-sharded --bin bookmarks-sharded --bin migrate
+RUN cargo build --release -p bookmarks-sharded --bin bookmarks-sharded --bin bookmarks-sharded-migrate
 
 FROM debian:bookworm-slim
 RUN apt-get update \
@@ -13,7 +13,7 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY --from=builder /workspace/target/release/bookmarks-sharded /app/bookmarks-sharded
-COPY --from=builder /workspace/target/release/migrate /app/bookmarks-sharded-migrate
+COPY --from=builder /workspace/target/release/bookmarks-sharded-migrate /app/bookmarks-sharded-migrate
 COPY --from=builder /workspace/examples/bookmarks-sharded /app/examples/bookmarks-sharded
 
 CMD ["/app/bookmarks-sharded"]

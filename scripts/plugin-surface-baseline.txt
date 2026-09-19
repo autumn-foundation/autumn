@@ -1,0 +1,43 @@
+# Baseline of Autumn's declared STABLE plugin surface (issue #1601).
+#
+# Every name here must still exist in `autumn_web::plugin_contract::PLUGIN_SURFACES`
+# AND still be declared `SurfaceTier::Stable`. `scripts/check-plugin-surface.sh`
+# fails otherwise.
+#
+# WHY A NAME LIST AND NOT A COUNT
+#   A count-only ratchet is defeated by a swap: demote one stable surface to
+#   experimental, add a new stable one, and the total is unchanged while
+#   Autumn's promise to plugin authors quietly shrank. The reference plugin
+#   stays green too — the call site simply moves. So the ratchet is over the
+#   SET of names.
+#
+# GROWING IT is routine: add the new stable surface's name, keep the file
+# sorted. SHRINKING IT — removing a line, or demoting an entry's tier — is the
+# deliberate act of breaking the contract, and belongs in the same change as a
+# `## Plugin authors` section in `docs/migrations/next.md` saying so.
+#
+# One name per line, sorted, `#` comments ignored.
+AppBuilder::config_section
+AppBuilder::declare_plugin_routes
+AppBuilder::error_pages
+AppBuilder::merge
+AppBuilder::nest
+AppBuilder::on_shutdown
+AppBuilder::on_startup
+AppBuilder::plugin
+AppBuilder::plugin_contracts
+AppBuilder::plugin_migrations
+AppBuilder::plugins
+AppBuilder::routes
+AppBuilder::with_config_loader
+AppBuilder::with_extension
+AppBuilder::with_pool_provider
+AppBuilder::with_session_store
+AppBuilder::with_telemetry_provider
+Plugin::build
+Plugin::contract
+Plugin::name
+db::Pool
+plugin_conformance
+plugin_contract
+route_listing::RouteInfo

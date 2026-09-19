@@ -19,6 +19,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -108,6 +110,23 @@ impl Default for RouteMetrics {
 /// Maximum number of latency samples to keep per route.
 const MAX_LATENCY_SAMPLES: usize = 10_000;
 const SHARD_COUNT: usize = 16;
+
+/// Map `key` onto one of the [`SHARD_COUNT`] metric shards.
+///
+/// ⚡ Bolt Optimization: FNV-1a is faster than `DefaultHasher` (`SipHash`) for
+/// short strings like routes and query keys. Neither cryptographic strength
+/// nor `HashDoS` resistance is needed — this shard map is purely internal.
+///
+/// `SHARD_COUNT` is a non-zero constant so the reduction is always defined;
+/// `checked_rem` says so in the code instead of leaving it to the reader.
+fn shard_index(key: &str) -> usize {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in key.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    usize::try_from(hash.checked_rem(SHARD_COUNT as u64).unwrap_or_default()).unwrap_or_default()
+}
 
 impl MetricsCollector {
     /// Create a new empty metrics collector.
@@ -230,21 +249,8 @@ impl MetricsCollector {
         }
     }
 
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "shard_idx is hash % SHARD_COUNT so always in bounds; buf slice length is <= 256, the buffer size"
-    )]
     fn record_route(&self, method: &str, route: &str, latency_ms: u64) {
-        // ⚡ Bolt Optimization:
-        // FNV-1a hash is faster than DefaultHasher (SipHash) for short strings like routes.
-        // We don't need cryptographic security or HashDoS resistance here since this is internal.
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in route.bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0100_0000_01b3);
-        }
-
-        let shard_idx = usize::try_from(hash % (SHARD_COUNT as u64)).unwrap_or_default();
+        let shard_idx = shard_index(route);
 
         // ⚡ Bolt Optimization:
         // Format the key into a stack-allocated buffer to avoid a heap allocation
@@ -252,20 +258,28 @@ impl MetricsCollector {
         // is exceptionally long (which is rare) or if it's a new route missing
         // from the metrics map.
         let mut buf = [0u8; 256];
-        let key_str = {
-            let mut cursor = &mut buf[..];
+        // `Cursor::position` reports the bytes written directly, so the filled
+        // prefix is read back without deriving a length from the remaining
+        // slice (`256 - cursor.len()`).
+        let written = {
+            let mut cursor = std::io::Cursor::new(buf.as_mut_slice());
             if std::io::Write::write_fmt(&mut cursor, format_args!("{method} {route}")).is_ok() {
-                let len = 256 - cursor.len();
-                std::str::from_utf8(&buf[..len]).unwrap_or_default()
+                usize::try_from(cursor.position()).unwrap_or_default()
             } else {
-                ""
+                0
             }
         };
+        let key_str = buf
+            .get(..written)
+            .and_then(|filled| std::str::from_utf8(filled).ok())
+            .unwrap_or_default();
 
         let mut is_new = false;
-        if let Ok(mut shard) = self.inner.shards[shard_idx].write() {
+        if let Some(lock) = self.inner.shards.get(shard_idx)
+            && let Ok(mut shard) = lock.write()
+        {
             if let Some(entry) = shard.by_route.get_mut(key_str) {
-                entry.count += 1;
+                entry.count = entry.count.saturating_add(1);
                 if entry.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
                     entry.latencies_ms.pop_front();
                 }
@@ -281,9 +295,11 @@ impl MetricsCollector {
             } else {
                 key_str.to_owned()
             };
-            if let Ok(mut shard) = self.inner.shards[shard_idx].write() {
+            if let Some(lock) = self.inner.shards.get(shard_idx)
+                && let Ok(mut shard) = lock.write()
+            {
                 let entry = shard.by_route.entry(key).or_default();
-                entry.count += 1;
+                entry.count = entry.count.saturating_add(1);
                 if entry.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
                     entry.latencies_ms.pop_front();
                 }
@@ -293,22 +309,14 @@ impl MetricsCollector {
     }
 
     /// Record a database query's duration.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "shard_idx is hash % SHARD_COUNT so always in bounds"
-    )]
     pub fn record_db_query(&self, key: &str, latency_ms: u64) {
-        // Hash key to determine shard index using FNV-1a
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in key.bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0100_0000_01b3);
-        }
-        let shard_idx = usize::try_from(hash % (SHARD_COUNT as u64)).unwrap_or_default();
+        let shard_idx = shard_index(key);
 
-        if let Ok(mut shard) = self.inner.shards[shard_idx].write() {
+        if let Some(lock) = self.inner.shards.get(shard_idx)
+            && let Ok(mut shard) = lock.write()
+        {
             let entry = shard.by_query.entry(key.to_owned()).or_default();
-            entry.count += 1;
+            entry.count = entry.count.saturating_add(1);
             if entry.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
                 entry.latencies_ms.pop_front();
             }
@@ -532,9 +540,11 @@ fn compute_percentiles(latencies: &VecDeque<u64>) -> Percentiles {
     data.extend_from_slice(slice1);
     data.extend_from_slice(slice2);
 
-    let p50_idx = len * 50 / 100;
-    let p95_idx = len.saturating_sub(1).min(len * 95 / 100);
-    let p99_idx = len.saturating_sub(1).min(len * 99 / 100);
+    // `len` is capped at MAX_LATENCY_SAMPLES, so the products are exact;
+    // `saturating_mul` keeps the index math total for pathological inputs.
+    let p50_idx = len.saturating_mul(50) / 100;
+    let p95_idx = len.saturating_sub(1).min(len.saturating_mul(95) / 100);
+    let p99_idx = len.saturating_sub(1).min(len.saturating_mul(99) / 100);
 
     // Use select_nth_unstable to find percentiles in O(N) time instead of O(N log N) sort
     let (_, &mut p99, _) = data.select_nth_unstable(p99_idx);
@@ -705,6 +715,50 @@ mod tests {
         assert_eq!(snap.http.by_status.s5xx, 1);
         assert!(snap.http.by_route.contains_key("GET /test"));
         assert_eq!(snap.http.by_route["GET /test"].count, 2);
+    }
+
+    /// Pin an existing per-route/per-query counter at `u64::MAX` so the next
+    /// recorded observation exercises the overflow boundary.
+    fn pin_counter_at_ceiling(collector: &MetricsCollector, shard_key: &str, entry_key: &str) {
+        let lock = collector
+            .inner
+            .shards
+            .get(shard_index(shard_key))
+            .expect("shard_index always yields an in-bounds shard");
+        let mut shard = lock.write().expect("shard lock is not poisoned");
+        let entry = if shard.by_route.contains_key(entry_key) {
+            shard.by_route.get_mut(entry_key)
+        } else {
+            shard.by_query.get_mut(entry_key)
+        };
+        entry.expect("the counter was just recorded").count = u64::MAX;
+    }
+
+    #[test]
+    fn route_counter_saturates_at_the_ceiling() {
+        // A long-lived process can in principle drive a per-route counter to
+        // `u64::MAX`; the bump must stick there rather than overflow-panic the
+        // request path in a debug build.
+        let collector = MetricsCollector::new();
+        collector.record_route("GET", "/saturating", 5);
+        pin_counter_at_ceiling(&collector, "/saturating", "GET /saturating");
+
+        collector.record_route("GET", "/saturating", 5);
+
+        let snap = collector.snapshot();
+        assert_eq!(snap.http.by_route["GET /saturating"].count, u64::MAX);
+    }
+
+    #[test]
+    fn db_query_counter_saturates_at_the_ceiling() {
+        let collector = MetricsCollector::new();
+        collector.record_db_query("SELECT 1", 5);
+        pin_counter_at_ceiling(&collector, "SELECT 1", "SELECT 1");
+
+        collector.record_db_query("SELECT 1", 5);
+
+        let snap = collector.snapshot();
+        assert_eq!(snap.db_queries["SELECT 1"].count, u64::MAX);
     }
 
     #[test]

@@ -1,0 +1,12 @@
+error: authority_grant!: unknown key `audit`. The grammar is `writes: [..]`, `unbounded_writes: [..]`, `tenant_scope: scoped | cross_tenant | none`, `outbound: [".."]`, `webhooks: [".."]`, `jobs: [..]`, `rate: "10/min"`, `spend: "500.00 USD"`, `reversibility: reversible | compensable | irreversible` (required). The keys may appear in any order and all but `reversibility` may be omitted. See docs/guide/agent-authority.md
+  --> tests/compile-fail/agent_authority_unknown_grant_key.rs:5:1
+   |
+ 5 | / autumn_web::authority_grant! {
+ 6 | |     /// Draft-only refund authority for the support agent.
+ 7 | |     pub RefundDrafter {
+ 8 | |         writes: [Refund],
+...  |
+13 | | }
+   | |_^
+   |
+   = note: this error originates in the macro `$crate::__authority_grant_parse` which comes from the expansion of the macro `autumn_web::authority_grant` (in Nightly builds, run with -Z macro-backtrace for more info)

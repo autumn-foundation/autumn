@@ -360,6 +360,7 @@ Point `pagerduty_url` at a PagerDuty-Events-compatible enqueue endpoint offered
 by another paging service to reuse this same channel:
 
 ```toml
+[alerts]
 pagerduty_url = "https://events.eu.pagerduty.com/v2/enqueue"
 ```
 

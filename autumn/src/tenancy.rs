@@ -39,7 +39,14 @@ impl axum::extract::FromRequestParts<crate::AppState> for Tenant {
             .ok_or_else(|| {
                 crate::AutumnError::service_unavailable_msg("Config is not available")
             })?;
-        let tenant_id = extract_tenant_from_parts(parts, &config).await?;
+        let domains =
+            state.extension::<std::sync::Arc<crate::custom_domain::CustomDomainRegistry>>();
+        let tenant_id = extract_tenant_from_parts_with_domains(
+            parts,
+            &config,
+            domains.as_deref().map(AsRef::as_ref),
+        )
+        .await?;
         Ok(Self(tenant_id))
     }
 }
@@ -52,9 +59,140 @@ where
     CURRENT_TENANT.scope(Some(tenant_id), future).await
 }
 
-// Tenant extraction logic based on configuration
+/// Resolve the request's tenant, recording it into a failure capsule and
+/// serving it from one during replay (#1634).
+///
+/// Wrapping the resolver — rather than the middleware — puts the seam on the
+/// one path both the [`Tenant`] extractor and [`tenancy_middleware`] take, so
+/// a capsule cannot miss the tenant because the app resolves it in a handler
+/// instead of a layer.
+///
+/// Replay serves the *recorded* tenant without re-running resolution: the
+/// resolution reads live tenant configuration (a header allow-list, a session
+/// lookup, a subdomain map) that the machine doing the replaying generally
+/// does not have, and a replay that re-derived a different tenant would judge
+/// the handler on data the failing request never saw.
 #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
 pub async fn extract_tenant_from_parts(
+    parts: &mut axum::http::request::Parts,
+    config: &crate::config::AutumnConfig,
+) -> Result<String, crate::AutumnError> {
+    extract_tenant_from_parts_with_domains(parts, config, None).await
+}
+
+/// [`extract_tenant_from_parts`], plus the custom-domain registry (#1635).
+///
+/// A hostname a tenant connected is not a subdomain of `tenancy.base_domain`,
+/// so subdomain resolution would reject it. Consulting the registry FIRST — and
+/// only for a domain that has reached `Active` — is what routes
+/// `app.clientco.com` to its owning tenant while an unregistered outside host
+/// keeps its 400.
+///
+/// Applies only to `tenancy.source = "subdomain"`, where the `Host` header is
+/// already what identifies the tenant. Under a credential-backed source
+/// (`header`, `session`, `jwt`) the registry is not consulted at all.
+///
+/// Callers holding an `AppState` pass
+/// [`CustomDomainRegistry::from_state`](crate::custom_domain::CustomDomainRegistry::from_state);
+/// `None` is the pre-#1635 behaviour.
+///
+/// # Errors
+///
+/// Returns the same rejection as [`extract_tenant_from_parts`] when the
+/// configured source cannot resolve a tenant.
+pub async fn extract_tenant_from_parts_with_domains(
+    parts: &mut axum::http::request::Parts,
+    config: &crate::config::AutumnConfig,
+    domains: Option<&crate::custom_domain::CustomDomainRegistry>,
+) -> Result<String, crate::AutumnError> {
+    if let Some(tenant_id) = replayed_tenant() {
+        return Ok(tenant_id);
+    }
+    // Only under `source = "subdomain"`, where the `Host` header is ALREADY the
+    // tenant signal. Under `header`/`session`/`jwt` the tenant comes from a
+    // credential the client cannot forge, and letting a connected `Host`
+    // outrank it would let any authenticated user reach another tenant's data
+    // by setting one header.
+    if config.tenancy.enabled
+        && config.tenancy.source == "subdomain"
+        && let Some(registry) = domains
+        && let Some(host) = request_host(parts)
+        && let Some(tenant_id) = registry.tenant_for_host(&host)
+    {
+        record_tenant(&tenant_id);
+        return Ok(tenant_id);
+    }
+    // A capsule with no recorded tenant falls through to the real resolver.
+    // That is not a gap: the recorded request's headers are restored verbatim,
+    // so a run whose recorded failure *was* a tenant-resolution error
+    // reproduces that error instead of being handed a different 503 saying the
+    // capsule is too old.
+    let resolved = extract_tenant_from_parts_inner(parts, config).await;
+    if let Ok(tenant_id) = resolved.as_ref() {
+        record_tenant(tenant_id);
+    }
+    resolved
+}
+
+// The `capsule` module is behind the `reporting` feature, so both halves of the
+// seam have a no-op twin for builds without it.
+
+/// The tenant a capsule replay serves, when one is serving this task.
+#[cfg(feature = "reporting")]
+fn replayed_tenant() -> Option<String> {
+    crate::capsule::effects::current_tape().and_then(|tape| tape.tenant())
+}
+
+/// No capsule support compiled in: never a replay.
+#[cfg(not(feature = "reporting"))]
+const fn replayed_tenant() -> Option<String> {
+    None
+}
+
+/// Tee the resolved tenant into the in-flight request's capsule.
+#[cfg(feature = "reporting")]
+fn record_tenant(tenant_id: &str) {
+    if let Some(scope) = crate::capsule::current_scope() {
+        scope.record_tenant(crate::capsule::TenantEffect {
+            id: Some(tenant_id.to_owned()),
+        });
+    }
+}
+
+/// No capsule support compiled in: nothing to record.
+#[cfg(not(feature = "reporting"))]
+const fn record_tenant(_tenant_id: &str) {}
+
+/// The request's effective host, preferring the proxy-resolved one.
+///
+/// The `X-Forwarded-Host` a trusted upstream set (resolved into
+/// [`crate::security::ResolvedClientIdentity`]) wins over the raw `Host`
+/// header, so a deployment behind a load balancer sees the name the client
+/// actually asked for. `None` when neither is present or the header is not
+/// UTF-8.
+fn request_host(parts: &axum::http::request::Parts) -> Option<String> {
+    parts
+        .extensions
+        .get::<crate::security::ResolvedClientIdentity>()
+        .and_then(|id| id.host.clone())
+        .or_else(|| {
+            parts
+                .headers
+                .get(axum::http::header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .map(ToOwned::to_owned)
+        })
+}
+
+// Tenant extraction logic based on configuration
+#[allow(
+    clippy::too_many_lines,
+    clippy::needless_pass_by_ref_mut,
+    reason = "the `&mut Parts` signature mirrors the public wrapper and axum's \
+              `FromRequestParts` contract; narrowing it here would force the \
+              caller to reborrow"
+)]
+async fn extract_tenant_from_parts_inner(
     parts: &mut axum::http::request::Parts,
     config: &crate::config::AutumnConfig,
 ) -> Result<String, crate::AutumnError> {
@@ -93,32 +231,21 @@ pub async fn extract_tenant_from_parts(
             Ok(val)
         }
         "subdomain" => {
-            // Prefer the proxy-resolved host (honours X-Forwarded-Host from trusted
-            // upstreams); fall back to the raw Host header when the layer has not run.
-            let host_owned: String = parts
-                .extensions
-                .get::<crate::security::ResolvedClientIdentity>()
-                .and_then(|id| id.host.clone())
-                .map_or_else(
-                    || {
-                        parts
-                            .headers
-                            .get(axum::http::header::HOST)
-                            .ok_or_else(|| {
-                                crate::AutumnError::bad_request_msg(
-                                    "Missing Host header for subdomain tenancy",
-                                )
-                            })
-                            .and_then(|h| {
-                                h.to_str().map(ToOwned::to_owned).map_err(|_| {
-                                    crate::AutumnError::bad_request_msg(
-                                        "Invalid UTF-8 in Host header",
-                                    )
-                                })
-                            })
-                    },
-                    Ok,
-                )?;
+            let host_owned = match request_host(parts) {
+                Some(host) => host,
+                // A present-but-undecodable `Host` is a different operator
+                // problem from an absent one, so it keeps its own message.
+                None if parts.headers.contains_key(axum::http::header::HOST) => {
+                    return Err(crate::AutumnError::bad_request_msg(
+                        "Invalid UTF-8 in Host header",
+                    ));
+                }
+                None => {
+                    return Err(crate::AutumnError::bad_request_msg(
+                        "Missing Host header for subdomain tenancy",
+                    ));
+                }
+            };
 
             let host = host_owned.as_str();
             let host_only = host.split(':').next().unwrap_or(host).trim();
@@ -329,6 +456,17 @@ pub async fn extract_tenant_from_parts(
 /// framework (CSRF, CAPTCHA): `/login` matches `/login` and `/login/sso` but not
 /// `/login-admin`.
 fn is_public_path(path: &str, config: &crate::config::AutumnConfig) -> bool {
+    // When locale-prefix routing (issue #1251) is on, a public route like
+    // `/login` is actually reachable at `/en/login`, but every exemption
+    // below (`public_paths`, `login_redirect`, health probes, actuator) is
+    // configured as an unprefixed path. Strip a leading `/{locale}` segment
+    // first so tenancy sees the same logical path regardless of which locale
+    // prefix carried the request — otherwise the locale-prefixed request for
+    // an exempt page is never exempt, and its tenant-resolution failure
+    // redirects back to a bare `login_redirect` that immediately
+    // locale-redirects right back into the same failure (Codex review).
+    let path = strip_locale_prefix_for_tenancy(path, config);
+
     // Guard against empty prefixes: `path_matches_route_prefix(path, "")` is true
     // for every absolute path, so an empty entry — whether a stray `public_paths`
     // item or a misconfigured built-in like `health.path = ""` — would otherwise
@@ -399,6 +537,73 @@ fn is_public_path(path: &str, config: &crate::config::AutumnConfig) -> bool {
     user_paths_match || redirect_match || probe_match || actuator_match
 }
 
+/// Strips a leading `/{locale}` segment from `path` when locale-prefix
+/// routing (issue #1251) is enabled and that segment names a configured
+/// supported locale, so [`is_public_path`] evaluates the same logical path
+/// regardless of which locale prefix carried the request. Returns `path`
+/// unchanged otherwise (feature off, routing disabled, no matching locale
+/// segment, or `path` itself matches a configured locale-prefix exclusion).
+///
+/// That last case matters: a route excluded from locale-prefix routing
+/// (`[i18n] locale_prefix_exclude`/an auto-excluded `#[static_get]` route)
+/// was never actually nested under `/{locale}` — its first segment merely
+/// *resembles* a locale. E.g. locale `en`, exclusion `/en`, public path
+/// `/login`: `/en/login` is a real, still-tenant-scoped route (excluded from
+/// locale-prefixing), not the locale-prefixed `/login` — stripping it would
+/// wrongly exempt it from tenant resolution (Codex review).
+///
+/// **Known limitation** (Codex review): this heuristic can't see the actual
+/// route table — only `AutumnConfig` — so a raw/opaque route registered via
+/// `AppBuilder::scoped()`/`merge()`/`nest()` at a literal path that happens
+/// to start with a supported locale segment (e.g. a scoped `/en/login`, not
+/// tracked in either exclusion list because it was never part of the
+/// locale-prefix-eligible `routes![...]` table to begin with) is
+/// indistinguishable here from a genuinely locale-prefixed `/login`. Closing
+/// this gap for real would require tenancy to run *after* axum has already
+/// resolved routing (so it could see the nest-specific `UriPrefixedLocale`
+/// extension) rather than as an outer layer ahead of dispatch — a larger
+/// layering change out of scope for issue #1251. An app with this exact
+/// combination (tenancy + locale-prefix routing + an opaque route whose
+/// literal path shadows a locale segment) should rename the route or list
+/// it in `tenancy.public_paths`/handle tenancy explicitly for that path.
+#[cfg(feature = "i18n")]
+fn strip_locale_prefix_for_tenancy<'a>(
+    path: &'a str,
+    config: &crate::config::AutumnConfig,
+) -> &'a str {
+    if !config.i18n.locale_prefix_enabled {
+        return path;
+    }
+    if config
+        .i18n
+        .locale_prefix_exclude_exact
+        .iter()
+        .any(|p| p == path)
+        || crate::router::matches_locale_exclude_prefix(path, &config.i18n.locale_prefix_exclude)
+    {
+        return path;
+    }
+    let Some(rest) = path.strip_prefix('/') else {
+        return path;
+    };
+    let (segment, remainder) = rest
+        .find('/')
+        .map_or((rest, ""), |idx| (&rest[..idx], &rest[idx..]));
+    if config.i18n.supported_locales.iter().any(|l| l == segment) {
+        if remainder.is_empty() { "/" } else { remainder }
+    } else {
+        path
+    }
+}
+
+#[cfg(not(feature = "i18n"))]
+const fn strip_locale_prefix_for_tenancy<'a>(
+    path: &'a str,
+    _config: &crate::config::AutumnConfig,
+) -> &'a str {
+    path
+}
+
 // Tenancy middleware for Axum requests
 pub async fn tenancy_middleware(
     State(state): State<crate::AppState>,
@@ -423,29 +628,32 @@ pub async fn tenancy_middleware(
         return next.run(Request::from_parts(parts, body)).await;
     }
 
-    let tenant_id = match extract_tenant_from_parts(&mut parts, &config).await {
-        Ok(t) => t,
-        Err(e) => {
-            // For browser logins, bounce a missing/unauthenticated tenant to the
-            // configured login page instead of returning a raw 401. Only do this
-            // for clients that accept HTML (navigating browsers): API clients
-            // (e.g. `Accept: application/json`) expect the 401 so their error
-            // handling isn't broken by a 303 to a login page. Other error classes
-            // (e.g. a 500 misconfiguration) are surfaced unchanged so real bugs
-            // are not masked as login redirects.
-            if e.status() == axum::http::StatusCode::UNAUTHORIZED
-                && let Some(target) = &config.tenancy.login_redirect
-                && parts
-                    .headers
-                    .get(axum::http::header::ACCEPT)
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|accept| accept.contains("text/html"))
-            {
-                return axum::response::Redirect::to(target).into_response();
+    let domains = crate::custom_domain::CustomDomainRegistry::from_state(&state);
+    let tenant_id =
+        match extract_tenant_from_parts_with_domains(&mut parts, &config, domains.as_deref()).await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                // For browser logins, bounce a missing/unauthenticated tenant to the
+                // configured login page instead of returning a raw 401. Only do this
+                // for clients that accept HTML (navigating browsers): API clients
+                // (e.g. `Accept: application/json`) expect the 401 so their error
+                // handling isn't broken by a 303 to a login page. Other error classes
+                // (e.g. a 500 misconfiguration) are surfaced unchanged so real bugs
+                // are not masked as login redirects.
+                if e.status() == axum::http::StatusCode::UNAUTHORIZED
+                    && let Some(target) = &config.tenancy.login_redirect
+                    && parts
+                        .headers
+                        .get(axum::http::header::ACCEPT)
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|accept| accept.contains("text/html"))
+                {
+                    return axum::response::Redirect::to(target).into_response();
+                }
+                return e.into_response();
             }
-            return e.into_response();
-        }
-    };
+        };
 
     // Tag the request-scoped log context (#1169) so every subsequent event
     // automatically carries the resolved tenant id.
@@ -744,6 +952,76 @@ mod tests {
         let c = public_paths_config(&["/login"]);
         assert!(!is_public_path("/login-admin", &c));
         assert!(!is_public_path("/dashboard", &c));
+    }
+
+    /// Codex review (P1): once locale-prefix routing (issue #1251) is on, a
+    /// public route like `/login` is actually reachable at `/en/login` — the
+    /// exemption must follow the locale prefix, or the locale-prefixed
+    /// request is never exempt and its failed tenant resolution redirects
+    /// back into a bare `login_redirect` that immediately locale-redirects
+    /// right back into the same failure (an infinite loop).
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn public_path_exemption_follows_the_locale_prefix() {
+        let mut c = public_paths_config(&["/login"]);
+        c.i18n.locale_prefix_enabled = true;
+        c.i18n.supported_locales = vec!["en".to_owned(), "es".to_owned()];
+
+        assert!(is_public_path("/login", &c), "bare path must stay exempt");
+        assert!(is_public_path("/en/login", &c));
+        assert!(is_public_path("/es/login/sso", &c));
+        assert!(
+            !is_public_path("/en/dashboard", &c),
+            "the locale prefix must not exempt an otherwise non-public route"
+        );
+        assert!(
+            !is_public_path("/fr/login", &c),
+            "an unsupported locale segment must not be stripped"
+        );
+    }
+
+    /// Codex review (P1): a path that itself matches a configured
+    /// locale-prefix exclusion was never actually nested under `/{locale}` —
+    /// its first segment merely resembles a locale — so it must NOT be
+    /// stripped. Locale `en`, exclusion `/en`, public path `/login`: `/en/login`
+    /// is a real, still-tenant-scoped route (excluded from locale-prefixing),
+    /// not the locale-prefixed `/login`.
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn locale_lookalike_prefix_is_not_stripped_when_it_matches_an_exclusion() {
+        let mut c = public_paths_config(&["/login"]);
+        c.i18n.locale_prefix_enabled = true;
+        c.i18n.supported_locales = vec!["en".to_owned()];
+        c.i18n.locale_prefix_exclude = vec!["/en".to_owned()];
+
+        assert!(
+            !is_public_path("/en/login", &c),
+            "/en/login matches the /en exclusion, so it must stay tenant-scoped, \
+             not be treated as the locale-prefixed /login"
+        );
+    }
+
+    /// The `login_redirect` auto-exemption (preventing an infinite redirect
+    /// loop) must also follow the locale prefix.
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn login_redirect_exemption_follows_the_locale_prefix() {
+        let mut c = crate::config::AutumnConfig::default();
+        c.tenancy.login_redirect = Some("/login".to_owned());
+        c.i18n.locale_prefix_enabled = true;
+        c.i18n.supported_locales = vec!["en".to_owned()];
+
+        assert!(is_public_path("/en/login", &c));
+    }
+
+    /// Locale-prefix routing off (the default) must not strip anything —
+    /// `/en/login` stays tenant-scoped unless `/en/login` itself is listed.
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn locale_prefix_stripping_is_a_noop_when_routing_disabled() {
+        let c = public_paths_config(&["/login"]);
+        assert!(!c.i18n.locale_prefix_enabled);
+        assert!(!is_public_path("/en/login", &c));
     }
 
     /// Health/liveness/readiness/startup probes are public without being listed.

@@ -1,0 +1,5 @@
+error: state `OnHold` is a non-terminal dead-end of lifecycle `OrderState`: no declared transition path reaches a terminal state — add an outgoing transition, or declare it terminal
+  --> tests/compile-fail/lifecycle_dead_end_state.rs:19:5
+   |
+19 |     OnHold,
+   |     ^^^^^^

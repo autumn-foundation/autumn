@@ -1,4 +1,5 @@
 use autumn_web::error::{AutumnError, AutumnResult};
+use autumn_web::slugify;
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
@@ -62,7 +63,7 @@ impl Post {
 }
 
 /// Data needed to insert a new post.
-#[derive(Insertable, Deserialize)]
+#[derive(Insertable, Deserialize, Default)]
 #[diesel(table_name = posts)]
 pub struct NewPost {
     pub title: String,
@@ -76,6 +77,12 @@ pub struct NewPost {
 
 impl NewPost {
     /// Validate the post data. Returns 422 if title or body is empty.
+    ///
+    /// Used by the JSON API (`routes::api::create`) and the admin-plugin
+    /// backend (`admin.rs`), both of which already have their own
+    /// error-reporting conventions for a rejected submission (a JSON problem
+    /// response and the admin plugin's generic form-redisplay respectively) —
+    /// see [`Self::validate_fields`] for the HTML admin routes' own path.
     pub fn validated(self) -> AutumnResult<Self> {
         let title = self.title.trim().to_owned();
         let body = self.body.trim().to_owned();
@@ -102,6 +109,45 @@ impl NewPost {
             published: self.published,
         })
     }
+
+    /// Same rule as [`Self::validated`] (title/body must have at least one
+    /// non-whitespace character), but returns every violation as a
+    /// `(field, message)` pair instead of stopping at the first one and
+    /// failing the whole request. Used by `routes::posts::create`/`update` so
+    /// a rejected submission can be redisplayed with each message next to its
+    /// field and the author's draft intact, instead of losing the page to a
+    /// generic error response.
+    pub fn validate_fields(&self) -> Vec<(&'static str, &'static str)> {
+        let mut errors = Vec::new();
+        if self.title.trim().is_empty() {
+            errors.push(("title", "Title must not be empty"));
+        }
+        if self.body.trim().is_empty() {
+            errors.push(("body", "Body must not be empty"));
+        }
+        errors
+    }
+
+    /// Trim title/body and auto-generate the slug from the title when the
+    /// author left it blank. Call only after [`Self::validate_fields`]
+    /// reports no errors.
+    pub fn normalized(self) -> Self {
+        let title = self.title.trim().to_owned();
+        let body = self.body.trim().to_owned();
+        let slug = self.slug.trim();
+        let slug = if slug.is_empty() {
+            slugify(&title)
+        } else {
+            slugify(slug)
+        };
+
+        Self {
+            title,
+            slug,
+            body,
+            published: self.published,
+        }
+    }
 }
 
 /// Data for updating an existing post.
@@ -123,33 +169,4 @@ pub struct UpdatePost {
     /// Never deserialized from form/JSON input; the handler always sets it.
     #[serde(skip)]
     pub updated_at: Option<chrono::NaiveDateTime>,
-}
-
-/// Convert a string into a URL-safe slug.
-///
-/// ⚡ Bolt Optimization:
-/// This avoids multiple heap allocations (an intermediate `String` and `Vec`)
-/// by iterating through characters in a single pass and pushing to a pre-allocated String.
-pub fn slugify(s: &str) -> String {
-    let mut slug = String::with_capacity(s.len());
-    let mut last_was_dash = true; // Start true to prevent leading dashes
-
-    for c in s.chars() {
-        if c.is_alphanumeric() {
-            // Using flat_map to handle potential multiple chars from lowercase conversion
-            for lc in c.to_lowercase() {
-                slug.push(lc);
-            }
-            last_was_dash = false;
-        } else if !last_was_dash {
-            slug.push('-');
-            last_was_dash = true;
-        }
-    }
-
-    if slug.ends_with('-') {
-        slug.pop();
-    }
-
-    slug
 }

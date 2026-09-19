@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/autumn-foundation/autumn/actions/workflows/ci.yml/badge.svg)](https://github.com/autumn-foundation/autumn/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/autumn-foundation/autumn/branch/trunk/graph/badge.svg)](https://codecov.io/gh/autumn-foundation/autumn)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
 [![Rust: 1.88.0+](https://img.shields.io/badge/rust-1.88.0%2B-orange.svg)](https://www.rust-lang.org)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/autumn-foundation/autumn)
 
@@ -27,13 +27,13 @@ for that same "ship the app, not the plumbing" shape in Rust.
 - **Transactional email** - optional `mail` feature with Maud templates, log/file/SMTP transports, and a `Mailer` extractor
 - **Security primitives** - session cookies, auth extractor, security headers, CSRF, and `#[secured]`
 - **File storage (optional)** - pluggable `BlobStore` trait with built-in `Local` and S3-compatible backends, HMAC-signed URLs, and `MultipartField::save_to_blob_store` (see [storage guide](docs/guide/storage.md))
-- **CLI workflow** - `autumn new`, `autumn setup`, `autumn dev`, `autumn build`, `autumn migrate`, and `autumn task`
+- **CLI workflow** - `autumn new`, `autumn setup`, `autumn dev`, `autumn build`, `autumn migrate`, `autumn console`, and `autumn task`
 
 ## Quickstart
 
 ```bash
 # Install the published CLI
-cargo install autumn-cli --version 0.6.0
+cargo install autumn-cli --version 0.7.0
 
 # Local development only, from an Autumn checkout:
 # cargo install --path autumn-cli
@@ -55,6 +55,14 @@ autumn dev
 # cargo run
 ```
 
+Need to poke at your data? `autumn console` scaffolds and runs a pre-wired
+playground binary — same config, same database URL resolution, same pool as the
+app (see the [data playground guide](docs/guide/console.md)):
+
+```bash
+autumn console
+```
+
 Visit <http://localhost:3000>. Autumn also auto-mounts `/health`,
 `/actuator/health`, `/actuator/info`, and `/static/js/htmx.min.js`.
 
@@ -73,7 +81,7 @@ Prefer a manual download? Grab the tarball plus its `.sha256`:
 - Latest: `https://github.com/autumn-foundation/autumn/releases/latest/download/autumn-<target>.tar.gz`
 - Pinned: `https://github.com/autumn-foundation/autumn/releases/download/<tag>/autumn-<target>.tar.gz`
 
-where `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, or `aarch64-apple-darwin` (Linux binaries are static musl — no glibc version dependency). Binaries track tagged crate releases (e.g. `v0.6.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds.
+where `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, or `aarch64-apple-darwin` (Linux binaries are static musl — no glibc version dependency). Binaries track tagged crate releases (e.g. `v0.7.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds.
 
 ### Install a prebuilt binary (Windows)
 
@@ -125,7 +133,13 @@ Autumn still distinguishes between "works on your laptop" and "safe to run in a
 multi-replica deployment":
 
 - Local-safe defaults: in-memory sessions, pretty logs in `dev`, `scheduler.backend = "in_process"` for `#[scheduled]`, single-binary startup, and no inbound request deadline (so a debugger pause never 503s you).
-- Production-safe options: `/live`, `/ready`, `/startup` probes, OTLP telemetry config, Redis-backed sessions, Redis-backed channels/jobs, Postgres-coordinated scheduled tasks, container scaffolding from `autumn new`, explicit migration jobs before web replicas roll, and a built-in **inbound request timeout** (the `prod` profile smart-defaults `server.timeouts.request_timeout_ms = 30000`) so a single hung handler returns a clean `503` and frees its worker instead of starving the pool — no hand-written tower layers. Streaming responses (SSE) are never interrupted — the deadline bounds the response head, not the body stream — and WebSocket upgrades are bounded only for the handshake, never the live socket. Any route can override with `#[get("/export", timeout_ms = 120000)]` or `timeout = "off"`.
+- Production-safe options: `/live`, `/ready`, `/startup` probes, OTLP telemetry config, Redis-backed sessions, Redis-backed channels/jobs, Postgres-coordinated scheduled tasks, an experimental zero-dependency [embedded 2-node cluster](docs/guide/clustering.md) (authenticated gossip membership plus an eventually consistent cluster-wide counter — an additional option for a shared counter without standing up Redis, not a production-safe substitute for the backends above and not a leader-election or mutual-exclusion primitive), container scaffolding from `autumn new`, explicit migration jobs before web replicas roll, and a built-in **inbound request timeout** (the `prod` profile smart-defaults `server.timeouts.request_timeout_ms = 30000`) so a single hung handler returns a clean `503` and frees its worker instead of starving the pool — no hand-written tower layers. Streaming responses (SSE) are never interrupted — the deadline bounds the response head, not the body stream — and WebSocket upgrades are bounded only for the handshake, never the live socket. Any route can override with `#[get("/export", timeout_ms = 120000)]` or `timeout = "off"`.
+
+Deploys can also carry a **proven capacity contract**: `autumn calibrate` measures
+what a build sustains and records `capacity.lock`, `autumn calibrate --check`
+gates rebuilds against it in CI, and `[server] capacity_contract` lets the binary
+admission-control against its own proven envelope instead of a hand-tuned guess
+(see [Capacity Contracts](docs/guide/capacity-contracts.md)).
 
 If you are deploying beyond a single process, read the
 [Cloud-Native Guide](docs/guide/cloud-native.md) before treating the defaults as
@@ -170,7 +184,7 @@ for the model and roadmap.
 
 This is the small-app shape Autumn is built around:
 
-```rust
+```rust,no_run
 use autumn_web::prelude::*;
 
 #[get("/")]
@@ -212,39 +226,80 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 | [`examples/flock`](examples/flock) | WASM island spike: a server-rendered maud page whose home route mounts a Yew CSR "literary boids" widget compiled to `wasm32-unknown-unknown`, with a custom `'wasm-unsafe-eval'` CSP |
 | [`examples/todo-app`](examples/todo-app) | Full-stack CRUD app with Diesel, Maud, htmx, Tailwind, JSON API, bearer-token auth, and MCP tool projection |
 | [`examples/blog`](examples/blog) | Blog engine with admin UI, validation, and pre-rendering pages to static HTML via `#[static_get]` |
-| [`examples/bookmarks`](examples/bookmarks) | Repository macro, generated CRUD API, profiles, scheduled tasks, and actuator endpoints |
-| [`examples/bookmarks-distributed`](examples/bookmarks-distributed) | Primary/replica Postgres, multi-replica web tier behind nginx, advisory-lock scheduling, and Docker Compose deployment |
+| [`examples/cms`](examples/cms) | WordPress-parity CMS: posts/pages, taxonomies, media, moderated comments, revisions, roles, themes, plugin hooks |
+| [`examples/bookmarks`](examples/bookmarks) | Repository macro, generated CRUD API, profiles, scheduled tasks, actuator endpoints, and app metrics (a domain counter + timer on `/actuator/prometheus`) |
+| [`examples/bookmarks-distributed`](examples/bookmarks-distributed) | Primary/replica Postgres, multi-replica web tier behind nginx, advisory-lock scheduling, a two-node self-clustering substrate needing no coordination service, and Docker Compose deployment |
 | [`examples/bookmarks-sharded`](examples/bookmarks-sharded) | Framework-native horizontal sharding: tenant → slot → shard routing, control database, cross-shard fan-out, and Docker Compose deployment |
 | [`examples/wiki`](examples/wiki) | Mutation hooks, revision history, generated REST API, and slug lifecycle management |
-| [`examples/reddit-clone`](examples/reddit-clone) | Canonical feature showcase: auth, sessions, CSRF, `#[secured]`, transactional email, `#[job]`, `#[ws]` channels, Redis fan-out, htmx voting, A/B experiments, signed webhook intake, outbound HTTP with SSRF protection, structured error reporting, and live-tunable config |
+| [`examples/reddit-clone`](examples/reddit-clone) | Canonical feature showcase: auth, sessions, CSRF, `#[secured]`, transactional email, `#[job]`, `#[ws]` channels, Redis fan-out, htmx voting, A/B experiments, signed webhook intake, outbound HTTP with SSRF protection, structured error reporting, route-level SEO (`seo(...)`, `sitemap.xml`, `robots.txt`), typed accessible forms, sanitized user-submitted rich text, cookie consent, offset pagination, live-tunable config, failure capsules with an `autumn replay` walkthrough, and a seeded `#[sim_test]` |
 | [`examples/saas`](examples/saas) | Multi-tenant SaaS starter: session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype (see the [starters guide](docs/guide/starters.md)) |
+| [`examples/teams`](examples/teams) | Organization membership, roles, and email invitations: multi-org `Membership`, a `require_role` guard, `#[mailer]` invite emails, idempotent accept, and role-gated member management |
 | [`examples/media-room`](examples/media-room) | Live-media plugin: installs `autumn-media-plugin` with the rooms primitive and creates/lists mesh-call rooms through the mounted `RoomService` (see the [media guide](docs/guide/media.md)) |
+| [`examples/collab-notes`](examples/collab-notes) | Conflict-free collaborative editing: a `#[collaborative]` text field backed by an in-tree CRDT, live merge and presence over `#[ws]` + channels, and a thin browser replica — no external real-time service (see the [collaboration guide](docs/guide/collaboration.md)) |
+| [`examples/invoice`](examples/invoice) | Renders one Maud view as both an on-screen detail page and a downloadable PDF via `autumn_web::pdf::Pdf` (see the [PDF downloads guide](docs/guide/pdf-downloads.md)) |
+| [`examples/react-graphql`](examples/react-graphql) | TypeScript React SPA on an Autumn backend, talking GraphQL through a generic `GraphqlPlugin`: resolvers built on a `#[model]` + `#[repository]` with `#[normalize]`, `#[validate]` and `MutationHooks`, generated REST CRUD over the same rows, `Plugin` + `nest` + `declare_plugin_routes`, `PluginContract`, and a committed Vite bundle served under the default CSP |
 
 ## Documentation
 
+- [**What's new in 0.7.0**](docs/releases/0.7.0.md) — a walkthrough of the release: host-preparing deploys and fleets, deterministic simulation testing, the new model attributes, failure-capsule replay, and a request path that allocates ~59% less
 - [Getting Started Guide](docs/guide/getting-started.md)
+- [Authentication](docs/guide/authentication.md) — sessions, password policy, login/logout, `#[secured]`, lockout, and remember-me; the hub that links OAuth, step-up, and MFA
 - [Dev-Loop Latency Budget](docs/guide/dev-loop-latency.md) — p50/p95/max budgets per change class, measurement methodology, and CI gates for `autumn dev`
-- [Signed Webhook Intake](docs/guide/signed-webhooks.md)
+- [Cache Coherence](docs/guide/cache-coherence.md) — `autumn cache audit`: the build fails when a `#[repository]` write can leave a `#[cached]` read stale with no invalidation covering it, turning cache invalidation from a runtime footgun into a compile-time obligation
+- [Data Classification](docs/guide/data-classification.md) — `#[classified]`: a personal-data column is carried as a taint on the *type*, so returning it from a JSON response without passing a declared declassification boundary is a compile error, and `autumn data-flow` emits the diffable manifest of which sinks each classified field can reach
+- [Confidential Fields](docs/guide/confidential-fields.md) — `#[confidential]`: a column sealed client side under a key the server never receives, so the database, backups, logs, replay capsules and the admin UI carry only ciphertext; equality still works through a client-computed blind index, and anything that would make the operator read, compare or group the value fails the build
+- [Compile-Time Query Budgets](docs/guide/query-budgets.md) — `#[query_budget(N)]`: the build fails when a handler's reachable paths can exceed its declared query count, catching N+1 regressions on every branch instead of only the ones a test exercises
+- [The Agent Authority Envelope](docs/guide/agent-authority.md) — `#[agent_operable(grant = ...)]`: an agent-callable handler's blast radius becomes a compile-time constant, so a write, outbound host, webhook, job or cross-tenant query the declared grant does not allow fails the build, `autumn agents manifest --check` keeps the diffable record (including MCP tools nothing governs), and every `tools/call` is audited against what the compiler proved
+- [The Architecture Graph](docs/guide/architecture-graph.md) — `autumn graph impact Post`: the framework derives a typed graph of the application from the macros that declare it (routes, models, repositories, jobs, plus each route's auth requirement and the tables it touches) and embeds it in the binary, so impact analysis is a query rather than a full-codebase read, `/actuator/graph` answers from the running process, and `autumn graph show --check` fails the build when a declared element or an edge quietly disappears
+- [Generated UI (Constela)](docs/guide/constela.md) — serve an interface a language model wrote: the [Constela](https://github.com/yuuichieguchi/constela) constrained JSON UI language is parsed, validated against an allowlist of tags, attributes and URL schemes, and server-rendered to Maud, with element ids prefixed so a generated fragment cannot clobber the host page; `Document::dispatch` runs an action's pure state steps on the server so the interaction loop works over htmx with no client runtime, and browser-side steps such as `fetch` are reported as effects for the app to allow or decline rather than performed
+- [Signed Webhook Intake](docs/guide/signed-webhooks.md) — webhooks arriving **in**: verifying a sender's signature, replay protection, and the intake route
+- [Outbound Signed Webhooks](docs/guide/outbound-webhooks.md) — sending outbound webhooks **out** to endpoints your own users/customers register: `WebhookSubscription`, `WebhookOutboundManager::dispatch()`, the retrying `autumn_webhook_delivery` job, and dead-letter inspection and replay under `/actuator/webhooks/*`
+- [Billing](docs/guide/billing.md) — `autumn-billing`: Stripe checkout and portal, a webhook-fed local mirror, the `Entitled<Plan>` gate, and durable dunning retries
+- [Money and the Ledger](docs/guide/money.md) — typed `Money<C>`, currency-safe arithmetic and rounding, and the append-only double-entry ledger with idempotent posting that commits inside your `Db::tx`
+- [Platform Support](docs/guide/platform-support.md) — the Windows tier policy: which commands run natively, which need WSL2, and the `windows-latest` CI job that gates the native journey
 - [Docs Smoke Procedure](docs/guide/docs-smoke.md) - release gate for first-run docs
 - [Release Checklist](docs/release-checklist.md)
 - [Code Generators](docs/guide/generators.md) — `autumn generate model | migration | scaffold`
+- [Data Playground](docs/guide/console.md) — `autumn console`, the pre-wired edit-and-run answer to `rails console`
 - [One-Off Tasks](docs/guide/tasks.md) - `#[task]`, `one_off_tasks![]`, and `autumn task`
+- [Embedded Clustering](docs/guide/clustering.md) — zero-dependency two-node clustering: `[cluster]` config, authenticated gossip membership, the cluster-wide CRDT counter via `ClusterHandle`, and the `cluster:membership` health indicator
 - [Multi-Replica Scheduled Tasks](docs/guide/scheduled-multi-replica.md) - `#[scheduled]` with Postgres advisory-lock coordination
+- [Fleet Deploys](docs/guide/fleet-deploys.md) — `[deploy] hosts`: `autumn deploy up` rolls a release across several VPS hosts one at a time (per-host blue/green, migrations exactly once, halt-and-roll-back on failure), plus `deploy status` drift detection, fleet maintenance, and the load-balancer contract
+- [Data-Retention Sweeps](docs/guide/retention-sweeps.md) — `retention(...)` on `#[repository(...)]`: batched, soft-delete-aware, fleet-coordinated auto-purge, plus `autumn retention --dry-run`
+- [Data Retention for Framework-Owned Data](docs/guide/data-retention.md) — one `[retention]` section that bounds every table Autumn creates (job history, tracking, idempotency, experiment assignments, webhook replay, sessions, audit archives), enforced by an in-process fleet-coordinated sweep, GDPR legal-hold aware, with `autumn db retention --dry-run`
+- [Data Scrubbing](docs/guide/data-scrubbing.md) — `autumn db scrub`: turn a production backup into an anonymized staging copy, with fail-closed PII classification driven by `#[encrypted]` columns, GDPR anonymize registrations, and a checked-in `scrub.toml`
 - [Horizontal Sharding](docs/guide/sharding.md) — `[[database.shards]]`, slot-based routing, `ShardedDb`/`Shards` extractors, per-shard health and migrations
 - [Per-Tenant Memory Cells](docs/guide/tenant-cells.md) — `TenantCell` byte accounting with the `tenancy.quota_bytes` soft quota and deterministic per-tenant eviction
 - [Operating Background Jobs](docs/guide/operating-background-jobs.md) - admin dashboard and recovery actions for `#[job]`
+- [OpenAPI Spec Generation](docs/guide/openapi.md) — the spec Autumn derives from your handlers, `#[api_doc(...)]`, `#[derive(OpenApiSchema)]`, Swagger UI, and the production profile gate
 - [Exposing Your API as MCP Tools](docs/guide/mcp.md) — project typed endpoints into a Model Context Protocol server with `#[api_doc(mcp)]` + `mount_mcp`
 - [Mail Guide](docs/guide/mail.md)
 - [Widget Stories](docs/guide/stories.md) — the `/_stories` widget gallery and the `story!` macro
+- [Active Search & Autocomplete](docs/guide/active-search-and-autocomplete.md) — a search box whose results appear as you type, and typeahead/autocomplete pickers that store the chosen record's ID, via `active_search` and `autocomplete_input`; built on htmx and server-rendered Maud fragments, so you write no JavaScript of your own — active search needs htmx, and autocomplete selection also needs the shipped `/static/js/autumn-widgets.js` runtime. Both degrade without scripting, but differently: active search emits a self-contained `<noscript>` search form, while autocomplete emits a `<noscript>` `<select>` that has to sit inside your own form
 - [View Formatting Helpers](docs/guide/format-helpers.md) — `number_to_currency`, `pluralize`, `truncate`, `time_ago_in_words`, and friends for Maud templates
+- [Per-User Time Zones](docs/guide/time-zones.md) — rendering timestamps in each user's own time zone: the `TimeZone` extractor resolving their IANA zone, `set_time_zone_in_session`, `local_datetime`, and pairing it with the `Clock` extractor so date/time rendering stays deterministic and test-injectable
 - [Cloud-Native Guide](docs/guide/cloud-native.md)
+- [Capacity Contracts](docs/guide/capacity-contracts.md)
 - [Logging & PII](docs/guide/logging-pii.md)
+- [Failure Capsules](docs/guide/failure-capsules.md) — `[failure_capture]` records a failing request, its database traffic and its clock reads as one replayable file; `autumn replay` re-runs it offline
+- [Edge Capsules](docs/guide/edge.md) — `#[edge]` compiles read-path routes into a portable `wasm32-wasip1` artifact a CDN can run, byte-identical to the origin and falling back to it for anything the edge cannot serve (experimental)
+- [Wire Contracts](docs/guide/wire-contracts.md) — `#[endpoint]` turns a typed handler into a contract, `wire_client!` generates the caller's typed client from it, and `#[contract_checked]` fails the caller's build at the call site when a request or response field the caller actually reads or sets stops matching — including the two breaks the type checker cannot see, a new required field behind `..Default::default()` and a serde-skipped field (experimental)
+- [Sandboxed Plugins](docs/guide/sandboxed-plugins.md) — install an unaudited third-party plugin as a capability-sandboxed `wasm32-wasip1` artifact: one declared prefix, no filesystem/network/env/database, hard CPU and memory ceilings, and a trap that is a 5xx on its own prefix instead of a dead process (experimental)
 - [Todo Tutorial](docs/guide/tutorial/index.md)
 - [Autumn Harvest Architecture Notes](docs/autumn-workflow-architecture.md)
 - [API Reference](https://docs.rs/autumn-web)
 - [Pre-rendering Design Notes](docs/design/hybrid-rendering.md)
 - [Stability Policy](STABILITY.md) — SemVer, MSRV, and migration commitments
+- [Upgrading](docs/guide/upgrading.md) — `autumn upgrade` applies each release's mechanical API migrations to your own code **and** reconciles your project's framework-owned scaffold files (`Dockerfile`, `build.rs`, CI workflow, toolchain configs) against the current release, after showing you the diff; files you edited are flagged as conflicts rather than overwritten, `--check` exits nonzero on drift for CI, and everything it cannot safely rewrite is listed with `file:line` and a guide link
 - [Transition effects](docs/guide/transition-effects.md) — per-edge `on` / `on_commit` side effects on `#[state_machine]` transitions.
+- [Counter Caches](docs/guide/counter-cache.md) — `#[belongs_to(Post, counter_cache)]` keeps `posts.comment_count` current atomically, in the same transaction, with an idempotent `recompute` for drift
+- [Maintained Derived Read Models](docs/guide/derivations.md) — `#[derivation(Post, column = "published_comment_count", filter = published)]` keeps a filtered count or weighted `sum(field)` on the parent current in the same transaction, with a content-addressed definition hash, a resumable backfill and `/actuator/derivations` for state and drift
+- [Votes, Likes and Reactions](docs/guide/votable.md) — `#[votable(by = ..., aggregate = sum|count)]`, the race-safe `react()` / `reaction_of()` helpers, and the no-JS `reaction_controls` widget
+- [SEO](docs/guide/seo.md) — `seo(...)` on any route macro plus the `SeoMeta` extractor, canonical URLs, `robots = "noindex"` and its sitemap exclusion, `SitemapSource`, and the auto-mounted `/sitemap.xml` + `/robots.txt`
+- [Forms, Validation and Normalization](docs/guide/forms.md) — the `ChangesetForm` round-trip that re-renders a rejected submission with the user's input and inline errors, `Valid<T>` / `Validated<T>` for API endpoints, model-level `#[validate(...)]`, `#[normalize(trim, downcase, …)]` and where it runs on the write path, htmx inline validation and its automatic no-JavaScript fallback
+- [Extractors](docs/guide/extractors.md) — the full extractor catalog, the two ordering rules, writing your own, and `Query<T>`'s structured decoding: repeated keys, `tags[]`, `tags[0]`, `filter[status]` and `items[0][sku]` all decode into typed sequences and nested structs
+- [Cookie Consent](docs/guide/cookie-consent.md) — the `Consent` gate that is the actual compliance (not the banner), `inject_consent_banner`, the strictly-necessary exemption, policy-version re-prompting, and the GDPR Art. 7(3) withdraw flow
+- [Threaded Comments on Anything](docs/guide/commentable.md) — `#[commentable]`, the polymorphic `(commentable_type, commentable_id)` association, `add_comment()` / `comment_thread()` / `delete_comment()`, the registry-driven comment router, and the no-JS `comment_thread` widget
 
 ## Stability
 
@@ -262,6 +317,23 @@ Until `1.0.0`, Autumn is in its `0.x` series — see the
 - PostgreSQL for database-backed apps
 
 Autumn can still run without a database if you omit the `[database]` section.
+
+## Platform support
+
+Develop on **macOS, Linux, or Windows**; deploy on **Linux**.
+
+On Windows the core journey — `autumn new`, `doctor`, `setup`, `dev`, `test`,
+foreground `serve`, and managed Postgres — is **Tier 1: works natively**, and a
+`windows-latest` CI job walks that whole journey on every pull request. The
+Unix-native slices — the `autumn serve --daemon` lifecycle, the `autumn deploy`
+actions that reach a host over SSH, and the bash contributor gate scripts — are
+**Tier 2: supported via WSL2**, and fail
+fast on native Windows with an error naming the policy rather than
+half-working.
+
+See [Platform support](docs/guide/platform-support.md) for the full
+command-by-command policy, the Windows prerequisites `autumn doctor` flags, and
+how to run the Tier 2 commands under WSL2.
 
 ## License
 

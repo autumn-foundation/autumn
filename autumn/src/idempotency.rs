@@ -11,6 +11,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -65,7 +67,7 @@ fn compute_body_hash(bytes: &[u8], content_type: Option<&[u8]>) -> Vec<u8> {
 
 fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
     bytes.as_ref().iter().fold(
-        String::with_capacity(bytes.as_ref().len() * 2),
+        String::with_capacity(bytes.as_ref().len().saturating_mul(2)),
         |mut out, byte| {
             use std::fmt::Write as _;
             let _ = write!(out, "{byte:02x}");
@@ -93,23 +95,61 @@ fn push_storage_key_component(hasher: &mut sha2::Sha256, label: &str, value: &[u
     hasher.update(b";");
 }
 
-/// Namespace the cache key by method, path, a stable principal digest, and the
-/// client-supplied idempotency key.
+/// The tenant Autumn's own tenancy middleware resolved for the in-flight
+/// request, if any.
+///
+/// Read from the [`CURRENT_TENANT`](crate::tenancy::CURRENT_TENANT) task-local
+/// rather than from a request header, which is what makes it safe to key on:
+/// the value is the framework's *resolution* under `[tenancy] source`
+/// (`header`, `subdomain`, `session`, `jwt`), not a string the client can
+/// restate at will. A legitimate retry from the same tenant therefore
+/// reproduces the same component and still finds its cached response, while a
+/// request that resolved to a different tenant lands in a different slot
+/// instead of replaying that tenant's stored mutation.
+///
+/// `None` — tenancy disabled, or a `[tenancy] public_paths` route the
+/// middleware exempts before it scopes anything — pushes no component at all,
+/// so every storage key an app without tenancy computes is byte-identical to
+/// the one it computed before this existed.
+fn current_tenant_scope() -> Option<String> {
+    crate::tenancy::CURRENT_TENANT
+        .try_with(std::clone::Clone::clone)
+        .ok()
+        .flatten()
+}
+
+/// Namespace the cache key by method, path, the resolved tenant, a stable
+/// principal digest, and the client-supplied idempotency key.
 ///
 /// Namespacing by method+path prevents cross-endpoint cache collisions (P2).
 /// Namespacing by session scope prevents cross-principal collisions (P1) for
-/// cookie-backed authenticated sessions. Request headers, including
-/// `Authorization`, are intentionally excluded: client-controlled headers must
-/// not let a retry force a fresh miss after a successful mutation. Opaque route
-/// layers that resolve tenants, bearer principals, or policy state must use the
-/// fail-closed replay path instead of storage-key partitioning. Each component
-/// is length-delimited inside a SHA-256 digest so raw `:` bytes in paths or
-/// client-controlled keys cannot synthesize another storage key.
+/// cookie-backed authenticated sessions, and namespacing by the
+/// framework-resolved tenant prevents them across tenants — for `header`,
+/// `subdomain` and `jwt` tenancy the two requests are otherwise
+/// indistinguishable to this key (same method, same target, and for a
+/// token-authenticated API the same empty session scope), so tenant B replaying
+/// tenant A's key would be served tenant A's stored response with the handler —
+/// and every `tenant_scoped` repository predicate inside it — never running.
+///
+/// Request headers, including `Authorization` *and* the configured tenant
+/// header, are intentionally excluded: client-controlled headers must not let a
+/// retry force a fresh miss after a successful mutation. That is exactly why
+/// the tenant is taken from the middleware's task-local resolution rather than
+/// from the wire. Opaque route layers that resolve their own tenants, bearer
+/// principals, or policy state must still use the fail-closed replay path
+/// instead of storage-key partitioning. Each component is length-delimited
+/// inside a SHA-256 digest so raw `:` bytes in paths or client-controlled keys
+/// cannot synthesize another storage key.
 #[derive(Clone)]
 struct StorageKeyContext {
     idempotency_key: String,
     method: Method,
     target: String,
+    /// Captured once, on the request path, while the tenancy middleware's
+    /// task-local scope is still established — the alias keys computed later
+    /// (see [`DeferredIdempotencyCommit::add_session_alias`]) must land in the
+    /// same tenant's namespace as the primary key.
+    tenant: Option<String>,
 }
 
 impl StorageKeyContext {
@@ -122,15 +162,17 @@ impl StorageKeyContext {
             idempotency_key,
             method: parts.method.clone(),
             target,
+            tenant: current_tenant_scope(),
         }
     }
 
-    fn storage_key(&self, session_id: Option<&str>) -> String {
+    fn storage_key(&self, session_id: Option<&str>, tenant_override: Option<&str>) -> String {
         build_storage_key(
             &self.idempotency_key,
             self.method.as_str(),
             &self.target,
             session_id,
+            tenant_override.or(self.tenant.as_deref()),
         )
     }
 }
@@ -140,6 +182,7 @@ fn build_storage_key(
     method: &str,
     target: &str,
     session_id: Option<&str>,
+    tenant: Option<&str>,
 ) -> String {
     let principal = principal_scope_digest(session_id);
     let mut hasher = sha2::Sha256::new();
@@ -147,6 +190,12 @@ fn build_storage_key(
     push_storage_key_component(&mut hasher, "target", target.as_bytes());
     push_storage_key_component(&mut hasher, "scope-header-count", b"0");
     push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
+    // Pushed only when a tenant was resolved, so an app that does not use
+    // tenancy keeps the exact keys it had before — no cache-wide miss, and no
+    // duplicate execution of a mutation retried across an upgrade.
+    if let Some(tenant) = tenant {
+        push_storage_key_component(&mut hasher, "tenant", tenant.as_bytes());
+    }
     push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
     format!("v2:{}", hex_lower(hasher.finalize()))
 }
@@ -460,11 +509,6 @@ struct MemoryInFlightLock {
     expires_at: Instant,
 }
 
-/// Clamp horizon (~10 years) used when a caller-supplied TTL would overflow
-/// `Instant + Duration`. This constant is itself always representable when
-/// added to a fresh `Instant`, so it can never re-trigger the overflow.
-const SATURATING_DEADLINE_HORIZON_SECS: u64 = 10 * 365 * 24 * 3600;
-
 /// Compute an expiry `Instant` for `ttl`, saturating instead of panicking on
 /// overflow.
 ///
@@ -473,14 +517,10 @@ const SATURATING_DEADLINE_HORIZON_SECS: u64 = 10 * 365 * 24 * 3600;
 /// `Duration::from_secs(u64::MAX)` (which is entirely attacker-influenceable
 /// via configured TTLs) triggers this. Instead of panicking we clamp the
 /// deadline to ~10 years out (far enough that the entry is effectively
-/// non-expiring), falling back to `now` only in the astronomically unlikely
-/// event that even the clamped horizon is not representable.
+/// non-expiring). See [`crate::time_math::saturating_deadline`], which the
+/// job and job-tracking modules share.
 fn saturating_deadline(ttl: Duration) -> Instant {
-    let now = Instant::now();
-    now.checked_add(ttl).unwrap_or_else(|| {
-        now.checked_add(Duration::from_secs(SATURATING_DEADLINE_HORIZON_SECS))
-            .unwrap_or(now)
-    })
+    crate::time_math::saturating_deadline(Instant::now(), ttl)
 }
 
 impl MemoryIdempotencyStore {
@@ -590,7 +630,7 @@ mod redis_store {
         IdempotencyEntry, IdempotencyRecord, IdempotencyStore, IdempotencyStoreError,
         saturating_deadline,
     };
-    use redis::{AsyncCommands, Client, aio::ConnectionManager, aio::ConnectionManagerConfig};
+    use redis::{AsyncCommands, aio::ConnectionManager, aio::ConnectionManagerConfig};
     use serde::{Deserialize, Serialize};
     use std::time::Duration;
 
@@ -631,7 +671,7 @@ mod redis_store {
                      [idempotency.redis] url in autumn.toml."
                         .to_owned()
                 })?;
-            let client = Client::open(url).map_err(|e| e.to_string())?;
+            let client = crate::redis_tls::open_client(url).map_err(|e| e.to_string())?;
             let connection =
                 ConnectionManager::new_lazy_with_config(client, ConnectionManagerConfig::new())
                     .map_err(|e| e.to_string())?;
@@ -961,9 +1001,16 @@ where
             return Box::pin(async move { Ok(replay.into_response()) });
         }
 
-        let clone = self.inner.clone();
-        let mut inner = std::mem::replace(&mut self.inner, clone);
-        Box::pin(async move { inner.call(req).await })
+        // The overwhelming majority of requests carry no replay marker (only
+        // the capsule replay driver ever sets one), so this runs for nearly
+        // every request through this layer. Nothing here needs `self.inner`
+        // cloned into an owned value first: `self.inner.call(req)` can be
+        // boxed directly instead of cloning `self.inner` (a
+        // `BoxCloneSyncService` at this point in the stack, whose `Clone`
+        // impl allocates a fresh box) purely to move the clone into an
+        // `async move` block that immediately `.await`s it and does nothing
+        // else.
+        Box::pin(self.inner.call(req))
     }
 }
 
@@ -1320,13 +1367,26 @@ impl DeferredIdempotencyCommit {
         Ok(())
     }
 
-    fn add_session_alias(&self, session_id: Option<&str>, primary_replay_after_guard_denial: bool) {
+    fn add_session_alias(
+        &self,
+        session_id: Option<&str>,
+        primary_replay_after_guard_denial: bool,
+        tenant_override: Option<&str>,
+    ) {
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(state) = guard.as_mut() else {
             return;
         };
 
-        let storage_key = state.key_context.storage_key(session_id);
+        // Only honor the override when the request that produced this commit
+        // itself resolved a tenant. Tenancy resolution is a property of the
+        // *path*, not of session content — a `[tenancy] public_paths` route
+        // (or a request under a non-session tenancy source) computes no
+        // tenant now and never will on retry, however a handler mutates the
+        // session. Forcing a tenant into that alias would make it un-matchable
+        // by any future request to the same always-exempt path.
+        let tenant_override = tenant_override.filter(|_| state.key_context.tenant.is_some());
+        let storage_key = state.key_context.storage_key(session_id, tenant_override);
         if primary_replay_after_guard_denial && storage_key != state.storage_key {
             state.primary_replay_after_guard_denial = true;
         }
@@ -1366,13 +1426,30 @@ pub(crate) fn finalize_deferred_session_commit(
     commit.commit_with_final_headers(response.headers())
 }
 
+/// Register the storage key a retry presenting `session_id` will compute as
+/// an alias of the primary key, so that retry replays the response instead of
+/// re-executing the mutation.
+///
+/// `tenant_override`, when set, is the tenant `[tenancy] source = "session"`
+/// will resolve for that retry — read live from the finalized session data
+/// rather than the tenant captured before the handler ran, which a handler
+/// that itself changes the tenancy session key (an org switch, a
+/// tenant-scoped login) may have just moved. `None` leaves the alias in the
+/// same tenant namespace as the primary key, which is correct for every
+/// other tenancy source and for a session mutation that doesn't touch the
+/// tenancy session key.
 pub(crate) fn add_deferred_session_replay_key(
     response: &Response<Body>,
     session_id: Option<&str>,
     primary_replay_after_guard_denial: bool,
+    tenant_override: Option<&str>,
 ) {
     if let Some(commit) = response.extensions().get::<DeferredIdempotencyCommit>() {
-        commit.add_session_alias(session_id, primary_replay_after_guard_denial);
+        commit.add_session_alias(
+            session_id,
+            primary_replay_after_guard_denial,
+            tenant_override,
+        );
     }
 }
 
@@ -1398,6 +1475,13 @@ fn in_flight_lock_owner(entropy: &dyn crate::entropy::Entropy) -> String {
     entropy.uuid_v4().to_string()
 }
 
+// `clippy::result_large_err` (armed by rustc 1.98) measures the `Err` variant at
+// 128 bytes — that is `axum::response::Response`'s own size, not something this
+// crate chose. Returning a ready-made rejection response IS the idiom here, and
+// boxing it would add an allocation to every rejection path to satisfy a size
+// heuristic. Allowed at the site rather than workspace-wide so the lint stays
+// armed for error types we do control.
+#[allow(clippy::result_large_err)]
 async fn prepare_idempotency_request(
     idempotency_key: String,
     req: Request<Body>,
@@ -1405,9 +1489,9 @@ async fn prepare_idempotency_request(
     let (mut parts, body) = req.into_parts();
     let key_context = StorageKeyContext::from_parts(idempotency_key.clone(), &parts);
     let session_id = storage_session_id_for_parts(&parts).await;
-    let storage_key = key_context.storage_key(session_id.as_deref());
+    let storage_key = key_context.storage_key(session_id.as_deref(), None);
     let stale_cookie_storage_key = stale_cookie_session_id_for_parts(&parts).and_then(|id| {
-        let key = key_context.storage_key(Some(&id));
+        let key = key_context.storage_key(Some(&id), None);
         (key != storage_key).then_some(key)
     });
     parts.extensions.insert(IdempotencyContext::new(
@@ -2061,6 +2145,39 @@ mod tests {
         push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
         push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
         format!("v2:{}", hex_lower(hasher.finalize()))
+    }
+
+    /// An app that does not use tenancy must keep byte-identical storage keys,
+    /// so upgrading cannot turn an in-flight client retry into a second
+    /// execution of an already-committed mutation.
+    #[test]
+    fn storage_key_without_a_resolved_tenant_is_unchanged() {
+        assert_eq!(
+            build_storage_key("pay-once", "POST", "/payments", None, None),
+            expected_storage_key("POST", "/payments", None, "pay-once")
+        );
+    }
+
+    /// Two tenants sharing a key, a target and (for a token-authenticated API)
+    /// an empty session scope must not share a cache slot.
+    #[test]
+    fn storage_key_partitions_by_resolved_tenant() {
+        let tenant_a = build_storage_key("pay-once", "POST", "/payments", None, Some("tenant-a"));
+        let tenant_b = build_storage_key("pay-once", "POST", "/payments", None, Some("tenant-b"));
+        let untenanted = build_storage_key("pay-once", "POST", "/payments", None, None);
+
+        assert_ne!(tenant_a, tenant_b, "tenants must not share a storage key");
+        assert_ne!(tenant_a, untenanted);
+        assert_ne!(tenant_b, untenanted);
+    }
+
+    /// The tenant component is length-delimited like every other one, so a
+    /// tenant id carrying the separator cannot spell another tenant's slot.
+    #[test]
+    fn storage_key_tenant_component_is_length_delimited() {
+        let split = build_storage_key("pay-once", "POST", "/payments", None, Some("a:b"));
+        let shifted = build_storage_key("pay-once:a", "POST", "/payments", None, Some("b"));
+        assert_ne!(split, shifted);
     }
 
     #[test]

@@ -1,8 +1,13 @@
 //! `#[secured]` proc macro implementation.
 //!
-//! Generates an authentication/authorization guard that runs before
-//! the handler body. Injects hidden `Session` and `AppState` extractors
-//! and prepends a call to the runtime check function.
+//! Generates an authentication/authorization guard that runs as a
+//! `FromRequestParts` gate — a hidden, handler-unique parameter inserted
+//! ahead of the handler's own parameters — instead of a statement inside the
+//! handler body (issue #1668). Axum resolves every `FromRequestParts`
+//! extractor, left to right, *before* it ever reaches a `FromRequest` body
+//! extractor (`Json` / `Form` / `Multipart`) and short-circuits on the first
+//! rejection, so an unauthenticated/unauthorized request is rejected with
+//! `401`/`403` before the request body is parsed, rather than after.
 //!
 //! ## Forms
 //!
@@ -17,12 +22,11 @@
 //!   role (via the session) **and** the scope (AND semantics).
 
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::parse::Parser as _;
-use syn::{Expr, ExprLit, ItemFn, Lit, LitStr, Meta, Token, parse_quote};
+use syn::{Expr, ExprLit, Lit, LitStr, Meta, Token};
 
-use crate::idempotency_guard::block_has_replay_guard;
-use crate::param_helpers::has_input_named;
+use crate::idempotency_guard::should_own_replay;
 
 /// Parsed `#[secured(...)]` arguments: positional role literals plus an
 /// optional `scopes = [...]` list of token abilities.
@@ -108,51 +112,87 @@ fn parse_scope_array(expr: &Expr) -> syn::Result<Vec<String>> {
 }
 
 #[allow(clippy::too_many_lines)]
+// `item` is only ever borrowed via
+// `param_helpers::split_leading_items_and_reject_incompatible` now, but
+// keeps the owned `TokenStream` signature every macro entry point in this
+// crate shares (and the proc-macro boundary in `lib.rs` requires).
+#[allow(clippy::needless_pass_by_value)]
 pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let SecuredArgs { roles, scopes } = match parse_secured_args(attr) {
         Ok(r) => r,
         Err(err) => return err.to_compile_error(),
     };
 
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
-    };
+    let (leading_items, mut input_fn) =
+        match crate::param_helpers::split_leading_items_and_reject_incompatible(&item, "secured") {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
 
-    if input_fn.sig.asyncness.is_none() {
-        return syn::Error::new_spanned(
-            input_fn.sig.fn_token,
-            "#[secured] can only be applied to async functions",
-        )
-        .to_compile_error();
+    // An attribute sharing #[authorize]'s argument grammar under a different
+    // name is refused rather than guessed at — see
+    // `authorize::reject_if_ambiguous_authorize_shape`'s doc comment.
+    if let Some(err) = crate::authorize::reject_if_ambiguous_authorize_shape(&input_fn) {
+        return err;
     }
 
     // The session/role check is emitted for the classic forms (`#[secured]`,
     // `#[secured("admin")]`) and whenever a role is required. It is OMITTED for
     // a scopes-ONLY gate so a pure service token with no session authorizes on
-    // its scopes alone (injecting the Session extractor would otherwise require
-    // a SessionLayer and reject token-only requests).
+    // its scopes alone (extracting a real `Session` would otherwise require a
+    // `SessionLayer` and reject token-only requests).
     let emit_session_check = !roles.is_empty() || scopes.is_empty();
     let emit_scope_check = !scopes.is_empty();
 
     let role_literals = roles.iter().map(|role| quote! { #role });
     let scope_literals = scopes.iter().map(|scope| quote! { #scope });
+    // A single `TokenStream` (cheaply `Clone`) so the role/scope consts can be
+    // emitted twice — once in the handler body for OpenAPI extraction (where
+    // nothing in the body reads them any more, hence `allow(dead_code)`), once
+    // inside the gate for the actual runtime check — without moving the
+    // (single-use) role/scope literal iterators twice.
+    let role_scope_consts = quote! {
+        #[allow(dead_code)]
+        const __AUTUMN_SECURED_ROLES: &[&str] = &[#(#role_literals),*];
+        #[allow(dead_code)]
+        const __AUTUMN_SECURED_SCOPES: &[&str] = &[#(#scope_literals),*];
+    };
+    let fn_name = input_fn.sig.ident.clone();
+    let gate_ident = format_ident!("__AutumnSecuredGate_{}", fn_name);
 
     let session_check = if emit_session_check {
         quote! {
+            // A real `Session` extraction (not a raw extensions lookup) so a
+            // missing `SessionLayer` still fails loudly, exactly as the
+            // hidden `__autumn_session: Session` handler parameter this
+            // replaces did.
+            let __autumn_session: ::autumn_web::session::Session = match
+                <::autumn_web::session::Session as ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState>>
+                    ::from_request_parts(parts, state).await
+            {
+                ::core::result::Result::Ok(__session) => __session,
+                ::core::result::Result::Err(__never) => match __never {},
+            };
             if let ::core::result::Result::Err(__autumn_error) = ::autumn_web::auth::__check_secured_with_key(
                 &__autumn_session,
-                __autumn_state.auth_session_key(),
+                state.auth_session_key(),
                 __AUTUMN_SECURED_ROLES,
             ).await {
                 if __autumn_error.status() == ::autumn_web::reexports::http::StatusCode::UNAUTHORIZED {
+                    let __autumn_idempotency_replay = parts
+                        .extensions
+                        .get::<::autumn_web::idempotency::IdempotencyReplayResponse>()
+                        .cloned()
+                        .map(::autumn_web::reexports::axum::extract::Extension);
                     if let ::core::option::Option::Some(__autumn_response) =
                         ::autumn_web::idempotency::__replay_finalized_session_response(&__autumn_idempotency_replay)
                     {
-                        return __autumn_response;
+                        return ::core::result::Result::Err(__autumn_response);
                     }
                 }
-                return ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_error);
+                return ::core::result::Result::Err(
+                    ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_error),
+                );
             }
         }
     } else {
@@ -161,115 +201,87 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let scope_check = if emit_scope_check {
         quote! {
+            let __autumn_token_scopes = parts
+                .extensions
+                .get::<::autumn_web::auth::ApiTokenScopes>()
+                .cloned();
             if let ::core::result::Result::Err(__autumn_error) = ::autumn_web::auth::__check_secured_scopes(
-                __autumn_token_scopes.as_ref().map(|__e| &__e.0),
+                __autumn_token_scopes.as_ref(),
                 __AUTUMN_SECURED_SCOPES,
             ).await {
-                return ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_error);
+                return ::core::result::Result::Err(
+                    ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_error),
+                );
             }
         }
     } else {
         quote! {}
     };
 
-    let check_call = quote! {
-        // Route macros read these markers when #[secured] expands before #[get]/#[post]/etc.
-        const __AUTUMN_SECURED_ROLES: &[&str] = &[#(#role_literals),*];
-        const __AUTUMN_SECURED_SCOPES: &[&str] = &[#(#scope_literals),*];
-        #session_check
-        #scope_check
-    };
-    let original_body = &input_fn.block;
-    let original_response = match &input_fn.sig.output {
-        syn::ReturnType::Default => quote! {
-            let __autumn_inner: () = (async move #original_body).await;
-            ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
-        },
-        syn::ReturnType::Type(_, ty) if matches!(ty.as_ref(), syn::Type::ImplTrait(_)) => quote! {
-            ::autumn_web::reexports::axum::response::IntoResponse::into_response(
-                (async move #original_body).await
-            )
-        },
-        syn::ReturnType::Type(_, ty) => quote! {
-            let __autumn_inner: #ty = (async move #original_body).await;
-            ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
-        },
-    };
-    let body_already_has_replay_guard = block_has_replay_guard(original_body);
-    let replay_stop = if body_already_has_replay_guard {
-        quote! {}
-    } else {
+    // Whether THIS gate should also serve a cached idempotency replay: see
+    // `should_own_replay` for the full ordering rationale (issue #1668's
+    // pre-body gates and `#[authorize]`'s in-body check must never both skip
+    // replay-ownership, nor both claim it).
+    let owns_replay = should_own_replay(&input_fn);
+    let replay_check = if owns_replay {
         quote! {
-            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
+            let __autumn_idempotency_replay = parts
+                .extensions
+                .get::<::autumn_web::idempotency::IdempotencyReplayResponse>()
+                .cloned()
+                .map(::autumn_web::reexports::axum::extract::Extension);
             if let ::core::option::Option::Some(__autumn_response) =
                 ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
             {
-                return __autumn_response;
+                return ::core::result::Result::Err(__autumn_response);
             }
         }
+    } else {
+        quote! {}
     };
 
-    // Inject hidden State<AppState> and Session parameters at the start of
-    // the parameter list, but only if no other macro (typically `#[authorize]`) has
-    // already injected them. Without these guards, stacking
-    // `#[authorize]` + `#[secured]` in either attribute order would
-    // produce duplicate hidden parameters and fail to
-    // compile.
-    //
-    // For a scopes-ONLY gate the session/role check is not emitted, so we skip
-    // injecting the Session extractor — a token-only route has no SessionLayer
-    // and the extractor would otherwise reject the request.
-    if emit_session_check && !has_input_named(&input_fn, "__autumn_state") {
-        let state_param: syn::FnArg = syn::parse_quote! {
-            ::autumn_web::reexports::axum::extract::State(__autumn_state):
-                ::autumn_web::reexports::axum::extract::State<::autumn_web::AppState>
-        };
-        input_fn.sig.inputs.insert(0, state_param);
-    }
-    if emit_session_check && !has_input_named(&input_fn, "__autumn_session") {
-        let session_param: syn::FnArg = syn::parse_quote! {
-            __autumn_session: ::autumn_web::session::Session
-        };
-        input_fn.sig.inputs.insert(0, session_param);
-    }
-    // Inject the granted-scopes extension when a scope gate is present.
-    if emit_scope_check && !has_input_named(&input_fn, "__autumn_token_scopes") {
-        let scopes_param: syn::FnArg = syn::parse_quote! {
-            __autumn_token_scopes: ::core::option::Option<
-                ::autumn_web::reexports::axum::extract::Extension<
-                    ::autumn_web::auth::ApiTokenScopes
-                >
-            >
-        };
-        input_fn.sig.inputs.insert(0, scopes_param);
-    }
-    if !has_input_named(&input_fn, "__autumn_idempotency_replay") {
-        let idempotency_param: syn::FnArg = syn::parse_quote! {
-            __autumn_idempotency_replay: ::core::option::Option<
-                ::autumn_web::reexports::axum::extract::Extension<
-                    ::autumn_web::idempotency::IdempotencyReplayResponse
-                >
-            >
-        };
-        input_fn.sig.inputs.insert(0, idempotency_param);
-    }
+    // The marker consts stay in the handler body (not just the gate below) so
+    // `api_doc::extract_secured_info` can still recover the role/scope values
+    // for OpenAPI when `#[secured]` expands before the route macro.
+    let markers = role_scope_consts.clone();
 
-    input_fn
-        .attrs
-        .push(parse_quote!(#[allow(clippy::too_many_arguments)]));
-    input_fn.sig.output = parse_quote! {
-        -> ::autumn_web::reexports::axum::response::Response
-    };
+    // Both checks — and any replay lookup this gate owns — run inside a
+    // `FromRequestParts` gate: a hidden parameter inserted ahead of the
+    // handler's own parameters, rather than as a statement inside the handler
+    // body. Axum resolves every `FromRequestParts` extractor before it ever
+    // reaches a `FromRequest` body extractor (`Json` / `Form` / `Multipart`)
+    // and short-circuits on the first rejection, so an unauthenticated /
+    // unauthorized / replayed request never causes the body to be parsed.
+    let gate_item = crate::request_gate::wrap_gate(
+        &gate_ident,
+        &quote! {
+            #role_scope_consts
+            #session_check
+            #scope_check
+            #replay_check
+        },
+    );
+
+    let original_response =
+        crate::param_helpers::build_original_response(&input_fn.block, &input_fn.sig.output);
+
+    // Insert the gate as the FIRST parameter — ahead of every other
+    // extractor, including any earlier-inserted guard gate (which then
+    // correctly runs AFTER this one; see `should_own_replay`'s doc comment).
+    crate::request_gate::insert_gate_param(&mut input_fn, &gate_ident);
 
     input_fn.block = syn::parse_quote! {
         {
-            #check_call
-            #replay_stop
+            #markers
             #original_response
         }
     };
 
-    quote! { #input_fn }
+    quote! {
+        #leading_items
+        #gate_item
+        #input_fn
+    }
 }
 
 #[cfg(test)]
@@ -277,6 +289,134 @@ mod tests {
     use quote::quote;
 
     use super::{parse_secured_args, secured_macro};
+    use crate::static_route::static_get_macro;
+
+    /// Characterization test (Echo refactor, clone class: the
+    /// `FromRequestParts` gate skeleton shared with `step_up`/`throttle`):
+    /// pins `#[secured("admin", scopes = ["posts:write"])]`'s exact expansion
+    /// — exercising the role check, the scope check, and (as the only guard
+    /// on this handler) the replay lookup all at once — so that factoring the
+    /// gate's struct+impl skeleton into `request_gate::wrap_gate` cannot
+    /// silently change a single token of it.
+    #[test]
+    fn secured_macro_expansion_is_unchanged_by_the_gate_skeleton_refactor() {
+        let generated = secured_macro(
+            quote! { "admin", scopes = ["posts:write"] },
+            quote! {
+                async fn handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert_eq!(
+            generated,
+            include_str!("../testdata/secured_golden.txt").trim_end()
+        );
+    }
+
+    /// Characterization test (Echo refactor, clone class: the
+    /// `split_leading_items_and_fn` + asyncness-check + marker-check preamble
+    /// shared byte-for-byte with `step_up`/`throttle`/`authorize`): pins the
+    /// exact async-required message so factoring the preamble into
+    /// `param_helpers` cannot silently change it or misattribute it to the
+    /// wrong attribute name.
+    #[test]
+    fn secured_rejects_sync_functions_with_the_attribute_named_in_the_message() {
+        let generated = secured_macro(
+            quote! { "admin" },
+            quote! {
+                fn sync_handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("#[secured] can only be applied to async functions"),
+            "should emit the exact async-required message naming #[secured]:\n{generated}"
+        );
+    }
+
+    #[test]
+    fn secured_rejects_when_invoked_on_a_static_route_handler_via_an_alias() {
+        // Simulates real source using `use ::autumn_web::secured as auth;`:
+        //   #[static_get("/private")]
+        //   #[auth("admin")]
+        //   async fn private() -> &'static str { "private" }
+        // `static_get_macro` cannot recognize `auth` by name (Codex review on
+        // #2513, tenth finding) and must accept the combination rather than
+        // reject it, leaving the incompatibility for the guard's own macro to
+        // catch via the marker it left behind. The compiler invokes the SAME
+        // `secured_macro` function regardless of what alias the source used
+        // to name it — aliasing changes only the surface spelling, never
+        // which function actually runs — so calling `secured_macro` directly
+        // here is exactly what real, aliased source code produces.
+        let accepted = static_get_macro(
+            quote! { "/private" },
+            quote! {
+                #[auth("admin")]
+                async fn private() -> &'static str { "private" }
+            },
+        );
+        assert!(
+            !accepted.to_string().contains("compile_error"),
+            "static_get_macro cannot recognize an aliased guard attribute by name, so it must \
+             accept (not reject) at this point, deferring to the guard's own marker check: \
+             {accepted}"
+        );
+
+        let accepted_fn = crate::param_helpers::extract_fn_item(accepted, "private");
+        let generated = secured_macro(quote! { "admin" }, quote! { #accepted_fn }).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "secured_macro must reject a handler already marked as a #[static_get] route, \
+             regardless of what alias attribute name the source used to invoke it: {generated}"
+        );
+    }
+
+    #[test]
+    fn secured_rejects_when_a_marker_is_buried_inside_a_cached_wrapper() {
+        // Simulates real source using `use ::autumn_web::secured as auth;`:
+        //   #[static_get("/private")]
+        //   #[cached]
+        //   #[auth("admin")]
+        //   async fn private() -> &'static str { "private" }
+        // `#[static_get]` injects `STATIC_ROUTE_HANDLER_MARKER` into the top
+        // of the original body, but `#[cached]` — the next attribute to
+        // expand — re-homes that ENTIRE body (marker included) one level
+        // deeper, inside its own `(|| async move { ... })().await` closure
+        // IIFE (`cached_macro`'s `compute`). A marker scan that only looks at
+        // the function's top-level statements would miss it entirely,
+        // reopening the exact cache-bypass hole this whole rejection exists
+        // to close (Codex review on #2513, eleventh finding).
+        let marked = static_get_macro(
+            quote! { "/private" },
+            quote! {
+                #[cached]
+                #[auth("admin")]
+                async fn private() -> &'static str { "private" }
+            },
+        );
+        assert!(
+            !marked.to_string().contains("compile_error"),
+            "static_get_macro cannot recognize #[cached] or the aliased guard by name, so it \
+             must accept at this point: {marked}"
+        );
+
+        let marked_fn = crate::param_helpers::extract_fn_item(marked, "private");
+        let cached = crate::cached::cached_macro(quote! {}, quote! { #marked_fn });
+        assert!(
+            !cached.to_string().contains("compile_error"),
+            "#[cached] knows nothing about route guards and must accept unconditionally: {cached}"
+        );
+
+        let cached_fn = crate::param_helpers::extract_fn_item(cached, "private");
+        let generated = secured_macro(quote! { "admin" }, quote! { #cached_fn }).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "secured_macro must still find the #[static_get] marker even after #[cached] buried \
+             it inside a closure IIFE: {generated}"
+        );
+    }
 
     #[test]
     fn secured_string_literal_replay_guard_still_injects_replay_stop() {
@@ -332,6 +472,17 @@ mod tests {
         assert!(parse_secured_args(quote! { foo = ["x"] }).is_err());
     }
 
+    /// `#[secured(policy = "…")]` is not a form this macro has ever accepted,
+    /// but it read like one: five doc sites (two of them `ignore`d rustdoc
+    /// fences, which are never compiled) told readers to write it. The grammar
+    /// is bare role literals and/or `scopes = [...]`; a `policy` key lands on
+    /// the catch-all arm and fails the build. Pinned so the spelling cannot
+    /// come back looking supported.
+    #[test]
+    fn rejects_policy_key() {
+        assert!(parse_secured_args(quote! { policy = "reports.read" }).is_err());
+    }
+
     #[test]
     fn rejects_non_string_scope_entries() {
         assert!(parse_secured_args(quote! { scopes = [1, 2] }).is_err());
@@ -380,5 +531,145 @@ mod tests {
         // Both markers always emitted for OpenAPI extraction.
         assert!(generated.contains("__AUTUMN_SECURED_ROLES"));
         assert!(generated.contains("__AUTUMN_SECURED_SCOPES"));
+    }
+
+    // ── Pre-body FromRequestParts gate (#1668) ──────────────────────────────
+
+    #[test]
+    fn check_runs_in_a_from_request_parts_gate() {
+        let generated = secured_macro(
+            quote! { "admin" },
+            quote! { async fn h() -> &'static str { "ok" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("FromRequestParts"),
+            "the check must run in a FromRequestParts gate, not a body statement:\n{generated}"
+        );
+        assert!(
+            generated.contains("struct __AutumnSecuredGate_h"),
+            "should emit a handler-unique gate marker struct:\n{generated}"
+        );
+    }
+
+    #[test]
+    fn inserts_gate_as_first_parameter() {
+        let generated_fn = {
+            let generated = secured_macro(
+                quote! { "admin" },
+                quote! {
+                    async fn h(::autumn_web::reexports::axum::extract::Json(_body): ::autumn_web::reexports::axum::extract::Json<String>) -> &'static str { "ok" }
+                },
+            );
+            let items: syn::File = syn::parse2(generated).expect("generated tokens must parse");
+            items
+                .items
+                .into_iter()
+                .find_map(|item| match item {
+                    syn::Item::Fn(f) if f.sig.ident == "h" => Some(f),
+                    _ => None,
+                })
+                .expect("handler fn must be present in the expansion")
+        };
+        let first_param = generated_fn
+            .sig
+            .inputs
+            .first()
+            .expect("handler must have at least the gate parameter");
+        let syn::FnArg::Typed(pat_type) = first_param else {
+            panic!("first parameter must be a typed gate parameter");
+        };
+        let syn::Type::Path(type_path) = pat_type.ty.as_ref() else {
+            panic!("gate parameter must be a named type");
+        };
+        assert_eq!(
+            type_path.path.segments.last().unwrap().ident,
+            "__AutumnSecuredGate_h",
+            "the gate must be the FIRST parameter — ahead of the body extractor — so Axum \
+             resolves (and can reject on) it before ever reaching the body"
+        );
+    }
+
+    #[test]
+    fn handler_body_no_longer_contains_the_session_check() {
+        let generated_fn = {
+            let generated = secured_macro(
+                quote! { "admin" },
+                quote! { async fn h() -> &'static str { "ok" } },
+            );
+            let items: syn::File = syn::parse2(generated).expect("generated tokens must parse");
+            items
+                .items
+                .into_iter()
+                .find_map(|item| match item {
+                    syn::Item::Fn(f) if f.sig.ident == "h" => Some(f),
+                    _ => None,
+                })
+                .expect("handler fn must be present in the expansion")
+        };
+        let body = quote! { #generated_fn }.to_string();
+        assert!(
+            !body.contains("__check_secured_with_key"),
+            "the handler body must not call the runtime check directly:\n{body}"
+        );
+    }
+
+    #[test]
+    fn defers_replay_to_an_earlier_gate_when_stacked() {
+        let generated = secured_macro(
+            quote! { "admin" },
+            quote! {
+                async fn h(_g: __AutumnThrottleGate_h) -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("__replay_response"),
+            "must defer replay-ownership to the earlier-inserted gate:\n{generated}"
+        );
+    }
+
+    #[test]
+    fn defers_replay_when_authorize_still_pending() {
+        let generated = secured_macro(
+            quote! { "admin" },
+            quote! {
+                #[authorize("update", resource = Post)]
+                async fn h() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("__replay_response"),
+            "must defer replay-ownership while #[authorize] is still pending:\n{generated}"
+        );
+    }
+
+    /// Echo clone-class regression (missed-fix half): `step_up_macro` and
+    /// `throttle_macro` both guard their `original_response` match with a
+    /// recursive `type_contains_impl_trait` check (see their own
+    /// `*_handles_nested_impl_trait_return_type` tests) specifically because
+    /// Rust rejects `impl Trait` in local variable type annotations (E0562)
+    /// even when it's nested, e.g. `Result<impl IntoResponse, _>`.
+    /// `secured_macro` never received that fix — it still guards with a
+    /// shallow `matches!(ty.as_ref(), syn::Type::ImplTrait(_))` that only
+    /// catches a *top-level* `impl Trait` return type, so it emits
+    /// `let __autumn_inner: Result<impl IntoResponse, _> = …`, which fails to
+    /// compile for any real handler shaped like this.
+    #[test]
+    fn secured_handles_nested_impl_trait_return_type() {
+        let generated = secured_macro(
+            quote! { "admin" },
+            quote! {
+                async fn handler() -> Result<impl IntoResponse, String> {
+                    Ok("ok")
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("__autumn_inner :"),
+            "should not emit an explicit local annotation for nested impl Trait: {generated}"
+        );
     }
 }

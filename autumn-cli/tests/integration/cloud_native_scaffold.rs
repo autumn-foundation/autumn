@@ -395,9 +395,187 @@ fn ci_workflow_runs_a11y_verify() {
         ci.contains("scripts/install.sh"),
         "ci.yml must install the autumn CLI via the install script"
     );
+}
+
+/// Issue #2495: `ci.yml`'s `a11y verify` and `routes audit` steps compile
+/// and introspect the pull request's own code, the same as
+/// posture-gate.yml's `manifest` job — so unlike that job's `posture`
+/// sibling (which only ever reads JSON, and does probe forward for a
+/// compatible release), `ci.yml` must keep installing the CLI pinned to
+/// this app's `autumn-web` version and never silently reach for a CLI this
+/// project's own compatibility check (`autumn doctor`) would call
+/// incompatible.
+#[test]
+fn ci_workflow_always_installs_the_cli_pinned_to_app_version() {
+    let temp_dir = scaffold("ci-pinned-cli-app");
+    let project_dir = temp_dir.path().join("ci-pinned-cli-app");
+    let ci = fs::read_to_string(project_dir.join(".github/workflows/ci.yml")).unwrap();
+
     assert!(
         ci.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
-        "ci.yml must pin the installed CLI to this app's autumn version"
+        "ci.yml must install the CLI pinned to this app's autumn version: {ci}"
+    );
+    assert!(
+        !ci.contains("trunk-dev") && !ci.contains("for bump in"),
+        "ci.yml must never fall back to a CLI this project's own \
+         compatibility check would call incompatible: {ci}"
+    );
+}
+
+/// A raw `autumn a11y verify` / `autumn routes audit` invocation against a
+/// CLI that lacks the subcommand fails with a cryptic "unknown subcommand"
+/// error. Mirroring `posture-gate.yml`'s existing `routes posture --help`
+/// probe (#2467), both must be checked for and fail with an actionable
+/// `::error::` message before either gate actually runs.
+#[test]
+fn ci_workflow_probes_for_a11y_and_routes_audit_before_running_them() {
+    let temp_dir = scaffold("ci-probe-app");
+    let project_dir = temp_dir.path().join("ci-probe-app");
+    let ci = fs::read_to_string(project_dir.join(".github/workflows/ci.yml")).unwrap();
+
+    assert!(
+        ci.contains("a11y verify --help"),
+        "ci.yml must probe for `a11y verify` before running it: {ci}"
+    );
+    assert!(
+        ci.contains("routes audit --help"),
+        "ci.yml must probe for `routes audit` before running it: {ci}"
+    );
+    assert!(
+        ci.contains("::error::"),
+        "ci.yml's probe must fail with an actionable ::error:: message, not \
+         a bare exit: {ci}"
+    );
+
+    let probe_pos = ci.find("a11y verify --help").expect("a11y probe present");
+    let run_pos = ci
+        .rfind("a11y verify .")
+        .expect("a11y verify invocation present");
+    assert!(
+        probe_pos < run_pos,
+        "the a11y probe must run before `autumn a11y verify` itself: {ci}"
+    );
+}
+
+#[test]
+fn ci_workflow_runs_routes_audit() {
+    let temp_dir = scaffold("ci-routes-audit-app");
+    let project_dir = temp_dir.path().join("ci-routes-audit-app");
+    let ci = fs::read_to_string(project_dir.join(".github/workflows/ci.yml")).unwrap();
+
+    assert!(
+        ci.contains("run: autumn routes audit"),
+        "ci.yml must run `autumn routes audit` as a default-on route \
+         auth-coverage gate (#1604)"
+    );
+    // The gate must run after the CLI is installed (the a11y step's `run:`
+    // block), not require a second, separate install.
+    let a11y_pos = ci
+        .find("- name: Accessibility (a11y) verify")
+        .expect("a11y verify step present");
+    let audit_pos = ci
+        .find("run: autumn routes audit")
+        .expect("routes audit step present");
+    assert!(
+        audit_pos > a11y_pos,
+        "routes audit step must come after the CLI install (a11y step)"
+    );
+}
+
+/// Patch a scaffolded project's `Cargo.toml` to build against this workspace's
+/// `autumn-web` instead of a published crates.io version, mirroring
+/// `seed_model_linking::linked_seed_binary_cargo_checks`.
+fn patch_to_local_autumn_web(project: &std::path::Path) {
+    use std::fmt::Write as _;
+
+    let cargo_toml_path = project.join("Cargo.toml");
+    let mut content = fs::read_to_string(&cargo_toml_path).unwrap();
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let autumn_web = workspace_root.join("autumn");
+    let _ = write!(
+        content,
+        "\n[patch.crates-io]\nautumn-web = {{ path = \"{}\" }}\n",
+        autumn_web.display().to_string().replace('\\', "/")
+    );
+    fs::write(&cargo_toml_path, content).unwrap();
+}
+
+/// Regression guard for the Codex review finding on PR #2154: the audit gate
+/// wired into scaffolded CI (`ci_workflow_runs_routes_audit`) is worthless —
+/// worse, actively hostile to first-run DX — if the scaffold it gates ships
+/// with unclassified starter routes. Every fresh `autumn new` app (and
+/// `autumn new --api`) must pass `autumn routes audit` with no changes,
+/// exactly as the generated CI step will run it.
+#[test]
+#[ignore = "slow: compiles a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn scaffolded_app_passes_routes_audit_gate() {
+    let temp_dir = scaffold("routes-audit-gate-app");
+    let project_dir = temp_dir.path().join("routes-audit-gate-app");
+    patch_to_local_autumn_web(&project_dir);
+
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let audit = Command::new(autumn_bin)
+        .args(["routes", "audit"])
+        .current_dir(&project_dir)
+        .output()
+        .expect("failed to run `autumn routes audit`");
+    assert!(
+        audit.status.success(),
+        "a freshly scaffolded app must pass `autumn routes audit` unmodified \
+         (every starter handler needs #[public]/#[secured]/#[authorize]):\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&audit.stdout),
+        String::from_utf8_lossy(&audit.stderr),
+    );
+}
+
+/// Issue #1706's success metric has two halves: a seeded fixture app carrying
+/// known defects is caught in full (`a11y_verify`'s red fixture), and the
+/// scaffolded starter passes clean. This is the second half, and it guards the
+/// gate the scaffold's own CI runs against itself. `a11y verify` is a static
+/// scan, so this needs no compile.
+#[test]
+fn scaffolded_app_passes_a11y_verify_gate() {
+    let temp_dir = scaffold("a11y-verify-gate-app");
+    let project_dir = temp_dir.path().join("a11y-verify-gate-app");
+
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let verify = Command::new(autumn_bin)
+        .args(["a11y", "verify", "."])
+        .current_dir(&project_dir)
+        .output()
+        .expect("failed to run `autumn a11y verify`");
+    assert!(
+        verify.status.success(),
+        "a freshly scaffolded app must pass `autumn a11y verify` unmodified — \
+         the gate its own generated CI runs:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&verify.stdout),
+        String::from_utf8_lossy(&verify.stderr),
+    );
+}
+
+/// Same guarantee as [`scaffolded_app_passes_routes_audit_gate`], for the
+/// `--api` JSON-first starter (`main.api.rs.tmpl`), which has its own set of
+/// starter handlers.
+#[test]
+#[ignore = "slow: compiles a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn scaffolded_api_app_passes_routes_audit_gate() {
+    let temp_dir = scaffold_with_flags("routes-audit-gate-api-app", &["--api"]);
+    let project_dir = temp_dir.path().join("routes-audit-gate-api-app");
+    patch_to_local_autumn_web(&project_dir);
+
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let audit = Command::new(autumn_bin)
+        .args(["routes", "audit"])
+        .current_dir(&project_dir)
+        .output()
+        .expect("failed to run `autumn routes audit`");
+    assert!(
+        audit.status.success(),
+        "a freshly scaffolded --api app must pass `autumn routes audit` unmodified:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&audit.stdout),
+        String::from_utf8_lossy(&audit.stderr),
     );
 }
 

@@ -591,7 +591,7 @@ pub fn default_tigris_public_base(bucket: &str, key_prefix: &str) -> String {
 /// backend (AWS, Cloudflare R2, `MinIO`, …) — or an S3 backend with no endpoint
 /// at all (the AWS SDK default) — is not Tigris, so the Tigris public-base
 /// default must not be applied to it.
-fn is_tigris_endpoint(endpoint_url: Option<&str>) -> bool {
+pub(crate) fn is_tigris_endpoint(endpoint_url: Option<&str>) -> bool {
     let Some(endpoint) = endpoint_url else {
         return false;
     };

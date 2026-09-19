@@ -52,8 +52,11 @@
 //! | `AUTUMN_SERVER__HOST` | `server.host` | `String` |
 //! | `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` | `server.shutdown_timeout_secs` | `u64` |
 //! | `AUTUMN_SERVER__PRESTOP_GRACE_SECS` | `server.prestop_grace_secs` | `u64` |
+//! | `AUTUMN_SERVER__UPGRADE__ENABLED` | `server.upgrade.enabled` | `bool` |
+//! | `AUTUMN_SERVER__UPGRADE__READY_TIMEOUT_SECS` | `server.upgrade.ready_timeout_secs` | `u64` |
 //! | `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS` | `server.timeouts.request_timeout_ms` | `u64` |
 //! | `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS` | `server.max_concurrent_requests` | `usize` |
+//! | `AUTUMN_SERVER__CAPACITY_CONTRACT` | `server.capacity_contract` | `String` |
 //! | `AUTUMN_DATABASE__URL` | `database.url` | `String` |
 //! | `AUTUMN_DATABASE__PRIMARY_URL` | `database.primary_url` | `String` |
 //! | `AUTUMN_DATABASE__REPLICA_URL` | `database.replica_url` | `String` |
@@ -82,6 +85,9 @@
 //! | `AUTUMN_TELEMETRY__OTLP_ENDPOINT` | `telemetry.otlp_endpoint` | `String` |
 //! | `AUTUMN_TELEMETRY__PROTOCOL` | `telemetry.protocol` | `Grpc` / `HttpProtobuf` |
 //! | `AUTUMN_TELEMETRY__STRICT` | `telemetry.strict` | `bool` |
+//! | `AUTUMN_METRICS__MAX_SERIES_PER_METRIC` | `metrics.max_series_per_metric` | `usize` |
+//! | `AUTUMN_METRICS__MAX_INSTRUMENTS` | `metrics.max_instruments` | `usize` |
+//! | `AUTUMN_METRICS__MAX_LABELS_PER_SERIES` | `metrics.max_labels_per_series` | `usize` |
 //! | `AUTUMN_HEALTH__PATH` | `health.path` | `String` |
 //! | `AUTUMN_HEALTH__LIVE_PATH` | `health.live_path` | `String` |
 //! | `AUTUMN_HEALTH__READY_PATH` | `health.ready_path` | `String` |
@@ -111,7 +117,9 @@
 //! | `AUTUMN_CHANNELS__REPLAY_BUFFER` | `channels.replay_buffer` | `usize` |
 //! | `AUTUMN_CHANNELS__REDIS__URL` | `channels.redis.url` | `String` |
 //! | `AUTUMN_CHANNELS__REDIS__KEY_PREFIX` | `channels.redis.key_prefix` | `String` |
-//! | `AUTUMN_JOBS__BACKEND` | `jobs.backend` | `local` / `postgres` / `redis` |
+//! | `AUTUMN_JOBS__BACKEND` | `jobs.backend` | `local` / `postgres` / `redis` / `sqlite` |
+//! | `AUTUMN_JOBS__SQLITE__VISIBILITY_TIMEOUT_MS` | `jobs.sqlite.visibility_timeout_ms` | `u64` |
+//! | `AUTUMN_JOBS__SQLITE__POLL_INTERVAL_MS` | `jobs.sqlite.poll_interval_ms` | `u64` |
 //! | `AUTUMN_JOBS__WORKERS` | `jobs.workers` | `usize` |
 //! | `AUTUMN_JOBS__PIN` | `jobs.pin` | comma-separated queue names |
 //! | `AUTUMN_JOBS__MAX_ATTEMPTS` | `jobs.max_attempts` | `u32` |
@@ -122,7 +130,17 @@
 //! | `AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS` | `jobs.postgres.visibility_timeout_ms` | `u64` |
 //! | `AUTUMN_JOBS__TRACKING__TTL_SECS` | `jobs.tracking.ttl_secs` | `u64` |
 //! | `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` | `jobs.tracking.route_enabled` | `bool` |
-//! | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` | `in_process` / `postgres` |
+//! | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` | `in_process` / `postgres` / `sqlite` |
+//! | `AUTUMN_RETENTION__SWEEP_INTERVAL` | `retention.sweep_interval` | duration `String` |
+//! | `AUTUMN_RETENTION__JOB_HISTORY` | `retention.job_history` | duration `String` |
+//! | `AUTUMN_RETENTION__COMMIT_HOOKS` | `retention.commit_hooks` | duration `String` |
+//! | `AUTUMN_RETENTION__JOB_TRACKING` | `retention.job_tracking` | duration `String` |
+//! | `AUTUMN_RETENTION__IDEMPOTENCY` | `retention.idempotency` | duration `String` |
+//! | `AUTUMN_RETENTION__EXPERIMENT_ASSIGNMENTS` | `retention.experiment_assignments` | duration `String` |
+//! | `AUTUMN_RETENTION__WEBHOOK_REPLAY` | `retention.webhook_replay` | duration `String` |
+//! | `AUTUMN_RETENTION__SESSIONS` | `retention.sessions` | duration `String` |
+//! | `AUTUMN_RETENTION__AUDIT_ARCHIVES` | `retention.audit_archives` | duration `String` |
+//! | `AUTUMN_RETENTION__CUSTOM_DOMAINS` | `retention.custom_domains` | duration `String` |
 //! | `AUTUMN_SCHEDULER__LEASE_TTL_SECS` | `scheduler.lease_ttl_secs` | `u64` |
 //! | `AUTUMN_SCHEDULER__REPLICA_ID` | `scheduler.replica_id` | `String` |
 //! | `AUTUMN_SCHEDULER__KEY_PREFIX` | `scheduler.key_prefix` | `String` |
@@ -157,6 +175,29 @@
 //! | `AUTUMN_AUTH__MAGIC_LINK__TTL_MINUTES` | `auth.magic_link.ttl_minutes` | `u64` |
 //! | `AUTUMN_AUTH__MAGIC_LINK__EMAIL_COOLDOWN_SECS` | `auth.magic_link.email_cooldown_secs` | `u64` |
 //! | `AUTUMN_TIME_ZONE__IDENTIFIER` | `time_zone.identifier` | IANA id `String` |
+//! | `AUTUMN_FAILURE_CAPTURE__ENABLED` | `failure_capture.enabled` | `bool` |
+//! | `AUTUMN_FAILURE_CAPTURE__DIR` | `failure_capture.dir` | `String` |
+//! | `AUTUMN_FAILURE_CAPTURE__MAX_BODY_BYTES` | `failure_capture.max_body_bytes` | `usize` |
+//! | `AUTUMN_FAILURE_CAPTURE__MAX_CAPSULE_BYTES` | `failure_capture.max_capsule_bytes` | `usize` |
+//! | `AUTUMN_FAILURE_CAPTURE__MAX_CAPSULES` | `failure_capture.max_capsules` | `usize` |
+//! | `AUTUMN_CLUSTER__ENABLED` | `cluster.enabled` | `bool` |
+//! | `AUTUMN_CLUSTER__SECRET` | `cluster.secret` | `SecretString` |
+//! | `AUTUMN_CLUSTER__CLUSTER_NAME` | `cluster.cluster_name` | `String` |
+//! | `AUTUMN_CLUSTER__BIND_ADDR` | `cluster.bind_addr` | `String` |
+//! | `AUTUMN_CLUSTER__ADVERTISE_ADDR` | `cluster.advertise_addr` | `String` |
+//! | `AUTUMN_CLUSTER__SEED_PEERS` | `cluster.seed_peers` | comma-separated addresses |
+//! | `AUTUMN_CLUSTER__NODE_ID` | `cluster.node_id` | `String` |
+//! | `AUTUMN_CLUSTER__PUSH_INTERVAL_MS` | `cluster.push_interval_ms` | `u64` |
+//! | `AUTUMN_CLUSTER__SUSPICION_TIMEOUT_MS` | `cluster.suspicion_timeout_ms` | `u64` |
+//! | `AUTUMN_SHADOW__ENABLED` | `shadow.enabled` | `bool` |
+//! | `AUTUMN_SHADOW__TARGET` | `shadow.target` | `String` |
+//! | `AUTUMN_SHADOW__SAMPLE_RATE` | `shadow.sample_rate` | `f64` |
+//! | `AUTUMN_SHADOW__ROUTES` | `shadow.routes` | comma-separated patterns |
+//! | `AUTUMN_SHADOW__TIMEOUT_MS` | `shadow.timeout_ms` | `u64` |
+//! | `AUTUMN_SHADOW__MAX_IN_FLIGHT` | `shadow.max_in_flight` | `usize` |
+//! | `AUTUMN_SHADOW__MAX_BODY_BYTES` | `shadow.max_body_bytes` | `usize` |
+//! | `AUTUMN_SHADOW__MAX_RECORDS` | `shadow.max_records` | `usize` |
+//! | `AUTUMN_SHADOW__MAX_SAMPLE_BYTES` | `shadow.max_sample_bytes` | `usize` |
 
 use std::path::{Path, PathBuf};
 
@@ -385,6 +426,28 @@ pub fn normalize_profile_name(profile: &str) -> Option<String> {
 
     // Preserve user-specified case for custom profile names.
     Some(trimmed.to_owned())
+}
+
+/// The single source of truth for "is this profile dev-like?", used by every
+/// dev-only surface (the request inspector, the HTML dev error overlay, …).
+///
+/// Fails closed: an unset profile (`None`) is NOT dev. A [`ConfigLoader`]
+/// other than the default [`TomlEnvConfigLoader`] is free to build an
+/// [`AutumnConfig`] however it wants (see `docs/guide/custom-subsystems.md`),
+/// and nothing requires it to populate `profile` — `resolve_profile` (which
+/// always resolves to a concrete profile, defaulting to `"dev"`) only runs
+/// inside `TomlEnvConfigLoader`. A dev-only surface must never treat that
+/// absence as an invitation to guess `cfg!(debug_assertions)` instead: a
+/// production deployment running a debug build (forgetting `--release`, or a
+/// misconfigured Docker multi-stage build, is an easy operational mistake)
+/// would otherwise get the dev error overlay — internal error messages,
+/// headers, cookies, and SQL query text — on every 5xx, even though the app
+/// author never opted into `profile = "dev"`.
+///
+/// [`ConfigLoader`]: crate::config::ConfigLoader
+#[must_use]
+pub(crate) fn profile_is_dev(profile: Option<&str>) -> bool {
+    matches!(profile, Some("dev" | "development"))
 }
 
 /// Profile names to check for inline/file overrides.
@@ -974,6 +1037,269 @@ pub struct OffsiteS3Config {
     pub force_path_style: bool,
 }
 
+/// `[replication]` — continuous `SQLite` replication to an offsite destination
+/// (issue #1628).
+///
+/// NOT feature-gated, for the same reason `[backup]` is not: a strict-config app
+/// must accept its own `autumn.toml` keys whatever feature set it was compiled
+/// with. The replication engine itself lives behind the `db` feature.
+///
+/// The section is absent by default. Present-but-`enabled = false` is the shape
+/// a profile overlay wants: keep one destination definition in `autumn.toml` and
+/// turn replication off for `dev`/`test`.
+///
+/// ```toml
+/// [replication]
+/// enabled = true
+/// rpo_secs = 10
+/// retention_hours = 168
+///
+/// [replication.s3]
+/// bucket = "myapp-replicas"
+/// region = "auto"
+/// endpoint = "https://<account>.r2.cloudflarestorage.com"
+/// access_key_id_env = "AUTUMN_REPLICA_ACCESS_KEY_ID"
+/// secret_access_key_env = "AUTUMN_REPLICA_SECRET_ACCESS_KEY"
+/// force_path_style = true
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReplicationConfig {
+    /// Master switch. Off by default, so adding the section is not enough to
+    /// start shipping — the operator must say so.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// The recovery point objective in seconds: the steady-state upper bound on
+    /// how much recently committed data a total loss of the machine costs.
+    /// Defaults to 10 (AC #2).
+    #[serde(default = "default_rpo_secs")]
+    pub rpo_secs: u64,
+
+    /// How often the replicator ships, in seconds. Defaults to half the RPO
+    /// (minimum one second) so the steady-state lag stays inside the contract.
+    #[serde(default)]
+    pub sync_interval_secs: Option<u64>,
+
+    /// How old a generation may get before the replicator checkpoints and opens
+    /// a fresh one. Bounds how many segments a restore replays. Default: 1 hour.
+    #[serde(default = "default_snapshot_interval_secs")]
+    pub snapshot_interval_secs: u64,
+
+    /// How large the `-wal` file may grow before the replicator checkpoints.
+    /// Default: 16 MiB.
+    #[serde(default = "default_max_wal_bytes")]
+    pub max_wal_bytes: u64,
+
+    /// How far back a point-in-time restore must stay possible. Older
+    /// generations are pruned. Default: 168 hours (7 days).
+    #[serde(default = "default_retention_hours")]
+    pub retention_hours: u64,
+
+    /// How often to prove the replica restorable by actually restoring it into
+    /// a scratch directory. `0` disables periodic verification. Default: 6 hours.
+    #[serde(default = "default_verify_interval_secs")]
+    pub verify_interval_secs: u64,
+
+    /// Key prefix under the destination. Objects are keyed
+    /// `{prefix}/{profile}/generations/…`. Defaults to the bucket/directory root.
+    #[serde(default)]
+    pub prefix: Option<String>,
+
+    /// Opt in to pointing replication at the same bucket + endpoint as the app's
+    /// user-facing blob storage (`[storage.s3]`). Off by default so a shared
+    /// bucket — where a lifecycle rule written for user uploads could quietly
+    /// expire the replicas — is a deliberate choice. Mirrors #1619.
+    #[serde(default)]
+    pub allow_shared_bucket: bool,
+
+    /// S3-compatible destination (`[replication.s3]`). Mutually exclusive with
+    /// [`path`](Self::path).
+    #[serde(default)]
+    pub s3: Option<ReplicationS3Config>,
+
+    /// Filesystem destination: a directory to replicate into. A second disk, an
+    /// NFS/SSHFS mount or a bind-mounted volume is a legitimate offsite target.
+    /// Mutually exclusive with [`s3`](Self::s3).
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rpo_secs: default_rpo_secs(),
+            sync_interval_secs: None,
+            snapshot_interval_secs: default_snapshot_interval_secs(),
+            max_wal_bytes: default_max_wal_bytes(),
+            retention_hours: default_retention_hours(),
+            verify_interval_secs: default_verify_interval_secs(),
+            prefix: None,
+            allow_shared_bucket: false,
+            s3: None,
+            path: None,
+        }
+    }
+}
+
+impl ReplicationConfig {
+    /// The effective ship interval: the explicit override, else half the RPO,
+    /// never less than one second.
+    #[must_use]
+    pub fn sync_interval(&self) -> std::time::Duration {
+        let secs = self
+            .sync_interval_secs
+            .unwrap_or_else(|| self.rpo_secs.div_euclid(2))
+            .max(1);
+        std::time::Duration::from_secs(secs)
+    }
+
+    /// The RPO as a duration, never zero.
+    #[must_use]
+    pub fn rpo(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.rpo_secs.max(1))
+    }
+
+    /// The periodic-verification interval, or `None` when disabled.
+    #[must_use]
+    pub fn verify_interval(&self) -> Option<std::time::Duration> {
+        (self.verify_interval_secs > 0)
+            .then(|| std::time::Duration::from_secs(self.verify_interval_secs))
+    }
+
+    /// Validate the section on its own terms, returning an operator-facing
+    /// message for each problem. Only meaningful when `enabled`.
+    #[must_use]
+    pub fn validation_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if !self.enabled {
+            return errors;
+        }
+        match (&self.s3, &self.path) {
+            (Some(_), Some(_)) => errors.push(
+                "[replication] configures both `s3` and `path`; pick exactly one destination"
+                    .to_owned(),
+            ),
+            (None, None) => errors.push(
+                "[replication] enabled = true but no destination is configured; add a \
+                 [replication.s3] section (bucket/region/endpoint plus *_env credential \
+                 indirection) or set `path` to a directory"
+                    .to_owned(),
+            ),
+            (Some(s3), None) => {
+                if s3.bucket.as_deref().unwrap_or("").trim().is_empty() {
+                    errors.push("[replication.s3] bucket is unset".to_owned());
+                }
+                if s3
+                    .access_key_id_env
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty()
+                    || s3
+                        .secret_access_key_env
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .is_empty()
+                {
+                    errors.push(
+                        "[replication.s3] needs access_key_id_env and secret_access_key_env \
+                         (the NAMES of the environment variables the credentials are read \
+                         from — never the credentials themselves)"
+                            .to_owned(),
+                    );
+                }
+            }
+            (None, Some(path)) => {
+                if path.trim().is_empty() {
+                    errors.push("[replication] path is empty".to_owned());
+                }
+            }
+        }
+        if self.rpo_secs == 0 {
+            errors.push("[replication] rpo_secs must be at least 1".to_owned());
+        }
+        // An explicit override longer than the RPO quietly invalidates the
+        // objective it sits next to: `rpo_secs = 10` with
+        // `sync_interval_secs = 60` ships once a minute and can lose nearly a
+        // minute of committed writes, while every surface — the docs, the health
+        // detail, the restore report — still promises ten seconds. Refuse the
+        // pair rather than letting the stricter-looking number be the wrong one.
+        if let Some(interval) = self.sync_interval_secs
+            && self.rpo_secs > 0
+            && interval > self.rpo_secs
+        {
+            errors.push(format!(
+                "[replication] sync_interval_secs ({interval}) must not exceed rpo_secs \
+                 ({}): shipping less often than the objective cannot meet it",
+                self.rpo_secs
+            ));
+        }
+        if self.retention_hours == 0 {
+            errors.push("[replication] retention_hours must be at least 1".to_owned());
+        }
+        if self.max_wal_bytes < 32 {
+            errors.push(
+                "[replication] max_wal_bytes must be at least 32 (the size of a WAL header)"
+                    .to_owned(),
+            );
+        }
+        errors
+    }
+}
+
+/// `[replication.s3]` — S3-compatible destination for continuous replication.
+///
+/// Same credential posture as `[backup.offsite.s3]`: the secrets are named by
+/// environment variable, never inlined into config, argv, logs, or errors.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ReplicationS3Config {
+    /// Target bucket.
+    #[serde(default)]
+    pub bucket: Option<String>,
+    /// Region for the `SigV4` credential scope (R2 uses `auto`).
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Custom endpoint URL. Required for non-AWS providers.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Environment variable the access-key id is read from.
+    #[serde(default)]
+    pub access_key_id_env: Option<String>,
+    /// Environment variable the secret access key is read from.
+    #[serde(default)]
+    pub secret_access_key_env: Option<String>,
+    /// Path-style addressing toggle (R2 / `MinIO` need this `true`).
+    #[serde(default)]
+    pub force_path_style: bool,
+}
+
+/// Default RPO: at most ten seconds of potential data loss (#1628 AC #2).
+const fn default_rpo_secs() -> u64 {
+    10
+}
+
+/// Default generation length: one hour.
+const fn default_snapshot_interval_secs() -> u64 {
+    3600
+}
+
+/// Default WAL ceiling before a checkpoint: 16 MiB.
+const fn default_max_wal_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
+/// Default point-in-time window: seven days.
+const fn default_retention_hours() -> u64 {
+    168
+}
+
+/// Default restore-verification cadence: every six hours.
+const fn default_verify_interval_secs() -> u64 {
+    21_600
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AutumnConfig {
     /// Active profile name (e.g., "dev", "prod", "staging").
@@ -1015,6 +1341,89 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub deploy: Option<DeployConfig>,
 
+    /// Deterministic replay capsule settings (`[failure_capture]` section,
+    /// issue #1598).
+    ///
+    /// Off by default. When enabled, each failing request is written to disk
+    /// as a replayable capsule; see [`FailureCaptureConfig`] and
+    /// `docs/guide/failure-capsules.md` (capsules contain real request data —
+    /// read the security section before turning this on).
+    ///
+    /// # Field ordering (load-bearing — do not move below `database`)
+    ///
+    /// Declared here, before [`database`](Self::database), for the same reason
+    /// [`deploy`](Self::deploy) is: `DatabaseConfig`'s `deserialize_with`
+    /// duration field aborts the `SchemaDeserializer` traversal, so a section
+    /// declared after it is recorded only as an opaque root leaf and strict
+    /// unknown-key validation never descends into its children. The regression
+    /// guard `failure_capture_child_keys_are_strictly_validated` fails if this
+    /// ordering breaks.
+    #[cfg(feature = "reporting")]
+    #[serde(default)]
+    pub failure_capture: FailureCaptureConfig,
+
+    /// Embedded self-clustering control plane (`[cluster]` section, issue
+    /// #1762).
+    ///
+    /// Off by default. See [`ClusterConfig`] and `docs/guide/clustering.md`.
+    ///
+    /// # Field ordering (load-bearing — do not move below `database`)
+    ///
+    /// Declared here, before [`database`](Self::database), for the same reason
+    /// [`deploy`](Self::deploy) and `failure_capture` (a field only present
+    /// with the `reporting` feature, hence not linked) are: `DatabaseConfig`'s
+    /// `deserialize_with` duration field aborts the
+    /// `SchemaDeserializer` traversal, so a section declared after it is
+    /// recorded only as an opaque root leaf and strict unknown-key validation
+    /// never descends into its children — a typo like
+    /// `[cluster] seed_peer = […]` would then be silently accepted. The
+    /// regression guard `cluster_child_keys_are_strictly_validated` fails if
+    /// this ordering breaks.
+    #[serde(default)]
+    pub cluster: ClusterConfig,
+
+    /// Live-traffic shadow mirroring and response diffing (`[shadow]` section,
+    /// issue #1653).
+    ///
+    /// Off by default. When enabled, a sampled slice of `GET`/`HEAD` traffic is
+    /// replayed against an operator-provided candidate build and the two
+    /// responses are diffed; see [`crate::shadow::ShadowConfig`] and
+    /// `docs/guide/staged-deploys.md`.
+    ///
+    /// # Field ordering (load-bearing — do not move below `database`)
+    ///
+    /// Declared here, before [`database`](Self::database), for the same reason
+    /// [`deploy`](Self::deploy) and `cluster` are: `DatabaseConfig`'s
+    /// `deserialize_with` duration field can abort the `SchemaDeserializer`
+    /// traversal, and a section it never descends into is recorded only as an
+    /// opaque root leaf — so a typo like `[shadow] targt = "…"` would be
+    /// silently accepted and the mirror would never run. The regression guard
+    /// `shadow_child_keys_are_strictly_validated` fails if this ordering breaks.
+    #[serde(default)]
+    pub shadow: crate::shadow::ShadowConfig,
+
+    /// App-metric registry limits (`[metrics]` section).
+    ///
+    /// The cardinality caps the call-site metrics facade
+    /// ([`crate::metrics`], #1378) enforces on an app's own instruments.
+    /// Every key defaults to the value the facade shipped with, so an app
+    /// with no `[metrics]` section behaves exactly as before.
+    ///
+    /// # Field ordering (load-bearing — do not move below `database`)
+    ///
+    /// Declared here, before [`database`](Self::database), for the same reason
+    /// [`deploy`](Self::deploy), `cluster` and [`shadow`](Self::shadow) are:
+    /// `DatabaseConfig`'s `deserialize_with` duration field aborts the
+    /// `SchemaDeserializer` traversal, so a section declared after it is
+    /// recorded only as an opaque root leaf and strict unknown-key validation
+    /// never descends into its children — a typo like
+    /// `[metrics] max_serie_per_metric = 500` would then be silently accepted
+    /// and the cap the operator meant to raise would stay at its default. The
+    /// regression guard `metrics_child_keys_are_strictly_validated` fails if
+    /// this ordering breaks.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+
     /// Database connection settings (URL, pool size, timeouts).
     #[serde(default)]
     pub database: DatabaseConfig,
@@ -1050,6 +1459,15 @@ pub struct AutumnConfig {
     /// Row-level multi-tenancy settings.
     #[serde(default)]
     pub tenancy: TenancyConfig,
+
+    /// Web Push settings (`[push]` section, issue #1392).
+    ///
+    /// Absent by default. The VAPID key it names is loaded and validated once
+    /// at boot — a key that is present but unusable fails the boot rather than
+    /// leaving the app running with push silently dead. See
+    /// [`crate::push::PushConfig`] and `docs/guide/web-push.md`.
+    #[serde(default)]
+    pub push: crate::push::PushConfig,
 
     /// HTTP idempotency-key middleware settings.
     #[serde(default)]
@@ -1118,6 +1536,13 @@ pub struct AutumnConfig {
     /// feature.
     #[serde(default)]
     pub backup: BackupConfig,
+    /// Continuous `SQLite` replication (`[replication]` section, issue #1628).
+    ///
+    /// `None` (the default) means the section is absent and nothing is
+    /// replicated. Boxed so an app that never replicates costs one pointer in
+    /// the app-run future rather than the whole section inline.
+    #[serde(default)]
+    pub replication: Option<Box<ReplicationConfig>>,
     /// Transactional email settings.
     #[cfg(feature = "mail")]
     #[serde(default)]
@@ -1243,6 +1668,17 @@ pub struct AutumnConfig {
     /// reads/writes still work through `Deref`/`DerefMut`.
     #[serde(default)]
     pub alerts: Box<crate::alerts::AlertConfig>,
+
+    /// Unified data-retention policy for framework-owned data
+    /// (`[retention]` section in `autumn.toml`, issue #1605).
+    ///
+    /// One retention window per framework-owned dataset (job history, job
+    /// tracking, idempotency records, experiment assignments, webhook replay
+    /// markers, sessions, audit archives). Every window is unset by default,
+    /// which preserves today's behavior exactly. See [`RetentionConfig`] and
+    /// `docs/guide/data-retention.md`.
+    #[serde(default)]
+    pub retention: RetentionConfig,
 }
 
 /// Opt-in TLS termination at the deploy-managed reverse proxy (`[deploy.tls]`
@@ -1291,6 +1727,9 @@ pub struct DeployTlsConfig {
 /// ```toml
 /// [deploy]
 /// host = "203.0.113.10"      # required at deploy time; SSH-reachable address
+/// # hosts = ["10.0.0.1", "10.0.0.2"]  # fleet alternative to `host` (#1621);
+/// #                                   # mutually exclusive with it, and the
+/// #                                   # order is the rollout order
 /// user = "deploy"            # SSH user (default: "root")
 /// ssh_port = 22              # SSH port (default: 22)
 /// app_name = "myapp"         # default: the crate's package name
@@ -1299,6 +1738,7 @@ pub struct DeployTlsConfig {
 /// readiness_timeout_secs = 60 # readiness window before rollback (default: 60)
 /// keep_releases = 3          # releases retained on the host (default: 3)
 /// profile = "prod"           # profile the deployed app runs under (default: "prod")
+/// install_proxy = true       # install the reverse proxy on a bare host (default: true)
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeployConfig {
@@ -1309,6 +1749,25 @@ pub struct DeployConfig {
     /// [`validate`](Self::validate).
     #[serde(default)]
     pub host: Option<String>,
+
+    /// SSH-reachable addresses of the target fleet, in rollout order (#1621).
+    ///
+    /// Mutually exclusive with [`host`](Self::host): a single-entry `hosts` list
+    /// is byte-for-byte the historical single-server deploy, and the order of the
+    /// list **is** the rollout order (a documented operator contract, not an
+    /// implementation detail — the fleet driver never sorts or regroups it).
+    /// Empty by default, so every pre-#1621 `[deploy]` table is unchanged.
+    ///
+    /// `[deploy.tls] host` stays fleet-singular: it is the PUBLIC DNS name the
+    /// certificate is issued for, semantically distinct from these SSH targets.
+    ///
+    /// Blank entries and duplicates (compared after trimming) are rejected, as is
+    /// setting this alongside `host`. The enforcing seam is the CLI's
+    /// `ResolvedFleet::resolve` — the only validation a deploy actually calls;
+    /// [`validate`](Self::validate) mirrors the same rules so the two never
+    /// disagree about what a valid `[deploy]` table looks like.
+    #[serde(default)]
+    pub hosts: Vec<String>,
 
     /// SSH user to connect as. Default: `"root"`.
     #[serde(default = "default_deploy_user")]
@@ -1354,12 +1813,37 @@ pub struct DeployConfig {
     /// the historical HTTP-only behavior. See [`DeployTlsConfig`].
     #[serde(default)]
     pub tls: DeployTlsConfig,
+
+    /// Whether `autumn deploy` may PREPARE the target host by installing the
+    /// reverse-proxy binary when the host has none. Default: `true` (issue #1607,
+    /// AC-1 — the documented target-host precondition is at most a stock Ubuntu
+    /// LTS with SSH access, so the command performs the remaining host preparation
+    /// itself).
+    ///
+    /// Probe-gated and idempotent: a host that already has a working proxy binary
+    /// is never touched, and a binary that responds but whose CLI surface has
+    /// drifted is never replaced (that stays a hard, actionable refusal).
+    ///
+    /// Set to `false` when you provision the proxy yourself — a pinned internal
+    /// build, your own package, or a host you do not want a container runtime
+    /// installed on. A missing binary is then an actionable deploy failure instead
+    /// of something the deploy fixes.
+    #[serde(default = "default_deploy_install_proxy")]
+    pub install_proxy: bool,
+}
+
+/// Default for [`DeployConfig::install_proxy`]: prepare the host (issue #1607).
+const fn default_deploy_install_proxy() -> bool {
+    true
 }
 
 impl Default for DeployConfig {
     fn default() -> Self {
         Self {
             host: None,
+            // #1621: empty, so an existing single-host `[deploy]` table (and the
+            // type default) is byte-for-byte unchanged.
+            hosts: Vec::new(),
             user: default_deploy_user(),
             ssh_port: default_deploy_ssh_port(),
             app_name: None,
@@ -1369,6 +1853,7 @@ impl Default for DeployConfig {
             keep_releases: default_deploy_keep_releases(),
             profile: default_deploy_profile(),
             tls: DeployTlsConfig::default(),
+            install_proxy: default_deploy_install_proxy(),
         }
     }
 }
@@ -1380,18 +1865,75 @@ impl DeployConfig {
     /// this rejects a missing or blank `host` with an actionable message so the
     /// operator knows exactly which key to set.
     ///
+    /// Since #1621 it also mirrors the fleet rules the CLI's
+    /// `ResolvedFleet::resolve` enforces — `host`/`hosts` mutual exclusion, no
+    /// blank entry, no duplicate entry — in the same order, so the two surfaces
+    /// never disagree about what a valid `[deploy]` table looks like.
+    ///
+    /// **This method has no production call site** (it is not reached from
+    /// [`AutumnConfig::validate`]); the CLI's resolve step is the enforcing seam.
+    /// Keep the rules here in sync anyway: a future wiring must not change
+    /// behavior.
+    ///
     /// # Errors
     ///
-    /// Returns a message when `host` is unset or empty.
+    /// Returns a message when `host` and `hosts` are both set, when a `hosts`
+    /// entry is blank or duplicated, or when neither key provides a target.
     pub fn validate(&self) -> Result<(), String> {
-        match self.host.as_deref() {
-            Some(host) if !host.trim().is_empty() => Ok(()),
-            _ => Err(
-                "[deploy] requires a target host: set `[deploy] host = \"<address>\"` in \
-                      autumn.toml to the SSH-reachable hostname or IP of your server"
+        let host = self
+            .host
+            .as_deref()
+            .map(str::trim)
+            .filter(|host| !host.is_empty());
+
+        // 1. Mutual exclusion: with both spellings set the rollout order is
+        //    ambiguous, so name BOTH keys and let the operator pick one.
+        if host.is_some() && !self.hosts.is_empty() {
+            return Err(
+                "[deploy] host and [deploy] hosts are mutually exclusive: keep the \
+                 single-server `[deploy] host = \"<address>\"` or the fleet list \
+                 `[deploy] hosts = [\"<address>\", …]` in autumn.toml, not both (#1621)"
                     .to_owned(),
-            ),
+            );
         }
+
+        // 2. A blank entry would resolve to a hostless SSH target mid-rollout.
+        for (index, entry) in self.hosts.iter().enumerate() {
+            if entry.trim().is_empty() {
+                return Err(format!(
+                    "[deploy] hosts entry {index} is blank: every fleet entry must be an \
+                     SSH-reachable hostname or IP (#1621)"
+                ));
+            }
+        }
+
+        // 3. A duplicate would deploy the same server twice — the second pass sees
+        //    its own new release as live and corrupts the previous-release chain a
+        //    rollback depends on. Compared after trimming; DNS aliases are a
+        //    documented limitation.
+        let mut seen: Vec<&str> = Vec::with_capacity(self.hosts.len());
+        for entry in &self.hosts {
+            let trimmed = entry.trim();
+            if seen.contains(&trimmed) {
+                return Err(format!(
+                    "[deploy] hosts lists `{trimmed}` more than once: each fleet host must \
+                     appear exactly once (#1621)"
+                ));
+            }
+            seen.push(trimmed);
+        }
+
+        // 4. Neither spelling provides a target.
+        if host.is_none() && self.hosts.is_empty() {
+            return Err(
+                "[deploy] requires a target host: set `[deploy] host = \"<address>\"` in \
+                      autumn.toml to the SSH-reachable hostname or IP of your server, or \
+                      `[deploy] hosts = [\"<address>\", …]` for a fleet (#1621)"
+                    .to_owned(),
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -1549,6 +2091,99 @@ const fn default_reporting_enabled() -> bool {
 #[cfg(feature = "reporting")]
 const fn default_reporting_sample_rate() -> f64 {
     1.0
+}
+
+/// Deterministic replay capsule settings (`[failure_capture]` section in
+/// `autumn.toml`, issue #1598).
+///
+/// # Example `autumn.toml`
+///
+/// ```toml
+/// [failure_capture]
+/// enabled = true                  # record capsules for failing requests (default: false)
+/// dir = "tmp/autumn-capsules"     # where capsules are written (project-relative)
+/// max_body_bytes = 65536          # largest request body copied into a capsule
+/// max_capsule_bytes = 1048576     # effect budget before a capsule is marked truncated
+/// max_capsules = 50               # retained capsules; oldest are pruned
+/// ```
+///
+/// **A capsule holds real production request data and real database rows.**
+/// Sensitive headers, query parameters and structured body fields are masked
+/// through `[log] filter_parameters`, but unstructured bodies, URL paths and
+/// result rows are not. Read `docs/guide/failure-capsules.md` before enabling
+/// this outside development.
+#[cfg(feature = "reporting")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct FailureCaptureConfig {
+    /// Whether failing requests are recorded as capsules.
+    ///
+    /// Defaults to `false` — capture costs a teed request body and a
+    /// teed database stream on every request, and the artifacts contain
+    /// production data.
+    #[serde(default = "default_failure_capture_enabled")]
+    pub enabled: bool,
+
+    /// Directory capsules are written to, project-relative by default
+    /// (mirroring `tmp/autumn-maintenance.json`).
+    #[serde(default = "default_failure_capture_dir")]
+    pub dir: String,
+
+    /// Largest request body copied into a capsule, in bytes.
+    ///
+    /// A body larger than this is never consumed at all — the handler still
+    /// receives it intact and the capsule records it as skipped.
+    #[serde(default = "default_failure_capture_max_body_bytes")]
+    pub max_body_bytes: usize,
+
+    /// Budget for recorded effects before a capsule is marked truncated.
+    ///
+    /// Recording stops at the ceiling; the capsule is still written (so the
+    /// failure is not lost) but replay refuses it.
+    #[serde(default = "default_failure_capture_max_capsule_bytes")]
+    pub max_capsule_bytes: usize,
+
+    /// How many capsules to retain in `dir`; the oldest beyond this are
+    /// pruned after each write so an error storm cannot fill a disk.
+    #[serde(default = "default_failure_capture_max_capsules")]
+    pub max_capsules: usize,
+}
+
+#[cfg(feature = "reporting")]
+impl Default for FailureCaptureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_failure_capture_enabled(),
+            dir: default_failure_capture_dir(),
+            max_body_bytes: default_failure_capture_max_body_bytes(),
+            max_capsule_bytes: default_failure_capture_max_capsule_bytes(),
+            max_capsules: default_failure_capture_max_capsules(),
+        }
+    }
+}
+
+#[cfg(feature = "reporting")]
+const fn default_failure_capture_enabled() -> bool {
+    false
+}
+
+#[cfg(feature = "reporting")]
+fn default_failure_capture_dir() -> String {
+    "tmp/autumn-capsules".to_owned()
+}
+
+#[cfg(feature = "reporting")]
+const fn default_failure_capture_max_body_bytes() -> usize {
+    65_536
+}
+
+#[cfg(feature = "reporting")]
+const fn default_failure_capture_max_capsule_bytes() -> usize {
+    1_048_576
+}
+
+#[cfg(feature = "reporting")]
+const fn default_failure_capture_max_capsules() -> usize {
+    50
 }
 
 /// Developer-experience settings (`[dev]` section in `autumn.toml`).
@@ -1788,6 +2423,307 @@ fn default_channels_redis_prefix() -> String {
     "autumn:channels".to_owned()
 }
 
+// ── Cluster configuration ────────────────────────────────────────────────────
+
+/// Embedded self-clustering control plane (`[cluster]` section, issue #1762).
+///
+/// Off by default. When enabled, the node binds a small authenticated gossip
+/// listener, discovers the peers named in `seed_peers`, and exposes a
+/// cluster-wide counter through
+/// [`ClusterHandle`](crate::cluster::ClusterHandle). No external coordination
+/// service is involved — see `docs/guide/clustering.md`.
+///
+/// The transport is **authenticated (HMAC-SHA256), not encrypted**: run it on a
+/// trusted network.
+///
+/// Unrelated to [`crate::sharding`]'s database-"cluster" vocabulary.
+///
+/// # Examples
+///
+/// ```toml
+/// [cluster]
+/// enabled = true
+/// secret = "a-shared-secret-at-least-16-bytes"
+/// bind_addr = "0.0.0.0:7946"
+/// advertise_addr = "10.0.0.4:7946"
+/// seed_peers = ["10.0.0.5:7946"]
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClusterConfig {
+    /// Master switch. When `false` (the default) nothing is bound, nothing is
+    /// spawned, and `state.extension::<ClusterHandle>()` is `None`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Shared secret every member signs its frames with (minimum 16 bytes).
+    ///
+    /// Stored as a [`secrecy::SecretString`] so the raw value is redacted from
+    /// `Debug` output and zeroized on drop. Call
+    /// [`secrecy::ExposeSecret::expose_secret`] at the point of use.
+    #[serde(default)]
+    pub secret: Option<secrecy::SecretString>,
+
+    /// Cluster name. Signed into every frame, so two clusters that share a
+    /// secret still refuse each other's traffic.
+    #[serde(default = "default_cluster_name")]
+    pub cluster_name: String,
+
+    /// Address the cluster listener binds. Port `0` takes an OS-assigned
+    /// ephemeral port, readable back through `ClusterHandle::local_addr`.
+    #[serde(default = "default_cluster_bind_addr")]
+    pub bind_addr: String,
+
+    /// Address advertised to peers when it differs from `bind_addr` (NAT,
+    /// container port mapping). Defaults to the bound address.
+    #[serde(default)]
+    pub advertise_addr: Option<String>,
+
+    /// Peer addresses to dial on startup. One reachable seed is enough.
+    #[serde(default)]
+    pub seed_peers: Vec<String>,
+
+    /// Explicit node id. Entropy-derived when absent (never hostname-derived).
+    #[serde(default)]
+    pub node_id: Option<String>,
+
+    /// Base interval between state pushes, in milliseconds. The push is also
+    /// the heartbeat, so this is the failure-detector's sampling rate.
+    #[serde(default = "default_cluster_push_interval_ms")]
+    pub push_interval_ms: u64,
+
+    /// How long without a push before a peer is suspected, in milliseconds.
+    /// Must be at least three push intervals (anti-flap hysteresis).
+    #[serde(default = "default_cluster_suspicion_timeout_ms")]
+    pub suspicion_timeout_ms: u64,
+}
+
+fn default_cluster_name() -> String {
+    "autumn".to_owned()
+}
+
+fn default_cluster_bind_addr() -> String {
+    "127.0.0.1:0".to_owned()
+}
+
+const fn default_cluster_push_interval_ms() -> u64 {
+    500
+}
+
+const fn default_cluster_suspicion_timeout_ms() -> u64 {
+    2_500
+}
+
+/// Shortest secret accepted when `[cluster] enabled = true`.
+pub(crate) const MIN_CLUSTER_SECRET_LEN: usize = 16;
+
+/// Shortest push interval accepted, in milliseconds.
+pub(crate) const MIN_CLUSTER_PUSH_INTERVAL_MS: u64 = 10;
+
+/// The suspicion timeout must be at least this many push intervals.
+pub(crate) const MIN_CLUSTER_SUSPICION_MULTIPLE: u64 = 3;
+
+/// Longest `node_id` / `cluster_name` accepted, in bytes.
+///
+/// Both travel in every frame and are covered by the MAC, so the bound keeps
+/// the fixed overhead of a state push small and predictable.
+pub(crate) const MAX_CLUSTER_IDENT_LEN: usize = 64;
+
+/// Separator between node id and incarnation in a counter cell key
+/// (`"{node_id}#{incarnation}"`). Reserved: an id containing it would make
+/// cell keys ambiguous, so validation refuses one.
+pub(crate) const CLUSTER_CELL_KEY_SEPARATOR: char = '#';
+
+/// Validate one identity string (`cluster.node_id`, `cluster.cluster_name`).
+///
+/// `field` is the dotted config path, used verbatim in the message so an
+/// operator can fix the offending key without reading the source.
+fn validate_cluster_ident(field: &str, value: &str) -> Result<(), ConfigError> {
+    if value.trim().is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "{field} must not be empty: it identifies this node (or its cluster) in every frame"
+        )));
+    }
+    let len = value.len();
+    if len > MAX_CLUSTER_IDENT_LEN {
+        return Err(ConfigError::Validation(format!(
+            "{field} must be at most {MAX_CLUSTER_IDENT_LEN} bytes, got {len} ({value:?}); it \
+             travels in every cluster frame and is covered by the MAC"
+        )));
+    }
+    if value.contains(CLUSTER_CELL_KEY_SEPARATOR) {
+        return Err(ConfigError::Validation(format!(
+            "{field} must not contain {CLUSTER_CELL_KEY_SEPARATOR:?} ({value:?}): it separates \
+             the node id from the incarnation in counter cell keys, and an id containing it \
+             would make two different cells collide"
+        )));
+    }
+    Ok(())
+}
+
+/// Parse a cluster address, rejecting anything that is not a `host:port` pair
+/// with an IP literal (hostnames are never resolved).
+fn parse_cluster_addr(field: &str, value: &str) -> Result<std::net::SocketAddr, ConfigError> {
+    value.parse::<std::net::SocketAddr>().map_err(|error| {
+        ConfigError::Validation(format!(
+            "{field} must be a socket address of the form host:port with an IP literal \
+             (hostnames are not resolved), got {value:?}: {error}"
+        ))
+    })
+}
+
+/// Reject port `0` on an address somebody has to *dial*.
+///
+/// Port `0` is only meaningful on `bind_addr`, where it means "let the OS pick"
+/// and the node then advertises the port it actually got. Everywhere else it is
+/// undialable: a peer would connect to port 0 and fail forever, and the mistake
+/// looks exactly like a network problem from the other side.
+fn reject_ephemeral_cluster_port(
+    field: &str,
+    value: &str,
+    addr: std::net::SocketAddr,
+) -> Result<(), ConfigError> {
+    if addr.port() == 0 {
+        return Err(ConfigError::Validation(format!(
+            "{field} is {value:?}, which no peer can dial: port 0 means \"any free port\" and is \
+             only meaningful on cluster.bind_addr, where the node advertises the port it was \
+             actually given (see docs/guide/clustering.md)"
+        )));
+    }
+    Ok(())
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            secret: None,
+            cluster_name: default_cluster_name(),
+            bind_addr: default_cluster_bind_addr(),
+            advertise_addr: None,
+            seed_peers: Vec::new(),
+            node_id: None,
+            push_interval_ms: default_cluster_push_interval_ms(),
+            suspicion_timeout_ms: default_cluster_suspicion_timeout_ms(),
+        }
+    }
+}
+
+impl ClusterConfig {
+    /// Fail fast on a `[cluster]` section that would boot an insecure or
+    /// flapping cluster.
+    ///
+    /// Checked when `enabled` — these are about a node that will really bind
+    /// and gossip:
+    /// - `secret` must be present and at least 16 bytes. There is no lenient
+    ///   unauthenticated mode.
+    /// - The address peers are told to dial (`advertise_addr`, or `bind_addr`
+    ///   when it is unset) must not be a wildcard: nobody can dial `0.0.0.0`.
+    ///
+    /// Checked always, enabled or not — a section that is wrong is wrong
+    /// before the switch is flipped:
+    /// - `push_interval_ms` must be at least 10ms.
+    /// - `suspicion_timeout_ms` must be at least 3 × `push_interval_ms`: the
+    ///   anti-flap hysteresis, below which one delayed push evicts a healthy
+    ///   peer.
+    /// - `bind_addr`, `advertise_addr` and every `seed_peers` entry must parse
+    ///   as a [`std::net::SocketAddr`] (IP literal — hostnames are not
+    ///   resolved).
+    /// - `cluster_name`, and `node_id` when set, must be non-empty, at most 64
+    ///   bytes, and free of the `#` counter cell-key separator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] describing the first violated rule.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        // Operational rules: only meaningful for a node that will actually
+        // bind and gossip.
+        if self.enabled {
+            self.validate_secret()?;
+        }
+
+        if self.push_interval_ms < MIN_CLUSTER_PUSH_INTERVAL_MS {
+            return Err(ConfigError::Validation(format!(
+                "cluster.push_interval_ms must be at least {MIN_CLUSTER_PUSH_INTERVAL_MS}ms, \
+                 got {}",
+                self.push_interval_ms
+            )));
+        }
+        // Saturating: a push interval near u64::MAX would overflow the
+        // multiply, and an overflow must not turn into an accidental pass.
+        let min_suspicion = self
+            .push_interval_ms
+            .saturating_mul(MIN_CLUSTER_SUSPICION_MULTIPLE);
+        if self.suspicion_timeout_ms < min_suspicion {
+            return Err(ConfigError::Validation(format!(
+                "cluster.suspicion_timeout_ms ({}) must be at least \
+                 {MIN_CLUSTER_SUSPICION_MULTIPLE}x cluster.push_interval_ms ({}), i.e. at least \
+                 {min_suspicion}ms: below that ratio one delayed push evicts a healthy peer and \
+                 the view flaps",
+                self.suspicion_timeout_ms, self.push_interval_ms
+            )));
+        }
+
+        validate_cluster_ident("cluster.cluster_name", &self.cluster_name)?;
+        if let Some(node_id) = self.node_id.as_deref() {
+            validate_cluster_ident("cluster.node_id", node_id)?;
+        }
+
+        // `bind_addr` may keep port 0 — that is the documented "ephemeral bind"
+        // spelling, read back through `ClusterHandle::local_addr`.
+        let bind_addr = parse_cluster_addr("cluster.bind_addr", &self.bind_addr)?;
+        let advertise_addr = match self.advertise_addr.as_deref() {
+            Some(addr) => {
+                let parsed = parse_cluster_addr("cluster.advertise_addr", addr)?;
+                reject_ephemeral_cluster_port("cluster.advertise_addr", addr, parsed)?;
+                parsed
+            }
+            None => bind_addr,
+        };
+        for (index, peer) in self.seed_peers.iter().enumerate() {
+            let field = format!("cluster.seed_peers[{index}]");
+            let parsed = parse_cluster_addr(&field, peer)?;
+            reject_ephemeral_cluster_port(&field, peer, parsed)?;
+        }
+
+        // A wildcard bind is legal, advertising one is not: peers copy the
+        // advertised address out of the pushed state and dial it verbatim.
+        if self.enabled && advertise_addr.ip().is_unspecified() {
+            let source = if self.advertise_addr.is_some() {
+                "cluster.advertise_addr"
+            } else {
+                "cluster.bind_addr"
+            };
+            return Err(ConfigError::Validation(format!(
+                "{source} advertises {advertise_addr}, which no peer can dial: binding a \
+                 wildcard address is fine, but it requires an explicit, non-wildcard \
+                 cluster.advertise_addr (see docs/guide/clustering.md)"
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// The shared HMAC key: required, and long enough to be a key.
+    fn validate_secret(&self) -> Result<(), ConfigError> {
+        let Some(secret) = self.secret.as_ref() else {
+            return Err(ConfigError::Validation(
+                "cluster.secret is required when cluster.enabled = true: the cluster transport \
+                 is authenticated (HMAC-SHA256) and has no unauthenticated mode — set it with \
+                 AUTUMN_CLUSTER__SECRET"
+                    .to_owned(),
+            ));
+        };
+        let len = secrecy::ExposeSecret::expose_secret(secret).len();
+        if len < MIN_CLUSTER_SECRET_LEN {
+            return Err(ConfigError::Validation(format!(
+                "cluster.secret must be at least {MIN_CLUSTER_SECRET_LEN} bytes, got {len}: a \
+                 short shared key is a guessable one, and every member signs every frame with it"
+            )));
+        }
+        Ok(())
+    }
+}
+
 // ── Cache configuration ──────────────────────────────────────────────────────
 
 /// Cache backend selection for `#[cached]` and `CacheResponseLayer`.
@@ -1886,6 +2822,13 @@ pub enum SchedulerBackend {
     InProcess,
     /// Fleet coordination with Postgres advisory locks.
     Postgres,
+    /// Single-host coordination with a `SQLite` lease table (issue #1907).
+    ///
+    /// Each `(task, tick)` is leased in the app's own database file, so several
+    /// processes on one host elect exactly one leader per tick. `SQLite` has no
+    /// advisory locks, and a `SQLite` deployment is single-host by definition.
+    #[serde(alias = "single_host")]
+    Sqlite,
 }
 
 impl SchedulerBackend {
@@ -1895,8 +2838,23 @@ impl SchedulerBackend {
         match value.trim().to_ascii_lowercase().as_str() {
             "in_process" | "in-process" | "local" | "memory" => Some(Self::InProcess),
             "postgres" | "postgresql" => Some(Self::Postgres),
+            "sqlite" | "single_host" | "single-host" => Some(Self::Sqlite),
             _ => None,
         }
+    }
+
+    /// Whether this CONFIGURED backend coordinates across a fleet of
+    /// replicas, rather than a single process.
+    ///
+    /// Named so call sites (issue #1864) — like the ACME renewal spawn site,
+    /// which must ask this even when it had to fall back to an in-process
+    /// [`crate::scheduler::SchedulerCoordinator`] after a construction error —
+    /// read as intent rather than an inline enum match. See
+    /// [`crate::scheduler::SchedulerCoordinator::is_fleet_distributed`] for
+    /// the equivalent query on an actually-built coordinator instance.
+    #[must_use]
+    pub const fn is_fleet_distributed(self) -> bool {
+        matches!(self, Self::Postgres | Self::Sqlite)
     }
 }
 
@@ -1984,7 +2942,11 @@ impl ProcessRole {
 /// A split role runs the HTTP tier and the job/scheduler tier in **separate
 /// processes**, so it needs a jobs backend the two processes can share. Only the
 /// recognized durable backends [`start_runtime`](crate::job::start_runtime)
-/// dispatches to durably — exactly `"postgres"` or `"redis"` — qualify. Every
+/// dispatches to durably — exactly `"postgres"`, `"redis"`, or `"sqlite"` —
+/// qualify. The `"sqlite"` queue is a table in the app's own database file, so
+/// two processes on the **same host** share it; a `SQLite` deployment is
+/// single-host by definition, and a multi-replica `SQLite` topology is already
+/// refused at boot (issue #1907). Every
 /// other value (the in-process `"local"` queue, a typo like `"postgresql"`, or a
 /// blank backend) falls through to the per-process local runtime, where a
 /// [`Web`](ProcessRole::Web) replica would enqueue into a queue no separate
@@ -1994,9 +2956,326 @@ impl ProcessRole {
 ///
 /// The combined role is always valid because it enqueues and drains in one
 /// process. Returns `true` when the combination is **invalid**.
+///
+/// This answers only the *backend shape*. `sqlite` also needs a file-backed
+/// database to be shareable at all — see
+/// [`split_role_requires_file_backed_sqlite`], which the boot guard checks
+/// alongside this one.
 #[must_use]
 pub fn split_role_requires_durable_backend(role: ProcessRole, jobs_backend: &str) -> bool {
-    role != ProcessRole::Combined && !matches!(jobs_backend, "postgres" | "redis")
+    role != ProcessRole::Combined && !matches!(jobs_backend, "postgres" | "redis" | "sqlite")
+}
+
+/// Whether a `SQLite` target is in memory rather than a file.
+///
+/// An in-memory database is private to the process that opened it — even the
+/// `cache=shared` spellings, which share only within one process. Nothing
+/// written by one process is visible to another.
+///
+/// Deliberately self-contained rather than calling `crate::db`'s equivalent:
+/// that one is gated on the `sqlite` feature, and this has to answer for
+/// `autumn doctor`, which reads a `sqlite://` config from a Postgres build.
+/// The two must agree on the spellings; see
+/// `crate::db::sqlite_target_is_any_in_memory`.
+#[must_use]
+pub fn is_in_memory_sqlite_target(url: &str) -> bool {
+    if url.starts_with("file:") {
+        return url == "file::memory:"
+            || url.starts_with("file::memory:?")
+            || url.contains("mode=memory");
+    }
+    let target = url
+        .strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"))
+        .unwrap_or(url);
+    // An empty target is in memory too: a bare `sqlite://` or `sqlite:` names
+    // no file, and `crate::db::normalize_sqlite_target` turns it into
+    // `:memory:` before handing it to `sqlite3_open`.
+    target.is_empty()
+        || target == ":memory:"
+        || target == "file::memory:"
+        || target.starts_with("file::memory:?")
+        || target.contains("mode=memory")
+}
+
+/// Whether a split role on the `SQLite` jobs backend is invalid because the
+/// database is in memory (issue #1907).
+///
+/// The `sqlite` queue is durable enough for a split web/worker topology only
+/// because both processes open the same **file**. Against an in-memory target
+/// each process gets its own database, so the web replica enqueues into a queue
+/// the worker can never see and every job is silently stranded — the exact
+/// failure [`split_role_requires_durable_backend`] exists to prevent, which it
+/// cannot see because it is given only the backend name.
+///
+/// `None` for `database_url` answers `false`: a `sqlite` backend with no
+/// database configured fails earlier, with its own error.
+#[must_use]
+pub fn split_role_requires_file_backed_sqlite(
+    role: ProcessRole,
+    jobs_backend: &str,
+    database_url: Option<&str>,
+) -> bool {
+    role != ProcessRole::Combined
+        && jobs_backend == "sqlite"
+        && database_url.is_some_and(is_in_memory_sqlite_target)
+}
+
+/// `[retention]` — one retention window per framework-owned dataset
+/// (issue #1605).
+///
+/// Autumn creates and fills tables and stores the application never asked
+/// for: the job queue and its tracking records, idempotency replay records,
+/// sticky experiment assignments, webhook replay markers, sessions, and audit
+/// archives. Being batteries-included means owning their lifecycle. This
+/// section is the single place an operator declares how long each of those
+/// datasets is kept; the framework then enforces it on a recurring in-process
+/// sweep with no external cron.
+///
+/// Every window defaults to `None`, which means **exactly today's behavior**
+/// for that dataset — nothing is swept and no sweep task is even registered
+/// unless at least one window is set.
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [retention]
+/// sweep_interval         = "1h"    # how often the sweep runs (default "1h")
+/// job_history            = "90d"   # terminal rows in `autumn_jobs`
+/// commit_hooks           = "30d"   # terminal `#[after_commit]` hook rows
+/// job_tracking           = "7d"    # `autumn_job_tracking` records
+/// idempotency            = "2d"    # stored idempotency responses
+/// experiment_assignments = "365d"  # `autumn_experiment_assignments`
+/// webhook_replay         = "3d"    # inbound webhook replay markers
+/// sessions               = "30d"   # server-side session records
+/// audit_archives         = "400d"  # JSONL audit archive entries
+/// custom_domains         = "30d"   # tenant domains never verified since
+/// ```
+///
+/// Durations use the same syntax as `#[scheduled(every = ...)]`: `s`/`m`/`h`/
+/// `d`, optionally compound (`"1h 30m"`).
+///
+/// See `docs/guide/data-retention.md` for the full dataset table, the
+/// precedence rule against `jobs.tracking.ttl_secs` / `idempotency.ttl_secs`,
+/// and the `autumn db retention` CLI.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetentionConfig {
+    /// How often the framework retention sweep runs. Default: `"1h"`.
+    ///
+    /// Only consulted when at least one dataset window is set — with none set
+    /// no sweep task is registered at all.
+    #[serde(default = "default_retention_sweep_interval")]
+    pub sweep_interval: String,
+
+    /// Terminal (`completed`/`failed`/`discarded`) rows in `autumn_jobs`,
+    /// measured from `finished_at`. Unset (default): job history is kept
+    /// forever.
+    ///
+    /// Live rows — enqueued, running, or retrying — are never touched
+    /// regardless of age, and neither is a row still holding a
+    /// `#[job(unique, unique_for_ms = ...)]` dedup key. Note that `failed` is
+    /// also the dead-letter state a `autumn jobs retry` replays from, so a
+    /// window here bounds how long a dead letter stays replayable; see
+    /// `docs/guide/data-retention.md`.
+    #[serde(default)]
+    pub job_history: Option<String>,
+
+    /// Terminal rows in the `#[after_commit]` hook queue,
+    /// `autumn_repository_commit_hooks`, measured from `finished_at`. Unset
+    /// (default): kept forever.
+    #[serde(default)]
+    pub commit_hooks: Option<String>,
+
+    /// `autumn_job_tracking` progress/result records, measured from
+    /// `updated_at`. Unset (default): rows live until their
+    /// `jobs.tracking.ttl_secs` expiry, which the existing sweep already
+    /// enforces.
+    ///
+    /// When both are set the **shorter** bound wins; see
+    /// `docs/guide/data-retention.md`.
+    #[serde(default)]
+    pub job_tracking: Option<String>,
+
+    /// Stored idempotency-key responses, measured from when they were
+    /// written. Unset (default): records live for `idempotency.ttl_secs`.
+    ///
+    /// Idempotency backends expire their own records, so this window is
+    /// enforced by capping the record TTL at write time rather than by a
+    /// sweep. When both are set the **shorter** bound wins.
+    #[serde(default)]
+    pub idempotency: Option<String>,
+
+    /// Sticky `autumn_experiment_assignments` rows, measured from
+    /// `assigned_at`. Unset (default): assignments are kept forever.
+    #[serde(default)]
+    pub experiment_assignments: Option<String>,
+
+    /// Inbound webhook replay markers, measured from when they were
+    /// recorded. Unset (default): markers live for the endpoint's
+    /// `replay_window_secs`.
+    ///
+    /// Enforced by capping the marker TTL, as for [`Self::idempotency`].
+    #[serde(default)]
+    pub webhook_replay: Option<String>,
+
+    /// Server-side session records, measured from their last write. Unset
+    /// (default): the session backend's own expiry applies (which, for the
+    /// in-memory store, is no expiry at all).
+    #[serde(default)]
+    pub sessions: Option<String>,
+
+    /// Entries in the JSONL audit archive, measured from each event's
+    /// `timestamp`. Unset (default): audit archives are kept forever.
+    ///
+    /// Enforced by rewriting the archive file in place (atomically), so it
+    /// only applies to sinks that support purging — today
+    /// [`crate::audit::JsonlFileAuditSink`].
+    #[serde(default)]
+    pub audit_archives: Option<String>,
+
+    /// Tenant custom-domain registrations that never reached DNS
+    /// verification, measured from registration. Unset (default): a pending
+    /// registration is kept until the app offboards it.
+    ///
+    /// Never touches a domain that verified: an active domain is live
+    /// configuration, not aged data. Orphaned certificates — a stored pair for
+    /// a hostname no longer registered — are pruned by the same sweep
+    /// regardless of this window, since there is no record left to age.
+    #[serde(default)]
+    pub custom_domains: Option<String>,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            sweep_interval: default_retention_sweep_interval(),
+            job_history: None,
+            commit_hooks: None,
+            job_tracking: None,
+            idempotency: None,
+            experiment_assignments: None,
+            webhook_replay: None,
+            sessions: None,
+            audit_archives: None,
+            custom_domains: None,
+        }
+    }
+}
+
+fn default_retention_sweep_interval() -> String {
+    "1h".to_owned()
+}
+
+impl RetentionConfig {
+    /// Every `(config key, window)` pair, in the order the CLI reports them.
+    ///
+    /// The single source of truth that keeps the config surface, the dataset
+    /// registry in [`crate::data_retention`], the CLI report, and the docs
+    /// table from drifting apart: adding a field here without adding the
+    /// matching dataset fails a test in `crate::data_retention`.
+    #[must_use]
+    pub fn windows(&self) -> [(&'static str, Option<&str>); 9] {
+        [
+            ("job_history", self.job_history.as_deref()),
+            ("commit_hooks", self.commit_hooks.as_deref()),
+            ("job_tracking", self.job_tracking.as_deref()),
+            ("idempotency", self.idempotency.as_deref()),
+            (
+                "experiment_assignments",
+                self.experiment_assignments.as_deref(),
+            ),
+            ("webhook_replay", self.webhook_replay.as_deref()),
+            ("sessions", self.sessions.as_deref()),
+            ("audit_archives", self.audit_archives.as_deref()),
+            ("custom_domains", self.custom_domains.as_deref()),
+        ]
+    }
+
+    /// `true` when at least one dataset declares a retention window.
+    ///
+    /// When this is `false` no sweep task is registered and no framework
+    /// behavior changes — AC #1's "leaving a dataset unset preserves today's
+    /// behavior exactly", enforced structurally rather than by each sweeper
+    /// remembering to check.
+    #[must_use]
+    pub fn any_window_configured(&self) -> bool {
+        self.windows().iter().any(|(_, window)| window.is_some())
+    }
+
+    /// The configured window for one dataset key, already parsed.
+    ///
+    /// Returns `None` both when the dataset is unset and when its value does
+    /// not parse — [`Self::validate`] rejects the latter at boot, so a
+    /// running app never reaches this with an unparseable value.
+    #[must_use]
+    pub fn window(&self, key: &str) -> Option<std::time::Duration> {
+        self.windows()
+            .into_iter()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, window)| window)
+            .and_then(crate::task::parse_duration)
+    }
+
+    /// How often the sweep runs, already parsed. Falls back to one hour when
+    /// unparseable ([`Self::validate`] rejects that at boot).
+    #[must_use]
+    pub fn sweep_interval_duration(&self) -> std::time::Duration {
+        crate::task::parse_duration(&self.sweep_interval)
+            .unwrap_or(std::time::Duration::from_secs(3_600))
+    }
+
+    /// Validate every declared window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] when a window (or the sweep
+    /// interval) is not a valid duration string, or resolves to zero — a zero
+    /// window would purge a dataset the instant it was written, which is
+    /// never what an operator means and is not something to guess at.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (key, window) in self.windows() {
+            let Some(raw) = window else { continue };
+            // One message, not two: `parse_duration` already returns `None`
+            // for a syntactically valid but zero total ("0s"), so a separate
+            // "resolves to zero" branch would be unreachable. State what is
+            // required — valid *and* non-zero — and why zero is refused.
+            let Some(parsed) = crate::task::parse_duration(raw) else {
+                return Err(ConfigError::Validation(format!(
+                    "retention.{key} = {raw:?} is not a valid non-zero duration: use a \
+                     string like \"90d\", \"12h\", or \"1h 30m\". A zero window would \
+                     purge the dataset as soon as it is written; remove the key entirely \
+                     to keep today's behavior (see docs/guide/data-retention.md)"
+                )));
+            };
+            // The sweep binds its cutoff as `NOW() - make_interval(secs => $1)`
+            // with a `u32`-representable value. Rejecting anything larger here
+            // keeps the configured window and the window the database actually
+            // applies identical — silently clamping would delete rows the
+            // report claimed were still inside the policy. 136 years is far
+            // past any real retention policy, so this only ever catches a typo.
+            if parsed.as_secs() > u64::from(u32::MAX) {
+                return Err(ConfigError::Validation(format!(
+                    "retention.{key} = {raw:?} is longer than the maximum supported \
+                     retention window ({} years). Remove the key entirely to keep the \
+                     data forever, which is what a window that long means in practice \
+                     (see docs/guide/data-retention.md)",
+                    u64::from(u32::MAX) / (365 * 86_400)
+                )));
+            }
+        }
+
+        // Only meaningful once something is actually swept, but validated
+        // unconditionally so a typo is caught the first time it is written
+        // rather than the first time a window is added next to it.
+        if crate::task::parse_duration(&self.sweep_interval).is_none() {
+            return Err(ConfigError::Validation(format!(
+                "retention.sweep_interval = {:?} is not a valid non-zero duration: use a \
+                 string like \"1h\" or \"30m\" (see docs/guide/data-retention.md)",
+                self.sweep_interval
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Scheduled task coordination runtime configuration.
@@ -2223,6 +3502,8 @@ pub struct JobConfig {
     /// - `local` (default): in-process Tokio queue
     /// - `postgres`: Postgres-backed durable queue (requires `db` feature)
     /// - `redis`: Redis-backed durable queue (requires `redis` feature)
+    /// - `sqlite`: durable queue in the app's own `SQLite` file (requires the
+    ///   `sqlite` feature)
     #[serde(default = "default_job_backend")]
     pub backend: String,
     /// Number of concurrent worker loops to spawn.
@@ -2250,12 +3531,21 @@ pub struct JobConfig {
     /// ignored. Set from `AUTUMN_JOBS__PIN` (comma-separated) too.
     #[serde(default)]
     pub pin: Vec<String>,
+    /// Declared worker-fleet topology, read by `autumn doctor` to prove
+    /// topology-wide queue coverage (issue #1623, AC6). Purely declarative: the
+    /// running process never acts on it — it describes the *other* tiers, which
+    /// a single process cannot observe.
+    #[serde(default)]
+    pub fleet: JobFleetConfig,
     /// Redis backend options.
     #[serde(default)]
     pub redis: JobRedisConfig,
     /// Postgres backend options.
     #[serde(default)]
     pub postgres: JobPostgresConfig,
+    /// `SQLite` backend options.
+    #[serde(default)]
+    pub sqlite: JobSqliteConfig,
     /// Tracked-job progress/result store options (`enqueue_tracked`, the
     /// built-in `GET /_autumn/jobs/{token}` status route).
     #[serde(default)]
@@ -2271,8 +3561,10 @@ impl Default for JobConfig {
             initial_backoff_ms: default_job_backoff_ms(),
             queues: JobQueuesConfig::default(),
             pin: Vec::new(),
+            fleet: JobFleetConfig::default(),
             redis: JobRedisConfig::default(),
             postgres: JobPostgresConfig::default(),
+            sqlite: JobSqliteConfig::default(),
             tracking: JobTrackingConfig::default(),
         }
     }
@@ -2541,6 +3833,57 @@ impl<'de> serde::Deserialize<'de> for JobQueuesConfig {
     }
 }
 
+/// Declared worker-fleet topology (`[jobs.fleet]` in `autumn.toml`).
+///
+/// A single process can see its own `jobs.pin` but not its siblings', so it can
+/// never tell a valid multi-tier split (one tier drains `critical`, another
+/// drains `bulk`) from a real coverage gap. Declaring every tier's pin here is
+/// what lets `autumn doctor --strict` *prove* that some queue is drained by no
+/// tier anywhere and hard-fail on it (issue #1623, AC6) instead of only
+/// reporting what this one process claims.
+///
+/// # Example `autumn.toml`
+///
+/// ```toml
+/// [jobs.fleet]
+/// # One entry per worker tier, each holding that tier's `jobs.pin`. Must list
+/// # every tier actually running: doctor can only reason about declared tiers,
+/// # so omitting one reports a coverage gap that does not exist.
+/// # An empty entry is an *unpinned* tier that drains every queue.
+/// tiers = [["critical"], ["bulk", "default", "thumbnails"]]
+/// # Optional: where the compiled `#[job(queue = "…")]` set comes from, so the
+/// # check also covers queues declared in code but absent from `[jobs.queues]`.
+/// # `manifest` (emitted by `autumn jobs manifest <path>`) wins when both are
+/// # set. Every queue they name must be covered by some tier above.
+/// manifest = "target/jobs-manifest.toml"
+/// declared_queues = ["thumbnails"]
+/// ```
+///
+/// The framework itself never reads this at runtime — it is operator-declared
+/// input for the `doctor` check, and an app that declares nothing keeps today's
+/// behavior exactly (the check stays informational-only).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct JobFleetConfig {
+    /// One entry per worker tier, each entry being that tier's `jobs.pin`. An
+    /// **empty** entry is an unpinned tier that drains every queue, which makes
+    /// topology-wide coverage total. Empty/unset declares no topology.
+    #[serde(default)]
+    pub tiers: Vec<Vec<String>>,
+
+    /// Path to a jobs manifest (a TOML file with a `queues = [...]` array) the
+    /// app emits, naming the queues `#[job(queue = "…")]` declares. Lets the
+    /// coverage check see queues that exist in code but not in `[jobs.queues]`.
+    /// Takes precedence over [`Self::declared_queues`].
+    #[serde(default)]
+    pub manifest: Option<String>,
+
+    /// Inline list of `#[job(queue = "…")]`-declared queue names, for operators
+    /// who don't emit a manifest. Only *adds* to the set of queues that must be
+    /// covered, so an incomplete list can never manufacture a false failure.
+    #[serde(default)]
+    pub declared_queues: Vec<String>,
+}
+
 /// Redis backend configuration options for the job runner.
 #[derive(Debug, Clone, Deserialize)]
 pub struct JobRedisConfig {
@@ -2582,6 +3925,41 @@ impl Default for JobPostgresConfig {
             visibility_timeout_ms: default_jobs_pg_visibility_timeout_ms(),
         }
     }
+}
+
+/// `SQLite` backend configuration options for the job runner (issue #1907).
+#[derive(Debug, Clone, Deserialize)]
+pub struct JobSqliteConfig {
+    /// Duration before an in-flight job claim is considered stale and recovered.
+    ///
+    /// A worker that dies mid-job has its claim reclaimed within this bound.
+    /// Default: 30 seconds.
+    #[serde(default = "default_jobs_sqlite_visibility_timeout_ms")]
+    pub visibility_timeout_ms: u64,
+    /// How long an idle worker waits before it polls the queue table again.
+    ///
+    /// `SQLite` has no `LISTEN`/`NOTIFY`, so a worker polls. An enqueue in the
+    /// same process wakes a worker directly, so this bound sets how fast a
+    /// worker sees work another process enqueued. Default: 250ms.
+    #[serde(default = "default_jobs_sqlite_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+}
+
+impl Default for JobSqliteConfig {
+    fn default() -> Self {
+        Self {
+            visibility_timeout_ms: default_jobs_sqlite_visibility_timeout_ms(),
+            poll_interval_ms: default_jobs_sqlite_poll_interval_ms(),
+        }
+    }
+}
+
+const fn default_jobs_sqlite_visibility_timeout_ms() -> u64 {
+    30_000
+}
+
+const fn default_jobs_sqlite_poll_interval_ms() -> u64 {
+    250
 }
 
 /// Tracked-job progress/result store configuration.
@@ -2713,6 +4091,22 @@ const MANUAL_SCHEMA_SECTIONS: &[(&str, &[&str])] = &[
     // `crate::time_zone::TimeZoneConfig` — untagged Scalar|Table.
     ("time_zone", &["identifier", "sources"]),
 ];
+
+impl AutumnConfig {
+    /// Validate the `[push]` block, as `AppBuilder::run` does before binding.
+    ///
+    /// Factored out of the boot path so the rule it enforces — a VAPID key
+    /// that is present but unusable is a hard failure, never a quiet fallback
+    /// to "push disabled" — is reachable from a test. `run` calls exactly this
+    /// and exits on `Err`.
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::push::PushConfig::load_vapid_key`].
+    pub fn validate_push(&self) -> Result<(), crate::push::PushError> {
+        self.push.load_vapid_key().map(|_| ())
+    }
+}
 
 impl AutumnConfig {
     /// Recursively extracts all valid configuration schema keys and nested fields.
@@ -2935,36 +4329,32 @@ impl AutumnConfig {
                     }
                     path.pop();
                 } else if path.is_empty() && plugin_config_roots.contains(k) && val.is_table() {
-                    // A plugin has declared this TOP-LEVEL root as its own config
-                    // section (via `AppBuilder::config_section`). It is known AND
-                    // opaque: accept it and do NOT descend — the plugin, not core,
-                    // owns validation of its subtree. The `path.is_empty()` guard
-                    // keeps this strictly the TRUE top-level root (`[media]`,
-                    // path `[]`), so a key that merely shares a plugin-root name
-                    // while nested inside a known section is still validated
-                    // normally (fail-closed).
+                    // A plugin has declared this top-level root as its own config
+                    // section, via `AppBuilder::config_section`. It is known and opaque:
+                    // accept it and do not descend, because the plugin, not core, owns
+                    // validation of its subtree. The `path.is_empty()` guard keeps this
+                    // strictly the true top-level root (`[media]`, path `[]`), so a key
+                    // that merely shares a plugin-root name while nested inside a known
+                    // section is still validated normally.
                     //
-                    // The `val.is_table()` guard keeps the exemption TABLE-only:
-                    // `config_section` declares a top-level config TABLE (`[media]`),
-                    // so a registered root written as a scalar or array
-                    // (`media = "enabled"`, `media = ["a", "b"]`) is a malformed
-                    // section — nothing would deserialize it and the app would boot
-                    // on default plugin config. A non-table value therefore does NOT
-                    // match here and falls through to the normal unknown-root strict
-                    // rejection below, failing loudly instead of booting on defaults.
+                    // The `val.is_table()` guard keeps the exemption table-only:
+                    // `config_section` declares a top-level config table, so a registered
+                    // root written as a scalar or array (`media = "enabled"`, `media =
+                    // ["a", "b"]`) is a malformed section that nothing would deserialize,
+                    // and the app would boot on default plugin config. A non-table value
+                    // therefore falls through to the normal unknown-root strict rejection
+                    // below and fails loudly.
                     //
-                    // A profile-prefixed plugin root (`[profile.<env>.media]`,
-                    // path `["profile","<env>"]`) is deliberately NOT exempted and
-                    // falls through to the normal unknown-root strict rejection:
-                    // the plugin consumes ONLY the top-level `[media]` table (its
-                    // reader deserializes `root.media` directly and does not apply
-                    // Autumn's profile merge), so exempting a profile layer the
-                    // plugin cannot read would let a strict app with media settings
-                    // only under `[profile.<env>.media]` boot SILENTLY on default
-                    // plugin config instead of failing loudly. Profile-aware plugin
-                    // config is a separate, larger enhancement. Deliberately NOT
-                    // added to `valid_keys`, which would make the walk recurse and
-                    // flag every one of the plugin's children as unknown.
+                    // A profile-prefixed plugin root (`[profile.<env>.media]`, path
+                    // `["profile","<env>"]`) is deliberately not exempted and falls
+                    // through to that same rejection: the plugin consumes only the
+                    // top-level `[media]` table — its reader deserializes `root.media`
+                    // directly and does not apply Autumn's profile merge — so exempting a
+                    // profile layer the plugin cannot read would let a strict app with
+                    // media settings only under `[profile.<env>.media]` boot silently on
+                    // defaults. Profile-aware plugin config is a separate, larger
+                    // enhancement. Deliberately not added to `valid_keys`, which would
+                    // make the walk recurse and flag every plugin child as unknown.
                 } else {
                     let mut full_path_parts = path.clone();
                     full_path_parts.push(k.clone());
@@ -3040,17 +4430,15 @@ impl AutumnConfig {
                     path.pop();
                 } else if plugin_config_roots.contains(k) && val.is_table() {
                     // A plugin has declared this top-level root as its own config
-                    // section (via `AppBuilder::config_section`). It is known AND
-                    // opaque: accept it and do NOT descend — the plugin, not core,
-                    // owns validation of its subtree. Deliberately NOT injected
-                    // into `root_keys`, which would make the walk recurse and flag
-                    // every one of the plugin's children as unknown.
-                    //
-                    // The `val.is_table()` guard keeps the exemption TABLE-only
-                    // (`config_section` declares a top-level `[media]` TABLE): a
-                    // registered root written as a scalar/array is malformed and
-                    // falls through to the unknown-root strict rejection below
-                    // instead of being silently exempted and booting on defaults.
+                    // section, via `AppBuilder::config_section`. It is known and opaque:
+                    // accept it and do not descend, because the plugin owns validation of
+                    // its subtree. Deliberately not injected into `root_keys`, which would
+                    // make the walk recurse and flag every plugin child as unknown. The
+                    // `val.is_table()` guard keeps the exemption table-only, since
+                    // `config_section` declares a top-level `[media]` table: a registered
+                    // root written as a scalar or array is malformed and falls through to
+                    // the unknown-root strict rejection below rather than being exempted
+                    // and booting on defaults.
                 } else {
                     let mut closest: Option<&str> = None;
                     let mut min_dist = usize::MAX;
@@ -3392,60 +4780,46 @@ impl AutumnConfig {
         let mut warn_only = Vec::new();
         let mut opaque_roots = Vec::new();
         for (path, sug, schema_parent, is_table, is_top_level) in errors {
-            // Deploy-CLI leniency (#2063/#2067): a genuinely-unknown TRUE
-            // top-level root — one sitting directly at the document root, i.e.
-            // whose ACTUAL path is a bare root key (no `profile.<name>` prefix)
-            // AND whose schema parent is the document root `""` — is accepted as
-            // opaque rather than failing. It is almost certainly a plugin-owned
-            // config table (e.g. `[media]`) the CLI structurally cannot know
+            // Deploy-CLI leniency (#2063/#2067): a genuinely-unknown true top-level
+            // root — one whose actual path is a bare root key, with no `profile.<name>`
+            // prefix, and whose schema parent is the document root `""` — is accepted
+            // as opaque rather than failing. It is almost certainly a plugin-owned
+            // config table such as `[media]` that the CLI structurally cannot know
             // about, and app boot stays the strict gate for it.
             //
-            // Top-level-ness is STRUCTURAL, taken from the error's `is_top_level`
-            // flag (the offending key's parent path was empty at push time) — the
-            // SAME signal #2061's app-boot exemption keys on (`path.is_empty()`
-            // in `validate_toml_table`). It is deliberately NOT inferred from the
-            // rendered dotted `path` string: that string is AMBIGUOUS, because a
-            // legitimately quoted-dotted top-level key like `["my.plugin"]` (from
-            // `config_section("my.plugin")`) and a 2-level path both render
-            // `my.plugin`. The earlier `!path.contains('.')` heuristic therefore
-            // HARD-FAILED a quoted-dotted top-level plugin root at deploy even
-            // though app boot ACCEPTS it (its exemption keys on the RAW table key
-            // with `path.is_empty()`). Gating on `is_top_level` closes that gap:
-            // a quoted-dotted top-level table matches here exactly as it is
-            // exempted at boot.
+            // Top-level-ness is structural, taken from the error's `is_top_level` flag,
+            // set when the offending key's parent path was empty at push time. That is
+            // the same signal #2061's app-boot exemption keys on (`path.is_empty()` in
+            // `validate_toml_table`). It is deliberately not inferred from the rendered
+            // dotted `path` string, which is ambiguous: a legitimately quoted-dotted
+            // top-level key like `["my.plugin"]`, from `config_section("my.plugin")`,
+            // and a two-level path both render `my.plugin`. The earlier
+            // `!path.contains('.')` heuristic therefore hard-failed a quoted-dotted
+            // top-level plugin root at deploy even though app boot accepts it.
             //
-            // It is also NOT merely `schema_parent.is_empty()`:
-            // `validate_toml_detailed` reports an EMPTY schema parent for a
-            // profile-prefixed section like `[profile.prod.media]` too (the
-            // profile prefix is stripped before root-schema validation, so
-            // `[profile.prod.media]` and top-level `[media]` both surface with
-            // schema parent `""`). But a profile-prefixed section is pushed with a
-            // NON-EMPTY parent path (`["profile","prod"]`), so `is_top_level` is
-            // false for it — and the deployed app, whose `config_section` seam
-            // (#2061) exempts ONLY the TRUE top-level `[media]` via
-            // `path.is_empty()`, still REJECTS `[profile.prod.media]` at boot. So
-            // deploy and app boot AGREE: both accept top-level `[media]` /
-            // `["my.plugin"]`, both reject `[profile.prod.media]`.
+            // Nor is it merely `schema_parent.is_empty()`. `validate_toml_detailed`
+            // reports an empty schema parent for a profile-prefixed section like
+            // `[profile.prod.media]` too, because the profile prefix is stripped before
+            // root-schema validation. But such a section is pushed with a non-empty
+            // parent path (`["profile","prod"]`), so `is_top_level` is false for it, and
+            // the deployed app — whose `config_section` seam exempts only the true
+            // top-level `[media]` via `path.is_empty()` — still rejects it at boot. So
+            // deploy and app boot agree: both accept top-level `[media]` and
+            // `["my.plugin"]`, and both reject `[profile.prod.media]`.
             //
-            // A profile-prefixed root therefore no longer matches this branch
-            // and falls through to the normal (hard, since schema_parent `""` ∈
-            // PRE_1890_STRICT_PARENTS) classification below → strict rejection at
-            // deploy, matching app boot. ONLY a true root is spared: an unknown
-            // key inside a KNOWN section (schema_parent != "") also falls
-            // through, so a `[database] primry_url` typo still hard-fails. The
-            // app-boot path passes `Strict`, so its behavior is unchanged.
+            // A profile-prefixed root therefore falls through to the normal hard
+            // classification below (schema_parent `""` ∈ `PRE_1890_STRICT_PARENTS`) and
+            // is strictly rejected at deploy, matching app boot. Only a true root is
+            // spared: an unknown key inside a known section, with a non-empty
+            // schema_parent, also falls through, so a `[database] primry_url` typo still
+            // hard-fails. The app-boot path passes `Strict`, so its behavior is unchanged.
             //
-            // Leniency additionally requires the root's TOML value to be a TABLE
-            // (`is_table`), mirroring the #2061 `config_section` app-boot
-            // exemption, which accepts a registered plugin root only when
-            // `val.is_table()`. A non-table true-top-level root — a scalar or
-            // array like `media = "enabled"` / `media = ["a", "b"]` — is a
-            // malformed section nothing would deserialize, so it does NOT match
-            // here and falls through to the normal (hard) classification →
-            // strict rejection at deploy, EXACTLY as the deployed app rejects it
-            // at boot. Without this check deploy would accept a non-table root
-            // that app boot rejects, reopening the "deploy accepts what boot
-            // rejects" gap this branch exists to close.
+            // Leniency also requires the root's TOML value to be a table, mirroring the
+            // #2061 app-boot exemption. A non-table true top-level root — `media =
+            // "enabled"`, `media = ["a", "b"]` — is a malformed section nothing would
+            // deserialize, so it falls through to the hard classification exactly as the
+            // deployed app rejects it. Without this check, deploy would accept a
+            // non-table root that boot rejects, reopening the gap this branch closes.
             if root_policy == UnknownRootPolicy::LenientWarn
                 && schema_parent.is_empty()
                 && is_top_level
@@ -3487,14 +4861,12 @@ impl AutumnConfig {
         }
 
         // Warn-first rollout (#1890): unknown keys in sections that only became
-        // strictly validated by the schema-walk fix are surfaced loudly but do
-        // NOT fail startup for one release, so configs that silently passed
-        // before keep booting. `eprintln!` guarantees visibility before the
-        // tracing subscriber is installed; the `tracing::warn!` keeps structured
-        // output for apps that pre-install one. Set
-        // `server.strict_config_enforce_all = true` (or
-        // AUTUMN_SERVER__STRICT_CONFIG_ENFORCE_ALL=1) to promote these to hard
-        // errors now.
+        // strictly validated by the schema-walk fix are surfaced loudly but do not fail
+        // startup for one release, so configs that silently passed before keep booting.
+        // `eprintln!` guarantees visibility before the tracing subscriber is installed;
+        // the `tracing::warn!` keeps structured output for apps that pre-install one.
+        // Set `server.strict_config_enforce_all = true`, or
+        // `AUTUMN_SERVER__STRICT_CONFIG_ENFORCE_ALL=1`, to promote these to hard errors.
         for (path, sug) in &warn_only {
             let hint = sug
                 .as_deref()
@@ -3629,6 +5001,11 @@ impl AutumnConfig {
         self.database.validate()?;
         self.cors.validate()?;
         self.scheduler.validate()?;
+        // #1605: reject an unparseable or zero retention window at boot rather
+        // than silently skipping the dataset it names — a policy an operator
+        // believes is enforced but isn't is worse than no policy.
+        self.retention.validate()?;
+        self.validate_retention_against_replay_protection()?;
         // Framework state (autumn_jobs, scheduler advisory locks) lives on
         // the control topology and is never sharded. Sharded apps that use a
         // Postgres-backed jobs or scheduler backend therefore need a control
@@ -3653,16 +5030,131 @@ impl AutumnConfig {
         #[cfg(feature = "mail")]
         self.mail.validate(self.profile.as_deref())?;
         self.time_zone.validate()?;
+        // A `[shadow]` block that is switched on but cannot be honoured (no
+        // target, an unusable URL, an out-of-range sample rate) must fail boot
+        // rather than start a replica that silently mirrors nothing.
+        self.shadow.validate().map_err(ConfigError::Validation)?;
+        // Fail fast on an insecure or flapping [cluster] section: a node that
+        // would boot without a shared secret must not boot at all.
+        self.cluster.validate()?;
+        // A zero or absurd `[metrics]` cap is refused here rather than clamped
+        // at apply time, so `autumn check` names the key. A cap of 0 would
+        // silently drop every labeled sample the app records.
+        self.metrics.validate()?;
+        // A `[replication]` block that is switched on but cannot ship (no
+        // destination, both destinations, no credential indirection) must fail
+        // here — so `autumn check` and `autumn doctor` see it too — rather than
+        // only when the app itself boots (#1628).
+        if let Some(replication) = &self.replication {
+            let errors = replication.validation_errors();
+            if !errors.is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "invalid [replication] configuration:\n  - {}",
+                    errors.join("\n  - ")
+                )));
+            }
+        }
         // Session backend validation deliberately lives in
-        // `crate::session::apply_session_layer`, not here. That function
+        // `crate::session::build_session_layer`, not here. That function
         // short-circuits when a custom `SessionStore` was installed via
-        // `AppBuilder::with_session_store(...)`, so the (then-irrelevant)
-        // `session.backend = "redis"` config without a redis URL doesn't
-        // need to fail the boot. Validating the same thing here would
-        // defeat the override and exit the app before the custom store
-        // ever gets a chance to apply. The "prod profile + memory backend"
-        // warning lives in `apply_session_layer` for the same reason.
+        // `AppBuilder::with_session_store(...)`, so a then-irrelevant
+        // `session.backend = "redis"` without a redis URL need not fail the
+        // boot. Validating it here would defeat the override and exit before
+        // the custom store applies. The "prod profile plus memory backend"
+        // warning lives there for the same reason.
         Ok(())
+    }
+
+    /// Reject a `retention.webhook_replay` window shorter than any configured
+    /// endpoint's replay-rejection window (issue #1605).
+    ///
+    /// A retention window is a *compliance* knob. Letting it silently shorten
+    /// the lifetime of a replay marker would weaken a *security* control
+    /// through a door nobody would think to look behind: once the marker is
+    /// gone, a captured request replayed after that point is accepted again.
+    /// Fail closed and name the knob to lower instead
+    /// (`replay_window_secs`), rather than quietly reducing replay
+    /// protection.
+    ///
+    /// Endpoints registered in code rather than in `autumn.toml` are not
+    /// visible here; `docs/guide/data-retention.md` states the same rule for
+    /// them.
+    fn validate_retention_against_replay_protection(&self) -> Result<(), ConfigError> {
+        let Some(window) = self.retention.window("webhook_replay") else {
+            return Ok(());
+        };
+        for endpoint in &self.security.webhooks.endpoints {
+            if !endpoint.replay_protection {
+                continue;
+            }
+            let replay = std::time::Duration::from_secs(endpoint.replay_window_secs);
+            if window < replay {
+                return Err(ConfigError::Validation(format!(
+                    "retention.webhook_replay ({window_secs}s) is shorter than the \
+                     replay_window_secs ({replay_secs}s) of webhook endpoint {name:?}: \
+                     expiring replay markers early would silently weaken replay \
+                     protection. Lower that endpoint's replay_window_secs instead, or \
+                     widen retention.webhook_replay (see \
+                     docs/guide/data-retention.md).",
+                    window_secs = window.as_secs(),
+                    replay_secs = endpoint.replay_window_secs,
+                    name = endpoint.name,
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Tighten the TTL-native subsystem knobs to their `[retention]` window
+    /// (issue #1605).
+    ///
+    /// The `idempotency` and `sessions` datasets are expired by their own
+    /// storage rather than by a sweep, so their retention window is enforced
+    /// by writing records with a shorter lifetime. Applying the cap once, to
+    /// the loaded config, means every derived lifetime inherits it: the
+    /// idempotency layer's TTL, and the session cookie's `Max-Age` together
+    /// with the Redis session TTL.
+    ///
+    /// Note that capping `sessions` shortens how long a signed-in user stays
+    /// signed in — see `docs/guide/data-retention.md`.
+    ///
+    /// **`job_tracking` is deliberately not capped here.** It is
+    /// sweep-enforced, and the sweep honours a GDPR legal hold on
+    /// `autumn_job_tracking` while `job.rs`'s independent `expires_at`
+    /// cleanup cannot — capping `jobs.tracking.ttl_secs` would let that
+    /// cleanup delete, on exactly the retention schedule, the very rows the
+    /// retention report says are being preserved under hold.
+    ///
+    /// Always a `min`, so this can only ever *shorten* a lifetime — there is
+    /// no configuration in which declaring `[retention]` causes data to be
+    /// kept longer than it is today — and it is idempotent, so calling it
+    /// twice is harmless.
+    ///
+    /// Called on the loaded config during boot; apps do not call this
+    /// directly.
+    pub fn apply_retention_caps(&mut self) {
+        // `job_tracking` is capped only when its records do NOT live in
+        // `autumn_job_tracking`. Under `jobs.backend = "postgres"` the sweep
+        // enforces the window and a GDPR legal hold can stop it, so capping
+        // the TTL there would let the job runner's independent `expires_at`
+        // cleanup delete held rows on exactly the retention schedule. Under
+        // any other backend (redis, or the in-memory fallback) there is no
+        // table to sweep and the record's TTL is the only bound there is —
+        // leaving it uncapped would claim a window nothing enforces.
+        let cap_job_tracking = self.jobs.backend != "postgres";
+        let caps: [(&str, &mut u64); 3] = [
+            ("idempotency", &mut self.idempotency.ttl_secs),
+            ("sessions", &mut self.session.max_age_secs),
+            ("job_tracking", &mut self.jobs.tracking.ttl_secs),
+        ];
+        for (key, target) in caps {
+            if key == "job_tracking" && !cap_job_tracking {
+                continue;
+            }
+            if let Some(window) = self.retention.window(key) {
+                *target = (*target).min(window.as_secs());
+            }
+        }
     }
 
     /// Apply environment variable overrides to the loaded config.
@@ -3675,6 +5167,9 @@ impl AutumnConfig {
     /// - `AUTUMN_SERVER__HOST` → `server.host` (String)
     /// - `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` → `server.shutdown_timeout_secs` (u64)
     /// - `AUTUMN_SERVER__PRESTOP_GRACE_SECS` → `server.prestop_grace_secs` (u64)
+    /// - `AUTUMN_SERVER__UPGRADE__ENABLED` → `server.upgrade.enabled` (bool)
+    /// - `AUTUMN_SERVER__UPGRADE__READY_TIMEOUT_SECS` →
+    ///   `server.upgrade.ready_timeout_secs` (u64)
     ///
     /// # Database
     /// - `AUTUMN_DATABASE__PRIMARY_URL` -> `database.primary_url` (String)
@@ -3712,7 +5207,7 @@ impl AutumnConfig {
     /// - `AUTUMN_HEALTH__ENABLED` → `health.enabled` (bool)
     ///
     /// # Jobs
-    /// - `AUTUMN_JOBS__BACKEND` → `jobs.backend` (`local` / `redis`)
+    /// - `AUTUMN_JOBS__BACKEND` → `jobs.backend` (`local` / `redis` / `sqlite`)
     /// - `AUTUMN_JOBS__WORKERS` → `jobs.workers` (`usize`)
     /// - `AUTUMN_JOBS__PIN` → `jobs.pin` (comma-separated queue names)
     /// - `AUTUMN_JOBS__MAX_ATTEMPTS` → `jobs.max_attempts` (`u32`)
@@ -3723,11 +5218,43 @@ impl AutumnConfig {
     /// - `AUTUMN_JOBS__TRACKING__TTL_SECS` → `jobs.tracking.ttl_secs` (`u64`)
     /// - `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` → `jobs.tracking.route_enabled` (`bool`)
     ///
+    /// # Retention (issue #1605)
+    /// - `AUTUMN_RETENTION__SWEEP_INTERVAL` → `retention.sweep_interval` (duration `String`)
+    /// - `AUTUMN_RETENTION__JOB_HISTORY` → `retention.job_history` (duration `String`)
+    /// - `AUTUMN_RETENTION__COMMIT_HOOKS` → `retention.commit_hooks` (duration `String`)
+    /// - `AUTUMN_RETENTION__JOB_TRACKING` → `retention.job_tracking` (duration `String`)
+    /// - `AUTUMN_RETENTION__IDEMPOTENCY` → `retention.idempotency` (duration `String`)
+    /// - `AUTUMN_RETENTION__EXPERIMENT_ASSIGNMENTS` → `retention.experiment_assignments` (duration `String`)
+    /// - `AUTUMN_RETENTION__WEBHOOK_REPLAY` → `retention.webhook_replay` (duration `String`)
+    /// - `AUTUMN_RETENTION__SESSIONS` → `retention.sessions` (duration `String`)
+    /// - `AUTUMN_RETENTION__AUDIT_ARCHIVES` → `retention.audit_archives` (duration `String`)
+    /// - `AUTUMN_RETENTION__CUSTOM_DOMAINS` → `retention.custom_domains` (duration `String`)
+    ///
     /// # Signed webhooks
     /// - `AUTUMN_SECURITY__WEBHOOKS__REPLAY__BACKEND` -> `security.webhooks.replay.backend` (`memory` / `redis`)
     /// - `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__URL` -> `security.webhooks.replay.redis.url` (`String`)
     /// - `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__KEY_PREFIX` -> `security.webhooks.replay.redis.key_prefix` (`String`)
     /// - `AUTUMN_SECURITY__WEBHOOKS__REPLAY__ALLOW_MEMORY_IN_PRODUCTION` -> `security.webhooks.replay.allow_memory_in_production` (`bool`)
+    ///
+    /// # Cluster
+    /// - `AUTUMN_CLUSTER__ENABLED` → `cluster.enabled` (`bool`)
+    /// - `AUTUMN_CLUSTER__SECRET` → `cluster.secret` (`SecretString`)
+    /// - `AUTUMN_CLUSTER__CLUSTER_NAME` → `cluster.cluster_name` (`String`)
+    /// - `AUTUMN_CLUSTER__BIND_ADDR` → `cluster.bind_addr` (`String`)
+    /// - `AUTUMN_CLUSTER__ADVERTISE_ADDR` → `cluster.advertise_addr` (`String`)
+    /// - `AUTUMN_CLUSTER__SEED_PEERS` → `cluster.seed_peers` (comma-separated addresses)
+    /// - `AUTUMN_CLUSTER__NODE_ID` → `cluster.node_id` (`String`)
+    /// - `AUTUMN_CLUSTER__PUSH_INTERVAL_MS` → `cluster.push_interval_ms` (`u64`)
+    /// - `AUTUMN_CLUSTER__SUSPICION_TIMEOUT_MS` → `cluster.suspicion_timeout_ms` (`u64`)
+    /// - `AUTUMN_SHADOW__ENABLED` → `shadow.enabled` (`bool`)
+    /// - `AUTUMN_SHADOW__TARGET` → `shadow.target` (`String`)
+    /// - `AUTUMN_SHADOW__SAMPLE_RATE` → `shadow.sample_rate` (`f64`)
+    /// - `AUTUMN_SHADOW__ROUTES` → `shadow.routes` (comma-separated patterns)
+    /// - `AUTUMN_SHADOW__TIMEOUT_MS` → `shadow.timeout_ms` (`u64`)
+    /// - `AUTUMN_SHADOW__MAX_IN_FLIGHT` → `shadow.max_in_flight` (`usize`)
+    /// - `AUTUMN_SHADOW__MAX_BODY_BYTES` → `shadow.max_body_bytes` (`usize`)
+    /// - `AUTUMN_SHADOW__MAX_RECORDS` → `shadow.max_records` (`usize`)
+    /// - `AUTUMN_SHADOW__MAX_SAMPLE_BYTES` → `shadow.max_sample_bytes` (`usize`)
     pub fn apply_env_overrides(&mut self) {
         self.apply_env_overrides_with_env(&OsEnv);
     }
@@ -3746,6 +5273,7 @@ impl AutumnConfig {
         self.apply_channels_env_overrides_with_env(env);
         self.apply_jobs_env_overrides_with_env(env);
         self.apply_scheduler_env_overrides_with_env(env);
+        self.apply_retention_env_overrides_with_env(env);
         self.apply_role_env_overrides_with_env(env);
         self.apply_auth_env_overrides_with_env(env);
         self.apply_security_env_overrides_with_env(env);
@@ -3755,11 +5283,15 @@ impl AutumnConfig {
         self.apply_observability_env_overrides_with_env(env);
         self.apply_compression_env_overrides_with_env(env);
         self.apply_actuator_env_overrides_with_env(env);
+        self.apply_metrics_env_overrides_with_env(env);
         #[cfg(feature = "reporting")]
         self.apply_reporting_env_overrides_with_env(env);
+        #[cfg(feature = "reporting")]
+        self.apply_failure_capture_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
         self.apply_storage_env_overrides_with_env(env);
         self.apply_backup_env_overrides_with_env(env);
+        self.apply_replication_env_overrides_with_env(env);
         #[cfg(feature = "mail")]
         self.apply_mail_env_overrides_with_env(env);
         #[cfg(feature = "maud")]
@@ -3768,6 +5300,111 @@ impl AutumnConfig {
         self.apply_time_zone_env_overrides_with_env(env);
         self.apply_alerts_env_overrides_with_env(env);
         self.apply_tenancy_env_overrides_with_env(env);
+        self.apply_cluster_env_overrides_with_env(env);
+        self.apply_push_env_overrides_with_env(env);
+        self.apply_shadow_env_overrides_with_env(env);
+    }
+
+    /// Web Push (`[push]`) environment overrides.
+    ///
+    /// The private key is the reason this exists: it is a credential, so the
+    /// guide and `PushConfig`'s own docs tell operators to supply it through
+    /// `AUTUMN_PUSH__PRIVATE_KEY` rather than commit it. Overrides are applied
+    /// only through the explicit per-section methods above, so without this one
+    /// that documented deployment path silently leaves push unconfigured —
+    /// every send failing `NotConfigured` and the public-key endpoint serving
+    /// `503`, with the operator looking at a variable they did set.
+    fn apply_push_env_overrides_with_env(&mut self, env: &dyn Env) {
+        // Not `parse_env_option_secret`. That helper treats a blank value as "clear this
+        // setting", which is right where unsetting via env is meaningful but wrong here,
+        // and dangerously so: the commonest way `AUTUMN_PUSH__PRIVATE_KEY` ends up blank
+        // is a secret that failed to interpolate. Clearing it would silently disable
+        // push, sail through `validate_push`, and surface much later as a 503 and
+        // `NotConfigured` on every send — and it would erase a good key from
+        // `autumn.toml`. So a blank value is preserved, precisely so `load_vapid_key`
+        // can reject it at boot with a message naming the environment variable.
+        if let Ok(value) = env.var("AUTUMN_PUSH__PRIVATE_KEY") {
+            self.push.private_key = Some(secrecy::SecretString::from(value));
+        }
+        parse_env_option_string(env, "AUTUMN_PUSH__PUBLIC_KEY", &mut self.push.public_key);
+        parse_env_option_string(env, "AUTUMN_PUSH__SUBJECT", &mut self.push.subject);
+        parse_env_option(env, "AUTUMN_PUSH__TTL_SECS", &mut self.push.ttl_secs);
+    }
+
+    fn apply_shadow_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(env, "AUTUMN_SHADOW__ENABLED", &mut self.shadow.enabled);
+        parse_env_option_string(env, "AUTUMN_SHADOW__TARGET", &mut self.shadow.target);
+        parse_env(
+            env,
+            "AUTUMN_SHADOW__SAMPLE_RATE",
+            &mut self.shadow.sample_rate,
+        );
+        // `_non_empty`: an unfilled template (`AUTUMN_SHADOW__ROUTES=`) must not
+        // become a one-element allowlist containing the empty pattern, which
+        // matches no path and would silently mirror nothing (issue #1621's
+        // failure shape).
+        parse_env_csv_non_empty(env, "AUTUMN_SHADOW__ROUTES", &mut self.shadow.routes);
+        parse_env(
+            env,
+            "AUTUMN_SHADOW__TIMEOUT_MS",
+            &mut self.shadow.timeout_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SHADOW__MAX_IN_FLIGHT",
+            &mut self.shadow.max_in_flight,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SHADOW__MAX_BODY_BYTES",
+            &mut self.shadow.max_body_bytes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SHADOW__MAX_RECORDS",
+            &mut self.shadow.max_records,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SHADOW__MAX_SAMPLE_BYTES",
+            &mut self.shadow.max_sample_bytes,
+        );
+    }
+
+    fn apply_cluster_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(env, "AUTUMN_CLUSTER__ENABLED", &mut self.cluster.enabled);
+        parse_env_option_secret(env, "AUTUMN_CLUSTER__SECRET", &mut self.cluster.secret);
+        parse_env_string(
+            env,
+            "AUTUMN_CLUSTER__CLUSTER_NAME",
+            &mut self.cluster.cluster_name,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_CLUSTER__BIND_ADDR",
+            &mut self.cluster.bind_addr,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_CLUSTER__ADVERTISE_ADDR",
+            &mut self.cluster.advertise_addr,
+        );
+        parse_env_csv(
+            env,
+            "AUTUMN_CLUSTER__SEED_PEERS",
+            &mut self.cluster.seed_peers,
+        );
+        parse_env_option_string(env, "AUTUMN_CLUSTER__NODE_ID", &mut self.cluster.node_id);
+        parse_env(
+            env,
+            "AUTUMN_CLUSTER__PUSH_INTERVAL_MS",
+            &mut self.cluster.push_interval_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_CLUSTER__SUSPICION_TIMEOUT_MS",
+            &mut self.cluster.suspicion_timeout_ms,
+        );
     }
 
     fn apply_tenancy_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -3940,6 +5577,35 @@ impl AutumnConfig {
         );
     }
 
+    #[cfg(feature = "reporting")]
+    fn apply_failure_capture_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(
+            env,
+            "AUTUMN_FAILURE_CAPTURE__ENABLED",
+            &mut self.failure_capture.enabled,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_FAILURE_CAPTURE__DIR",
+            &mut self.failure_capture.dir,
+        );
+        parse_env(
+            env,
+            "AUTUMN_FAILURE_CAPTURE__MAX_BODY_BYTES",
+            &mut self.failure_capture.max_body_bytes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_FAILURE_CAPTURE__MAX_CAPSULE_BYTES",
+            &mut self.failure_capture.max_capsule_bytes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_FAILURE_CAPTURE__MAX_CAPSULES",
+            &mut self.failure_capture.max_capsules,
+        );
+    }
+
     fn apply_dev_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_string(
             env,
@@ -3993,6 +5659,24 @@ impl AutumnConfig {
             env,
             "AUTUMN_ACTUATOR__PROMETHEUS",
             &mut self.actuator.prometheus,
+        );
+    }
+
+    fn apply_metrics_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env(
+            env,
+            "AUTUMN_METRICS__MAX_SERIES_PER_METRIC",
+            &mut self.metrics.max_series_per_metric,
+        );
+        parse_env(
+            env,
+            "AUTUMN_METRICS__MAX_INSTRUMENTS",
+            &mut self.metrics.max_instruments,
+        );
+        parse_env(
+            env,
+            "AUTUMN_METRICS__MAX_LABELS_PER_SERIES",
+            &mut self.metrics.max_labels_per_series,
         );
     }
 
@@ -4050,6 +5734,16 @@ impl AutumnConfig {
             "AUTUMN_SERVER__PRESTOP_GRACE_SECS",
             &mut self.server.prestop_grace_secs,
         );
+        parse_env(
+            env,
+            "AUTUMN_SERVER__UPGRADE__ENABLED",
+            &mut self.server.upgrade.enabled,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SERVER__UPGRADE__READY_TIMEOUT_SECS",
+            &mut self.server.upgrade.ready_timeout_secs,
+        );
         parse_env_option(
             env,
             "AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS",
@@ -4064,6 +5758,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS",
             &mut self.server.max_concurrent_requests,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_SERVER__CAPACITY_CONTRACT",
+            &mut self.server.capacity_contract,
         );
 
         // `[server.tls]` is a nested optional. Materialize it from the
@@ -4469,6 +6168,16 @@ impl AutumnConfig {
         );
         parse_env(
             env,
+            "AUTUMN_JOBS__SQLITE__VISIBILITY_TIMEOUT_MS",
+            &mut self.jobs.sqlite.visibility_timeout_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__SQLITE__POLL_INTERVAL_MS",
+            &mut self.jobs.sqlite.poll_interval_ms,
+        );
+        parse_env(
+            env,
             "AUTUMN_JOBS__TRACKING__TTL_SECS",
             &mut self.jobs.tracking.ttl_secs,
         );
@@ -4491,13 +6200,72 @@ impl AutumnConfig {
         }
     }
 
+    /// `AUTUMN_RETENTION__*` overrides for the unified retention policy
+    /// (issue #1605).
+    ///
+    /// Each window uses [`parse_env_option_string`], so an empty value is the
+    /// documented way to *clear* a window `autumn.toml` declared — restoring
+    /// today's behavior for that one dataset without editing the file.
+    fn apply_retention_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_string(
+            env,
+            "AUTUMN_RETENTION__SWEEP_INTERVAL",
+            &mut self.retention.sweep_interval,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_RETENTION__JOB_HISTORY",
+            &mut self.retention.job_history,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_RETENTION__COMMIT_HOOKS",
+            &mut self.retention.commit_hooks,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_RETENTION__JOB_TRACKING",
+            &mut self.retention.job_tracking,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_RETENTION__IDEMPOTENCY",
+            &mut self.retention.idempotency,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_RETENTION__EXPERIMENT_ASSIGNMENTS",
+            &mut self.retention.experiment_assignments,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_RETENTION__WEBHOOK_REPLAY",
+            &mut self.retention.webhook_replay,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_RETENTION__SESSIONS",
+            &mut self.retention.sessions,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_RETENTION__AUDIT_ARCHIVES",
+            &mut self.retention.audit_archives,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_RETENTION__CUSTOM_DOMAINS",
+            &mut self.retention.custom_domains,
+        );
+    }
+
     fn apply_scheduler_env_overrides_with_env(&mut self, env: &dyn Env) {
         if let Ok(val) = env.var("AUTUMN_SCHEDULER__BACKEND") {
             match SchedulerBackend::from_env_value(&val) {
                 Some(backend) => self.scheduler.backend = backend,
                 None => eprintln!(
                     "Warning: AUTUMN_SCHEDULER__BACKEND={val:?} is not valid \
-                     (expected in_process or postgres), ignoring"
+                     (expected in_process, postgres or sqlite), ignoring"
                 ),
             }
         }
@@ -4972,22 +6740,20 @@ impl AutumnConfig {
     /// section exists in TOML, a default one is materialized only if at least
     /// one offsite env var is present, so an all-env deployment still works.
     fn apply_backup_env_overrides_with_env(&mut self, env: &dyn Env) {
-        // Keys that signal a genuine intent to CONFIGURE an offsite destination —
-        // presence of any REQUIRED destination/credential key materializes the
-        // `[backup.offsite]` section (issue #1791). This is limited to the keys
-        // that a working upload genuinely requires — a bucket, or the access /
-        // secret key-env names. Optional-only keys (`region`,
-        // `force_path_style`, `endpoint`, `prefix`, `keep`) do NOT materialize
-        // the section on their own: a bare `AUTUMN_BACKUP__OFFSITE__S3__REGION`
-        // (or endpoint) with no bucket cannot upload, so it must leave offsite
-        // UNCONFIGURED rather than produce an empty section that then fails
-        // validation / `doctor` with "backup.offsite.s3.bucket is unset". Those
-        // optional keys are still APPLIED below once the section IS materialized
-        // by a required key. This also EXCLUDES the two opt-out toggles: a lone
-        // `AUTO_UPLOAD=false` / `ALLOW_SHARED_BUCKET=false` must NOT create an
-        // otherwise-empty section (issue #1619 P2 #18). A truthy
-        // `AUTO_UPLOAD=true` DOES materialize, since it requires a validated
-        // destination to act on.
+        // Keys that signal genuine intent to configure an offsite destination: the
+        // presence of any required destination or credential key materializes the
+        // `[backup.offsite]` section (#1791). The list is limited to what a working
+        // upload requires — a bucket, or the access and secret key-env names.
+        // Optional-only keys (`region`, `force_path_style`, `endpoint`, `prefix`,
+        // `keep`) do not materialize the section on their own: a bare
+        // `AUTUMN_BACKUP__OFFSITE__S3__REGION` with no bucket cannot upload, so it must
+        // leave offsite unconfigured rather than produce an empty section that then
+        // fails validation or `doctor` with "backup.offsite.s3.bucket is unset". Those
+        // optional keys are still applied below once a required key materializes the
+        // section. The two opt-out toggles are excluded too: a lone `AUTO_UPLOAD=false`
+        // or `ALLOW_SHARED_BUCKET=false` must not create an otherwise-empty section
+        // (#1619 P2 #18). A truthy `AUTO_UPLOAD=true` does materialize, since it needs a
+        // validated destination to act on.
         const OFFSITE_DEST_KEYS: &[&str] = &[
             "AUTUMN_BACKUP__OFFSITE__S3__BUCKET",
             "AUTUMN_BACKUP__OFFSITE__S3__ACCESS_KEY_ID_ENV",
@@ -4996,8 +6762,7 @@ impl AutumnConfig {
         let has_dest_key = OFFSITE_DEST_KEYS.iter().any(|k| env.var(k).is_ok());
         let auto_upload_truthy = env
             .var("AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD")
-            .ok()
-            .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"));
+            .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"));
         if self.backup.offsite.is_none() && !has_dest_key && !auto_upload_truthy {
             return;
         }
@@ -5046,6 +6811,111 @@ impl AutumnConfig {
             env,
             "AUTUMN_BACKUP__OFFSITE__ALLOW_SHARED_BUCKET",
             &mut offsite.allow_shared_bucket,
+        );
+    }
+
+    /// Apply `AUTUMN_REPLICATION__*` overrides to the `[replication]` section
+    /// (issue #1628). Mirrors the `[backup.offsite]` convention: a *destination*
+    /// key materializes the section for an all-env deployment, while
+    /// optional-only keys never conjure a section that would then fail
+    /// validation.
+    fn apply_replication_env_overrides_with_env(&mut self, env: &dyn Env) {
+        // Keys that express a real intent to configure a destination. A lone
+        // region/endpoint/prefix cannot replicate anywhere, so it must not
+        // materialize the section; `ENABLED=true` does, because it needs a
+        // destination to act on and the resulting validation error is the honest
+        // answer.
+        const DEST_KEYS: &[&str] = &[
+            "AUTUMN_REPLICATION__S3__BUCKET",
+            "AUTUMN_REPLICATION__S3__ACCESS_KEY_ID_ENV",
+            "AUTUMN_REPLICATION__S3__SECRET_ACCESS_KEY_ENV",
+            "AUTUMN_REPLICATION__PATH",
+        ];
+        // Only a REQUIRED S3 key materializes the sub-section, exactly as
+        // `OFFSITE_DEST_KEYS` does for `[backup.offsite]`. A stray
+        // `AUTUMN_REPLICATION__S3__REGION` next to a `path` destination must not
+        // conjure an empty `[replication.s3]` — that would make the section
+        // "configures both s3 and path" and fail boot on an otherwise valid
+        // config. The optional keys are still APPLIED once a required one has
+        // materialized the sub-section.
+        const S3_KEYS: &[&str] = &[
+            "AUTUMN_REPLICATION__S3__BUCKET",
+            "AUTUMN_REPLICATION__S3__ACCESS_KEY_ID_ENV",
+            "AUTUMN_REPLICATION__S3__SECRET_ACCESS_KEY_ENV",
+        ];
+        let has_dest_key = DEST_KEYS.iter().any(|k| env.var(k).is_ok());
+        let enabled_truthy = env
+            .var("AUTUMN_REPLICATION__ENABLED")
+            .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"));
+        if self.replication.is_none() && !has_dest_key && !enabled_truthy {
+            return;
+        }
+        let replication = self
+            .replication
+            .get_or_insert_with(|| Box::new(ReplicationConfig::default()));
+
+        parse_env_bool(env, "AUTUMN_REPLICATION__ENABLED", &mut replication.enabled);
+        parse_env(
+            env,
+            "AUTUMN_REPLICATION__RPO_SECS",
+            &mut replication.rpo_secs,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_REPLICATION__SYNC_INTERVAL_SECS",
+            &mut replication.sync_interval_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_REPLICATION__SNAPSHOT_INTERVAL_SECS",
+            &mut replication.snapshot_interval_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_REPLICATION__MAX_WAL_BYTES",
+            &mut replication.max_wal_bytes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_REPLICATION__RETENTION_HOURS",
+            &mut replication.retention_hours,
+        );
+        parse_env(
+            env,
+            "AUTUMN_REPLICATION__VERIFY_INTERVAL_SECS",
+            &mut replication.verify_interval_secs,
+        );
+        parse_env_option_string(env, "AUTUMN_REPLICATION__PREFIX", &mut replication.prefix);
+        parse_env_option_string(env, "AUTUMN_REPLICATION__PATH", &mut replication.path);
+        parse_env_bool(
+            env,
+            "AUTUMN_REPLICATION__ALLOW_SHARED_BUCKET",
+            &mut replication.allow_shared_bucket,
+        );
+
+        if replication.s3.is_none() && !S3_KEYS.iter().any(|k| env.var(k).is_ok()) {
+            return;
+        }
+        let s3 = replication
+            .s3
+            .get_or_insert_with(ReplicationS3Config::default);
+        parse_env_option_string(env, "AUTUMN_REPLICATION__S3__BUCKET", &mut s3.bucket);
+        parse_env_option_string(env, "AUTUMN_REPLICATION__S3__REGION", &mut s3.region);
+        parse_env_option_string(env, "AUTUMN_REPLICATION__S3__ENDPOINT", &mut s3.endpoint);
+        parse_env_option_string(
+            env,
+            "AUTUMN_REPLICATION__S3__ACCESS_KEY_ID_ENV",
+            &mut s3.access_key_id_env,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_REPLICATION__S3__SECRET_ACCESS_KEY_ENV",
+            &mut s3.secret_access_key_env,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_REPLICATION__S3__FORCE_PATH_STYLE",
+            &mut s3.force_path_style,
         );
     }
 
@@ -5203,6 +7073,30 @@ pub struct RequestTimeoutsConfig {
     pub request_timeout_ms: Option<u64>,
 }
 
+/// `[server.upgrade]` — in-place upgrades (issue #1674).
+///
+/// On `SIGUSR2` a running app hands its listening socket and its designated
+/// live state to a freshly-execed build, waits for that build to serve, and
+/// only then drains itself. See `docs/guide/hot-upgrades.md`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpgradeConfig {
+    /// Whether `SIGUSR2` triggers an in-place upgrade. Default: `true`.
+    ///
+    /// With this off the signal is logged and ignored — which is still safer
+    /// than the default disposition of `SIGUSR2`, which terminates the process.
+    #[serde(default = "default_upgrade_enabled")]
+    pub enabled: bool,
+
+    /// Seconds to wait for the successor to signal that it is serving before
+    /// abandoning the upgrade and carrying on with the current build.
+    /// Default: `30`.
+    ///
+    /// The wait ends early — with the upgrade abandoned — if the successor
+    /// exits first, so this only bounds a successor that hangs during startup.
+    #[serde(default = "default_upgrade_ready_timeout")]
+    pub ready_timeout_secs: u64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     /// Port to listen on. Default: `3000`.
@@ -5251,6 +7145,12 @@ pub struct ServerConfig {
     #[serde(default = "default_prestop_grace")]
     pub prestop_grace_secs: u64,
 
+    /// In-place upgrade settings (`SIGUSR2` handoff to a new binary).
+    ///
+    /// See [`UpgradeConfig`] and `docs/guide/hot-upgrades.md`.
+    #[serde(default)]
+    pub upgrade: UpgradeConfig,
+
     /// Per-request timeout configuration.
     ///
     /// Controls request-cycle timeouts for `DoS` protection. By default
@@ -5296,6 +7196,25 @@ pub struct ServerConfig {
     /// Configured via `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS`.
     #[serde(default)]
     pub max_concurrent_requests: Option<usize>,
+
+    /// Path to the committed capacity contract (`capacity.lock`) this deploy
+    /// should admit against (issue #1733).
+    ///
+    /// When set — and [`Self::max_concurrent_requests`] is *not* — the
+    /// load-shedding ceiling is sourced from the contract's proven envelope
+    /// instead of a hand-tuned guess, so the binary sheds at the edge someone
+    /// actually measured. Relative paths resolve against the process working
+    /// directory.
+    ///
+    /// An explicit `max_concurrent_requests` always wins, and every failure
+    /// along the contract path (missing file, malformed document, a contract
+    /// measured on a different host class) degrades to *unlimited* with a
+    /// warning rather than to a ceiling — see
+    /// [`capacity::resolve_admission_limit`](crate::capacity::resolve_admission_limit).
+    ///
+    /// Configured via `AUTUMN_SERVER__CAPACITY_CONTRACT`.
+    #[serde(default)]
+    pub capacity_contract: Option<String>,
 
     /// Terminate HTTPS directly in the app process (issue #1603).
     ///
@@ -5376,9 +7295,30 @@ pub struct TlsConfig {
     /// code is gated behind the off-by-default `acme` feature.
     #[serde(default)]
     pub acme: Option<AcmeConfig>,
+
+    /// Mutual-TLS client-certificate verification (issue #1640). When present
+    /// with a mode other than [`ClientAuthMode::Off`], the listener requests —
+    /// and verifies — a client certificate against the configured CA bundle.
+    /// Absent (the default), the handshake is byte-for-byte #1603's
+    /// server-only TLS. The serving code is gated behind the same
+    /// off-by-default `tls` feature as the listener.
+    #[serde(default)]
+    pub client_auth: Option<ClientAuthConfig>,
 }
 
 impl TlsConfig {
+    /// Whether the listener should request a client certificate — i.e. a
+    /// `[server.tls.client_auth]` section is present with a mode other than
+    /// `off`.
+    ///
+    /// The bind path keys the whole mTLS wiring on this, so an absent (or
+    /// `off`) section takes the identical #1603 code path.
+    #[must_use]
+    pub fn client_auth_active(&self) -> bool {
+        self.client_auth
+            .as_ref()
+            .is_some_and(|c| c.mode.requests_certificate())
+    }
     /// An empty `TlsConfig` used only as the seed for env-var overrides of a
     /// section that was absent from TOML. Both paths are unset (which fails
     /// fast at startup if neither a static cert nor ACME is configured), and the
@@ -5390,6 +7330,7 @@ impl TlsConfig {
             reload_interval_secs: default_tls_reload_interval_secs(),
             handshake_timeout_secs: default_tls_handshake_timeout_secs(),
             acme: None,
+            client_auth: None,
         }
     }
 
@@ -5441,6 +7382,186 @@ impl TlsConfig {
 
         if let Some(acme) = &self.acme {
             acme.validate()?;
+        }
+
+        if let Some(client_auth) = &self.client_auth {
+            client_auth.validate()?;
+        }
+
+        Ok(())
+    }
+}
+
+/// How hard the listener asks for a client certificate (issue #1640).
+///
+/// Per listener; a route can additionally demand one via
+/// [`ClientAuthConfig::required_paths`] or the `RequireClientCert` layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum ClientAuthMode {
+    /// No certificate is requested. The handshake is #1603's server-only TLS.
+    #[default]
+    Off,
+    /// A certificate is requested but not demanded. A client that presents one
+    /// must pass verification; a client that presents none still connects, and
+    /// routes that require mTLS reject it.
+    Optional,
+    /// A valid certificate is demanded. The handshake fails without one.
+    Required,
+}
+
+impl ClientAuthMode {
+    /// Whether the listener asks the client for a certificate at all.
+    #[must_use]
+    pub const fn requests_certificate(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Whether a missing certificate fails the handshake.
+    #[must_use]
+    pub const fn mandates_certificate(self) -> bool {
+        matches!(self, Self::Required)
+    }
+
+    /// The lowercase tag used in config, logs, and the posture manifest.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Optional => "optional",
+            Self::Required => "required",
+        }
+    }
+}
+
+/// Mutual-TLS client-certificate verification (issue #1640). Present under
+/// `[server.tls.client_auth]`.
+///
+/// The trust store is a PEM bundle of one or more client CAs. It hot-reloads on
+/// the same poll the server certificate uses, so a CA rotation — ship old+new in
+/// one bundle, later drop old — needs no restart and drops no connection.
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [server.tls.client_auth]
+/// mode = "required"                                  # off (default) | optional | required
+/// ca_bundle_path = "/etc/autumn/tls/client-ca.pem"   # one or more PEM CAs
+/// crl_path = "/etc/autumn/tls/client-ca.crl.pem"     # optional; hot-reloads too
+/// required_paths = ["/internal/"]                    # routes that demand a certificate
+/// reload_interval_secs = 60
+/// ```
+///
+/// Unlike `cert_path`/`key_path`, these keys have no `AUTUMN_SERVER__TLS__*`
+/// env-var override — matching the sibling `[server.tls.acme]` sub-table.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ClientAuthConfig {
+    /// Listener-wide requirement level. Default: `off`.
+    #[serde(default)]
+    pub mode: ClientAuthMode,
+
+    /// Path to the PEM bundle of trusted client CAs. Required whenever
+    /// [`mode`](Self::mode) is not `off`. A bundle that is missing, unparseable,
+    /// or contains no CERTIFICATE block fails startup.
+    #[serde(default)]
+    pub ca_bundle_path: Option<PathBuf>,
+
+    /// Optional path to a PEM certificate revocation list issued by a CA in the
+    /// bundle. Revocation is checked for the presented client certificate only;
+    /// see the deployment guide for the recommended short-lived-certificate
+    /// posture. OCSP is not supported.
+    #[serde(default)]
+    pub crl_path: Option<PathBuf>,
+
+    /// Rooted path prefixes whose routes demand a verified client certificate,
+    /// matched against the normalized request path exactly as CSRF exemptions
+    /// are. A request reaching one of these over a connection with no verified
+    /// certificate is rejected with `403` and the standard JSON error envelope.
+    #[serde(default)]
+    pub required_paths: Vec<String>,
+
+    /// How often, in seconds, to poll the CA bundle and CRL modification times
+    /// for a rotation. Default: `60`. A value of `0` is clamped to `1` second.
+    #[serde(default = "default_tls_reload_interval_secs")]
+    pub reload_interval_secs: u64,
+}
+
+impl ClientAuthConfig {
+    /// Validate the `[server.tls.client_auth]` wiring before the listener binds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message describing the first problem found.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.mode.requests_certificate() {
+            match &self.ca_bundle_path {
+                None => {
+                    return Err(format!(
+                        "[server.tls.client_auth] mode = \"{}\" needs ca_bundle_path — the PEM \
+                         bundle of client CAs to verify against",
+                        self.mode.as_str()
+                    ));
+                }
+                Some(path) if path.to_str().is_none_or(|p| p.trim().is_empty()) => {
+                    return Err(
+                        "[server.tls.client_auth] ca_bundle_path is empty; set it to the PEM \
+                         bundle of client CAs, or remove the section"
+                            .to_owned(),
+                    );
+                }
+                Some(_) => {}
+            }
+        } else if !self.required_paths.is_empty() {
+            return Err(
+                "[server.tls.client_auth] lists required_paths but mode = \"off\", so no \
+                 certificate is ever requested and those routes would reject every request; \
+                 set mode = \"optional\" or \"required\""
+                    .to_owned(),
+            );
+        }
+
+        if self
+            .crl_path
+            .as_ref()
+            .is_some_and(|p| p.to_str().is_none_or(|s| s.trim().is_empty()))
+        {
+            return Err(
+                "[server.tls.client_auth] crl_path is empty; set it to a PEM revocation list, \
+                 or remove the key"
+                    .to_owned(),
+            );
+        }
+
+        for path in &self.required_paths {
+            if !path.starts_with('/') {
+                return Err(format!(
+                    "[server.tls.client_auth] required_paths entry `{path}` must be a rooted \
+                     path prefix starting with `/`"
+                ));
+            }
+            // Requests are normalized before matching (`security::path::clean_path`)
+            // but the configured prefix is not, so a noncanonical prefix silently
+            // matches less than it appears to: `/internal//` reduces to
+            // `/internal/` after the matcher strips ONE trailing slash, and
+            // `/internal/keys` then fails to match it. A prefix that protects
+            // less than the operator wrote is the failure this whole section
+            // exists to prevent, so refuse it rather than normalize it silently.
+            if path.contains("//") {
+                return Err(format!(
+                    "[server.tls.client_auth] required_paths entry `{path}` contains an empty \
+                     path segment; write it as a canonical prefix like `/internal/`"
+                ));
+            }
+            if path
+                .split('/')
+                .any(|segment| segment == "." || segment == "..")
+            {
+                return Err(format!(
+                    "[server.tls.client_auth] required_paths entry `{path}` contains a dot \
+                     segment; write the resolved prefix instead"
+                ));
+            }
         }
 
         Ok(())
@@ -5501,6 +7622,291 @@ pub struct AcmeConfig {
     /// left. Default: `30`.
     #[serde(default = "default_acme_renew_before_days")]
     pub renew_before_days: u32,
+
+    /// PEM file holding the root certificate that signs the ACME **directory's
+    /// own HTTPS certificate**, for a directory that is not publicly trusted.
+    ///
+    /// The ACME client speaks HTTPS to the directory and, by default, verifies
+    /// it against the **platform trust store** (the host's own installed CA
+    /// certificates). That is right for Let's Encrypt — both its staging and its
+    /// production API endpoints carry publicly-trusted certificates — and wrong
+    /// for a private CA or a [Pebble](https://github.com/letsencrypt/pebble)
+    /// test server whose API certificate chains to a root the host does not
+    /// know. Point this at that root and the client trusts it *instead of* the
+    /// platform store.
+    ///
+    /// Only the **first** certificate in the file becomes a trust anchor, so
+    /// give it the root alone rather than a leaf/intermediate bundle. Setting it
+    /// also swaps the platform verifier for a plain path verifier, which on
+    /// macOS and Windows means the OS-level policy and revocation checks no
+    /// longer apply to this one connection.
+    ///
+    /// Unset by default, and unnecessary for `directory = "staging"` /
+    /// `"production"`. This changes trust for the **ACME control plane only**;
+    /// it has no bearing on which certificates browsers accept from your site.
+    ///
+    /// Like every other `[server.tls.acme]` key, this has no
+    /// `AUTUMN_SERVER__TLS__ACME__*` environment override: the section is
+    /// configured in `autumn.toml` as a unit. Deliberate, and worth knowing if
+    /// the root arrives as a container mount — the path still has to be named in
+    /// the config file.
+    #[serde(default)]
+    pub ca_root_path: Option<PathBuf>,
+
+    /// DNS-01 challenge settings (issue #1620). Present under
+    /// `[server.tls.acme.dns]`.
+    ///
+    /// When set, every authorization in an order is answered over **DNS-01**
+    /// instead of HTTP-01, which is the only challenge type a CA will accept for
+    /// a **wildcard** identifier — so `domains` may list `*.example.com`. When
+    /// absent, issuance stays on #1608's HTTP-01 path and wildcards are rejected.
+    #[serde(default)]
+    pub dns: Option<AcmeDnsConfig>,
+
+    /// Tenant custom domains (issue #1635). Present under
+    /// `[server.tls.acme.custom_domains]`.
+    ///
+    /// When enabled, tenants connect their own hostnames, each getting its own
+    /// verified, per-domain certificate served by SNI. Absent means no tenant
+    /// hostname is registrable and SNI selection is unchanged.
+    #[serde(default)]
+    pub custom_domains: Option<CustomDomainsConfig>,
+}
+
+/// `[server.tls.acme.custom_domains]` — tenant-connected hostnames with
+/// per-domain ACME certificates (issue #1635).
+///
+/// The whole feature is config-only: no per-domain entries ever appear here.
+/// Domains are registered at runtime through
+/// [`CustomDomainRegistry`](crate::custom_domain::CustomDomainRegistry), which
+/// is what makes a 1,000-tenant deployment a fixed twenty lines of config.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CustomDomainsConfig {
+    /// Turn the feature on. Off by default: enabling it opens an ACME order
+    /// path driven by tenant-supplied hostnames.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// The ingress hostname tenants CNAME their subdomains at.
+    #[serde(default)]
+    pub ingress_hostname: Option<String>,
+
+    /// The ingress IPv4 addresses tenants point apex domains at with A records.
+    ///
+    /// Held as strings and parsed by [`validate`](Self::validate), matching
+    /// `[server.tls.acme.dns] resolvers`: a typed address here aborts the
+    /// config schema walk that `autumn doctor` and strict-config checking
+    /// build on.
+    #[serde(default)]
+    pub ingress_ipv4: Vec<String>,
+
+    /// The ingress IPv6 addresses, for AAAA records.
+    #[serde(default)]
+    pub ingress_ipv6: Vec<String>,
+
+    /// Directory holding the domain registry. Default: `config/acme/domains`.
+    #[serde(default = "default_custom_domains_dir")]
+    pub store_dir: PathBuf,
+
+    /// Most domains this deployment will accept. Default: `1000`.
+    #[serde(default = "default_custom_domains_max")]
+    pub max_domains: usize,
+
+    /// Certificates held in memory at once. Beyond this, a handshake for a
+    /// cold domain re-reads its certificate from the store. Default: `256`.
+    #[serde(default = "default_custom_domains_cert_cache")]
+    pub cert_cache_size: usize,
+
+    /// ACME orders allowed per domain per day. Default: `5`.
+    #[serde(default = "default_custom_domains_per_domain_per_day")]
+    pub issuance_per_domain_per_day: u32,
+
+    /// ACME orders allowed across all domains per hour. Default: `50`.
+    #[serde(default = "default_custom_domains_global_per_hour")]
+    pub issuance_global_per_hour: u32,
+
+    /// First retry delay after a failure; doubles per consecutive failure.
+    /// Default: `300` (5 minutes).
+    #[serde(default = "default_custom_domains_base_backoff")]
+    pub failure_backoff_secs: u64,
+
+    /// Cap on the doubling backoff. Default: `86400` (a day).
+    #[serde(default = "default_custom_domains_max_backoff")]
+    pub max_failure_backoff_secs: u64,
+
+    /// How often the orchestrator verifies, issues and renews. Default: `60`.
+    #[serde(default = "default_custom_domains_poll_secs")]
+    pub poll_interval_secs: u64,
+}
+
+impl Default for CustomDomainsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ingress_hostname: None,
+            ingress_ipv4: Vec::new(),
+            ingress_ipv6: Vec::new(),
+            store_dir: default_custom_domains_dir(),
+            max_domains: default_custom_domains_max(),
+            cert_cache_size: default_custom_domains_cert_cache(),
+            issuance_per_domain_per_day: default_custom_domains_per_domain_per_day(),
+            issuance_global_per_hour: default_custom_domains_global_per_hour(),
+            failure_backoff_secs: default_custom_domains_base_backoff(),
+            max_failure_backoff_secs: default_custom_domains_max_backoff(),
+            poll_interval_secs: default_custom_domains_poll_secs(),
+        }
+    }
+}
+
+impl CustomDomainsConfig {
+    /// A scheme, a port or a path in `ingress_hostname` reaches tenants
+    /// verbatim as their CNAME target. The record would be invalid, the
+    /// ingress would never resolve, and every subdomain domain would sit at
+    /// `pending_dns` with nothing to explain why.
+    fn validate_ingress_hostname(&self) -> Result<(), String> {
+        if let Some(raw) = self
+            .ingress_hostname
+            .as_ref()
+            .filter(|h| !h.trim().is_empty())
+        {
+            let canonical = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+            match crate::custom_domain::normalize_hostname(raw) {
+                Ok(host) if host == canonical => {}
+                Ok(host) => {
+                    return Err(format!(
+                        "[server.tls.acme.custom_domains] ingress_hostname `{raw}` must be a bare \
+                     DNS name (`{host}`): a scheme, port or path cannot be a CNAME target, so \
+                     tenants would be given a record that never resolves"
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "[server.tls.acme.custom_domains] ingress_hostname `{raw}` is not a usable \
+                     DNS name: {e}. Tenants are given it as their CNAME target, so every \
+                     subdomain would stay at pending_dns"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate the custom-domain wiring.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message describing the first problem found.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self
+            .ingress_hostname
+            .as_ref()
+            .is_none_or(|h| h.trim().is_empty())
+            && self.ingress_ipv4.is_empty()
+            && self.ingress_ipv6.is_empty()
+        {
+            return Err(
+                "[server.tls.acme.custom_domains] needs somewhere for tenants to point DNS: set \
+                 ingress_hostname (the CNAME target for tenant subdomains) and/or ingress_ipv4 / \
+                 ingress_ipv6 (the A/AAAA records apex domains need). Without one, no tenant can \
+                 be given usable DNS instructions and no domain can ever verify"
+                    .to_owned(),
+            );
+        }
+        self.validate_ingress_hostname()?;
+        for (key, values) in [
+            ("ingress_ipv4", &self.ingress_ipv4),
+            ("ingress_ipv6", &self.ingress_ipv6),
+        ] {
+            for value in values {
+                let parsed = if key == "ingress_ipv4" {
+                    value.trim().parse::<std::net::Ipv4Addr>().is_ok()
+                } else {
+                    value.trim().parse::<std::net::Ipv6Addr>().is_ok()
+                };
+                if !parsed {
+                    return Err(format!(
+                        "[server.tls.acme.custom_domains] {key} entry `{value}` is not a valid \
+                         address; a tenant would be given a DNS record that points nowhere"
+                    ));
+                }
+            }
+        }
+        if self.max_domains == 0 {
+            return Err(
+                "[server.tls.acme.custom_domains] max_domains must be at least 1; 0 rejects every \
+                 registration"
+                    .to_owned(),
+            );
+        }
+        if self.cert_cache_size == 0 {
+            return Err(
+                "[server.tls.acme.custom_domains] cert_cache_size must be at least 1: a zero-sized \
+                 cache would re-read every certificate on every handshake"
+                    .to_owned(),
+            );
+        }
+        if self.issuance_per_domain_per_day == 0 || self.issuance_global_per_hour == 0 {
+            return Err(
+                "[server.tls.acme.custom_domains] issuance_per_domain_per_day and \
+                 issuance_global_per_hour must both be at least 1; 0 refuses every order and no \
+                 domain can ever become active"
+                    .to_owned(),
+            );
+        }
+        if self.failure_backoff_secs == 0 {
+            return Err(
+                "[server.tls.acme.custom_domains] failure_backoff_secs must be at least 1: a zero \
+                 backoff retries a permanently broken domain every tick and burns the CA's rate \
+                 limits"
+                    .to_owned(),
+            );
+        }
+        if self.max_failure_backoff_secs < self.failure_backoff_secs {
+            return Err(format!(
+                "[server.tls.acme.custom_domains] max_failure_backoff_secs ({}) must be at least \
+                 failure_backoff_secs ({}): the cap is applied to the doubling delay, so a smaller \
+                 cap silently disables the backoff",
+                self.max_failure_backoff_secs, self.failure_backoff_secs
+            ));
+        }
+        if self.poll_interval_secs == 0 {
+            return Err(
+                "[server.tls.acme.custom_domains] poll_interval_secs must be at least 1; 0 spins \
+                 the orchestrator"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The ingress this deployment tells tenants to point at.
+    ///
+    /// A hostname or address that does not parse is dropped here;
+    /// [`validate`](Self::validate) has already refused the configuration, so
+    /// the app never reaches this with a bad value.
+    #[must_use]
+    pub fn ingress(&self) -> crate::custom_domain::ExpectedIngress {
+        crate::custom_domain::ExpectedIngress {
+            hostname: self
+                .ingress_hostname
+                .as_ref()
+                .and_then(|h| crate::custom_domain::normalize_hostname(h).ok()),
+            ipv4: self
+                .ingress_ipv4
+                .iter()
+                .filter_map(|a| a.trim().parse().ok())
+                .collect(),
+            ipv6: self
+                .ingress_ipv6
+                .iter()
+                .filter_map(|a| a.trim().parse().ok())
+                .collect(),
+        }
+    }
 }
 
 impl AcmeConfig {
@@ -5553,6 +7959,17 @@ impl AcmeConfig {
                 self.renew_before_days
             ));
         }
+        if let Some(path) = &self.ca_root_path
+            && path.to_str().is_none_or(|p| p.trim().is_empty())
+        {
+            return Err(
+                "[server.tls.acme] ca_root_path is set but blank: either remove it (to use the \
+                 platform trust store, which is correct for Let's Encrypt staging and \
+                 production) or point it at the PEM root that signs your ACME directory's HTTPS \
+                 certificate"
+                    .to_owned(),
+            );
+        }
         for (index, domain) in self.domains.iter().enumerate() {
             let trimmed = domain.trim();
             if trimmed.is_empty() {
@@ -5561,16 +7978,325 @@ impl AcmeConfig {
                      {index} is empty or whitespace-only)"
                 ));
             }
-            if trimmed.starts_with("*.") {
+            // A wildcard identifier can only ever be validated over DNS-01, so it
+            // is accepted exactly when `[server.tls.acme.dns]` is configured —
+            // and its shape is checked here rather than surfacing later as an
+            // opaque CA rejection mid-issuance.
+            if trimmed.contains('*') {
+                if self.dns.is_none() {
+                    return Err(format!(
+                        "[server.tls.acme] wildcard domain `{trimmed}` needs the DNS-01 \
+                         challenge: an ACME CA will not validate a wildcard identifier over \
+                         HTTP-01. Add a [server.tls.acme.dns] section naming your DNS provider \
+                         (and the credentials-store key holding its API token), or list explicit \
+                         hostnames instead"
+                    ));
+                }
+                let Some(base) = trimmed.strip_prefix("*.") else {
+                    return Err(format!(
+                        "[server.tls.acme] domain `{trimmed}` is not a usable wildcard: a \
+                         wildcard SAN must be written as `*.` followed by the base domain (e.g. \
+                         `*.myapp.com`) — a `*` anywhere else is not matched by any client"
+                    ));
+                };
+                if base.is_empty() || base.contains('*') {
+                    return Err(format!(
+                        "[server.tls.acme] domain `{trimmed}` is not a usable wildcard: exactly \
+                         one leading `*.` is allowed and the base domain after it must be \
+                         non-empty (e.g. `*.myapp.com`)"
+                    ));
+                }
+            }
+            // The checks above read `trimmed`, but the entry is stored — and used —
+            // UNTRIMMED: it becomes the certificate's SAN via `CertificateParams`,
+            // the placeholder key's `CertId`, and the ACME order's
+            // `Identifier::Dns`. A padded ` app.example.com ` is therefore a
+            // different identifier than the hostname the operator meant, and the
+            // failure surfaces as an opaque CA rejection mid-issuance. Reject the
+            // padding here instead of silently trimming, so the config file says
+            // exactly what will be requested.
+            if domain != trimmed {
                 return Err(format!(
-                    "[server.tls.acme] wildcard domain `{trimmed}` is not supported: wildcards \
-                     require the DNS-01 challenge, which is out of scope here (tracked in #1620). \
-                     List explicit hostnames instead"
+                    "[server.tls.acme] domain `{domain}` (entry at index {index}) has leading or \
+                     trailing whitespace: the entry is used verbatim as the certificate's SAN and \
+                     as the ACME order's DNS identifier, so the padded value would be requested \
+                     as-is. Write it as `{trimmed}`"
                 ));
             }
         }
+        if let Some(dns) = &self.dns {
+            dns.validate()?;
+        }
+        if let Some(custom) = &self.custom_domains {
+            custom.validate()?;
+        }
         Ok(())
     }
+
+    /// Whether the configured certificate would cover `host`.
+    ///
+    /// Applies RFC 6125 wildcard matching across every entry in
+    /// [`domains`](Self::domains), so a `*.myapp.com` SAN covers
+    /// `tenant42.myapp.com` but not the apex and not a deeper label. Used by
+    /// `autumn doctor` to check a `tenancy.base_domain` against the certificate
+    /// (issue #1620).
+    #[must_use]
+    pub fn covers_host(&self, host: &str) -> bool {
+        self.domains.iter().any(|san| san_covers_host(san, host))
+    }
+}
+
+/// DNS-01 challenge settings for wildcard (and multi-replica) ACME issuance
+/// (issue #1620). Present under `[server.tls.acme.dns]`.
+///
+/// # Secrets never live here
+///
+/// This section names a **credential reference**, never a token. The provider's
+/// API credential is read from the encrypted credentials store
+/// (`autumn credentials edit`, `config/credentials/<env>.toml.enc`) under the
+/// [`credential`](Self::credential) key, or from the documented environment
+/// variables. There is deliberately no field to hold a token, and the section is
+/// `deny_unknown_fields`, so an `api_token = "..."` written into `autumn.toml`
+/// is a **load-time error** rather than a plaintext secret that silently works.
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [server.tls.acme]
+/// domains = ["myapp.com", "*.myapp.com"]
+/// contact_email = "ops@myapp.com"
+/// directory = "production"
+///
+/// [server.tls.acme.dns]
+/// provider = "cloudflare"
+/// # optional; the credentials-store key holding the token. Default: "acme_dns".
+/// credential = "acme_dns"
+/// ```
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeDnsConfig {
+    /// Which DNS provider writes the `_acme-challenge` TXT records.
+    pub provider: AcmeDnsProvider,
+
+    /// Key in the encrypted credentials store holding this provider's
+    /// credential. Default: `acme_dns`. Never the credential itself.
+    #[serde(default = "default_acme_dns_credential")]
+    pub credential: String,
+
+    /// How long, in seconds, to wait for a published TXT record to become
+    /// visible on every configured resolver before failing the order.
+    /// Default: `300`.
+    #[serde(default = "default_acme_dns_propagation_timeout_secs")]
+    pub propagation_timeout_secs: u64,
+
+    /// Seconds between propagation probes. Default: `5`.
+    #[serde(default = "default_acme_dns_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+
+    /// Resolvers queried to confirm propagation. Each entry is `IP` (port 53
+    /// implied) or `IP:port`. Default: Cloudflare and Google public DNS.
+    #[serde(default = "default_acme_dns_resolvers")]
+    pub resolvers: Vec<String>,
+
+    /// The hook program for [`AcmeDnsProvider::Exec`], as an **argv array**
+    /// (never a shell string). Autumn appends `present|cleanup`, the record
+    /// FQDN, and the TXT value as three further arguments, so nothing is
+    /// interpolated into a shell. Required for `exec`, rejected for every other
+    /// provider.
+    #[serde(default)]
+    pub command: Vec<String>,
+}
+
+impl AcmeDnsConfig {
+    /// Parse [`resolvers`](Self::resolvers) into socket addresses, defaulting a
+    /// bare IP to port 53.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the first unparseable entry.
+    pub fn resolver_addrs(&self) -> Result<Vec<std::net::SocketAddr>, String> {
+        self.resolvers
+            .iter()
+            .map(|entry| parse_resolver_addr(entry))
+            .collect()
+    }
+
+    /// Validate the DNS-01 wiring.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message describing the first problem found.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.credential.trim().is_empty() {
+            return Err(
+                "[server.tls.acme.dns] credential must name the key in the encrypted \
+                 credentials store that holds the DNS provider's API credential (run \
+                 `autumn credentials edit`). It is a key NAME, never the token itself"
+                    .to_owned(),
+            );
+        }
+        match self.provider {
+            AcmeDnsProvider::Exec => {
+                if self
+                    .command
+                    .first()
+                    .is_some_and(|program| !program.trim().is_empty() && program != program.trim())
+                {
+                    return Err(format!(
+                        "[server.tls.acme.dns] command's program `{}` has leading or trailing \
+                         whitespace: it is passed to the OS verbatim, so the padded value would \
+                         fail to execute. Write it without the padding",
+                        self.command[0]
+                    ));
+                }
+                if self.command.first().is_none_or(|p| p.trim().is_empty()) {
+                    return Err(
+                        "[server.tls.acme.dns] provider = \"exec\" requires a non-empty `command` \
+                         argv array (e.g. command = [\"/usr/local/bin/dns-hook\"]); autumn appends \
+                         `present`/`cleanup`, the record FQDN and the TXT value as further \
+                         arguments"
+                            .to_owned(),
+                    );
+                }
+            }
+            AcmeDnsProvider::Cloudflare | AcmeDnsProvider::Route53 => {
+                if !self.command.is_empty() {
+                    return Err(format!(
+                        "[server.tls.acme.dns] command is set but provider is \"{}\": the command \
+                         would never run. Remove it, or set provider = \"exec\" to use the \
+                         external-hook escape hatch",
+                        self.provider.as_str()
+                    ));
+                }
+            }
+        }
+        if self.propagation_timeout_secs == 0 {
+            return Err(
+                "[server.tls.acme.dns] propagation_timeout_secs must not be 0: a zero budget \
+                 fails every order before a freshly-written TXT record could ever be visible. \
+                 Use the default (300) or a larger value for a slow-propagating zone"
+                    .to_owned(),
+            );
+        }
+        if self.poll_interval_secs == 0 {
+            return Err(
+                "[server.tls.acme.dns] poll_interval_secs must not be 0: it would busy-loop the \
+                 configured resolvers. Use the default (5)"
+                    .to_owned(),
+            );
+        }
+        if self.propagation_timeout_secs > MAX_ACME_DNS_PROPAGATION_TIMEOUT_SECS {
+            return Err(format!(
+                "[server.tls.acme.dns] propagation_timeout_secs ({}) must be at most {}: the wait \
+                 is computed as an instant `now + timeout`, and an unbounded value overflows that \
+                 and panics the renewal task, leaving the self-signed placeholder served \
+                 indefinitely. An hour is far past any real provider's propagation time",
+                self.propagation_timeout_secs, MAX_ACME_DNS_PROPAGATION_TIMEOUT_SECS
+            ));
+        }
+        if self.poll_interval_secs > self.propagation_timeout_secs {
+            return Err(format!(
+                "[server.tls.acme.dns] poll_interval_secs ({}) is greater than \
+                 propagation_timeout_secs ({}): the record would be probed once and the wait \
+                 would time out without ever re-checking. Lower poll_interval_secs",
+                self.poll_interval_secs, self.propagation_timeout_secs
+            ));
+        }
+        if self.resolvers.is_empty() {
+            return Err(
+                "[server.tls.acme.dns] resolvers must list at least one DNS resolver to confirm \
+                 TXT propagation against (default: 1.1.1.1:53 and 8.8.8.8:53)"
+                    .to_owned(),
+            );
+        }
+        self.resolver_addrs()?;
+        Ok(())
+    }
+}
+
+/// Parse one `[server.tls.acme.dns] resolvers` entry into a socket address,
+/// defaulting a bare IP address to port 53.
+fn parse_resolver_addr(entry: &str) -> Result<std::net::SocketAddr, String> {
+    let trimmed = entry.trim();
+    if let Ok(addr) = trimmed.parse::<std::net::SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
+        return Ok(std::net::SocketAddr::new(ip, 53));
+    }
+    Err(format!(
+        "[server.tls.acme.dns] resolvers entry `{entry}` is not a resolver address: write it as \
+         an IP (`1.1.1.1`, port 53 implied) or `IP:port` (`1.1.1.1:53`). Hostnames are not \
+         accepted — resolving the resolver would defeat the purpose of the propagation check"
+    ))
+}
+
+/// Which DNS provider writes the ACME DNS-01 `_acme-challenge` TXT records.
+///
+/// The curated set is deliberately small; [`Exec`](Self::Exec) is the documented
+/// escape hatch for everything else (RFC 2136 via `nsupdate`, a registrar CLI, a
+/// webhook shim).
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AcmeDnsProvider {
+    /// Cloudflare DNS, via the v4 REST API with a scoped API token.
+    Cloudflare,
+    /// Amazon Route 53, via `ChangeResourceRecordSets` with `SigV4` credentials.
+    Route53,
+    /// An operator-provided hook program — the escape hatch for any other
+    /// provider.
+    Exec,
+}
+
+impl AcmeDnsProvider {
+    /// The provider's stable config spelling (also used in health details).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cloudflare => "cloudflare",
+            Self::Route53 => "route53",
+            Self::Exec => "exec",
+        }
+    }
+}
+
+impl std::fmt::Display for AcmeDnsProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Whether a certificate SAN entry covers `host`, using RFC 6125 wildcard rules.
+///
+/// A `*.example.com` SAN covers exactly one label — `tenant1.example.com` but
+/// neither `a.b.example.com` nor the bare apex `example.com`. Matching is
+/// case-insensitive and tolerates a trailing dot on `host`.
+///
+/// Used by `autumn doctor` to tell an operator that their `tenancy.base_domain`
+/// is not covered by the configured certificate (issue #1620).
+#[must_use]
+pub fn san_covers_host(san: &str, host: &str) -> bool {
+    let san = san.trim().trim_end_matches('.').to_ascii_lowercase();
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if san.is_empty() || host.is_empty() {
+        return false;
+    }
+    let Some(suffix) = san.strip_prefix("*.") else {
+        return san == host;
+    };
+    if suffix.is_empty() {
+        return false;
+    }
+    // Exactly one label may stand in for the `*`: strip the suffix and require
+    // what remains to be a single non-empty, dot-free label.
+    let Some(label) = host
+        .strip_suffix(&suffix)
+        .and_then(|prefix| prefix.strip_suffix('.'))
+    else {
+        return false;
+    };
+    !label.is_empty() && !label.contains('.')
 }
 
 /// Which ACME directory endpoint to provision against.
@@ -5814,10 +8540,12 @@ impl ShardConfig {
 
 /// Which database engine a configured connection target names.
 ///
-/// Autumn recognizes two backends. Postgres is the fully wired runtime; `SQLite`
-/// (issue #1614) is recognized at config time so a `SQLite` target validates and
-/// is reported honestly, while the runtime pool that would serve it refuses at
-/// boot until the pool rework lands (see [`create_pool`](crate::db::create_pool)).
+/// Autumn recognizes two backends. Postgres is the default runtime; `SQLite`
+/// (issue #1614) is served by the runtime built with the crate's `sqlite`
+/// cargo feature. Detection here is backend-neutral and always compiled, so a
+/// `SQLite` target validates on either build; a build that cannot serve the
+/// detected backend refuses at pool construction with a message naming the
+/// feature (see [`create_pool`](crate::db::create_pool)).
 ///
 /// # Detection rules
 ///
@@ -5836,10 +8564,10 @@ impl ShardConfig {
 ///   `sqlite://` (or `sqlite:` / `file:`) scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatabaseBackend {
-    /// `PostgreSQL` — the fully wired runtime backend.
+    /// `PostgreSQL` — the default runtime backend.
     Postgres,
-    /// `SQLite` — recognized at config time; the runtime pool is not yet wired
-    /// (issue #1614).
+    /// `SQLite` — served by a build compiled with the `sqlite` feature
+    /// (issue #1614); refused at pool construction by any other build.
     Sqlite,
 }
 
@@ -6265,6 +8993,25 @@ impl DatabaseConfig {
         self.primary_url.as_deref().or(self.url.as_deref())
     }
 
+    /// Resolved primary/write database URL, but only when it names Postgres.
+    ///
+    /// Autumn ships subsystems that are Postgres-only by construction — the
+    /// `PgFlagStore`, `PgExperimentStore` and `PgConfigStore` open a
+    /// `diesel::PgConnection` and issue `pg_notify` / `pg_advisory_xact_lock` /
+    /// `jsonb` SQL. Handing one a `SQLite` target builds a store that fails on
+    /// first use with a connection error naming a driver the operator never
+    /// chose. This accessor is what those constructors screen on, so an
+    /// unsupported target yields "no store" at construction instead.
+    ///
+    /// Fails closed: a target [`DatabaseBackend::detect`] cannot classify is
+    /// refused too, rather than handed to a Postgres driver on the chance that
+    /// it might work.
+    #[must_use]
+    pub fn effective_primary_postgres_url(&self) -> Option<&str> {
+        self.effective_primary_url()
+            .filter(|url| DatabaseBackend::detect(url) == Some(DatabaseBackend::Postgres))
+    }
+
     /// Resolved primary/write role pool size.
     #[must_use]
     pub fn effective_primary_pool_size(&self) -> usize {
@@ -6444,9 +9191,11 @@ impl DatabaseConfig {
         ] {
             // A SQLite target (issue #1614) is now a recognized shape and
             // passes this per-field check; only strings that are neither a
-            // Postgres nor a SQLite target are rejected here. The message is
-            // unchanged for the Postgres-shaped forms so existing deployments
-            // and diagnostics see byte-for-byte identical errors.
+            // Postgres nor a SQLite target are rejected here. The message's
+            // GUIDANCE half is unchanged — everything up to "got" — so existing
+            // diagnostics that match on it still match; the target it quotes is
+            // now redacted (see below), because a rejected string is by
+            // definition one whose secrets this code cannot enumerate.
             if let Some(url) = url
                 && DatabaseBackend::detect(url).is_none()
             {
@@ -6455,10 +9204,16 @@ impl DatabaseConfig {
                 } else {
                     field
                 };
+                // Redacted: this is the refusal a normal `autumn.toml`
+                // misconfiguration hits, and it reaches `tracing::error!` at
+                // boot — one line after the startup summary masked the same
+                // URL. A target this branch could not classify is, by
+                // definition, not a shape we can enumerate the secrets of.
+                let target = crate::db_url::redact_target(url);
                 return Err(ConfigError::Validation(format!(
                     "Invalid {label}: must start with postgres:// or postgresql://, or be a \
                      keyword/value connection string \
-                     (e.g. \"host=db user=app dbname=app sslmode=require\"), got {url:?}"
+                     (e.g. \"host=db user=app dbname=app sslmode=require\"), got {target:?}"
                 )));
             }
         }
@@ -6503,11 +9258,12 @@ impl DatabaseConfig {
                 if let Some(url) = url
                     && !is_pg_connection_string(url)
                 {
+                    let target = crate::db_url::redact_target(url);
                     return Err(ConfigError::Validation(format!(
                         "Invalid database.shards[{idx}].{field}: must start with \
                          postgres:// or postgresql://, or be a keyword/value \
                          connection string \
-                         (e.g. \"host=db user=app dbname=app sslmode=require\"), got {url:?}"
+                         (e.g. \"host=db user=app dbname=app sslmode=require\"), got {target:?}"
                     )));
                 }
             }
@@ -6790,6 +9546,125 @@ const fn default_actuator_prometheus() -> bool {
     true
 }
 
+/// App-metric registry limits (`[metrics]` section).
+///
+/// These are the three cardinality caps the call-site metrics facade
+/// ([`crate::metrics`]) enforces on an app's own counters, gauges, histograms
+/// and timers. They exist so a label-cardinality mistake degrades the metric
+/// instead of growing memory without bound; they are configurable because the
+/// line between "a mistake" and "a large but deliberate label space" is a
+/// property of the app, not of the framework.
+///
+/// Every key defaults to the value the facade shipped with in 0.7.0, so an
+/// app with no `[metrics]` section is unaffected.
+///
+/// # Raising a cap is not free
+///
+/// A retained series is never evicted — evicting a counter would reset it, and
+/// a reset is indistinguishable from a restart to `rate()`. Raising
+/// `max_series_per_metric` therefore raises the *permanent* memory an
+/// unbounded label value (a user id, a URL, an error string) can claim.
+/// Raise it because the app's label space is genuinely larger, not to silence
+/// `autumn_metrics_series_dropped_total`.
+///
+/// # Examples
+///
+/// ```toml
+/// [metrics]
+/// max_series_per_metric = 500
+/// max_instruments = 512
+/// ```
+///
+/// Each key also takes an environment override:
+/// `AUTUMN_METRICS__MAX_SERIES_PER_METRIC`,
+/// `AUTUMN_METRICS__MAX_INSTRUMENTS`,
+/// `AUTUMN_METRICS__MAX_LABELS_PER_SERIES`.
+///
+/// # Where it is applied
+///
+/// `AppBuilder::run` installs this section process-wide before it builds
+/// anything from the config, so it is in force before the first call site can
+/// record. The registry is process-global, so
+/// [`TestApp`](crate::test::TestApp) deliberately does **not** apply it — one
+/// test's caps would leak into every test sharing the binary. A test that needs
+/// a different cap calls [`crate::metrics::set_limits`] itself and restores the
+/// default afterwards.
+///
+/// See `docs/guide/metrics.md`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetricsConfig {
+    /// Distinct **labeled** series retained per instrument. Default: `100`.
+    ///
+    /// Beyond this, a sample carrying a label set the instrument has not seen
+    /// is dropped and counted in `autumn_metrics_series_dropped_total`. The
+    /// unlabeled series does not count against it. Range: 1 to
+    /// [`MAX_SERIES_PER_METRIC_CEILING`](crate::metrics::MAX_SERIES_PER_METRIC_CEILING).
+    #[serde(default = "default_max_series_per_metric")]
+    pub max_series_per_metric: usize,
+
+    /// Distinct instruments the process-global registry holds. Default: `256`.
+    ///
+    /// Beyond this, a new metric name gets an inert handle. Range: 1 to
+    /// [`MAX_INSTRUMENTS_CEILING`](crate::metrics::MAX_INSTRUMENTS_CEILING).
+    #[serde(default = "default_max_instruments")]
+    pub max_instruments: usize,
+
+    /// Labels retained on a single series. Default: `8`.
+    ///
+    /// Extras are dropped — lexicographically smallest names survive — and
+    /// the sample is still recorded. Range: 1 to
+    /// [`MAX_LABELS_PER_SERIES_CEILING`](crate::metrics::MAX_LABELS_PER_SERIES_CEILING).
+    ///
+    /// Changing this changes **series identity**: the same twelve labels
+    /// canonicalize to a different key under a cap of 8 than under 12. Set it
+    /// once, before the app records anything.
+    #[serde(default = "default_max_labels_per_series")]
+    pub max_labels_per_series: usize,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            max_series_per_metric: default_max_series_per_metric(),
+            max_instruments: default_max_instruments(),
+            max_labels_per_series: default_max_labels_per_series(),
+        }
+    }
+}
+
+impl MetricsConfig {
+    /// This section as the value the metrics registry consumes.
+    #[must_use]
+    pub const fn limits(&self) -> crate::metrics::Limits {
+        crate::metrics::Limits {
+            max_series_per_metric: self.max_series_per_metric,
+            max_instruments: self.max_instruments,
+            max_labels_per_series: self.max_labels_per_series,
+        }
+    }
+
+    /// Reject an out-of-range cap by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns the offending `autumn.toml` key and its accepted range.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.limits().validate().map_err(ConfigError::Validation)
+    }
+}
+
+const fn default_max_series_per_metric() -> usize {
+    crate::metrics::DEFAULT_MAX_SERIES_PER_METRIC
+}
+
+const fn default_max_instruments() -> usize {
+    crate::metrics::DEFAULT_MAX_INSTRUMENTS
+}
+
+const fn default_max_labels_per_series() -> usize {
+    crate::metrics::DEFAULT_MAX_LABELS_PER_SERIES
+}
+
 /// CORS (Cross-Origin Resource Sharing) configuration.
 ///
 /// Controls which origins, methods, and headers are allowed for
@@ -6978,8 +9853,14 @@ pub struct CompressionConfig {
 // Exposed for autumn-cli's `autumn deploy` preflight (doctor) to reuse the deploy env-override logic; not yet a stable public API.
 #[doc(hidden)]
 pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn Env) {
-    const KEYS: [&str; 11] = [
+    // This array is a PRESENCE PROBE gating materialization of the ENTIRE
+    // `[deploy]` table: a key missing from it means an env-only config that sets
+    // only that key produces no deploy section at all — a silent skip, not an
+    // error, in both `AutumnConfig::load` and `autumn doctor`. Every key parsed
+    // below MUST appear here.
+    const KEYS: [&str; 13] = [
         "AUTUMN_DEPLOY__HOST",
+        "AUTUMN_DEPLOY__HOSTS",
         "AUTUMN_DEPLOY__USER",
         "AUTUMN_DEPLOY__SSH_PORT",
         "AUTUMN_DEPLOY__APP_NAME",
@@ -6990,12 +9871,54 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
         "AUTUMN_DEPLOY__PROFILE",
         "AUTUMN_DEPLOY__TLS__ENABLED",
         "AUTUMN_DEPLOY__TLS__HOST",
+        "AUTUMN_DEPLOY__INSTALL_PROXY",
     ];
     if !KEYS.iter().any(|key| env.var(key).is_ok()) {
         return;
     }
     let deploy = deploy.get_or_insert_with(DeployConfig::default);
+    // #1621 review round 1: `host` and `hosts` are mutually exclusive downstream, so
+    // applying one spelling from the environment on top of the other spelling in TOML
+    // produced a config that refuses every `autumn deploy` subcommand — even though
+    // `AUTUMN_DEPLOY__*` is documented to win over TOML. Whether each spelling was set
+    // non-empty in the environment is therefore captured before either is applied, so a
+    // non-empty env value can clear the TOML alternate below.
+    //
+    // "Non-empty" is judged conservatively: a value blank after trimming never clears
+    // the other spelling, so the established empty-means-unset semantics survive.
+    // `AUTUMN_DEPLOY__HOST=` and `AUTUMN_DEPLOY__HOSTS=`/`,`/` , ` are the shape a CI or
+    // compose template emits for an unfilled slot, and they say nothing about the other
+    // spelling. `parse_env_option_string` below still applies its own unchanged
+    // `is_empty()` rule to `host` itself; trimming here only makes the clearing decision
+    // stricter, so a whitespace-only value can never drop a configured fleet list.
+    let env_set_host = env
+        .var("AUTUMN_DEPLOY__HOST")
+        .is_ok_and(|value| !value.trim().is_empty());
+    let env_set_hosts = env
+        .var("AUTUMN_DEPLOY__HOSTS")
+        .is_ok_and(|value| value.split(',').any(|entry| !entry.trim().is_empty()));
     parse_env_option_string(env, "AUTUMN_DEPLOY__HOST", &mut deploy.host);
+    // #1621: the fleet host list, as CSV. It REPLACES the whole TOML list (a
+    // fleet-level retarget), matching every other `AUTUMN_DEPLOY__*` override.
+    // Entries are trimmed by `parse_env_csv_non_empty`, which also DROPS blank
+    // segments: `AUTUMN_DEPLOY__HOSTS=` means unset (as `AUTUMN_DEPLOY__HOST=`
+    // does) and a trailing/doubled comma is tolerated, rather than reaching the
+    // CLI as a blank fleet entry that refuses every deploy subcommand. Duplicate
+    // entries are still rejected downstream by the CLI's `ResolvedFleet::resolve`.
+    parse_env_csv_non_empty(env, "AUTUMN_DEPLOY__HOSTS", &mut deploy.hosts);
+    // Env-over-TOML precedence, applied to the spelling the operator did not set:
+    // retargeting a `[deploy] host` project as a fleet, or a `[deploy] hosts` project at
+    // a single server, is a legitimate env override rather than a conflict. It is
+    // deliberately not a tie-break: when both env spellings are set non-empty the
+    // rollout order is genuinely ambiguous — an operator error, not a precedence
+    // question — so both survive and the existing mutual-exclusion refusal
+    // (`DeployConfig::validate`, the CLI's `deploy_host_list`) still fires, naming both
+    // keys.
+    if env_set_hosts && !env_set_host {
+        deploy.host = None;
+    } else if env_set_host && !env_set_hosts {
+        deploy.hosts.clear();
+    }
     parse_env_string(env, "AUTUMN_DEPLOY__USER", &mut deploy.user);
     parse_env(env, "AUTUMN_DEPLOY__SSH_PORT", &mut deploy.ssh_port);
     parse_env_option_string(env, "AUTUMN_DEPLOY__APP_NAME", &mut deploy.app_name);
@@ -7016,6 +9939,14 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
     // every other deploy override above.
     parse_env_bool(env, "AUTUMN_DEPLOY__TLS__ENABLED", &mut deploy.tls.enabled);
     parse_env_option_string(env, "AUTUMN_DEPLOY__TLS__HOST", &mut deploy.tls.host);
+    // Host preparation opt-out (#1607). Env wins over TOML, like every other deploy
+    // override above, so a CI pipeline deploying to pre-provisioned hosts can
+    // decline it without editing `autumn.toml`.
+    parse_env_bool(
+        env,
+        "AUTUMN_DEPLOY__INSTALL_PROXY",
+        &mut deploy.install_proxy,
+    );
 }
 
 /// Parse an environment variable into a typed target, logging a warning on failure.
@@ -7091,6 +10022,33 @@ fn parse_env_option_bool(env: &dyn Env, key: &str, target: &mut Option<bool>) {
 fn parse_env_csv(env: &dyn Env, key: &str, target: &mut Vec<String>) {
     if let Ok(val) = env.var(key) {
         *target = val.split(',').map(|s| s.trim().to_owned()).collect();
+    }
+}
+
+/// CSV env override that drops blank segments (issue #1621).
+///
+/// Same shape as [`parse_env_csv`], but an empty/whitespace-only segment is not a
+/// list entry. Two consequences, both deliberate:
+///
+/// * `KEY=` (or `KEY="   "`) means **unset**, i.e. the list is cleared rather than
+///   set to a one-element vector holding a blank string. That is the shape a CI or
+///   compose env template produces for a not-yet-filled-in value, and it matches
+///   [`parse_env_option_string`]'s empty-is-unset rule for the sibling scalar keys
+///   (and `crate::maintenance::flag_file_path_from`'s blank-is-unset rule).
+/// * A trailing or doubled comma — routine in generated env lists — is tolerated
+///   instead of surfacing downstream as a blank entry.
+///
+/// Used only for `AUTUMN_DEPLOY__HOSTS`, whose downstream consumer turns a blank
+/// entry into a hard refusal of every `autumn deploy` subcommand; the other CSV
+/// overrides keep [`parse_env_csv`]'s long-standing behaviour.
+fn parse_env_csv_non_empty(env: &dyn Env, key: &str, target: &mut Vec<String>) {
+    if let Ok(val) = env.var(key) {
+        *target = val
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
     }
 }
 
@@ -7222,6 +10180,80 @@ const fn default_acme_renew_before_days() -> u32 {
     30
 }
 
+/// Default custom-domain registry directory.
+fn default_custom_domains_dir() -> PathBuf {
+    PathBuf::from("config/acme/domains")
+}
+
+/// Default cap on registered tenant domains.
+const fn default_custom_domains_max() -> usize {
+    1000
+}
+
+/// Default number of per-domain certificates held in memory.
+const fn default_custom_domains_cert_cache() -> usize {
+    256
+}
+
+/// Default per-domain daily ACME order budget.
+const fn default_custom_domains_per_domain_per_day() -> u32 {
+    5
+}
+
+/// Default deployment-wide hourly ACME order budget.
+const fn default_custom_domains_global_per_hour() -> u32 {
+    50
+}
+
+/// Default first retry delay after a custom-domain failure.
+const fn default_custom_domains_base_backoff() -> u64 {
+    300
+}
+
+/// Default cap on the custom-domain retry backoff.
+const fn default_custom_domains_max_backoff() -> u64 {
+    86_400
+}
+
+/// Default custom-domain orchestrator poll interval.
+const fn default_custom_domains_poll_secs() -> u64 {
+    60
+}
+
+/// Default credentials-store key holding the DNS provider credential
+/// (`[server.tls.acme.dns] credential`).
+fn default_acme_dns_credential() -> String {
+    "acme_dns".to_owned()
+}
+
+/// Default bound on the DNS-01 TXT propagation wait, in seconds
+/// (`[server.tls.acme.dns] propagation_timeout_secs`). Five minutes covers the
+/// slow tail of public-resolver caches without parking a renewal indefinitely.
+const fn default_acme_dns_propagation_timeout_secs() -> u64 {
+    300
+}
+
+/// Default gap between propagation probes, in seconds
+/// (`[server.tls.acme.dns] poll_interval_secs`).
+const fn default_acme_dns_poll_interval_secs() -> u64 {
+    5
+}
+
+/// Upper bound on `[server.tls.acme.dns] propagation_timeout_secs`.
+///
+/// The wait is computed as `Instant::now() + Duration::from_secs(timeout)`, which
+/// **panics** on overflow — inside the spawned renewal task, where the panic
+/// silently kills the loop and leaves the self-signed placeholder served
+/// forever. An hour is far past any real provider's propagation time.
+const MAX_ACME_DNS_PROPAGATION_TIMEOUT_SECS: u64 = 3600;
+
+/// Default public resolvers the propagation wait queries
+/// (`[server.tls.acme.dns] resolvers`). Two independent operators, so one
+/// operator's stale cache cannot alone declare a record propagated.
+fn default_acme_dns_resolvers() -> Vec<String> {
+    vec!["1.1.1.1:53".to_owned(), "8.8.8.8:53".to_owned()]
+}
+
 const fn default_health_enabled() -> bool {
     true
 }
@@ -7232,6 +10264,23 @@ fn default_health_path() -> String {
 
 fn default_live_path() -> String {
     "/live".to_owned()
+}
+
+const fn default_upgrade_enabled() -> bool {
+    true
+}
+
+const fn default_upgrade_ready_timeout() -> u64 {
+    30
+}
+
+impl Default for UpgradeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_upgrade_enabled(),
+            ready_timeout_secs: default_upgrade_ready_timeout(),
+        }
+    }
 }
 
 fn default_ready_path() -> String {
@@ -7253,9 +10302,11 @@ impl Default for ServerConfig {
             strict_config_enforce_all: false,
             shutdown_timeout_secs: default_shutdown_timeout(),
             prestop_grace_secs: default_prestop_grace(),
+            upgrade: UpgradeConfig::default(),
             timeouts: RequestTimeoutsConfig::default(),
             unix_socket: None,
             max_concurrent_requests: None,
+            capacity_contract: None,
             tls: None,
         }
     }
@@ -8513,15 +11564,14 @@ mod tests {
         );
     }
 
-    // #2067: a legitimately quoted-dotted TOP-LEVEL table root — the valid TOML
-    // form of a plugin `config_section("my.plugin")`, whose top-level table is
-    // `["my.plugin"]` (a single quoted key that happens to contain a dot) — must
-    // be leniently ACCEPTED by the deploy CLI, because app boot ACCEPTS it too
-    // (the #2061 exemption keys on the RAW table key with `path.is_empty()`). The
-    // earlier `!path.contains('.')` heuristic wrongly HARD-FAILED it: the rendered
-    // dotted string `my.plugin` is ambiguous between a quoted top-level key and a
-    // 2-level path. Gating on the STRUCTURAL `is_top_level` (empty parent path)
-    // fixes it. Regression against that string-heuristic bug.
+    // #2067: a legitimately quoted-dotted top-level table root — the valid TOML form of
+    // a plugin `config_section("my.plugin")`, whose top-level table is `["my.plugin"]`,
+    // one quoted key that happens to contain a dot — must be leniently accepted by the
+    // deploy CLI, because app boot accepts it too: the #2061 exemption keys on the raw
+    // table key with `path.is_empty()`. The earlier `!path.contains('.')` heuristic
+    // wrongly hard-failed it, since the rendered `my.plugin` is ambiguous between a
+    // quoted top-level key and a two-level path. Gating on the structural
+    // `is_top_level`, an empty parent path, fixes it.
     #[test]
     fn deploy_cli_lenient_accepts_quoted_dotted_top_level_root() {
         // `["my.plugin"]` is a quoted top-level key CONTAINING a dot (one
@@ -8852,15 +11902,14 @@ mod tests {
         );
     }
 
-    // A registered plugin root under a PROFILE prefix (`[profile.prod.media]`)
-    // stays STRICT and must be rejected — the exemption only ever covers the
-    // TRUE top-level `[media]` table. Soundness rationale: the media plugin's
-    // reader deserializes only the top-level `root.media` and does NOT apply
-    // Autumn's profile merge, so a profile layer the plugin cannot consume must
-    // not be exempted — otherwise a strict app with media settings only under
-    // `[profile.prod.media]` would boot silently on default plugin config
-    // instead of failing loudly. (Profile-aware plugin config is a separate,
-    // larger enhancement.)
+    // A registered plugin root under a profile prefix (`[profile.prod.media]`) stays
+    // strict and must be rejected: the exemption covers only the true top-level
+    // `[media]` table. The media plugin's reader deserializes only the top-level
+    // `root.media` and does not apply Autumn's profile merge, so a profile layer the
+    // plugin cannot consume must not be exempted — otherwise a strict app with media
+    // settings only under `[profile.prod.media]` would boot silently on default plugin
+    // config instead of failing loudly. Profile-aware plugin config is a separate,
+    // larger enhancement.
     #[test]
     fn strict_config_still_rejects_profile_prefixed_plugin_root() {
         let temp = tempfile::tempdir().unwrap();
@@ -9013,15 +12062,15 @@ mod tests {
         );
     }
 
-    // 7c″ (#1890 P2 fix): a typo under a QUOTED DOTTED profile name (e.g.
-    // `[profile."prod.eu".server]`) must classify by its real segment-derived
-    // schema parent. The `"prod.eu"` key is ONE TOML key (a literal dot), so the
-    // segmented path is `["profile", "prod.eu", "server"]` and the profile-stripped
-    // schema parent is `server` — a pre-#1890 strict section that must keep
-    // hard-failing, NOT be demoted to warn-only by string-splitting the joined
-    // path. A `[profile."prod.eu".resilience]` typo (a newly-#1890-covered section)
-    // with the same strict_config (enforce_all OFF) must still only warn — proving
-    // the fix stays narrow even under dotted profile names.
+    // 7c″ (#1890 P2 fix): a typo under a quoted dotted profile name, such as
+    // `[profile."prod.eu".server]`, must classify by its real segment-derived schema
+    // parent. `"prod.eu"` is one TOML key with a literal dot, so the segmented path is
+    // `["profile", "prod.eu", "server"]` and the profile-stripped schema parent is
+    // `server`, a pre-#1890 strict section that must keep hard-failing rather than be
+    // demoted to warn-only by string-splitting the joined path. A
+    // `[profile."prod.eu".resilience]` typo, in a newly-#1890-covered section, with the
+    // same strict_config and enforce_all off must still only warn — proving the fix
+    // stays narrow under dotted profile names.
     #[test]
     fn dotted_profile_name_preserves_strictness() {
         // Pre-#1890 strict section (`server`) under a quoted dotted profile name:
@@ -9180,7 +12229,7 @@ mod tests {
         // `session.backend_plan(profile)` which returned an error for
         // `backend = "redis"` without `redis.url`, exiting the boot before
         // a `with_session_store(...)` override could apply. Session
-        // backend validation now lives in `apply_session_layer`, which
+        // backend validation now lives in `build_session_layer`, which
         // short-circuits when a custom store is installed. `validate()`
         // is config-shape-only and must accept this combination.
         let mut config = AutumnConfig::default();
@@ -9246,6 +12295,50 @@ mod tests {
             }
             _ => panic!("Expected ConfigError::Validation"),
         }
+    }
+
+    // The boot refusal an ordinary `autumn.toml` misconfiguration hits. It
+    // reaches `tracing::error!`, so under `log.format = "json"` whatever it
+    // names lands in the structured log stream — one line after the startup
+    // summary masked the very same URL.
+    #[test]
+    fn database_config_validate_does_not_echo_credentials() {
+        for url in [
+            "mysql://user:hunter2@localhost:3306/db",
+            "redis://:hunter2@localhost:6379",
+            "amqp://app:hunter2@broker/vhost",
+        ] {
+            let config = DatabaseConfig {
+                url: Some(url.to_owned()),
+                ..Default::default()
+            };
+            let Err(ConfigError::Validation(msg)) = config.validate() else {
+                panic!("{url} must be refused");
+            };
+            assert!(!msg.contains("hunter2"), "password leaked in: {msg}");
+            // Still actionable: the operator can tell which URL to go fix.
+            assert!(msg.contains("localhost") || msg.contains("broker"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn database_shard_url_validation_does_not_echo_credentials() {
+        let config = DatabaseConfig {
+            shards: vec![ShardConfig {
+                name: "shard0".to_owned(),
+                primary_url: "mysql://user:hunter2@localhost:3306/db".to_owned(),
+                slots: None,
+                replica_url: None,
+                primary_pool_size: None,
+                replica_pool_size: None,
+                replica_fallback: None,
+            }],
+            ..Default::default()
+        };
+        let Err(ConfigError::Validation(msg)) = config.validate() else {
+            panic!("a non-Postgres shard url must be refused");
+        };
+        assert!(!msg.contains("hunter2"), "password leaked in: {msg}");
     }
 
     #[test]
@@ -9917,15 +13010,13 @@ slots = ["8194-16383"]
 
     #[test]
     fn autumn_config_validate_no_longer_errors_on_invalid_session_backend() {
-        // Session backend validation moved to `apply_session_layer` so a
-        // custom store installed via `AppBuilder::with_session_store(...)`
-        // can override an otherwise-invalid backend config without the boot
-        // exiting first. `validate()` is config-shape-only now; runtime
-        // session selection (and the backend error) lives in
-        // `apply_session_layer`, which short-circuits when a custom store
-        // is installed. `crate::session::tests::session_backend_plan_*`
-        // still cover the underlying error cases directly on
-        // `SessionConfig::backend_plan`.
+        // Session backend validation moved to `build_session_layer`, so a custom store
+        // installed via `AppBuilder::with_session_store(...)` can override an otherwise
+        // invalid backend config without the boot exiting first. `validate()` is
+        // config-shape-only now; runtime session selection, and the backend error, live
+        // in `build_session_layer`, which short-circuits when a custom store is
+        // installed. `crate::session::tests::session_backend_plan_*` still cover the
+        // error cases directly on `SessionConfig::backend_plan`.
         let mut config = AutumnConfig::default();
         config.session.backend = crate::session::SessionBackend::Redis;
         config.session.redis.url = None;
@@ -10166,6 +13257,81 @@ path = "/healthz"
     }
 
     #[test]
+    fn metrics_section_defaults_to_the_shipped_caps() {
+        // The whole point of making the caps configurable is that an app which
+        // configures nothing keeps the behaviour 0.7.0 shipped.
+        let config = AutumnConfig::default();
+        assert_eq!(config.metrics.limits(), crate::metrics::Limits::default());
+
+        let parsed: AutumnConfig =
+            toml::from_str("[server]\nport = 3000\n").expect("config without [metrics] parses");
+        assert_eq!(parsed.metrics.limits(), crate::metrics::Limits::default());
+    }
+
+    #[test]
+    fn metrics_section_parses_a_raised_cap() {
+        let parsed: AutumnConfig =
+            toml::from_str("[metrics]\nmax_series_per_metric = 500\nmax_labels_per_series = 12\n")
+                .expect("[metrics] parses");
+
+        assert_eq!(parsed.metrics.max_series_per_metric, 500);
+        assert_eq!(parsed.metrics.max_labels_per_series, 12);
+        assert_eq!(
+            parsed.metrics.max_instruments,
+            crate::metrics::DEFAULT_MAX_INSTRUMENTS,
+            "an unset key keeps its default rather than zeroing"
+        );
+        parsed.metrics.validate().expect("in-range caps validate");
+    }
+
+    #[test]
+    fn env_override_metrics_caps() {
+        let env = MockEnv::new()
+            .with("AUTUMN_METRICS__MAX_SERIES_PER_METRIC", "500")
+            .with("AUTUMN_METRICS__MAX_INSTRUMENTS", "512")
+            .with("AUTUMN_METRICS__MAX_LABELS_PER_SERIES", "12");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(
+            config.metrics.limits(),
+            crate::metrics::Limits {
+                max_series_per_metric: 500,
+                max_instruments: 512,
+                max_labels_per_series: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn validate_rejects_an_out_of_range_metrics_cap() {
+        // A cap of 0 would drop every labeled sample the app records, silently.
+        // It must fail the boot — and `autumn check` — by name.
+        let mut config = AutumnConfig::default();
+        config.metrics.max_series_per_metric = 0;
+
+        let error = config
+            .validate()
+            .expect_err("a zero cap must not validate")
+            .to_string();
+        assert!(
+            error.contains("max_series_per_metric"),
+            "the error must name the key at fault; got {error}"
+        );
+
+        let mut config = AutumnConfig::default();
+        config.metrics.max_labels_per_series = crate::metrics::MAX_LABELS_PER_SERIES_CEILING + 1;
+        assert!(
+            config.validate().is_err(),
+            "a cap above its ceiling must not validate"
+        );
+
+        AutumnConfig::default()
+            .validate()
+            .expect("the default [metrics] section validates");
+    }
+
+    #[test]
     fn env_override_actuator_prometheus_disables() {
         // Operators must be able to remove the scrape endpoint via the
         // documented AUTUMN_SECTION__FIELD convention, not just TOML.
@@ -10263,6 +13429,461 @@ path = "/healthz"
         config.apply_env_overrides_with_env(&env);
         assert!(!config.reporting.enabled);
         assert!((config.reporting.sample_rate - 0.1).abs() < f64::EPSILON);
+    }
+
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn failure_capture_defaults_are_off() {
+        let config = AutumnConfig::default();
+        assert!(
+            !config.failure_capture.enabled,
+            "capture writes production request data to disk; it must be opt-in"
+        );
+        assert_eq!(config.failure_capture.dir, "tmp/autumn-capsules");
+        assert_eq!(config.failure_capture.max_body_bytes, 65_536);
+        assert_eq!(config.failure_capture.max_capsule_bytes, 1_048_576);
+        assert_eq!(config.failure_capture.max_capsules, 50);
+    }
+
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn failure_capture_env_overrides_apply() {
+        let env = MockEnv::new()
+            .with("AUTUMN_FAILURE_CAPTURE__ENABLED", "true")
+            .with("AUTUMN_FAILURE_CAPTURE__DIR", "/var/tmp/capsules")
+            .with("AUTUMN_FAILURE_CAPTURE__MAX_BODY_BYTES", "1024")
+            .with("AUTUMN_FAILURE_CAPTURE__MAX_CAPSULE_BYTES", "2048")
+            .with("AUTUMN_FAILURE_CAPTURE__MAX_CAPSULES", "5");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        assert!(config.failure_capture.enabled);
+        assert_eq!(config.failure_capture.dir, "/var/tmp/capsules");
+        assert_eq!(config.failure_capture.max_body_bytes, 1024);
+        assert_eq!(config.failure_capture.max_capsule_bytes, 2048);
+        assert_eq!(config.failure_capture.max_capsules, 5);
+    }
+
+    /// Regression guard for the `[failure_capture]` field ordering.
+    ///
+    /// Mirrors `deploy_child_keys_are_strictly_validated`: the strict
+    /// unknown-key validator only descends into a config.rs-internal section
+    /// declared *before* `database`, because `DatabaseConfig`'s
+    /// `deserialize_with` duration field aborts the schema walk. If someone
+    /// moves `failure_capture` below `database`, its child keys silently
+    /// vanish from the schema and this fails.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn failure_capture_child_keys_are_strictly_validated() {
+        let leaves = AutumnConfig::schema_leaf_paths();
+        for key in [
+            "failure_capture.enabled",
+            "failure_capture.dir",
+            "failure_capture.max_body_bytes",
+            "failure_capture.max_capsule_bytes",
+            "failure_capture.max_capsules",
+        ] {
+            assert!(
+                leaves.contains(key),
+                "{key} must be a schema leaf so strict validation descends into \
+                 [failure_capture]; if this fails, the section was likely moved below \
+                 `database` in AutumnConfig"
+            );
+        }
+
+        let schema = AutumnConfig::get_schema_keys();
+        let errors = AutumnConfig::validate_toml("[failure_capture]\nenabledd = true\n", &schema);
+        assert!(
+            errors
+                .iter()
+                .any(|(path, _)| path == "failure_capture.enabledd"),
+            "a bogus [failure_capture] child key must be rejected by strict validation, \
+             got: {errors:?}"
+        );
+    }
+
+    // ── [cluster] (issue #1762) ──────────────────────────────────────────
+
+    /// A cluster with no shared secret is an unauthenticated cluster: anyone
+    /// who can reach the port can inject state. Boot must fail, not warn.
+    #[test]
+    fn cluster_enabled_requires_secret() {
+        let mut config = AutumnConfig::default();
+        config.cluster.enabled = true;
+        config.cluster.secret = None;
+
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "[cluster] enabled = true with no secret must fail validation, got {result:?}"
+        );
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("secret"),
+            "the error must name the missing key so an operator can fix it; got {message:?}"
+        );
+
+        // Disabled clusters need nothing: the default config must still boot.
+        assert!(
+            AutumnConfig::default().cluster.validate().is_ok(),
+            "a disabled [cluster] section must validate with no secret at all"
+        );
+    }
+
+    #[test]
+    fn cluster_rejects_short_secret() {
+        let mut config = AutumnConfig::default();
+        config.cluster.enabled = true;
+        config.cluster.secret = Some(secrecy::SecretString::from("too-short".to_owned()));
+
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "a secret shorter than {MIN_CLUSTER_SECRET_LEN} bytes must be refused, got {result:?}"
+        );
+
+        // …and a long-enough secret must be accepted, or the rule is vacuous.
+        config.cluster.secret = Some(secrecy::SecretString::from(
+            "a-perfectly-adequate-cluster-secret".to_owned(),
+        ));
+        assert!(
+            config.cluster.validate().is_ok(),
+            "a secret of at least {MIN_CLUSTER_SECRET_LEN} bytes must be accepted"
+        );
+    }
+
+    /// Anti-flap hysteresis: a suspicion timeout under three push intervals
+    /// turns one lost packet into a membership change.
+    #[test]
+    fn cluster_rejects_suspicion_below_3x_push_interval() {
+        let mut config = AutumnConfig::default();
+        config.cluster.enabled = true;
+        config.cluster.secret = Some(secrecy::SecretString::from(
+            "a-perfectly-adequate-cluster-secret".to_owned(),
+        ));
+        config.cluster.push_interval_ms = 500;
+        config.cluster.suspicion_timeout_ms = 1_000;
+
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "suspicion_timeout_ms must be at least {MIN_CLUSTER_SUSPICION_MULTIPLE}x \
+             push_interval_ms, got {result:?}"
+        );
+
+        config.cluster.suspicion_timeout_ms = 1_500;
+        assert!(
+            config.cluster.validate().is_ok(),
+            "exactly {MIN_CLUSTER_SUSPICION_MULTIPLE}x the push interval must be accepted"
+        );
+
+        // A push interval below the floor is refused too.
+        config.cluster.push_interval_ms = 1;
+        config.cluster.suspicion_timeout_ms = 3;
+        assert!(
+            config.cluster.validate().is_err(),
+            "push_interval_ms below {MIN_CLUSTER_PUSH_INTERVAL_MS}ms must be refused"
+        );
+    }
+
+    /// Counter cells are keyed `"{node_id}#{incarnation}"`, so a `#` in a node
+    /// id (or a cluster name, which is signed alongside it) makes the key
+    /// ambiguous. Validation refuses it rather than shipping a counter whose
+    /// cells can collide.
+    #[test]
+    fn cluster_rejects_node_id_with_cell_separator() {
+        let mut config = AutumnConfig::default();
+        config.cluster.enabled = true;
+        config.cluster.secret = Some(secrecy::SecretString::from(
+            "a-perfectly-adequate-cluster-secret".to_owned(),
+        ));
+
+        config.cluster.node_id = Some("node#1".to_owned());
+        assert!(
+            config.cluster.validate().is_err(),
+            "a node_id containing '#' must be refused: it is the counter cell-key separator"
+        );
+
+        config.cluster.node_id = Some("node-1".to_owned());
+        config.cluster.cluster_name = "orch#ard".to_owned();
+        assert!(
+            config.cluster.validate().is_err(),
+            "a cluster_name containing '#' must be refused for the same reason"
+        );
+
+        config.cluster.cluster_name = "orchard".to_owned();
+        assert!(
+            config.cluster.validate().is_ok(),
+            "…and separator-free names must be accepted, or the rule is vacuous"
+        );
+    }
+
+    /// Port `0` means "any free port". That is a legal *bind*, because the node
+    /// advertises the port it was actually given — but it is never a legal
+    /// thing to publish or to dial, and a peer pointed at port 0 fails in a way
+    /// that reads as a network fault rather than as a typo.
+    #[test]
+    fn cluster_rejects_ephemeral_port_where_a_peer_must_dial() {
+        let mut config = AutumnConfig::default();
+        config.cluster.enabled = true;
+        config.cluster.secret = Some(secrecy::SecretString::from(
+            "a-perfectly-adequate-cluster-secret".to_owned(),
+        ));
+
+        // An ephemeral BIND is the documented default and must keep working.
+        config.cluster.bind_addr = "127.0.0.1:0".to_owned();
+        assert!(
+            config.cluster.validate().is_ok(),
+            "bind_addr with port 0 is the ephemeral-bind spelling and must be accepted"
+        );
+
+        config.cluster.advertise_addr = Some("10.0.0.4:0".to_owned());
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "an explicit advertise_addr on port 0 must be refused: peers dial it verbatim, \
+             got {result:?}"
+        );
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("cluster.advertise_addr"),
+            "the error must name the offending key; got {message:?}"
+        );
+
+        config.cluster.advertise_addr = Some("10.0.0.4:7946".to_owned());
+        assert!(
+            config.cluster.validate().is_ok(),
+            "…and a real advertised port must be accepted, or the rule is vacuous"
+        );
+
+        config.cluster.seed_peers = vec!["10.0.0.5:7946".to_owned(), "10.0.0.6:0".to_owned()];
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "a seed peer on port 0 is equally undialable and must be refused, got {result:?}"
+        );
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("cluster.seed_peers[1]"),
+            "the error must name which seed is wrong; got {message:?}"
+        );
+
+        config.cluster.seed_peers = vec!["10.0.0.5:7946".to_owned()];
+        assert!(
+            config.cluster.validate().is_ok(),
+            "…and dialable seeds must be accepted"
+        );
+    }
+
+    /// `0.0.0.0` is a bind, never a dial address. A node that gossips it hands
+    /// its peer an address nothing can reach — the one-way cluster the guide's
+    /// "Choosing addresses" section warns about, which then looks exactly like
+    /// a network fault from the other side rather than like the typo it is.
+    #[test]
+    fn cluster_rejects_a_wildcard_advertised_address() {
+        let mut config = AutumnConfig::default();
+        config.cluster.enabled = true;
+        config.cluster.secret = Some(secrecy::SecretString::from(
+            "a-perfectly-adequate-cluster-secret".to_owned(),
+        ));
+
+        // A wildcard bind with nothing to advertise: the bound address IS what
+        // peers would be told to dial.
+        config.cluster.bind_addr = "0.0.0.0:7946".to_owned();
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "binding a wildcard with no advertise_addr must be refused: the node \
+             would gossip 0.0.0.0 as its dial address, got {result:?}"
+        );
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("cluster.bind_addr"),
+            "the error must name the key the operator has to fix; got {message:?}"
+        );
+
+        // An EXPLICIT wildcard advertise is the same mistake, spelled out.
+        config.cluster.advertise_addr = Some("0.0.0.0:7946".to_owned());
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "an explicit wildcard advertise_addr must be refused too, got {result:?}"
+        );
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("cluster.advertise_addr"),
+            "…and must blame advertise_addr, not the (legal) wildcard bind; \
+             got {message:?}"
+        );
+
+        // …while a wildcard bind WITH a concrete advertised address — the
+        // documented container spelling — must pass, or the rule is a ban on
+        // the very deployment shape the guide recommends.
+        config.cluster.advertise_addr = Some("10.0.1.7:7946".to_owned());
+        assert!(
+            config.cluster.validate().is_ok(),
+            "0.0.0.0 bind + explicit advertise_addr is the documented spelling \
+             and must be accepted"
+        );
+
+        // The rule is scoped to enabled sections: a disabled one binds nothing.
+        config.cluster.enabled = false;
+        config.cluster.advertise_addr = None;
+        assert!(
+            config.cluster.validate().is_ok(),
+            "a disabled section advertises nothing, so the wildcard rule must \
+             not fire on it"
+        );
+    }
+
+    /// `node_id` and `cluster_name` travel in every frame and are covered by
+    /// the MAC, so the 64-byte cap keeps a push's fixed overhead predictable.
+    #[test]
+    fn cluster_rejects_over_long_idents() {
+        let mut config = AutumnConfig::default();
+        config.cluster.enabled = true;
+        config.cluster.secret = Some(secrecy::SecretString::from(
+            "a-perfectly-adequate-cluster-secret".to_owned(),
+        ));
+
+        let at_cap = "n".repeat(MAX_CLUSTER_IDENT_LEN);
+        let over_cap = "n".repeat(MAX_CLUSTER_IDENT_LEN.saturating_add(1));
+
+        config.cluster.node_id = Some(at_cap.clone());
+        assert!(
+            config.cluster.validate().is_ok(),
+            "exactly {MAX_CLUSTER_IDENT_LEN} bytes must be accepted, or the cap \
+             is off by one"
+        );
+
+        config.cluster.node_id = Some(over_cap.clone());
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "a node_id one byte over {MAX_CLUSTER_IDENT_LEN} must be refused, \
+             got {result:?}"
+        );
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("cluster.node_id"),
+            "the error must name the offending key; got {message:?}"
+        );
+
+        config.cluster.node_id = Some("node-a".to_owned());
+        config.cluster.cluster_name = over_cap;
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "an over-long cluster_name must be refused for the same reason, \
+             got {result:?}"
+        );
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("cluster.cluster_name"),
+            "…naming cluster_name this time; got {message:?}"
+        );
+
+        config.cluster.cluster_name = at_cap;
+        assert!(
+            config.cluster.validate().is_ok(),
+            "…and a cluster_name at the cap must be accepted, or the rule is vacuous"
+        );
+    }
+
+    #[test]
+    fn shadow_env_overrides_apply() {
+        let env = MockEnv::new()
+            .with("AUTUMN_SHADOW__ENABLED", "true")
+            .with("AUTUMN_SHADOW__TARGET", "http://127.0.0.1:9091")
+            .with("AUTUMN_SHADOW__SAMPLE_RATE", "0.25")
+            .with("AUTUMN_SHADOW__ROUTES", "/api/*, /status")
+            .with("AUTUMN_SHADOW__TIMEOUT_MS", "750")
+            .with("AUTUMN_SHADOW__MAX_IN_FLIGHT", "16")
+            .with("AUTUMN_SHADOW__MAX_BODY_BYTES", "4096")
+            .with("AUTUMN_SHADOW__MAX_RECORDS", "12")
+            .with("AUTUMN_SHADOW__MAX_SAMPLE_BYTES", "256");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        assert!(config.shadow.enabled);
+        assert_eq!(
+            config.shadow.target.as_deref(),
+            Some("http://127.0.0.1:9091")
+        );
+        assert!((config.shadow.sample_rate - 0.25).abs() < f64::EPSILON);
+        assert_eq!(config.shadow.routes, vec!["/api/*", "/status"]);
+        assert_eq!(config.shadow.timeout_ms, 750);
+        assert_eq!(config.shadow.max_in_flight, 16);
+        assert_eq!(config.shadow.max_body_bytes, 4096);
+        assert_eq!(config.shadow.max_records, 12);
+        assert_eq!(config.shadow.max_sample_bytes, 256);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn an_empty_shadow_routes_override_does_not_disable_mirroring() {
+        // An unfilled compose/CI template (`AUTUMN_SHADOW__ROUTES=`) must not
+        // become a one-element allowlist holding the empty pattern: that
+        // matches no path, so the mirror would run and mirror nothing, with no
+        // diagnostic. Same failure shape `parse_env_csv_non_empty` was added
+        // for in #1621.
+        let env = MockEnv::new().with("AUTUMN_SHADOW__ROUTES", "");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.shadow.routes.is_empty());
+    }
+
+    #[test]
+    fn top_level_validation_rejects_an_unusable_shadow_section() {
+        // Guards the `self.shadow.validate()?` call in `AutumnConfig::validate`:
+        // without it a replica boots with mirroring "on" and no target.
+        let mut config = AutumnConfig::default();
+        config.shadow.enabled = true;
+        let error = config.validate().expect_err("must reject");
+        assert!(
+            error.to_string().contains("shadow.target"),
+            "the boot failure must name the missing key, got: {error}"
+        );
+    }
+
+    #[test]
+    fn cluster_env_overrides_apply() {
+        let env = MockEnv::new()
+            .with("AUTUMN_CLUSTER__ENABLED", "true")
+            .with("AUTUMN_CLUSTER__SECRET", "a-shared-cluster-secret-value")
+            .with("AUTUMN_CLUSTER__CLUSTER_NAME", "orchard")
+            .with("AUTUMN_CLUSTER__BIND_ADDR", "0.0.0.0:7946")
+            .with("AUTUMN_CLUSTER__ADVERTISE_ADDR", "10.0.0.4:7946")
+            .with("AUTUMN_CLUSTER__SEED_PEERS", "10.0.0.5:7946, 10.0.0.6:7946")
+            .with("AUTUMN_CLUSTER__NODE_ID", "node-a")
+            .with("AUTUMN_CLUSTER__PUSH_INTERVAL_MS", "250")
+            .with("AUTUMN_CLUSTER__SUSPICION_TIMEOUT_MS", "1500");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        assert!(config.cluster.enabled);
+        assert_eq!(
+            config
+                .cluster
+                .secret
+                .as_ref()
+                .map(|s| secrecy::ExposeSecret::expose_secret(s).to_owned()),
+            Some("a-shared-cluster-secret-value".to_owned())
+        );
+        assert_eq!(config.cluster.cluster_name, "orchard");
+        assert_eq!(config.cluster.bind_addr, "0.0.0.0:7946");
+        assert_eq!(
+            config.cluster.advertise_addr.as_deref(),
+            Some("10.0.0.4:7946")
+        );
+        assert_eq!(
+            config.cluster.seed_peers,
+            vec!["10.0.0.5:7946".to_owned(), "10.0.0.6:7946".to_owned()],
+            "AUTUMN_CLUSTER__SEED_PEERS must split on commas and trim"
+        );
+        assert_eq!(config.cluster.node_id.as_deref(), Some("node-a"));
+        assert_eq!(config.cluster.push_interval_ms, 250);
+        assert_eq!(config.cluster.suspicion_timeout_ms, 1_500);
     }
 
     #[test]
@@ -10442,6 +14063,214 @@ path = "/healthz"
         assert_eq!(config.storage.variants.max_source_bytes, 5_242_880);
         assert_eq!(config.storage.variants.max_source_width, 2_000);
         assert_eq!(config.storage.variants.max_source_height, 1_500);
+    }
+
+    // ── [replication] (issue #1628) ──────────────────────────────────────────
+
+    #[test]
+    fn replication_parses_from_toml() {
+        let toml = r#"
+            [replication]
+            enabled = true
+            rpo_secs = 5
+            sync_interval_secs = 2
+            snapshot_interval_secs = 900
+            max_wal_bytes = 8388608
+            retention_hours = 48
+            verify_interval_secs = 3600
+            prefix = "db"
+            allow_shared_bucket = true
+
+            [replication.s3]
+            bucket = "myapp-replicas"
+            region = "auto"
+            endpoint = "https://acct.r2.cloudflarestorage.com"
+            access_key_id_env = "AUTUMN_REPLICA_ACCESS_KEY_ID"
+            secret_access_key_env = "AUTUMN_REPLICA_SECRET_ACCESS_KEY"
+            force_path_style = true
+        "#;
+        let config: AutumnConfig = toml::from_str(toml).expect("parse");
+        let replication = *config.replication.expect("section present");
+        assert!(replication.enabled);
+        assert_eq!(replication.rpo_secs, 5);
+        assert_eq!(
+            replication.sync_interval(),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(replication.snapshot_interval_secs, 900);
+        assert_eq!(replication.max_wal_bytes, 8_388_608);
+        assert_eq!(replication.retention_hours, 48);
+        assert_eq!(
+            replication.verify_interval(),
+            Some(std::time::Duration::from_secs(3600))
+        );
+        assert_eq!(replication.prefix.as_deref(), Some("db"));
+        assert!(replication.allow_shared_bucket);
+        let s3 = replication.s3.expect("s3 destination");
+        assert_eq!(s3.bucket.as_deref(), Some("myapp-replicas"));
+        assert_eq!(s3.region.as_deref(), Some("auto"));
+        assert_eq!(
+            s3.endpoint.as_deref(),
+            Some("https://acct.r2.cloudflarestorage.com")
+        );
+        assert_eq!(
+            s3.access_key_id_env.as_deref(),
+            Some("AUTUMN_REPLICA_ACCESS_KEY_ID")
+        );
+        assert_eq!(
+            s3.secret_access_key_env.as_deref(),
+            Some("AUTUMN_REPLICA_SECRET_ACCESS_KEY")
+        );
+        assert!(s3.force_path_style);
+    }
+
+    #[test]
+    fn replication_defaults_to_absent_and_carries_the_documented_rpo() {
+        let config = AutumnConfig::default();
+        assert!(config.replication.is_none());
+
+        let defaults = ReplicationConfig::default();
+        assert!(!defaults.enabled, "replication is opt-in");
+        assert_eq!(defaults.rpo_secs, 10, "AC #2: at most 10s of data loss");
+        assert_eq!(defaults.retention_hours, 168);
+        assert_eq!(defaults.max_wal_bytes, 16 * 1024 * 1024);
+        assert!(
+            !defaults.allow_shared_bucket,
+            "#1619's distinct-bucket posture"
+        );
+        assert!(defaults.validation_errors().is_empty(), "disabled is valid");
+    }
+
+    #[test]
+    fn replication_validation_names_every_problem() {
+        let no_destination = ReplicationConfig {
+            enabled: true,
+            ..ReplicationConfig::default()
+        };
+        assert!(
+            no_destination
+                .validation_errors()
+                .iter()
+                .any(|e| e.contains("no destination is configured")),
+            "{:?}",
+            no_destination.validation_errors()
+        );
+
+        let both = ReplicationConfig {
+            enabled: true,
+            path: Some("/mnt/replica".to_owned()),
+            s3: Some(ReplicationS3Config {
+                bucket: Some("b".to_owned()),
+                ..ReplicationS3Config::default()
+            }),
+            ..ReplicationConfig::default()
+        };
+        assert!(
+            both.validation_errors()
+                .iter()
+                .any(|e| e.contains("pick exactly one destination"))
+        );
+
+        let no_credentials = ReplicationConfig {
+            enabled: true,
+            s3: Some(ReplicationS3Config {
+                bucket: Some("b".to_owned()),
+                ..ReplicationS3Config::default()
+            }),
+            rpo_secs: 0,
+            retention_hours: 0,
+            ..ReplicationConfig::default()
+        };
+        let errors = no_credentials.validation_errors();
+        assert!(
+            errors.iter().any(|e| e.contains("access_key_id_env")),
+            "{errors:?}"
+        );
+        assert!(errors.iter().any(|e| e.contains("rpo_secs")), "{errors:?}");
+        assert!(
+            errors.iter().any(|e| e.contains("retention_hours")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn env_override_replication_fields() {
+        let env = MockEnv::new()
+            .with("AUTUMN_REPLICATION__ENABLED", "true")
+            .with("AUTUMN_REPLICATION__RPO_SECS", "20")
+            .with("AUTUMN_REPLICATION__SYNC_INTERVAL_SECS", "7")
+            .with("AUTUMN_REPLICATION__SNAPSHOT_INTERVAL_SECS", "600")
+            .with("AUTUMN_REPLICATION__MAX_WAL_BYTES", "1048576")
+            .with("AUTUMN_REPLICATION__RETENTION_HOURS", "12")
+            .with("AUTUMN_REPLICATION__VERIFY_INTERVAL_SECS", "0")
+            .with("AUTUMN_REPLICATION__PREFIX", "replicas")
+            .with("AUTUMN_REPLICATION__ALLOW_SHARED_BUCKET", "true")
+            .with("AUTUMN_REPLICATION__S3__BUCKET", "from-env")
+            .with("AUTUMN_REPLICATION__S3__REGION", "auto")
+            .with(
+                "AUTUMN_REPLICATION__S3__ENDPOINT",
+                "https://minio.test:9000",
+            )
+            .with("AUTUMN_REPLICATION__S3__ACCESS_KEY_ID_ENV", "KEY")
+            .with("AUTUMN_REPLICATION__S3__SECRET_ACCESS_KEY_ENV", "SECRET")
+            .with("AUTUMN_REPLICATION__S3__FORCE_PATH_STYLE", "true");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        let replication = *config.replication.expect("materialized from env alone");
+        assert!(replication.enabled);
+        assert_eq!(replication.rpo_secs, 20);
+        assert_eq!(replication.sync_interval_secs, Some(7));
+        assert_eq!(replication.snapshot_interval_secs, 600);
+        assert_eq!(replication.max_wal_bytes, 1_048_576);
+        assert_eq!(replication.retention_hours, 12);
+        assert_eq!(replication.verify_interval(), None);
+        assert_eq!(replication.prefix.as_deref(), Some("replicas"));
+        assert!(replication.allow_shared_bucket);
+        let s3 = replication.s3.expect("s3 from env");
+        assert_eq!(s3.bucket.as_deref(), Some("from-env"));
+        assert_eq!(s3.endpoint.as_deref(), Some("https://minio.test:9000"));
+        assert!(s3.force_path_style);
+    }
+
+    #[test]
+    fn replication_env_does_not_materialize_a_section_from_optional_keys_alone() {
+        // A lone region/prefix cannot replicate anywhere, so it must NOT conjure
+        // a section that then fails validation (mirrors #1619's #1791 fix).
+        let env = MockEnv::new()
+            .with("AUTUMN_REPLICATION__S3__REGION", "auto")
+            .with("AUTUMN_REPLICATION__PREFIX", "db")
+            .with("AUTUMN_REPLICATION__ENABLED", "false");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.replication.is_none());
+    }
+
+    #[test]
+    fn a_path_destination_from_env_never_grows_an_empty_s3_section() {
+        let env = MockEnv::new()
+            .with("AUTUMN_REPLICATION__ENABLED", "true")
+            .with("AUTUMN_REPLICATION__PATH", "/mnt/replica");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        let replication = *config.replication.expect("materialized");
+        assert_eq!(replication.path.as_deref(), Some("/mnt/replica"));
+        assert!(replication.s3.is_none(), "no S3 key was set");
+        assert!(replication.validation_errors().is_empty());
+    }
+
+    #[test]
+    fn replication_env_overlays_a_toml_section() {
+        let mut config: AutumnConfig = toml::from_str(
+            "[replication]\nenabled = false\nretention_hours = 24\npath = \"/from-toml\"",
+        )
+        .expect("parse");
+        let env = MockEnv::new().with("AUTUMN_REPLICATION__ENABLED", "true");
+        config.apply_env_overrides_with_env(&env);
+        let replication = *config.replication.expect("section");
+        assert!(replication.enabled, "env flips the TOML toggle");
+        assert_eq!(replication.retention_hours, 24, "TOML value survives");
+        assert_eq!(replication.path.as_deref(), Some("/from-toml"));
     }
 
     #[test]
@@ -10720,6 +14549,153 @@ path = "/healthz"
         assert_eq!(config.jobs.redis.visibility_timeout_ms, 45_000);
     }
 
+    // ── [retention] unified framework-owned data retention (issue #1605) ──
+
+    #[test]
+    fn retention_config_defaults_leave_every_dataset_unset() {
+        // AC #1: "Leaving a dataset unset preserves today's behavior exactly."
+        // The only way to guarantee that is for every window to default to
+        // None, and for the whole section to report itself as unconfigured.
+        let config = AutumnConfig::default();
+        assert!(
+            config.retention.job_history.is_none(),
+            "job_history must default to unset"
+        );
+        assert!(config.retention.job_tracking.is_none());
+        assert!(config.retention.idempotency.is_none());
+        assert!(config.retention.experiment_assignments.is_none());
+        assert!(config.retention.webhook_replay.is_none());
+        assert!(config.retention.sessions.is_none());
+        assert!(config.retention.audit_archives.is_none());
+        assert!(
+            !config.retention.any_window_configured(),
+            "a default config must register no retention sweep at all"
+        );
+        assert_eq!(
+            config.retention.sweep_interval, "1h",
+            "the sweep cadence has a documented default even when no window is set"
+        );
+    }
+
+    #[test]
+    fn retention_toml_deserializes_every_dataset_window() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [retention]
+            sweep_interval = "30m"
+            job_history = "90d"
+            job_tracking = "7d"
+            idempotency = "2d"
+            experiment_assignments = "365d"
+            webhook_replay = "3d"
+            sessions = "30d"
+            audit_archives = "400d"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.retention.sweep_interval, "30m");
+        assert_eq!(config.retention.job_history.as_deref(), Some("90d"));
+        assert_eq!(config.retention.job_tracking.as_deref(), Some("7d"));
+        assert_eq!(config.retention.idempotency.as_deref(), Some("2d"));
+        assert_eq!(
+            config.retention.experiment_assignments.as_deref(),
+            Some("365d")
+        );
+        assert_eq!(config.retention.webhook_replay.as_deref(), Some("3d"));
+        assert_eq!(config.retention.sessions.as_deref(), Some("30d"));
+        assert_eq!(config.retention.audit_archives.as_deref(), Some("400d"));
+        assert!(config.retention.any_window_configured());
+        config.validate().expect("a well-formed section validates");
+    }
+
+    #[test]
+    fn env_override_retention_windows() {
+        let env = MockEnv::new()
+            .with("AUTUMN_RETENTION__SWEEP_INTERVAL", "15m")
+            .with("AUTUMN_RETENTION__JOB_HISTORY", "45d")
+            .with("AUTUMN_RETENTION__JOB_TRACKING", "2d")
+            .with("AUTUMN_RETENTION__IDEMPOTENCY", "12h")
+            .with("AUTUMN_RETENTION__EXPERIMENT_ASSIGNMENTS", "180d")
+            .with("AUTUMN_RETENTION__WEBHOOK_REPLAY", "1d")
+            .with("AUTUMN_RETENTION__SESSIONS", "14d")
+            .with("AUTUMN_RETENTION__AUDIT_ARCHIVES", "365d")
+            .with("AUTUMN_RETENTION__CUSTOM_DOMAINS", "30d");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(config.retention.sweep_interval, "15m");
+        assert_eq!(config.retention.job_history.as_deref(), Some("45d"));
+        assert_eq!(config.retention.job_tracking.as_deref(), Some("2d"));
+        assert_eq!(config.retention.idempotency.as_deref(), Some("12h"));
+        assert_eq!(
+            config.retention.experiment_assignments.as_deref(),
+            Some("180d")
+        );
+        assert_eq!(config.retention.webhook_replay.as_deref(), Some("1d"));
+        assert_eq!(config.retention.sessions.as_deref(), Some("14d"));
+        assert_eq!(config.retention.audit_archives.as_deref(), Some("365d"));
+        assert_eq!(config.retention.custom_domains.as_deref(), Some("30d"));
+    }
+
+    #[test]
+    fn env_override_retention_empty_value_clears_a_window() {
+        // An empty env value is the documented way to *unset* a window that
+        // autumn.toml declared, restoring today's behavior for that dataset
+        // without editing the file (matches parse_env_option_string).
+        let env = MockEnv::new().with("AUTUMN_RETENTION__JOB_HISTORY", "");
+        let mut config = AutumnConfig::default();
+        config.retention.job_history = Some("90d".to_owned());
+        config.apply_env_overrides_with_env(&env);
+
+        assert!(config.retention.job_history.is_none());
+    }
+
+    #[test]
+    fn retention_validate_rejects_an_unparseable_window() {
+        let mut config = AutumnConfig::default();
+        config.retention.job_history = Some("ninety days".to_owned());
+        let error = config
+            .validate()
+            .expect_err("an unparseable duration must fail boot, not be ignored");
+        let message = error.to_string();
+        assert!(
+            message.contains("retention.job_history"),
+            "the error must name the offending key: {message}"
+        );
+    }
+
+    #[test]
+    fn retention_validate_rejects_a_zero_window() {
+        // "0s" would purge everything the instant it is written — almost
+        // certainly a typo, and never something to guess at.
+        let mut config = AutumnConfig::default();
+        config.retention.sessions = Some("0s".to_owned());
+        let error = config.validate().expect_err("a zero window must fail boot");
+        assert!(error.to_string().contains("retention.sessions"), "{error}");
+    }
+
+    #[test]
+    fn retention_validate_rejects_an_unparseable_sweep_interval() {
+        let mut config = AutumnConfig::default();
+        config.retention.job_history = Some("30d".to_owned());
+        config.retention.sweep_interval = "whenever".to_owned();
+        let error = config.validate().expect_err("bad cadence must fail boot");
+        assert!(
+            error.to_string().contains("retention.sweep_interval"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn retention_validate_accepts_a_default_config() {
+        // The whole point of AC #1: an app that never mentions [retention]
+        // must be entirely unaffected, validation included.
+        AutumnConfig::default()
+            .validate()
+            .expect("an unconfigured [retention] section must validate");
+    }
+
     #[test]
     fn job_tracking_config_defaults_ttl_86400_and_route_enabled() {
         let config = AutumnConfig::default();
@@ -10963,6 +14939,112 @@ path = "/healthz"
         )
         .unwrap();
         assert_eq!(config.jobs.pin, vec!["critical", "default"]);
+    }
+
+    /// Issue #1623, AC6: `autumn doctor --strict` can only *prove* a zero-coverage
+    /// gap when the operator declares the fleet topology under `[jobs.fleet]
+    /// tiers` — every worker tier's `jobs.pin`. That key lives in the same
+    /// `autumn.toml` the app boots from, so the app's own schema must know it;
+    /// otherwise declaring the topology that makes the doctor check work is an
+    /// unknown config key that hard-fails boot under `strict_config_enforce_all`.
+    #[test]
+    fn jobs_fleet_tiers_parse_from_toml() {
+        let default = AutumnConfig::default();
+        assert!(
+            default.jobs.fleet.tiers.is_empty(),
+            "no fleet topology is declared by default (AC4)"
+        );
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [jobs.fleet]
+            tiers = [["critical"], ["bulk", "default"], []]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.jobs.fleet.tiers,
+            vec![
+                vec!["critical".to_owned()],
+                vec!["bulk".to_owned(), "default".to_owned()],
+                // An empty inner list is an *unpinned* tier that drains
+                // everything — a meaningful declaration, not a typo.
+                Vec::<String>::new(),
+            ],
+        );
+    }
+
+    /// The regression this closes: `[jobs.fleet]` is documented for
+    /// `autumn doctor`, so an operator who declares it must still be able to
+    /// boot the app with the strictest config validation turned on.
+    #[test]
+    fn declared_fleet_topology_boots_under_enforce_all() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("autumn.toml");
+        std::fs::write(
+            &config_path,
+            "[server]\nstrict_config = true\nstrict_config_enforce_all = true\n\n\
+             [jobs]\npin = [\"critical\"]\n\n\
+             [jobs.fleet]\ntiers = [[\"critical\"], [\"bulk\", \"default\"]]\n",
+        )
+        .unwrap();
+
+        let env = FakeEnv(
+            [
+                ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp.path().to_str().unwrap().to_owned(),
+                ),
+            ]
+            .into(),
+        );
+
+        let res = AutumnConfig::load_with_env(&env);
+        assert!(
+            res.is_ok(),
+            "a declared [jobs.fleet] topology must not be an unknown config key: {res:?}"
+        );
+        let config = res.unwrap();
+        assert_eq!(config.jobs.fleet.tiers.len(), 2);
+        assert_eq!(config.jobs.pin, vec!["critical".to_owned()]);
+    }
+
+    /// A typo *inside* `[jobs.fleet]` must still be caught — accepting the
+    /// section must not turn it into an opaque bag that swallows mistakes. The
+    /// crate catches unknown keys through the strict-config schema walk (not
+    /// `deny_unknown_fields`), so this asserts it there.
+    #[test]
+    fn jobs_fleet_typo_is_caught_by_strict_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("autumn.toml");
+        std::fs::write(
+            &config_path,
+            "[server]\nstrict_config = true\nstrict_config_enforce_all = true\n\n\
+             [jobs.fleet]\nteirs = [[\"critical\"]]\n",
+        )
+        .unwrap();
+
+        let env = FakeEnv(
+            [
+                ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp.path().to_str().unwrap().to_owned(),
+                ),
+            ]
+            .into(),
+        );
+
+        let res = AutumnConfig::load_with_env(&env);
+        assert!(
+            res.is_err(),
+            "a typo inside [jobs.fleet] must not be silently accepted"
+        );
+        let err_str = format!("{:?}", res.err().unwrap());
+        assert!(
+            err_str.contains("teirs"),
+            "error should name the typo: {err_str}"
+        );
     }
 
     #[test]
@@ -11469,6 +15551,44 @@ path = "/healthz"
         );
     }
 
+    // ── server.upgrade (#1674) ────────────────────────────────────
+
+    #[test]
+    fn server_upgrade_config_defaults_enabled_with_a_30s_readiness_budget() {
+        // On by default: SIGUSR2's own default disposition terminates the
+        // process, so an app that ignores this feature is strictly safer with
+        // the handler installed than without it.
+        let config = AutumnConfig::default();
+        assert!(config.server.upgrade.enabled);
+        assert_eq!(config.server.upgrade.ready_timeout_secs, 30);
+    }
+
+    #[test]
+    fn server_upgrade_parses_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r"
+            [server.upgrade]
+            enabled = false
+            ready_timeout_secs = 5
+            ",
+        )
+        .expect("config with [server.upgrade] should parse");
+        assert!(!config.server.upgrade.enabled);
+        assert_eq!(config.server.upgrade.ready_timeout_secs, 5);
+    }
+
+    #[test]
+    fn env_overrides_server_upgrade() {
+        // The deploy-time knob an operator reaches for first is the env var.
+        let env = MockEnv::new()
+            .with("AUTUMN_SERVER__UPGRADE__ENABLED", "false")
+            .with("AUTUMN_SERVER__UPGRADE__READY_TIMEOUT_SECS", "90");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(!config.server.upgrade.enabled);
+        assert_eq!(config.server.upgrade.ready_timeout_secs, 90);
+    }
+
     // ── server.tls (#1603) ────────────────────────────────────────
 
     #[test]
@@ -11613,6 +15733,11 @@ path = "/healthz"
         assert_eq!(deploy.service_name, None);
         assert_eq!(deploy.readiness_timeout_secs, 60);
         assert_eq!(deploy.keep_releases, 3);
+        // #1607: host preparation is ON by default, so the documented "target host
+        // precondition is at most a stock Ubuntu LTS" holds for a bare table. A
+        // plain `#[serde(default)]` here would silently deserialize `false` for
+        // every real user while `DeployConfig::default()` stayed `true`.
+        assert!(deploy.install_proxy);
     }
 
     #[test]
@@ -11628,6 +15753,7 @@ path = "/healthz"
             service_name = "myapp-web"
             readiness_timeout_secs = 90
             keep_releases = 5
+            install_proxy = false
             "#,
         )
         .expect("full [deploy] table should parse");
@@ -11640,6 +15766,10 @@ path = "/healthz"
         assert_eq!(deploy.service_name.as_deref(), Some("myapp-web"));
         assert_eq!(deploy.readiness_timeout_secs, 90);
         assert_eq!(deploy.keep_releases, 5);
+        assert!(
+            !deploy.install_proxy,
+            "the host-prep opt-out parses (#1607)"
+        );
         assert!(deploy.validate().is_ok());
     }
 
@@ -11698,6 +15828,26 @@ path = "/healthz"
         assert_eq!(deploy.keep_releases, 5);
         assert_eq!(deploy.profile, "staging");
         assert!(deploy.validate().is_ok());
+    }
+
+    #[test]
+    fn env_override_declines_deploy_host_preparation() {
+        // #1607: a CI pipeline deploying to pre-provisioned hosts must be able to
+        // decline host preparation without editing `autumn.toml`. The key is also in
+        // the presence probe, so setting only it materializes `[deploy]` — otherwise
+        // the override would be silently skipped for an env-only config.
+        let env = MockEnv::new().with("AUTUMN_DEPLOY__INSTALL_PROXY", "false");
+        let mut config = AutumnConfig::default();
+        assert!(config.deploy.is_none());
+        config.apply_env_overrides_with_env(&env);
+        let deploy = config.deploy.expect("env should materialize deploy");
+        assert!(!deploy.install_proxy);
+
+        // …and it wins over TOML, like every other deploy override.
+        let mut from_toml: AutumnConfig =
+            toml::from_str("[deploy]\nhost = \"203.0.113.10\"\ninstall_proxy = true\n").unwrap();
+        from_toml.apply_env_overrides_with_env(&env);
+        assert!(!from_toml.deploy.expect("deploy configured").install_proxy);
     }
 
     #[test]
@@ -11836,6 +15986,583 @@ path = "/healthz"
         assert!(config.deploy.is_none());
     }
 
+    // ── deploy fleet hosts (#1621) ────────────────────────────────
+
+    #[test]
+    fn deploy_hosts_list_parses_in_declaration_order_and_defaults_to_empty() {
+        // #1621 (AC-1): `[deploy] hosts` is the fleet spelling of the target
+        // list. Declaration order IS the rollout order, so parsing must preserve
+        // it verbatim, and a `[deploy]` table without the key stays empty so
+        // every pre-#1621 config is unchanged.
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [deploy]
+            hosts = ["web-1.example.com", "web-2.example.com", "web-3.example.com"]
+            "#,
+        )
+        .expect("[deploy] hosts list should parse");
+        let deploy = config.deploy.expect("deploy configured");
+        assert_eq!(
+            deploy.hosts,
+            vec![
+                "web-1.example.com".to_owned(),
+                "web-2.example.com".to_owned(),
+                "web-3.example.com".to_owned(),
+            ],
+            "hosts must parse in declaration order (the documented rollout order), got: {:?}",
+            deploy.hosts
+        );
+        assert_eq!(
+            deploy.host, None,
+            "the fleet spelling must not populate the legacy scalar, got: {:?}",
+            deploy.host
+        );
+
+        let bare: AutumnConfig =
+            toml::from_str("[deploy]\nhost = \"203.0.113.10\"\n").expect("legacy table parses");
+        let bare_deploy = bare.deploy.expect("deploy configured");
+        assert!(
+            bare_deploy.hosts.is_empty(),
+            "a pre-#1621 [deploy] table must resolve to an empty hosts list, got: {:?}",
+            bare_deploy.hosts
+        );
+        assert!(
+            DeployConfig::default().hosts.is_empty(),
+            "the hand-written Default impl must seed an empty hosts list, got: {:?}",
+            DeployConfig::default().hosts
+        );
+    }
+
+    #[test]
+    fn deploy_validate_rejects_host_and_hosts_set_together() {
+        // #1621 (AC-1): `host` and `hosts` are mutually exclusive — with both set
+        // there is no unambiguous rollout order. `DeployConfig::validate` is not
+        // wired into `AutumnConfig::validate` (the CLI's `ResolvedFleet::resolve`
+        // is the enforcing seam), but it must MIRROR the same rules so the two
+        // never disagree about what a valid `[deploy]` table looks like.
+        let cfg = DeployConfig {
+            host: Some("203.0.113.10".to_owned()),
+            hosts: vec!["web-1.example.com".to_owned()],
+            ..DeployConfig::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("host + hosts together must be rejected");
+        assert!(
+            err.contains("[deploy] host") && err.contains("[deploy] hosts"),
+            "the mutual-exclusion error must name BOTH keys so the operator knows \
+             which one to delete, got: {err}"
+        );
+    }
+
+    #[test]
+    fn deploy_validate_rejects_blank_and_duplicate_hosts_entries() {
+        // #1621 (AC-1): a blank entry is a typo that would otherwise resolve to a
+        // hostless SSH target mid-rollout, and a duplicate entry would deploy the
+        // same machine twice (the second pass sees its own new release as live and
+        // corrupts the blue/green previous-release chain).
+        let blank = DeployConfig {
+            hosts: vec!["web-1.example.com".to_owned(), "   ".to_owned()],
+            ..DeployConfig::default()
+        };
+        let blank_err = blank
+            .validate()
+            .expect_err("a blank hosts entry must be rejected");
+        assert!(
+            blank_err.contains("hosts") && blank_err.contains('1'),
+            "the blank-entry error must name `hosts` and the 0-based index, got: {blank_err}"
+        );
+
+        let duplicate = DeployConfig {
+            hosts: vec![
+                "web-1.example.com".to_owned(),
+                " web-1.example.com ".to_owned(),
+            ],
+            ..DeployConfig::default()
+        };
+        let duplicate_err = duplicate
+            .validate()
+            .expect_err("a duplicate hosts entry must be rejected");
+        assert!(
+            duplicate_err.contains("web-1.example.com"),
+            "the duplicate error must name the repeated value, got: {duplicate_err}"
+        );
+
+        let ok = DeployConfig {
+            hosts: vec![
+                "web-1.example.com".to_owned(),
+                "web-2.example.com".to_owned(),
+            ],
+            ..DeployConfig::default()
+        };
+        assert!(
+            ok.validate().is_ok(),
+            "a well-formed fleet list must validate, got: {:?}",
+            ok.validate()
+        );
+    }
+
+    #[test]
+    fn env_override_materializes_deploy_from_hosts_only() {
+        // #1621: `KEYS` in `apply_deploy_env_overrides` is a PRESENCE PROBE that
+        // gates materialisation of the ENTIRE `[deploy]` table. If
+        // `AUTUMN_DEPLOY__HOSTS` is missing from that array, an env-only fleet
+        // config produces no deploy section at all — a silent skip, not an error,
+        // in both `AutumnConfig::load` and `autumn doctor`. This is the trap test.
+        let env = MockEnv::new().with(
+            "AUTUMN_DEPLOY__HOSTS",
+            "web-1.example.com,web-2.example.com",
+        );
+        let mut config = AutumnConfig::default();
+        assert!(config.deploy.is_none());
+        config.apply_env_overrides_with_env(&env);
+        let deploy = config
+            .deploy
+            .expect("AUTUMN_DEPLOY__HOSTS alone must materialize the [deploy] table");
+        assert_eq!(
+            deploy.hosts,
+            vec![
+                "web-1.example.com".to_owned(),
+                "web-2.example.com".to_owned(),
+            ],
+            "the CSV env value must parse into the ordered fleet list, got: {:?}",
+            deploy.hosts
+        );
+        // Every other key falls back to its documented default.
+        assert_eq!(deploy.host, None, "got: {:?}", deploy.host);
+        assert_eq!(deploy.user, "root");
+        assert_eq!(deploy.ssh_port, 22);
+    }
+
+    #[test]
+    fn env_override_hosts_replaces_the_whole_toml_list() {
+        // #1621: `AUTUMN_DEPLOY__HOSTS` is a fleet-level RETARGET — it replaces
+        // the TOML list wholesale rather than appending, matching every other
+        // `AUTUMN_DEPLOY__*` override (env wins).
+        let mut config: AutumnConfig = toml::from_str(
+            r#"
+            [deploy]
+            hosts = ["toml-1", "toml-2", "toml-3"]
+            "#,
+        )
+        .expect("[deploy] hosts list should parse");
+        let env = MockEnv::new().with("AUTUMN_DEPLOY__HOSTS", "env-1, env-2");
+        config.apply_env_overrides_with_env(&env);
+        let deploy = config.deploy.expect("deploy configured");
+        assert_eq!(
+            deploy.hosts,
+            vec!["env-1".to_owned(), "env-2".to_owned()],
+            "env must REPLACE the TOML fleet list (and trim each entry), got: {:?}",
+            deploy.hosts
+        );
+    }
+
+    #[test]
+    fn an_empty_deploy_hosts_env_override_behaves_as_unset() {
+        // #1621 review finding 13. `AUTUMN_DEPLOY__HOSTS=` is the shape a CI or
+        // compose env template produces for "fill in for a fleet" — exactly what
+        // the sibling `AUTUMN_DEPLOY__HOST=` harmlessly takes. Splitting it
+        // unconditionally yielded `[""]`, a NON-empty fleet list holding a blank
+        // string, so a project keeping `[deploy] host` in autumn.toml hard-failed
+        // every `autumn deploy` subcommand (and `autumn doctor`) with "`[deploy]
+        // host` and `[deploy] hosts` are mutually exclusive" — naming a key the
+        // operator never set.
+        for blank in ["", "   ", ",", " , "] {
+            let mut config: AutumnConfig = toml::from_str(
+                r#"
+                [deploy]
+                host = "203.0.113.10"
+                "#,
+            )
+            .expect("[deploy] host should parse");
+            let env = MockEnv::new().with("AUTUMN_DEPLOY__HOSTS", blank);
+            config.apply_env_overrides_with_env(&env);
+            let deploy = config.deploy.expect("deploy configured");
+            assert!(
+                deploy.hosts.is_empty(),
+                "AUTUMN_DEPLOY__HOSTS={blank:?} must behave as unset, got: {:?}",
+                deploy.hosts
+            );
+            assert_eq!(deploy.host.as_deref(), Some("203.0.113.10"));
+            assert!(
+                deploy.validate().is_ok(),
+                "a blank fleet override must not trip the mutual-exclusion refusal, got: {:?}",
+                deploy.validate()
+            );
+        }
+    }
+
+    #[test]
+    fn a_trailing_comma_in_the_deploy_hosts_env_override_is_tolerated() {
+        // #1621 review finding 13. Generated env lists routinely carry a trailing
+        // (or doubled) comma; the blank segment it produces used to reach the CLI
+        // as a blank fleet entry and refuse the whole command. Blank segments are
+        // dropped, so the list is exactly the addresses the operator wrote.
+        for (value, expected) in [
+            ("10.0.0.1,10.0.0.2,", vec!["10.0.0.1", "10.0.0.2"]),
+            ("10.0.0.1,,10.0.0.2", vec!["10.0.0.1", "10.0.0.2"]),
+            (" 10.0.0.1 , 10.0.0.2 , ", vec!["10.0.0.1", "10.0.0.2"]),
+        ] {
+            let mut config = AutumnConfig::default();
+            let env = MockEnv::new().with("AUTUMN_DEPLOY__HOSTS", value);
+            config.apply_env_overrides_with_env(&env);
+            let deploy = config.deploy.expect("deploy configured");
+            assert_eq!(
+                deploy.hosts,
+                expected
+                    .iter()
+                    .map(|h| (*h).to_owned())
+                    .collect::<Vec<String>>(),
+                "AUTUMN_DEPLOY__HOSTS={value:?} must drop blank segments, got: {:?}",
+                deploy.hosts
+            );
+            assert!(
+                deploy.validate().is_ok(),
+                "a tolerated trailing comma must not refuse the fleet, got: {:?}",
+                deploy.validate()
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_empty_deploy_host_env_override_clears_the_toml_alternate_spelling() {
+        // #1621 review round 1 (Codex 1). `host` and `hosts` are MUTUALLY
+        // EXCLUSIVE downstream, so an env override that sets one spelling while the
+        // TOML still holds the other produced a config that refuses every `autumn
+        // deploy` subcommand — even though `AUTUMN_DEPLOY__*` is documented to WIN
+        // over TOML. Retargeting a `[deploy] host` project as a fleet with
+        // `AUTUMN_DEPLOY__HOSTS=a,b` (and the reverse) must simply work.
+        let mut fleet_over_scalar: AutumnConfig = toml::from_str(
+            r#"
+            [deploy]
+            host = "203.0.113.10"
+            "#,
+        )
+        .expect("[deploy] host should parse");
+        fleet_over_scalar.apply_env_overrides_with_env(
+            &MockEnv::new().with("AUTUMN_DEPLOY__HOSTS", "web-1,web-2"),
+        );
+        let deploy = fleet_over_scalar.deploy.expect("deploy configured");
+        assert_eq!(
+            deploy.hosts,
+            vec!["web-1".to_owned(), "web-2".to_owned()],
+            "the env fleet list must win, got: {:?}",
+            deploy.hosts
+        );
+        assert_eq!(
+            deploy.host, None,
+            "a non-empty AUTUMN_DEPLOY__HOSTS must CLEAR the TOML `host`, got: {:?}",
+            deploy.host
+        );
+        assert!(
+            deploy.validate().is_ok(),
+            "env-over-TOML retarget must not trip mutual exclusion, got: {:?}",
+            deploy.validate()
+        );
+
+        let mut scalar_over_fleet: AutumnConfig = toml::from_str(
+            r#"
+            [deploy]
+            hosts = ["toml-1", "toml-2"]
+            "#,
+        )
+        .expect("[deploy] hosts should parse");
+        scalar_over_fleet
+            .apply_env_overrides_with_env(&MockEnv::new().with("AUTUMN_DEPLOY__HOST", "single-1"));
+        let deploy = scalar_over_fleet.deploy.expect("deploy configured");
+        assert_eq!(deploy.host.as_deref(), Some("single-1"));
+        assert!(
+            deploy.hosts.is_empty(),
+            "a non-empty AUTUMN_DEPLOY__HOST must CLEAR the TOML `hosts`, got: {:?}",
+            deploy.hosts
+        );
+        assert!(
+            deploy.validate().is_ok(),
+            "env-over-TOML narrowing must not trip mutual exclusion, got: {:?}",
+            deploy.validate()
+        );
+    }
+
+    #[test]
+    fn two_conflicting_non_empty_deploy_host_env_overrides_are_still_refused() {
+        // #1621 review round 1 (Codex 1), the other half: env-over-TOML precedence
+        // is NOT a licence to pick a winner between two conflicting env vars. Both
+        // spellings set NON-EMPTY in the environment is a genuine operator error —
+        // the rollout order is ambiguous — so both survive and the downstream
+        // mutual-exclusion refusal still fires.
+        for toml_src in [
+            "[deploy]\n",
+            "[deploy]\nhost = \"toml-host\"\n",
+            "[deploy]\nhosts = [\"toml-1\"]\n",
+        ] {
+            let mut config: AutumnConfig =
+                toml::from_str(toml_src).expect("[deploy] table should parse");
+            config.apply_env_overrides_with_env(
+                &MockEnv::new()
+                    .with("AUTUMN_DEPLOY__HOST", "env-single")
+                    .with("AUTUMN_DEPLOY__HOSTS", "env-1,env-2"),
+            );
+            let deploy = config.deploy.expect("deploy configured");
+            assert_eq!(
+                deploy.host.as_deref(),
+                Some("env-single"),
+                "both env spellings must survive so the conflict is visible ({toml_src:?})"
+            );
+            assert_eq!(
+                deploy.hosts,
+                vec!["env-1".to_owned(), "env-2".to_owned()],
+                "both env spellings must survive so the conflict is visible ({toml_src:?})"
+            );
+            assert!(
+                deploy.validate().is_err(),
+                "two conflicting NON-EMPTY env spellings must still be refused ({toml_src:?})",
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_deploy_host_env_override_never_clears_the_toml_alternate_spelling() {
+        // #1621 review round 1 (Codex 1). The established empty-means-unset
+        // semantics must survive the clearing rule above: `AUTUMN_DEPLOY__HOST=`
+        // and `AUTUMN_DEPLOY__HOSTS=` (the shape a CI/compose template emits for an
+        // unfilled slot) say NOTHING about the alternate spelling, so the TOML value
+        // stands.
+        for blank in ["", "   ", ",", " , "] {
+            let mut config: AutumnConfig = toml::from_str(
+                r#"
+                [deploy]
+                host = "203.0.113.10"
+                "#,
+            )
+            .expect("[deploy] host should parse");
+            config
+                .apply_env_overrides_with_env(&MockEnv::new().with("AUTUMN_DEPLOY__HOSTS", blank));
+            let deploy = config.deploy.expect("deploy configured");
+            assert_eq!(
+                deploy.host.as_deref(),
+                Some("203.0.113.10"),
+                "AUTUMN_DEPLOY__HOSTS={blank:?} must not clear the TOML `host`"
+            );
+            assert!(deploy.hosts.is_empty());
+        }
+
+        for blank in ["", "   "] {
+            let mut config: AutumnConfig = toml::from_str(
+                r#"
+                [deploy]
+                hosts = ["toml-1", "toml-2"]
+                "#,
+            )
+            .expect("[deploy] hosts should parse");
+            config.apply_env_overrides_with_env(&MockEnv::new().with("AUTUMN_DEPLOY__HOST", blank));
+            let deploy = config.deploy.expect("deploy configured");
+            assert_eq!(
+                deploy.hosts,
+                vec!["toml-1".to_owned(), "toml-2".to_owned()],
+                "AUTUMN_DEPLOY__HOST={blank:?} must not clear the TOML `hosts`"
+            );
+        }
+        // `AUTUMN_DEPLOY__HOST=` (truly empty) keeps its own documented
+        // clears-the-scalar meaning — the clearing rule above changes nothing here.
+        let mut config = AutumnConfig {
+            deploy: Some(DeployConfig {
+                host: Some("toml-host".to_owned()),
+                ..DeployConfig::default()
+            }),
+            ..AutumnConfig::default()
+        };
+        config.apply_env_overrides_with_env(&MockEnv::new().with("AUTUMN_DEPLOY__HOST", ""));
+        assert_eq!(config.deploy.expect("deploy configured").host, None);
+    }
+
+    // ── server.tls.client_auth (#1640) ────────────────────────────
+
+    #[test]
+    fn client_auth_absent_is_none_and_off() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.tls]
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+            "#,
+        )
+        .expect("server-only TLS should parse");
+        let tls = config.server.tls.expect("tls configured");
+        // Absent section => no client auth at all, so #1603's path is unchanged.
+        assert!(tls.client_auth.is_none());
+        assert!(!tls.client_auth_active());
+        assert!(tls.validate().is_ok());
+    }
+
+    #[test]
+    fn client_auth_parses_modes_and_paths() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.tls]
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+
+            [server.tls.client_auth]
+            mode = "required"
+            ca_bundle_path = "/etc/autumn/tls/client-ca.pem"
+            crl_path = "/etc/autumn/tls/client-ca.crl.pem"
+            required_paths = ["/internal/"]
+            "#,
+        )
+        .expect("[server.tls.client_auth] should parse");
+        let tls = config.server.tls.expect("tls configured");
+        let ca = tls.client_auth.as_ref().expect("client_auth configured");
+        assert_eq!(ca.mode, ClientAuthMode::Required);
+        assert_eq!(
+            ca.ca_bundle_path,
+            Some(PathBuf::from("/etc/autumn/tls/client-ca.pem"))
+        );
+        assert_eq!(
+            ca.crl_path,
+            Some(PathBuf::from("/etc/autumn/tls/client-ca.crl.pem"))
+        );
+        assert_eq!(ca.required_paths, vec!["/internal/".to_owned()]);
+        assert_eq!(ca.reload_interval_secs, 60);
+        assert!(tls.client_auth_active());
+        assert!(tls.validate().is_ok());
+    }
+
+    #[test]
+    fn client_auth_mode_defaults_to_off() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.tls]
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+
+            [server.tls.client_auth]
+            "#,
+        )
+        .expect("an empty [server.tls.client_auth] should parse");
+        let tls = config.server.tls.expect("tls configured");
+        let ca = tls.client_auth.as_ref().expect("client_auth present");
+        assert_eq!(ca.mode, ClientAuthMode::Off);
+        // Present but off is still no handshake change.
+        assert!(!tls.client_auth_active());
+        assert!(tls.validate().is_ok());
+    }
+
+    #[test]
+    fn client_auth_requires_a_ca_bundle_when_enabled() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.tls]
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+
+            [server.tls.client_auth]
+            mode = "optional"
+            "#,
+        )
+        .expect("parse");
+        let err = config
+            .server
+            .tls
+            .expect("tls configured")
+            .validate()
+            .expect_err("client auth without a trust store is invalid");
+        assert!(err.contains("ca_bundle_path"), "unhelpful message: {err}");
+    }
+
+    #[test]
+    fn client_auth_rejects_blank_paths() {
+        let ca = ClientAuthConfig {
+            mode: ClientAuthMode::Required,
+            ca_bundle_path: Some(PathBuf::new()),
+            ..ClientAuthConfig::default()
+        };
+        let err = ca
+            .validate()
+            .expect_err("a blank ca_bundle_path is invalid");
+        assert!(err.contains("ca_bundle_path"), "unhelpful message: {err}");
+
+        let ca = ClientAuthConfig {
+            mode: ClientAuthMode::Required,
+            ca_bundle_path: Some(PathBuf::from("ca.pem")),
+            crl_path: Some(PathBuf::new()),
+            ..ClientAuthConfig::default()
+        };
+        let err = ca.validate().expect_err("a blank crl_path is invalid");
+        assert!(err.contains("crl_path"), "unhelpful message: {err}");
+    }
+
+    #[test]
+    fn client_auth_rejects_required_paths_when_mode_is_off() {
+        // Routes declaring an mTLS requirement on a listener that never
+        // requests a certificate would reject every request forever — that is a
+        // misconfiguration, not a posture.
+        let ca = ClientAuthConfig {
+            required_paths: vec!["/internal/".to_owned()],
+            ..ClientAuthConfig::default()
+        };
+        let err = ca
+            .validate()
+            .expect_err("required_paths with mode = off is invalid");
+        assert!(err.contains("required_paths"), "unhelpful message: {err}");
+    }
+
+    #[test]
+    fn client_auth_rejects_relative_required_paths() {
+        let ca = ClientAuthConfig {
+            mode: ClientAuthMode::Optional,
+            ca_bundle_path: Some(PathBuf::from("ca.pem")),
+            required_paths: vec!["internal/".to_owned()],
+            ..ClientAuthConfig::default()
+        };
+        let err = ca.validate().expect_err("a required_path must be rooted");
+        assert!(err.contains("required_paths"), "unhelpful message: {err}");
+    }
+
+    #[test]
+    fn client_auth_rejects_noncanonical_required_paths() {
+        // Requests are normalized before matching but the configured prefix is
+        // not, so `/internal//` would protect strictly less than it looks like
+        // it does. A prefix that protects less than the operator wrote is the
+        // failure this section exists to prevent.
+        for bad in [
+            "/internal//",
+            "//internal",
+            "/internal/./keys",
+            "/internal/../admin",
+        ] {
+            let ca = ClientAuthConfig {
+                mode: ClientAuthMode::Required,
+                ca_bundle_path: Some(PathBuf::from("ca.pem")),
+                required_paths: vec![bad.to_owned()],
+                ..ClientAuthConfig::default()
+            };
+            let Err(err) = ca.validate() else {
+                panic!("`{bad}` should be rejected");
+            };
+            assert!(err.contains("required_paths"), "unhelpful message: {err}");
+        }
+
+        // The canonical spellings stay accepted.
+        for good in ["/internal", "/internal/", "/internal/keys", "/"] {
+            let ca = ClientAuthConfig {
+                mode: ClientAuthMode::Required,
+                ca_bundle_path: Some(PathBuf::from("ca.pem")),
+                required_paths: vec![good.to_owned()],
+                ..ClientAuthConfig::default()
+            };
+            assert!(ca.validate().is_ok(), "`{good}` should be accepted");
+        }
+    }
+
+    #[test]
+    fn client_auth_mode_requires_a_certificate_only_when_required() {
+        assert!(!ClientAuthMode::Off.requests_certificate());
+        assert!(ClientAuthMode::Optional.requests_certificate());
+        assert!(ClientAuthMode::Required.requests_certificate());
+        assert!(!ClientAuthMode::Optional.mandates_certificate());
+        assert!(ClientAuthMode::Required.mandates_certificate());
+    }
+
     // ── server.tls.acme (#1608) ───────────────────────────────────
 
     fn tls_static(cert: Option<&str>, key: Option<&str>) -> TlsConfig {
@@ -11845,6 +16572,7 @@ path = "/healthz"
             reload_interval_secs: default_tls_reload_interval_secs(),
             handshake_timeout_secs: default_tls_handshake_timeout_secs(),
             acme: None,
+            client_auth: None,
         }
     }
 
@@ -11856,6 +16584,9 @@ path = "/healthz"
             cache_dir: default_acme_cache_dir(),
             http_challenge_port: default_acme_http_challenge_port(),
             renew_before_days: default_acme_renew_before_days(),
+            ca_root_path: None,
+            dns: None,
+            custom_domains: None,
         }
     }
 
@@ -11879,6 +16610,45 @@ path = "/healthz"
         assert_eq!(acme.http_challenge_port, 80);
         assert_eq!(acme.renew_before_days, 30);
         assert!(tls.validate().is_ok());
+    }
+
+    #[test]
+    fn acme_ca_root_path_defaults_to_unset_and_round_trips() {
+        // Unset is the default: Let's Encrypt's staging and production API
+        // endpoints are publicly trusted, so no extra root is needed.
+        let acme = acme_cfg(&["app.example.com"], "ops@example.com");
+        assert_eq!(acme.ca_root_path, None);
+        assert!(acme.validate().is_ok());
+
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.tls.acme]
+            domains = ["app.example.com"]
+            contact_email = "ops@example.com"
+            directory = { custom = { url = "https://pebble.test/dir" } }
+            ca_root_path = "config/pebble-root.pem"
+            "#,
+        )
+        .expect("ca_root_path should parse");
+        let acme = config.server.tls.unwrap().acme.unwrap();
+        assert_eq!(
+            acme.ca_root_path,
+            Some(PathBuf::from("config/pebble-root.pem"))
+        );
+        assert!(acme.validate().is_ok());
+    }
+
+    #[test]
+    fn acme_rejects_a_blank_ca_root_path() {
+        // An empty path would otherwise be carried all the way into the renewal
+        // loop and fail every order at the TLS handshake with a far less
+        // actionable message.
+        let mut acme = acme_cfg(&["app.example.com"], "ops@example.com");
+        acme.ca_root_path = Some(PathBuf::new());
+        let err = acme
+            .validate()
+            .expect_err("a blank ca_root_path is invalid");
+        assert!(err.contains("ca_root_path"), "unhelpful message: {err}");
     }
 
     #[test]
@@ -11950,11 +16720,11 @@ path = "/healthz"
     }
 
     #[test]
-    fn validate_acme_wildcard_domain_rejected_mentions_1620() {
+    fn validate_acme_wildcard_domain_without_dns_provider_rejected() {
         let mut cfg = tls_static(None, None);
         cfg.acme = Some(acme_cfg(&["*.example.com"], "ops@example.com"));
         let err = cfg.validate().unwrap_err();
-        assert!(err.contains("#1620"), "got: {err}");
+        assert!(err.contains("[server.tls.acme.dns]"), "got: {err}");
         assert!(err.contains("wildcard"), "got: {err}");
     }
 
@@ -11973,6 +16743,108 @@ path = "/healthz"
         cfg.acme = Some(acme_cfg(&["   "], "ops@example.com"));
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("blank entries"), "got: {err}");
+    }
+
+    // The `autumn doctor` grader FAILs a malformed `http_challenge_port` /
+    // `renew_before_days` (#1608, #1874) on the premise that the runtime's TYPED
+    // deserialization rejects the same spellings before boot. Pin that premise
+    // here: if a future lenient `deserialize_with` ever made the runtime accept
+    // `"30"`, doctor would start FAILing a file that boots fine — the same parity
+    // bug in the opposite direction, and today nothing would catch it.
+    #[test]
+    fn acme_numeric_fields_reject_non_integer_toml_values() {
+        for key in ["http_challenge_port", "renew_before_days"] {
+            for bad in ["\"30\"", "30.5", "true", "-1", "4294967296"] {
+                let src = format!(
+                    "[server.tls.acme]\ndomains = [\"app.example.com\"]\n\
+                     contact_email = \"ops@example.com\"\n{key} = {bad}\n"
+                );
+                assert!(
+                    toml::from_str::<AutumnConfig>(&src).is_err(),
+                    "{key} = {bad} must fail to deserialize"
+                );
+            }
+            // ... while the plain unquoted integer the doctor grader treats as
+            // valid really is accepted.
+            let src = format!(
+                "[server.tls.acme]\ndomains = [\"app.example.com\"]\n\
+                 contact_email = \"ops@example.com\"\n{key} = 45\n"
+            );
+            assert!(
+                toml::from_str::<AutumnConfig>(&src).is_ok(),
+                "{key} = 45 must deserialize"
+            );
+        }
+    }
+
+    // Regression (#1874): a whitespace-padded domain (`" app.example.com "`)
+    // passed `validate()` — the blank and wildcard checks look at `domain.trim()`
+    // but the UNTRIMMED value is what is stored, so the padded string reached the
+    // placeholder/CSR builder and the ACME `Identifier::Dns` order. The CA then
+    // rejects (or mis-issues) an identifier that is not the hostname the operator
+    // meant, with a far less actionable error than a boot-time rejection.
+    #[test]
+    fn validate_acme_whitespace_padded_domain_rejected() {
+        for padded in [
+            " app.example.com",
+            "app.example.com ",
+            "\tapp.example.com\n",
+        ] {
+            let mut cfg = tls_static(None, None);
+            cfg.acme = Some(acme_cfg(&[padded], "ops@example.com"));
+            let err = cfg
+                .validate()
+                .expect_err("a whitespace-padded domain must be rejected");
+            assert!(
+                err.contains("whitespace"),
+                "message must name the problem: {err}"
+            );
+            assert!(
+                err.contains(&format!("`{padded}`")),
+                "message must echo the RAW padded entry, not only the trimmed \
+                 spelling it suggests: {err}"
+            );
+            assert!(
+                err.contains("`app.example.com`"),
+                "message must name the trimmed spelling to use: {err}"
+            );
+        }
+
+        // A padded entry is rejected even when a well-formed one precedes it, and
+        // the message points at the right index.
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(
+            &["app.example.com", " www.example.com "],
+            "ops@example.com",
+        ));
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.contains("index 1"),
+            "message must name the index: {err}"
+        );
+
+        // The already-trimmed spelling of the same name still passes.
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&["app.example.com"], "ops@example.com"));
+        assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
+    }
+
+    // The padded-domain rule must not shadow the two more specific per-entry
+    // rules: a whitespace-only entry is still reported as blank, and a padded
+    // wildcard is still reported as a wildcard (the deeper problem, and the
+    // message operators already get today).
+    #[test]
+    fn validate_acme_padded_domain_rule_does_not_shadow_blank_or_wildcard() {
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&["   "], "ops@example.com"));
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("blank entries"), "got: {err}");
+
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&[" *.example.com "], "ops@example.com"));
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("wildcard"), "got: {err}");
+        assert!(err.contains("[server.tls.acme.dns]"), "got: {err}");
     }
 
     // Regression (#1608, Codex P2): `http_challenge_port = 0` binds an ephemeral
@@ -12030,6 +16902,324 @@ path = "/healthz"
         assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
     }
 
+    // ── DNS-01 / wildcard config surface (issue #1620) ───────────────────────
+
+    fn acme_dns_cfg(provider: AcmeDnsProvider) -> AcmeDnsConfig {
+        AcmeDnsConfig {
+            provider,
+            credential: default_acme_dns_credential(),
+            propagation_timeout_secs: default_acme_dns_propagation_timeout_secs(),
+            poll_interval_secs: default_acme_dns_poll_interval_secs(),
+            resolvers: default_acme_dns_resolvers(),
+            command: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn acme_dns_section_parses_with_defaults() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.tls.acme]
+            domains = ["myapp.com", "*.myapp.com"]
+            contact_email = "ops@myapp.com"
+
+            [server.tls.acme.dns]
+            provider = "cloudflare"
+            "#,
+        )
+        .expect("[server.tls.acme.dns] should parse");
+        let tls = config.server.tls.expect("tls configured");
+        let acme = tls.acme.as_ref().expect("acme configured");
+        let dns = acme.dns.as_ref().expect("dns configured");
+        assert_eq!(dns.provider, AcmeDnsProvider::Cloudflare);
+        // The credential is a NAME in the encrypted credentials store, never a token.
+        assert_eq!(dns.credential, "acme_dns");
+        assert_eq!(dns.propagation_timeout_secs, 300);
+        assert_eq!(dns.poll_interval_secs, 5);
+        assert!(!dns.resolvers.is_empty());
+        assert!(tls.validate().is_ok(), "got: {:?}", tls.validate());
+    }
+
+    #[test]
+    fn acme_dns_provider_names_round_trip() {
+        for (spelling, expected) in [
+            ("cloudflare", AcmeDnsProvider::Cloudflare),
+            ("route53", AcmeDnsProvider::Route53),
+            ("exec", AcmeDnsProvider::Exec),
+        ] {
+            let extra = if expected == AcmeDnsProvider::Exec {
+                "\ncommand = [\"/usr/local/bin/dns-hook\"]"
+            } else {
+                ""
+            };
+            let src = format!(
+                "[server.tls.acme]\ndomains = [\"*.myapp.com\"]\n\
+                 contact_email = \"ops@myapp.com\"\n\
+                 [server.tls.acme.dns]\nprovider = \"{spelling}\"{extra}\n"
+            );
+            let config: AutumnConfig =
+                toml::from_str(&src).unwrap_or_else(|e| panic!("{spelling} should parse: {e}"));
+            let acme = config.server.tls.unwrap().acme.unwrap();
+            assert_eq!(acme.dns.as_ref().unwrap().provider, expected);
+            assert!(acme.validate().is_ok(), "{spelling}: {:?}", acme.validate());
+        }
+    }
+
+    // AC3: DNS provider API tokens are NEVER supplied in plaintext `autumn.toml`.
+    // The section has no field to hold one, and `deny_unknown_fields` turns an
+    // operator's attempt into a load-time error rather than a silently-ignored key
+    // that leaves them wondering why the token "did not work".
+    #[test]
+    fn acme_dns_section_rejects_an_inline_secret() {
+        for secret_key in [
+            "api_token",
+            "token",
+            "secret_access_key",
+            "access_key_id",
+            "api_key",
+        ] {
+            let src = format!(
+                "[server.tls.acme]\ndomains = [\"*.myapp.com\"]\n\
+                 contact_email = \"ops@myapp.com\"\n\
+                 [server.tls.acme.dns]\nprovider = \"cloudflare\"\n{secret_key} = \"s3cret\"\n"
+            );
+            let err = toml::from_str::<AutumnConfig>(&src)
+                .err()
+                .unwrap_or_else(|| panic!("{secret_key} in autumn.toml must be rejected"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(secret_key),
+                "the rejection must name the offending key: {msg}"
+            );
+        }
+    }
+
+    // AC1: a wildcard domain is accepted once — and only once — a DNS-01 provider
+    // is configured, because only DNS-01 can validate a wildcard identifier.
+    #[test]
+    fn validate_acme_wildcard_requires_a_dns_provider() {
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&["*.myapp.com"], "ops@myapp.com"));
+        let err = cfg
+            .validate()
+            .expect_err("a wildcard without [server.tls.acme.dns] must be rejected");
+        assert!(err.contains("wildcard"), "got: {err}");
+        assert!(
+            err.contains("[server.tls.acme.dns]"),
+            "the message must name the section that fixes it: {err}"
+        );
+        assert!(err.contains("DNS-01"), "got: {err}");
+
+        // With the section present it is accepted.
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["myapp.com", "*.myapp.com"], "ops@myapp.com");
+        acme.dns = Some(acme_dns_cfg(AcmeDnsProvider::Cloudflare));
+        cfg.acme = Some(acme);
+        assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
+    }
+
+    // A malformed wildcard never reaches the CA as an opaque rejection.
+    #[test]
+    fn validate_acme_rejects_malformed_wildcards() {
+        for bad in ["*", "*.", "*myapp.com", "app.*.myapp.com", "*.*.myapp.com"] {
+            let mut cfg = tls_static(None, None);
+            let mut acme = acme_cfg(&[bad], "ops@myapp.com");
+            acme.dns = Some(acme_dns_cfg(AcmeDnsProvider::Cloudflare));
+            cfg.acme = Some(acme);
+            let err = cfg.validate().expect_err(&format!(
+                "`{bad}` is not a usable wildcard and must be rejected"
+            ));
+            assert!(
+                err.contains(bad),
+                "the message must echo the offending entry `{bad}`: {err}"
+            );
+        }
+
+        // The one well-formed shape stays accepted.
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        acme.dns = Some(acme_dns_cfg(AcmeDnsProvider::Cloudflare));
+        cfg.acme = Some(acme);
+        assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
+    }
+
+    #[test]
+    fn validate_acme_dns_exec_requires_a_command() {
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        acme.dns = Some(acme_dns_cfg(AcmeDnsProvider::Exec));
+        cfg.acme = Some(acme);
+        let err = cfg
+            .validate()
+            .expect_err("provider = \"exec\" with no command must be rejected");
+        assert!(err.contains("command"), "got: {err}");
+
+        // …and a command on a non-exec provider is a misconfiguration too: it
+        // would be silently ignored while the operator believes it runs.
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.command = vec!["/usr/local/bin/dns-hook".to_owned()];
+        acme.dns = Some(dns);
+        cfg.acme = Some(acme);
+        let err = cfg
+            .validate()
+            .expect_err("command on cloudflare is invalid");
+        assert!(err.contains("command"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_acme_dns_rejects_unusable_propagation_bounds() {
+        // A zero timeout would fail every order before a record could ever appear.
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.propagation_timeout_secs = 0;
+        acme.dns = Some(dns);
+        let err = acme.validate().expect_err("zero timeout is invalid");
+        assert!(err.contains("propagation_timeout_secs"), "got: {err}");
+
+        // A zero poll interval would busy-loop the resolver.
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.poll_interval_secs = 0;
+        acme.dns = Some(dns);
+        let err = acme.validate().expect_err("zero poll interval is invalid");
+        assert!(err.contains("poll_interval_secs"), "got: {err}");
+
+        // A poll interval longer than the whole budget means exactly one probe.
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.poll_interval_secs = 600;
+        dns.propagation_timeout_secs = 60;
+        acme.dns = Some(dns);
+        let err = acme.validate().expect_err("interval > timeout is invalid");
+        assert!(err.contains("poll_interval_secs"), "got: {err}");
+    }
+
+    // An unbounded budget reaches `Instant::now() + Duration::from_secs(..)`,
+    // which PANICS on overflow — inside the spawned renewal task, where the
+    // panic kills the loop silently and the placeholder is served forever.
+    #[test]
+    fn validate_acme_dns_rejects_an_unbounded_propagation_timeout() {
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.propagation_timeout_secs = u64::MAX;
+        acme.dns = Some(dns);
+        let err = acme
+            .validate()
+            .expect_err("an unbounded propagation budget is invalid");
+        assert!(err.contains("propagation_timeout_secs"), "got: {err}");
+
+        // The documented ceiling itself is accepted.
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.propagation_timeout_secs = MAX_ACME_DNS_PROPAGATION_TIMEOUT_SECS;
+        acme.dns = Some(dns);
+        assert!(acme.validate().is_ok(), "got: {:?}", acme.validate());
+    }
+
+    // `command[0]` is handed to the OS verbatim, so a blank or padded program
+    // would fail at order time with an opaque ENOENT rather than at boot.
+    #[test]
+    fn validate_acme_dns_rejects_an_unusable_exec_program() {
+        for bad in [
+            vec![String::new()],
+            vec!["   ".to_owned(), "arg".to_owned()],
+        ] {
+            let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+            let mut dns = acme_dns_cfg(AcmeDnsProvider::Exec);
+            dns.command = bad.clone();
+            acme.dns = Some(dns);
+            let err = acme
+                .validate()
+                .expect_err(&format!("`{bad:?}` is not a usable exec command"));
+            assert!(err.contains("command"), "got: {err}");
+        }
+
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Exec);
+        dns.command = vec![" /usr/local/bin/hook ".to_owned()];
+        acme.dns = Some(dns);
+        let err = acme.validate().expect_err("a padded program is invalid");
+        assert!(err.contains("whitespace"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_acme_dns_rejects_a_blank_or_unparseable_resolver() {
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.resolvers = Vec::new();
+        acme.dns = Some(dns);
+        let err = acme.validate().expect_err("no resolvers is invalid");
+        assert!(err.contains("resolvers"), "got: {err}");
+
+        let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.resolvers = vec!["not a resolver".to_owned()];
+        acme.dns = Some(dns);
+        let err = acme.validate().expect_err("garbage resolver is invalid");
+        assert!(err.contains("resolvers"), "got: {err}");
+    }
+
+    #[test]
+    fn acme_dns_resolver_addresses_accept_bare_ips_and_explicit_ports() {
+        let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+        dns.resolvers = vec!["1.1.1.1".to_owned(), "9.9.9.9:5353".to_owned()];
+        let addrs = dns.resolver_addrs().expect("resolvers parse");
+        assert_eq!(addrs[0].port(), 53, "a bare IP defaults to port 53");
+        assert_eq!(addrs[1].port(), 5353);
+    }
+
+    #[test]
+    fn validate_acme_dns_rejects_a_blank_credential_reference() {
+        for blank in ["", "   "] {
+            let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
+            let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
+            dns.credential = blank.to_owned();
+            acme.dns = Some(dns);
+            let err = acme.validate().expect_err("a blank credential is invalid");
+            assert!(err.contains("credential"), "got: {err}");
+        }
+    }
+
+    // AC7 support: the grader `autumn doctor` uses to tell an operator that their
+    // `tenancy.base_domain` is not covered by the certificate.
+    #[test]
+    fn san_covers_host_matches_rfc6125_wildcard_rules() {
+        // Exact match.
+        assert!(san_covers_host("myapp.com", "myapp.com"));
+        assert!(
+            san_covers_host("MyApp.COM", "myapp.com"),
+            "case-insensitive"
+        );
+        assert!(!san_covers_host("myapp.com", "tenant1.myapp.com"));
+
+        // A wildcard covers exactly ONE label.
+        assert!(san_covers_host("*.myapp.com", "tenant1.myapp.com"));
+        assert!(
+            !san_covers_host("*.myapp.com", "a.b.myapp.com"),
+            "a wildcard must not span a dot"
+        );
+        assert!(
+            !san_covers_host("*.myapp.com", "myapp.com"),
+            "a wildcard does not cover the apex"
+        );
+        assert!(!san_covers_host("*.myapp.com", "myapp.com.evil.com"));
+        assert!(!san_covers_host("*.myapp.com", ""));
+
+        // A trailing dot on the queried host is the same name.
+        assert!(san_covers_host("*.myapp.com", "tenant1.myapp.com."));
+    }
+
+    #[test]
+    fn acme_config_covers_host_uses_every_san() {
+        let acme = acme_cfg(&["myapp.com", "*.myapp.com"], "ops@myapp.com");
+        assert!(acme.covers_host("myapp.com"));
+        assert!(acme.covers_host("tenant42.myapp.com"));
+        assert!(!acme.covers_host("other.example.com"));
+        assert!(!acme.covers_host("deep.tenant42.myapp.com"));
+    }
+
     // Companion: a valid domain list plus the default challenge port is unaffected
     // by the new blank-entry / zero-port rejections.
     #[test]
@@ -12040,6 +17230,40 @@ path = "/healthz"
             "ops@example.com",
         ));
         assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
+    }
+
+    // ── server.capacity_contract (#1733) ───────────────────────────────
+
+    #[test]
+    fn server_config_defaults_capacity_contract_none() {
+        let config = AutumnConfig::default();
+        assert!(config.server.capacity_contract.is_none());
+    }
+
+    #[test]
+    fn capacity_contract_parses_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server]
+            capacity_contract = "capacity.lock"
+            "#,
+        )
+        .expect("config with server.capacity_contract should parse");
+        assert_eq!(
+            config.server.capacity_contract.as_deref(),
+            Some("capacity.lock")
+        );
+    }
+
+    #[test]
+    fn env_override_server_capacity_contract() {
+        let env = MockEnv::new().with("AUTUMN_SERVER__CAPACITY_CONTRACT", "deploy/capacity.lock");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.server.capacity_contract.as_deref(),
+            Some("deploy/capacity.lock")
+        );
     }
 
     // ── server.max_concurrent_requests (#1006) ────────────────────
@@ -14222,6 +19446,14 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         }
     }
 
+    // Issue #1864: named so ACME's spawn site reads as intent rather than an
+    // inline `matches!` against the enum.
+    #[test]
+    fn scheduler_backend_is_fleet_distributed_only_for_postgres() {
+        assert!(!SchedulerBackend::InProcess.is_fleet_distributed());
+        assert!(SchedulerBackend::Postgres.is_fleet_distributed());
+    }
+
     #[test]
     fn process_role_serves_http_and_runs_workers_truth_table() {
         assert!(ProcessRole::Combined.serves_http());
@@ -14296,6 +19528,129 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
             ProcessRole::Worker,
             "redis"
         ));
+        // The SQLite queue is a table two processes on one host share, so it
+        // backs a split role too (issue #1907).
+        assert!(!split_role_requires_durable_backend(
+            ProcessRole::Web,
+            "sqlite"
+        ));
+        assert!(!split_role_requires_durable_backend(
+            ProcessRole::Worker,
+            "sqlite"
+        ));
+    }
+
+    /// Issue #1907: a split role on the sqlite queue needs a FILE-backed
+    /// database. An in-memory target is private to each process, so the web
+    /// replica would enqueue where no worker can look.
+    #[test]
+    fn split_role_on_sqlite_requires_a_file_backed_database() {
+        // Every in-memory spelling is refused for a split role.
+        for url in [
+            "sqlite::memory:",
+            "sqlite://:memory:",
+            ":memory:",
+            "file::memory:",
+            "file::memory:?cache=shared",
+            "sqlite:file::memory:?cache=shared",
+            "sqlite://app.db?mode=memory",
+            // A bare scheme names no file: `normalize_sqlite_target` turns
+            // both of these into `:memory:`.
+            "sqlite://",
+            "sqlite:",
+        ] {
+            assert!(
+                is_in_memory_sqlite_target(url),
+                "{url} must read as in-memory"
+            );
+            assert!(
+                split_role_requires_file_backed_sqlite(ProcessRole::Web, "sqlite", Some(url)),
+                "a split role on {url} must be refused"
+            );
+        }
+
+        // A file target is exactly what makes the split valid.
+        for url in ["sqlite:///var/lib/app.db", "sqlite://./app.db", "app.db"] {
+            assert!(
+                !is_in_memory_sqlite_target(url),
+                "{url} must read as file-backed"
+            );
+            assert!(
+                !split_role_requires_file_backed_sqlite(ProcessRole::Web, "sqlite", Some(url)),
+                "a split role on {url} is valid"
+            );
+        }
+
+        // The combined role shares nothing, so it is fine either way.
+        assert!(!split_role_requires_file_backed_sqlite(
+            ProcessRole::Combined,
+            "sqlite",
+            Some("sqlite::memory:")
+        ));
+        // Other backends do not answer to this rule.
+        assert!(!split_role_requires_file_backed_sqlite(
+            ProcessRole::Worker,
+            "postgres",
+            Some("sqlite::memory:")
+        ));
+        // No database configured fails earlier, with its own error.
+        assert!(!split_role_requires_file_backed_sqlite(
+            ProcessRole::Worker,
+            "sqlite",
+            None
+        ));
+    }
+
+    /// Issue #1907: the single-host lease backend is selectable, aliased, and
+    /// reports itself as fleet-distributed.
+    #[test]
+    fn scheduler_backend_sqlite_is_selectable_and_fleet_distributed() {
+        assert_eq!(
+            SchedulerBackend::from_env_value("sqlite"),
+            Some(SchedulerBackend::Sqlite)
+        );
+        assert_eq!(
+            SchedulerBackend::from_env_value(" SINGLE_HOST "),
+            Some(SchedulerBackend::Sqlite)
+        );
+        assert_eq!(SchedulerBackend::from_env_value("nonsense"), None);
+        assert!(SchedulerBackend::Sqlite.is_fleet_distributed());
+        assert!(!SchedulerBackend::InProcess.is_fleet_distributed());
+
+        let config: AutumnConfig =
+            toml::from_str("[scheduler]\nbackend = \"sqlite\"\n").expect("sqlite backend");
+        assert_eq!(config.scheduler.backend, SchedulerBackend::Sqlite);
+        let aliased: AutumnConfig =
+            toml::from_str("[scheduler]\nbackend = \"single_host\"\n").expect("single_host alias");
+        assert_eq!(aliased.scheduler.backend, SchedulerBackend::Sqlite);
+
+        let env = MockEnv::new().with("AUTUMN_SCHEDULER__BACKEND", "sqlite");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.scheduler.backend, SchedulerBackend::Sqlite);
+    }
+
+    /// Issue #1907: `[jobs.sqlite]` carries the durable queue's knobs and
+    /// defaults to values an app never has to set.
+    #[test]
+    fn jobs_sqlite_section_parses_with_defaults() {
+        let defaults = JobSqliteConfig::default();
+        assert_eq!(defaults.visibility_timeout_ms, 30_000);
+        assert_eq!(defaults.poll_interval_ms, 250);
+
+        let config: AutumnConfig = toml::from_str(
+            "[jobs]\nbackend = \"sqlite\"\n\n[jobs.sqlite]\nvisibility_timeout_ms = 5000\n\
+             poll_interval_ms = 50\n",
+        )
+        .expect("sqlite job section");
+        assert_eq!(config.jobs.backend, "sqlite");
+        assert_eq!(config.jobs.sqlite.visibility_timeout_ms, 5_000);
+        assert_eq!(config.jobs.sqlite.poll_interval_ms, 50);
+
+        // Omitting the section keeps the defaults.
+        let bare: AutumnConfig =
+            toml::from_str("[jobs]\nbackend = \"sqlite\"\n").expect("bare jobs section");
+        assert_eq!(bare.jobs.sqlite.visibility_timeout_ms, 30_000);
     }
 
     #[test]

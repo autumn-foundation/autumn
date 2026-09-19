@@ -1,3 +1,4 @@
+mod metrics;
 mod models;
 mod repositories;
 mod routes;
@@ -18,6 +19,11 @@ async fn home() -> Redirect {
 
 #[autumn_web::main]
 async fn main() {
+    // Attach `# HELP` text and bucket bounds to this example's own
+    // instruments before anything records into them. Recording itself needs
+    // no registration at all — see `src/metrics.rs`.
+    metrics::describe();
+
     autumn_web::app()
         .migrations(MIGRATIONS)
         .routes(routes![
@@ -49,6 +55,9 @@ async fn main() {
             wizards::add_bookmark::cancel,
         ])
         .tasks(tasks![tasks::check_links])
+        // Serves the derived spec at `/openapi.json` and a Swagger UI at
+        // `/swagger-ui`, covering the `#[repository]`-generated JSON handlers
+        // registered above. See `docs/guide/openapi.md`.
         .openapi(OpenApiConfig::new("Bookmarks API", "1.0.0"))
         .run()
         .await;

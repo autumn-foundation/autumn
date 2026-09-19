@@ -1,0 +1,63 @@
+[package]
+name = "edge-greeting"
+version = "0.1.0"
+edition = "2024"
+publish = false
+# Two bin targets: the origin and the capsule. Without this, `cargo run -p
+# edge-greeting` cannot pick one.
+default-run = "edge-greeting"
+
+[dependencies]
+# The ONLY dependency the edge-safe handler module has, and the only one that
+# ends up inside the capsule. `autumn-edge` compiles for both the host target
+# and `wasm32-wasip1`; it re-exports the `#[get]` / `#[edge]` / `edge_routes![]`
+# macros so `src/handlers.rs` never has to name `autumn-web` at all.
+autumn-edge = { path = "../../autumn-edge" }
+
+# The origin binary — everything a real app has — is NEVER compiled for wasm.
+# Declaring `autumn-web` under a `cfg(not(target_arch = "wasm32"))` target
+# section is what makes `cargo build --target wasm32-wasip1 --bin edge-capsule`
+# work: tokio, hyper and diesel are simply not in the graph for that target.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# `edge` is the origin half of the seam: `AppBuilder::with_edge_kv` and the
+# `CacheEdgeKv` adapter. The `#[edge]` / `edge_routes![]` macros need no feature
+# — a route can be marked without it; the feature is what wires the store.
+autumn-web = { path = "../../autumn", features = ["edge"] }
+
+[dev-dependencies]
+# `host` adds the `wasmi`-backed reference host used by the conformance suite.
+# It is additive and native-only: `cargo build --target wasm32-wasip1` never
+# builds dev-dependencies, so no capsule ever links its own interpreter.
+autumn-edge = { path = "../../autumn-edge", features = ["host"] }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[[bin]]
+name = "edge-greeting"
+path = "src/main.rs"
+
+# The capsule entry point. `autumn build` looks for a bin target with exactly
+# this name, and so does the conformance suite.
+[[bin]]
+name = "edge-capsule"
+path = "src/bin/edge-capsule.rs"
+
+# Isolated `[[test]]` target on purpose: every test in it shells out to
+# `cargo build --target wasm32-wasip1`, so it must never be swept into a
+# consolidated binary that CI runs with a bare `--ignored`. See CLAUDE.md.
+[[test]]
+name = "conformance"
+path = "tests/conformance.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# Determinism seam gate (autumn #1797): `clippy.toml`'s workspace-global
+# `disallowed-methods` config arms `clippy::disallowed_methods` (warn-by-default)
+# in every crate that sees it. This package is outside the gate's manifest, so
+# grandfather the lint here. Crates that set `[lints] workspace = true` get the
+# same grandfathering from `[workspace.lints.clippy]` in the root Cargo.toml.
+# A package-level table (rather than a crate-root attribute) is used so it
+# covers every target — lib, bins, tests, benches — not just one root.
+[lints.clippy]
+disallowed_methods = "allow"

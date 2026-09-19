@@ -206,7 +206,7 @@ pub fn scan_project(root: &Path) -> ScanResult {
     result
 }
 
-fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+pub fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -243,7 +243,7 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// translations live — are still found. A `syn`-`Visit` walk would stop at the
 /// outer `html!` invocation and never see the `t!` calls inside its token
 /// stream. A file that fails to tokenize is skipped silently.
-fn scan_source(src: &str, file: &str, result: &mut ScanResult) {
+pub fn scan_source(src: &str, file: &str, result: &mut ScanResult) {
     let Ok(stream) = TokenStream::from_str(src) else {
         return;
     };
@@ -1192,6 +1192,9 @@ mod tests {
             supported_locales: vec![default.to_owned()],
             fallback_chain: chain.iter().map(|s| (*s).to_owned()).collect(),
             dir: "i18n".to_owned(),
+            locale_prefix_enabled: false,
+            locale_prefix_exclude: vec![],
+            locale_prefix_exclude_exact: vec![],
         }
     }
 
@@ -2131,6 +2134,9 @@ mod tests {
             supported_locales: vec!["en".to_owned(), "es".to_owned()],
             fallback_chain: Vec::new(),
             dir: "i18n".to_owned(),
+            locale_prefix_enabled: false,
+            locale_prefix_exclude: vec![],
+            locale_prefix_exclude_exact: vec![],
         };
         let report = build_report(&scan, &config, &per_locale);
 

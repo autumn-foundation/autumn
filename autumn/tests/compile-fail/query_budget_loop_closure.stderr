@@ -1,0 +1,7 @@
+error: `#[query_budget(2)]` cannot be proven: a database query (`find_by_id`) runs inside a closure, which the analysis cannot prove runs only once.
+
+       Batch the per-row lookup into one query with `preload(...)`, or opt the handler out with `#[query_budget(unbounded, reason = ...)]`. See docs/guide/query-budgets.md.
+  --> tests/compile-fail/query_budget_loop_closure.rs:24:14
+   |
+24 |         .map(|post| repo.find_by_id(post.author_id))
+   |              ^

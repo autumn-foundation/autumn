@@ -1,0 +1,4 @@
+CREATE TABLE gadgets (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL
+);

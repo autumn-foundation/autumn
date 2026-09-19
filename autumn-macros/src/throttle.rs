@@ -1,8 +1,13 @@
 //! `#[throttle]` proc macro implementation.
 //!
-//! Generates a per-route rate-limit guard that runs before the handler
-//! body. Injects hidden extractors and prepends a call to the runtime
-//! check function.
+//! Generates a per-route rate-limit guard that runs as a `FromRequestParts`
+//! gate — a hidden, handler-unique parameter inserted ahead of the handler's
+//! own parameters — instead of a statement inside the handler body (issue
+//! #1668). Axum resolves every `FromRequestParts` extractor, left to right,
+//! *before* it ever reaches a `FromRequest` body extractor (`Json` / `Form` /
+//! `Multipart`) and short-circuits on the first rejection, so an over-limit
+//! request is rejected with `429` before the request body is parsed or
+//! buffered, rather than after.
 //!
 //! ## Forms
 //!
@@ -14,12 +19,11 @@
 //!   `[security.rate_limit.named.login]`
 
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::parse::Parser as _;
-use syn::{Expr, ItemFn, Lit, LitInt, LitStr, parse_quote};
+use syn::{Expr, Lit, LitInt, LitStr};
 
-use crate::idempotency_guard::block_has_replay_guard;
-use crate::param_helpers::has_input_named;
+use crate::idempotency_guard::should_own_replay;
 
 /// Parsed `#[throttle(...)]` attribute arguments.
 enum ThrottleAttrs {
@@ -172,124 +176,6 @@ fn parse_throttle_args(attr: TokenStream) -> syn::Result<ThrottleAttrs> {
     })
 }
 
-/// Inject the hidden extractors the runtime check needs. Guards against
-/// duplication when stacking with `#[secured]`, `#[step_up]`, etc.
-fn inject_throttle_params(input_fn: &mut ItemFn) {
-    if !has_input_named(input_fn, "__autumn_state") {
-        let p: syn::FnArg = parse_quote! {
-            ::autumn_web::reexports::axum::extract::State(__autumn_state):
-                ::autumn_web::reexports::axum::extract::State<::autumn_web::AppState>
-        };
-        input_fn.sig.inputs.insert(0, p);
-    }
-    if !has_input_named(input_fn, "__autumn_throttle_headers") {
-        let p: syn::FnArg = parse_quote! {
-            __autumn_throttle_headers: ::autumn_web::reexports::axum::http::HeaderMap
-        };
-        input_fn.sig.inputs.insert(0, p);
-    }
-    if !has_input_named(input_fn, "__autumn_throttle_matched_path") {
-        // Optional because `MatchedPath` is absent for some routes (fallbacks,
-        // unnested handlers). When present, the runtime matched route pattern
-        // isolates an INLINE throttle's bucket per mounted path — a handler
-        // reused under two `scoped` prefixes maps to the same compile-time
-        // `route_id`, so folding the matched path in gives each mount its own
-        // bucket. `__check_throttle` consults it only for inline throttles.
-        let p: syn::FnArg = parse_quote! {
-            __autumn_throttle_matched_path: ::core::option::Option<
-                ::autumn_web::reexports::axum::extract::MatchedPath
-            >
-        };
-        input_fn.sig.inputs.insert(0, p);
-    }
-    if !has_input_named(input_fn, "__autumn_throttle_peer") {
-        // Wrap ConnectInfo in Extension so `Option<...>` is a valid extractor
-        // even in tests that don't call `into_make_service_with_connect_info`.
-        let p: syn::FnArg = parse_quote! {
-            __autumn_throttle_peer: ::core::option::Option<
-                ::autumn_web::reexports::axum::extract::Extension<
-                    ::autumn_web::reexports::axum::extract::ConnectInfo<
-                        ::std::net::SocketAddr
-                    >
-                >
-            >
-        };
-        input_fn.sig.inputs.insert(0, p);
-    }
-    if !has_input_named(input_fn, "__autumn_throttle_principal") {
-        let p: syn::FnArg = parse_quote! {
-            __autumn_throttle_principal: ::core::option::Option<
-                ::autumn_web::reexports::axum::extract::Extension<
-                    ::autumn_web::security::RateLimitPrincipal
-                >
-            >
-        };
-        input_fn.sig.inputs.insert(0, p);
-    }
-    if !has_input_named(input_fn, "__autumn_throttle_session") {
-        // Optional so throttled routes without session middleware (or a
-        // per-route throttle that doesn't key on the principal) still compile
-        // and run. `__check_throttle` only consults it for `key = "principal"`
-        // when no `RateLimitPrincipal` extension was installed, deriving the
-        // principal from the same verified session `populate_rate_limit_principal`
-        // reads.
-        let p: syn::FnArg = parse_quote! {
-            __autumn_throttle_session: ::core::option::Option<
-                ::autumn_web::reexports::axum::extract::Extension<
-                    ::autumn_web::session::Session
-                >
-            >
-        };
-        input_fn.sig.inputs.insert(0, p);
-    }
-    if !has_input_named(input_fn, "__autumn_throttle_exempt") {
-        let p: syn::FnArg = parse_quote! {
-            __autumn_throttle_exempt: ::core::option::Option<
-                ::autumn_web::reexports::axum::extract::Extension<
-                    ::autumn_web::security::RateLimitExempt
-                >
-            >
-        };
-        input_fn.sig.inputs.insert(0, p);
-    }
-    if !has_input_named(input_fn, "__autumn_idempotency_replay") {
-        let p: syn::FnArg = parse_quote! {
-            __autumn_idempotency_replay: ::core::option::Option<
-                ::autumn_web::reexports::axum::extract::Extension<
-                    ::autumn_web::idempotency::IdempotencyReplayResponse
-                >
-            >
-        };
-        input_fn.sig.inputs.insert(0, p);
-    }
-}
-
-/// Returns `true` if `ty` contains an `impl Trait` anywhere in its tree.
-///
-/// Rust rejects `impl Trait` in local variable type annotations, so the
-/// wrapper must skip the explicit annotation when the handler return type
-/// contains `impl Trait` at any depth (e.g. `AutumnResult<impl IntoResponse>`).
-fn type_contains_impl_trait(ty: &syn::Type) -> bool {
-    match ty {
-        syn::Type::ImplTrait(_) => true,
-        syn::Type::Path(tp) => tp.path.segments.iter().any(|seg| match &seg.arguments {
-            syn::PathArguments::AngleBracketed(args) => args.args.iter().any(|arg| match arg {
-                syn::GenericArgument::Type(t) => type_contains_impl_trait(t),
-                _ => false,
-            }),
-            syn::PathArguments::Parenthesized(args) => {
-                args.inputs.iter().any(type_contains_impl_trait)
-                    || matches!(&args.output,
-                            syn::ReturnType::Type(_, t) if type_contains_impl_trait(t))
-            }
-            syn::PathArguments::None => false,
-        }),
-        syn::Type::Reference(r) => type_contains_impl_trait(&r.elem),
-        syn::Type::Tuple(t) => t.elems.iter().any(type_contains_impl_trait),
-        _ => false,
-    }
-}
-
 fn build_spec_tokens(attrs: &ThrottleAttrs) -> TokenStream {
     match attrs {
         ThrottleAttrs::Named(name) => {
@@ -332,65 +218,172 @@ fn build_spec_tokens(attrs: &ThrottleAttrs) -> TokenStream {
 }
 
 /// Expand the `#[throttle(...)]` attribute.
+#[allow(clippy::too_many_lines)]
+// `item` is only ever borrowed via
+// `param_helpers::split_leading_items_and_reject_incompatible` now, but
+// keeps the owned `TokenStream` signature every macro entry point in this
+// crate shares (and the proc-macro boundary in `lib.rs` requires).
+#[allow(clippy::needless_pass_by_value)]
 pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_throttle_args(attr) {
         Ok(a) => a,
         Err(err) => return err.to_compile_error(),
     };
 
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
-    };
+    let (leading_items, mut input_fn) =
+        match crate::param_helpers::split_leading_items_and_reject_incompatible(&item, "throttle") {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
 
-    if input_fn.sig.asyncness.is_none() {
-        return syn::Error::new_spanned(
-            input_fn.sig.fn_token,
-            "#[throttle] can only be applied to async functions",
-        )
-        .to_compile_error();
+    // An attribute sharing #[authorize]'s argument grammar under a different
+    // name is refused rather than guessed at — see
+    // `authorize::reject_if_ambiguous_authorize_shape`'s doc comment.
+    if let Some(err) = crate::authorize::reject_if_ambiguous_authorize_shape(&input_fn) {
+        return err;
     }
 
-    let fn_name_str = input_fn.sig.ident.to_string();
+    let fn_name = input_fn.sig.ident.clone();
+    let fn_name_str = fn_name.to_string();
     let spec_tokens = build_spec_tokens(&attrs);
+    let gate_ident = format_ident!("__AutumnThrottleGate_{}", fn_name);
 
-    let check_call = quote! {
-        // Stable per-handler bucket namespace. Two routes pointing at the same
-        // named limiter share their bucket via the runtime registry — the
-        // route_id here is only used for inline limiters and for uniqueness
-        // when a named entry is missing from config.
-        const __AUTUMN_THROTTLE_ROUTE_ID: &str =
-            ::core::concat!(::core::module_path!(), "::", #fn_name_str);
-        if let ::core::result::Result::Err(__autumn_throttle_response) =
-            ::autumn_web::security::__check_throttle(
-                &__autumn_state,
-                __AUTUMN_THROTTLE_ROUTE_ID,
-                __autumn_throttle_matched_path.as_ref().map(|__mp| __mp.as_str()),
-                #spec_tokens,
-                &__autumn_throttle_headers,
-                __autumn_throttle_peer
-                    .as_ref()
-                    .map(|ext| ext.0.0),
-                __autumn_throttle_principal.as_ref().map(|e| &e.0),
-                __autumn_throttle_session.as_ref().map(|e| &e.0),
-                __autumn_throttle_exempt.is_some(),
-            ).await
-        {
-            return __autumn_throttle_response;
+    // Whether THIS gate should also serve a cached idempotency replay: see
+    // `should_own_replay` for the full ordering rationale (issue #1668's
+    // pre-body gates and `#[authorize]`'s in-body check must never both skip
+    // replay-ownership, nor both claim it).
+    let owns_replay = should_own_replay(&input_fn);
+    let replay_check = if owns_replay {
+        quote! {
+            let __autumn_idempotency_replay = parts
+                .extensions
+                .get::<::autumn_web::idempotency::IdempotencyReplayResponse>()
+                .cloned()
+                .map(::autumn_web::reexports::axum::extract::Extension);
+            if let ::core::option::Option::Some(__autumn_response) =
+                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+            {
+                return ::core::result::Result::Err(__autumn_response);
+            }
         }
+    } else {
+        quote! {}
     };
 
+    // The throttle check must run BEFORE the idempotency-replay lookup.
+    // Returning a cached response ahead of `__check_throttle` would let repeat
+    // requests reusing the same `Idempotency-Key` bypass the per-route bucket
+    // forever. Running the throttle check first ensures replays still consume
+    // the bucket and can 429 once the route limit is exhausted; only if the
+    // throttle check passes do we replay any cached response.
+    //
+    // Both the check and the replay lookup run inside a `FromRequestParts`
+    // gate — a hidden parameter inserted ahead of the handler's own
+    // parameters — rather than as a statement inside the handler body. Axum
+    // resolves every `FromRequestParts` extractor before it ever reaches a
+    // `FromRequest` body extractor (`Json` / `Form` / `Multipart`) and
+    // short-circuits on the first rejection, so an over-limit or replayed
+    // request never causes the body to be parsed or buffered.
+    // Stable per-handler bucket namespace. Two routes pointing at the same
+    // named limiter share their bucket via the runtime registry — the
+    // route_id here is only used for inline limiters and for uniqueness when
+    // a named entry is missing from config.
+    //
+    // Emitted from one shared `TokenStream` (cheaply `Clone`) so it can be
+    // declared TWICE — once inside the gate below for the actual runtime
+    // check, and once (inert) into the handler body via `route_id_marker`
+    // near the bottom of this function — mirroring `secured_macro`'s
+    // `role_scope_consts`/`markers` split. `api_doc::infer_response_body`'s
+    // guard recovery (`RESPONSE_REWRITING_GUARD_MARKERS`) requires this const
+    // in the handler's OWN body to tell a real guard's `__autumn_inner`
+    // wrapper apart from unrelated code with the same shape; since #1668
+    // moved the throttle check itself into this gate, this is the only
+    // reason a copy still needs to live in the body at all (issue #2516).
+    let route_id_marker = quote! {
+        #[allow(dead_code)]
+        const __AUTUMN_THROTTLE_ROUTE_ID: &str =
+            ::core::concat!(::core::module_path!(), "::", #fn_name_str);
+    };
+
+    let gate_item = crate::request_gate::wrap_gate(
+        &gate_ident,
+        &quote! {
+            #route_id_marker
+            let __autumn_throttle_headers = parts.headers.clone();
+            // Optional because `MatchedPath` is absent for some routes
+            // (fallbacks, unnested handlers). When present, the
+            // runtime matched route pattern isolates an INLINE
+            // throttle's bucket per mounted path — a handler reused
+            // under two `scoped` prefixes maps to the same
+            // compile-time `route_id`, so folding the matched path in
+            // gives each mount its own bucket. `__check_throttle`
+            // consults it only for inline throttles.
+            let __autumn_throttle_matched_path = parts
+                .extensions
+                .get::<::autumn_web::reexports::axum::extract::MatchedPath>()
+                .cloned();
+            let __autumn_throttle_peer = parts
+                .extensions
+                .get::<::autumn_web::reexports::axum::extract::ConnectInfo<::std::net::SocketAddr>>()
+                .copied();
+            let __autumn_throttle_principal = parts
+                .extensions
+                .get::<::autumn_web::security::RateLimitPrincipal>()
+                .cloned();
+            // Optional so throttled routes without session middleware
+            // (or a per-route throttle that doesn't key on the
+            // principal) still compile and run. `__check_throttle`
+            // only consults it for `key = "principal"` when no
+            // `RateLimitPrincipal` extension was installed, deriving
+            // the principal from the same verified session
+            // `populate_rate_limit_principal` reads. Read directly
+            // from extensions (not the `Session` extractor) so a
+            // route with no `SessionLayer` installed does not panic.
+            let __autumn_throttle_session = parts
+                .extensions
+                .get::<::autumn_web::session::Session>()
+                .cloned();
+            let __autumn_throttle_exempt = parts
+                .extensions
+                .get::<::autumn_web::security::RateLimitExempt>()
+                .is_some();
+            if let ::core::result::Result::Err(__autumn_throttle_response) =
+                ::autumn_web::security::__check_throttle(
+                    state,
+                    __AUTUMN_THROTTLE_ROUTE_ID,
+                    __autumn_throttle_matched_path.as_ref().map(|__mp| __mp.as_str()),
+                    #spec_tokens,
+                    &__autumn_throttle_headers,
+                    __autumn_throttle_peer.map(|c| c.0),
+                    __autumn_throttle_principal.as_ref(),
+                    __autumn_throttle_session.as_ref(),
+                    __autumn_throttle_exempt,
+                ).await
+            {
+                return ::core::result::Result::Err(__autumn_throttle_response);
+            }
+            #replay_check
+        },
+    );
+
+    // NOT `param_helpers::build_original_response` (which `secured`/
+    // `step_up`/`authorize` share): this match has an extra
+    // `should_stringify_primitive_output` arm below that the other three
+    // don't need. Deliberate divergence, not an omission — see that arm's
+    // comment.
     let original_body = input_fn.block.clone();
     let original_response = match &input_fn.sig.output {
         syn::ReturnType::Default => quote! {
             let __autumn_inner: () = (async move #original_body).await;
             ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
         },
-        syn::ReturnType::Type(_, ty) if type_contains_impl_trait(ty) => quote! {
-            ::autumn_web::reexports::axum::response::IntoResponse::into_response(
-                (async move #original_body).await
-            )
-        },
+        syn::ReturnType::Type(_, ty) if crate::param_helpers::type_contains_impl_trait(ty) => {
+            quote! {
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                    (async move #original_body).await
+                )
+            }
+        }
         // A bare numeric/bool primitive does not implement `IntoResponse`;
         // Autumn's plain primitive-output wrapper serves it by stringifying. The
         // route macro suppresses that wrapper when `#[throttle]` is present (the
@@ -412,43 +405,27 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     };
 
-    inject_throttle_params(&mut input_fn);
-    input_fn
-        .attrs
-        .push(parse_quote!(#[allow(clippy::too_many_arguments)]));
-    input_fn.sig.output = parse_quote! {
-        -> ::autumn_web::reexports::axum::response::Response
-    };
-    let body_already_has_replay_guard = block_has_replay_guard(&original_body);
-    let replay_stop = if body_already_has_replay_guard {
-        quote! {}
-    } else {
-        quote! {
-            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
-            if let ::core::option::Option::Some(__autumn_response) =
-                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
-            {
-                return __autumn_response;
-            }
-        }
-    };
-    // The throttle check must run BEFORE the idempotency-replay lookup. Because
-    // the route macro disables the outer `IdempotencyReplayLayer` for throttled
-    // routes (replay handling moves into this body), returning a cached response
-    // ahead of `__check_throttle` would let repeat requests reusing the same
-    // `Idempotency-Key` bypass the per-route bucket forever. Running the throttle
-    // check first ensures replays still consume the bucket and can 429 once the
-    // route limit is exhausted; only if the throttle check passes do we replay
-    // any cached response, then fall through to the user body.
+    // Insert the gate as the FIRST parameter. Axum evaluates `FromRequestParts`
+    // extractors left to right, so this must sit ahead of every other
+    // extractor — including any earlier-inserted guard gate, which then
+    // correctly runs AFTER (see `should_own_replay`'s doc comment: whichever
+    // guard is applied to a still-unguarded function owns replay, and
+    // "unguarded" is judged at each macro's OWN expansion time, before later
+    // macros insert their gates further left).
+    crate::request_gate::insert_gate_param(&mut input_fn, &gate_ident);
+
     input_fn.block = syn::parse_quote! {
         {
-            #check_call
-            #replay_stop
+            #route_id_marker
             #original_response
         }
     };
 
-    quote! { #input_fn }
+    quote! {
+        #leading_items
+        #gate_item
+        #input_fn
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -458,6 +435,56 @@ mod tests {
     use quote::quote;
 
     use super::throttle_macro;
+    use crate::static_route::static_get_macro;
+
+    /// Characterization test (Echo refactor, clone class: the
+    /// `FromRequestParts` gate skeleton shared with `secured`/`step_up`):
+    /// pins `#[throttle(limit = 5, per = "1m", key = "principal")]`'s exact
+    /// expansion — exercising the rate-limit check and (as the only guard on
+    /// this handler) the replay lookup at once — so that factoring the
+    /// gate's struct+impl skeleton into `request_gate::wrap_gate` cannot
+    /// silently change a single token of it.
+    #[test]
+    fn throttle_macro_expansion_is_unchanged_by_the_gate_skeleton_refactor() {
+        let generated = throttle_macro(
+            quote! { limit = 5, per = "1m", key = "principal" },
+            quote! {
+                async fn handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert_eq!(
+            generated,
+            include_str!("../testdata/throttle_golden.txt").trim_end()
+        );
+    }
+
+    #[test]
+    fn throttle_rejects_when_invoked_on_a_static_route_handler_via_an_alias() {
+        // See `secured::tests::secured_rejects_when_invoked_on_a_static_route_handler_via_an_alias`
+        // for the full rationale (Codex review on #2513, tenth finding).
+        let accepted = static_get_macro(
+            quote! { "/private" },
+            quote! {
+                #[auth]
+                async fn private() -> &'static str { "private" }
+            },
+        );
+        assert!(
+            !accepted.to_string().contains("compile_error"),
+            "static_get_macro cannot recognize an aliased guard attribute by name: {accepted}"
+        );
+
+        let accepted_fn = crate::param_helpers::extract_fn_item(accepted, "private");
+        let generated =
+            throttle_macro(quote! { limit = 5, per = "1m" }, quote! { #accepted_fn }).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "throttle_macro must reject a handler already marked as a #[static_get] route, \
+             regardless of what alias attribute name the source used to invoke it: {generated}"
+        );
+    }
 
     #[test]
     fn inline_form_generates_check_call() {
@@ -626,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn injects_state_extractor() {
+    fn gate_reads_state_from_from_request_parts() {
         let generated = throttle_macro(
             quote! { limit = 5, per = "1m" },
             quote! {
@@ -635,8 +662,17 @@ mod tests {
         )
         .to_string();
         assert!(
-            generated.contains("__autumn_state"),
-            "should inject state extractor:\n{generated}"
+            generated.contains("FromRequestParts"),
+            "check should run in a FromRequestParts gate, not a body statement:\n{generated}"
+        );
+        assert!(
+            generated.contains("__check_throttle"),
+            "should still emit the runtime check call:\n{generated}"
+        );
+        assert!(
+            !generated.contains("__autumn_state"),
+            "the old hidden State<AppState> handler parameter should be gone — the gate reads \
+             state from its own `from_request_parts` argument instead:\n{generated}"
         );
     }
 
@@ -651,11 +687,11 @@ mod tests {
         .to_string();
         assert!(
             generated.contains("__autumn_throttle_headers"),
-            "should inject headers extractor:\n{generated}"
+            "should read headers from request parts:\n{generated}"
         );
         assert!(
-            generated.contains("__autumn_throttle_peer"),
-            "should inject ConnectInfo extractor:\n{generated}"
+            generated.contains("ConnectInfo"),
+            "should read ConnectInfo from request parts:\n{generated}"
         );
     }
 
@@ -670,11 +706,151 @@ mod tests {
         .to_string();
         assert!(
             generated.contains("__autumn_throttle_matched_path"),
-            "should inject MatchedPath extractor:\n{generated}"
+            "should read MatchedPath from request parts:\n{generated}"
         );
         assert!(
             generated.contains("MatchedPath"),
             "should reference axum MatchedPath:\n{generated}"
+        );
+    }
+
+    #[test]
+    fn emits_gate_struct_and_impl_as_sibling_items() {
+        let generated = throttle_macro(
+            quote! { limit = 5, per = "1m" },
+            quote! {
+                async fn handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("struct __AutumnThrottleGate_handler"),
+            "should emit a handler-unique gate marker struct:\n{generated}"
+        );
+        assert!(
+            generated
+                .contains("impl :: autumn_web :: reexports :: axum :: extract :: FromRequestParts"),
+            "gate must implement FromRequestParts so Axum resolves it before the body extractor:\n{generated}"
+        );
+    }
+
+    #[test]
+    fn inserts_gate_as_first_parameter() {
+        let generated_fn = {
+            let generated = throttle_macro(
+                quote! { limit = 5, per = "1m" },
+                quote! {
+                    async fn handler(::autumn_web::reexports::axum::extract::Json(_body): ::autumn_web::reexports::axum::extract::Json<String>) -> &'static str { "ok" }
+                },
+            );
+            let items: syn::File = syn::parse2(generated).expect("generated tokens must parse");
+            items
+                .items
+                .into_iter()
+                .find_map(|item| match item {
+                    syn::Item::Fn(f) if f.sig.ident == "handler" => Some(f),
+                    _ => None,
+                })
+                .expect("handler fn must be present in the expansion")
+        };
+        let first_param = generated_fn
+            .sig
+            .inputs
+            .first()
+            .expect("handler must have at least the gate parameter");
+        let syn::FnArg::Typed(pat_type) = first_param else {
+            panic!("first parameter must be a typed gate parameter");
+        };
+        let syn::Type::Path(type_path) = pat_type.ty.as_ref() else {
+            panic!("gate parameter must be a named type");
+        };
+        assert_eq!(
+            type_path.path.segments.last().unwrap().ident,
+            "__AutumnThrottleGate_handler",
+            "the gate must be the FIRST parameter — ahead of the body extractor — so Axum \
+             resolves (and can reject on) it before ever reaching the body"
+        );
+    }
+
+    #[test]
+    fn handler_body_no_longer_contains_the_throttle_check() {
+        // The whole point of issue #1668: the runtime check must live in the
+        // gate's `FromRequestParts` impl, not in a statement inside the
+        // handler body (which only runs after every extractor — including a
+        // body extractor — has already succeeded).
+        let generated_fn = {
+            let generated = throttle_macro(
+                quote! { limit = 5, per = "1m" },
+                quote! {
+                    async fn handler() -> &'static str { "ok" }
+                },
+            );
+            let items: syn::File = syn::parse2(generated).expect("generated tokens must parse");
+            items
+                .items
+                .into_iter()
+                .find_map(|item| match item {
+                    syn::Item::Fn(f) if f.sig.ident == "handler" => Some(f),
+                    _ => None,
+                })
+                .expect("handler fn must be present in the expansion")
+        };
+        let body = quote! { #generated_fn }.to_string();
+        assert!(
+            !body.contains("__check_throttle"),
+            "the handler body must not call the runtime check directly:\n{body}"
+        );
+    }
+
+    #[test]
+    fn owns_replay_when_unguarded() {
+        let generated = throttle_macro(
+            quote! { limit = 5, per = "1m" },
+            quote! {
+                async fn handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("__replay_response"),
+            "an otherwise-unguarded throttled handler's gate must own replay-serving:\n{generated}"
+        );
+    }
+
+    #[test]
+    fn defers_replay_to_an_earlier_gate_when_stacked() {
+        // Simulate `#[secured]` having already expanded and inserted its own
+        // gate parameter ahead of `#[throttle]`'s.
+        let generated = throttle_macro(
+            quote! { limit = 5, per = "1m" },
+            quote! {
+                async fn handler(_g: __AutumnSecuredGate_handler) -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("__replay_response"),
+            "must defer replay-ownership to the earlier-inserted gate:\n{generated}"
+        );
+    }
+
+    #[test]
+    fn defers_replay_when_authorize_still_pending() {
+        // `#[authorize]` written below `#[throttle]` hasn't expanded yet, so
+        // its in-body policy check will only run once the handler body is
+        // invoked — strictly after this gate. If this gate served a cached
+        // replay itself, `#[authorize]`'s check would never run for a replay.
+        let generated = throttle_macro(
+            quote! { limit = 5, per = "1m" },
+            quote! {
+                #[authorize("update", resource = Post)]
+                async fn handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("__replay_response"),
+            "must defer replay-ownership while #[authorize] is still pending:\n{generated}"
         );
     }
 
@@ -702,6 +878,30 @@ mod tests {
         assert!(
             generated_s.contains("30"),
             "30s should expand to 30 seconds:\n{generated_s}"
+        );
+    }
+
+    /// Echo clone-class regression, `throttle`'s side of the pair covered by
+    /// `step_up::tests::step_up_handles_nested_impl_trait_return_type` — see
+    /// `secured::tests::secured_handles_nested_impl_trait_return_type` for
+    /// why the recursive `type_contains_impl_trait` guard matters. Already
+    /// green here (`throttle_macro` has the fix); kept alongside the other
+    /// three copies so the four macros stay provably in lockstep on this
+    /// rule.
+    #[test]
+    fn throttle_handles_nested_impl_trait_return_type() {
+        let generated = throttle_macro(
+            quote! { limit = 5, per = "1m" },
+            quote! {
+                async fn handler() -> Result<impl IntoResponse, String> {
+                    Ok("ok")
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("__autumn_inner :"),
+            "should not emit an explicit local annotation for nested impl Trait: {generated}"
         );
     }
 }

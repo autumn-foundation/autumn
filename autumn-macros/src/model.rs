@@ -13,9 +13,17 @@
 //! Recognises `#[id]`, `#[indexed]`, and `#[validate(...)]` field attributes.
 
 use proc_macro2::TokenStream;
-use quote::{format_ident, quote};
+use quote::{ToTokens as _, format_ident, quote};
 use syn::parse::Parser as _;
 use syn::{DeriveInput, Field, LitStr};
+
+use crate::commentable::{emit_commentable_items, is_commentable_attr, resolve_commentable};
+use crate::schema::{
+    apply_serde_rename_all_rule, emit_schema_fn_body_full, emit_schema_fn_body_named,
+    field_has_skip_serializing_if, field_is_collaborative, field_is_translatable,
+    field_serde_serialize_rename, has_attr, is_option_type, serde_bare_word,
+    serde_rename_all_serialize_rule, serde_valued_key, type_name_str,
+};
 
 /// Parsed `#[model(...)]` attribute arguments.
 ///
@@ -68,11 +76,6 @@ fn parse_attr_args(attr: TokenStream) -> syn::Result<ModelArgs> {
     Ok(args)
 }
 
-/// Check if a field has the `#[id]` attribute.
-fn has_attr(field: &Field, name: &str) -> bool {
-    field.attrs.iter().any(|a| a.path().is_ident(name))
-}
-
 /// Validate the declarative-schema field markers `#[unique]` and
 /// `#[references(...)]` (#1975).
 ///
@@ -94,6 +97,18 @@ fn validate_field_schema_markers(field: &Field) -> syn::Result<()> {
                 return Err(syn::Error::new_spanned(
                     attr,
                     "`#[unique]` takes no arguments; write a bare `#[unique]`",
+                ));
+            }
+        } else if attr.path().is_ident("position") {
+            // Bare marker only (issue #1358): the column name and optional
+            // scope live in the generated `#[repository(..., position(column
+            // = "...", scope = "..."))]` attribute, not here — this marker's
+            // only job is excluding the field from `New{Model}`/`Update{Model}`
+            // (see `excluded_from_new`), the same way `#[lock_version]` does.
+            if !matches!(attr.meta, syn::Meta::Path(_)) {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "`#[position]` takes no arguments; write a bare `#[position]`",
                 ));
             }
         } else if attr.path().is_ident("references") {
@@ -176,6 +191,36 @@ impl DependentAction {
     }
 }
 
+/// A resolved `counter_cache` declaration on a `#[belongs_to]` (#1325).
+///
+/// `#[belongs_to(Post, counter_cache)]` is the bare flag; `counter_cache =
+/// "comment_count"` names the parent column explicitly.
+#[derive(Clone, Debug)]
+struct CounterCacheDecl {
+    /// The explicitly named counter column, when given. `None` means the
+    /// convention applies: `{snake(ChildModel)}_count`.
+    ///
+    /// The convention is deliberately **singular** (`comment_count`, not Rails'
+    /// `comments_count`): it matches `#[votable(aggregate = count)]`'s
+    /// `{name}_count` and the `posts.comment_count` /
+    /// `subreddits.subscriber_count` columns autumn's own examples have shipped
+    /// since their first migration.
+    column: Option<String>,
+    /// The parent's tenant-discriminator column, from
+    /// `counter_cache_tenant = "<column>"`.
+    ///
+    /// Explicit rather than inferred: a counter update writes a parent row the
+    /// caller only had to name the id of, so on a shared multi-tenant table it
+    /// must be confined to the caller's tenant — but `#[model]` on the *child*
+    /// cannot see the parent's fields, and guessing `tenant_id` would break
+    /// every app whose tenant-scoped child hangs off a global parent with a hard
+    /// `column does not exist` error. Naming it is the author asserting the
+    /// parent really has it.
+    tenant_column: Option<String>,
+    /// Span of the `counter_cache` key, for diagnostics raised after parsing.
+    span: proc_macro2::Span,
+}
+
 /// A resolved association declaration: kind, target model, the (possibly
 /// inferred) foreign-key column, and the accessor/store name.
 struct Association {
@@ -207,6 +252,10 @@ struct Association {
     /// `following`, both through `Friendship` to `User`) without their
     /// target-derived helpers colliding.
     helper: Option<String>,
+    /// The `counter_cache` declaration on a `#[belongs_to]` (#1325). Drives the
+    /// runtime [`AutumnCounterCaches`] impl `#[model]` emits, which the child's
+    /// generated repository consults to keep `{parent}.{child}_count` current.
+    counter_cache: Option<CounterCacheDecl>,
 }
 
 /// The join-table half of a many-to-many `has_many(..., through = ...)`
@@ -216,6 +265,311 @@ struct ThroughSpec {
     table: String,
     /// The join table's column pointing at the target model, e.g. `tag_id`.
     target_fk: String,
+}
+
+/// How a `#[votable]` association aggregates its edges into the model's
+/// aggregate column (#1362).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoteAggregate {
+    /// Signed up/down votes: the aggregate is `SUM(value)` over the edge
+    /// table's `value_column`.
+    Sum,
+    /// Unary likes/bookmarks: the aggregate is `COUNT(*)` and the edge table
+    /// carries no value column at all.
+    Count,
+}
+
+/// A resolved `#[votable(by = <Reactor>, ...)]` declaration (#1362): the
+/// reaction edge table plus the aggregate column maintained on the model.
+///
+/// Every field except `reactor` has a convention-derived default, so the
+/// canonical declaration on a conventionally-named schema is the one-liner
+/// `#[votable(by = User, aggregate = sum)]` → `votes(user_id, post_id, value)`
+/// maintaining `posts.score`.
+struct VotableSpec {
+    /// The reactor model type named by `by = <Model>` (e.g. `User`).
+    reactor: syn::Ident,
+    /// `sum` (default) or `count`.
+    aggregate: VoteAggregate,
+    /// The reaction name, default `"vote"`. Drives `table` (pluralized) and,
+    /// in count mode, the `{name}_count` aggregate column.
+    name: String,
+    /// The edge table, default `pluralize(name)` → `votes` / `likes`.
+    table: String,
+    /// The edge column pointing at the reactor, default `{snake(by)}_id`.
+    reactor_fk: String,
+    /// The edge column pointing at this model, default `{snake(Model)}_id`.
+    target_fk: String,
+    /// The edge's signed value column, default `value` — `None` in count mode,
+    /// whose edge rows are pure membership and store no value.
+    value_column: Option<String>,
+    /// The aggregate column on *this* model, default `score` (sum) /
+    /// `{name}_count` (count).
+    column: String,
+}
+
+/// Reject a `#[votable(key = value)]` value that is not a plain Rust
+/// identifier.
+///
+/// Every name-shaped value in the attribute is spliced into generated code
+/// through `format_ident!` — as a table/column ident inside the hidden
+/// `diesel::table!` declarations, or (for `name`) as a fragment of the hidden
+/// module ident. `format_ident!` **panics** on a non-identifier, and a
+/// proc-macro panic reaches the user as an opaque "proc macro panicked" with no
+/// span pointing at the mistake. A raw identifier (`r#type`) does not panic but
+/// renders its `r#` prefix into the generated name, silently producing a
+/// column/table that cannot exist. Both are rejected here, spanned on the
+/// offending value.
+///
+/// # Errors
+///
+/// Returns a [`syn::Error`] naming the value and the key it was given for.
+fn check_votable_ident_value(
+    key: &syn::Ident,
+    value: &str,
+    span: proc_macro2::Span,
+) -> syn::Result<()> {
+    if !value.starts_with("r#") && syn::parse_str::<syn::Ident>(value).is_ok() {
+        return Ok(());
+    }
+    Err(syn::Error::new(
+        span,
+        format!(
+            "`{value}` is not a valid identifier for `{key} = ...` in \
+             `#[votable]`: the value is spliced verbatim into generated table, \
+             column and module names, so it must be a plain Rust identifier — \
+             no spaces or punctuation, no leading digit, no keyword, and no \
+             `r#` prefix"
+        ),
+    ))
+}
+
+/// Parse a single `#[votable(...)]` attribute into a resolved [`VotableSpec`].
+///
+/// Grammar (a `key = value` loop, each value a bare ident or a string literal;
+/// there is deliberately **no** positional head — the reactor is always named,
+/// because a bare `#[votable(User)]` reads ambiguously next to
+/// `#[has_many(Comment)]`, where the positional argument is the association
+/// *target* rather than the actor):
+///
+/// ```text
+/// #[votable(by = User, aggregate = sum | count, name = vote, table = votes,
+///           reactor_fk = user_id, target_fk = post_id,
+///           value_column = value, column = score)]
+/// ```
+// Eight independent keys, each with its own parse + validation arm, plus the
+// convention-derived defaults for the seven optional ones.
+#[allow(clippy::too_many_lines)]
+fn parse_votable_attr(attr: &syn::Attribute, model_ident: &syn::Ident) -> syn::Result<VotableSpec> {
+    use syn::parse::ParseStream;
+
+    if matches!(attr.meta, syn::Meta::Path(_)) {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "`#[votable]` requires `by = <ReactorModel>` \
+             (e.g. `#[votable(by = User)]`)",
+        ));
+    }
+
+    let mut reactor: Option<syn::Ident> = None;
+    let mut aggregate: Option<VoteAggregate> = None;
+    let mut name: Option<String> = None;
+    let mut table: Option<String> = None;
+    let mut reactor_fk: Option<String> = None;
+    let mut target_fk: Option<String> = None;
+    let mut value_column: Option<syn::Ident> = None;
+    let mut value_column_value: Option<String> = None;
+    let mut column: Option<String> = None;
+
+    // Every key already seen in *this* attribute, mapped to the value it was
+    // given. A repeat would otherwise silently win last-write, so a typo'd
+    // `by = A, by = B` would compile against the wrong reactor.
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    attr.parse_args_with(|input: ParseStream| {
+        while !input.is_empty() {
+            let key: syn::Ident = input.parse()?;
+            input.parse::<syn::Token![=]>()?;
+            // Accept either a bare identifier (`table = votes`) or a string
+            // literal (`table = "votes"`), exactly like the association attrs.
+            let (value_ident, value, value_span) = if input.peek(LitStr) {
+                let lit: LitStr = input.parse()?;
+                let span = lit.span();
+                (None, lit.value(), span)
+            } else {
+                let ident: syn::Ident = input.parse()?;
+                let span = ident.span();
+                (Some(ident.clone()), ident.to_string(), span)
+            };
+            if let Some(previous) = seen.insert(key.to_string(), value.clone()) {
+                return Err(syn::Error::new_spanned(
+                    &key,
+                    format!(
+                        "duplicate `{key} = ...` in `#[votable]` (was \
+                         `{previous}`, now `{value}`): each key may be given \
+                         at most once — the later value would silently win"
+                    ),
+                ));
+            }
+            if key == "by" {
+                // Every value that becomes part of a generated ident is
+                // validated, so a mistake is a directed error rather than a
+                // `format_ident!` panic (or, for `r#`, a garbage name).
+                check_votable_ident_value(&key, &value, value_span)?;
+                reactor = Some(match value_ident {
+                    Some(ident) => ident,
+                    None => syn::parse_str::<syn::Ident>(&value).map_err(|_| {
+                        syn::Error::new_spanned(
+                            &key,
+                            format!("`by = \"{value}\"` is not a valid model type name"),
+                        )
+                    })?,
+                });
+            } else if key == "aggregate" {
+                aggregate = Some(match value.as_str() {
+                    "sum" => VoteAggregate::Sum,
+                    "count" => VoteAggregate::Count,
+                    other => {
+                        return Err(syn::Error::new_spanned(
+                            &key,
+                            format!(
+                                "unknown aggregate `{other}`; expected `sum` \
+                                 (signed up/down votes) or `count` (unary likes)"
+                            ),
+                        ));
+                    }
+                });
+            } else if key == "name" {
+                // `name` feeds `format_ident!` composites (the hidden module
+                // ident and the `{name}_count` aggregate column), so it is held
+                // to the same identifier rule as the column names.
+                check_votable_ident_value(&key, &value, value_span)?;
+                name = Some(value);
+            } else if key == "table" {
+                check_votable_ident_value(&key, &value, value_span)?;
+                table = Some(value);
+            } else if key == "reactor_fk" {
+                check_votable_ident_value(&key, &value, value_span)?;
+                reactor_fk = Some(value);
+            } else if key == "target_fk" {
+                check_votable_ident_value(&key, &value, value_span)?;
+                target_fk = Some(value);
+            } else if key == "value_column" {
+                check_votable_ident_value(&key, &value, value_span)?;
+                value_column = Some(key.clone());
+                value_column_value = Some(value);
+            } else if key == "column" {
+                check_votable_ident_value(&key, &value, value_span)?;
+                column = Some(value);
+            } else {
+                return Err(syn::Error::new_spanned(
+                    &key,
+                    "expected `by = <Model>`, `aggregate = sum|count`, \
+                     `name = <ident>`, `table = <table>`, \
+                     `reactor_fk = <column>`, `target_fk = <column>`, \
+                     `value_column = <column>`, or \
+                     `column = <aggregate_column>` in `#[votable]`",
+                ));
+            }
+            if input.peek(syn::Token![,]) {
+                input.parse::<syn::Token![,]>()?;
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    })?;
+
+    let Some(reactor) = reactor else {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "`#[votable]` requires `by = <ReactorModel>` \
+             (e.g. `#[votable(by = User)]`)",
+        ));
+    };
+    let aggregate = aggregate.unwrap_or(VoteAggregate::Sum);
+
+    if aggregate == VoteAggregate::Count
+        && let Some(key) = value_column
+    {
+        return Err(syn::Error::new_spanned(
+            key,
+            "`value_column = ...` has no meaning with `aggregate = count`: a \
+             count reaction's edge table stores no value column, its rows are \
+             pure membership — use `aggregate = sum` (signed values) or drop \
+             the key",
+        ));
+    }
+
+    let name = name.unwrap_or_else(|| "vote".to_owned());
+    let table = table.unwrap_or_else(|| pluralize_word(&name));
+    let reactor_fk =
+        reactor_fk.unwrap_or_else(|| format!("{}_id", pascal_to_snake(&reactor.to_string())));
+    let target_fk =
+        target_fk.unwrap_or_else(|| format!("{}_id", pascal_to_snake(&model_ident.to_string())));
+    let value_column = match aggregate {
+        VoteAggregate::Sum => Some(value_column_value.unwrap_or_else(|| "value".to_owned())),
+        VoteAggregate::Count => None,
+    };
+    let column = column.unwrap_or_else(|| match aggregate {
+        VoteAggregate::Sum => "score".to_owned(),
+        VoteAggregate::Count => format!("{name}_count"),
+    });
+
+    Ok(VotableSpec {
+        reactor,
+        aggregate,
+        name,
+        table,
+        reactor_fk,
+        target_fk,
+        value_column,
+        column,
+    })
+}
+
+/// Resolve the (at most one) `#[votable]` declaration on a model's outer
+/// attributes.
+///
+/// A second `#[votable]` is a directed compile error rather than a silently
+/// dropped declaration: both would generate the same `{Model}Reactions` trait
+/// with the same `react`/`reaction_of` methods.
+///
+/// # Errors
+///
+/// Returns a [`syn::Error`] when more than one `#[votable]` is declared, or
+/// when the single declaration fails [`parse_votable_attr`]'s validation.
+fn resolve_votable(
+    model_ident: &syn::Ident,
+    attrs: &[syn::Attribute],
+) -> syn::Result<Option<VotableSpec>> {
+    let mut found: Option<&syn::Attribute> = None;
+    for attr in attrs {
+        if !is_votable_attr(attr) {
+            continue;
+        }
+        if found.is_some() {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "at most one `#[votable]` per model: the generated \
+                 `{Model}Reactions` trait's `react`/`reaction_of` methods would \
+                 otherwise collide (multiple reaction kinds per model are not \
+                 yet supported — see \
+                 https://github.com/autumn-foundation/autumn/issues/1362)",
+            ));
+        }
+        found = Some(attr);
+    }
+    found
+        .map(|attr| parse_votable_attr(attr, model_ident))
+        .transpose()
+}
+
+/// Whether an attribute is the `#[votable]` declaration consumed by `#[model]`
+/// (and therefore must not be re-emitted onto the Diesel struct, where it
+/// would fail with "cannot find attribute `votable` in this scope").
+fn is_votable_attr(attr: &syn::Attribute) -> bool {
+    attr.path().is_ident("votable")
 }
 
 /// Resolve the foreign-key column and accessor name for an association,
@@ -314,19 +668,39 @@ fn parse_assoc_attr(
         explicit_target_fk,
         dependent,
         explicit_helper,
+        counter_cache,
+        counter_cache_tenant,
     ) = attr.parse_args_with(|input: ParseStream| {
         let target: syn::Ident = input.parse()?;
         let mut explicit_fk: Option<String> = None;
         let mut explicit_name: Option<String> = None;
         let mut explicit_through: Option<String> = None;
         let mut explicit_target_fk: Option<String> = None;
-        let mut dependent: Option<DependentAction> = None;
+        // The key's span rides along so a later cross-key rejection (the
+        // `through =` combination below) can point its caret at the offending
+        // `dependent`/`on_delete` key — the thing the fix removes — rather than
+        // at the association's target ident.
+        let mut dependent: Option<(DependentAction, proc_macro2::Span)> = None;
         let mut explicit_helper: Option<String> = None;
+        let mut counter_cache: Option<CounterCacheDecl> = None;
+        let mut counter_cache_tenant: Option<(String, proc_macro2::Span)> = None;
         // Zero or more trailing `, key = value` pairs (`fk`, `name`,
-        // `through`, `target_fk`, `helper`), any order.
+        // `through`, `target_fk`, `helper`), any order — plus `counter_cache`,
+        // the one key that is also legal as a bare flag.
         while input.peek(syn::Token![,]) {
             input.parse::<syn::Token![,]>()?;
             let key: syn::Ident = input.parse()?;
+            // `counter_cache` may appear bare (`#[belongs_to(Post,
+            // counter_cache)]`) or with an explicit column
+            // (`counter_cache = "comment_count"`), so its `=` is optional.
+            if key == "counter_cache" && !input.peek(syn::Token![=]) {
+                counter_cache = Some(CounterCacheDecl {
+                    column: None,
+                    tenant_column: None,
+                    span: key.span(),
+                });
+                continue;
+            }
             input.parse::<syn::Token![=]>()?;
             // Accept either a bare identifier (`fk = author_id`) or a string
             // literal (`fk = "author_id"`).
@@ -335,7 +709,17 @@ fn parse_assoc_attr(
             } else {
                 input.parse::<syn::Ident>()?.to_string()
             };
-            if key == "fk" {
+            if key == "counter_cache" {
+                check_column_ident(&key, "counter_cache", &value)?;
+                counter_cache = Some(CounterCacheDecl {
+                    column: Some(value),
+                    tenant_column: None,
+                    span: key.span(),
+                });
+            } else if key == "counter_cache_tenant" {
+                check_column_ident(&key, "counter_cache", &value)?;
+                counter_cache_tenant = Some((value, key.span()));
+            } else if key == "fk" {
                 explicit_fk = Some(value);
             } else if key == "name" {
                 explicit_name = Some(value);
@@ -346,13 +730,16 @@ fn parse_assoc_attr(
             } else if key == "helper" {
                 explicit_helper = Some(value);
             } else if key == "dependent" || key == "on_delete" {
-                dependent = Some(parse_dependent_action(kind, &key, &value)?);
+                dependent = Some((parse_dependent_action(kind, &key, &value)?, key.span()));
             } else {
                 return Err(syn::Error::new_spanned(
                     &key,
                     "expected `fk = <column>`, `name = <accessor>`, \
-                         `through = <join_table>`, `target_fk = <column>`, or \
-                         `helper = <singular>` in association attribute",
+                         `through = <join_table>`, `target_fk = <column>`, \
+                         `helper = <singular>`, `counter_cache` / \
+                         `counter_cache = <column>`, or \
+                         `counter_cache_tenant = <column>` in association \
+                         attribute",
                 ));
             }
         }
@@ -364,8 +751,59 @@ fn parse_assoc_attr(
             explicit_target_fk,
             dependent,
             explicit_helper,
+            counter_cache,
+            counter_cache_tenant,
         ))
     })?;
+
+    // `counter_cache_tenant` scopes the counter cache; on its own it means
+    // nothing, and silently ignoring it would leave a multi-tenant app believing
+    // it was protected.
+    let counter_cache = match (counter_cache, counter_cache_tenant) {
+        (Some(decl), Some((tenant_column, _))) => Some(CounterCacheDecl {
+            tenant_column: Some(tenant_column),
+            ..decl
+        }),
+        (decl @ Some(_), None) => decl,
+        (None, Some((_, span))) => {
+            return Err(syn::Error::new(
+                span,
+                "`counter_cache_tenant = \"<column>\"` scopes a counter cache to \
+                 the caller's tenant, so it requires `counter_cache` on the same \
+                 association",
+            ));
+        }
+        (None, None) => None,
+    };
+
+    if let Some(decl) = counter_cache.as_ref()
+        && kind != AssocKind::BelongsTo
+    {
+        return Err(syn::Error::new(
+            decl.span,
+            format!(
+                "`counter_cache` is a `#[belongs_to]` option: the counter is \
+                 maintained by the child's repository — the side that owns the \
+                 foreign key and runs the insert/delete — so there is nothing on \
+                 this side to hang the maintenance off. Move it to the child \
+                 model's `#[belongs_to(...)]`, i.e. `#[belongs_to({model_ident}, \
+                 counter_cache)]` on `{target}`"
+            ),
+        ));
+    }
+    if let Some(decl) = counter_cache.as_ref()
+        && explicit_through.is_some()
+    {
+        return Err(syn::Error::new(
+            decl.span,
+            "`counter_cache` is not supported on a `through = <join_table>` \
+             (many-to-many) association: its foreign key names a column on the \
+             join table, not on this model, so the generated increment would \
+             read a column that does not exist. Counters over join tables are \
+             out of scope — map the join table as its own model and put \
+             `counter_cache` on its `#[belongs_to]`",
+        ));
+    }
 
     if explicit_through.is_some() && kind != AssocKind::HasMany {
         return Err(syn::Error::new_spanned(
@@ -380,7 +818,9 @@ fn parse_assoc_attr(
             "`target_fk = <column>` requires `through = <join_table>`",
         ));
     }
-    if explicit_through.is_some() && dependent.is_some() {
+    if let Some((_, dependent_span)) = dependent.as_ref()
+        && explicit_through.is_some()
+    {
         // A `through = <join_table>` association's `fk` names a column on the
         // *join table*, not on the target model. The emitted cascade calls the
         // target repository's `__autumn_apply_dependent_on_conn`, whose SQL
@@ -389,8 +829,8 @@ fn parse_assoc_attr(
         // Reject the combination directed rather than silently mis-cascading.
         // (Generating a real join-table cascade is a possible future
         // enhancement; a clean reject is the correct minimal behavior.)
-        return Err(syn::Error::new_spanned(
-            &target,
+        return Err(syn::Error::new(
+            *dependent_span,
             "`dependent`/`on_delete` cascade is not supported on a `through = \
              <join_table>` (many-to-many) association: its foreign key names a \
              column on the join table, not on the target model, so the cascade \
@@ -425,9 +865,58 @@ fn parse_assoc_attr(
         fk,
         name,
         through,
-        dependent,
+        dependent: dependent.map(|(action, _span)| action),
         helper: explicit_helper,
+        counter_cache,
     })
+}
+
+/// The `T` of an `Option<T>`, for any spelling of the path (`Option<T>`,
+/// `std::option::Option<T>`, `::core::option::Option<T>`).
+fn option_inner(ty: &syn::Type) -> Option<&syn::Type> {
+    let syn::Type::Path(type_path) = ty else {
+        return None;
+    };
+    let segment = type_path.path.segments.last()?;
+    if segment.ident != "Option" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+    args.args.iter().find_map(|arg| match arg {
+        syn::GenericArgument::Type(inner) => Some(inner),
+        _ => None,
+    })
+}
+
+/// Reject a column-naming attribute value that is not a plain identifier.
+///
+/// The value is spliced verbatim into generated SQL — `UPDATE posts SET
+/// <column> = <column> + $1 …` — so it is the one user-controlled name in the
+/// counter-cache and derivation codegen that reaches `format!`. Rejecting it
+/// here, spanned on the key, is what keeps that splice safe; the run-time
+/// `is_plain_identifier` guard in `autumn_web::counter_cache` is the backstop.
+///
+/// `keyword` is the attribute key as the diagnostic should spell it
+/// (`counter_cache`, `column`, `tenant`).
+fn check_column_ident(key: &syn::Ident, keyword: &str, value: &str) -> syn::Result<()> {
+    let plain = !value.is_empty()
+        && !value.starts_with(|c: char| c.is_ascii_digit())
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if plain {
+        return Ok(());
+    }
+    Err(syn::Error::new_spanned(
+        key,
+        format!(
+            "`{value}` is not a valid column name for `{keyword} = ...`: \
+             the value is spliced verbatim into the generated `UPDATE <parent> \
+             SET <column> = <column> + $1` statement, so it must be a plain \
+             identifier — ASCII letters, digits and underscores only, and no \
+             leading digit"
+        ),
+    ))
 }
 
 /// Collect all `#[belongs_to]` / `#[has_many]` / `#[has_one]` declarations from
@@ -450,7 +939,986 @@ fn resolve_associations(
         out.push(parse_assoc_attr(attr, kind, model_ident)?);
     }
     check_m2m_mutation_name_collisions(&out)?;
+    check_counter_cache_collisions(model_ident, &out)?;
     Ok(out)
+}
+
+/// The parent column a counter-cached association maintains: the explicit
+/// `counter_cache = "..."` override, else `{snake(ChildModel)}_count`.
+fn counter_cache_column(model_ident: &syn::Ident, assoc: &Association) -> Option<String> {
+    let decl = assoc.counter_cache.as_ref()?;
+    Some(
+        decl.column
+            .clone()
+            .unwrap_or_else(|| format!("{}_count", pascal_to_snake(&model_ident.to_string()))),
+    )
+}
+
+/// Reject two counter-cached legs that resolve onto the **same**
+/// `(parent table, counter column)` pair.
+///
+/// Both legs would move one column on every insert, double-counting silently
+/// and permanently. This is not a hypothetical: the default column name is
+/// derived from the *child* model, so two `belongs_to` legs to the same parent
+/// type (`Message` → `sender` / `recipient`, both `User`) collide by default.
+///
+/// Legs to *different* parent tables that happen to share a column name are
+/// fine — they are different columns on different tables — so the key is the
+/// pair, not the name.
+fn check_counter_cache_collisions(
+    model_ident: &syn::Ident,
+    assocs: &[Association],
+) -> syn::Result<()> {
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for assoc in assocs {
+        let Some(column) = counter_cache_column(model_ident, assoc) else {
+            continue;
+        };
+        let parent_table = infer_table_name(&assoc.target);
+        let key = (parent_table.clone(), column.clone());
+        if seen.contains(&key) {
+            let span = assoc
+                .counter_cache
+                .as_ref()
+                .map_or_else(proc_macro2::Span::call_site, |d| d.span);
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "two counter-cached associations on `{model_ident}` both \
+                     maintain `{parent_table}.{column}`, so every insert would \
+                     count twice. The column name defaults to \
+                     `{{snake(model)}}_count`, which collides whenever two \
+                     `belongs_to` legs point at the same parent — give at least \
+                     one of them an explicit `counter_cache = \"<column>\"` (and \
+                     a matching column on `{parent_table}`)"
+                ),
+            ));
+        }
+        seen.push(key);
+    }
+    Ok(())
+}
+
+// ── `#[derivation]` (#1769) ──────────────────────────────────────────────
+//
+// A derivation is a counter cache with a filter and a contribution: the same
+// `CounterCacheSpec` maintains it, so every generated mutation path keeps it
+// current for free. One filter declaration is lowered twice — to a Rust
+// predicate for the record-shaped paths and to a SQL predicate for the
+// set-based ones — because a divergence between the two is drift.
+
+/// How a `#[derivation]` folds qualifying child rows into the parent column.
+#[derive(Clone, Debug)]
+enum DerivationTransform {
+    /// `transform = count` (the default): a qualifying row contributes 1.
+    Count,
+    /// `transform = sum(<field>)`: a qualifying row contributes that field.
+    Sum {
+        /// The summed child column, which must be a non-nullable integer
+        /// field. Raw-identifier prefixes are already stripped.
+        field: String,
+        /// Span of the field name, for the type diagnostics raised later.
+        span: proc_macro2::Span,
+    },
+}
+
+impl DerivationTransform {
+    /// The canonical spelling recorded in the emitted `DerivationDef`.
+    fn as_source(&self) -> String {
+        match self {
+            Self::Count => "count".to_owned(),
+            Self::Sum { field, .. } => format!("sum({field})"),
+        }
+    }
+}
+
+/// A parsed `#[derivation(Parent, column = "...", ...)]` declaration.
+///
+/// Parsing needs only the attribute; resolving the foreign key needs the
+/// model's associations, and lowering the filter needs its fields, so both
+/// happen later.
+#[derive(Clone)]
+struct DerivationDecl {
+    /// The parent model type carrying the maintained column.
+    target: syn::Ident,
+    /// The maintained column on the parent. Always a plain identifier.
+    column: String,
+    /// The aggregate. Defaults to `count`.
+    transform: DerivationTransform,
+    /// The `filter = <expr>` predicate, if any.
+    filter: Option<syn::Expr>,
+    /// The `fk = <column>` override. `None` means the convention applies.
+    explicit_fk: Option<String>,
+    /// The parent's tenant-discriminator column, from `tenant = "<column>"`.
+    /// Same semantics — and same reason to be explicit — as
+    /// `counter_cache_tenant`.
+    tenant_column: Option<String>,
+    /// The `name = "<name>"` override. `None` means
+    /// `{parent_table}.{column}`.
+    name: Option<String>,
+    /// The `parent_table = "<table>"` override. `None` means the table name
+    /// inferred from the parent type.
+    parent_table: Option<String>,
+    /// Span of the attribute, for diagnostics raised after parsing.
+    span: proc_macro2::Span,
+}
+
+/// Whether an attribute is a `#[derivation(...)]` declaration consumed by
+/// `#[model]` (and therefore must not be re-emitted onto the Diesel struct).
+fn is_derivation_attr(attr: &syn::Attribute) -> bool {
+    attr.path().is_ident("derivation")
+}
+
+/// Parse the value after `transform =`: `count`, or `sum(<field>)`.
+fn parse_derivation_transform(input: syn::parse::ParseStream) -> syn::Result<DerivationTransform> {
+    let kind: syn::Ident = input.parse()?;
+    if kind == "count" {
+        return Ok(DerivationTransform::Count);
+    }
+    if kind == "sum" {
+        let inner;
+        syn::parenthesized!(inner in input);
+        let field: syn::Ident = inner.parse()?;
+        // `sum(score + bonus)` or `sum(score, bonus)` must not be read as
+        // `sum(score)`: the maintained aggregate would differ from what the
+        // source says, silently.
+        if !inner.is_empty() {
+            return Err(inner.error(
+                "`sum(...)` takes exactly one field name: an expression, a second field or \
+                 anything else after it is not part of the derivation grammar",
+            ));
+        }
+        return Ok(DerivationTransform::Sum {
+            // The unraw name: `r#match` is the Rust spelling of column
+            // `match`, and the contribution SQL names the column.
+            field: unraw_ident(&field),
+            span: field.span(),
+        });
+    }
+    Err(syn::Error::new_spanned(
+        &kind,
+        format!("unknown transform `{kind}`; expected `count` or `sum(<field>)`"),
+    ))
+}
+
+/// Record one `#[derivation(...)]` key, rejecting a second spelling of it.
+///
+/// A repeated key would silently keep one value and drop the other, so the
+/// second is an error at its own span.
+fn set_derivation_key<T>(slot: &mut Option<T>, key: &syn::Ident, value: T) -> syn::Result<()> {
+    if slot.is_some() {
+        return Err(syn::Error::new_spanned(
+            key,
+            format!(
+                "duplicate `{key} = ...` in `#[derivation(...)]`: each key may \
+                 appear once, and a repeat would silently drop one of the two \
+                 values"
+            ),
+        ));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+/// The largest `name = "..."` a derivation may carry.
+///
+/// The name is the primary key of the `_autumn_derivations` state row and the
+/// key of the actuator report, so it stays short enough to index and read.
+const DERIVATION_NAME_MAX_BYTES: usize = 128;
+/// Must match `autumn_web::derivation::PARKING_PREFIX`.
+const DERIVATION_PARKING_PREFIX: &str = "parked::";
+
+/// Reject a `name = "..."` that cannot serve as a registry key.
+fn check_derivation_name(key: &syn::Ident, value: &str) -> syn::Result<()> {
+    let reason = if value.is_empty() {
+        "it must not be empty"
+    } else if value.len() > DERIVATION_NAME_MAX_BYTES {
+        "it must be at most 128 bytes"
+    } else if value.chars().any(char::is_control) {
+        "it must not contain control characters"
+    } else if value.starts_with(DERIVATION_PARKING_PREFIX) {
+        // `ensure_derivations` parks a row being adopted by a renamed
+        // derivation under this prefix between its two passes.
+        "the `parked::` prefix is reserved for the framework"
+    } else {
+        return Ok(());
+    };
+    Err(syn::Error::new_spanned(
+        key,
+        format!(
+            "`{value}` is not a valid `name = \"<name>\"` for a \
+             `#[derivation]`: {reason}. The name is the primary key of the \
+             `_autumn_derivations` state row and the key of the \
+             `/actuator/derivations` report"
+        ),
+    ))
+}
+
+/// Parse one `#[derivation(Parent, ...)]` attribute body.
+fn parse_derivation_attr(attr: &syn::Attribute) -> syn::Result<DerivationDecl> {
+    use syn::parse::ParseStream;
+
+    let span = attr
+        .path()
+        .get_ident()
+        .map_or_else(proc_macro2::Span::call_site, syn::Ident::span);
+
+    let (target, column, transform, filter, explicit_fk, tenant_column, name, parent_table) = attr
+        .parse_args_with(|input: ParseStream| {
+            let target: syn::Ident = input.parse()?;
+            let mut column: Option<String> = None;
+            let mut transform: Option<DerivationTransform> = None;
+            let mut filter: Option<syn::Expr> = None;
+            let mut explicit_fk: Option<String> = None;
+            let mut tenant_column: Option<String> = None;
+            let mut name: Option<String> = None;
+            let mut parent_table: Option<String> = None;
+            while input.peek(syn::Token![,]) {
+                input.parse::<syn::Token![,]>()?;
+                if input.is_empty() {
+                    break;
+                }
+                let key: syn::Ident = input.parse()?;
+                input.parse::<syn::Token![=]>()?;
+                if key == "transform" {
+                    set_derivation_key(&mut transform, &key, parse_derivation_transform(input)?)?;
+                    continue;
+                }
+                if key == "filter" {
+                    set_derivation_key(&mut filter, &key, input.parse()?)?;
+                    continue;
+                }
+                // Every remaining key takes a bare identifier or a string
+                // literal, the same pair the association attributes accept.
+                // A bare identifier drops its raw prefix: `r#type` is the Rust
+                // spelling of column `type`.
+                let value = if input.peek(LitStr) {
+                    input.parse::<LitStr>()?.value()
+                } else {
+                    unraw_ident(&input.parse::<syn::Ident>()?)
+                };
+                if key == "column" {
+                    check_column_ident(&key, "column", &value)?;
+                    set_derivation_key(&mut column, &key, value)?;
+                } else if key == "fk" {
+                    // Checked before `format_ident!` sees it: an invalid
+                    // identifier there panics with no span.
+                    check_column_ident(&key, "fk", &value)?;
+                    set_derivation_key(&mut explicit_fk, &key, value)?;
+                } else if key == "tenant" {
+                    check_column_ident(&key, "tenant", &value)?;
+                    set_derivation_key(&mut tenant_column, &key, value)?;
+                } else if key == "parent_table" {
+                    check_column_ident(&key, "parent_table", &value)?;
+                    set_derivation_key(&mut parent_table, &key, value)?;
+                } else if key == "name" {
+                    check_derivation_name(&key, &value)?;
+                    set_derivation_key(&mut name, &key, value)?;
+                } else {
+                    return Err(syn::Error::new_spanned(
+                        &key,
+                        "expected `column = \"<column>\"`, `transform = count` / \
+                         `transform = sum(<field>)`, `filter = <expr>`, \
+                         `fk = <column>`, `tenant = \"<column>\"`, \
+                         `parent_table = \"<table>\"`, or `name = \"<name>\"` in \
+                         `#[derivation(...)]`",
+                    ));
+                }
+            }
+            Ok((
+                target,
+                column,
+                transform,
+                filter,
+                explicit_fk,
+                tenant_column,
+                name,
+                parent_table,
+            ))
+        })?;
+
+    let Some(column) = column else {
+        return Err(syn::Error::new(
+            span,
+            "`#[derivation(...)]` requires `column = \"<column>\"`: the column \
+             on the parent this derivation maintains",
+        ));
+    };
+
+    Ok(DerivationDecl {
+        target,
+        column,
+        transform: transform.unwrap_or(DerivationTransform::Count),
+        filter,
+        explicit_fk,
+        tenant_column,
+        name,
+        parent_table,
+        span,
+    })
+}
+
+/// Collect and validate every `#[derivation]` on a model, in source order.
+fn resolve_derivations(
+    model_ident: &syn::Ident,
+    attrs: &[syn::Attribute],
+    assocs: &[Association],
+) -> syn::Result<Vec<DerivationDecl>> {
+    let mut out = Vec::new();
+    for attr in attrs {
+        if !is_derivation_attr(attr) {
+            continue;
+        }
+        out.push(parse_derivation_attr(attr)?);
+    }
+    check_derivation_collisions(model_ident, assocs, &out)?;
+    Ok(out)
+}
+
+/// The parent table this derivation maintains: the explicit
+/// `parent_table = "..."`, else the name inferred from the parent type.
+///
+/// The override exists for a parent that carries `#[model(table = "...")]`,
+/// which this macro cannot see from the child.
+fn derivation_parent_table(decl: &DerivationDecl) -> String {
+    decl.parent_table
+        .clone()
+        .unwrap_or_else(|| infer_table_name(&decl.target))
+}
+
+/// The derivation's registry name: the explicit `name = "..."`, else
+/// `{parent_table}.{column}`.
+fn derivation_name(decl: &DerivationDecl, parent_table: &str) -> String {
+    decl.name
+        .clone()
+        .unwrap_or_else(|| format!("{parent_table}.{}", decl.column))
+}
+
+/// The child column holding the parent's id: the explicit `fk = <column>`,
+/// else the `#[belongs_to]` leg pointing at the same parent type, else the
+/// `{snake(Parent)}_id` convention.
+///
+/// Preferring the association keeps a model with `#[belongs_to(Post, fk =
+/// article_id)]` from needing to repeat the column on every derivation.
+fn derivation_fk(
+    model_ident: &syn::Ident,
+    decl: &DerivationDecl,
+    assocs: &[Association],
+) -> syn::Result<String> {
+    if let Some(fk) = decl.explicit_fk.clone() {
+        return Ok(fk);
+    }
+    let legs: Vec<&Association> = assocs
+        .iter()
+        .filter(|a| {
+            a.kind == AssocKind::BelongsTo && a.target == decl.target && a.through.is_none()
+        })
+        .collect();
+    // Two legs to one parent (`Message` -> `sender` / `recipient`) give no
+    // ground to prefer either key, and guessing would count the wrong parent.
+    if legs.len() > 1 {
+        let listed = legs
+            .iter()
+            .map(|a| format!("`{}`", a.fk))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let target = &decl.target;
+        return Err(syn::Error::new(
+            decl.span,
+            format!(
+                "`#[derivation({target}, ...)]` cannot pick a foreign key: \
+                 model `{model_ident}` has {} `#[belongs_to({target})]` legs \
+                 ({listed}). Name the one this derivation counts with \
+                 `fk = <column>`",
+                legs.len()
+            ),
+        ));
+    }
+    if let Some(assoc) = legs.first() {
+        return Ok(assoc.fk.clone());
+    }
+    Ok(format!("{}_id", pascal_to_snake(&decl.target.to_string())))
+}
+
+/// Reject a `#[derivation]` that maintains a `(parent table, column)` pair
+/// another derivation — or a counter cache — on the same model already
+/// maintains.
+///
+/// Both would move the one column on every insert, double-counting silently
+/// and permanently. This is the same hazard `check_counter_cache_collisions`
+/// guards, over the union of both declaration kinds.
+fn check_derivation_collisions(
+    model_ident: &syn::Ident,
+    assocs: &[Association],
+    derivations: &[DerivationDecl],
+) -> syn::Result<()> {
+    // The flag records whether the pair came from a counter cache, so the
+    // error can name the declaration to change.
+    let mut seen: Vec<((String, String), bool)> = Vec::new();
+    for assoc in assocs {
+        if let Some(column) = counter_cache_column(model_ident, assoc) {
+            seen.push(((infer_table_name(&assoc.target), column), true));
+        }
+    }
+    for decl in derivations {
+        let parent_table = derivation_parent_table(decl);
+        let key = (parent_table.clone(), decl.column.clone());
+        if let Some((_, from_counter_cache)) = seen.iter().find(|(seen_key, _)| *seen_key == key) {
+            let column = &decl.column;
+            // Two spellings, so the derivation/derivation case does not read
+            // "a `#[derivation]` and another `#[derivation]`".
+            let subject = if *from_counter_cache {
+                format!(
+                    "a `#[derivation]` and a `counter_cache` association on \
+                     `{model_ident}`"
+                )
+            } else {
+                format!("two `#[derivation]`s on `{model_ident}`")
+            };
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "{subject} both maintain `{parent_table}.{column}`, so \
+                     every insert would count twice: give one of them a \
+                     different `column = \"<column>\"`"
+                ),
+            ));
+        }
+        seen.push((key, false));
+    }
+    Ok(())
+}
+
+/// The scalar shape a field must have to appear in a derivation filter.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FilterScalar {
+    Bool,
+    Int,
+    Str,
+}
+
+/// A filterable child field: its scalar kind, and whether it is `Option<T>`
+/// (NULL-able, so the Rust lowering has to match SQL's NULL semantics).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FilterField {
+    kind: FilterScalar,
+    optional: bool,
+    /// Whether the field carries `#[diesel(column_name = ...)]`, which renames
+    /// the database column out from under the Rust field name.
+    renamed: bool,
+}
+
+/// Every named field of the child model, mapped to its filter classification.
+/// `None` marks a field whose type the grammar does not support, so naming it
+/// yields a type error rather than "not a field".
+type FilterFields = std::collections::BTreeMap<String, Option<FilterField>>;
+
+/// Classify a field type for the filter grammar, or `None` if unsupported.
+///
+/// Matches the LAST path segment, so every spelling of a type takes the same
+/// arm (`String`, `std::string::String`, `Option<i64>`,
+/// `::core::option::Option<i64>`).
+fn classify_filter_field(field: &syn::Field) -> Option<FilterField> {
+    let ty = &field.ty;
+    let (inner, optional) = option_inner(ty).map_or((ty, false), |inner| (inner, true));
+    let syn::Type::Path(path) = inner else {
+        return None;
+    };
+    let kind = match path.path.segments.last()?.ident.to_string().as_str() {
+        "bool" => FilterScalar::Bool,
+        "i8" | "i16" | "i32" | "i64" => FilterScalar::Int,
+        "String" => FilterScalar::Str,
+        _ => return None,
+    };
+    Some(FilterField {
+        kind,
+        optional,
+        renamed: field_has_diesel_column_name(field),
+    })
+}
+
+/// The body of a `fn(&Model) -> Option<String>` reading `field` as text, the
+/// way the database spells `CAST(<column> AS TEXT)` for an integer or string
+/// column: `Some(field.to_string())`, or the `Option` forwarded.
+///
+/// `None` for a field of any other type (or an unnamed one): a leg whose
+/// tenant the maintenance cannot read as text stays exactly as it was, and a
+/// `#[derivation]` rejects such a tenant field outright.
+fn tenant_text_body(field: &syn::Field) -> Option<TokenStream> {
+    let ident = field.ident.as_ref()?;
+    let classified = classify_filter_field(field)?;
+    if classified.kind == FilterScalar::Bool {
+        return None;
+    }
+    Some(if classified.optional {
+        quote! {
+            __autumn_cc_record
+                .#ident
+                .as_ref()
+                .map(::std::string::ToString::to_string)
+        }
+    } else {
+        quote! {
+            ::core::option::Option::Some(::std::string::ToString::to_string(
+                &__autumn_cc_record.#ident,
+            ))
+        }
+    })
+}
+
+/// Build the filter classification map for a model's fields.
+fn filter_field_map(all_fields: &[&syn::Field]) -> FilterFields {
+    all_fields
+        .iter()
+        .filter_map(|field| {
+            field
+                .ident
+                .as_ref()
+                .map(|ident| (ident.to_string(), classify_filter_field(field)))
+        })
+        .collect()
+}
+
+/// One filter declaration, lowered twice: a Rust predicate over `__r: &Model`
+/// and the matching SQL predicate over the `{c}` child alias placeholder.
+#[derive(Debug)]
+struct LoweredFilter {
+    rust: TokenStream,
+    sql: String,
+}
+
+/// The grammar rejection, listing what a filter may contain.
+fn filter_grammar_error<T: quote::ToTokens>(tokens: T) -> syn::Error {
+    syn::Error::new_spanned(
+        tokens,
+        "unsupported expression in `#[derivation(filter = ...)]`; the grammar \
+         accepts `field` and `!field` (bool fields), `field OP <literal>` with \
+         OP one of `==` `!=` `<` `<=` `>` `>=` and an integer, bool or string \
+         literal, `field.is_some()`, `field.is_none()`, `a && b`, and \
+         parentheses",
+    )
+}
+
+/// The SQL spelling of a comparison operator, or `None` if the operator is
+/// outside the grammar.
+const fn sql_comparison_op(op: &syn::BinOp) -> Option<&'static str> {
+    Some(match op {
+        syn::BinOp::Eq(_) => "=",
+        syn::BinOp::Ne(_) => "<>",
+        syn::BinOp::Lt(_) => "<",
+        syn::BinOp::Le(_) => "<=",
+        syn::BinOp::Gt(_) => ">",
+        syn::BinOp::Ge(_) => ">=",
+        _ => return None,
+    })
+}
+
+/// A literal on the right of a filter comparison.
+enum FilterLiteral {
+    /// An integer literal, with its Rust tokens (a leading `-` included) and
+    /// its SQL text.
+    Int {
+        tokens: TokenStream,
+        sql: String,
+    },
+    Bool(bool),
+    Str(LitStr),
+}
+
+impl FilterLiteral {
+    /// How the literal is named in a type-mismatch diagnostic.
+    const fn describe(&self) -> &'static str {
+        match self {
+            Self::Int { .. } => "an integer",
+            Self::Bool(_) => "a bool",
+            Self::Str(_) => "a string",
+        }
+    }
+}
+
+/// Extract the literal on the right of a filter comparison.
+///
+/// Floats are rejected by name: a Rust `f64` comparison and a SQL numeric
+/// comparison round differently, so the two lowerings could disagree.
+fn filter_literal(expr: &syn::Expr) -> syn::Result<FilterLiteral> {
+    match expr {
+        syn::Expr::Paren(paren) => filter_literal(&paren.expr),
+        syn::Expr::Group(group) => filter_literal(&group.expr),
+        syn::Expr::Lit(syn::ExprLit { lit, .. }) => match lit {
+            syn::Lit::Int(value) => Ok(FilterLiteral::Int {
+                tokens: quote! { #value },
+                sql: value.base10_digits().to_owned(),
+            }),
+            syn::Lit::Bool(value) => Ok(FilterLiteral::Bool(value.value)),
+            syn::Lit::Str(value) => Ok(FilterLiteral::Str(value.clone())),
+            syn::Lit::Float(value) => Err(filter_float_error(value)),
+            other => Err(filter_grammar_error(other)),
+        },
+        syn::Expr::Unary(syn::ExprUnary {
+            op: syn::UnOp::Neg(_),
+            expr: inner,
+            ..
+        }) => match &**inner {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Int(value),
+                ..
+            }) => Ok(FilterLiteral::Int {
+                tokens: quote! { -#value },
+                sql: format!("-{}", value.base10_digits()),
+            }),
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Float(value),
+                ..
+            }) => Err(filter_float_error(value)),
+            other => Err(filter_grammar_error(other)),
+        },
+        other => Err(filter_grammar_error(other)),
+    }
+}
+
+/// The float rejection, shared by the signed and unsigned literal arms.
+fn filter_float_error<T: quote::ToTokens>(tokens: T) -> syn::Error {
+    syn::Error::new_spanned(
+        tokens,
+        "float literals are not supported in `#[derivation(filter = ...)]`: a \
+         Rust float comparison and a SQL numeric comparison round differently, \
+         so the two lowerings of one filter could disagree — compare an \
+         integer column instead",
+    )
+}
+
+/// The SQL text of a string literal: single-quoted, with `'` doubled.
+///
+/// A brace is rejected because `{c}` in the emitted SQL is the child-alias
+/// placeholder the runtime substitutes. Letting a literal carry a brace would
+/// let it forge one.
+///
+/// A backslash, a NUL and any other control character are rejected too. `'`
+/// doubling is the whole escape rule for a standard SQL literal, but some
+/// backends read a backslash as an escape, and a control character in a
+/// statement is unreadable in a log. A `;` or a `--` needs no rejection: both
+/// are inert inside a quoted literal.
+fn filter_sql_string(lit: &LitStr) -> syn::Result<String> {
+    let value = lit.value();
+    if value.contains('{') || value.contains('}') {
+        return Err(syn::Error::new_spanned(
+            lit,
+            "a `{` or `}` is not allowed in a `#[derivation(filter = ...)]` \
+             string literal: `{c}` in the emitted SQL is the child-alias \
+             placeholder the runtime substitutes, and a literal brace could \
+             forge one",
+        ));
+    }
+    if value.contains('\\') || value.chars().any(char::is_control) {
+        return Err(syn::Error::new_spanned(
+            lit,
+            "a backslash, a NUL or a control character is not allowed in a \
+             `#[derivation(filter = ...)]` string literal: the literal is \
+             spliced into SQL as a quoted constant, `''` is the only escape \
+             every backend agrees on, and a control character makes the \
+             statement unreadable in a log",
+        ));
+    }
+    Ok(format!("'{}'", value.replace('\'', "''")))
+}
+
+/// Resolve a bare field reference in a filter to its name and classification.
+fn filter_field(
+    expr: &syn::Expr,
+    model_ident: &syn::Ident,
+    fields: &FilterFields,
+) -> syn::Result<(syn::Ident, FilterField)> {
+    let syn::Expr::Path(path) = expr else {
+        return Err(filter_grammar_error(expr));
+    };
+    if path.qself.is_some() || path.path.leading_colon.is_some() || path.path.segments.len() != 1 {
+        return Err(filter_grammar_error(expr));
+    }
+    let segment = &path.path.segments[0];
+    if !matches!(segment.arguments, syn::PathArguments::None) {
+        return Err(filter_grammar_error(expr));
+    }
+    let ident = segment.ident.clone();
+    let name = ident.to_string();
+    match fields.get(&name) {
+        None => Err(syn::Error::new_spanned(
+            &ident,
+            format!(
+                "`{name}` is not a field of model `{model_ident}`, so it cannot \
+                 appear in `#[derivation(filter = ...)]`"
+            ),
+        )),
+        Some(None) => Err(syn::Error::new_spanned(
+            &ident,
+            format!(
+                "field `{name}` of model `{model_ident}` has a type the \
+                 derivation filter grammar does not support; a filter accepts \
+                 `bool`, integer and `String` fields, and their `Option<...>` \
+                 forms"
+            ),
+        )),
+        // The lowering names the column after the Rust field, so a renamed
+        // database column would be spliced under a name the table does not
+        // have. Same rule, and same reason, as `#[translatable]`.
+        Some(Some(field)) if field.renamed => Err(syn::Error::new_spanned(
+            &ident,
+            format!(
+                "field `{name}` of model `{model_ident}` carries \
+                 `#[diesel(column_name = ...)]`, so it cannot appear in \
+                 `#[derivation(filter = ...)]`: the filter is lowered to SQL \
+                 that names the column after the Rust field. Name the Rust \
+                 field after the column instead"
+            ),
+        )),
+        Some(Some(field)) => Ok((ident, *field)),
+    }
+}
+
+/// Lower a bare (or negated) bool field condition.
+fn lower_filter_bool(
+    expr: &syn::Expr,
+    negated: bool,
+    model_ident: &syn::Ident,
+    fields: &FilterFields,
+) -> syn::Result<LoweredFilter> {
+    let (ident, field) = filter_field(expr, model_ident, fields)?;
+    if field.kind != FilterScalar::Bool {
+        return Err(syn::Error::new_spanned(
+            &ident,
+            format!(
+                "`{ident}` is not a `bool` field, so it cannot stand alone as a \
+                 derivation filter condition — compare it, e.g. \
+                 `{ident} == <literal>`"
+            ),
+        ));
+    }
+    let column = unraw_ident(&ident);
+    // A NULL bool is counted by nobody, matching SQL: `NULL = TRUE` is NULL,
+    // which the WHERE clause treats as false.
+    let wanted = !negated;
+    let rust = if field.optional {
+        quote! { __r.#ident == ::core::option::Option::Some(#wanted) }
+    } else if negated {
+        quote! { !__r.#ident }
+    } else {
+        quote! { __r.#ident }
+    };
+    let keyword = if negated { "FALSE" } else { "TRUE" };
+    Ok(LoweredFilter {
+        rust,
+        sql: format!("{{c}}.\"{column}\" = {keyword}"),
+    })
+}
+
+/// Lower `field.is_some()` / `field.is_none()` to a NULL predicate.
+fn lower_filter_probe(
+    call: &syn::ExprMethodCall,
+    model_ident: &syn::Ident,
+    fields: &FilterFields,
+) -> syn::Result<LoweredFilter> {
+    if !call.args.is_empty() || call.turbofish.is_some() {
+        return Err(filter_grammar_error(call));
+    }
+    let method = call.method.to_string();
+    let is_none = match method.as_str() {
+        "is_some" => false,
+        "is_none" => true,
+        _ => return Err(filter_grammar_error(call)),
+    };
+    let (ident, field) = filter_field(&call.receiver, model_ident, fields)?;
+    if !field.optional {
+        return Err(syn::Error::new_spanned(
+            &call.method,
+            format!(
+                "`{ident}` is not an `Option<...>` field of model \
+                 `{model_ident}`, so `{method}()` is a constant — drop the \
+                 condition"
+            ),
+        ));
+    }
+    let column = unraw_ident(&ident);
+    let probe = &call.method;
+    let predicate = if is_none { "IS NULL" } else { "IS NOT NULL" };
+    Ok(LoweredFilter {
+        rust: quote! { __r.#ident.#probe() },
+        sql: format!("{{c}}.\"{column}\" {predicate}"),
+    })
+}
+
+/// Lower `field OP <literal>`.
+///
+/// An `Option<T>` field lowers so that a NULL row is excluded, which is what
+/// SQL already does: every comparison against NULL is NULL, and a WHERE clause
+/// drops it.
+fn lower_filter_comparison(
+    binary: &syn::ExprBinary,
+    model_ident: &syn::Ident,
+    fields: &FilterFields,
+) -> syn::Result<LoweredFilter> {
+    let Some(sql_op) = sql_comparison_op(&binary.op) else {
+        // Spanned on the operator, not the whole expression: the operator is
+        // the part to change.
+        return Err(filter_grammar_error(binary.op));
+    };
+    let (ident, field) = filter_field(&binary.left, model_ident, fields)?;
+    let literal = filter_literal(&binary.right)?;
+    let column = unraw_ident(&ident);
+    let is_eq = matches!(binary.op, syn::BinOp::Eq(_));
+    let ordering = !is_eq && !matches!(binary.op, syn::BinOp::Ne(_));
+    let op = &binary.op;
+    match (field.kind, &literal) {
+        (FilterScalar::Bool, FilterLiteral::Bool(value)) => {
+            if ordering {
+                return Err(filter_grammar_error(binary));
+            }
+            // `f == true` is the bare condition and `f == false` its negation,
+            // so both share one lowering with `f` / `!f`.
+            lower_filter_bool(&binary.left, is_eq != *value, model_ident, fields)
+        }
+        (FilterScalar::Int, FilterLiteral::Int { tokens, sql }) => {
+            let rust = if field.optional {
+                quote! { __r.#ident.is_some_and(|__v| __v #op #tokens) }
+            } else {
+                quote! { __r.#ident #op #tokens }
+            };
+            Ok(LoweredFilter {
+                rust,
+                sql: format!("{{c}}.\"{column}\" {sql_op} {sql}"),
+            })
+        }
+        (FilterScalar::Str, FilterLiteral::Str(lit)) => {
+            if ordering {
+                return Err(syn::Error::new_spanned(
+                    op,
+                    format!(
+                        "ordering comparisons on a string field are not \
+                         supported in a derivation filter: Rust compares bytes \
+                         and SQL compares by collation, so the two lowerings of \
+                         one filter would disagree — compare `{ident}` with \
+                         `==` or `!=`"
+                    ),
+                ));
+            }
+            let sql_literal = filter_sql_string(lit)?;
+            let rust = match (field.optional, is_eq) {
+                (false, _) => quote! { __r.#ident #op #lit },
+                (true, true) => {
+                    quote! { __r.#ident.as_deref() == ::core::option::Option::Some(#lit) }
+                }
+                // `as_deref() != Some(s)` would count a NULL row, but SQL's
+                // `col <> 's'` is NULL for a NULL column and excludes it.
+                (true, false) => {
+                    quote! { __r.#ident.as_deref().is_some_and(|__v| __v != #lit) }
+                }
+            };
+            // `{bin}` resolves to the backend's bytewise collation (`COLLATE
+            // "C"`, `COLLATE BINARY`): Rust compares bytes, and a `NOCASE`
+            // column would otherwise make SQL call `"PUB"` and `'pub'` equal
+            // where the Rust lowering of the same filter does not, so the
+            // record paths and the set-based paths would disagree. The cast
+            // covers Postgres `citext`, whose own equality operator folds case
+            // whatever the collation says: as `TEXT` the comparison is the
+            // plain one the collation governs. On SQLite the cast is a no-op.
+            Ok(LoweredFilter {
+                rust,
+                sql: format!("CAST({{c}}.\"{column}\" AS TEXT) {sql_op} {sql_literal} {{bin}}"),
+            })
+        }
+        (kind, literal) => {
+            let expected = match kind {
+                FilterScalar::Bool => "a `bool`",
+                FilterScalar::Int => "an integer",
+                FilterScalar::Str => "a string",
+            };
+            Err(syn::Error::new_spanned(
+                &binary.right,
+                format!(
+                    "`{ident}` is {expected} field of model `{model_ident}`, so \
+                     it cannot be compared with {} literal in a derivation \
+                     filter",
+                    literal.describe()
+                ),
+            ))
+        }
+    }
+}
+
+/// Whether a filter expression names `field` anywhere: as a bare operand, the
+/// receiver of a NULL probe, or a side of a comparison or `&&`.
+fn expr_mentions_field(expr: &syn::Expr, field: &str) -> bool {
+    match expr {
+        syn::Expr::Path(path) => path
+            .path
+            .get_ident()
+            .is_some_and(|ident| unraw_ident(ident) == field),
+        syn::Expr::Paren(paren) => expr_mentions_field(&paren.expr, field),
+        syn::Expr::Unary(unary) => expr_mentions_field(&unary.expr, field),
+        syn::Expr::Binary(binary) => {
+            expr_mentions_field(&binary.left, field) || expr_mentions_field(&binary.right, field)
+        }
+        syn::Expr::MethodCall(call) => expr_mentions_field(&call.receiver, field),
+        _ => false,
+    }
+}
+
+/// Lower one filter expression to its Rust and SQL forms.
+///
+/// Parentheses are transparent: `a && b` already parenthesises both sides in
+/// both lowerings, so grouping never changes the meaning.
+fn lower_filter(
+    expr: &syn::Expr,
+    model_ident: &syn::Ident,
+    fields: &FilterFields,
+) -> syn::Result<LoweredFilter> {
+    match expr {
+        syn::Expr::Paren(paren) => lower_filter(&paren.expr, model_ident, fields),
+        syn::Expr::Group(group) => lower_filter(&group.expr, model_ident, fields),
+        syn::Expr::Path(_) => lower_filter_bool(expr, false, model_ident, fields),
+        syn::Expr::Unary(syn::ExprUnary {
+            op: syn::UnOp::Not(_),
+            expr: inner,
+            ..
+        }) => lower_filter_bool(inner, true, model_ident, fields),
+        syn::Expr::MethodCall(call) => lower_filter_probe(call, model_ident, fields),
+        syn::Expr::Binary(binary) if matches!(binary.op, syn::BinOp::And(_)) => {
+            let left = lower_filter(&binary.left, model_ident, fields)?;
+            let right = lower_filter(&binary.right, model_ident, fields)?;
+            let (left_rust, right_rust) = (&left.rust, &right.rust);
+            Ok(LoweredFilter {
+                rust: quote! { (#left_rust) && (#right_rust) },
+                sql: format!("({}) AND ({})", left.sql, right.sql),
+            })
+        }
+        syn::Expr::Binary(binary) => lower_filter_comparison(binary, model_ident, fields),
+        other => Err(filter_grammar_error(other)),
+    }
+}
+
+/// Whether a type is `i64`, however it is spelled.
+///
+/// An `i64` contribution is read as-is; the narrower widths go through
+/// `i64::from`.
+fn is_i64_type(ty: &syn::Type) -> bool {
+    let syn::Type::Path(path) = ty else {
+        return false;
+    };
+    path.path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "i64")
+}
+
+/// Whether a type is one of the integer widths `sum(<field>)` accepts.
+fn is_sum_integer_type(ty: &syn::Type) -> bool {
+    let syn::Type::Path(path) = ty else {
+        return false;
+    };
+    path.path.segments.last().is_some_and(|segment| {
+        matches!(
+            segment.ident.to_string().as_str(),
+            "i8" | "i16" | "i32" | "i64"
+        )
+    })
 }
 
 /// The singular form used to derive a many-to-many association's mutation
@@ -625,6 +2093,789 @@ fn emit_dependents_impl(model_ident: &syn::Ident, assocs: &[Association]) -> Tok
     }
 }
 
+/// Emit the inherent counter-cache items on the model (#1325): the
+/// `HAS_COUNTER_CACHES` flag and the `counter_caches()` spec slice the child's
+/// generated repository consults to keep each parent's `{child}_count` column
+/// current.
+///
+/// `#[derivation]` legs (#1769) are appended to the SAME slice, after the
+/// counter-cache legs, and each also emits an item-level `DerivationDef` static
+/// plus its inventory registration. Sharing the slice is what makes a
+/// derivation ride every mutation path a counter cache already rides: a counter
+/// cache is the unfiltered `count` special case, and its emitted SQL stays
+/// byte-identical (`contrib_sql` `"1"`, empty `filter_sql`).
+///
+/// Only produced when at least one `#[belongs_to(…, counter_cache)]` or
+/// `#[derivation]` is declared; otherwise the blanket `AutumnCounterCaches`
+/// impl supplies `false` / an empty slice and this emits nothing, so a model
+/// without either keeps its exact prior codegen and its repository's mutation
+/// paths stay on their existing (transaction-free, where they were) shape.
+///
+/// Both items are **inherent**, which is what shadows the blanket impl — and
+/// which is why the generated repository names them by concrete path
+/// (`Comment::counter_caches()`) rather than through a generic bound.
+///
+/// The parent's table is convention-derived from the target type
+/// (`Post` → `posts`), the same assumption the preload codegen already makes for
+/// `belongs_to`; the parent's primary key is assumed to be `id`, matching the
+/// dependent-cascade specs. `fk_of` is emitted as a plain `fn` item per leg,
+/// which doubles as the type guard: a foreign-key field that is not `i64` /
+/// `Option<i64>` fails to coerce to `fn(&Model) -> Option<i64>`.
+// One resolution + validation arm per spec field (column, tenant column, the
+// foreign key's existence and nullability, the primary key's arity, the filter
+// lowering and the summed field's type), so it grows past the line lint as
+// counter-cache and derivation options are added.
+#[allow(clippy::too_many_lines)]
+fn emit_counter_caches_impl(
+    model_ident: &syn::Ident,
+    table_name: &str,
+    pk_ident: Option<&syn::Ident>,
+    has_deleted_at: bool,
+    assocs: &[Association],
+    derivations: &[DerivationDecl],
+    all_fields: &[&syn::Field],
+) -> syn::Result<TokenStream> {
+    let cached: Vec<&Association> = assocs
+        .iter()
+        .filter(|a| a.counter_cache.is_some())
+        .collect();
+    // The `#[lock_version]` column is a maintained column too: every update
+    // increments it as the optimistic-concurrency token, so a derivation
+    // adjusting it as an aggregate would break the protocol and the backfill
+    // would erase it. Its claim is emitted whether or not this model keeps a
+    // counter cache of its own, since the usual shape is a parent that keeps
+    // none while a child's derivation names one of its columns (#1769).
+    // So is the `tenant_id` field, the framework's tenant discriminator
+    // (`#[repository(tenant_scoped)]` filters on it, and every read scope
+    // keys off it): a derivation maintaining it would move the parent to
+    // another tenant, and on a sharded deployment leave it on the wrong shard.
+    // And so is `deleted_at`, the soft-delete marker: a maintained value
+    // would hide the parent from every `deleted_at IS NULL` read (on SQLite an
+    // integer aggregate simply lands in it; on Postgres the type mismatch
+    // fails the write).
+    let implicit_claims: Vec<TokenStream> = all_fields
+        .iter()
+        .filter(|f| has_attr(f, "lock_version") || is_tenant_id_field(f) || is_deleted_at_field(f))
+        .filter_map(|field| Some((field, field.ident.as_ref()?)))
+        .map(|(field, ident)| {
+            // The claim names the *database* column: a field Diesel renames
+            // with `#[diesel(column_name = ...)]` stores the token under the
+            // physical name, and that is the name a derivation would spell.
+            let column = diesel_column_name(field).unwrap_or_else(|| unraw_ident(ident));
+            quote! {
+                ::autumn_web::reexports::inventory::submit! {
+                    ::autumn_web::derivation::CounterCacheClaim {
+                        model: ::core::stringify!(#model_ident),
+                        child_table: #table_name,
+                        parent_table: #table_name,
+                        column: #column,
+                        direct_sql: false,
+                        module_path: ::core::module_path!(),
+                    }
+                }
+            }
+        })
+        .collect();
+    if cached.is_empty() && derivations.is_empty() {
+        return Ok(quote! { #(#implicit_claims)* });
+    }
+
+    // Every column something in THIS model maintains on its own table by
+    // direct SQL: a derivation onto its own table, or a `counter_cache` leg
+    // pointing back at it. No derivation may read one of them as a source
+    // (see below); the registry repeats the check across models at boot.
+    let maintained_here: Vec<(Option<usize>, String, String)> = derivations
+        .iter()
+        .enumerate()
+        .filter(|(_, decl)| derivation_parent_table(decl) == table_name)
+        .map(|(index, decl)| {
+            (
+                Some(index),
+                decl.column.clone(),
+                "another `#[derivation]` of this model".to_owned(),
+            )
+        })
+        .chain(
+            cached
+                .iter()
+                .filter(|assoc| infer_table_name(&assoc.target) == table_name)
+                .map(|assoc| {
+                    (
+                        None,
+                        counter_cache_column(model_ident, assoc)
+                            .expect("filtered to a counter-cached association above"),
+                        "a `counter_cache` of this model".to_owned(),
+                    )
+                }),
+        )
+        .collect();
+
+    // Both declaration kinds share every validation below, so the diagnostics
+    // name whichever one the model actually used.
+    let feature = if cached.is_empty() {
+        "derivation"
+    } else {
+        "counter_cache"
+    };
+    let feature_span = cached
+        .first()
+        .and_then(|assoc| assoc.counter_cache.as_ref())
+        .map_or_else(
+            || {
+                derivations
+                    .first()
+                    .map_or_else(proc_macro2::Span::call_site, |decl| decl.span)
+            },
+            |decl| decl.span,
+        );
+
+    // A composite key cannot back a counter cache: the maintenance addresses the
+    // child by ONE value, so with two `#[id]` fields the decrement would key on
+    // whichever rows share the first component and move every one of their
+    // parents. Reject rather than silently corrupt (the same call `#[votable]`
+    // makes for the same reason).
+    let id_fields: Vec<&syn::Ident> = all_fields
+        .iter()
+        .filter(|f| has_attr(f, "id"))
+        .filter_map(|f| f.ident.as_ref())
+        .collect();
+    if id_fields.len() > 1 {
+        let listed = id_fields
+            .iter()
+            .map(|i| format!("`{i}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(syn::Error::new(
+            feature_span,
+            format!(
+                "`{feature}` requires a single primary key: model \
+                 `{model_ident}` declares a composite key ({listed}), and the \
+                 counter maintenance identifies its child row by one id — the \
+                 decrement would key on every row sharing the first component"
+            ),
+        ));
+    }
+    let Some(pk_ident) = pk_ident else {
+        return Err(syn::Error::new_spanned(
+            model_ident,
+            format!(
+                "`{feature}` requires the child model to have a primary-key \
+                 field: the maintenance resolves the parent from the child row \
+                 by primary key. Mark one with `#[id]`"
+            ),
+        ));
+    };
+    // The unraw name is what `sum(<field>)` is compared against; the column
+    // the primary key reaches SQL under is its physical name, which a
+    // `#[diesel(column_name = ...)]` on the `#[id]` field may have renamed.
+    let pk_field_name = unraw_ident(pk_ident);
+    let pk_column = all_fields
+        .iter()
+        .find(|f| f.ident.as_ref() == Some(pk_ident))
+        .and_then(|f| diesel_column_name(f))
+        .unwrap_or_else(|| pk_field_name.clone());
+
+    // One shared primary-key extractor: the bulk update path matches a
+    // post-update record back to the foreign keys captured for it before the
+    // update, and every leg keys off the same child primary key.
+    // A soft-deleted child is counted by nobody. The generated `update` does not
+    // filter `deleted_at`, so one can still be re-parented — without this the
+    // move would decrement a parent that had already dropped the row and
+    // increment another for a row that stays deleted.
+    let live_body = if has_deleted_at {
+        quote! { __autumn_cc_record.deleted_at.is_none() }
+    } else {
+        quote! { { let _ = __autumn_cc_record; true } }
+    };
+    let mut fk_fns: Vec<TokenStream> = vec![
+        quote! {
+            fn __autumn_counter_cache_pk(__autumn_cc_record: &#model_ident) -> i64 {
+                __autumn_cc_record.#pk_ident
+            }
+        },
+        quote! {
+            fn __autumn_counter_cache_live(__autumn_cc_record: &#model_ident) -> bool {
+                #live_body
+            }
+        },
+    ];
+    // A counter cache counts rows, so every live row contributes 1. The
+    // derivation legs below each get their own contribution fn instead.
+    if !cached.is_empty() {
+        fk_fns.push(quote! {
+            fn __autumn_counter_cache_contrib_one(__autumn_cc_record: &#model_ident) -> i64 {
+                let _ = __autumn_cc_record;
+                1
+            }
+        });
+    }
+    let mut spec_entries: Vec<TokenStream> = Vec::new();
+    // One link-time claim per plain counter cache, so the derivation registry
+    // can refuse a `#[derivation]` on another model that maintains the same
+    // parent column (#1769): the two would double count, and the backfill
+    // would then overwrite the counter cache's rows.
+    let mut claim_items: Vec<TokenStream> = implicit_claims;
+    for (index, assoc) in cached.iter().enumerate() {
+        let decl = assoc
+            .counter_cache
+            .as_ref()
+            .expect("filtered to Some above");
+        let column = counter_cache_column(model_ident, assoc)
+            .expect("filtered to a counter-cached association above");
+        // Explicit opt-in (`counter_cache_tenant = "<column>"`): the author is
+        // asserting the PARENT carries this column. Inferring it from the child
+        // would break every tenant-scoped child hanging off a global parent with
+        // a hard `column does not exist`, and this macro cannot see the parent's
+        // fields to check.
+        let tenant_column = decl.tenant_column.as_deref().map_or_else(
+            || quote! { ::core::option::Option::None },
+            |tenant| quote! { ::core::option::Option::Some(#tenant) },
+        );
+        // The tenant as text, when the child carries the column as a field the
+        // maintenance can read: then a child moved between tenants takes its
+        // contribution off the old parent under the old tenant.
+        let tenant_of = decl
+            .tenant_column
+            .as_deref()
+            .and_then(|tenant| {
+                all_fields
+                    .iter()
+                    .find(|f| f.ident.as_ref().is_some_and(|i| unraw_ident(i) == tenant))
+            })
+            .and_then(|field| tenant_text_body(field))
+            .map_or_else(
+                || quote! { ::core::option::Option::None },
+                |body| {
+                    let tenant_fn = format_ident!("__autumn_counter_cache_tenant_{index}");
+                    fk_fns.push(quote! {
+                        fn #tenant_fn(
+                            __autumn_cc_record: &#model_ident,
+                        ) -> ::core::option::Option<::std::string::String> {
+                            #body
+                        }
+                    });
+                    quote! { ::core::option::Option::Some(#tenant_fn) }
+                },
+            );
+        let parent_table = infer_table_name(&assoc.target);
+        let fk = &assoc.fk;
+        let fk_ident = format_ident!("{fk}");
+
+        // The foreign key has to be a real field: without this check the
+        // generated `fn` would fail with a bare "no field `post_id`" pointing
+        // into macro-expanded code instead of at the attribute.
+        let fk_field = all_fields
+            .iter()
+            .find(|f| f.ident.as_ref().is_some_and(|i| i == fk));
+        let Some(fk_field) = fk_field else {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`counter_cache` foreign key `{fk}` is not a field of model \
+                     `{model_ident}`; add it, or name the right column with \
+                     `#[belongs_to({}, fk = <column>, counter_cache)]`",
+                    assoc.target
+                ),
+            ));
+        };
+        // A nullable foreign key yields the field as-is; a non-null one is
+        // wrapped, so both shapes satisfy `fn(&M) -> Option<i64>` and an
+        // unparented child is a no-op rather than a `WHERE id = NULL`.
+        // `option_inner_type` matches the LAST path segment, so every spelling
+        // of the type (`Option<i64>`, `std::option::Option<i64>`,
+        // `::core::option::Option<i64>`) takes the same arm — a token-text
+        // prefix check would send the qualified spellings down the wrapping arm
+        // and fail with a type error inside macro-expanded code.
+        let fk_expr = if option_inner(&fk_field.ty).is_some() {
+            quote! { __autumn_cc_record.#fk_ident }
+        } else {
+            quote! { ::core::option::Option::Some(__autumn_cc_record.#fk_ident) }
+        };
+        let fk_fn = format_ident!("__autumn_counter_cache_fk_{index}");
+        fk_fns.push(quote! {
+            fn #fk_fn(__autumn_cc_record: &#model_ident) -> ::core::option::Option<i64> {
+                #fk_expr
+            }
+        });
+        spec_entries.push(quote! {
+            ::autumn_web::repository::CounterCacheSpec {
+                child_table: #table_name,
+                child_pk: #pk_column,
+                child_soft_delete: #has_deleted_at,
+                fk_column: #fk,
+                parent_table: #parent_table,
+                parent_pk: "id",
+                counter_column: #column,
+                fk_of: #fk_fn,
+                pk_of: __autumn_counter_cache_pk,
+                live_of: __autumn_counter_cache_live,
+                tenant_column: #tenant_column,
+                tenant_of: #tenant_of,
+                contrib_of: __autumn_counter_cache_contrib_one,
+                contrib_sql: "1",
+                filter_sql: "",
+                derivation: ::core::option::Option::None,
+            }
+        });
+        // Submitted as a literal rather than through a named `static`: the
+        // claim is all `&'static str`, so it is const-constructible in place,
+        // and a name would have to be unique across every model in a module.
+        claim_items.push(quote! {
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::derivation::CounterCacheClaim {
+                    model: ::core::stringify!(#model_ident),
+                    child_table: #table_name,
+                    parent_table: #parent_table,
+                    column: #column,
+                    direct_sql: true,
+                    module_path: ::core::module_path!(),
+                }
+            }
+        });
+    }
+
+    // ── Derivation legs (#1769) ───────────────────────────────────────────
+    // Appended to the SAME spec slice, after the counter-cache legs: the
+    // repository dispatch is shared, so a derivation rides every mutation path
+    // a counter cache already rides.
+    let filter_fields = filter_field_map(all_fields);
+    let mut derivation_items: Vec<TokenStream> = Vec::new();
+    for (index, decl) in derivations.iter().enumerate() {
+        let column = &decl.column;
+        let parent_table = derivation_parent_table(decl);
+        // The parent primary key is `id` (see `parent_pk` below), and a
+        // derivation maintaining it would rewrite the parent's identity on the
+        // first qualifying mutation.
+        if column == "id" {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`#[derivation]` cannot maintain `{parent_table}.id`: that is the \
+                     parent's primary key, and a maintained value would rewrite the \
+                     parent's identity. Name a dedicated aggregate column"
+                ),
+            ));
+        }
+        // `tenant_id` is the framework's tenant discriminator on every model
+        // that has it (see `is_tenant_id_field`), so a maintained value would
+        // move the parent to another tenant. The parent's own claim catches
+        // this at boot as well; this is the earlier, clearer diagnostic.
+        if column == "tenant_id" {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`#[derivation]` cannot maintain `{parent_table}.tenant_id`: that is the \
+                     parent's tenant discriminator, and a maintained value would move the \
+                     parent to another tenant. Name a dedicated aggregate column"
+                ),
+            ));
+        }
+        // `deleted_at` is the soft-delete marker wherever it appears: any
+        // non-NULL value hides the row from every soft-deleting read.
+        if column == "deleted_at" {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`#[derivation]` cannot maintain `{parent_table}.deleted_at`: that is the \
+                     parent's soft-delete marker, and any maintained value (a zero \
+                     included) would hide the parent from every `deleted_at IS NULL` \
+                     read. Name a dedicated aggregate column"
+                ),
+            ));
+        }
+        let self_referential = parent_table == table_name;
+        let fk = derivation_fk(model_ident, decl, assocs)?;
+        let Some(fk_field) = all_fields
+            .iter()
+            .find(|f| f.ident.as_ref().is_some_and(|i| unraw_ident(i) == fk))
+        else {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`#[derivation]` foreign key `{fk}` is not a field of model \
+                     `{model_ident}`; add it, or name the right column with \
+                     `fk = <column>`"
+                ),
+            ));
+        };
+        // `fk` names the Rust field; the column it reaches SQL under is the
+        // physical one, which `#[diesel(column_name = ...)]` may have renamed.
+        let fk_column = diesel_column_name(fk_field).unwrap_or_else(|| fk.clone());
+        // The grouping key and the tenant discriminator are read by every
+        // aggregate as well, `transform` and `filter` aside, so onto its own
+        // table a derivation must not maintain either: the parent-side update
+        // would re-parent (or re-tenant) the row without the repository hook
+        // that carries the contribution off the old parent.
+        if self_referential {
+            let implicit = if *column == fk_column {
+                Some("foreign key")
+            } else if decl.tenant_column.as_deref() == Some(column.as_str()) {
+                Some("tenant column")
+            } else {
+                None
+            };
+            if let Some(role) = implicit {
+                return Err(syn::Error::new(
+                    decl.span,
+                    format!(
+                        "`#[derivation]` onto its own table cannot maintain its {role}: \
+                         `{column}` groups the contributions, and the parent-side update \
+                         runs no repository hook, so a maintained value would re-parent \
+                         the row without carrying its contribution off the old parent. \
+                         Maintain a dedicated aggregate column"
+                    ),
+                ));
+            }
+        }
+        // A derivation onto its own table must not read the column it writes:
+        // the parent-side UPDATE runs no repository hook, so a node's new
+        // aggregate would change its own contribution (or its eligibility)
+        // toward its parent without that parent ever hearing about it.
+        // What this derivation reads off the child row: the summed field, the
+        // filter's fields, and the two every aggregate reads implicitly, the
+        // grouping key and the tenant column.
+        let reads = |source: &str| {
+            let summed = match &decl.transform {
+                DerivationTransform::Sum { field, .. } => field == source,
+                DerivationTransform::Count => false,
+            };
+            summed
+                || decl
+                    .filter
+                    .as_ref()
+                    .is_some_and(|expr| expr_mentions_field(expr, source))
+                || fk_column == source
+                || decl.tenant_column.as_deref() == Some(source)
+        };
+        if self_referential && reads(column) {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`#[derivation]` onto its own table cannot read the column it \
+                     maintains: `{column}` is both the maintained column and a \
+                     source of the contribution (in `transform` or `filter`), and \
+                     the parent-side update runs no repository hook, so a row's new \
+                     aggregate would change what it contributes to its own parent \
+                     without that parent being maintained. Read another column, or \
+                     maintain another one"
+                ),
+            ));
+        }
+        // The same hole one level over: a source that something else in this
+        // model maintains on this table moves under direct SQL, and the
+        // contribution built from it changes with no delta carrying the change
+        // up. A comment's `child_score` moves; the post's `sum(child_score)`
+        // never hears of it.
+        if let Some((_, source, by)) = maintained_here
+            .iter()
+            .find(|(owner, source, _)| *owner != Some(index) && reads(source))
+        {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`#[derivation]` cannot read `{source}` as a source (summed, filtered \
+                     on, grouped by, or scoped by): {by} maintains `{table_name}.{source}` \
+                     by direct SQL, which runs no repository hook, so this contribution \
+                     would change without the delta that carries it up. Read a column \
+                     nothing maintains, or maintain the aggregate one level at a time"
+                ),
+            ));
+        }
+        // Read through the field's own ident, which keeps a raw-identifier
+        // spelling (`r#type`) that the column name (`type`) has dropped.
+        let fk_ident = fk_field
+            .ident
+            .as_ref()
+            .expect("matched a named field above");
+        // Same wrapping rule as a counter cache: a nullable foreign key
+        // forwards as-is so an unparented child moves nothing, and the emitted
+        // `fn` signature is what enforces `i64`.
+        let fk_expr = if option_inner(&fk_field.ty).is_some() {
+            quote! { __autumn_cc_record.#fk_ident }
+        } else {
+            quote! { ::core::option::Option::Some(__autumn_cc_record.#fk_ident) }
+        };
+        let fk_fn = format_ident!("__autumn_derivation_fk_{index}");
+        fk_fns.push(quote! {
+            fn #fk_fn(__autumn_cc_record: &#model_ident) -> ::core::option::Option<i64> {
+                #fk_expr
+            }
+        });
+
+        // Unlike `counter_cache_tenant`, a derivation's tenant column is read
+        // from the CHILD row (`child.tenant`), so the macro can check it.
+        let tenant_of = if let Some(tenant) = decl.tenant_column.as_deref() {
+            let Some(tenant_field) = all_fields
+                .iter()
+                .find(|f| f.ident.as_ref().is_some_and(|i| unraw_ident(i) == tenant))
+            else {
+                return Err(syn::Error::new(
+                    decl.span,
+                    format!(
+                        "`#[derivation]` tenant column `{tenant}` is not a \
+                         field of model `{model_ident}`: the maintenance \
+                         scopes its statements by `{table_name}.{tenant}`, so \
+                         it must be a column of the child"
+                    ),
+                ));
+            };
+            // The name is spliced into SQL as the physical column of both
+            // tables, so a Rust field that is not the column's name would scope
+            // every statement by a column the child table does not have — and
+            // naming the database column instead fails the lookup above.
+            if field_has_diesel_column_name(tenant_field) {
+                return Err(syn::Error::new(
+                    decl.span,
+                    format!(
+                        "`#[derivation]` tenant column `{tenant}` names a field \
+                         carrying `#[diesel(column_name = ...)]`: the \
+                         maintenance scopes its statements by \
+                         `{table_name}.{tenant}` and by the same column of the \
+                         parent, spelled after the Rust field, so a renamed \
+                         database column would be spliced under a name the \
+                         tables do not have. Name the Rust field after the \
+                         column instead"
+                    ),
+                ));
+            }
+            // The maintenance reads the tenant off the record as text and
+            // compares it with the database's `CAST(... AS TEXT)` of the
+            // pre-update row, so the two spellings have to agree: integers
+            // and strings do, anything else does not.
+            let Some(body) = tenant_text_body(tenant_field) else {
+                return Err(syn::Error::new(
+                    decl.span,
+                    format!(
+                        "`#[derivation]` tenant column `{tenant}` must be an integer \
+                         or `String` field (or an `Option` of one): the maintenance \
+                         reads it as text to tell a child moved between tenants from \
+                         one that stayed"
+                    ),
+                ));
+            };
+            let tenant_fn = format_ident!("__autumn_derivation_tenant_{index}");
+            fk_fns.push(quote! {
+                fn #tenant_fn(
+                    __autumn_cc_record: &#model_ident,
+                ) -> ::core::option::Option<::std::string::String> {
+                    #body
+                }
+            });
+            quote! { ::core::option::Option::Some(#tenant_fn) }
+        } else {
+            quote! { ::core::option::Option::None }
+        };
+
+        let lowered = decl
+            .filter
+            .as_ref()
+            .map(|expr| lower_filter(expr, model_ident, &filter_fields))
+            .transpose()?;
+        // The leading ` AND ` is included so every statement builder can
+        // concatenate the fragment without knowing whether it is empty.
+        let filter_sql = lowered
+            .as_ref()
+            .map_or_else(String::new, |l| format!(" AND ({})", l.sql));
+        let filter_src = decl
+            .filter
+            .as_ref()
+            .map_or_else(String::new, |expr| expr.to_token_stream().to_string());
+
+        let (contrib_expr, contrib_sql) = match &decl.transform {
+            DerivationTransform::Count => (quote! { 1 }, "1".to_owned()),
+            DerivationTransform::Sum { field, span } => {
+                let Some(sum_field) = all_fields
+                    .iter()
+                    .find(|f| f.ident.as_ref().is_some_and(|i| unraw_ident(i) == *field))
+                else {
+                    return Err(syn::Error::new(
+                        *span,
+                        format!(
+                            "`sum({field})` names `{field}`, which is not a \
+                             field of model `{model_ident}`"
+                        ),
+                    ));
+                };
+                // The two columns that are never data to aggregate: the child's
+                // own id, and the parent id the derivation groups by.
+                if *field == pk_field_name {
+                    return Err(syn::Error::new(
+                        *span,
+                        format!(
+                            "`sum({field})` sums the primary key of model \
+                             `{model_ident}`: the total would be a sum of row \
+                             ids, not of the child's data. Sum a value column, \
+                             or use `transform = count`"
+                        ),
+                    ));
+                }
+                if *field == fk {
+                    return Err(syn::Error::new(
+                        *span,
+                        format!(
+                            "`sum({field})` sums the foreign key this \
+                             derivation groups by: every qualifying row carries \
+                             the same parent id, so the total would be that id \
+                             times the row count. Use `transform = count`"
+                        ),
+                    ));
+                }
+                if option_inner(&sum_field.ty).is_some() || !is_sum_integer_type(&sum_field.ty) {
+                    return Err(syn::Error::new(
+                        *span,
+                        format!(
+                            "`sum({field})` requires a non-nullable integer \
+                             field: `{field}` must be `i8`, `i16`, `i32` or \
+                             `i64`. A nullable or floating-point sum would make \
+                             the Rust and SQL lowerings of one derivation \
+                             disagree"
+                        ),
+                    ));
+                }
+                if field_has_diesel_column_name(sum_field) {
+                    return Err(syn::Error::new(
+                        *span,
+                        format!(
+                            "`sum({field})` names a field carrying \
+                             `#[diesel(column_name = ...)]`: the contribution \
+                             SQL names the column after the Rust field, so a \
+                             renamed database column would be spliced under a \
+                             name the table does not have. Name the Rust field \
+                             after the column instead"
+                        ),
+                    ));
+                }
+                // Read through the field's own ident, which keeps a raw
+                // prefix the column name has dropped.
+                let sum_ident = sum_field
+                    .ident
+                    .as_ref()
+                    .expect("matched a named field above");
+                // An `i64` field needs no widening; `i64::from` covers the
+                // narrower widths.
+                let read = if is_i64_type(&sum_field.ty) {
+                    quote! { __r.#sum_ident }
+                } else {
+                    quote! { i64::from(__r.#sum_ident) }
+                };
+                (read, format!("{{c}}.\"{field}\""))
+            }
+        };
+        let contrib_fn = format_ident!("__autumn_derivation_contrib_{index}");
+        let contrib_body = match (lowered.as_ref(), &decl.transform) {
+            (Some(filter), _) => {
+                let predicate = &filter.rust;
+                quote! { if #predicate { #contrib_expr } else { 0 } }
+            }
+            // An unfiltered count never reads the record.
+            (None, DerivationTransform::Count) => quote! { let _ = __r; #contrib_expr },
+            (None, DerivationTransform::Sum { .. }) => quote! { #contrib_expr },
+        };
+        fk_fns.push(quote! {
+            fn #contrib_fn(__r: &#model_ident) -> i64 {
+                #contrib_body
+            }
+        });
+
+        let tenant_column = decl.tenant_column.as_deref().map_or_else(
+            || quote! { ::core::option::Option::None },
+            |tenant| quote! { ::core::option::Option::Some(#tenant) },
+        );
+        let name = derivation_name(decl, &parent_table);
+        let transform_src = decl.transform.as_source();
+        let def_ident = format_ident!("__AUTUMN_DERIVATION_{}_{}", model_ident, index);
+        let target = &decl.target;
+        derivation_items.push(quote! {
+            /// The parent type is otherwise never named in the expansion: the
+            /// parent table is a string and the maintenance is SQL. This makes
+            /// a typo in `#[derivation(Psot, ...)]` a compile error.
+            const _: ::core::marker::PhantomData<#target> =
+                ::core::marker::PhantomData;
+
+            /// Registered definition of one `#[derivation]` on this model
+            /// (#1769): framework plumbing, not a public API.
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals)]
+            pub static #def_ident: ::autumn_web::derivation::DerivationDef =
+                ::autumn_web::derivation::DerivationDef {
+                    name: #name,
+                    model: ::core::stringify!(#model_ident),
+                    child_table: #table_name,
+                    child_pk: #pk_column,
+                    child_soft_delete: #has_deleted_at,
+                    fk_column: #fk_column,
+                    parent_table: #parent_table,
+                    parent_pk: "id",
+                    column: #column,
+                    transform: #transform_src,
+                    filter: #filter_src,
+                    filter_sql: #filter_sql,
+                    contrib_sql: #contrib_sql,
+                    tenant_column: #tenant_column,
+                    module_path: ::core::module_path!(),
+                    file: ::core::file!(),
+                    line: ::core::line!(),
+                };
+
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::derivation::DerivationDescriptor { def: &#def_ident }
+            }
+        });
+        spec_entries.push(quote! {
+            ::autumn_web::repository::CounterCacheSpec {
+                child_table: #table_name,
+                child_pk: #pk_column,
+                child_soft_delete: #has_deleted_at,
+                fk_column: #fk_column,
+                parent_table: #parent_table,
+                parent_pk: "id",
+                counter_column: #column,
+                fk_of: #fk_fn,
+                pk_of: __autumn_counter_cache_pk,
+                live_of: __autumn_counter_cache_live,
+                tenant_column: #tenant_column,
+                tenant_of: #tenant_of,
+                contrib_of: #contrib_fn,
+                contrib_sql: #contrib_sql,
+                filter_sql: #filter_sql,
+                derivation: ::core::option::Option::Some(&#def_ident),
+            }
+        });
+    }
+
+    Ok(quote! {
+        #(#claim_items)*
+        #(#derivation_items)*
+
+        impl #model_ident {
+            /// Whether this model maintains any counter cache (#1325) or
+            /// derivation (#1769). An inherent shadow of
+            /// `AutumnCounterCaches::HAS_COUNTER_CACHES`; framework plumbing,
+            /// not a public API.
+            #[doc(hidden)]
+            pub const HAS_COUNTER_CACHES: bool = true;
+
+            /// Runtime counter-cache specs consulted by this model's generated
+            /// repository (#1325), with the model's derivations (#1769)
+            /// appended. An inherent shadow of
+            /// `AutumnCounterCaches::counter_caches`; framework plumbing, not a
+            /// public API.
+            #[doc(hidden)]
+            #[must_use]
+            pub fn counter_caches()
+                -> &'static [::autumn_web::repository::CounterCacheSpec<#model_ident>]
+            {
+                #(#fk_fns)*
+                const __AUTUMN_COUNTER_CACHES:
+                    &[::autumn_web::repository::CounterCacheSpec<#model_ident>] = &[
+                        #(#spec_entries),*
+                    ];
+                __AUTUMN_COUNTER_CACHES
+            }
+        }
+    })
+}
+
 /// Generate everything needed to make a model's associations preloadable:
 ///
 /// 1. A `{Model}Preload` spec builder (one optional nested spec per association).
@@ -750,7 +3001,7 @@ fn emit_association_items(
                         __keys.dedup();
                         let __rows: ::std::vec::Vec<#target> = #target_table::table
                             .filter(#filter_col.eq_any(__keys))
-                            .select(<#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::reexports::diesel::pg::Pg>>::as_select())
+                            .select(<#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::RuntimeBackend>>::as_select())
                             .load::<#target>(&mut *conn)
                             .await
                             .map_err(::autumn_web::AutumnError::from)?;
@@ -817,7 +3068,7 @@ fn emit_association_items(
                         __keys.dedup();
                         let __rows: ::std::vec::Vec<#target> = #target_table::table
                             .filter(#target_table::#fk_ident.eq_any(__keys))
-                            .select(<#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::reexports::diesel::pg::Pg>>::as_select())
+                            .select(<#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::RuntimeBackend>>::as_select())
                             .load::<#target>(&mut *conn)
                             .await
                             .map_err(::autumn_web::AutumnError::from)?;
@@ -963,7 +3214,7 @@ fn emit_association_items(
                                     )
                                     .select((
                                         #join_mod_ident::#join_table_ident::#fk_ident,
-                                        <#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::reexports::diesel::pg::Pg>>::as_select(),
+                                        <#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::RuntimeBackend>>::as_select(),
                                     ))
                                     .load::<(i64, #target)>(&mut *conn)
                                     .await
@@ -977,20 +3228,19 @@ fn emit_association_items(
                             // below never runs).
                             let _ = #target::__autumn_preload_retain(::std::vec::Vec::new())?;
                             // The same target row can appear once per linking
-                            // parent (that's the point of many-to-many), so
+                            // parent — that is the point of many-to-many — so
                             // recursing into nested associations must run on a
-                            // *deduplicated* set of targets, not once per join
-                            // row — otherwise two parents sharing a target
-                            // would each get their own independent (and only
-                            // one of them fully grouped) copy of its nested
-                            // associations. Dedup by id, recurse once, then
-                            // share the single recursed record across every
-                            // parent via `Arc`. Filter and dedup in the same
-                            // pass: each kept row is moved directly into
-                            // `__unique_by_id` (no clone) and only its
-                            // lightweight `(parent_key, target_id)` pair is
-                            // kept in `__links` for the final grouping pass
-                            // below.
+                            // deduplicated set of targets, not once per join row.
+                            // Otherwise two parents sharing a target would each
+                            // get their own independent copy of its nested
+                            // associations, only one of them fully grouped.
+                            // Dedup by id, recurse once, then share the single
+                            // recursed record across every parent via `Arc`.
+                            // Filtering and dedup happen in one pass: each kept
+                            // row moves directly into `__unique_by_id` with no
+                            // clone, and only its lightweight `(parent_key,
+                            // target_id)` pair stays in `__links` for the
+                            // grouping pass below.
                             let mut __unique_by_id: ::std::collections::HashMap<i64, #target> =
                                 ::std::collections::HashMap::new();
                             let mut __links: ::std::vec::Vec<(i64, i64)> = ::std::vec::Vec::new();
@@ -1271,6 +3521,762 @@ fn emit_association_items(
     }
 }
 
+/// Emit everything a `#[votable]` declaration generates (#1362):
+///
+/// 1. a hidden, length-prefixed `mod __autumn_votable_{len}_{model}_{name}`
+///    declaring the reaction edge table *and* a minimal projection of the
+///    target table (`id`, the aggregate column, and `deleted_at` when the model
+///    soft-deletes). Projecting the target keeps the codegen self-contained: it
+///    needs no `crate::schema::*` in scope at the `#[model]` site and cannot
+///    pick up a conflicting column type;
+/// 2. a `{Model}Reactions` trait with `react` / `reaction_of`, blanket
+///    implemented over `M2mConnSource<Model = #model_ident>` exactly like the
+///    many-to-many mutation helpers, so method resolution stays unambiguous
+///    when several models' reaction traits are in scope.
+///
+/// `react()` runs S1–S5 (lock target → read edge → toggle/flip/insert →
+/// recompute the aggregate from ground truth → persist) inside one
+/// `scoped_immediate_transaction`. The Postgres `SELECT ... FOR NO KEY UPDATE`
+/// row lock is held from before the edge is read until commit, so concurrent
+/// reactions on one target are serialized and the recomputed aggregate is
+/// exact; `SQLite` gets strictly stronger mutual exclusion from `BEGIN
+/// IMMEDIATE`, which is why `for_no_key_update()` lives only in the `pg` arm of
+/// `backend_select!` (it is a parse error on `SQLite`, and the unselected arm
+/// is never type-checked).
+///
+/// `pk_ident` is the model's primary-key field (resolved by the caller exactly
+/// as the CRUD codegen resolves it). It is used both for the `i64`-primary-key
+/// compile-time guard and as the primary-key column of the hidden target
+/// projection — a model whose `#[id]` field is not named `id` (e.g. `memo_id`)
+/// has no `id` column for S1/S5 to lock and update.
+///
+/// `has_tenant_id` mirrors `has_deleted_at`: when the model carries a
+/// `tenant_id` column the projection declares it and S1/S5 (and
+/// `reaction_of`'s target probe) gain a second, tenant-filtered arm, selected
+/// at runtime from `M2mConnSource::__autumn_m2m_tenant_scope()`. A model
+/// without the column emits none of it and is byte-for-byte unchanged.
+#[allow(clippy::too_many_lines)]
+fn emit_votable_items(
+    model_ident: &syn::Ident,
+    table_ident: &syn::Ident,
+    vis: &syn::Visibility,
+    spec: &VotableSpec,
+    has_deleted_at: bool,
+    has_tenant_id: bool,
+    pk_ident: Option<&syn::Ident>,
+) -> TokenStream {
+    let model_snake = pascal_to_snake(&model_ident.to_string());
+    // Length-prefixed for the same reason as the m2m join module: it keeps two
+    // different (model, reaction name) pairs from colliding.
+    let edge_mod = format_ident!(
+        "__autumn_votable_{}_{model_snake}_{}",
+        model_snake.len(),
+        spec.name
+    );
+    let edge_table = format_ident!("{}", spec.table);
+    let reactor_fk = format_ident!("{}", spec.reactor_fk);
+    let target_fk = format_ident!("{}", spec.target_fk);
+    let agg_column = format_ident!("{}", spec.column);
+    let edge_table_name = spec.table.as_str();
+    let table_name_str = table_ident.to_string();
+    let agg_column_name = spec.column.as_str();
+    // The target projection must name the model's real primary-key column:
+    // `react()` locks and updates `WHERE #pk_column = $target_id`, and a
+    // hard-coded `id` would miss (or worse, hit an unrelated column on) a
+    // model whose `#[id]` field is named differently. `None` only happens for
+    // models the rest of the macro already refuses to generate CRUD for; keep
+    // the historical `id` there so the error surface is unchanged.
+    let pk_column = pk_ident.map_or_else(|| format_ident!("id"), ::std::clone::Clone::clone);
+    let trait_ident = format_ident!("{model_ident}Reactions");
+    let is_sum = spec.aggregate == VoteAggregate::Sum;
+
+    // ── Compile-time guards ──────────────────────────────────────────────
+    // The whole reaction surface is typed on `i64` ids: the hidden edge table
+    // declares both foreign keys `Int8`, and `react(reactor_id: i64, target_id:
+    // i64)` binds them directly. A UUID- or i32-keyed model would otherwise
+    // compile the trait fine and only fail deep inside a Diesel bound (or, on
+    // an i32 key, silently widen). Pin the model's own primary key here so the
+    // error points at the model.
+    let pk_guard = pk_ident.map(|pk| {
+        quote! {
+            const _: fn(&#model_ident) -> i64 = |__autumn_votable_model| {
+                __autumn_votable_model.#pk
+            };
+        }
+    });
+    // The aggregate field must *be* `i64`, whatever it is spelled as
+    // (`std::primitive::i64`, a type alias, …). The macro-level check only
+    // rejects the definitely-wrong spellings with a directed message; this
+    // guard is what actually enforces the type, by name resolution rather than
+    // token text.
+    let agg_ty_guard = quote! {
+        const _: fn(&#model_ident) -> i64 = |__autumn_votable_model| {
+            __autumn_votable_model.#agg_column
+        };
+    };
+    // `by = <Reactor>` is otherwise never mentioned in the generated code — the edge
+    // table stores a bare `i64` reactor fk — so a typo'd model name would compile
+    // silently. Force its name resolution the way every other association attribute
+    // does.
+    //
+    // Name resolution only, deliberately not a `ModelPrimaryKey<IdType = i64>` bound:
+    // `by` accepts hand-written reactor structs (reddit-clone's `User` keeps
+    // `password_hash` out of `#[model]`'s generated surface on purpose), and those
+    // implement no framework trait to constrain. The reactor's `i64`-primary-key
+    // requirement is documented contract; a non-BIGINT reactor fk fails loudly on
+    // first use with a database type error, not silent corruption.
+    let reactor_ident = &spec.reactor;
+    let reactor_guard = quote! {
+        const _: ::core::marker::PhantomData<#reactor_ident> =
+            ::core::marker::PhantomData;
+    };
+
+    // ── The hidden module ────────────────────────────────────────────────
+    let value_column_decl = spec.value_column.as_ref().map(|value_column| {
+        let value_ident = format_ident!("{value_column}");
+        quote! { #value_ident -> Int2, }
+    });
+    let deleted_at_decl = has_deleted_at.then(|| {
+        quote! { deleted_at -> Nullable<Timestamp>, }
+    });
+    // Projected for the same reason `deleted_at` is: S1/S5 filter on it, so
+    // the column has to exist in the hidden target `table!`.
+    let tenant_id_decl = has_tenant_id.then(|| {
+        quote! { tenant_id -> Text, }
+    });
+    let hidden_module = quote! {
+        // Hidden Diesel declarations backing `#model_ident`'s `#[votable]`
+        // reactions: the `#edge_table` edge table (keyed on the composite
+        // `(#reactor_fk, #target_fk)` pair that is also the `ON CONFLICT`
+        // arbiter) and a minimal `#table_ident` projection. Scoped to its own
+        // module so it can never collide with the application's own
+        // `crate::schema::#edge_table`.
+        #[allow(
+            missing_docs,
+            unreachable_pub,
+            clippy::all,
+            clippy::pedantic,
+            clippy::nursery
+        )]
+        mod #edge_mod {
+            ::autumn_web::reexports::diesel::table! {
+                #edge_table (#reactor_fk, #target_fk) {
+                    #reactor_fk -> Int8,
+                    #target_fk -> Int8,
+                    #value_column_decl
+                }
+            }
+            ::autumn_web::reexports::diesel::table! {
+                #table_ident (#pk_column) {
+                    #pk_column -> Int8,
+                    #agg_column -> Int8,
+                    #tenant_id_decl
+                    #deleted_at_decl
+                }
+            }
+            // Lets the tenant `EXISTS` subquery on the target appear inside a
+            // query on the edge table (and any future cross-table predicate).
+            ::autumn_web::reexports::diesel::allow_tables_to_appear_in_same_query!(
+                #edge_table,
+                #table_ident,
+            );
+        }
+    };
+
+    // ── Shared query fragments ───────────────────────────────────────────
+    // `AND deleted_at IS NULL`, emitted only when the model actually has the
+    // field — a model that does not soft-delete pays nothing (AC6).
+    let live_filter = has_deleted_at.then(|| {
+        quote! { .filter(#edge_mod::#table_ident::deleted_at.is_null()) }
+    });
+    let edge_of_reactor = quote! {
+        #edge_mod::#edge_table::table
+            .filter(#edge_mod::#edge_table::#reactor_fk.eq(reactor_id))
+            .filter(#edge_mod::#edge_table::#target_fk.eq(target_id))
+    };
+    let not_found_msg = format!("{model_ident} not found");
+
+    // ── Tenant isolation (PR #2177 review, P1) ───────────────────────────
+    //
+    // Through a `#[repository(..., tenant_scoped)]` repository, filtering the target by
+    // primary key alone lets a caller who can guess an id react to another tenant's
+    // row: an edge insert plus an aggregate UPDATE across the tenant boundary. So when
+    // the model carries a `tenant_id` column, the predicate the repository's finders
+    // would apply is resolved once up front and threaded through S1 (the locking
+    // existence guard), S5 (the aggregate UPDATE), and `reaction_of`'s target probe.
+    //
+    // `__autumn_m2m_tenant_scope()` is three-valued and matches the finders exactly:
+    // `Some(tenant)` scopes, `None` (non-`tenant_scoped`, or `across_tenants()`) does
+    // not, and a `tenant_scoped` repository with no tenant context is an error before
+    // anything is read or written.
+    //
+    // Both arms stay whole, statically-typed queries rather than one boxed query with a
+    // conditional predicate: the `pg` arm of S1 carries `.for_no_key_update()`, which an
+    // `into_boxed()` query cannot express. The call is emitted unconditionally, even
+    // for a model with no `tenant_id` column, because it also carries the cross-shard
+    // reject: on a sharded repository in `across_tenants()` mode there is no single
+    // right shard for a reaction, and the guard errors before any connection is taken.
+    let resolve_tenant = if has_tenant_id {
+        quote! {
+            let __tenant: ::core::option::Option<::std::string::String> =
+                self.__autumn_m2m_tenant_scope()?;
+        }
+    } else {
+        quote! {
+            let _: ::core::option::Option<::std::string::String> =
+                self.__autumn_m2m_tenant_scope()?;
+        }
+    };
+    let tenant_filter = quote! {
+        .filter(#edge_mod::#table_ident::tenant_id.eq(__t))
+    };
+
+    // S1's existence/soft-delete guard: `lock` adds the Postgres row lock,
+    // `scoped` the tenant predicate.
+    let target_probe = |scoped: bool, lock: bool| {
+        let tenant_predicate = scoped.then(|| tenant_filter.clone());
+        let lock_clause = lock.then(|| quote! { .for_no_key_update() });
+        quote! {
+            #edge_mod::#table_ident::table
+                .filter(#edge_mod::#table_ident::#pk_column.eq(target_id))
+                #tenant_predicate
+                #live_filter
+                .select(#edge_mod::#table_ident::#pk_column)
+                #lock_clause
+                .first::<i64>(conn)
+                .await
+                .optional()
+                .map_err(::autumn_web::AutumnError::from)?
+        }
+    };
+    let s1_arm = |lock: bool| {
+        let unscoped = target_probe(false, lock);
+        if has_tenant_id {
+            let scoped = target_probe(true, lock);
+            quote! {
+                match __tenant {
+                    ::core::option::Option::Some(ref __t) => { #scoped }
+                    ::core::option::Option::None => { #unscoped }
+                }
+            }
+        } else {
+            unscoped
+        }
+    };
+    let s1_pg = s1_arm(true);
+    let s1_sqlite = s1_arm(false);
+
+    // S5: persist the recomputed aggregate. Tenant-filtered on the same terms
+    // as S1 — belt and braces, since S1 already proved the target is in this
+    // tenant and holds its lock, but a zero-row S5 is the loud failure the
+    // `__persisted == 0` guard below is there for.
+    let aggregate_update = |scoped: bool| {
+        let tenant_predicate = scoped.then(|| tenant_filter.clone());
+        quote! {
+            ::autumn_web::reexports::diesel::update(
+                #edge_mod::#table_ident::table
+                    .filter(#edge_mod::#table_ident::#pk_column.eq(target_id))
+                    #tenant_predicate
+                    #live_filter
+            )
+            .set(#edge_mod::#table_ident::#agg_column.eq(__aggregate))
+            .execute(conn)
+            .await
+            .map_err(::autumn_web::AutumnError::from)?
+        }
+    };
+    let s5_persist = if has_tenant_id {
+        let scoped = aggregate_update(true);
+        let unscoped = aggregate_update(false);
+        quote! {
+            let __persisted: usize = match __tenant {
+                ::core::option::Option::Some(ref __t) => { #scoped }
+                ::core::option::Option::None => { #unscoped }
+            };
+        }
+    } else {
+        let unscoped = aggregate_update(false);
+        quote! { let __persisted: usize = #unscoped; }
+    };
+
+    // `reaction_of`'s tenant boundary. The edge table has no tenant column, so the
+    // target row is the boundary: a target owned by another tenant has no visible
+    // reaction here, which is `Ok(None)` rather than an error — the same thing the
+    // reactor would see for a target with no edge. The predicate is an `EXISTS` on the
+    // target projection folded into the edge lookup itself, not a separate probe: two
+    // statements under READ COMMITTED would leave a TOCTOU window where a concurrent
+    // tenant reassignment lands between them and the foreign edge leaks anyway.
+    // Deliberately unlocked and not soft-delete filtered, mirroring `reaction_of`'s
+    // stance of reporting the edge regardless.
+    let reaction_of_tenant_exists = quote! {
+        .filter(::autumn_web::reexports::diesel::dsl::exists(
+            #edge_mod::#table_ident::table
+                .filter(#edge_mod::#table_ident::#pk_column.eq(target_id))
+                .filter(#edge_mod::#table_ident::tenant_id.eq(__t))
+        ))
+    };
+
+    // ── S2: the reactor's current edge, S3: the three-way branch ─────────
+    let (react_value_param, read_current, branch, aggregate_query) = if is_sum {
+        let value_ident = format_ident!(
+            "{}",
+            spec.value_column
+                .as_ref()
+                .expect("sum mode always resolves a value column")
+        );
+        (
+            Some(quote! { value: i16, }),
+            quote! {
+                let __current: ::core::option::Option<i16> = #edge_of_reactor
+                    .select(#edge_mod::#edge_table::#value_ident)
+                    .first::<i16>(conn)
+                    .await
+                    .optional()
+                    .map_err(::autumn_web::AutumnError::from)?;
+            },
+            quote! {
+                let (__new_value, __outcome) = match __current {
+                    // (a) toggle-off: the same value again removes the edge.
+                    ::core::option::Option::Some(__existing) if __existing == value => {
+                        ::autumn_web::reexports::diesel::delete(#edge_of_reactor)
+                            .execute(conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        (
+                            ::core::option::Option::None,
+                            ::autumn_web::repository::ReactionOutcome::Removed,
+                        )
+                    }
+                    // (b) flip: replace the value in place, never a second row.
+                    ::core::option::Option::Some(_) => {
+                        ::autumn_web::reexports::diesel::update(#edge_of_reactor)
+                            .set(#edge_mod::#edge_table::#value_ident.eq(value))
+                            .execute(conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        (
+                            ::core::option::Option::Some(value),
+                            ::autumn_web::repository::ReactionOutcome::Flipped,
+                        )
+                    }
+                    // (c) insert. The explicit `(reactor, target)` arbiter is
+                    // load-bearing: an edge table may carry more than one
+                    // unique constraint, and a bare `ON CONFLICT DO UPDATE`
+                    // is a syntax error. Under the target-row lock the
+                    // conflict arm is unreachable; it is emitted so that a
+                    // lock-bypassing writer produces an idempotent update
+                    // rather than a `23505` escaping to the caller.
+                    ::core::option::Option::None => {
+                        ::autumn_web::reexports::diesel::insert_into(
+                            #edge_mod::#edge_table::table
+                        )
+                        .values((
+                            #edge_mod::#edge_table::#reactor_fk.eq(reactor_id),
+                            #edge_mod::#edge_table::#target_fk.eq(target_id),
+                            #edge_mod::#edge_table::#value_ident.eq(value),
+                        ))
+                        .on_conflict((
+                            #edge_mod::#edge_table::#reactor_fk,
+                            #edge_mod::#edge_table::#target_fk,
+                        ))
+                        .do_update()
+                        .set(
+                            #edge_mod::#edge_table::#value_ident.eq(
+                                ::autumn_web::reexports::diesel::upsert::excluded(
+                                    #edge_mod::#edge_table::#value_ident
+                                )
+                            )
+                        )
+                        .execute(conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?;
+                        (
+                            ::core::option::Option::Some(value),
+                            ::autumn_web::repository::ReactionOutcome::Inserted,
+                        )
+                    }
+                };
+            },
+            // `sum(SmallInt)` is typed `Nullable<BigInt>` by Diesel, so no
+            // backend-specific cast is needed; the `NULL` (no edges) case is
+            // coalesced in Rust rather than in SQL.
+            quote! {
+                let __total: ::core::option::Option<i64> = #edge_mod::#edge_table::table
+                    .filter(#edge_mod::#edge_table::#target_fk.eq(target_id))
+                    .select(::autumn_web::reexports::diesel::dsl::sum(
+                        #edge_mod::#edge_table::#value_ident
+                    ))
+                    .get_result::<::core::option::Option<i64>>(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                let __aggregate: i64 = __total.unwrap_or(0);
+            },
+        )
+    } else {
+        (
+            None,
+            quote! {
+                let __current: ::core::option::Option<i64> = #edge_of_reactor
+                    .select(#edge_mod::#edge_table::#target_fk)
+                    .first::<i64>(conn)
+                    .await
+                    .optional()
+                    .map_err(::autumn_web::AutumnError::from)?;
+            },
+            quote! {
+                let (__new_value, __outcome) = match __current {
+                    // Count mode is unary membership: a repeat click can only
+                    // toggle the row off, never flip it.
+                    ::core::option::Option::Some(_) => {
+                        ::autumn_web::reexports::diesel::delete(#edge_of_reactor)
+                            .execute(conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        (
+                            ::core::option::Option::None,
+                            ::autumn_web::repository::ReactionOutcome::Removed,
+                        )
+                    }
+                    ::core::option::Option::None => {
+                        ::autumn_web::reexports::diesel::insert_into(
+                            #edge_mod::#edge_table::table
+                        )
+                        .values((
+                            #edge_mod::#edge_table::#reactor_fk.eq(reactor_id),
+                            #edge_mod::#edge_table::#target_fk.eq(target_id),
+                        ))
+                        .on_conflict((
+                            #edge_mod::#edge_table::#reactor_fk,
+                            #edge_mod::#edge_table::#target_fk,
+                        ))
+                        .do_nothing()
+                        .execute(conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?;
+                        (
+                            ::core::option::Option::Some(1i16),
+                            ::autumn_web::repository::ReactionOutcome::Inserted,
+                        )
+                    }
+                };
+            },
+            quote! {
+                let __aggregate: i64 = #edge_mod::#edge_table::table
+                    .filter(#edge_mod::#edge_table::#target_fk.eq(target_id))
+                    .count()
+                    .get_result::<i64>(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+            },
+        )
+    };
+
+    // One statically-typed lookup per (mode, scoped) combination, mirroring
+    // `target_probe`: the scoped arms carry the single-snapshot tenant
+    // `EXISTS`, the unscoped arms are byte-identical to the pre-tenant code.
+    let reaction_of_lookup = |scoped: bool| {
+        let tenant_predicate = scoped.then(|| reaction_of_tenant_exists.clone());
+        if is_sum {
+            let value_ident = format_ident!(
+                "{}",
+                spec.value_column
+                    .as_ref()
+                    .expect("sum mode always resolves a value column")
+            );
+            quote! {
+                #edge_of_reactor
+                    #tenant_predicate
+                    .select(#edge_mod::#edge_table::#value_ident)
+                    .first::<i16>(&mut conn)
+                    .await
+                    .optional()
+                    .map_err(::autumn_web::AutumnError::from)
+            }
+        } else {
+            quote! {
+                {
+                    let __row: ::core::option::Option<i64> = #edge_of_reactor
+                        #tenant_predicate
+                        .select(#edge_mod::#edge_table::#target_fk)
+                        .first::<i64>(&mut conn)
+                        .await
+                        .optional()
+                        .map_err(::autumn_web::AutumnError::from)?;
+                    // Uniform `Option<i16>` in both modes: a present membership
+                    // row reports `Some(1)`, so view/widget code is
+                    // mode-independent.
+                    ::core::result::Result::Ok(__row.map(|_| 1i16))
+                }
+            }
+        }
+    };
+    let reaction_of_body = if has_tenant_id {
+        let scoped = reaction_of_lookup(true);
+        let unscoped = reaction_of_lookup(false);
+        quote! {
+            match __tenant {
+                ::core::option::Option::Some(ref __t) => #scoped,
+                ::core::option::Option::None => #unscoped,
+            }
+        }
+    } else {
+        reaction_of_lookup(false)
+    };
+
+    // ── Docs ─────────────────────────────────────────────────────────────
+    let aggregate_word = if is_sum { "SUM(value)" } else { "COUNT(*)" };
+    // Only documented where it can apply. A model without a `tenant_id`
+    // column emits no tenant scoping at all, so promising it there would be a
+    // lie — and the shape tests use exactly that to prove the zero-cost path.
+    let (react_tenant_doc, react_tenant_not_found, react_tenant_error) = if has_tenant_id {
+        (
+            "This model has a `tenant_id` column, so a `tenant_scoped` \
+             repository matches the target on it too: another tenant's \
+             `target_id` is `NotFound` before any write. `across_tenants()` \
+             opts out; a `tenant_scoped` repository with no tenant context is \
+             an error.\n\n",
+            ", or belongs to another tenant",
+            "- An error when this repository is `tenant_scoped` and no tenant \
+             context was established.\n",
+        )
+    } else {
+        ("", "", "")
+    };
+    // Applies regardless of `has_tenant_id`: the scope call carrying the
+    // reject is emitted unconditionally.
+    let cross_shard_error = "- `AutumnError::bad_request` when this repository is sharded and in \
+                             `across_tenants()` mode: there is no single right shard for a \
+                             reaction, so cross-shard reactions are rejected.\n";
+    let (reaction_of_tenant_doc, reaction_of_tenant_error) = if has_tenant_id {
+        (
+            "Tenant-isolated on the same terms as `react()`: through a \
+             `tenant_scoped` repository, a target belonging to another tenant \
+             reports `None` rather than that tenant's reaction.\n\n",
+            "- An error when this repository is `tenant_scoped` and no tenant \
+             context was established.\n",
+        )
+    } else {
+        ("", "")
+    };
+    let trait_doc = format!(
+        "Reaction helpers for `{model_ident}`'s `#[votable(by = {}, aggregate \
+         = {})]` declaration: the `{}` edge table keyed on `({}, {})`, \
+         aggregated into `{}.{}`.",
+        spec.reactor,
+        if is_sum { "sum" } else { "count" },
+        spec.table,
+        spec.reactor_fk,
+        spec.target_fk,
+        table_ident,
+        spec.column,
+    );
+    let react_doc = format!(
+        "Toggle / flip / insert this reactor's reaction on `target_id`, and \
+         recompute `{}.{}` from ground truth in the **same** transaction, so a \
+         reader never observes edge/aggregate disagreement.\n\
+         \n\
+         Race-safe: the target row is locked for the whole \
+         read-decide-write-recompute window, so N concurrent calls converge to \
+         at most one edge per `({}, {})` and the persisted aggregate always \
+         equals `{aggregate_word}`.\n\
+         \n\
+         **Not idempotent — it is a toggle.** Calling it twice with the same \
+         arguments reacts and then un-reacts. In particular, blindly retrying \
+         a call that timed out (or whose response was lost) can *invert* the \
+         outcome: the first attempt may well have committed. Callers that need \
+         retry safety must dedupe above this layer — an idempotency key on the \
+         HTTP request, or re-reading `reaction_of()` before retrying.\n\
+         \n\
+         Runs on its **own** pooled connection — it does not join an enclosing \
+         `Db::tx`. Do not hold a `Db` extractor across this call on a small \
+         pool.\n\
+         \n\
+         `value` is **not** validated: it is written to the edge table as \
+         given, so the edge table's `CHECK` constraint is what keeps the sum \
+         meaningful. Never bind it straight from a request body.\n\
+         \n\
+         {react_tenant_doc}\
+         # Errors\n\
+         \n\
+         - `AutumnError::not_found` when `target_id` does not exist (or is \
+         soft-deleted{react_tenant_not_found}).\n\
+         {react_tenant_error}\
+         {cross_shard_error}\
+         - Any database error from the enclosing transaction.",
+        table_ident, spec.column, spec.reactor_fk, spec.target_fk,
+    );
+    let reaction_of_doc = format!(
+        "This reactor's current reaction on `target_id`, or `None`.\n\
+         \n\
+         A single indexed lookup on `{}`; safe to call per-row on a detail \
+         page. For feed pages prefer rendering un-highlighted controls over an \
+         N+1 — a batch accessor is tracked as a follow-up.\n\
+         \n\
+         A **read**: it routes per this repository's read route, so a \
+         configured replica serves it, and it does not pin read-your-writes. \
+         It can therefore lag a `react()` this request just committed — render \
+         from the `Reaction` that `react()` returned instead of re-reading, or \
+         use a `primary_reads` / `on_primary()` repository.\n\
+         \n\
+         {reaction_of_tenant_doc}\
+         # Errors\n\
+         \n\
+         {reaction_of_tenant_error}\
+         {cross_shard_error}\
+         - Any database error.",
+        spec.table,
+    );
+
+    quote! {
+        // The aggregate column this model keeps from its reaction edges is a
+        // framework-maintained column like a counter cache's, so it is
+        // registered as a claim: a `#[derivation]` on another model naming
+        // the same `(table, column)` would discard this aggregate on every
+        // mutation and backfill, and the boot refuses the pair (#1769).
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::derivation::CounterCacheClaim {
+                model: ::core::stringify!(#model_ident),
+                child_table: #edge_table_name,
+                parent_table: #table_name_str,
+                column: #agg_column_name,
+                direct_sql: true,
+                module_path: ::core::module_path!(),
+            }
+        }
+        #hidden_module
+
+        #pk_guard
+        #agg_ty_guard
+        #reactor_guard
+
+        #[doc = #trait_doc]
+        #vis trait #trait_ident {
+            #[doc = #react_doc]
+            fn react(
+                &self,
+                reactor_id: i64,
+                target_id: i64,
+                #react_value_param
+            ) -> impl ::std::future::Future<
+                Output = ::autumn_web::AutumnResult<::autumn_web::repository::Reaction>
+            > + Send;
+
+            #[doc = #reaction_of_doc]
+            fn reaction_of(
+                &self,
+                reactor_id: i64,
+                target_id: i64,
+            ) -> impl ::std::future::Future<
+                Output = ::autumn_web::AutumnResult<::core::option::Option<i16>>
+            > + Send;
+        }
+
+        impl<__R> #trait_ident for __R
+        where
+            __R: ::autumn_web::repository::M2mConnSource<Model = #model_ident>
+                + ::core::marker::Sync,
+        {
+            async fn react(
+                &self,
+                reactor_id: i64,
+                target_id: i64,
+                #react_value_param
+            ) -> ::autumn_web::AutumnResult<::autumn_web::repository::Reaction> {
+                use ::autumn_web::reexports::diesel::result::OptionalExtension as _;
+                use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                // Resolved before the connection is taken, so a tenant_scoped
+                // repository with no tenant context fails closed without
+                // occupying a pooled connection.
+                #resolve_tenant
+                let mut conn = self.__autumn_m2m_write_conn().await?;
+                ::autumn_web::__private::scoped_immediate_transaction::<
+                    ::autumn_web::repository::Reaction,
+                    ::autumn_web::AutumnError,
+                    _,
+                >(&mut *conn, |conn| {
+                    async move {
+                        // S1: take the row lock on the target before anything
+                        // is read, in the same statement as the existence and
+                        // soft-delete guard. `FOR NO KEY UPDATE`, not `FOR
+                        // UPDATE`: this transaction only ever writes the
+                        // target's aggregate column, never its key. The weaker
+                        // mode still conflicts with itself, so reactions on one
+                        // target stay serialized, but does not conflict with the
+                        // `FOR KEY SHARE` locks Postgres takes for foreign-key
+                        // checks, so a concurrent `INSERT INTO comments
+                        // (post_id) …` does not queue behind a vote. On SQLite
+                        // the enclosing `BEGIN IMMEDIATE` already serializes
+                        // writers, so the clause is redundant as well as
+                        // unemittable.
+                        let __target: ::core::option::Option<i64> =
+                            ::autumn_web::backend_select! {
+                                pg => { #s1_pg },
+                                sqlite => { #s1_sqlite },
+                            };
+                        if __target.is_none() {
+                            return ::core::result::Result::Err(
+                                ::autumn_web::AutumnError::not_found_msg(#not_found_msg)
+                            );
+                        }
+
+                        // S2 — safe: the target lock is held.
+                        #read_current
+
+                        // S3 — exactly one of delete / update / upsert.
+                        #branch
+
+                        // S4 — ground truth, not an accumulated delta, so any
+                        // historical drift self-heals on the next reaction.
+                        #aggregate_query
+
+                        // S5 — persist, in the same transaction as S3.
+                        #s5_persist
+
+                        // Defense in depth: unreachable while S1's lock holds —
+                        // the target existed and was live when we locked it, and
+                        // nobody can delete or soft-delete it underneath us. If
+                        // the lock strength ever regresses this fails loudly
+                        // instead of committing an edge whose aggregate was
+                        // silently dropped on the floor.
+                        if __persisted == 0 {
+                            return ::core::result::Result::Err(
+                                ::autumn_web::AutumnError::not_found_msg(#not_found_msg)
+                            );
+                        }
+
+                        ::core::result::Result::Ok(
+                            ::autumn_web::repository::Reaction::__new(
+                                __new_value,
+                                __aggregate,
+                                __outcome,
+                            )
+                        )
+                    }
+                    .scope_boxed()
+                })
+                .await
+            }
+
+            async fn reaction_of(
+                &self,
+                reactor_id: i64,
+                target_id: i64,
+            ) -> ::autumn_web::AutumnResult<::core::option::Option<i16>> {
+                use ::autumn_web::reexports::diesel::result::OptionalExtension as _;
+                use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+                #resolve_tenant
+                // A read: routed per the repository's `ReadRoute`, and it does
+                // not mark the read-your-writes pin.
+                let mut conn = self.__autumn_m2m_read_conn().await?;
+                #reaction_of_body
+            }
+        }
+    }
+}
+
 /// Extract `#[validate(...)]` attributes from a field (verbatim pass-through).
 fn validate_attrs(field: &Field) -> Vec<&syn::Attribute> {
     field
@@ -1285,7 +4291,24 @@ fn validate_attrs(field: &Field) -> Vec<&syn::Attribute> {
 /// trait impl (struct-level / cross-field rules), or their `Patch<T>` impl
 /// inverts our absent-field skip semantics (`does_not_contain`). See
 /// `validate_attrs_for_patch` for the full rationale.
+///
+/// `nested` is listed here too: it has no `Patch<T>` impl at all, so it must
+/// be dropped from the `Update{Model}` field the same as `custom`. Separately
+/// from the `Patch<T>` question, `nested` on the read model / `NewModel` can
+/// hit a real `E0034: multiple applicable items in scope` if the *model's own
+/// defining module* also imports `autumn_web::prelude::ValidateExt` (a
+/// blanket `impl<T: validator::Validate> ValidateExt for T` also named
+/// `validate`, which collides with `validator_derive`'s bare
+/// `(&field).validate()` nested codegen). This crate cannot detect that from
+/// here -- a derive/attribute macro only sees the item it's attached to, not
+/// the rest of its enclosing module's `use` statements -- so it is not
+/// rejected at macro-expansion time; see the hazard note on
+/// `ValidateExt`'s doc comment (`autumn/src/validation.rs`) for the full
+/// explanation and the workaround (keep the model's own module free of that
+/// import, or use `#[validate(custom(...))]` instead).
 const NON_PATCH_VALIDATORS: &[&str] = &[
+    // See the module-level rationale above for why `nested` is listed here
+    // without a `reject_*`-style macro-time guard.
     "custom",
     "must_match",
     "nested",
@@ -1333,10 +4356,15 @@ const OPTION_INCOMPATIBLE_VALIDATORS: &[&str] = &["ip"];
 /// `Patch<T>`, which only implements validator's per-field *declarative* traits
 /// (`length`, `email`, `url`, `range`, `contains`, `ip`, `regex`, `required`,
 /// …). The validators in [`NON_PATCH_VALIDATORS`] (`custom`, `must_match`,
-/// `nested`, `credit_card`, `non_control_character`) have no `Patch<T>` impl,
-/// so propagating them verbatim would break `UpdateModel` compilation even
-/// though `NewModel` still compiles — a latent footgun for a user who adds e.g.
-/// `#[validate(custom(...))]` to a model field.
+/// `nested`, `credit_card`, `non_control_character`) have no *usable*
+/// `Patch<T>` impl (`must_match` technically compiles via `Patch<T>: Eq`, but
+/// with the wrong semantics — comparing raw `Unchanged`/`Set`/`Clear`
+/// sentinels rather than the underlying values), so propagating them verbatim
+/// would break `UpdateModel` compilation or its correctness even though
+/// `NewModel` still compiles — a latent footgun for a user who adds e.g.
+/// `#[validate(custom(...))]` to a model field. (`nested` has its own,
+/// separate hazard even where it does compile -- see [`NON_PATCH_VALIDATORS`]'s
+/// doc comment.)
 ///
 /// `required` is deliberately NOT in the denylist (#1719 / Codex P2): it must
 /// propagate so the `UpdateModel` rejects an explicit `null` on a required
@@ -1379,10 +4407,17 @@ const OPTION_INCOMPATIBLE_VALIDATORS: &[&str] = &["ip"];
 /// Limitation: a type *alias* to `Option` is not detected (no worse than the
 /// derive's own behaviour, which also inspects the syntactic type).
 ///
-/// Documented limitation: `custom`/`must_match`/`nested`/`does_not_contain`/etc.
-/// are enforced on create (via `NewModel`) but NOT on the PATCH update path; a
-/// follow-up may add merged-model validation for cross-field/custom rules.
-/// (`required` IS enforced on the PATCH path via the tri-state `Patch<T>` impl.)
+/// Documented limitation: `custom`/`must_match`/`does_not_contain`/etc. are
+/// enforced on create (via `NewModel`) but NOT on the PATCH update path unless
+/// the model builds a draft via `from_patch`, which validates the merged
+/// concrete model and closes this gap for `custom`, `must_match`,
+/// `does_not_contain`, and `ip` on `Option<…>` fields (issues #1778/#1751).
+/// `nested` is filtered from `Patch<T>` the same way, and the same
+/// merged-model mechanism would run it too -- but see [`NON_PATCH_VALIDATORS`]'s
+/// doc comment for the separate `ValidateExt` hazard that applies to it on
+/// create and the merged model alike, independent of this Patch-vs-update
+/// question. (`required` IS enforced on the PATCH path via the tri-state
+/// `Patch<T>` impl.)
 fn validate_attrs_for_patch(field: &Field) -> Vec<syn::Attribute> {
     let field_is_option = is_option_type(&field.ty);
     let mut out = Vec::new();
@@ -1426,8 +4461,8 @@ fn validate_attrs_for_patch(field: &Field) -> Vec<syn::Attribute> {
 }
 
 /// Filter out framework-specific attributes (`#[id]`, `#[indexed]`, `#[validate]`,
-/// `#[default]`, `#[factory_assoc]`, `#[lock_version]`, `#[searchable]`,
-/// `#[state_machine]`) that shouldn't be on the query struct
+/// `#[default]`, `#[factory_assoc]`, `#[lock_version]`, `#[position]`,
+/// `#[searchable]`, `#[state_machine]`) that shouldn't be on the query struct
 /// (they'd confuse Diesel derives).
 fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
     field
@@ -1442,6 +4477,10 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 && !a.path().is_ident("lock_version")
                 && !a.path().is_ident("searchable")
                 && !a.path().is_ident("encrypted")
+                // #1654: `#[classified]` is a marker the model macro reads; the
+                // behaviour lives in the field's `Classified<T, Marker>` type, so
+                // the attribute itself must never reach the Diesel derives.
+                && !a.path().is_ident("classified")
                 && !a.path().is_ident("private")
                 && !a.path().is_ident("normalize")
                 && !a.path().is_ident("state_machine")
@@ -1450,6 +4489,24 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 // they never leak onto the Diesel derives; codegen is unchanged.
                 && !a.path().is_ident("unique")
                 && !a.path().is_ident("references")
+                && !a.path().is_ident("position")
+                // #1384: `#[translatable]` is a marker the model macro reads;
+                // the behaviour lives in the field's `Translated` type, so the
+                // attribute itself must never reach the Diesel derives.
+                && !a.path().is_ident("translatable")
+                // #1806: `#[collaborative]` is a marker the model macro reads;
+                // the behaviour lives in the field's `CollabText` type, so the
+                // attribute itself must never reach the Diesel derives.
+                && !a.path().is_ident("collaborative")
+                // #1771: `#[confidential]` is a marker the model macro reads;
+                // the behaviour lives in the field's `Sealed` type, so the
+                // attribute itself must never reach the Diesel derives.
+                && !a.path().is_ident("confidential")
+                // #2597: `#[decimal_shape(precision = .., scale = ..)]` is a
+                // marker the model macro reads to shape factory `.fake()`
+                // values; the field type carries no such information, so the
+                // attribute itself must never reach the Diesel derives.
+                && !a.path().is_ident("decimal_shape")
         })
         .collect()
 }
@@ -1585,6 +4642,489 @@ fn parse_field_encrypted_mode(field: &syn::Field) -> syn::Result<EncryptedMode> 
     Ok(parse_field_encrypted(field)?.mode)
 }
 
+// ── #1771: `#[confidential]` field attribute ─────────────────────
+
+/// Parsed `#[confidential(...)]` field specification (issue #1771).
+#[derive(Clone, Copy, Default)]
+struct ConfidentialSpec {
+    /// The field carries `#[confidential]`.
+    present: bool,
+    /// `blind_index` — a companion `<field>_bidx` column holds the equality
+    /// token, so the field supports `WHERE <field>_bidx = $1` lookups.
+    blind_index: bool,
+}
+
+/// The companion column name for a `#[confidential(blind_index)]` field.
+fn blind_index_column(field: &syn::Ident) -> String {
+    format!("{}_bidx", unraw_ident(field))
+}
+
+/// Parse `#[confidential]` / `#[confidential(blind_index)]`.
+fn parse_field_confidential(field: &syn::Field) -> syn::Result<ConfidentialSpec> {
+    let mut spec = ConfidentialSpec::default();
+    for attr in &field.attrs {
+        if !attr.path().is_ident("confidential") {
+            continue;
+        }
+        spec.present = true;
+        if matches!(attr.meta, syn::Meta::Path(_)) {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("blind_index") {
+                spec.blind_index = true;
+                return Ok(());
+            }
+            Err(meta.error(
+                "unsupported `#[confidential]` option; the first slice supports \
+                 `blind_index` only (issue #1771). Write `#[confidential]` or \
+                 `#[confidential(blind_index)]`.",
+            ))
+        })?;
+    }
+    Ok(spec)
+}
+
+/// Reject every marker that would make the operator read, index, order or join
+/// a sealed column. Split out of [`validate_confidential_field`] so the table
+/// of reasons stays one readable list.
+fn reject_confidential_marker_conflicts(field: &syn::Field) -> syn::Result<()> {
+    // Anything that makes the operator read, index, order or join the column is
+    // refused: the server holds ciphertext it cannot compare or rank.
+    for (marker, why) in [
+        (
+            "encrypted",
+            "`#[encrypted]` seals the column under a key the operator holds, which \
+             is the trust boundary `#[confidential]` exists to remove",
+        ),
+        (
+            "classified",
+            "a classification gates where a plaintext may go; a confidential column \
+             has no server-side plaintext to gate",
+        ),
+        (
+            "searchable",
+            "full-text search indexes the stored column, and an index over \
+             ciphertext matches nothing",
+        ),
+        (
+            "normalize",
+            "a normalizer rewrites the column in place, which needs the plaintext \
+             the server does not have",
+        ),
+        (
+            "unique",
+            "a UNIQUE constraint compares stored values, and sealing is randomized, \
+             so equal plaintexts never collide. Put the constraint on the \
+             `blind_index` companion column instead",
+        ),
+        (
+            "indexed",
+            "an index over randomized ciphertext serves no lookup. Index the \
+             `blind_index` companion column instead",
+        ),
+        (
+            "references",
+            "a foreign key is a server-side join, which cannot read a sealed value",
+        ),
+        (
+            "translatable",
+            "a per-locale container is a JSON document, not the single sealed value",
+        ),
+        (
+            "id",
+            "a primary key is echoed back in URLs, ETags and pagination cursors, \
+             and the server must be able to compare it",
+        ),
+        (
+            "lock_version",
+            "the optimistic-lock column is framework-managed and must stay a plain integer",
+        ),
+        (
+            "position",
+            "the position column is framework-managed and must stay a plain integer",
+        ),
+        (
+            "state_machine",
+            "a state column must hold one state name, which the state-machine \
+             codegen reads and writes directly",
+        ),
+        (
+            "default",
+            "a default is a server-side value, and the server cannot seal one",
+        ),
+    ] {
+        if has_attr(field, marker) {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!("`#[confidential]` cannot be combined with `#[{marker}]`: {why}."),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate a `#[confidential]` field against the whole struct.
+///
+/// `siblings` is every field of the model, needed to prove that a
+/// `blind_index` field has its companion token column.
+fn validate_confidential_field(field: &syn::Field, siblings: &[&Field]) -> syn::Result<()> {
+    let spec = parse_field_confidential(field)?;
+    if !spec.present {
+        return Ok(());
+    }
+
+    reject_confidential_marker_conflicts(field)?;
+
+    if ty_last_ident(&field.ty).as_deref() != Some("Sealed") {
+        return Err(syn::Error::new_spanned(
+            &field.ty,
+            "`#[confidential]` requires the field type \
+             `autumn_web::confidential::Sealed` (issue #1771). The server never \
+             holds the plaintext, so the column is declared as the envelope it \
+             actually stores.",
+        ));
+    }
+
+    let ident = field
+        .ident
+        .as_ref()
+        .ok_or_else(|| syn::Error::new_spanned(field, "`#[confidential]` needs a named field"))?;
+
+    if unraw_ident(ident) == "tenant_id" {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[confidential]` cannot be applied to `tenant_id`: the tenancy codegen \
+             reads the column directly as its isolation key, so the server must be \
+             able to compare it.",
+        ));
+    }
+
+    // The column is registered under its Rust name, which every sink-side
+    // lookup keys off. A Diesel rename would desync the two.
+    if diesel_column_name(field).is_some() {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[confidential]` fields cannot use `#[diesel(column_name = ...)]`: the \
+             column is registered under its Rust name, which the build-time query \
+             guard, the log filter, version history and admin redaction all key off.",
+        ));
+    }
+
+    // The column is registered under its Rust name, which every sink-side
+    // lookup keys off. A serde rename or alias would desync the two.
+    if let Some(key) = field_serde_wire_name_override(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            format!(
+                "`#[confidential]` fields cannot use `#[serde({})]`: the column is \
+                 registered under its Rust name, which the log filter, version history \
+                 and admin redaction all key off. An alias is accepted on the way in, so \
+                 a request could deliver the envelope under a name no filter knows, and \
+                 `flatten` removes the key altogether.",
+                serde_key_display(key)
+            ),
+        ));
+    }
+
+    // The envelope is what the owning client needs back, so a confidential
+    // column is always serialized. Skipping it would also drop it out of the
+    // version-history snapshot, which is built from the `Serialize` view: the
+    // column would then produce no "changed" marker at all rather than the
+    // redacted one the registry promises. On the way in, the client's own bytes
+    // are the only valid value, so an omission has no server-side substitute.
+    if let Some(attr) = field_serde_omission(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            format!(
+                "`#[confidential]` fields cannot use `#[{attr}]`: the envelope is \
+                 ciphertext the owning client needs back, a skipped column leaves \
+                 version history with no record that it changed, and a defaulted one \
+                 stores an envelope no key opens."
+            ),
+        ));
+    }
+
+    if spec.blind_index {
+        validate_blind_index_companion(field, ident, siblings)?;
+    }
+
+    Ok(())
+}
+
+/// Validate the `<field>_bidx` companion of a `#[confidential(blind_index)]`
+/// field: it must exist, be a `BlindIndex`, and keep its Rust name.
+fn validate_blind_index_companion(
+    field: &syn::Field,
+    ident: &syn::Ident,
+    siblings: &[&Field],
+) -> syn::Result<()> {
+    let expected = blind_index_column(ident);
+    let companion = siblings
+        .iter()
+        .find(|f| f.ident.as_ref().is_some_and(|i| unraw_ident(i) == expected));
+    match companion {
+        Some(f) if ty_last_ident(&f.ty).as_deref() == Some("BlindIndex") => {
+            // The companion is registered under its Rust name too, and every
+            // protection it gets is keyed off that name: version-history
+            // redaction, the log parameter filter and the CSV export. A rename
+            // on the companion would leave the token unprotected under a name
+            // none of them look for, which is worse than a rename on the sealed
+            // column: the token is what tells an operator which of an owner's
+            // rows hold the same value.
+            // Markers that keep a column out of the `New*` struct leave the
+            // client-computed token with nowhere to go: the insert either fails
+            // on the non-null column or stores a server-side default that does
+            // not match the sealed value, and every equality lookup then misses
+            // the row.
+            for marker in ["default", "id", "lock_version", "position"] {
+                if has_attr(f, marker) {
+                    return Err(syn::Error::new_spanned(
+                        f,
+                        format!(
+                            "`{expected}` is a blind-index companion, so it cannot be \
+                             `#[{marker}]`: that keeps the column out of the insert, and \
+                             the token has to be the one the client computed for the \
+                             sealed value."
+                        ),
+                    ));
+                }
+            }
+            if field_serde_wire_name_override(f).is_some()
+                || diesel_column_name(f).is_some()
+                || field_serde_omission(f).is_some()
+            {
+                return Err(syn::Error::new_spanned(
+                    f,
+                    format!(
+                        "`{expected}` is a blind-index companion, so it cannot use \
+                         `#[serde(rename/alias = ...)]`, `#[serde(flatten)]`, \
+                         `#[diesel(column_name = ...)]`, `#[private]`, \
+                         `#[serde(skip_serializing)]`, `#[serde(default)]` or \
+                         `#[serde(skip_deserializing)]`: the token is registered under \
+                         its Rust name, which version history, the log filter and the CSV \
+                         export all key off, and a defaulted token matches no envelope."
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        Some(f) => Err(syn::Error::new_spanned(
+            &f.ty,
+            format!(
+                "`{expected}` is the blind-index companion of a \
+                 `#[confidential(blind_index)]` field, so it must be typed \
+                 `autumn_web::confidential::BlindIndex`."
+            ),
+        )),
+        None => Err(syn::Error::new_spanned(
+            field,
+            format!(
+                "`#[confidential(blind_index)]` needs a companion column \
+                 `{expected}: autumn_web::confidential::BlindIndex` on this \
+                 model. The client computes the token; the server only \
+                 compares it."
+            ),
+        )),
+    }
+}
+
+// ── #1654: `#[classified]` field attribute ───────────────────────────────────
+
+/// Whether a field is marked `#[classified]` (issue #1654): its value carries a
+/// data classification on the *type*, so it cannot reach a gated sink without
+/// passing a declared declassification boundary.
+fn field_is_classified(field: &syn::Field) -> bool {
+    has_attr(field, "classified")
+}
+
+/// Parse `#[classified]` / `#[classified(personal_data)]`.
+///
+/// The first slice supports exactly one tier, so the only accepted spelling
+/// beyond the bare marker is the tier's own name -- written out so a second tier
+/// is additive rather than a breaking respelling.
+fn validate_classified_tier(field: &syn::Field) -> syn::Result<()> {
+    for attr in &field.attrs {
+        if !attr.path().is_ident("classified") {
+            continue;
+        }
+        // `continue`, not `return`: a bare marker validates itself, but a field
+        // can carry more than one `#[classified]` attribute and every one of
+        // them has to be checked. Returning here let
+        // `#[classified] #[classified(top_secret)]` through, recording the
+        // column as `personal_data` while silently ignoring the tier the author
+        // actually asked for.
+        if matches!(attr.meta, syn::Meta::Path(_)) {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("personal_data") {
+                Ok(())
+            } else {
+                Err(meta.error(
+                    "unsupported `#[classified]` tier; the first slice supports \
+                     `personal_data` only (issue #1654). Write `#[classified]` or \
+                     `#[classified(personal_data)]`.",
+                ))
+            }
+        })?;
+    }
+    Ok(())
+}
+
+/// The generated zero-sized marker naming one classified column, e.g.
+/// `Customer::email` -> `CustomerEmailClassified`.
+///
+/// The name is load bearing twice over: it is what the compiler prints when a
+/// leak is attempted (so it has to read as the field it guards), and it is what
+/// `declassify!` names to tie a boundary to exactly one column.
+fn classified_marker_ident(model: &syn::Ident, field: &syn::Ident) -> syn::Ident {
+    let mut camel = String::new();
+    let mut upper_next = true;
+    for ch in unraw_ident(field).chars() {
+        if ch == '_' {
+            upper_next = true;
+        } else if upper_next {
+            camel.extend(ch.to_uppercase());
+            upper_next = false;
+        } else {
+            camel.push(ch);
+        }
+    }
+    // `Classified`, not `Field`: `{Model}Field` is already the generated
+    // field enum, so `Customer::email` -> `CustomerEmailClassified` would collide
+    // with a sibling `#[model] struct CustomerEmail`'s field enum. No column
+    // name can be empty, so `{Model}{Column}Classified` cannot collide with
+    // another model's marker either.
+    format_ident!(
+        "{}{}Classified",
+        unraw_ident(model),
+        camel,
+        span = field.span()
+    )
+}
+
+/// Validate a `#[classified]` field.
+///
+/// v1 classifies non-null `String` columns, mirroring `#[encrypted]`: those are
+/// the realistic personal-data columns (email, phone, address), and restricting
+/// the shape keeps one Diesel column representation instead of a generic one.
+/// Every rejected combination below is a pair whose two halves disagree about
+/// whether the value may be read back out in the clear.
+fn validate_classified_field(field: &syn::Field) -> syn::Result<()> {
+    if !field_is_classified(field) {
+        return Ok(());
+    }
+    validate_classified_tier(field)?;
+
+    for (marker, why) in [
+        (
+            "encrypted",
+            "an encrypted column already routes through its own Diesel wrapper, and \
+             the two wrappers cannot both own the column's representation. \
+             `#[encrypted]` protects the value at rest; `#[classified]` proves where \
+             it may go. Combining them lands in a later slice",
+        ),
+        (
+            "searchable",
+            "full-text search indexes the stored column, which would put the personal \
+             data in a search vector the classification cannot gate",
+        ),
+        (
+            "normalize",
+            "normalizers rewrite the column in place, which needs the plaintext out of \
+             the classification with no boundary to record it",
+        ),
+        (
+            "translatable",
+            "a per-locale container is a JSON document, not the single value a \
+             classification tier applies to",
+        ),
+        (
+            "id",
+            "a primary key is echoed back in URLs, ETags and pagination cursors, none \
+             of which is a gated sink",
+        ),
+        (
+            "lock_version",
+            "the optimistic-lock column is framework-managed and must stay a plain integer",
+        ),
+        (
+            "position",
+            "the position column is framework-managed and must stay a plain integer",
+        ),
+        (
+            "state_machine",
+            "a state column must hold one state name, which the state-machine codegen \
+             reads and writes directly",
+        ),
+    ] {
+        if has_attr(field, marker) {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!("`#[classified]` cannot be combined with `#[{marker}]`: {why}."),
+            ));
+        }
+    }
+
+    // The `String`-only rule is checked *after* the conflicting-marker loop on
+    // purpose: several of those markers (`#[translatable]`, `#[lock_version]`,
+    // `#[position]`, `#[id]`) imply a non-`String` column, and the reason that
+    // names the conflict is the one that tells the author what to do.
+    let is_string = matches!(&field.ty, syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "String"));
+    if !is_string {
+        return Err(syn::Error::new_spanned(
+            &field.ty,
+            "`#[classified]` is only supported on non-null `String` fields in v1 \
+             (issue #1654). Model the column as a `String`, or classify a \
+             neighbouring string column that holds the personal data.",
+        ));
+    }
+
+    // `tenant_id` is read directly by the tenancy codegen (preload scoping,
+    // `ModelTenantIdMeta`, the search-text projection), all of which expect the
+    // declared type. It is also an isolation key, not personal data.
+    if field
+        .ident
+        .as_ref()
+        .is_some_and(|i| unraw_ident(i) == "tenant_id")
+    {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[classified]` cannot be applied to `tenant_id`: the tenancy codegen reads \
+             the column directly as its isolation key, and a tenant identifier is not the \
+             personal data this tier describes.",
+        ));
+    }
+    // A custom serde adapter is written against the declared type and would be
+    // handed the taint wrapper instead -- and a `serialize_with` is a serializer
+    // for the very value the classification is withholding.
+    if has_hook_serde_adapter(field, SerdeAdapterMode::Serialize)
+        || has_hook_serde_adapter(field, SerdeAdapterMode::Deserialize)
+    {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[classified]` cannot be combined with `#[serde(with = ...)]`, \
+             `#[serde(serialize_with = ...)]` or `#[serde(deserialize_with = ...)]`: the \
+             adapter is written against the declared type, and a `serialize_with` is a \
+             serializer for the value the classification withholds.",
+        ));
+    }
+    // The classified column is registered in the data-flow manifest under its
+    // Rust field name. A `#[serde(rename)]` would desync the manifest row from
+    // the wire name a reviewer reads it against.
+    if field_has_serde_rename(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[classified]` fields cannot use `#[serde(rename = ...)]` in v1: the \
+             column is registered in the data-flow manifest under its Rust name, \
+             which must match the name the manifest is reviewed against.",
+        ));
+    }
+    Ok(())
+}
+
 /// Build a manual `Debug` impl that redacts encrypted fields, so plaintext
 /// (held in memory as a `String` for ergonomics) never appears in `Debug`
 /// output, panic backtraces, or framework error messages. The development-only
@@ -1593,10 +5133,17 @@ fn redacting_debug_impl(
     struct_name: &syn::Ident,
     field_idents: &[&syn::Ident],
     encrypted_names: &[&str],
+    classified_names: &[&str],
 ) -> TokenStream {
     let stmts = field_idents.iter().map(|ident| {
         let nm = ident.to_string();
-        if encrypted_names.contains(&nm.as_str()) {
+        if classified_names.contains(&nm.as_str()) {
+            // #1654: the read model's column is already a `Classified<..>` with a
+            // redacting `Debug`, but `New*`/`Update*`/`Changeset` hold the plain
+            // `String` (the write path is not a gated sink), and their `Debug`
+            // reaches panic output and error pages just the same.
+            quote! { s.field(#nm, &::core::format_args!("<classified>")); }
+        } else if encrypted_names.contains(&nm.as_str()) {
             quote! {
                 if ::autumn_web::encryption::debug_plaintext_enabled() {
                     s.field(#nm, &self.#ident);
@@ -1648,9 +5195,14 @@ fn validate_encrypted_field(field: &syn::Field) -> syn::Result<()> {
     }
     // `#[encrypted]` columns must flow through the `serialize_as` wrapper on
     // insert. Fields excluded from the insert (`#[id]`, `#[default]`,
-    // `#[lock_version]`) would instead get a raw database value, which the
-    // decrypting reader then rejects as a malformed envelope. Reject the combo.
-    if has_attr(field, "default") || has_attr(field, "lock_version") || has_attr(field, "id") {
+    // `#[lock_version]`, `#[position]`) would instead get a raw database
+    // value, which the decrypting reader then rejects as a malformed
+    // envelope. Reject the combo.
+    if has_attr(field, "default")
+        || has_attr(field, "lock_version")
+        || has_attr(field, "id")
+        || has_attr(field, "position")
+    {
         return Err(syn::Error::new_spanned(
             field,
             "`#[encrypted]` cannot be combined with `#[default]`, `#[lock_version]`, \
@@ -1686,6 +5238,611 @@ fn validate_encrypted_field(field: &syn::Field) -> syn::Result<()> {
     Ok(())
 }
 
+// ── #1384: `#[translatable]` field attribute ─────────────────────────────────
+
+/// Validate a `#[translatable]` field.
+///
+/// The attribute is a marker: the *type* carries the behaviour, so the type
+/// has to be right. Everything else rejected here is a combination whose two
+/// halves disagree about what the column contains — a JSON container is not a
+/// string to encrypt, index, normalize, or full-text search.
+fn validate_translatable_field(field: &syn::Field) -> syn::Result<()> {
+    if !field_is_translatable(field) {
+        return Ok(());
+    }
+    // The type must be `Translated` (however it is spelled: bare, or fully
+    // qualified through any path). `Option<Translated>` is rejected on
+    // purpose — the container already models "no translation" as an empty
+    // map, and a nullable column would give two spellings for one state.
+    let is_translated = matches!(
+        &field.ty,
+        syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "Translated")
+            && p.path.segments.last().is_some_and(|s| s.arguments.is_empty())
+    );
+    if !is_translated {
+        return Err(syn::Error::new_spanned(
+            &field.ty,
+            "`#[translatable]` requires the field type `autumn_web::i18n::Translated` \
+             (a per-locale container), not a plain string. Change the field to \
+             `pub <name>: autumn_web::i18n::Translated`; it renders the active \
+             locale through `Display` and keeps every other locale intact on write. \
+             The check is syntactic — a type alias for `Translated` is not \
+             recognised, and conversely any type whose last path segment is \
+             `Translated` is accepted, so spell the real type here.",
+        ));
+    }
+    // Combinations whose two halves disagree about the column's contents.
+    for (marker, why) in [
+        (
+            "encrypted",
+            "an encrypted column stores one opaque ciphertext envelope, which has no \
+             per-locale structure to resolve",
+        ),
+        (
+            "searchable",
+            "full-text search indexes the stored column, which for a translatable field \
+             is a JSON container — the index would match locale tags and JSON \
+             punctuation, not the prose",
+        ),
+        (
+            "normalize",
+            "normalizers rewrite a single string; they cannot see inside the per-locale \
+             container",
+        ),
+        (
+            "unique",
+            "uniqueness would compare whole JSON containers, so two records translated \
+             into different locale sets would never collide even with identical text",
+        ),
+        (
+            "indexed",
+            "an equality index over a JSON container matches whole containers, never a \
+             single locale's value",
+        ),
+        ("id", "a primary key must be a single scalar value"),
+        (
+            "lock_version",
+            "the optimistic-lock column is framework-managed and must stay a plain integer",
+        ),
+        (
+            "position",
+            "the position column is framework-managed and must stay a plain integer",
+        ),
+        (
+            "state_machine",
+            "a state column must hold one state name, not a per-locale container",
+        ),
+    ] {
+        if has_attr(field, marker) {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!(
+                    "`#[translatable]` cannot be combined with `#[{marker}]`: {why}. \
+                     Keep a separate non-translatable column for that."
+                ),
+            ));
+        }
+    }
+    // The column is registered under its Rust field name, which the registry
+    // and the generated field-name-keyed accessors match against. A
+    // `#[serde(rename)]` would desync them.
+    if field_has_serde_rename(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[translatable]` fields cannot use `#[serde(rename = ...)]`: the column is \
+             registered under its Rust name, which must match the field name passed to \
+             `available_locales(..)` / `is_translated(..)`.",
+        ));
+    }
+    // `#[diesel(column_name = ...)]` is the spelling that actually renames the
+    // *database* column, so it desyncs the registry harder than a serde rename:
+    // `TranslatableColumnDescriptor` would name a column that does not exist on
+    // the table. Refuse it for the same reason, and say which one.
+    if field_has_diesel_column_name(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[translatable]` fields cannot use `#[diesel(column_name = ...)]`: the column \
+             is registered for framework surfaces under its Rust name, so a renamed database \
+             column would be advertised under a name that does not exist on the table. Name \
+             the Rust field after the column instead.",
+        ));
+    }
+    Ok(())
+}
+
+// ── #1806: `#[collaborative]` field attribute ────────────────────────────────
+
+/// Marker combinations `#[collaborative]` refuses, with the reason each one
+/// is incoherent.
+///
+/// A table rather than a match arm: every entry is a pair whose two halves
+/// disagree about what the column contains, and the reason is what the author
+/// reads.
+const COLLABORATIVE_MARKER_CONFLICTS: &[(&str, &str)] = &[
+    (
+        "encrypted",
+        "an encrypted column stores one opaque ciphertext envelope, which the \
+         merge cannot read the characters out of",
+    ),
+    (
+        "classified",
+        "a classification tier applies to one value; a CRDT document is a JSON \
+         container of characters, and the merge would move them across the \
+         boundary the tier records",
+    ),
+    (
+        "searchable",
+        "full-text search indexes the stored column, which for a collaborative \
+         field is a JSON container — the index would match character ids and \
+         JSON punctuation, not the prose",
+    ),
+    (
+        "translatable",
+        "both markers own the column's representation, and one column cannot \
+         hold a per-locale container and a CRDT document at once. Keep one \
+         collaborative column per locale",
+    ),
+    (
+        "normalize",
+        "normalizers rewrite a single string; they cannot see inside the \
+         document, and a rewrite behind the merge's back would drop characters \
+         other editors still hold",
+    ),
+    (
+        "unique",
+        "uniqueness would compare whole documents, so two records with identical \
+         text but different edit histories would never collide",
+    ),
+    (
+        "indexed",
+        "an equality index over a CRDT document matches whole documents, never \
+         the text",
+    ),
+    ("id", "a primary key must be a single scalar value"),
+    (
+        "lock_version",
+        "the optimistic-lock column is framework-managed and must stay a plain integer",
+    ),
+    (
+        "position",
+        "the position column is framework-managed and must stay a plain integer",
+    ),
+    (
+        "state_machine",
+        "a state column must hold one state name, not a document",
+    ),
+];
+
+/// Validate a `#[collaborative]` field.
+///
+/// The attribute is a marker: the *type* carries the merge, so the type has to
+/// be right. The rest is [`COLLABORATIVE_MARKER_CONFLICTS`] plus the two
+/// renames that would desync the registry.
+fn validate_collaborative_field(field: &syn::Field) -> syn::Result<()> {
+    if !field_is_collaborative(field) {
+        return Ok(());
+    }
+    // The type must be `CollabText` (however it is spelled: bare, or fully
+    // qualified through any path). `Option<CollabText>` is rejected on purpose
+    // — an empty document already models "no text", and a nullable column
+    // would give two spellings for one state.
+    let is_collab_text = matches!(
+        &field.ty,
+        syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "CollabText")
+            && p.path.segments.last().is_some_and(|s| s.arguments.is_empty())
+    );
+    if !is_collab_text {
+        return Err(syn::Error::new_spanned(
+            &field.ty,
+            "`#[collaborative]` requires the field type `autumn_web::collab::CollabText` \
+             (a text CRDT), not a plain string. Change the field to \
+             `pub <name>: autumn_web::collab::CollabText`; it renders through \
+             `Display` and merges concurrent edits character by character \
+             instead of letting the last writer overwrite them. The check is \
+             syntactic — a type alias for `CollabText` is not recognised, and \
+             conversely any type whose last path segment is `CollabText` is \
+             accepted, so spell the real type here.",
+        ));
+    }
+    for (marker, why) in COLLABORATIVE_MARKER_CONFLICTS {
+        if has_attr(field, marker) {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!(
+                    "`#[collaborative]` cannot be combined with `#[{marker}]`: {why}. \
+                     Keep a separate non-collaborative column for that."
+                ),
+            ));
+        }
+    }
+    // The column is registered under its Rust field name, which the registry,
+    // the generated field-name-keyed accessors and `CollabResolver` all match
+    // against. Anything that gives the field a different wire name — or no
+    // name of its own — desyncs them.
+    //
+    // `rename` moves the key, `alias` adds a second one a request may arrive
+    // under, and `flatten` removes it entirely: the document's `elems` and
+    // `pending` are emitted at the row's top level, so the resolver's lookup
+    // of the registered name finds nothing, falls through to the wrapped
+    // last-write-wins verdict, and discards one replica's edits — silently,
+    // which is the outcome this whole feature exists to prevent.
+    if let Some(key) = field_serde_wire_name_override(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            format!(
+                "`#[collaborative]` fields cannot use `#[serde({})]`: the column is \
+                 registered under its Rust name, which must match the field name passed to \
+                 `collaborative(..)`, used as the session key, and looked up by \
+                 `CollabResolver` when it merges an offline edit.",
+                serde_key_display(key),
+            ),
+        ));
+    }
+    // And anything that drops the column from the serialized form. The
+    // resolver reads both sides of a conflict out of the row's JSON, so a
+    // column that is not there is a column it cannot merge: the offline edit
+    // loses to last-write-wins exactly as if the field had never been marked.
+    if let Some(key) = field_serde_omission(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            format!(
+                "`#[collaborative]` fields cannot use `#[{key}]`: the column must be present \
+                 in the serialized row for `CollabResolver` to find and merge it. Without it \
+                 a conflicting offline edit falls back to last-write-wins and one side's \
+                 text is discarded."
+            ),
+        ));
+    }
+    // `#[diesel(column_name = ...)]` renames the *database* column, so it
+    // desyncs the registry harder than a serde rename: the descriptor would
+    // name a column that does not exist on the table.
+    if field_has_diesel_column_name(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[collaborative]` fields cannot use `#[diesel(column_name = ...)]`: the column \
+             is registered for framework surfaces under its Rust name, so a renamed database \
+             column would be advertised under a name that does not exist on the table. Name \
+             the Rust field after the column instead.",
+        ));
+    }
+    Ok(())
+}
+
+/// Build the `impl` block a model's `#[collaborative]` fields contribute:
+/// per-field edit helpers plus the field-name-keyed surface a session hub
+/// resolves a document from (issue #1806).
+///
+/// Returns an empty token stream when the model has no collaborative field, so
+/// a model that never opts in expands byte-for-byte as before.
+/// The rustdoc for one collaborative field's generated accessors.
+struct CollaborativeDocs {
+    text: String,
+    insert: String,
+    remove: String,
+    set: String,
+    merge: String,
+}
+
+/// Written out here rather than inline so `emit_collaborative_items` stays
+/// about the code it emits.
+fn collaborative_docs(name: &str) -> CollaborativeDocs {
+    CollaborativeDocs {
+        text: format!("`{name}` as visible text."),
+        insert: format!(
+            "Insert `text` into `{name}` before visible character `index`, as `actor`. \
+             Returns the operations to send to the other editors.\n\n\
+             # Errors\n\n\
+             Returns [`CollabEditError`](::autumn_web::collab::CollabEditError) when \
+             `actor` is empty or the counter space cannot seat the whole of `text`. \
+             Nothing is applied either way."
+        ),
+        remove: format!("Delete `count` visible characters from `{name}`, starting at `index`."),
+        set: format!(
+            "Rewrite `{name}` to `text` with the smallest edit that gets there, so a \
+             concurrent edit outside the changed span survives.\n\n\
+             # Errors\n\n\
+             Returns [`CollabEditError`](::autumn_web::collab::CollabEditError) when \
+             `actor` is empty or the counter space cannot seat the replacement. Nothing \
+             is applied either way — in particular the replaced span is not tombstoned."
+        ),
+        merge: format!("Merge another replica's `{name}` in. Order does not matter."),
+    }
+}
+
+fn emit_collaborative_items(model: &syn::Ident, fields: &[&syn::Ident]) -> TokenStream {
+    if fields.is_empty() {
+        return quote! {};
+    }
+    // `unraw()` for the same reason as in `emit_translatable_items`: the key
+    // must be the real column name, not `r#type`.
+    let names: Vec<String> = fields.iter().map(|f| unraw_ident(f)).collect();
+    let per_field = fields.iter().map(|ident| {
+        let name = unraw_ident(ident);
+        let text = format_ident!("{}_text", ident);
+        let insert = format_ident!("{}_insert", ident);
+        let remove = format_ident!("{}_remove", ident);
+        let set_text = format_ident!("{}_set_text", ident);
+        let merge = format_ident!("{}_merge", ident);
+        let CollaborativeDocs {
+            text: doc_text,
+            insert: doc_insert,
+            remove: doc_remove,
+            set: doc_set,
+            merge: doc_merge,
+        } = collaborative_docs(&name);
+        quote! {
+            #[doc = #doc_text]
+            #[must_use]
+            pub fn #text(&self) -> ::std::string::String {
+                self.#ident.text()
+            }
+
+            #[doc = #doc_insert]
+            pub fn #insert(
+                &mut self,
+                actor: &str,
+                index: usize,
+                text: &str,
+            ) -> ::std::result::Result<
+                ::std::vec::Vec<::autumn_web::collab::CollabOp>,
+                ::autumn_web::collab::CollabEditError,
+            > {
+                self.#ident.insert(actor, index, text)
+            }
+
+            #[doc = #doc_remove]
+            pub fn #remove(
+                &mut self,
+                index: usize,
+                count: usize,
+            ) -> ::std::vec::Vec<::autumn_web::collab::CollabOp> {
+                self.#ident.remove(index, count)
+            }
+
+            #[doc = #doc_set]
+            pub fn #set_text(
+                &mut self,
+                actor: &str,
+                text: &str,
+            ) -> ::std::result::Result<
+                ::std::vec::Vec<::autumn_web::collab::CollabOp>,
+                ::autumn_web::collab::CollabEditError,
+            > {
+                self.#ident.set_text(actor, text)
+            }
+
+            #[doc = #doc_merge]
+            pub fn #merge(&mut self, other: &::autumn_web::collab::CollabText) {
+                self.#ident.merge(other);
+            }
+        }
+    });
+    let read_arms = fields.iter().zip(names.iter()).map(|(ident, name)| {
+        quote! { #name => ::core::option::Option::Some(&self.#ident), }
+    });
+    let write_arms = fields.iter().zip(names.iter()).map(|(ident, name)| {
+        quote! { #name => ::core::option::Option::Some(&mut self.#ident), }
+    });
+    quote! {
+        impl #model {
+            #(#per_field)*
+
+            /// Field names on this model declared `#[collaborative]`.
+            #[must_use]
+            pub const fn collaborative_fields() -> &'static [&'static str] {
+                Self::__AUTUMN_COLLABORATIVE_COLUMNS
+            }
+
+            /// The document for `field`, or `None` when the model has no
+            /// collaborative field by that name.
+            #[must_use]
+            pub fn collaborative(
+                &self,
+                field: &str,
+            ) -> ::core::option::Option<&::autumn_web::collab::CollabText> {
+                match field {
+                    #(#read_arms)*
+                    _ => ::core::option::Option::None,
+                }
+            }
+
+            /// The document for `field`, mutably — how a session hub applies
+            /// an incoming operation to the record it loaded.
+            pub fn collaborative_mut(
+                &mut self,
+                field: &str,
+            ) -> ::core::option::Option<&mut ::autumn_web::collab::CollabText> {
+                match field {
+                    #(#write_arms)*
+                    _ => ::core::option::Option::None,
+                }
+            }
+        }
+    }
+}
+
+/// An identifier's name with any raw-identifier prefix removed (`r#type` ->
+/// `type`), matching the DB column and the key callers pass to the
+/// field-name-driven accessors.
+fn unraw_ident(ident: &syn::Ident) -> String {
+    let raw = ident.to_string();
+    raw.strip_prefix("r#").unwrap_or(&raw).to_owned()
+}
+
+/// Whether a field is the framework's tenant discriminator: the model macro
+/// keys tenant scoping off a field named `tenant_id`, wherever it appears.
+fn is_tenant_id_field(field: &syn::Field) -> bool {
+    field.ident.as_ref().is_some_and(|i| i == "tenant_id")
+}
+
+/// Whether a field is the framework's soft-delete marker, `deleted_at`.
+fn is_deleted_at_field(field: &syn::Field) -> bool {
+    field.ident.as_ref().is_some_and(|i| i == "deleted_at")
+}
+
+/// Whether a field carries `#[diesel(column_name = ...)]`, which renames the
+/// database column out from under the Rust field name.
+fn field_has_diesel_column_name(field: &syn::Field) -> bool {
+    diesel_column_name(field).is_some()
+}
+
+/// The database column a field's `#[diesel(column_name = ...)]` names, when it
+/// carries one. Diesel accepts both spellings, `column_name = revision` and
+/// `column_name = "revision"`, and so does this.
+///
+/// A `column_name` whose value is neither is still reported, as an empty name:
+/// this is a detector, not a validator (Diesel's own derive reports malformed
+/// input with a better message), and a caller asking "is this field renamed?"
+/// must not answer "no" because the rename did not parse.
+fn diesel_column_name(field: &syn::Field) -> Option<String> {
+    let mut found = None;
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("diesel")) {
+        // Swallow any parse error, for the reason above.
+        let _ = attr.parse_nested_meta(|meta| {
+            let value = meta
+                .value()
+                .and_then(syn::parse::ParseBuffer::parse::<syn::Expr>);
+            if meta.path.is_ident("column_name") {
+                let name = match value {
+                    Ok(syn::Expr::Path(path)) => {
+                        path.path.get_ident().map(unraw_ident).unwrap_or_default()
+                    }
+                    Ok(syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(lit),
+                        ..
+                    })) => lit.value(),
+                    _ => String::new(),
+                };
+                found = Some(name);
+            }
+            Ok(())
+        });
+    }
+    found
+}
+
+/// Build the `impl` block a model's `#[translatable]` fields contribute:
+/// per-field accessors plus the field-name-keyed surface an app renders a
+/// "needs translation" affordance from (issue #1384 AC5).
+///
+/// Returns an empty token stream when the model has no translatable field, so
+/// a model that never opts in expands byte-for-byte as before.
+fn emit_translatable_items(model: &syn::Ident, fields: &[&syn::Ident]) -> TokenStream {
+    if fields.is_empty() {
+        return quote! {};
+    }
+    // Strip the raw-identifier prefix (the house idiom, see `pascal_case`):
+    // `Ident`'s `Display` keeps `r#`, so a `#[translatable] pub r#type:
+    // Translated` field would be keyed as `"r#type"` — a name no `SELECT`
+    // resolves and no caller of `available_locales("type")` would ever pass.
+    let names: Vec<String> = fields.iter().map(|f| unraw_ident(f)).collect();
+    let per_field = fields.iter().map(|ident| {
+        let name = ident.to_string();
+        let localized = format_ident!("{}_localized", ident);
+        let in_locale = format_ident!("{}_in", ident);
+        let setter = format_ident!("set_{}", ident);
+        let locales = format_ident!("{}_locales", ident);
+        let is_translated = format_ident!("{}_is_translated", ident);
+        let doc_localized = format!(
+            "`{name}` resolved against the request's active locale, walking the \
+             configured fallback chain on miss. `None` once the chain is exhausted."
+        );
+        let doc_in =
+            format!("`{name}` resolved against an explicit locale, then the fallback chain.");
+        let doc_set = format!(
+            "Store `value` as `{name}`'s translation for `locale`, leaving every other \
+             locale untouched."
+        );
+        let doc_locales = format!("Every locale `{name}` has been translated into, in tag order.");
+        let doc_is_translated = format!("Whether `{name}` has its own translation for `locale`.");
+        quote! {
+            #[doc = #doc_localized]
+            #[must_use]
+            pub fn #localized(&self) -> ::core::option::Option<&str> {
+                self.#ident.resolve()
+            }
+
+            #[doc = #doc_in]
+            #[must_use]
+            pub fn #in_locale(&self, locale: &str) -> ::core::option::Option<&str> {
+                self.#ident.resolve_in(locale)
+            }
+
+            #[doc = #doc_set]
+            pub fn #setter(
+                &mut self,
+                locale: impl ::core::convert::Into<::std::string::String>,
+                value: impl ::core::convert::Into<::std::string::String>,
+            ) -> &mut Self {
+                self.#ident.set(locale, value);
+                self
+            }
+
+            #[doc = #doc_locales]
+            #[must_use]
+            pub fn #locales(&self) -> ::std::vec::Vec<&str> {
+                self.#ident.available_locales()
+            }
+
+            #[doc = #doc_is_translated]
+            #[must_use]
+            pub fn #is_translated(&self, locale: &str) -> bool {
+                self.#ident.is_translated(locale)
+            }
+        }
+    });
+    let match_arms = fields.iter().zip(names.iter()).map(|(ident, name)| {
+        quote! { #name => ::core::option::Option::Some(&self.#ident), }
+    });
+    quote! {
+        impl #model {
+            #(#per_field)*
+
+            /// Field names on this model declared `#[translatable]`.
+            #[must_use]
+            pub const fn translatable_fields() -> &'static [&'static str] {
+                Self::__AUTUMN_TRANSLATABLE_COLUMNS
+            }
+
+            /// The raw per-locale container for `field`, or `None` when the
+            /// model has no translatable field by that name.
+            #[must_use]
+            pub fn translated(
+                &self,
+                field: &str,
+            ) -> ::core::option::Option<&::autumn_web::i18n::Translated> {
+                match field {
+                    #(#match_arms)*
+                    _ => ::core::option::Option::None,
+                }
+            }
+
+            /// Which locales `field` has been translated into — the
+            /// "needs translation" affordance. Empty for an unknown field.
+            #[must_use]
+            pub fn available_locales(&self, field: &str) -> ::std::vec::Vec<&str> {
+                self.translated(field)
+                    .map(::autumn_web::i18n::Translated::available_locales)
+                    .unwrap_or_default()
+            }
+
+            /// Whether `field` has its own translation for `locale`.
+            #[must_use]
+            pub fn is_translated(&self, field: &str, locale: &str) -> bool {
+                self.translated(field)
+                    .is_some_and(|t| t.is_translated(locale))
+            }
+
+            /// `field` resolved against the request's active locale.
+            #[must_use]
+            pub fn localized(&self, field: &str) -> ::core::option::Option<&str> {
+                self.translated(field)
+                    .and_then(::autumn_web::i18n::Translated::resolve)
+            }
+        }
+    }
+}
+
 // ── #1379: `#[normalize(...)]` field normalization ────────────────────────
 
 /// One normalizer step from a `#[normalize(...)]` attribute, applied
@@ -1700,11 +5857,15 @@ enum Normalizer {
     Upcase,
     /// `squish` — trim and collapse internal whitespace runs to one space.
     Squish,
+    /// `strip_nul` — remove every NUL (`U+0000`), which a Postgres
+    /// `TEXT`/`VARCHAR` column cannot store (#2423).
+    StripNul,
     /// `with = path::to::fn` — user escape hatch (`fn(&str) -> String`).
     With(syn::Path),
 }
 
-/// Parse a field's `#[normalize(trim, downcase, upcase, squish, with = path)]`
+/// Parse a field's
+/// `#[normalize(trim, downcase, upcase, squish, strip_nul, with = path)]`
 /// attribute into an ordered list of normalizers. Returns an empty list when
 /// the field has no `#[normalize]` attribute.
 fn parse_field_normalize(field: &syn::Field) -> syn::Result<Vec<Normalizer>> {
@@ -1736,13 +5897,16 @@ fn parse_field_normalize(field: &syn::Field) -> syn::Result<Vec<Normalizer>> {
                 ops.push(Normalizer::Upcase);
             } else if meta.path.is_ident("squish") {
                 ops.push(Normalizer::Squish);
+            } else if meta.path.is_ident("strip_nul") {
+                ops.push(Normalizer::StripNul);
             } else if meta.path.is_ident("with") {
                 let path: syn::Path = meta.value()?.parse()?;
                 ops.push(Normalizer::With(path));
             } else {
                 return Err(meta.error(
                     "unsupported `#[normalize]` option; expected one of \
-                     `trim`, `downcase`, `upcase`, `squish`, or `with = path`",
+                     `trim`, `downcase`, `upcase`, `squish`, `strip_nul`, or \
+                     `with = path`",
                 ));
             }
             Ok(())
@@ -1793,6 +5957,9 @@ fn emit_normalize_expr(ops: &[Normalizer], value_expr: &TokenStream) -> TokenStr
         Normalizer::Squish => {
             quote! { __autumn_n = ::autumn_web::normalize::squish(&__autumn_n); }
         }
+        Normalizer::StripNul => {
+            quote! { __autumn_n = ::autumn_web::normalize::strip_nul(&__autumn_n); }
+        }
         Normalizer::With(path) => quote! { __autumn_n = #path(&__autumn_n); },
     });
     quote! {{
@@ -1819,6 +5986,95 @@ fn attrs_have_serde_rename_all(attrs: &[syn::Attribute]) -> bool {
     found
 }
 
+/// The attribute, if any, that lets a confidential value leave or enter the
+/// model without the client's own bytes. Named as the author wrote it.
+///
+/// On the way out, a column omitted on any path is absent from the
+/// version-history snapshot, which is built from the `Serialize` view, so it
+/// produces no "changed" marker at all. This is broader than
+/// [`field_already_skips_serialization`], which drives attribute injection and
+/// must not treat a conditional skip as an unconditional one.
+///
+/// On the way in, both wrappers implement `Default`, so serde reads an omitted
+/// value as valid input rather than an error: a defaulted `Sealed` is an
+/// envelope no key opens, and a defaulted `BlindIndex` is a random token that
+/// matches no envelope.
+fn field_serde_omission(field: &syn::Field) -> Option<&'static str> {
+    if has_attr(field, "private") {
+        return Some("private");
+    }
+    if field_already_skips_serialization(field) {
+        return Some("serde(skip_serializing)");
+    }
+    if field_has_skip_serializing_if(field) {
+        return Some("serde(skip_serializing_if = ...)");
+    }
+    match serde_bare_word(&field.attrs, &["skip_deserializing", "default"]) {
+        Some("skip_deserializing") => Some("serde(skip_deserializing)"),
+        Some(_) => Some("serde(default)"),
+        None => None,
+    }
+}
+
+/// Render a serde key as it is written: `flatten` and `transparent` take no
+/// value, the others do.
+fn serde_key_display(key: &str) -> String {
+    if matches!(key, "flatten" | "transparent") {
+        key.to_owned()
+    } else {
+        format!("{key} = ...")
+    }
+}
+
+/// Whether a container reshapes its serialized form: `#[serde(into = "...")]`,
+/// `from`, `try_from` or `transparent`.
+///
+/// The first three decide the keys and `transparent` removes them, so a registry
+/// keyed on the model's own field names cannot see through any of them.
+fn attrs_have_serde_shape_conversion(attrs: &[syn::Attribute]) -> Option<&'static str> {
+    let mut found = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            for key in ["into", "from", "try_from", "transparent"] {
+                if meta.path.is_ident(key) {
+                    found = found.or(Some(key));
+                }
+            }
+            if let Ok(value) = meta.value() {
+                let _: syn::Result<syn::Lit> = value.parse();
+            } else if meta.input.peek(syn::token::Paren) {
+                let _ = meta.parse_nested_meta(|_| Ok(()));
+            }
+            Ok(())
+        });
+    }
+    found
+}
+
+/// Whether a container lets serde fill a missing field from `Default`:
+/// `#[serde(default)]` or `#[serde(default = "...")]` written on the struct.
+///
+/// Serde applies it to every field the input omits, so unlike the field-level
+/// spelling it reaches the sealed column and its token without either of them
+/// carrying an attribute of its own.
+fn attrs_have_serde_container_default(attrs: &[syn::Attribute]) -> bool {
+    let mut found = false;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("default") {
+                found = true;
+            }
+            if let Ok(value) = meta.value() {
+                let _: syn::Result<syn::Lit> = value.parse();
+            } else if meta.input.peek(syn::token::Paren) {
+                let _ = meta.parse_nested_meta(|_| Ok(()));
+            }
+            Ok(())
+        });
+    }
+    found
+}
+
 /// Whether a field carries a `#[serde(rename = "...")]` (which would desync the
 /// encrypted-column registry from the serialized key).
 fn field_has_serde_rename(field: &syn::Field) -> bool {
@@ -1838,144 +6094,40 @@ fn field_has_serde_rename(field: &syn::Field) -> bool {
     renamed
 }
 
-/// The struct-level `#[serde(rename_all = "...")]` casing rule that applies
-/// to *serialization*, if any. Handles both the plain form and the split
-/// `rename_all(serialize = "...", deserialize = "...")` form (taking the
-/// `serialize` side — that is what `Changeset::field_value` indexes by).
+/// The `#[serde(...)]` key that stops a field appearing under its Rust name:
+/// `rename` (what it serializes as), `alias` (what it also accepts on the way
+/// in) or `flatten` (no key of its own at all).
 ///
-/// Same parsing convention as `field_has_serde_rename`: a `#[serde(...)]`
-/// list this parser can't fully walk simply yields no rule (the real serde
-/// derive still validates the attribute itself).
-pub fn serde_rename_all_serialize_rule(attrs: &[syn::Attribute]) -> Option<String> {
-    let mut rule = None;
-    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
-        let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("rename_all") {
-                if let Ok(value) = meta.value() {
-                    // rename_all = "camelCase"
-                    if let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>() {
-                        rule = Some(s.value());
-                    }
-                } else {
-                    // rename_all(serialize = "...", deserialize = "...")
-                    let _ = meta.parse_nested_meta(|inner| {
-                        if let Ok(value) = inner.value()
-                            && let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>()
-                            && inner.path.is_ident("serialize")
-                        {
-                            rule = Some(s.value());
-                        }
-                        Ok(())
-                    });
-                }
-            } else if let Ok(value) = meta.value() {
-                // Consume any `= value` so sibling metas keep parsing.
-                let _: syn::Result<syn::Lit> = value.parse();
-            }
-            Ok(())
-        });
+/// `#[confidential]` keys every protection off the Rust name, so all three
+/// matter. `alias` is the subtlest: the field still serializes under its Rust
+/// name, but a request may deliver it under the alias, and a raw-JSON capture
+/// path (a failure capsule, an error-page body preview) filters on names the
+/// registry knows. `flatten` does not even work on a `Sealed` column — serde
+/// takes the derive and fails at run time, because the value serializes as a
+/// string — and `version_column_values()` turns that failure into an empty
+/// snapshot, so the update records no change marker at all.
+fn field_serde_wire_name_override(field: &syn::Field) -> Option<&'static str> {
+    if let Some(word) = serde_bare_word(&field.attrs, &["flatten"]) {
+        return Some(word);
     }
-    rule
-}
-
-/// The field-level `#[serde(rename = "...")]` name that applies to
-/// *serialization*, if any. Handles both the plain form and the split
-/// `rename(serialize = "...", deserialize = "...")` form (taking the
-/// `serialize` side). Field-level `rename` overrides a struct-level
-/// `rename_all`, mirroring serde's own precedence.
-fn field_serde_serialize_rename(field: &syn::Field) -> Option<String> {
-    let mut renamed = None;
+    let mut found = None;
     for attr in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {
         let _ = attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("rename") {
-                if let Ok(value) = meta.value() {
-                    // rename = "headline"
-                    if let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>() {
-                        renamed = Some(s.value());
-                    }
-                } else {
-                    // rename(serialize = "...", deserialize = "...")
-                    let _ = meta.parse_nested_meta(|inner| {
-                        if let Ok(value) = inner.value()
-                            && let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>()
-                            && inner.path.is_ident("serialize")
-                        {
-                            renamed = Some(s.value());
-                        }
-                        Ok(())
-                    });
-                }
-            } else if let Ok(value) = meta.value() {
-                // Consume any `= value` so sibling metas keep parsing.
+                found = Some("rename");
+            } else if meta.path.is_ident("alias") {
+                found = found.or(Some("alias"));
+            }
+            // Consume any `= value` so sibling metas keep parsing.
+            if let Ok(value) = meta.value() {
                 let _: syn::Result<syn::Lit> = value.parse();
+            } else if meta.input.peek(syn::token::Paren) {
+                let _ = meta.parse_nested_meta(|_| Ok(()));
             }
             Ok(())
         });
     }
-    renamed
-}
-
-/// Apply a struct-level `#[serde(rename_all = "...")]` casing rule to a
-/// (`snake_case`) field identifier, mirroring `serde_derive`'s
-/// `RenameRule::apply_to_field`. Returns `None` for a rule string serde
-/// itself would reject (the `Serialize` derive on the emitted struct then
-/// reports the error — no point duplicating it here).
-fn apply_serde_rename_all_rule(rule: &str, field: &str) -> Option<String> {
-    fn pascal(field: &str) -> String {
-        field
-            .split('_')
-            .map(|word| {
-                let mut chars = word.chars();
-                chars.next().map_or_else(String::new, |first| {
-                    first.to_uppercase().collect::<String>() + chars.as_str()
-                })
-            })
-            .collect()
-    }
-    match rule {
-        // serde treats fields as already snake_case/lowercase.
-        "lowercase" | "snake_case" => Some(field.to_owned()),
-        "UPPERCASE" | "SCREAMING_SNAKE_CASE" => Some(field.to_ascii_uppercase()),
-        "PascalCase" => Some(pascal(field)),
-        "camelCase" => {
-            let pascal = pascal(field);
-            let mut chars = pascal.chars();
-            chars
-                .next()
-                .map(|first| first.to_lowercase().collect::<String>() + chars.as_str())
-        }
-        "kebab-case" => Some(field.replace('_', "-")),
-        "SCREAMING-KEBAB-CASE" => Some(field.to_ascii_uppercase().replace('_', "-")),
-        _ => None,
-    }
-}
-
-/// The JSON-schema property name a field serializes to, honoring serde attrs.
-///
-/// Precedence mirrors serde: a field-level `#[serde(rename = "...")]` wins over
-/// a container `#[serde(rename_all = "...")]`, which in turn overrides the raw
-/// identifier. The raw-ident prefix (`r#`) is stripped first, so a field
-/// `r#type` advertises the property name `"type"` (what the handler actually
-/// deserializes), never the literal `"r#type"`.
-///
-/// KNOWN LIMITATION: this uses the *serialize* side of a split
-/// `#[serde(rename(serialize = ..., deserialize = ...))]` /
-/// `#[serde(rename_all(serialize = ..., deserialize = ...))]`. For the common
-/// symmetric `rename` / `rename_all` (which apply to both sides) this is exact;
-/// only the rare split-form input struct could differ between the advertised
-/// schema and the deserialized wire name. This is deliberate: it keeps the
-/// `#[derive(OpenApiSchema)]`, `#[model]`, and `FormModel` code paths in
-/// lockstep on the same serde helpers rather than duplicating a
-/// deserialize-side variant.
-fn schema_property_name(field: &syn::Field, rename_all_rule: Option<&str>) -> Option<String> {
-    let ident = field.ident.as_ref()?;
-    let raw = ident.to_string();
-    let raw = raw.strip_prefix("r#").unwrap_or(&raw).to_owned();
-    Some(
-        field_serde_serialize_rename(field)
-            .or_else(|| rename_all_rule.and_then(|rule| apply_serde_rename_all_rule(rule, &raw)))
-            .unwrap_or(raw),
-    )
+    found
 }
 
 /// Parse the struct-level language dictionary configuration from `#[searchable(language = "...")]`
@@ -2031,36 +6183,92 @@ fn parse_model_shard_key(attrs: &[syn::Attribute]) -> syn::Result<Option<String>
     Ok(None)
 }
 
+#[derive(Debug)]
 enum FieldSearchable {
     NotSearchable,
     SearchableDefault,
     SearchableWithWeight(String),
 }
 
-/// Parse the field-level weight from `#[searchable(weight = "...")]`
-fn parse_field_searchable_weight(field: &syn::Field) -> syn::Result<FieldSearchable> {
+/// Field-level `#[searchable(...)]` configuration.
+///
+/// #842 introduced the weight; #1191 adds `embed`, which nominates the field
+/// whose text is embedded for vector / "find similar" search. The two are
+/// independent: `#[searchable(weight = "B", embed)]` both ranks the field at
+/// weight B for keyword search and embeds it for k-NN search.
+#[derive(Debug)]
+struct FieldSearchableConfig {
+    kind: FieldSearchable,
+    embed: bool,
+}
+
+/// Whether `ty` is `String` or `Option<String>` — the shape the tenancy path
+/// assumes for a `tenant_id` column.
+fn is_string_or_option_string(ty: &syn::Type) -> bool {
+    fn is_string(ty: &syn::Type) -> bool {
+        matches!(ty, syn::Type::Path(tp) if tp.path.segments.last()
+            .is_some_and(|s| s.ident == "String"))
+    }
+    if is_string(ty) {
+        return true;
+    }
+    let syn::Type::Path(tp) = ty else {
+        return false;
+    };
+    let Some(segment) = tp.path.segments.last() else {
+        return false;
+    };
+    if segment.ident != "Option" {
+        return false;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return false;
+    };
+    matches!(args.args.first(), Some(syn::GenericArgument::Type(inner)) if is_string(inner))
+}
+
+/// Parse the full field-level `#[searchable(weight = "...", embed)]` config.
+fn parse_field_searchable(field: &syn::Field) -> syn::Result<FieldSearchableConfig> {
     for attr in &field.attrs {
         if attr.path().is_ident("searchable") {
             if matches!(attr.meta, syn::Meta::Path(_)) {
-                return Ok(FieldSearchable::SearchableDefault);
+                return Ok(FieldSearchableConfig {
+                    kind: FieldSearchable::SearchableDefault,
+                    embed: false,
+                });
             }
             let mut weight = None;
+            let mut embed = false;
             attr.parse_nested_meta(|meta| {
                 if meta.path.is_ident("weight") {
                     let value: syn::LitStr = meta.value()?.parse()?;
                     weight = Some(value.value());
                     Ok(())
+                } else if meta.path.is_ident("embed") {
+                    if embed {
+                        return Err(meta.error("duplicate `embed` in #[searchable(...)]"));
+                    }
+                    embed = true;
+                    Ok(())
                 } else {
-                    Err(meta.error("unsupported field searchable attribute"))
+                    Err(meta.error(
+                        "unsupported field searchable attribute (expected `weight = \"A\"` or `embed`)",
+                    ))
                 }
             })?;
-            return Ok(weight.map_or(
-                FieldSearchable::SearchableDefault,
-                FieldSearchable::SearchableWithWeight,
-            ));
+            return Ok(FieldSearchableConfig {
+                kind: weight.map_or(
+                    FieldSearchable::SearchableDefault,
+                    FieldSearchable::SearchableWithWeight,
+                ),
+                embed,
+            });
         }
     }
-    Ok(FieldSearchable::NotSearchable)
+    Ok(FieldSearchableConfig {
+        kind: FieldSearchable::NotSearchable,
+        embed: false,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -2230,6 +6438,52 @@ fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
     None
 }
 
+/// Parse the declared `decimal{p,s}` shape from a field's
+/// `#[decimal_shape(precision = p, scale = s)]` attribute (issue #2597).
+///
+/// The attribute is emitted by the `autumn generate` model renderer for
+/// `decimal{p,s}` fields; the Rust type (`Decimal`/`SqliteDecimal`) carries
+/// no precision/scale, so the factory `.fake()` cannot do better without it.
+///
+/// Malformed spellings (unknown keys, missing or non-integer values) return
+/// `None`: the field then falls back to the untyped `fake::decimal()`,
+/// exactly as before this attribute existed. The macro's fake inference must
+/// never fail expansion on a best-effort hint, so silent fallback — not a
+/// compile error — is the correct failure mode here.
+fn field_decimal_shape(field: &Field) -> Option<(u32, u32)> {
+    for attr in field
+        .attrs
+        .iter()
+        .filter(|a| a.path().is_ident("decimal_shape"))
+    {
+        let mut precision = None;
+        let mut scale = None;
+        let parsed = attr
+            .parse_nested_meta(|meta| {
+                if meta.path.is_ident("precision") {
+                    let lit: syn::LitInt = meta.value()?.parse()?;
+                    precision = lit.base10_parse::<u32>().ok();
+                    Ok(())
+                } else if meta.path.is_ident("scale") {
+                    let lit: syn::LitInt = meta.value()?.parse()?;
+                    scale = lit.base10_parse::<u32>().ok();
+                    Ok(())
+                } else {
+                    Err(meta
+                        .error("unsupported decimal_shape key (expected `precision` or `scale`)"))
+                }
+            })
+            .is_ok();
+        if !parsed {
+            continue;
+        }
+        if let (Some(p), Some(s)) = (precision, scale) {
+            return Some((p, s));
+        }
+    }
+    None
+}
+
 /// Infer the fake-data expression for a factory field when `.fake()` is active.
 ///
 /// Selection order (per issue #1343):
@@ -2244,24 +6498,38 @@ fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
 ///    `Uuid` → `uuid()`, …).
 /// 3. `Option<T>` wraps the inner expression in `Some(..)`.
 ///
+/// The `decimal_shape` parameter carries the declared `decimal{p,s}` from a
+/// `#[decimal_shape(precision = p, scale = s)]` field attribute (issue #2597),
+/// parsed by [`field_decimal_shape`]; a shaped `Decimal`/`SqliteDecimal`
+/// field draws from `fake::decimal_with(p, s)` so every value fits the column
+/// by construction. `None` keeps the untyped `fake::decimal()`.
+///
 /// Returns `None` when no sensible fake value can be produced — the caller then
 /// leaves the field at its `Default::default()` value. This function must NEVER
 /// emit an expression that fails to compile: when unsure, return `None`.
-fn fake_expr_for_field(ident: &syn::Ident, ty: &syn::Type) -> Option<TokenStream> {
+fn fake_expr_for_field(
+    ident: &syn::Ident,
+    ty: &syn::Type,
+    decimal_shape: Option<(u32, u32)>,
+) -> Option<TokenStream> {
     let raw = ident.to_string();
     let name = raw.strip_prefix("r#").unwrap_or(&raw).to_ascii_lowercase();
 
     // Option<T>: fake the inner value, wrap in Some.
     if let Some(inner) = option_inner_type(ty) {
-        let inner_expr = fake_expr_core(&name, inner)?;
+        let inner_expr = fake_expr_core(&name, inner, decimal_shape)?;
         return Some(quote! { ::core::option::Option::Some(#inner_expr) });
     }
 
-    fake_expr_core(&name, ty)
+    fake_expr_core(&name, ty, decimal_shape)
 }
 
 /// Core inference over a non-`Option` target type. See [`fake_expr_for_field`].
-fn fake_expr_core(name: &str, ty: &syn::Type) -> Option<TokenStream> {
+fn fake_expr_core(
+    name: &str,
+    ty: &syn::Type,
+    decimal_shape: Option<(u32, u32)>,
+) -> Option<TokenStream> {
     let last = ty_last_ident(ty)?;
     match last.as_str() {
         "String" => Some(fake_string_expr(name)),
@@ -2286,8 +6554,21 @@ fn fake_expr_core(name: &str, ty: &syn::Type) -> Option<TokenStream> {
             Some(quote! { (::autumn_web::fake::decimal_f64() as #cast) })
         }
         "bool" => Some(quote! { ::autumn_web::fake::boolean() }),
-        "Decimal" => Some(quote! { ::autumn_web::fake::decimal() }),
+        // Issue #2597: a shaped decimal draws from `fake::decimal_with(p, s)`
+        // so factory values fit the declared `decimal{p,s}` by construction.
+        "Decimal" => Some(decimal_shape.map_or_else(
+            || quote! { ::autumn_web::fake::decimal() },
+            |(p, s)| quote! { ::autumn_web::fake::decimal_with(#p, #s) },
+        )),
         "Uuid" => Some(quote! { ::autumn_web::fake::uuid() }),
+        // The SQLite newtypes (issue #1924) wrap exactly those values. Without
+        // these arms every faked row falls back to `Default` — one shared nil
+        // UUID, which collides on a `:unique` column the first time twice.
+        "SqliteDecimal" => Some(decimal_shape.map_or_else(
+            || quote! { ::autumn_web::fake::decimal().into() },
+            |(p, s)| quote! { ::autumn_web::fake::decimal_with(#p, #s).into() },
+        )),
+        "SqliteUuid" => Some(quote! { ::autumn_web::fake::uuid().into() }),
         // `recent_datetime()` yields `DateTime<Utc>`, so only fake a `DateTime`
         // whose timezone parameter is `Utc`. Other zones (e.g. `Local`,
         // `FixedOffset`) fall through to Default to avoid a type mismatch.
@@ -2369,14 +6650,23 @@ fn validate_factory_assoc_attrs(fields: &[&Field]) -> Option<TokenStream> {
     None
 }
 
-/// True if a field has `#[id]`, `#[default]`, or `#[lock_version]` — all
-/// three are excluded from the `NewX` insert type.
+/// True if a field has `#[id]`, `#[default]`, `#[lock_version]`, or
+/// `#[position]` — all four are excluded from the `NewX` insert type (and,
+/// via `fields_for_new`, from `UpdateX` too — `#[lock_version]` is the one
+/// exception, re-added to `UpdateX` separately as a plain required field).
 ///
 /// `#[lock_version]` fields are excluded because the DB column must carry a
 /// `DEFAULT 0` constraint; the initial version is always zero and is never
-/// supplied by the caller on insert.
+/// supplied by the caller on insert. `#[position]` fields (issue #1358) are
+/// excluded because the generated repository assigns the next contiguous
+/// value on insert and only ever changes it through `move_to`/`move_before`/
+/// `move_after`/`move_up`/`move_down` — never a direct create/update payload,
+/// which would let a caller silently break the contiguous invariant.
 fn excluded_from_new(field: &Field) -> bool {
-    has_attr(field, "id") || has_attr(field, "default") || has_attr(field, "lock_version")
+    has_attr(field, "id")
+        || has_attr(field, "default")
+        || has_attr(field, "lock_version")
+        || has_attr(field, "position")
 }
 
 /// Convert a `snake_case` identifier to `PascalCase`.
@@ -2391,23 +6681,6 @@ fn pascal_case(s: &str) -> String {
             })
         })
         .collect()
-}
-
-/// Check whether a type is `Option<...>`.
-fn is_option_type(ty: &syn::Type) -> bool {
-    if let syn::Type::Path(tp) = ty {
-        tp.path
-            .segments
-            .last()
-            .is_some_and(|seg| seg.ident == "Option")
-    } else {
-        false
-    }
-}
-
-/// Return the final path segment name of a type (e.g. `foo::Bar` → `"Bar"`).
-fn type_name_str(ty: &syn::Type) -> String {
-    crate::api_doc::last_segment_name(ty).unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// Humanize a `snake_case` field name into a `<label>`-friendly title
@@ -2463,22 +6736,21 @@ fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
                 step: ::core::option::Option::Some(::std::string::String::from("1")),
             }
         },
-        "f32" | "f64" | "Decimal" | "BigDecimal" => quote! {
+        "f32" | "f64" | "Decimal" | "BigDecimal" | "SqliteDecimal" => quote! {
             ::autumn_web::form::FieldControl::Number {
                 step: ::core::option::Option::Some(::std::string::String::from("any")),
             }
         },
         "NaiveDate" => quote! { ::autumn_web::form::FieldControl::Date },
         "NaiveDateTime" => quote! { ::autumn_web::form::FieldControl::DateTime },
-        // `<input type="datetime-local">` posts an *offsetless* wall-clock
-        // value, so only zone parameters with a sound interpretation of that
-        // shape get the picker: `Utc` and the server's `Local` (each wired to
-        // a matching tolerant deserializer — see `datetime_local_serde_attr`).
-        // Any other zone (`FixedOffset`, chrono-tz zones, or a bare
-        // `DateTime` alias whose zone the derive can't see) falls back to a
-        // text input: the pre-filled value is the field's serialized RFC 3339
-        // string, which chrono's default `Deserialize` round-trips as-is —
-        // honest, if plainer, instead of a picker whose submission 400s.
+        // `<input type="datetime-local">` posts an offsetless wall-clock value, so only
+        // zone parameters with a sound interpretation of that shape get the picker:
+        // `Utc` and the server's `Local`, each wired to a matching tolerant deserializer
+        // (see `datetime_local_serde_attr`). Any other zone — `FixedOffset`, a chrono-tz
+        // zone, or a bare `DateTime` alias whose zone the derive cannot see — falls back
+        // to a text input, pre-filled with the field's serialized RFC 3339 string, which
+        // chrono's default `Deserialize` round-trips as-is. Plainer, but honest, rather
+        // than a picker whose submission 400s.
         "DateTime" => {
             let picker_zone = crate::api_doc::unwrap_single_generic(inner_ty, "DateTime")
                 .is_some_and(|tz| matches!(type_name_str(&tz).as_str(), "Utc" | "Local"));
@@ -2533,15 +6805,21 @@ fn datetime_local_serde_attr(ty: &syn::Type) -> Option<TokenStream> {
         }
         _ => return None,
     };
+    // `deserialize_with`'s value is a string serde parses into a path itself
+    // (it never passes through this crate's own generic `::autumn_web`
+    // token rewrite — see `crate_path`'s module doc, #1828), so it must be
+    // built from the actively resolved crate name directly.
+    let crate_root =
+        crate::crate_path::escaped_target_path_segment(&crate::crate_path::current_target());
     if nullable {
         // `deserialize_with` disables serde's implicit missing-`Option`-field
         // -is-`None` handling; `default` restores it so a JSON body may still
         // omit the nullable column. (The `_option` helper itself maps a
         // present-but-empty form value to `None`.)
-        let path = format!("::autumn_web::form::{base}_option");
+        let path = format!("::{crate_root}::form::{base}_option");
         Some(quote! { #[serde(default, deserialize_with = #path)] })
     } else {
-        let path = format!("::autumn_web::form::{base}");
+        let path = format!("::{crate_root}::form::{base}");
         Some(quote! { #[serde(deserialize_with = #path)] })
     }
 }
@@ -2607,134 +6885,6 @@ fn emit_form_model_impl(
                 ]
             }
         }
-    }
-}
-
-/// Emit a `TokenStream` that evaluates (at runtime) to a `serde_json::Value`
-/// representing the JSON Schema for the given Rust type.
-///
-/// Handles `Option<T>` (nullable), `Vec<T>` (array), primitives (`String`,
-/// `i64`, etc.), and everything else as a `$ref` to a component schema.
-fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
-    // Option<T> → OpenAPI 3.1 nullable: oneOf [{T-schema}, {type:null}]
-    if let Some(inner) = crate::api_doc::unwrap_single_generic(ty, "Option") {
-        let inner_tokens = emit_json_schema_tokens(&inner);
-        return quote! {{
-            let __inner = #inner_tokens;
-            ::autumn_web::reexports::serde_json::json!({ "oneOf": [__inner, { "type": "null" }] })
-        }};
-    }
-
-    // Vec<T> → {"type": "array", "items": <T-schema>}
-    if let Some(inner) = crate::api_doc::unwrap_single_generic(ty, "Vec") {
-        let inner_tokens = emit_json_schema_tokens(&inner);
-        return quote! {{
-            let __items = #inner_tokens;
-            ::autumn_web::reexports::serde_json::json!({ "type": "array", "items": __items })
-        }};
-    }
-
-    let name = type_name_str(ty);
-    crate::api_doc::primitive_json_type(&name).map_or_else(
-        || {
-            // Emit the `$ref` against the field type's FULL `type_name` identity
-            // (built at runtime), NOT its short last segment, so the finalize
-            // collision index can match this nested ref to the exact producing
-            // type and rewrite it to the same display key the top-level route
-            // refs use — even when two types share a last segment (issue #1972).
-            quote! {{
-                let __ref_path = ::std::format!(
-                    "#/components/schemas/{}",
-                    ::core::any::type_name::<#ty>()
-                );
-                ::autumn_web::reexports::serde_json::json!({ "$ref": __ref_path })
-            }}
-        },
-        |json_type| {
-            quote! { ::autumn_web::reexports::serde_json::json!({ "type": #json_type }) }
-        },
-    )
-}
-
-/// Emit the body of `OpenApiSchema::schema()` for a list of fields.
-///
-/// `all_optional` is `true` for `UpdateX` structs where every field is
-/// conceptually optional (backed by `Patch<T>`).
-pub fn emit_schema_fn_body(
-    fields: &[&&Field],
-    all_optional: bool,
-    rename_all_rule: Option<&str>,
-) -> TokenStream {
-    emit_schema_fn_body_ext(fields, all_optional, &[], rename_all_rule)
-}
-
-fn emit_schema_fn_body_ext(
-    fields: &[&&Field],
-    all_optional: bool,
-    extra_required: &[&&Field],
-    rename_all_rule: Option<&str>,
-) -> TokenStream {
-    // Resolve each field's advertised property name once — through the shared
-    // serde helpers so the schema honors `#[serde(rename)]` /
-    // `#[serde(rename_all)]` and strips raw-ident `r#` prefixes — and reuse the
-    // same resolved name for BOTH the property key and the `required` entry, so
-    // the two can never drift.
-    let insertions: Vec<TokenStream> = fields
-        .iter()
-        .chain(extra_required.iter())
-        .map(|f| {
-            let field_name = schema_property_name(f, rename_all_rule)
-                .unwrap_or_else(|| f.ident.as_ref().unwrap().to_string());
-            let schema_expr = emit_json_schema_tokens(&f.ty);
-            quote! {
-                __props.insert(#field_name.to_owned(), #schema_expr);
-            }
-        })
-        .collect();
-
-    let mut required_names: Vec<String> = if all_optional {
-        Vec::new()
-    } else {
-        fields
-            .iter()
-            .filter(|f| !is_option_type(&f.ty))
-            .filter_map(|f| schema_property_name(f, rename_all_rule))
-            .collect()
-    };
-    for f in extra_required {
-        if let Some(name) = schema_property_name(f, rename_all_rule) {
-            required_names.push(name);
-        }
-    }
-
-    let required_tokens: Vec<TokenStream> = required_names
-        .iter()
-        .map(|name| {
-            quote! { ::autumn_web::reexports::serde_json::json!(#name) }
-        })
-        .collect();
-
-    quote! {
-        let mut __props = ::autumn_web::reexports::serde_json::Map::new();
-        #(#insertions)*
-        let mut __schema = ::autumn_web::reexports::serde_json::Map::new();
-        __schema.insert(
-            "type".to_owned(),
-            ::autumn_web::reexports::serde_json::json!("object"),
-        );
-        __schema.insert(
-            "properties".to_owned(),
-            ::autumn_web::reexports::serde_json::Value::Object(__props),
-        );
-        let __required: ::std::vec::Vec<::autumn_web::reexports::serde_json::Value> =
-            ::std::vec![#(#required_tokens),*];
-        if !__required.is_empty() {
-            __schema.insert(
-                "required".to_owned(),
-                ::autumn_web::reexports::serde_json::Value::Array(__required),
-            );
-        }
-        ::autumn_web::reexports::serde_json::Value::Object(__schema)
     }
 }
 
@@ -3299,15 +7449,14 @@ fn emit_state_machine_lifecycle(
         field_str,
     } = state_machine_names(field);
 
-    // Normalize each effect edge's `from`/`to` by stripping a leading raw-
-    // identifier prefix (issue #1973 / Codex P2 on #2027). The `#[lifecycle]`
-    // macro stores variant names in `STATE_MACHINE_TRANSITIONS` with `r#`
-    // already stripped (see `lifecycle::variant_name_str`), but the effect
-    // edges parsed at the binding site preserve it (e.g. `Draft -> r#type`).
-    // Without this alignment the const assertion below would check `"r#type"`
-    // against a table containing `"type"` (falsely rejecting a real edge) and
-    // the generated match arm would never fire (silently dropping the effect).
-    // Guard/on_commit/on are carried through unchanged.
+    // Normalize each effect edge's `from`/`to` by stripping a leading raw-identifier
+    // prefix (#1973, Codex P2 on #2027). The `#[lifecycle]` macro stores variant names
+    // in `STATE_MACHINE_TRANSITIONS` with `r#` already stripped (see
+    // `lifecycle::variant_name_str`), but the effect edges parsed at the binding site
+    // keep it, as in `Draft -> r#type`. Without this alignment the const assertion
+    // below would check `"r#type"` against a table containing `"type"`, falsely
+    // rejecting a real edge, and the generated match arm would never fire, silently
+    // dropping the effect. Guard, on_commit, and on are carried through unchanged.
     let normalized_effects: Vec<StateMachineTransition> = effects
         .iter()
         .map(|t| StateMachineTransition {
@@ -3456,11 +7605,67 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let association_items = emit_association_items(name, &table_ident, vis, &associations);
     let dependents_impl = emit_dependents_impl(name, &associations);
 
+    // `#[derivation(Parent, column = "...", ...)]` (#1769). Parsed here beside
+    // the associations, because the default foreign key comes from the
+    // `#[belongs_to]` leg targeting the same parent. The filter is lowered
+    // below, once `all_fields` is known.
+    let derivations = match resolve_derivations(name, outer_attrs, &associations) {
+        Ok(decls) => decls,
+        Err(err) => return err.to_compile_error(),
+    };
+
+    // `#[votable(by = ..., ...)]` (#1362). Resolved here next to the
+    // associations; emitted below, once `all_fields` is known (the aggregate
+    // column must name a real field, and the soft-delete guard is emitted only
+    // when the model has a `deleted_at`).
+    let votable = match resolve_votable(name, outer_attrs) {
+        Ok(spec) => spec,
+        Err(err) => return err.to_compile_error(),
+    };
+
+    // `#[commentable(by = ..., ...)]` (#1367) — the polymorphic association
+    // kind. Resolved here beside `#[votable]`; emitted below, once `all_fields`
+    // is known (the counter column must name a real `i64` field, and the
+    // parent's soft-delete / tenant columns are projected into the spec).
+    let commentable = match resolve_commentable(name, outer_attrs) {
+        Ok(spec) => spec,
+        Err(err) => return err.to_compile_error(),
+    };
+
+    // ── Architecture-graph relation tables (#1747) ───────────────────────
+    // The edge tables this model's declared relations write. `#[votable]` and
+    // `#[commentable]` generate methods on the model's *repository*, so a route
+    // holding that repository reaches these tables without ever naming them.
+    // Sorted and deduplicated so the emitted graph is byte-deterministic.
+    let mut graph_relation_tables: Vec<String> = Vec::new();
+    if let Some(spec) = votable.as_ref() {
+        graph_relation_tables.push(spec.table.clone());
+    }
+    if let Some(spec) = commentable.as_ref() {
+        graph_relation_tables.push(spec.table.clone());
+    }
+    // A `#[derivation]` writes the parent's table from the child's repository,
+    // so the parent is reached without ever being named in a route.
+    for decl in &derivations {
+        graph_relation_tables.push(derivation_parent_table(decl));
+    }
+    graph_relation_tables.sort();
+    graph_relation_tables.dedup();
+    let graph_relations = if graph_relation_tables.is_empty() {
+        quote! { &[] }
+    } else {
+        let tables = graph_relation_tables.iter().map(String::as_str);
+        quote! { &[#(#tables),*] }
+    };
+
     let filtered_outer_attrs: Vec<&syn::Attribute> = outer_attrs
         .iter()
         .filter(|a| {
             !a.path().is_ident("searchable")
                 && !is_association_attr(a)
+                && !is_votable_attr(a)
+                && !is_commentable_attr(a)
+                && !is_derivation_attr(a)
                 && !a.path().is_ident("shard_key")
         })
         .collect();
@@ -3500,13 +7705,298 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
+    // Validate that `#[votable]`'s aggregate column names an existing field of
+    // the right type, mirroring the shard_key check above. Without the
+    // existence check the hidden edge module declares the column regardless and
+    // the mistake only surfaces as a runtime `42703 column "score" does not
+    // exist` on the very first reaction; without the type check the column is
+    // projected as `Int8` and a real `i32`/`Option<i64>` field only fails as an
+    // opaque Diesel trait-resolution wall inside the generated `react()`.
+    let votable_items = match votable {
+        None => TokenStream::new(),
+        Some(ref spec) => {
+            let aggregate_field = all_fields
+                .iter()
+                .find(|f| f.ident.as_ref().is_some_and(|i| i == &spec.column));
+            let Some(aggregate_field) = aggregate_field else {
+                let attr = outer_attrs
+                    .iter()
+                    .find(|a| is_votable_attr(a))
+                    .expect("attribute was parsed above");
+                return syn::Error::new_spanned(
+                    attr,
+                    format!(
+                        "votable aggregate column `{}` not found on model `{name}`; \
+                         add the field (e.g. `pub {}: i64`) or override it with \
+                         `#[votable(..., column = <field>)]`",
+                        spec.column, spec.column,
+                    ),
+                )
+                .to_compile_error();
+            };
+            // The aggregate is `SUM(value)` or `COUNT(*)`, both `BIGINT`, and the
+            // generated `Reaction::aggregate` is `i64`, so anything else is a schema
+            // mismatch rather than a convenience to coerce. Two layers (PR #2177
+            // review): a directed error here for the spellings that are definitely
+            // wrong — a bare non-`i64` primitive, an `Option` — and a generated `const`
+            // type guard (`emit_votable_items`) for everything else. So
+            // `std::primitive::i64` and aliases that really are `i64` compile, while a
+            // wrong alias fails at the guard rather than at runtime.
+            let aggregate_ty = aggregate_field.ty.to_token_stream().to_string();
+            let definitely_not_i64: &[&str] = &[
+                "i8", "i16", "i32", "i128", "u8", "u16", "u32", "u64", "u128", "usize", "isize",
+                "f32", "f64", "bool", "String",
+            ];
+            if definitely_not_i64.contains(&aggregate_ty.as_str())
+                || aggregate_ty.starts_with("Option <")
+            {
+                return syn::Error::new_spanned(
+                    &aggregate_field.ty,
+                    format!(
+                        "votable aggregate column `{}` on model `{name}` must be \
+                         `i64` (BIGINT), found `{aggregate_ty}`; the aggregate is \
+                         `SUM(value)` / `COUNT(*)` and is written back as an \
+                         `i64` — widen the column and the field",
+                        spec.column,
+                    ),
+                )
+                .to_compile_error();
+            }
+            let has_deleted_at = all_fields
+                .iter()
+                .any(|f| f.ident.as_ref().is_some_and(|i| i == "deleted_at"));
+            // Same field-presence precedent as `deleted_at`: the column has to
+            // exist for S1/S5 to filter on it. Whether it is actually *applied*
+            // is the repository's call, resolved at runtime through
+            // `M2mConnSource::__autumn_m2m_tenant_scope()`.
+            let has_tenant_id = all_fields
+                .iter()
+                .any(|f| f.ident.as_ref().is_some_and(|i| i == "tenant_id"));
+            // A composite key cannot back a reaction: `react(target_id)`
+            // identifies the target by ONE value, so with two `#[id]` fields
+            // S1 would lock whichever rows share the first component and S5
+            // would update all of them. Reject rather than silently keying on
+            // the first component (PR #2177 review).
+            let id_fields: Vec<&syn::Ident> = all_fields
+                .iter()
+                .filter(|f| has_attr(f, "id"))
+                .filter_map(|f| f.ident.as_ref())
+                .collect();
+            if id_fields.len() > 1 {
+                let attr = outer_attrs
+                    .iter()
+                    .find(|a| is_votable_attr(a))
+                    .expect("attribute was parsed above");
+                let listed = id_fields
+                    .iter()
+                    .map(|i| format!("`{i}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return syn::Error::new_spanned(
+                    attr,
+                    format!(
+                        "`#[votable]` requires a single `i64` primary key: model \
+                         `{name}` declares a composite key ({listed}), and \
+                         `react(reactor_id, target_id)` identifies its target by \
+                         one id — the edge table and the aggregate UPDATE cannot \
+                         address a composite-keyed row"
+                    ),
+                )
+                .to_compile_error();
+            }
+            let pk_ident = all_fields
+                .iter()
+                .find(|f| has_attr(f, "id"))
+                .or_else(|| {
+                    all_fields.iter().find(|f| match &f.ty {
+                        syn::Type::Path(tp) => tp.path.is_ident("i32") || tp.path.is_ident("i64"),
+                        _ => false,
+                    })
+                })
+                .and_then(|f| f.ident.as_ref());
+            emit_votable_items(
+                name,
+                &table_ident,
+                vis,
+                spec,
+                has_deleted_at,
+                has_tenant_id,
+                pk_ident,
+            )
+        }
+    };
+
+    // ── Polymorphic comments (#[commentable], #1367) ────────────────────────
+    // Validated on the same terms as `#[votable]`'s aggregate column: the
+    // maintained counter must name a real `i64` field, or the mistake only
+    // surfaces as a runtime `42703 column "comment_count" does not exist` on
+    // the very first comment.
+    let commentable_items = match commentable {
+        None => TokenStream::new(),
+        Some(ref spec) => {
+            if let Some(counter_column) = spec.counter_column.as_deref() {
+                let counter_field = all_fields
+                    .iter()
+                    .find(|f| f.ident.as_ref().is_some_and(|i| i == counter_column));
+                let Some(counter_field) = counter_field else {
+                    return syn::Error::new(
+                        spec.span,
+                        format!(
+                            "commentable counter column `{counter_column}` not found on \
+                             model `{name}`; add the field (e.g. `#[default] pub \
+                             {counter_column}: i64`), point the attribute at an \
+                             existing one with `#[commentable(..., counter_cache = \
+                             <field>)]`, or opt out with `#[commentable(..., \
+                             counter_cache = false)]`"
+                        ),
+                    )
+                    .to_compile_error();
+                };
+                // Two layers, exactly like `#[votable]`: a directed error for
+                // the spellings that are definitely wrong, and the generated
+                // `const` guard below for everything else — so
+                // `std::primitive::i64` and honest aliases still compile.
+                let counter_ty = counter_field.ty.to_token_stream().to_string();
+                let definitely_not_i64: &[&str] = &[
+                    "i8", "i16", "i32", "i128", "u8", "u16", "u32", "u64", "u128", "usize",
+                    "isize", "f32", "f64", "bool", "String",
+                ];
+                if definitely_not_i64.contains(&counter_ty.as_str())
+                    || counter_ty.starts_with("Option <")
+                {
+                    return syn::Error::new_spanned(
+                        &counter_field.ty,
+                        format!(
+                            "commentable counter column `{counter_column}` on model \
+                             `{name}` must be `i64` (BIGINT), found `{counter_ty}`; the \
+                             counter is maintained with `SET c = c + 1` and read back \
+                             as an `i64` — widen the column and the field"
+                        ),
+                    )
+                    .to_compile_error();
+                }
+            }
+            let cmt_has_deleted_at = all_fields
+                .iter()
+                .any(|f| f.ident.as_ref().is_some_and(|i| i == "deleted_at"));
+            let cmt_has_tenant_id = all_fields
+                .iter()
+                .any(|f| f.ident.as_ref().is_some_and(|i| i == "tenant_id"));
+            // A composite key cannot back a polymorphic parent: `commentable_id`
+            // is ONE column, so a two-`#[id]` model has no single value to store
+            // there. Reject rather than silently keying on the first component.
+            let cmt_id_fields: Vec<&syn::Ident> = all_fields
+                .iter()
+                .filter(|f| has_attr(f, "id"))
+                .filter_map(|f| f.ident.as_ref())
+                .collect();
+            if cmt_id_fields.len() > 1 {
+                let listed = cmt_id_fields
+                    .iter()
+                    .map(|i| format!("`{i}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return syn::Error::new(
+                    spec.span,
+                    format!(
+                        "`#[commentable]` requires a single `i64` primary key: model \
+                         `{name}` declares a composite key ({listed}), and \
+                         `commentable_id` is one column — it cannot address a \
+                         composite-keyed row"
+                    ),
+                )
+                .to_compile_error();
+            }
+            let cmt_pk_ident = all_fields
+                .iter()
+                .find(|f| has_attr(f, "id"))
+                .or_else(|| {
+                    all_fields.iter().find(|f| match &f.ty {
+                        syn::Type::Path(tp) => tp.path.is_ident("i32") || tp.path.is_ident("i64"),
+                        _ => false,
+                    })
+                })
+                .and_then(|f| f.ident.as_ref());
+            emit_commentable_items(
+                name,
+                vis,
+                spec,
+                &table_name,
+                &crate::commentable::ParentShape {
+                    has_deleted_at: cmt_has_deleted_at,
+                    has_tenant_id: cmt_has_tenant_id,
+                    is_sharded: shard_key_field.is_some(),
+                    pk_ident: cmt_pk_ident,
+                },
+            )
+        }
+    };
+
+    // ── Counter caches (#1325) ──────────────────────────────────────────────
+    // Resolved here (rather than beside `resolve_associations`) because the
+    // spec needs `all_fields`: the foreign key must be a real field, and its
+    // nullability decides whether `fk_of` wraps or forwards. A `deleted_at`
+    // column makes the count reflect live rows only.
+    let counter_caches_impl = {
+        let cc_has_deleted_at = all_fields
+            .iter()
+            .any(|f| f.ident.as_ref().is_some_and(|i| i == "deleted_at"));
+        // Same fallback every other primary-key consumer in this macro uses
+        // (`id_field_names`, the factory PK, `#[votable]`): an explicit `#[id]`,
+        // else the first integer field. Hard-requiring `#[id]` would reject
+        // models the rest of `#[model]` accepts — and, because the error
+        // short-circuits the whole macro, would bury it under a cascade of
+        // "cannot find type" errors from the paired `#[repository]`.
+        let cc_pk_ident = all_fields
+            .iter()
+            .find(|f| has_attr(f, "id"))
+            .or_else(|| {
+                all_fields.iter().find(|f| match &f.ty {
+                    syn::Type::Path(tp) => tp.path.is_ident("i32") || tp.path.is_ident("i64"),
+                    _ => false,
+                })
+            })
+            .and_then(|f| f.ident.as_ref());
+        match emit_counter_caches_impl(
+            name,
+            &table_name,
+            cc_pk_ident,
+            cc_has_deleted_at,
+            &associations,
+            &derivations,
+            &all_fields,
+        ) {
+            Ok(tokens) => tokens,
+            Err(err) => return err.to_compile_error(),
+        }
+    };
+
     let mut search_field_names = Vec::new();
     let mut search_field_weights = Vec::new();
+    // #1191: the field idents backing the searchable columns, so the derived
+    // `SearchIndexed::search_document` can extract their values, plus the
+    // single `#[searchable(embed)]` field (if any) that feeds vector search.
+    let mut search_field_idents: Vec<syn::Ident> = Vec::new();
+    let mut search_embed_field: Option<String> = None;
 
     for field in &all_fields {
-        match parse_field_searchable_weight(field) {
-            Ok(FieldSearchable::NotSearchable) => {}
-            Ok(weight_type) => {
+        let cfg = match parse_field_searchable(field) {
+            Ok(cfg) => cfg,
+            Err(err) => return err.to_compile_error(),
+        };
+        match cfg.kind {
+            FieldSearchable::NotSearchable => {
+                if cfg.embed {
+                    // Unreachable through the parser (a bare `embed` still
+                    // yields a searchable kind), but keep the invariant local.
+                    return syn::Error::new_spanned(
+                        field,
+                        "`embed` requires the field to be #[searchable]",
+                    )
+                    .to_compile_error();
+                }
+            }
+            weight_type => {
                 let field_ident = field.ident.as_ref().unwrap();
                 let weight = match weight_type {
                     FieldSearchable::SearchableWithWeight(w) => w,
@@ -3529,11 +8019,34 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     )
                     .to_compile_error();
                 }
+                if cfg.embed {
+                    if let Some(existing) = &search_embed_field {
+                        return syn::Error::new_spanned(
+                            field_ident,
+                            format!(
+                                "only one field may be marked #[searchable(embed)]; `{existing}` \
+                                 already is. A model has a single embedding per record — \
+                                 concatenate the fields you want embedded into one column."
+                            ),
+                        )
+                        .to_compile_error();
+                    }
+                    search_embed_field = Some(field_ident.to_string());
+                }
                 search_field_names.push(field_ident.to_string());
                 search_field_weights.push(weight_char);
+                search_field_idents.push(field_ident.clone());
             }
-            Err(err) => return err.to_compile_error(),
         }
+    }
+
+    if !is_searchable && search_embed_field.is_some() {
+        return syn::Error::new_spanned(
+            name,
+            "#[searchable(embed)] requires the model to be marked #[searchable] \
+             (add `#[searchable]` or `#[searchable(language = \"...\")]` above the struct)",
+        )
+        .to_compile_error();
     }
 
     let id_fields: Vec<&&Field> = all_fields.iter().filter(|f| has_attr(f, "id")).collect();
@@ -3591,6 +8104,169 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
+    // ── #1191: the engine-agnostic search index definition and document ─────
+    //
+    // #842 already emits `AutumnSearchableModel`, the metadata the in-core
+    // Postgres/SQLite FTS reads. `SearchIndexed` is the pluggable half: it hands
+    // `autumn-search` an `IndexDefinition` and a per-record `SearchDocument`, so any
+    // backend — Postgres with pgvector, Meilisearch, a vector store — can index the
+    // model with no hand-written glue.
+    //
+    // Emitted only for a model that is searchable, declares at least one searchable
+    // field, and has an `i64` primary key, the id type every search index keys on and
+    // the in-core FTS `search()` already assumes. A `#[searchable]` model with a `Uuid`
+    // key keeps its #842 behaviour and simply has no plugin index.
+    let search_pk_ident: Option<&syn::Ident> = pk_field_for_factory.and_then(|(id, ty)| {
+        matches!(ty, syn::Type::Path(tp) if tp.path.is_ident("i64")).then_some(id)
+    });
+    let search_indexed_impl = match (is_searchable, search_pk_ident) {
+        (true, Some(pk_ident)) if !search_field_idents.is_empty() => {
+            // Diesel maps a struct field to the identically-named column, so
+            // the `#[id]` field's ident IS the key column name.
+            let search_pk_column = pk_ident.to_string();
+            let field_names = search_field_names.clone();
+            let field_weights = search_field_weights.clone();
+            let field_idents = search_field_idents.clone();
+            let embed_const = search_embed_field.as_ref().map_or_else(
+                || quote! { ::core::option::Option::None },
+                |field| quote! { ::core::option::Option::Some(#field) },
+            );
+            let embed_extract = search_embed_field.as_ref().map_or_else(
+                || quote! {},
+                |field| {
+                    let ident = syn::Ident::new(field, name.span());
+                    quote! {
+                        // An empty embed source stays `None`: embedding the
+                        // empty string would cost a provider call and pollute
+                        // k-NN results with a meaningless vector.
+                        let __autumn_embed =
+                            ::autumn_web::search::SearchTextValue::search_text_value(&self.#ident);
+                        if !__autumn_embed.is_empty() {
+                            __autumn_doc.embed_text = ::core::option::Option::Some(__autumn_embed);
+                        }
+                    }
+                },
+            );
+            // A model with a `tenant_id` column carries its tenant into every document,
+            // so any backend can fail closed on a cross-tenant read.
+            //
+            // Keyed on the name and the type. An unrelated `tenant_id: i64` would
+            // otherwise stamp `tenant_id = "42"` on every document and make every
+            // real-tenant search return nothing, and a `tenant_id` of some other type
+            // would fail to compile inside generated code, pointing at a trait the user
+            // never mentioned. The rest of the macro's tenancy path already assumes
+            // `String`/`Option<String>`.
+            //
+            // This is the column check only. Whether the index is scoped to the tenant
+            // is resolved at runtime from the repository — see `#tenant_scoped_expr`.
+            let has_tenant_column = all_fields.iter().any(|f| {
+                f.ident.as_ref().is_some_and(|i| i == "tenant_id")
+                    && is_string_or_option_string(&f.ty)
+            });
+            // Tenant scoping follows `#[repository(tenant_scoped)]`, exactly as
+            // soft-delete follows `#[repository(soft_delete)]`, and for the same reason.
+            // A `tenant_id` column that is denormalized or audit data, on a repository
+            // that does not opt in, has unscoped finders; marking its index
+            // tenant-scoped anyway would make every search outside a tenant context
+            // fail with `TenantContextMissing` and every search inside one silently
+            // filter, neither of which matches the app's own reads.
+            //
+            // Column presence is still required: with no `tenant_id` the documents
+            // carry no tenant to filter on, so scoping would match nothing.
+            let tenant_scoped_expr = if has_tenant_column {
+                quote! { <Self>::__autumn_repo_tenant_scope() }
+            } else {
+                quote! { false }
+            };
+            let tenant_extract = if has_tenant_column {
+                quote! {
+                    let __autumn_tenant =
+                        ::autumn_web::search::SearchTextValue::search_text_value(&self.tenant_id);
+                    if !__autumn_tenant.is_empty() {
+                        __autumn_doc.tenant_id = ::core::option::Option::Some(__autumn_tenant);
+                    }
+                }
+            } else {
+                quote! {}
+            };
+
+            quote! {
+                impl ::autumn_web::search::SearchIndexed for #name {
+                    const SEARCH_INDEX: &'static str = #table_name;
+                    const SEARCH_EMBED_FIELD: ::core::option::Option<&'static str> = #embed_const;
+
+                    fn index_definition() -> ::autumn_web::search::IndexDefinition {
+                        // In scope so the blanket `false` defaults resolve for
+                        // a model whose repository is not `soft_delete` /
+                        // `tenant_scoped` (or that has no repository at all).
+                        // An inherent override emitted by `#[repository(...)]`
+                        // still wins — see the unqualified `<Self>::` calls.
+                        use ::autumn_web::preload::AutumnPreloadScopeExt as _;
+
+                        const __AUTUMN_SEARCH_INDEX_FIELDS:
+                            &[::autumn_web::search::SearchIndexField] = &[
+                            #(::autumn_web::search::SearchIndexField::new(
+                                #field_names,
+                                #field_weights,
+                            )),*
+                        ];
+                        ::autumn_web::search::IndexDefinition::new(
+                            #table_name,
+                            #search_language,
+                            __AUTUMN_SEARCH_INDEX_FIELDS,
+                            #embed_const,
+                            #tenant_scoped_expr,
+                        )
+                        // The REAL key column, not the conventional `id`: a
+                        // backend that rebuilds documents from the source table
+                        // (backfill, reindex) selects and paginates on it, and
+                        // a model keyed on `article_id` would otherwise fail at
+                        // runtime with an undefined column.
+                        .with_key_column(#search_pk_column)
+                        // Resolved at runtime through the same seam preload
+                        // uses: `#[repository(soft_delete)]` overrides this
+                        // inherently on the model, and `#[model]` cannot see the
+                        // repository attribute. A `deleted_at` column alone does
+                        // not mean soft delete — it is often audit history, and
+                        // those rows must stay indexed because the model's
+                        // finders still return them.
+                        //
+                        // Unqualified `<Self>::`, never `<Self as Trait>::`: the
+                        // override is an inherent associated fn, and naming the
+                        // trait would resolve past it to the blanket `false`
+                        // default, silently disabling the filter for every
+                        // genuinely soft-deleted model.
+                        .with_soft_delete(<Self>::__autumn_repo_soft_delete_scope())
+                    }
+
+                    fn search_id(&self) -> i64 {
+                        self.#pk_ident
+                    }
+
+                    fn search_document(&self) -> ::autumn_web::search::SearchDocument {
+                        let mut __autumn_doc = ::autumn_web::search::SearchDocument::new(
+                            #table_name,
+                            self.#pk_ident,
+                        );
+                        #(
+                            __autumn_doc = __autumn_doc.with_field(
+                                #field_names,
+                                #field_weights,
+                                ::autumn_web::search::SearchTextValue::search_text_value(
+                                    &self.#field_idents,
+                                ),
+                            );
+                        )*
+                        #embed_extract
+                        #tenant_extract
+                        __autumn_doc
+                    }
+                }
+            }
+        }
+        _ => quote! {},
+    };
+
     // Fields for NewX: exclude #[id], #[default], #[lock_version], and auto-detected ID fields
     let fields_for_new: Vec<&&Field> = all_fields
         .iter()
@@ -3636,6 +8312,262 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
+    // Collect `#[classified]` columns (issue #1654, validated to be non-null
+    // `String`). Each entry: (field ident, column name, generated field marker).
+    let mut classified_columns: Vec<(&syn::Ident, String, syn::Ident)> = Vec::new();
+    for f in &all_fields {
+        if let Err(err) = validate_classified_field(f) {
+            return err.to_compile_error();
+        }
+        if !field_is_classified(f) {
+            continue;
+        }
+        let ident = f.ident.as_ref().unwrap();
+        classified_columns.push((
+            ident,
+            unraw_ident(ident),
+            classified_marker_ident(name, ident),
+        ));
+    }
+    let has_classified = !classified_columns.is_empty();
+    // A struct-level `#[serde(rename_all = ...)]` desyncs the manifest row (Rust
+    // name) from the wire name it is reviewed against, exactly as it does for
+    // encrypted columns.
+    if has_classified && attrs_have_serde_rename_all(outer_attrs) {
+        return syn::Error::new_spanned(
+            name,
+            "`#[serde(rename_all = ...)]` cannot be combined with `#[classified]` fields in \
+             v1: classified columns are registered in the data-flow manifest under their \
+             Rust names, which must match the names the manifest is reviewed against.",
+        )
+        .to_compile_error();
+    }
+    let classified_column_names: Vec<&str> = classified_columns
+        .iter()
+        .map(|(_, col, _)| col.as_str())
+        .collect();
+
+    // Collect `#[confidential]` columns (issue #1771, validated to be `Sealed`).
+    // Each entry: (column name, blind-index companion column).
+    let mut confidential_columns: Vec<(String, Option<String>)> = Vec::new();
+    // One type assertion per confidential field. The attribute checks the field's
+    // type by name, which is a friendly diagnostic but not a proof: an app type
+    // that happens to be called `Sealed` would otherwise earn every guarantee the
+    // registry then claims, over a column holding plaintext. This is the proof.
+    let mut confidential_type_assertions: Vec<TokenStream> = Vec::new();
+    for f in &all_fields {
+        if let Err(err) = validate_confidential_field(f, &all_fields) {
+            return err.to_compile_error();
+        }
+        let spec = match parse_field_confidential(f) {
+            Ok(spec) => spec,
+            Err(err) => return err.to_compile_error(),
+        };
+        if !spec.present {
+            continue;
+        }
+        let ident = f.ident.as_ref().unwrap();
+        let bidx = spec.blind_index.then(|| blind_index_column(ident));
+        confidential_type_assertions.push(quote! {
+            const _: () = {
+                #[allow(dead_code)]
+                fn __autumn_confidential_column_is_sealed(
+                    m: &#name,
+                ) -> &::autumn_web::confidential::Sealed {
+                    &m.#ident
+                }
+            };
+        });
+        if let Some(ref bidx_name) = bidx {
+            let bidx_ident = format_ident!("{bidx_name}");
+            confidential_type_assertions.push(quote! {
+                const _: () = {
+                    #[allow(dead_code)]
+                    fn __autumn_blind_index_column_is_a_token(
+                        m: &#name,
+                    ) -> &::autumn_web::confidential::BlindIndex {
+                        &m.#bidx_ident
+                    }
+                };
+            });
+        }
+        confidential_columns.push((unraw_ident(ident), bidx));
+    }
+    // A struct-level `#[serde(rename_all = ...)]` desyncs the registered column
+    // name from the wire name, exactly as it does for encrypted columns.
+    if !confidential_columns.is_empty() && attrs_have_serde_rename_all(outer_attrs) {
+        return syn::Error::new_spanned(
+            name,
+            "`#[serde(rename_all = ...)]` cannot be combined with `#[confidential]` fields \
+             (issue #1771): confidential columns are registered under their Rust names, \
+             which the log filter, version history and admin redaction key off.",
+        )
+        .to_compile_error();
+    }
+    // A container conversion decides the serialized keys, and version history
+    // snapshots the model through `Serialize`. A `Wire` type that moves the
+    // sealed column under another key would carry the envelope past the
+    // sensitive-column lookup and into the history table; `from`/`try_from` are
+    // the same bypass on the way in. `transparent` is worse: the model
+    // serializes as the bare envelope, so the snapshot is a string, and
+    // `compute_diff_owned` returns no change at all for a non-object value.
+    if !confidential_columns.is_empty()
+        && let Some(key) = attrs_have_serde_shape_conversion(outer_attrs)
+    {
+        let key = serde_key_display(key);
+        return syn::Error::new_spanned(
+            name,
+            format!(
+                "`#[serde({key})]` cannot be combined with `#[confidential]` fields \
+                 (issue #1771): the attribute decides the serialized shape, so version \
+                 history and the raw-request filters — which key off the model's own field \
+                 names — cannot see the sealed column or its token through it."
+            ),
+        )
+        .to_compile_error();
+    }
+
+    // The field-level rule refuses the same omission written on the field. On
+    // the container it needs no field attribute at all: serde fills every key
+    // the request leaves out, and both wrappers implement `Default`, so the row
+    // takes an envelope no key opens or a token that indexes no envelope.
+    if !confidential_columns.is_empty() && attrs_have_serde_container_default(outer_attrs) {
+        return syn::Error::new_spanned(
+            name,
+            "`#[serde(default)]` cannot be combined with `#[confidential]` fields \
+             (issue #1771): it lets a request omit the sealed column or its blind-index \
+             companion, and both wrappers implement `Default`, so the row stores an \
+             envelope no key opens or a token that indexes no envelope. The client's own \
+             bytes are the only valid value for either column.",
+        )
+        .to_compile_error();
+    }
+    let confidential_column_names: Vec<&str> = confidential_columns
+        .iter()
+        .map(|(col, _)| col.as_str())
+        .collect();
+    // A shard key routes a write by reading the column, which a sealed value
+    // cannot answer.
+    if let Ok(Some(shard_key)) = parse_model_shard_key(outer_attrs)
+        && confidential_column_names.contains(&shard_key.as_str())
+    {
+        return syn::Error::new_spanned(
+            name,
+            format!(
+                "`{shard_key}` is this model's shard key, so it cannot be \
+                 `#[confidential]`: the router reads the column to pick a shard, and \
+                 a sealed value is opaque to the server."
+            ),
+        )
+        .to_compile_error();
+    }
+    let confidential_inventory: Vec<TokenStream> = confidential_columns
+        .iter()
+        .map(|(col, bidx)| {
+            let bidx = bidx.as_ref().map_or_else(
+                || quote! { ::core::option::Option::None },
+                |b| quote! { ::core::option::Option::Some(#b) },
+            );
+            quote! {
+                ::autumn_web::reexports::inventory::submit! {
+                    ::autumn_web::confidential::ConfidentialColumnDescriptor {
+                        model: stringify!(#name),
+                        table: #table_name,
+                        column: #col,
+                        blind_index: #bidx,
+                    }
+                }
+            }
+        })
+        .collect();
+
+    // Collect `#[translatable]` columns (issue #1384, validated to be
+    // non-null `Translated`). Each entry is the field ident; the column name is
+    // the Rust field name, which is also the key the field-name-driven
+    // `available_locales` / `is_translated` accessors match on.
+    let mut translatable_columns: Vec<&syn::Ident> = Vec::new();
+    for f in &all_fields {
+        if let Err(err) = validate_translatable_field(f) {
+            return err.to_compile_error();
+        }
+        if field_is_translatable(f)
+            && let Some(ident) = f.ident.as_ref()
+        {
+            translatable_columns.push(ident);
+        }
+    }
+    // `unraw()` for the same reason as in `emit_translatable_items`: the column
+    // registered here must be the real DB column name.
+    let translatable_column_names: Vec<String> = translatable_columns
+        .iter()
+        .map(|i| unraw_ident(i))
+        .collect();
+    let translatable_inventory: Vec<TokenStream> = translatable_column_names
+        .iter()
+        .map(|col| {
+            quote! {
+                ::autumn_web::reexports::inventory::submit! {
+                    ::autumn_web::i18n::TranslatableColumnDescriptor {
+                        model: stringify!(#name),
+                        table: #table_name,
+                        column: #col,
+                    }
+                }
+            }
+        })
+        .collect();
+    let translatable_items = emit_translatable_items(name, &translatable_columns);
+
+    // Collect `#[collaborative]` columns (issue #1806, validated to be
+    // non-null `CollabText`). Same keying rule as `#[translatable]`: the
+    // column name is the Rust field name, which is also the key the
+    // field-name-driven `collaborative` / `collaborative_mut` accessors and
+    // the session hub match on.
+    let mut collaborative_columns: Vec<&syn::Ident> = Vec::new();
+    for f in &all_fields {
+        if let Err(err) = validate_collaborative_field(f) {
+            return err.to_compile_error();
+        }
+        if field_is_collaborative(f)
+            && let Some(ident) = f.ident.as_ref()
+        {
+            collaborative_columns.push(ident);
+        }
+    }
+    // A struct-level `#[serde(rename_all = ...)]` desyncs the registry (Rust
+    // name) from the serialized key, exactly as it does for encrypted and
+    // classified columns — and here it is worse than a reporting mismatch:
+    // `CollabResolver` looks the field up by the registered name in a sync
+    // payload that carries the renamed one, finds neither side's document,
+    // and silently falls back to last-write-wins. That is the data loss the
+    // whole feature exists to prevent, so reject the combination.
+    if !collaborative_columns.is_empty() && attrs_have_serde_rename_all(outer_attrs) {
+        return syn::Error::new_spanned(
+            name,
+            "`#[serde(rename_all = ...)]` cannot be combined with `#[collaborative]` fields:              collaborative columns are registered under their Rust names, which must match              the serialized keys `CollabResolver` looks for in an offline-sync payload. A              renamed key would make the resolver miss the field and fall back to              last-write-wins, discarding one side's edits.",
+        )
+        .to_compile_error();
+    }
+    let collaborative_column_names: Vec<String> = collaborative_columns
+        .iter()
+        .map(|i| unraw_ident(i))
+        .collect();
+    let collaborative_inventory: Vec<TokenStream> = collaborative_column_names
+        .iter()
+        .map(|col| {
+            quote! {
+                ::autumn_web::reexports::inventory::submit! {
+                    ::autumn_web::collab::CollaborativeColumnDescriptor {
+                        model: stringify!(#name),
+                        table: #table_name,
+                        column: #col,
+                    }
+                }
+            }
+        })
+        .collect();
+    let collaborative_items = emit_collaborative_items(name, &collaborative_columns);
+
     // Collect `#[normalize]` columns (validated to be non-null `String`).
     // Each entry: (field ident, lookup key, normalizer chain).
     // The lookup key is the *Rust* field name (the diesel column), because the
@@ -3678,7 +8610,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // the model's module scope when `serialize_as` is present, which needs
     // `ExpressionMethods` in scope. Bring it in anonymously (only for models with
     // encrypted columns) so app authors don't have to add the import themselves.
-    let encrypted_use = if encrypted_columns.is_empty() {
+    let encrypted_use = if encrypted_columns.is_empty() && classified_columns.is_empty() {
         quote! {}
     } else {
         quote! {
@@ -3716,6 +8648,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // manual impl so values never leak through `Debug`/panic output — including
     // update payloads whose `Patch<String>` would otherwise print `Set("secret")`
     // (#805 AC, composes with #697).
+    // (`factory_name` is bound here rather than beside the factory builder so
+    // the redacting Debug impl below can name it, mirroring `changeset_name`.)
+    let factory_name = format_ident!("{name}Factory");
     let lock_version_ident: Option<&syn::Ident> = lock_version_field.and_then(|f| f.ident.as_ref());
     let mutable_idents: Vec<&syn::Ident> = fields_for_new
         .iter()
@@ -3731,8 +8666,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         update_debug_impl,
         changeset_debug_derive,
         changeset_debug_impl,
-    ) = if encrypted_columns.is_empty() {
+        factory_debug_derive,
+        factory_debug_impl,
+    ) = if encrypted_columns.is_empty() && classified_columns.is_empty() {
         (
+            quote! { Debug, },
+            quote! {},
             quote! { Debug, },
             quote! {},
             quote! { Debug, },
@@ -3753,15 +8692,108 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             .collect();
         (
             quote! {},
-            redacting_debug_impl(name, &all_idents, &encrypted_column_names),
+            redacting_debug_impl(
+                name,
+                &all_idents,
+                &encrypted_column_names,
+                &classified_column_names,
+            ),
             quote! {},
-            redacting_debug_impl(&new_name, &new_idents, &encrypted_column_names),
+            redacting_debug_impl(
+                &new_name,
+                &new_idents,
+                &encrypted_column_names,
+                &classified_column_names,
+            ),
             quote! {},
-            redacting_debug_impl(&update_name, &mutable_idents, &encrypted_column_names),
+            redacting_debug_impl(
+                &update_name,
+                &mutable_idents,
+                &encrypted_column_names,
+                &classified_column_names,
+            ),
             quote! {},
-            redacting_debug_impl(&changeset_name, &mutable_idents, &encrypted_column_names),
+            redacting_debug_impl(
+                &changeset_name,
+                &mutable_idents,
+                &encrypted_column_names,
+                &classified_column_names,
+            ),
+            // #2373: the factory holds the same plaintext-bearing columns and is
+            // the struct most likely to be printed while debugging a test, so it
+            // gets the same redacting `Debug` as the other four rather than a
+            // derived one.
+            quote! {},
+            redacting_debug_impl(
+                &factory_name,
+                &new_idents,
+                &encrypted_column_names,
+                &classified_column_names,
+            ),
         )
     };
+    // #1654: a model holding a classified column does not implement `Serialize`.
+    // That is the whole guarantee at the model level: every sink autumn gates is
+    // reached through `Serialize`, so withholding it makes `Json(model)` a build
+    // failure instead of a leak. `Deserialize` is untouched -- taking the data in
+    // is not a release.
+    let query_serde_derive = if has_classified {
+        quote! { #[derive(::serde::Deserialize)] }
+    } else {
+        quote! { #[derive(::serde::Serialize, ::serde::Deserialize)] }
+    };
+    // One zero-sized marker per classified column. It names the field inside the
+    // compiler diagnostic when a leak is attempted, keys a `declassify!` boundary
+    // to exactly one column, and publishes the manifest row.
+    let classified_items: Vec<TokenStream> = classified_columns
+        .iter()
+        .map(|(ident, col, marker)| {
+            let doc = format!(
+                "Field marker for the `#[classified]` column `{}::{}` (issue #1654).\n\n\
+                 Name it in [`declassify!`](autumn_web::declassify) to declare a boundary \
+                 that releases this column, and nothing else.",
+                unraw_ident(name),
+                col,
+            );
+            quote! {
+                #[doc = #doc]
+                #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+                #vis struct #marker;
+
+                impl ::autumn_web::classify::ClassifiedField for #marker {
+                    const MODEL: &'static str = stringify!(#name);
+                    // Module-qualified, because the manifest keys on this: two
+                    // linked crates can each define a `Customer` with a
+                    // classified `email`, and the bare name would merge them
+                    // into one row.
+                    const MODEL_PATH: &'static str =
+                        concat!(module_path!(), "::", stringify!(#name));
+                    const FIELD: &'static str = #col;
+                    const CLASSIFICATION: ::autumn_web::classify::Classification =
+                        ::autumn_web::classify::Classification::PersonalData;
+                }
+
+                ::autumn_web::reexports::inventory::submit! {
+                    ::autumn_web::classify::manifest::ClassifiedFieldDescriptor {
+                        model: stringify!(#name),
+                        model_path: concat!(module_path!(), "::", stringify!(#name)),
+                        field: #col,
+                        classification: ::autumn_web::classify::Classification::PersonalData,
+                    }
+                }
+
+                // Keep the field ident referenced so a marker can never outlive a
+                // renamed column without the rename being noticed here.
+                const _: () = {
+                    #[allow(dead_code)]
+                    fn __autumn_classified_column_exists(m: &#name) -> &::autumn_web::classify::Classified<::std::string::String, #marker> {
+                        &m.#ident
+                    }
+                };
+            }
+        })
+        .collect();
+
     let encrypted_inventory: Vec<TokenStream> = encrypted_columns
         .iter()
         .map(
@@ -3789,6 +8821,26 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let has_validation = all_fields.iter().any(|f| !validate_attrs(f).is_empty());
 
     // Build query struct fields (strip #[id], #[indexed], #[validate])
+    // #1654: the field marker for a `#[classified]` column, or `None`. Every
+    // generated struct that carries the column -- the read struct, `NewX`,
+    // `UpdateX` and the changeset -- looks it up through here so they cannot
+    // drift apart on whether the column is classified.
+    let classified_marker_for = |f: &Field| -> Option<&syn::Ident> {
+        let ident = f.ident.as_ref()?;
+        classified_columns
+            .iter()
+            .find(|(cid, ..)| *cid == ident)
+            .map(|(_, _, marker)| marker)
+    };
+    // The Diesel column mapping for a classified field. Write-only structs
+    // (`NewX`, the changeset) need `serialize_as` alone; the read struct also
+    // needs `deserialize_as`.
+    let classified_serialize_as = |marker: &syn::Ident| {
+        quote! {
+            #[diesel(serialize_as = ::autumn_web::classify::ClassifiedText<#marker>)]
+        }
+    };
+
     let query_fields: Vec<TokenStream> = all_fields
         .iter()
         .map(|f| {
@@ -3796,15 +8848,16 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let ty = &f.ty;
             let attrs = user_attrs(f);
             // #1778: keep the field's full `#[validate(...)]` rules on the read
-            // model so the *effective merged model* (existing row ∪ patch) can be
-            // validated on the update path via `from_patch`. The model's fields
-            // are concrete `T` (not `Patch<T>`), so every validator — including
-            // the ones the `Patch<T>` path cannot express (`ip` on `Option`,
-            // `does_not_contain`, and the cross-field `custom`/`must_match`/
-            // `nested`) — compiles and runs here without hitting the E0119
-            // trait-coherence walls that block them on `Patch<T>`. The struct
-            // only derives `validator::Validate` when `has_validation` is set
-            // (see below), so the attribute is always registered when present.
+            // model, so the effective merged model (existing row plus patch) can be
+            // validated on the update path via `from_patch`. The model's fields are
+            // concrete `T`, not `Patch<T>`, so every validator compiles and runs
+            // here — including the ones `Patch<T>` cannot express (`ip` on
+            // `Option`, `does_not_contain`, and the cross-field `custom`,
+            // `must_match`, `nested`) — without hitting the E0119 coherence walls
+            // that block them there. `nested` carries its own hazard even here: see
+            // `NON_PATCH_VALIDATORS`'s doc comment for the `ValidateExt` collision.
+            // The struct derives `validator::Validate` only when `has_validation` is
+            // set, so the attribute is always registered when present.
             let val_attrs = validate_attrs(f);
             // Encrypted columns route through an AEAD wrapper transparently:
             // `serialize_as` encrypts on write, `deserialize_as` decrypts on read.
@@ -3821,7 +8874,30 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // `skip`) keeps `Deserialize` intact.
             let private = (field_hidden_from_json(f) && !field_already_skips_serialization(f))
                 .then(|| quote! { #[serde(skip_serializing)] });
-            quote! { #(#val_attrs)* #(#attrs)* #enc #private pub #ident: #ty }
+            // #1654: a `#[classified]` column is generated as the taint wrapper
+            // rather than a bare `String`, so the classification is a property of the
+            // type. Diesel round-trips through the opaque `ClassifiedText` column
+            // wrapper, the only conversion out of `Classified` that is not a
+            // declassification, and it dead-ends in the database. The Diesel wrapper
+            // carries the same marker as the field: an `F`-erasing column type would
+            // let a value go in as one column and come back out as another, releasing
+            // it through the wrong boundary and recording it against the wrong column.
+            let classified_marker = classified_marker_for(f);
+            let (ident_ty, classified_diesel) = classified_marker.map_or_else(
+                || (quote! { #ty }, quote! {}),
+                |marker| {
+                    (
+                        quote! { ::autumn_web::classify::Classified<#ty, #marker> },
+                        quote! {
+                            #[diesel(
+                                serialize_as = ::autumn_web::classify::ClassifiedText<#marker>,
+                                deserialize_as = ::autumn_web::classify::ClassifiedText<#marker>
+                            )]
+                        },
+                    )
+                },
+            );
+            quote! { #(#val_attrs)* #(#attrs)* #enc #classified_diesel #private pub #ident: #ident_ty }
         })
         .collect();
 
@@ -3853,26 +8929,47 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // deserializer (which also still accepts RFC 3339 JSON bodies);
             // see `datetime_local_serde_attr`.
             let datetime_local = datetime_local_serde_attr(ty);
-            quote! { #(#val_attrs)* #enc #bool_default #datetime_local pub #ident: #ty }
+            // #1654 (review round 2): the write structs carry the taint wrapper too.
+            // Taking personal data in is not a release — `Classified` keeps its
+            // `Deserialize`, and the declarative validators see through it (see
+            // `autumn/src/classify/validate.rs`), so the form and validation paths
+            // are unaffected. What must not happen is the plaintext moving back out:
+            // these fields are `pub`, so a bare `String` here let a handler write
+            // `Json(View { email: input.email })` and release the value with no
+            // boundary and no audit record. `skip_serializing` alone cannot stop that
+            // — it governs only serializing the write struct itself.
+            let classified = classified_marker_for(f);
+            let classified_skip = (classified.is_some()
+                && !field_already_skips_serialization(f))
+            .then(|| quote! { #[serde(skip_serializing)] });
+            let (new_ty, classified_diesel) = classified.map_or_else(
+                || (quote! { #ty }, quote! {}),
+                |marker| {
+                    (
+                        quote! { ::autumn_web::classify::Classified<#ty, #marker> },
+                        classified_serialize_as(marker),
+                    )
+                },
+            );
+            quote! { #(#val_attrs)* #enc #classified_diesel #bool_default #datetime_local #classified_skip pub #ident: #new_ty }
         })
         .collect();
 
     // Build UpdateX fields:
-    // - Regular mutable fields: Patch<T>, propagating the field's `#[validate]`
-    //   attributes (#1719). The struct derives `validator::Validate` below, and
+    // - Regular mutable fields: `Patch<T>`, propagating the field's `#[validate]`
+    //   attributes (#1719). The struct derives `validator::Validate` below and
     //   `Patch<T>` implements validator's per-field traits (see
     //   `autumn/src/hooks.rs`), so a failing declarative rule (`length`, `email`,
     //   `url`, `range`, `contains`, …) on a `Set` value surfaces as a 422 on
-    //   PATCH/PUT, while an absent (`Unchanged`/`Clear`) field is skipped —
-    //   mirroring the create path. `required` is the one non-skip rule: its
-    //   `Patch<T>` impl fails `Clear`/`Set(None)` so a PATCH can't null a
-    //   required column. Non-declarative/struct-level validators (`custom`,
-    //   `must_match`, `nested`, `credit_card`, `non_control_character`) have no
-    //   `Patch<T>` impl and are filtered out here by `validate_attrs_for_patch`
-    //   (they still run on `NewX`); see that helper for the documented
-    //   create-vs-update limitation.
-    // - #[lock_version] field: plain required T (the client supplies the
-    //   version they read; the framework increments it atomically)
+    //   PATCH/PUT, while an absent `Unchanged`/`Clear` field is skipped, mirroring
+    //   create. `required` is the one non-skip rule: its `Patch<T>` impl fails
+    //   `Clear`/`Set(None)`, so a PATCH cannot null a required column.
+    //   Non-declarative and struct-level validators (`custom`, `must_match`,
+    //   `nested`, `credit_card`, `non_control_character`) have no usable `Patch<T>`
+    //   impl and are filtered out by `validate_attrs_for_patch`; they still run on
+    //   `NewX`. See that helper for the create-vs-update limitation.
+    // - `#[lock_version]` field: a plain required `T`. The client supplies the
+    //   version it read, and the framework increments it atomically.
     let mut update_fields: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
@@ -3881,12 +8978,25 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // #1719: `Patch<T>` only implements validator's per-field
             // declarative traits, so non-declarative/struct-level validators
             // (`custom`, `must_match`, `nested`, …) must be stripped here or the
-            // `UpdateModel` would fail to compile. `NewModel` keeps them all.
+            // `UpdateModel` would fail to compile or misvalidate. `NewModel`
+            // keeps them all.
             let val_attrs = validate_attrs_for_patch(f);
+            // #1654: see the `NewX` comment -- the patch carries the wrapper for
+            // the same reason. `Patch<T>` forwards `Deserialize` and every
+            // declarative validator to `T`, so `Patch<Classified<T, F>>` keeps
+            // both.
+            let classified = classified_marker_for(f);
+            let classified_skip = (classified.is_some() && !field_already_skips_serialization(f))
+                .then(|| quote! { #[serde(skip_serializing)] });
+            let patch_ty = classified.map_or_else(
+                || quote! { #ty },
+                |marker| quote! { ::autumn_web::classify::Classified<#ty, #marker> },
+            );
             quote! {
                 #(#val_attrs)*
                 #[serde(default)]
-                pub #ident: ::autumn_web::hooks::Patch<#ty>
+                #classified_skip
+                pub #ident: ::autumn_web::hooks::Patch<#patch_ty>
             }
         })
         .collect();
@@ -3916,16 +9026,15 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
-    // #1778: statement that validates the effective *merged model* inside
-    // `from_patch` (existing row ∪ patch). Because `after` is a concrete `#name`
-    // — not `Patch<T>` — the model's `#[validate(...)]` rules run against real
-    // values, so the validators that hit E0119 coherence walls on `Patch<T>`
-    // (`ip` on `Option`, `does_not_contain`) and the cross-field ones
-    // (`custom`, `must_match`, `nested`) are all enforced on the update path,
-    // returning the same 422 field-error map as create. Runs before the
-    // `before_update` hook, mirroring create (where `validate_new` runs before
-    // `before_create`). Emitted only when the model declares validation; when it
-    // does not there is nothing to check and the model derives no `Validate`.
+    // #1778: the statement that validates the effective merged model inside
+    // `from_patch` (existing row plus patch). Because `after` is a concrete `#name`
+    // and not `Patch<T>`, the model's `#[validate(...)]` rules run against real
+    // values, so the validators that hit E0119 coherence walls on `Patch<T>` (`ip` on
+    // `Option`, `does_not_contain`) and the cross-field ones (`custom`, `must_match`,
+    // `nested`) are all enforced on the update path, returning the same 422 field-error
+    // map as create. `nested` still carries its own `ValidateExt` hazard here — see
+    // `NON_PATCH_VALIDATORS`'s doc comment (#1751). Runs before the `before_update`
+    // hook, mirroring create. Emitted only when the model declares validation.
     let merged_validate_stmt = if has_validation {
         quote! {
             {
@@ -3938,6 +9047,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     } else {
         quote! {}
+    };
+
+    // #1654: a field's generated type -- the taint wrapper for a
+    // `#[classified]` column, the declared type otherwise. Everything that
+    // touches the field has to agree with the struct definition, so it goes
+    // through this.
+    let model_field_ty = |f: &Field| -> TokenStream {
+        let ty = &f.ty;
+        classified_marker_for(f).map_or_else(
+            || quote! { #ty },
+            |marker| quote! { ::autumn_web::classify::Classified<#ty, #marker> },
+        )
     };
 
     // Build merge arms for `from_patch` (applies Patch fields onto a cloned model)
@@ -3985,7 +9106,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .iter()
         .map(|f| {
             let ident = f.ident.as_ref().unwrap();
-            let ty = &f.ty;
+            let ty = model_field_ty(f);
             quote! {
                 fn #ident(&mut self) -> ::autumn_web::hooks::DraftField<'_, #ty>;
             }
@@ -3997,7 +9118,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .iter()
         .map(|f| {
             let ident = f.ident.as_ref().unwrap();
-            let ty = &f.ty;
+            let ty = model_field_ty(f);
             quote! {
                 fn #ident(&mut self) -> ::autumn_web::hooks::DraftField<'_, #ty> {
                     ::autumn_web::hooks::DraftField::new(&self.before.#ident, &mut self.after.#ident)
@@ -4020,21 +9141,19 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .find(|f| f.ident.as_ref().is_some_and(|id| id == "tenant_id"))
         .copied();
 
-    // `__autumn_preload_retain`: applies this model's read scoping to rows
-    // loaded by another model's `preload`, in-memory, so eager-loaded
-    // associations hide the same rows the model's repository finders do.
-    // Built from the model's own field set (the loading model can't see these
-    // columns): soft-delete drops `deleted_at IS NOT NULL`; tenant scoping
-    // keeps only rows matching the ambient `CURRENT_TENANT` when one is set.
+    // `__autumn_preload_retain` applies this model's read scoping, in memory, to rows
+    // loaded by another model's `preload`, so eager-loaded associations hide the same
+    // rows the model's repository finders do. It is built from the model's own field
+    // set, which the loading model cannot see: soft-delete drops `deleted_at IS NOT
+    // NULL`, and tenant scoping keeps only rows matching the ambient `CURRENT_TENANT`
+    // when one is set.
     //
-    // IMPORTANT: do not add an `if rows.is_empty() { return Ok(rows); }`
-    // early return ahead of the tenant check below. Many-to-many preload
-    // loaders (`through =`) call `__autumn_preload_retain(Vec::new())` as a
-    // fail-closed parity probe specifically to get the "no tenant context"
-    // error even when their join returns zero rows (model.rs, the
-    // `__autumn_m2m_...` loader block) — an empty-input early return would
-    // silently skip that check and break tenant isolation for a whole class
-    // of m2m preloads with no matching join rows. See
+    // Do not add an `if rows.is_empty() { return Ok(rows); }` early return ahead of the
+    // tenant check below. Many-to-many preload loaders (`through =`) call
+    // `__autumn_preload_retain(Vec::new())` as a fail-closed parity probe, precisely to
+    // get the "no tenant context" error even when their join returns zero rows. An
+    // empty-input early return would skip that check and break tenant isolation for a
+    // whole class of m2m preloads. See
     // `preload_retain_empty_rows_still_fails_closed_without_tenant` below.
     let deleted_at_field = all_fields
         .iter()
@@ -4325,26 +9444,22 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         )
     };
 
-    // SQLite counterpart of `#execute_upsert_body`: the per-row loop body that
-    // builds one `INSERT … ON CONFLICT(id) DO UPDATE …` statement, applies the
-    // SAME tenant/lock-version `DO UPDATE … WHERE` refinements Postgres uses
-    // (SQLite's `ON CONFLICT DO UPDATE` supports a `WHERE` clause), runs it, and
-    // pushes any RETURNING row (issue #1996, PR #2021). Matching Postgres' WHERE
-    // is load-bearing for two reasons:
-    //   * tenant isolation (SECURITY): the conflict target is `id` only and the
-    //     shared set-clause (`__autumn_upsert_set`) writes `tenant_id`, so
-    //     without `WHERE tenant_id = <current>` an id owned by another tenant
-    //     would be MOVED into the caller's tenant. With the predicate the DO
-    //     UPDATE simply does not fire for a cross-tenant id → the row is left
-    //     untouched and drops out of RETURNING (silent, no leak).
-    //   * optimistic locking: `WHERE lock_version = excluded.lock_version` leaves
-    //     a stale-version row untouched, dropping it from RETURNING.
+    // SQLite counterpart of `#execute_upsert_body`: the per-row loop body that builds
+    // one `INSERT … ON CONFLICT(id) DO UPDATE …`, applies the same tenant and
+    // lock-version `DO UPDATE … WHERE` refinements Postgres uses — SQLite's `ON
+    // CONFLICT DO UPDATE` supports a `WHERE` clause — runs it, and pushes any RETURNING
+    // row (#1996, PR #2021). Matching Postgres's WHERE is load-bearing twice over:
+    //   * tenant isolation (security): the conflict target is `id` alone and the shared
+    //     set-clause (`__autumn_upsert_set`) writes `tenant_id`, so without `WHERE
+    //     tenant_id = <current>` an id owned by another tenant would be moved into the
+    //     caller's tenant. With the predicate the DO UPDATE does not fire for a
+    //     cross-tenant id: the row is left untouched and drops out of RETURNING.
+    //   * optimistic locking: `WHERE lock_version = excluded.lock_version` leaves a
+    //     stale-version row untouched, dropping it from RETURNING.
     // A dropped row yields no RETURNING output, so per-row `get_result` returns
-    // `Error::NotFound`; `.optional()?` maps that to `None` so the row is simply
-    // absent from the returned Vec — exactly like Postgres' `get_results` omits
-    // filtered rows. The caller's fail-closed reconciliation (re-select dropped
-    // ids under tenant scope → 409 only if still present for this tenant) then
-    // behaves identically on both backends.
+    // `Error::NotFound` and `.optional()?` maps that to `None`, leaving the row absent
+    // from the returned Vec — exactly as Postgres's `get_results` omits filtered rows.
+    // The caller's fail-closed reconciliation then behaves identically on both backends.
     let execute_upsert_body_sqlite = {
         let build_stmt = quote! {
             let stmt = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
@@ -4418,6 +9533,13 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // Field-by-field equality, shared by `__autumn_correlate_model` (two models)
+    // and `__autumn_correlate_new` (a `New*` input against a persisted model).
+    // #1654: one expression serves both because the write struct carries the
+    // same taint wrapper as the model, so the two sides always have the same
+    // field types. Comparing `Classified` to `Classified` also keeps the
+    // correlation off the release path -- unwrapping either side to compare
+    // would be an unrecorded release.
     let compare_fields = fields_for_new.iter().map(|f| {
         let ident = &f.ident;
         quote! { input.#ident == record.#ident }
@@ -4445,7 +9567,20 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 parse_field_encrypted_mode(f).unwrap_or(EncryptedMode::None),
             )
             .map(|w| quote! { #[diesel(serialize_as = #w)] });
-            quote! { #enc pub #ident: Option<#ty> }
+            // #1654: the changeset is built from `UpdateX`'s `Patch` values, so
+            // it holds the wrapper too and writes through the opaque Diesel
+            // column type -- the same round trip the read struct uses, and the
+            // only conversion out of `Classified` that is not a declassification.
+            let (changeset_ty, classified_diesel) = classified_marker_for(f).map_or_else(
+                || (quote! { #ty }, quote! {}),
+                |marker| {
+                    (
+                        quote! { ::autumn_web::classify::Classified<#ty, #marker> },
+                        classified_serialize_as(marker),
+                    )
+                },
+            );
+            quote! { #enc #classified_diesel pub #ident: Option<#changeset_ty> }
         })
         .collect();
     // The lock_version column must be in the changeset so the UPDATE can
@@ -4494,8 +9629,6 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // ── Factory builder ────────────────────────────────────────
-    let factory_name = format_ident!("{name}Factory");
-
     // PK ident/type used for __autumn_pk() — fall back to a dummy `id: i64` if
     // no PK can be detected (the factory will fail to compile at the call site,
     // which is a better diagnostic than a macro panic).
@@ -4530,7 +9663,14 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             if factory_assoc_type(f).is_some() {
                 quote! { pub #ident: ::core::option::Option<#ty> }
             } else {
-                quote! { pub #ident: #ty }
+                // #2373: the factory field is `pub` and lives for the whole
+                // builder chain, so a bare `String` here was a way around the
+                // guarantee entirely -- `Customer::factory().email` could be
+                // moved into a serializable view with no boundary and no audit
+                // record. Classifying only at `build()` time was too late. The
+                // factory is emitted in every build, not just test ones.
+                let field_ty = model_field_ty(f);
+                quote! { pub #ident: #field_ty }
             }
         })
         .collect();
@@ -4568,10 +9708,23 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             factory_assoc_type(f).map_or_else(
                 // Normal field: a single setter that assigns directly.
                 || {
+                    // #2373: the setter keeps its `impl Into<#ty>` bound over the
+                    // declared type and classifies inside. Binding it to the wrapper
+                    // would break every `.email("ada@example.com")` call, because
+                    // `Classified<String, F>` converts only from `String`, not from
+                    // `&str`, and a blanket `From<U: Into<T>>` would overlap the
+                    // existing `From<T>`. Taking plaintext in is not a release, so the
+                    // setter is the right place to wrap: the value is classified from
+                    // the moment it is stored, and callers are unaffected.
+                    let store = if classified_marker_for(f).is_some() {
+                        quote! { ::autumn_web::classify::Classified::new(val.into()) }
+                    } else {
+                        quote! { val.into() }
+                    };
                     vec![quote! {
                         #[must_use]
                         pub fn #ident(mut self, val: impl ::core::convert::Into<#ty>) -> Self {
-                            self.#ident = val.into();
+                            self.#ident = #store;
                             self.__autumn_set.insert(#field_lit);
                             self
                         }
@@ -4611,24 +9764,32 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
-    // Per-field value bindings for NON-assoc fields, honoring `.fake()`.
+    // Per-field value bindings for non-assoc fields, honoring `.fake()`.
     //
-    // When the factory is in `.fake()` mode and the field was NOT explicitly set
-    // via its setter, draw a fake value inferred from the field name/type;
-    // otherwise use the value already stored on the factory. Each binding is a
-    // `let {ident} = …;` so both `build()` and `create()` can construct the
-    // record with struct-shorthand (`NewX { {ident}, … }`).
+    // In `.fake()` mode, a field not explicitly set via its setter draws a fake value
+    // inferred from the field name and type; otherwise the value already stored on the
+    // factory is used. Each binding is a `let {ident} = …;`, so both `build()` and
+    // `create()` can construct the record with struct shorthand.
     //
-    // `.clone()` (rather than moving `self.{ident}`) is required because the
-    // fake branch reads `self.__autumn_fake`/`self.__autumn_set` and the value
-    // is only conditionally consumed. All `NewX` field types are `Clone`.
+    // `.clone()`, rather than moving `self.{ident}`, is required because the fake
+    // branch reads `self.__autumn_fake`/`self.__autumn_set` and the value is only
+    // conditionally consumed. All `NewX` field types are `Clone`.
     let factory_value_bindings: Vec<TokenStream> = fields_for_new
         .iter()
         .filter(|f| factory_assoc_type(f).is_none())
         .map(|f| {
             let ident = f.ident.as_ref().unwrap();
             let field_lit = ident.to_string();
-            fake_expr_for_field(ident, &f.ty).map_or_else(
+            // #2373: the stored field is now the wrapper, but `fake_expr_for_field`
+            // yields a plain value, so the generated side is classified to match.
+            let fake_wrap = |expr: TokenStream| -> TokenStream {
+                if classified_marker_for(f).is_some() {
+                    quote! { ::autumn_web::classify::Classified::new(#expr) }
+                } else {
+                    expr
+                }
+            };
+            fake_expr_for_field(ident, &f.ty, field_decimal_shape(f)).map_or_else(
                 // No fake expression available for this type: leave the value
                 // as-is (its Default when `.fake()` was requested).
                 || {
@@ -4637,6 +9798,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 },
                 |fake_expr| {
+                    let fake_expr = fake_wrap(fake_expr);
                     quote! {
                         let #ident = if self.__autumn_fake
                             && !self.__autumn_set.contains(#field_lit)
@@ -4688,6 +9850,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .collect();
 
     // Struct-shorthand field list for `NewX { … }` (local bindings named to match).
+    // #2373: the factory now stores the wrapper, so the binding already has the
+    // write struct's field type and no conversion is needed here.
     let new_construct_fields: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
@@ -4853,19 +10017,227 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     );
 
     // Compute schema bodies for OpenApiSchema impls.
-    // all_fields is Vec<&Field>; emit_schema_fn_body expects &[&&Field].
+    // all_fields is Vec<&Field>; the schema emitters expect &[&&Field].
     // Thread the container `#[serde(rename_all)]` rule so the advertised schema
     // property names match the wire names the (de)serialized struct uses.
     let schema_rename_all_rule = serde_rename_all_serialize_rule(outer_attrs);
     let schema_rename_all_rule = schema_rename_all_rule.as_deref();
     let all_field_refs: Vec<&&Field> = all_fields.iter().collect();
-    let query_struct_schema_body =
-        emit_schema_fn_body(&all_field_refs, false, schema_rename_all_rule);
-    let new_struct_schema_body =
-        emit_schema_fn_body(&fields_for_new, false, schema_rename_all_rule);
+    // #1654: a classified column has no `Serialize` impl, so it can never appear
+    // in a JSON body. Advertising it in the read schema would document a property
+    // no response can carry. The write schemas keep it: a client still *sets* it.
+    //
+    // #802: the same is true of a field hidden from JSON — `#[private]`, or
+    // `#[encrypted]` without `admin_visible`. Those get `skip_serializing`
+    // injected below, so a response never carries them either. This filter did
+    // not matter while the read schema went unregistered and every model
+    // resolved to an opaque placeholder; now that `#[model]` advertises itself,
+    // omitting it would mark always-absent fields `required` (a strict client
+    // fails to deserialize every response) and publish the names of private and
+    // encrypted columns in the contract. Write schemas keep them: they are only
+    // skipped on the way OUT, and a client still sets them.
+    // An explicit `#[serde(skip)]` / `#[serde(skip_serializing)]` the author
+    // wrote is exactly as absent from a response as the two cases above, and
+    // `field_already_skips_serialization` is the predicate that already knows
+    // it — consult it rather than re-deriving the answer.
+    let serializable_field_refs: Vec<&&Field> = all_field_refs
+        .iter()
+        .filter(|f| {
+            !field_is_classified(f)
+                && !field_hidden_from_json(f)
+                && !field_already_skips_serialization(f)
+        })
+        .copied()
+        .collect();
+    // `skip_serializing_if` is the third member of the omission family, after
+    // the unconditional `skip` / `skip_serializing` filtered above. It differs
+    // in kind: the field DOES appear in some responses, so the property stays —
+    // it just cannot be `required`, because a response that trips the predicate
+    // omits it and a strict client would reject that response.
+    //
+    // Sound HERE and only here, because this schema describes a RESPONSE: the
+    // generated repository API takes `New*` / `Update*` as its request bodies,
+    // never the query struct. `#[derive(OpenApiSchema)]` has no such guarantee
+    // — the same type may be a `Json<T>` request — so it refuses the shape
+    // instead, since `skip_serializing_if` governs serialization alone and
+    // serde still rejects a request that omits the field.
+    let query_struct_schema_body = emit_schema_fn_body_full(
+        &serializable_field_refs,
+        false,
+        &[],
+        schema_rename_all_rule,
+        &|f: &Field| field_has_skip_serializing_if(f),
+    );
+    // Whether a container `#[serde(...)]` re-shapes what the QUERY struct
+    // serializes to, in which case the field-by-field schema above describes a
+    // response the server never sends and must not be registered.
+    //
+    // Direction matters, and only the serialize side does: this schema describes
+    // a RESPONSE (the generated API takes `New*` / `Update*` as request bodies).
+    // So:
+    //   * `transparent`     — writes the inner value, not an object     → skip
+    //   * `into = "X"`      — Serialize converts to X and writes X's shape → skip
+    //   * `tag = "t"`       — adds a tag field to the output            → skip
+    //   * `from` / `try_from` — DESERIALIZE-side only; serialization is
+    //                         unaffected, so the response shape is still these
+    //                         fields                                    → keep
+    //   * split `rename_all` — the read schema already takes the serialize
+    //                         side, which is the side a response uses   → keep
+    //
+    // Declining registration rather than raising a compile error: `#[model]` is
+    // a core macro, and refusing to compile an app that legitimately uses
+    // `#[serde(into = ...)]` would be a breaking change out of proportion to the
+    // problem. Falling back to the opaque placeholder restores the pre-#802
+    // behaviour for exactly these models, which is honest rather than wrong —
+    // and `autumn openapi export` names every placeholder it emits, so the
+    // author is told rather than left guessing.
+    //
+    // The same question has to be asked of the FIELDS, not just the container:
+    // a field-level attribute re-shapes one property where a container one
+    // re-shapes the whole object, but either way the emitted schema stops
+    // describing the response. Only fields that actually reach the schema are
+    // consulted — `serializable_field_refs`, not every field — because an
+    // adapter on a field the response never carries cannot misdescribe it.
+    //
+    //   * `flatten`          — serde merges this field's keys into the parent
+    //                          object while the emitter publishes it as a
+    //                          nested property                        → skip
+    //   * `with = "m"`       — sets both directions; the serialize half can
+    //                          write any shape (an `i64` as a string, say),
+    //                          so the Rust type no longer describes it → skip
+    //   * `serialize_with`   — the serialize half alone, same reason    → skip
+    //   * `deserialize_with` — DESERIALIZE-side only; the response is still
+    //                          the Rust type                            → keep
+    let query_field_reshaped = serializable_field_refs.iter().any(|f| {
+        serde_bare_word(&f.attrs, &["flatten"]).is_some()
+            || serde_valued_key(&f.attrs, &["with", "serialize_with"]).is_some()
+    });
+    let query_struct_reshaped = serde_bare_word(outer_attrs, &["transparent"]).is_some()
+        || serde_valued_key(outer_attrs, &["into", "tag"]).is_some()
+        || query_field_reshaped;
+    let query_schema_descriptor = if query_struct_reshaped {
+        quote! {}
+    } else {
+        quote! {
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::openapi::DerivedSchemaDescriptor {
+                    name: stringify!(#name),
+                    identity: ::autumn_web::openapi::type_name_of::<#name>,
+                    schema: <#name as ::autumn_web::openapi::OpenApiSchema>::schema,
+                }
+            }
+        }
+    };
+
+    // `NewModel` carries `#[serde(default)]` on every non-`Option` `bool` (see
+    // the `bool_default` wiring in the struct emitter), so a POST body may omit
+    // one and get `false`. Requiredness has to follow that, not the Rust type,
+    // or a generated client is forced to send a value the server does not need.
+    // RAW identifiers, not the model's serde names. The `New*` / `Update*`
+    // structs deliberately do not inherit `#[serde(rename_all)]` or a field
+    // `#[serde(rename)]` — pinned by `form_for_derive.rs` — so a body is decoded
+    // under the bare Rust identifiers. Advertising the model's renamed keys
+    // would make every generated POST/PUT fail with a missing-field error.
+    let new_struct_schema_body = emit_schema_fn_body_named(
+        &fields_for_new,
+        false,
+        &[],
+        None,
+        &|f: &Field| !is_option_type(&f.ty) && type_name_str(&f.ty) == "bool",
+        true,
+        // `NewModel` fields are plain `T`, not `Patch<T>` — nothing to widen.
+        false,
+    );
+    // A `NewModel` datetime field carries the datetime-local-tolerant
+    // deserializer this macro injects itself (`datetime_local_serde_attr`, wired
+    // in at the `new_fields` construction above). That adapter accepts BOTH RFC
+    // 3339 and the offsetless shape `<input type="datetime-local">` posts, while
+    // this schema is built from the original field type and `scalar_json_schema`
+    // labels every `DateTime` `format: date-time` — whose RFC 3339 production
+    // requires an offset. A strict validator therefore rejects a create body the
+    // generated POST handler accepts.
+    //
+    // Widened to the union rather than split by direction: every value a
+    // response emits is RFC 3339, which is inside the union, so one schema stays
+    // honest for both sides. That is the same reasoning as the `Patch<T>`
+    // nullability widening, and is what distinguishes this from the two
+    // direction-blind cases in #2607, where the correct request and response
+    // schemas genuinely disagree and no single document can serve both.
+    //
+    // The predicate is `datetime_local_serde_attr` itself, not a re-derivation of
+    // "is this a datetime": the schema must describe exactly the fields that
+    // actually receive the adapter, or the two drift.
+    //
+    // Nullability is carried alongside the name and re-applied below.
+    // `datetime_local_serde_attr` accepts `Option<DateTime<..>>` too (it unwraps
+    // the `Option` before matching), so this widening reaches optional datetime
+    // columns as well — and replacing the property wholesale would DISCARD the
+    // `oneOf [.., null]` branch the emitter put there, while the generated
+    // deserializer still accepts an explicit `null`. A string-only schema would
+    // then reject a valid create payload.
+    let datetime_local_properties: Vec<(String, bool)> = fields_for_new
+        .iter()
+        .filter(|f| datetime_local_serde_attr(&f.ty).is_some())
+        .filter_map(|f| {
+            // `raw_field_names: true` above, so the property is the bare ident.
+            let raw = f.ident.as_ref()?.to_string();
+            let name = raw.strip_prefix("r#").unwrap_or(&raw).to_owned();
+            Some((name, is_option_type(&f.ty)))
+        })
+        .collect();
+    let datetime_local_property_names: Vec<&String> =
+        datetime_local_properties.iter().map(|(n, _)| n).collect();
+    let datetime_local_property_nullable: Vec<bool> =
+        datetime_local_properties.iter().map(|(_, n)| *n).collect();
+    let new_struct_schema_body = if datetime_local_property_names.is_empty() {
+        new_struct_schema_body
+    } else {
+        quote! {{
+            let mut __autumn_new_schema = { #new_struct_schema_body };
+            if let Some(__autumn_props) = __autumn_new_schema
+                .get_mut("properties")
+                .and_then(|__p| __p.as_object_mut())
+            {
+                for (__autumn_name, __autumn_nullable) in [
+                    #((#datetime_local_property_names, #datetime_local_property_nullable)),*
+                ] {
+                    if let Some(__autumn_prop) = __autumn_props.get_mut(__autumn_name) {
+                        let __autumn_widened = ::autumn_web::reexports::serde_json::json!({
+                            "type": "string",
+                            "description": "RFC 3339, or an offsetless local datetime \
+                                            (YYYY-MM-DDTHH:MM[:SS[.f]]) as posted by an \
+                                            HTML `datetime-local` control.",
+                        });
+                        // An optional column keeps its null branch: the adapter
+                        // unwraps the `Option` but the deserializer still takes
+                        // an explicit `null`.
+                        *__autumn_prop = if __autumn_nullable {
+                            ::autumn_web::reexports::serde_json::json!({
+                                "oneOf": [__autumn_widened, { "type": "null" }]
+                            })
+                        } else {
+                            __autumn_widened
+                        };
+                    }
+                }
+            }
+            __autumn_new_schema
+        }}
+    };
+    // Every mutable field of `UpdateModel` is declared `Patch<T>`, and `null`
+    // is a MEANINGFUL value on both sides of the wire for one: `Deserialize`
+    // maps `null` to `Patch::Clear` ("unset this column"), and `Serialize`
+    // writes `null` for both `Unchanged` and `Clear`. Describing the property
+    // as a plain, non-nullable `T` is therefore wrong in both directions — a
+    // validator rejects a legitimate clear request, and rejects a response that
+    // serializes an `UpdateModel` with any field left unchanged. Widen each to
+    // `oneOf [T, null]`, the same shape `Option<T>` already emits.
+    //
+    // The lock-version column passed as `extra` is NOT a `Patch<T>` (see the
+    // `update_fields` construction above) and stays required and non-nullable.
     let update_struct_schema_body = {
         let extra: &[&&Field] = lock_version_field.as_slice();
-        emit_schema_fn_body_ext(&fields_for_new, true, extra, schema_rename_all_rule)
+        emit_schema_fn_body_named(&fields_for_new, true, extra, None, &|_| false, true, true)
     };
     let commit_hook_serialize_fields: Vec<TokenStream> = all_fields
         .iter()
@@ -4989,6 +10361,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         })?
                 }
             };
+            // #1654: the local binding feeds `Self { #ident: #ident }`, so it has
+            // to be the *model's* field type -- the taint wrapper for a
+            // classified column, which deserializes transparently. A
+            // `#[serde(default = "path")]` fallback returns the *declared* type,
+            // so it is classified on the way into the binding.
+            let ty = model_field_ty(f);
+            let missing_default = if classified_marker_for(f).is_some() {
+                missing_default
+                    .map(|d| quote! { ::autumn_web::classify::Classified::new(#d) })
+            } else {
+                missing_default
+            };
             missing_default.map_or_else(
                 || {
                     quote! {
@@ -5027,6 +10411,45 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { #ident: #ident }
         })
         .collect();
+    // #1654: the durable commit-hook and ledger payload is a second copy of the record,
+    // assembled by serializing every column into JSON. A classified column has no
+    // `Serialize` impl — that is the guarantee — so the payload cannot be built, and
+    // building it through a back door would put the value in a `serde_json::Value` that
+    // anything could hand to a sink. Gating the durable-payload sink is a follow-up
+    // slice; until then the combination fails loudly where it is used, naming the
+    // column and the fix. Both callers (`commit_hooks = true`, `ledgered = true`) are
+    // opt-in, so an ordinary repository over a classified model is unaffected.
+    let commit_hook_serialize_body = if has_classified {
+        let cols = classified_column_names.join("`, `");
+        let message = format!(
+            "`{}` has `#[classified]` column(s) `{cols}`, so it cannot be written into the \
+             durable commit-hook payload: that payload is a second, unclassified copy of the \
+             record. Gating it is a follow-up slice of issue #1654 -- until then, use \
+             non-durable `after_commit` hooks on this model, or drop `#[classified]` from the \
+             column. (`versioned = true` and `ledgered = true` take the same snapshot and are \
+             rejected earlier, at compile time.)",
+            unraw_ident(name),
+        );
+        quote! {
+            let _ = &self;
+            return ::core::result::Result::Err(
+                ::autumn_web::AutumnError::internal_server_error_msg(#message),
+            );
+        }
+    } else {
+        quote! {
+            let mut __autumn_object = ::autumn_web::reexports::serde_json::Map::new();
+            #(#commit_hook_serialize_fields)*
+            let mut __autumn_value =
+                ::autumn_web::reexports::serde_json::Value::Object(__autumn_object);
+            // Encrypted columns must not be persisted in plaintext into the
+            // durable `autumn_repository_commit_hooks` table (#805). Rewrite
+            // them as recoverable ciphertext in their declared mode.
+            #commit_hook_encrypt_stmt
+            ::core::result::Result::Ok(__autumn_value)
+        }
+    };
+
     let commit_hook_serialize_bounds: Vec<TokenStream> = all_fields
         .iter()
         .filter(|f| !has_hook_serde_adapter(f, SerdeAdapterMode::Serialize))
@@ -5116,12 +10539,30 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { #lookup_key => ::core::option::Option::Some(#expr), }
         })
         .collect();
-    let normalize_impls = quote! {
-        impl ::autumn_web::normalize::Normalize for #new_name {
-            fn normalize(&mut self) {
-                #(#normalize_new_stmts)*
+    // #2634: gate the `New*` `Normalize` impl on the insert struct actually
+    // having `#[normalize]` columns. With no columns the `Yes` arm of the
+    // repository autoref probe (`SpezNormalizeManyYes`) would win and clone
+    // the whole batch to run an empty `normalize()` — a guaranteed no-op.
+    // Omitting the impl lets the probe's `No` arm win, so `save` /
+    // `save_many` / `save_many_skip_invalid` / `find_or_create_by_*` pay no
+    // clone for unnormalized models. The read-model impl stays unconditional:
+    // it is `&mut self` in place (no clone involved) and user code may call
+    // `.normalize()` on it directly, so removing it would be a compile break.
+    // `NormalizedModel` stays unconditional too: derived finders call
+    // `normalize_lookup` for every model and rely on the `None` arm.
+    let normalize_new_impl = if normalize_new_stmts.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            impl ::autumn_web::normalize::Normalize for #new_name {
+                fn normalize(&mut self) {
+                    #(#normalize_new_stmts)*
+                }
             }
         }
+    };
+    let normalize_impls = quote! {
+        #normalize_new_impl
         impl ::autumn_web::normalize::Normalize for #name {
             fn normalize(&mut self) {
                 #(#normalize_model_stmts)*
@@ -5168,6 +10609,28 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let Some(ident) = field.ident.as_ref() else {
             continue;
         };
+        // #1654: `?filter[col]=` and `?sort=col` are client-controlled, so a
+        // classified column in either allowlist is a leak that compiles: the
+        // filter is an unauthenticated equality oracle over the personal data,
+        // and the sort orders the whole result set by it. Neither goes through a
+        // declassification boundary, so neither can appear in the manifest.
+        // Look it up by name explicitly rather than by trusting the DB column,
+        // then leave it out of both allowlists.
+        if classified_columns.iter().any(|(cid, ..)| *cid == ident) {
+            continue;
+        }
+        // #1771: the same reasoning for a confidential column and its
+        // blind-index companion. Neither is orderable or filterable today (the
+        // type lists below hold no `Sealed` or `BlindIndex`), but the exclusion
+        // is explicit so a later edit to those lists cannot open a client-driven
+        // equality oracle over a sealed value.
+        let name = unraw_ident(ident);
+        if confidential_columns
+            .iter()
+            .any(|(col, bidx)| *col == name || bidx.as_deref() == Some(name.as_str()))
+        {
+            continue;
+        }
         let raw = ident.to_string();
         let col = raw.strip_prefix("r#").unwrap_or(&raw).to_string();
         let is_option = option_inner_type(&field.ty).is_some();
@@ -5188,6 +10651,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 | "f64"
                 | "Decimal"
                 | "Uuid"
+                // `SqliteUuid` (issue #1924) is hyphenated lowercase text, which
+                // sorts in UUID byte order. `SqliteDecimal` is deliberately
+                // absent: its column is TEXT, so SQL would order it
+                // lexicographically ("9" after "10") and the header would lie.
+                | "SqliteUuid"
                 | "NaiveDateTime"
                 | "NaiveDate"
                 | "NaiveTime"
@@ -5303,10 +10771,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     quote! {
         #encrypted_use
 
+        #(#classified_items)*
+
         #list_query_helpers
 
         #[derive(#name_debug_derive Clone, ::diesel::Queryable, ::diesel::Selectable, ::diesel::AsChangeset, ::diesel::Insertable)]
-        #[derive(::serde::Serialize, ::serde::Deserialize)]
+        #query_serde_derive
         // #1778: derive `validator::Validate` on the read model (gated on
         // `has_validation`, symmetric with New*/Update*) so the merged model
         // built by `from_patch` can be validated on the update path. See the
@@ -5362,9 +10832,57 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             pub const __AUTUMN_ENCRYPTED_COLUMNS: &'static [&'static str] =
                 &[#(#encrypted_column_names),*];
+
+            /// Column names on this model marked `#[classified]` (#1654).
+            ///
+            /// Emitted for every model (empty when none are classified). The
+            /// compile-time guarantee is carried by the columns' types, not by
+            /// this list -- it exists so a surface without a compile-time view
+            /// of the model (the admin plugin, an operator report) can ask which
+            /// columns hold personal data, and so the `Json` sink diagnostic can
+            /// point somewhere when it can only name the model.
+            #[doc(hidden)]
+            pub const __AUTUMN_CLASSIFIED_COLUMNS: &'static [&'static str] =
+                &[#(#classified_column_names),*];
+
+            /// Column names on this model marked `#[confidential]` (#1771).
+            ///
+            /// Emitted for every model (empty when none are confidential). The
+            /// `#[repository]` macro reads this list at build time to refuse a
+            /// server-side predicate over a sealed column, and surfaces without
+            /// a compile-time view of the model read it to redact.
+            #[doc(hidden)]
+            pub const __AUTUMN_CONFIDENTIAL_COLUMNS: &'static [&'static str] =
+                &[#(#confidential_column_names),*];
+
+            /// Column names on this model declared `#[translatable]` (#1384).
+            ///
+            /// Emitted for every model (empty when none are translatable) so
+            /// that surfaces without a compile-time view of the model can ask
+            /// which columns hold a per-locale container.
+            #[doc(hidden)]
+            pub const __AUTUMN_TRANSLATABLE_COLUMNS: &'static [&'static str] =
+                &[#(#translatable_column_names),*];
+
+            /// Column names on this model declared `#[collaborative]` (#1806).
+            ///
+            /// Emitted for every model (empty when none are collaborative) so
+            /// that surfaces without a compile-time view of the model can ask
+            /// which columns hold a CRDT document.
+            #[doc(hidden)]
+            pub const __AUTUMN_COLLABORATIVE_COLUMNS: &'static [&'static str] =
+                &[#(#collaborative_column_names),*];
         }
 
         #(#encrypted_inventory)*
+        #(#confidential_type_assertions)*
+        #(#confidential_inventory)*
+
+        #translatable_items
+        #(#translatable_inventory)*
+
+        #collaborative_items
+        #(#collaborative_inventory)*
 
         impl #update_name {
             #[doc(hidden)]
@@ -5403,21 +10921,19 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
 
                 // Postgres builds one batched `INSERT … ON CONFLICT … DO UPDATE …
-                // RETURNING` over the whole chunk; SQLite cannot express a
-                // multi-row `VALUES` with the `DEFAULT` keyword (`BatchInsert<…,
-                // false>` has no `QueryFragment<Sqlite>`), so it upserts row by
-                // row, each `INSERT … ON CONFLICT(id) DO UPDATE … WHERE … RETURNING`
-                // (valid single-row on SQLite with the `returning_clauses`
-                // flag). The caller (`save_many`/`upsert_many`) already runs this
-                // inside a transaction, so the per-row loop stays atomic. The
-                // per-row body (`#execute_upsert_body_sqlite`) applies the SAME
-                // tenant/lock-version `DO UPDATE … WHERE` refinements as the
-                // Postgres arm — `diesel::upsert::excluded` is the backend-agnostic
-                // form (vs. `pg::upsert::excluded`) and SQLite's `ON CONFLICT DO
-                // UPDATE` supports a `WHERE` clause — so cross-tenant ids are left
-                // untouched (SECURITY: no cross-tenant row movement) and stale
-                // lock-version rows drop out of RETURNING, matching Postgres
-                // exactly (issue #1996, PR #2021).
+                // RETURNING` over the whole chunk. SQLite cannot express a multi-row
+                // `VALUES` with the `DEFAULT` keyword — `BatchInsert<…, false>` has no
+                // `QueryFragment<Sqlite>` — so it upserts row by row, each `INSERT …
+                // ON CONFLICT(id) DO UPDATE … WHERE … RETURNING`, valid single-row on
+                // SQLite with the `returning_clauses` flag. The caller
+                // (`save_many`/`upsert_many`) already runs this inside a transaction,
+                // so the per-row loop stays atomic. The per-row body
+                // (`#execute_upsert_body_sqlite`) applies the same tenant and
+                // lock-version `DO UPDATE … WHERE` refinements as the Postgres arm —
+                // `diesel::upsert::excluded` is the backend-agnostic form — so
+                // cross-tenant ids are left untouched, with no cross-tenant row
+                // movement, and stale lock-version rows drop out of RETURNING, matching
+                // Postgres exactly (#1996, PR #2021).
                 ::autumn_web::backend_select! {
                     pg => {
                         let stmt = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
@@ -5574,7 +11090,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         /// Produced by [`#name::factory()`]. All fields are pre-filled with
         /// `Default::default()` so callers only need to specify the fields that
         /// matter for their scenario.
-        #[derive(Debug, Clone)]
+        #[derive(#factory_debug_derive Clone)]
         #vis struct #factory_name {
             #(#factory_struct_fields,)*
             /// Names of fields the caller explicitly set via a setter. `.fake()`
@@ -5586,6 +11102,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             pub __autumn_fake: bool,
         }
+
+        #factory_debug_impl
 
         impl ::core::default::Default for #factory_name {
             fn default() -> Self {
@@ -5684,6 +11202,25 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // expands to nothing, so models compile unchanged when seeding is off.
         ::autumn_web::__autumn_register_fake_seeder!(#name, stringify!(#name));
 
+        // ── Architecture-graph node (#1747) ────────────────────────────
+        // The model's own declaration of the table it maps to: the join key
+        // every route, job and repository edge resolves against.
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::graph::ModelGraphDescriptor {
+                model: ::core::stringify!(#name),
+                model_path: ::core::concat!(
+                    ::core::module_path!(),
+                    "::",
+                    ::core::stringify!(#name)
+                ),
+                table: #table_name,
+                relations: #graph_relations,
+                module_path: ::core::module_path!(),
+                file: ::core::file!(),
+                line: ::core::line!(),
+            }
+        }
+
         // ── Durable commit-hook codec ───────────────────────────────────
         // Hidden durable commit-hook codec. These methods serialize fields
         // individually so public serde visibility attributes do not drop
@@ -5695,15 +11232,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ) -> ::autumn_web::AutumnResult<::autumn_web::reexports::serde_json::Value>
             #commit_hook_serialize_where
             {
-                let mut __autumn_object = ::autumn_web::reexports::serde_json::Map::new();
-                #(#commit_hook_serialize_fields)*
-                let mut __autumn_value =
-                    ::autumn_web::reexports::serde_json::Value::Object(__autumn_object);
-                // Encrypted columns must not be persisted in plaintext into the
-                // durable `autumn_repository_commit_hooks` table (#805). Rewrite
-                // them as recoverable ciphertext in their declared mode.
-                #commit_hook_encrypt_stmt
-                Ok(__autumn_value)
+                #commit_hook_serialize_body
             }
 
             #[doc(hidden)]
@@ -5789,6 +11318,32 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
+        // Advertise all three schemas by identity in the compile-time inventory
+        // the OpenAPI/MCP back-fill consults (issue #802). Without this the
+        // `impl`s above exist but nothing can FIND them: the back-fill resolves
+        // a referenced type through `DerivedSchemaDescriptor`, so a
+        // `#[repository(api = "..")]` endpoint's own model exported as the
+        // generic `{"type":"object","title":"X"}` placeholder — an untyped blob
+        // in every generated client — even though the real schema was compiled
+        // in all along.
+        #query_schema_descriptor
+
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::openapi::DerivedSchemaDescriptor {
+                name: stringify!(#new_name),
+                identity: ::autumn_web::openapi::type_name_of::<#new_name>,
+                schema: <#new_name as ::autumn_web::openapi::OpenApiSchema>::schema,
+            }
+        }
+
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::openapi::DerivedSchemaDescriptor {
+                name: stringify!(#update_name),
+                identity: ::autumn_web::openapi::type_name_of::<#update_name>,
+                schema: <#update_name as ::autumn_web::openapi::OpenApiSchema>::schema,
+            }
+        }
+
         impl ::autumn_web::repository::AutumnSearchableModel for #name {
             const IS_SEARCHABLE: bool = #is_searchable;
             const SEARCH_LANGUAGE: &'static str = #search_language;
@@ -5796,6 +11351,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #((#search_field_names, #search_field_weights)),*
             ];
         }
+
+        // ── Pluggable search index definition + document (#1191) ────────────
+        #search_indexed_impl
 
         // ── State machine impls (one per #[state_machine] field) ────────────
         #(#state_machine_impls)*
@@ -5806,6 +11364,15 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         // ── Model-declared dependent cascade specs (#1738) ──────────────────
         #dependents_impl
+
+        // ── Model-declared counter-cache specs (#1325) ──────────────────────
+        #counter_caches_impl
+
+        // ── Votable reactions (#[votable], #1362) ───────────────────────────
+        #votable_items
+
+        // ── Polymorphic comments (#[commentable], #1367) ────────────────────
+        #commentable_items
     }
 }
 
@@ -5889,7 +11456,7 @@ mod tests {
         // Narrow types must clamp the range to their own maximum so the `as`
         // cast can't wrap (`1000 as u8 == 232`, `1000 as i8 == -24`).
         let expr = |ty: syn::Type| {
-            fake_expr_core("count", &ty)
+            fake_expr_core("count", &ty, None)
                 .expect("integer type should infer a fake expr")
                 .to_string()
         };
@@ -5929,114 +11496,121 @@ mod tests {
         );
     }
 
-    // ── Serde-rename resolution for FormField::value_name (#1135) ─────────
+    // ── Fake decimal shape (#2597) ─────────────────────────────────────────
+    // A `#[decimal_shape(precision = p, scale = s)]` field attribute carries
+    // the generator's declared `decimal{p,s}` into `#[model]`, so the
+    // factory `.fake()` draws from `fake::decimal_with(p, s)` — values that
+    // fit the column by construction — instead of the untyped
+    // `fake::decimal()`.
 
     #[test]
-    fn field_serde_serialize_rename_parses_plain_and_split_forms() {
-        let field: syn::Field = syn::Field::parse_named
-            .parse2(quote! { #[serde(rename = "headline")] pub title: String })
-            .unwrap();
-        assert_eq!(
-            field_serde_serialize_rename(&field).as_deref(),
-            Some("headline")
-        );
-
-        let field: syn::Field = syn::Field::parse_named
-            .parse2(quote! {
-                #[serde(rename(serialize = "out", deserialize = "in"))]
-                pub title: String
-            })
-            .unwrap();
-        assert_eq!(field_serde_serialize_rename(&field).as_deref(), Some("out"));
-
-        // Deserialize-only rename leaves the serialized key alone.
-        let field: syn::Field = syn::Field::parse_named
-            .parse2(quote! { #[serde(rename(deserialize = "in"))] pub title: String })
-            .unwrap();
-        assert_eq!(field_serde_serialize_rename(&field), None);
-
-        let field: syn::Field = syn::Field::parse_named
-            .parse2(quote! { #[serde(default)] pub title: String })
-            .unwrap();
-        assert_eq!(field_serde_serialize_rename(&field), None);
+    fn decimal_shape_attr_parses_precision_and_scale() {
+        let field: syn::Field = syn::parse_quote! {
+            #[decimal_shape(precision = 5, scale = 2)]
+            pub price: rust_decimal::Decimal
+        };
+        assert_eq!(field_decimal_shape(&field), Some((5, 2)));
     }
 
     #[test]
-    fn schema_property_name_resolves_renames_and_strips_raw_idents() {
-        // field rename wins over rename_all.
-        let field: syn::Field = syn::Field::parse_named
-            .parse2(quote! { #[serde(rename = "kind")] pub category: String })
-            .unwrap();
-        assert_eq!(
-            schema_property_name(&field, Some("camelCase")).as_deref(),
-            Some("kind")
-        );
-
-        // container rename_all applies when there is no field rename.
-        let field: syn::Field = syn::Field::parse_named
-            .parse2(quote! { pub word_count: i64 })
-            .unwrap();
-        assert_eq!(
-            schema_property_name(&field, Some("camelCase")).as_deref(),
-            Some("wordCount")
-        );
-
-        // raw-ident prefix is stripped (advertise the wire name).
-        let field: syn::Field = syn::Field::parse_named
-            .parse2(quote! { pub r#type: String })
-            .unwrap();
-        assert_eq!(schema_property_name(&field, None).as_deref(), Some("type"));
-
-        // no rule, plain field → the identifier verbatim.
-        let field: syn::Field = syn::Field::parse_named
-            .parse2(quote! { pub title: String })
-            .unwrap();
-        assert_eq!(schema_property_name(&field, None).as_deref(), Some("title"));
+    fn decimal_shape_attr_absent_yields_no_shape() {
+        let field: syn::Field = syn::parse_quote! {
+            pub price: rust_decimal::Decimal
+        };
+        assert_eq!(field_decimal_shape(&field), None);
     }
 
     #[test]
-    fn serde_rename_all_serialize_rule_parses_plain_and_split_forms() {
-        let attrs: Vec<syn::Attribute> =
-            vec![syn::parse_quote!(#[serde(rename_all = "camelCase")])];
-        assert_eq!(
-            serde_rename_all_serialize_rule(&attrs).as_deref(),
-            Some("camelCase")
-        );
-
-        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(
-            #[serde(rename_all(serialize = "kebab-case", deserialize = "camelCase"))]
-        )];
-        assert_eq!(
-            serde_rename_all_serialize_rule(&attrs).as_deref(),
-            Some("kebab-case")
-        );
-
-        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[serde(deny_unknown_fields)])];
-        assert_eq!(serde_rename_all_serialize_rule(&attrs), None);
-    }
-
-    #[test]
-    fn apply_serde_rename_all_rule_mirrors_serde_field_casings() {
-        let cases = [
-            ("lowercase", "word_count", "word_count"),
-            ("snake_case", "word_count", "word_count"),
-            ("UPPERCASE", "word_count", "WORD_COUNT"),
-            ("SCREAMING_SNAKE_CASE", "word_count", "WORD_COUNT"),
-            ("PascalCase", "word_count", "WordCount"),
-            ("camelCase", "word_count", "wordCount"),
-            ("camelCase", "title", "title"),
-            ("kebab-case", "word_count", "word-count"),
-            ("SCREAMING-KEBAB-CASE", "word_count", "WORD-COUNT"),
-        ];
-        for (rule, field, expected) in cases {
+    fn decimal_shape_attr_malformed_falls_back_to_untyped() {
+        // The macro must never fail expansion on a best-effort hint: unknown
+        // keys, missing values, and non-integer values all fall back to the
+        // untyped `fake::decimal()`, exactly as before the attribute existed.
+        for tokens in [
+            quote! { #[decimal_shape(frobnicate = 1)] pub price: rust_decimal::Decimal },
+            quote! { #[decimal_shape(precision = 5)] pub price: rust_decimal::Decimal },
+            quote! { #[decimal_shape(precision = "five", scale = 2)] pub price: rust_decimal::Decimal },
+        ] {
+            let field: syn::Field = syn::parse_quote!(#tokens);
             assert_eq!(
-                apply_serde_rename_all_rule(rule, field).as_deref(),
-                Some(expected),
-                "rule {rule} on {field}"
+                field_decimal_shape(&field),
+                None,
+                "malformed attribute must fall back: {tokens}"
             );
         }
-        // A rule serde itself rejects resolves to no rename here.
-        assert_eq!(apply_serde_rename_all_rule("bogusCase", "word_count"), None);
+    }
+
+    #[test]
+    fn decimal_shape_attr_stripped_from_user_attrs() {
+        // The marker must not leak onto the generated Diesel query struct —
+        // Diesel doesn't understand it.
+        let field: syn::Field = syn::parse_quote! {
+            #[decimal_shape(precision = 5, scale = 2)]
+            pub price: rust_decimal::Decimal
+        };
+        let attrs = user_attrs(&field);
+        assert!(
+            attrs.iter().all(|a| !a.path().is_ident("decimal_shape")),
+            "`#[decimal_shape]` must be stripped from the query struct's attrs"
+        );
+    }
+
+    #[test]
+    fn shaped_decimal_fake_expr_uses_decimal_with() {
+        let ident: syn::Ident = syn::parse_quote!(price);
+        let ty: syn::Type = syn::parse_quote!(rust_decimal::Decimal);
+
+        let shaped = fake_expr_for_field(&ident, &ty, Some((5, 2)))
+            .expect("Decimal should infer a fake expr")
+            .to_string();
+        assert!(shaped.contains("decimal_with"), "{shaped}");
+        assert!(shaped.contains("5u32"), "{shaped}");
+        assert!(shaped.contains("2u32"), "{shaped}");
+
+        let untyped = fake_expr_for_field(&ident, &ty, None)
+            .expect("Decimal should infer a fake expr")
+            .to_string();
+        assert!(!untyped.contains("decimal_with"), "{untyped}");
+        assert!(untyped.contains("decimal ()"), "{untyped}");
+    }
+
+    #[test]
+    fn shaped_sqlite_decimal_fake_expr_converts() {
+        let ident: syn::Ident = syn::parse_quote!(price);
+        let ty: syn::Type = syn::parse_quote!(autumn_web::db::sqlite_types::SqliteDecimal);
+
+        let shaped = fake_expr_for_field(&ident, &ty, Some((5, 0)))
+            .expect("SqliteDecimal should infer a fake expr")
+            .to_string();
+        assert!(shaped.contains("decimal_with"), "{shaped}");
+        assert!(shaped.contains("into ()"), "{shaped}");
+    }
+
+    #[test]
+    fn model_macro_emits_decimal_with_for_shaped_field() {
+        // End-to-end at the macro level: the generator's attribute flows
+        // through `#[model]` into the factory's `.fake()` binding.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Invoice {
+                    #[id]
+                    pub id: i64,
+                    #[decimal_shape(precision = 5, scale = 2)]
+                    pub amount: rust_decimal::Decimal,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("decimal_with"),
+            "shaped decimal field must draw from fake::decimal_with: {generated}"
+        );
+        // ...and the marker attribute itself must not leak onto the Diesel
+        // structs (`cannot find attribute decimal_shape in this scope`).
+        assert!(
+            !generated.contains("decimal_shape ("),
+            "the marker must be consumed, not re-emitted: {generated}"
+        );
     }
 
     // ── RED: #[lock_version] detection ────────────────────────────────────
@@ -6125,6 +11699,1577 @@ mod tests {
     // `#[has_many]` / `#[has_one]`, validates the action, and records it on the
     // association so `#[model]` can emit the runtime `AutumnDependents` dispatch.
     // An unknown action is still rejected; `#[belongs_to]` still errors.
+
+    // ── `counter_cache` on `#[belongs_to]` (#1325) ────────────────────────
+    //
+    // The attribute parses as a bare flag and as an explicit column, resolves the
+    // column by the `{snake(child)}_count` convention, and rejects the shapes that
+    // would silently produce wrong SQL: a counter on the parent's `has_many`, where
+    // nothing owns the foreign key; a counter over a `through =` join table, where the
+    // foreign key is a join-table column; a non-identifier column name, since it is
+    // spliced into `format!`ed SQL; and two legs resolving onto one parent column,
+    // where both would move it.
+
+    /// `resolve_associations`' `Ok` type is not `Debug`, so unwrap the error by
+    /// matching rather than through `expect_err`.
+    fn expect_assoc_error(model: &syn::Ident, attrs: &[syn::Attribute]) -> String {
+        match resolve_associations(model, attrs) {
+            Ok(_) => panic!("expected the association to be rejected"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[test]
+    fn counter_cache_bare_flag_derives_the_column_from_the_child() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Post, counter_cache)])];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(assocs.len(), 1);
+        assert!(assocs[0].counter_cache.is_some());
+        assert_eq!(
+            counter_cache_column(&model, &assocs[0]).as_deref(),
+            Some("comment_count"),
+            "the default column is singular: {{snake(child)}}_count"
+        );
+    }
+
+    #[test]
+    fn counter_cache_accepts_an_explicit_column() {
+        let model: syn::Ident = syn::parse_quote!(Subscription);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Subreddit, counter_cache = "subscriber_count")])];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(
+            counter_cache_column(&model, &assocs[0]).as_deref(),
+            Some("subscriber_count")
+        );
+    }
+
+    #[test]
+    fn a_belongs_to_without_counter_cache_records_none() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[belongs_to(Post)])];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert!(assocs[0].counter_cache.is_none());
+        assert_eq!(counter_cache_column(&model, &assocs[0]), None);
+    }
+
+    #[test]
+    fn counter_cache_tenant_is_explicit_and_recorded() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[belongs_to(Post, counter_cache, counter_cache_tenant = "tenant_id")]),
+        ];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(
+            assocs[0]
+                .counter_cache
+                .as_ref()
+                .and_then(|d| d.tenant_column.clone())
+                .as_deref(),
+            Some("tenant_id")
+        );
+    }
+
+    #[test]
+    fn counter_cache_defaults_to_no_tenant_predicate() {
+        // Not inferred from the child's fields: the parent's schema is invisible
+        // here, and guessing would break a tenant-scoped child hanging off a
+        // global parent with a hard `column does not exist`.
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Post, counter_cache)])];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert!(
+            assocs[0]
+                .counter_cache
+                .as_ref()
+                .expect("counter cache")
+                .tenant_column
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn counter_cache_tenant_without_counter_cache_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Post, counter_cache_tenant = "tenant_id")])];
+        let message = expect_assoc_error(&model, &attrs);
+        assert!(message.contains("requires `counter_cache`"), "{message}");
+    }
+
+    #[test]
+    fn counter_cache_on_has_many_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_many(Comment, counter_cache)])];
+        let message = expect_assoc_error(&model, &attrs);
+        assert!(
+            message.contains("`#[belongs_to]` option")
+                && message.contains("Move it to the child model's"),
+            "the error must name the leg to move it to: {message}"
+        );
+    }
+
+    #[test]
+    fn counter_cache_on_a_join_table_association_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Tag, through = post_tags, counter_cache)])];
+        assert!(resolve_associations(&model, &attrs).is_err());
+    }
+
+    #[test]
+    fn a_non_identifier_counter_cache_column_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[belongs_to(Post, counter_cache = "comment_count; DROP TABLE posts")]),
+        ];
+        let message = expect_assoc_error(&model, &attrs);
+        assert!(message.contains("plain identifier"), "{message}");
+    }
+
+    #[test]
+    fn two_legs_onto_one_parent_column_collide() {
+        // Both legs point at `User` and both default to `message_count`, so
+        // every insert would count twice.
+        let model: syn::Ident = syn::parse_quote!(Message);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[belongs_to(User, fk = sender_id, name = sender, counter_cache)]),
+            syn::parse_quote!(#[belongs_to(User, fk = recipient_id, name = recipient, counter_cache)]),
+        ];
+        let message = expect_assoc_error(&model, &attrs);
+        assert!(message.contains("users.message_count"), "{message}");
+    }
+
+    #[test]
+    fn two_legs_onto_different_parent_tables_may_share_a_column_name() {
+        // `users.message_count` and `rooms.message_count` are different columns
+        // on different tables — not a collision.
+        let model: syn::Ident = syn::parse_quote!(Message);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[belongs_to(User, fk = sender_id, name = sender, counter_cache)]),
+            syn::parse_quote!(#[belongs_to(Room, fk = room_id, counter_cache)]),
+        ];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(assocs.len(), 2);
+    }
+
+    // ── `#[derivation]` (#1769) ───────────────────────────────────────────
+    //
+    // One declaration produces two lowerings of the same filter: a Rust
+    // predicate the repository evaluates on a record, and a SQL predicate the
+    // set-based statements splice. Every row of the lowering table is asserted
+    // pairwise, because a divergence between the two is exactly the drift this
+    // feature exists to prevent.
+
+    /// Named fields of a struct literal, for building a filter field map.
+    fn deriv_fields(input: TokenStream) -> Vec<syn::Field> {
+        let item: syn::ItemStruct = syn::parse2(input).expect("struct");
+        match item.fields {
+            syn::Fields::Named(named) => named.named.into_iter().collect(),
+            _ => panic!("expected named fields"),
+        }
+    }
+
+    /// The filter field map for a struct written inline in a test.
+    fn deriv_field_map(input: TokenStream) -> FilterFields {
+        let fields = deriv_fields(input);
+        let refs: Vec<&syn::Field> = fields.iter().collect();
+        filter_field_map(&refs)
+    }
+
+    /// Lower `filter` against a one-field child model of the given type.
+    fn lower_one(ty: &TokenStream, filter: &syn::Expr) -> syn::Result<LoweredFilter> {
+        let map = deriv_field_map(quote! { struct C { pub id: i64, pub f: #ty } });
+        let model: syn::Ident = syn::parse_quote!(C);
+        lower_filter(filter, &model, &map)
+    }
+
+    /// The error message from a filter the grammar must reject.
+    fn lower_one_err(ty: &TokenStream, filter: &syn::Expr) -> String {
+        match lower_one(ty, filter) {
+            Ok(_) => panic!("expected the filter to be rejected"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    /// The error message from a rejected `#[derivation]` attribute.
+    fn expect_derivation_error(
+        model: &syn::Ident,
+        attrs: &[syn::Attribute],
+        assocs: &[Association],
+    ) -> String {
+        match resolve_derivations(model, attrs, assocs) {
+            Ok(_) => panic!("expected the derivation to be rejected"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[test]
+    fn filter_bare_bool_field_lowers_to_both() {
+        let lowered = lower_one(&quote!(bool), &syn::parse_quote!(f)).expect("lower");
+        assert_eq!(lowered.rust.to_string(), quote! { __r.f }.to_string());
+        assert_eq!(lowered.sql, "{c}.\"f\" = TRUE");
+    }
+
+    #[test]
+    fn filter_bare_option_bool_uses_option_semantics() {
+        let lowered = lower_one(&quote!(Option<bool>), &syn::parse_quote!(f)).expect("lower");
+        assert_eq!(
+            lowered.rust.to_string(),
+            quote! { __r.f == ::core::option::Option::Some(true) }.to_string()
+        );
+        assert_eq!(lowered.sql, "{c}.\"f\" = TRUE");
+    }
+
+    #[test]
+    fn filter_negated_bool_lowers_to_false() {
+        let lowered = lower_one(&quote!(bool), &syn::parse_quote!(!f)).expect("lower");
+        assert_eq!(lowered.rust.to_string(), quote! { !__r.f }.to_string());
+        assert_eq!(lowered.sql, "{c}.\"f\" = FALSE");
+    }
+
+    #[test]
+    fn filter_negated_option_bool_compares_to_some_false() {
+        let lowered = lower_one(&quote!(Option<bool>), &syn::parse_quote!(!f)).expect("lower");
+        assert_eq!(
+            lowered.rust.to_string(),
+            quote! { __r.f == ::core::option::Option::Some(false) }.to_string()
+        );
+        assert_eq!(lowered.sql, "{c}.\"f\" = FALSE");
+    }
+
+    #[test]
+    fn filter_bool_literal_comparison_folds_to_the_bare_form() {
+        let eq_true = lower_one(&quote!(bool), &syn::parse_quote!(f == true)).expect("lower");
+        assert_eq!(eq_true.rust.to_string(), quote! { __r.f }.to_string());
+        assert_eq!(eq_true.sql, "{c}.\"f\" = TRUE");
+
+        let eq_false = lower_one(&quote!(bool), &syn::parse_quote!(f == false)).expect("lower");
+        assert_eq!(eq_false.rust.to_string(), quote! { !__r.f }.to_string());
+        assert_eq!(eq_false.sql, "{c}.\"f\" = FALSE");
+
+        let ne_true = lower_one(&quote!(bool), &syn::parse_quote!(f != true)).expect("lower");
+        assert_eq!(ne_true.sql, "{c}.\"f\" = FALSE");
+    }
+
+    #[test]
+    fn filter_int_comparison_lowers_verbatim() {
+        let lowered = lower_one(&quote!(i64), &syn::parse_quote!(f > 3)).expect("lower");
+        assert_eq!(lowered.rust.to_string(), quote! { __r.f > 3 }.to_string());
+        assert_eq!(lowered.sql, "{c}.\"f\" > 3");
+    }
+
+    #[test]
+    fn filter_negative_int_literal_is_accepted() {
+        let lowered = lower_one(&quote!(i64), &syn::parse_quote!(f >= -5)).expect("lower");
+        assert_eq!(lowered.rust.to_string(), quote! { __r.f >= -5 }.to_string());
+        assert_eq!(lowered.sql, "{c}.\"f\" >= -5");
+    }
+
+    #[test]
+    fn filter_option_int_comparison_excludes_null() {
+        let lowered = lower_one(&quote!(Option<i64>), &syn::parse_quote!(f > 3)).expect("lower");
+        assert_eq!(
+            lowered.rust.to_string(),
+            quote! { __r.f.is_some_and(|__v| __v > 3) }.to_string()
+        );
+        assert_eq!(lowered.sql, "{c}.\"f\" > 3");
+    }
+
+    #[test]
+    fn filter_option_int_inequality_excludes_null() {
+        // `__r.f != Some(3)` would count a NULL row, but SQL `f <> 3` is NULL
+        // (excluded) for a NULL `f`. `is_some_and` makes the two agree.
+        let lowered = lower_one(&quote!(Option<i64>), &syn::parse_quote!(f != 3)).expect("lower");
+        assert_eq!(
+            lowered.rust.to_string(),
+            quote! { __r.f.is_some_and(|__v| __v != 3) }.to_string()
+        );
+        assert_eq!(lowered.sql, "{c}.\"f\" <> 3");
+    }
+
+    #[test]
+    fn filter_string_equality_lowers_to_a_quoted_literal() {
+        let lowered = lower_one(&quote!(String), &syn::parse_quote!(f == "pub")).expect("lower");
+        assert_eq!(
+            lowered.rust.to_string(),
+            quote! { __r.f == "pub" }.to_string()
+        );
+        assert_eq!(lowered.sql, "CAST({c}.\"f\" AS TEXT) = 'pub' {bin}");
+    }
+
+    #[test]
+    fn filter_option_string_equality_uses_as_deref() {
+        let lowered =
+            lower_one(&quote!(Option<String>), &syn::parse_quote!(f == "pub")).expect("lower");
+        assert_eq!(
+            lowered.rust.to_string(),
+            quote! { __r.f.as_deref() == ::core::option::Option::Some("pub") }.to_string()
+        );
+        assert_eq!(lowered.sql, "CAST({c}.\"f\" AS TEXT) = 'pub' {bin}");
+    }
+
+    #[test]
+    fn filter_option_string_inequality_excludes_null() {
+        let lowered =
+            lower_one(&quote!(Option<String>), &syn::parse_quote!(f != "pub")).expect("lower");
+        assert_eq!(
+            lowered.rust.to_string(),
+            quote! { __r.f.as_deref().is_some_and(|__v| __v != "pub") }.to_string()
+        );
+        assert_eq!(lowered.sql, "CAST({c}.\"f\" AS TEXT) <> 'pub' {bin}");
+    }
+
+    #[test]
+    fn filter_string_literal_quote_is_escaped_for_sql() {
+        let lowered =
+            lower_one(&quote!(String), &syn::parse_quote!(f == "o'brien")).expect("lower");
+        assert_eq!(lowered.sql, "CAST({c}.\"f\" AS TEXT) = 'o''brien' {bin}");
+    }
+
+    #[test]
+    fn filter_string_literal_with_a_brace_is_rejected() {
+        let message = lower_one_err(&quote!(String), &syn::parse_quote!(f == "{c}"));
+        assert!(message.contains("placeholder"), "{message}");
+    }
+
+    #[test]
+    fn filter_option_probes_lower_to_null_predicates() {
+        let some = lower_one(&quote!(Option<i64>), &syn::parse_quote!(f.is_some())).expect("lower");
+        assert_eq!(
+            some.rust.to_string(),
+            quote! { __r.f.is_some() }.to_string()
+        );
+        assert_eq!(some.sql, "{c}.\"f\" IS NOT NULL");
+
+        let none = lower_one(&quote!(Option<i64>), &syn::parse_quote!(f.is_none())).expect("lower");
+        assert_eq!(
+            none.rust.to_string(),
+            quote! { __r.f.is_none() }.to_string()
+        );
+        assert_eq!(none.sql, "{c}.\"f\" IS NULL");
+    }
+
+    #[test]
+    fn filter_conjunction_parenthesises_both_sides() {
+        let map = deriv_field_map(quote! {
+            struct C { pub id: i64, pub published: bool, pub score: i64 }
+        });
+        let model: syn::Ident = syn::parse_quote!(C);
+        let lowered =
+            lower_filter(&syn::parse_quote!(published && score > 0), &model, &map).expect("lower");
+        assert_eq!(
+            lowered.rust.to_string(),
+            quote! { (__r.published) && (__r.score > 0) }.to_string()
+        );
+        assert_eq!(
+            lowered.sql,
+            "({c}.\"published\" = TRUE) AND ({c}.\"score\" > 0)"
+        );
+    }
+
+    #[test]
+    fn filter_parentheses_are_transparent() {
+        let lowered = lower_one(&quote!(bool), &syn::parse_quote!((f))).expect("lower");
+        assert_eq!(lowered.rust.to_string(), quote! { __r.f }.to_string());
+        assert_eq!(lowered.sql, "{c}.\"f\" = TRUE");
+    }
+
+    #[test]
+    fn filter_float_literal_is_rejected() {
+        let message = lower_one_err(&quote!(i64), &syn::parse_quote!(f > 1.5));
+        assert!(message.contains("float"), "{message}");
+    }
+
+    #[test]
+    fn filter_naming_a_non_field_is_rejected() {
+        let message = lower_one_err(&quote!(bool), &syn::parse_quote!(missing));
+        assert!(
+            message.contains("`missing` is not a field"),
+            "the error must name the unknown field: {message}"
+        );
+    }
+
+    #[test]
+    fn filter_over_an_unsupported_field_type_is_rejected() {
+        let map = deriv_field_map(quote! {
+            struct C { pub id: i64, pub at: chrono::NaiveDateTime }
+        });
+        let model: syn::Ident = syn::parse_quote!(C);
+        let err = lower_filter(&syn::parse_quote!(at == 1), &model, &map)
+            .expect_err("timestamps are outside the filter grammar");
+        assert!(err.to_string().contains("`at`"), "{err}");
+    }
+
+    #[test]
+    fn filter_outside_the_grammar_lists_the_grammar() {
+        let message = lower_one_err(&quote!(bool), &syn::parse_quote!(f || f));
+        assert!(
+            message.contains("field.is_some()") && message.contains("a && b"),
+            "the error must list the accepted grammar: {message}"
+        );
+    }
+
+    #[test]
+    fn filter_string_ordering_is_rejected() {
+        // Rust compares bytes, SQL compares by collation: the two lowerings
+        // would disagree, which is the drift this feature prevents.
+        let message = lower_one_err(&quote!(String), &syn::parse_quote!(f > "a"));
+        assert!(message.contains("collation"), "{message}");
+    }
+
+    #[test]
+    fn filter_is_some_on_a_non_option_field_is_rejected() {
+        let message = lower_one_err(&quote!(i64), &syn::parse_quote!(f.is_some()));
+        assert!(message.contains("not an `Option"), "{message}");
+    }
+
+    #[test]
+    fn filter_comparison_type_mismatch_is_rejected() {
+        let message = lower_one_err(&quote!(i64), &syn::parse_quote!(f == "x"));
+        assert!(message.contains("integer"), "{message}");
+    }
+
+    // ── attribute parsing and defaults ────────────────────────────────────
+
+    #[test]
+    fn derivation_defaults_to_count_and_no_filter() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "comment_count")])];
+        let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].column, "comment_count");
+        assert_eq!(decls[0].transform.as_source(), "count");
+        assert!(decls[0].filter.is_none());
+        assert!(decls[0].name.is_none());
+    }
+
+    #[test]
+    fn derivation_name_defaults_to_parent_table_and_column() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "published_comment_count")])];
+        let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
+        assert_eq!(
+            derivation_name(&decls[0], "posts"),
+            "posts.published_comment_count"
+        );
+    }
+
+    #[test]
+    fn derivation_name_override_is_recorded() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", name = "posts.custom")])];
+        let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
+        assert_eq!(derivation_name(&decls[0], "posts"), "posts.custom");
+    }
+
+    #[test]
+    fn derivation_fk_defaults_to_the_belongs_to_leg() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let assoc_attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Post, fk = article_id)])];
+        let assocs = resolve_associations(&model, &assoc_attrs).expect("assocs");
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[derivation(Post, column = "c")])];
+        let decls = resolve_derivations(&model, &attrs, &assocs).expect("parse ok");
+        assert_eq!(
+            derivation_fk(&model, &decls[0], &assocs).expect("resolved"),
+            "article_id"
+        );
+    }
+
+    #[test]
+    fn derivation_fk_falls_back_to_the_convention() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[derivation(Post, column = "c")])];
+        let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
+        assert_eq!(
+            derivation_fk(&model, &decls[0], &[]).expect("resolved"),
+            "post_id"
+        );
+    }
+
+    #[test]
+    fn derivation_fk_override_wins() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", fk = article_id)])];
+        let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
+        assert_eq!(
+            derivation_fk(&model, &decls[0], &[]).expect("resolved"),
+            "article_id"
+        );
+    }
+
+    #[test]
+    fn derivation_sum_transform_is_recorded() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "s", transform = sum(score))])];
+        let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
+        assert_eq!(decls[0].transform.as_source(), "sum(score)");
+    }
+
+    #[test]
+    fn derivation_sum_transform_rejects_anything_after_the_field() {
+        // `sum(score + bonus)` must not be read as `sum(score)`: the maintained
+        // aggregate would silently differ from what the source says.
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        for attr in [
+            quote! { #[derivation(Post, column = "s", transform = sum(score + bonus))] },
+            quote! { #[derivation(Post, column = "s", transform = sum(score, bonus))] },
+        ] {
+            let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#attr)];
+            let Err(err) = resolve_derivations(&model, &attrs, &[]) else {
+                panic!("extra tokens inside sum(...) must be an error")
+            };
+            assert!(err.to_string().contains("exactly one field name"), "{err}");
+        }
+    }
+
+    #[test]
+    fn derivation_tenant_column_is_recorded() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", tenant = "tenant_id")])];
+        let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
+        assert_eq!(decls[0].tenant_column.as_deref(), Some("tenant_id"));
+    }
+
+    #[test]
+    fn derivation_unknown_key_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", wat = "x")])];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("column = "), "{message}");
+    }
+
+    #[test]
+    fn derivation_without_a_column_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[derivation(Post)])];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("`column = \"<column>\"`"), "{message}");
+    }
+
+    #[test]
+    fn derivation_non_identifier_column_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c; DROP TABLE posts")])];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("plain identifier"), "{message}");
+    }
+
+    #[test]
+    fn derivation_unknown_transform_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", transform = avg(score))])];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("`count`"), "{message}");
+    }
+
+    #[test]
+    fn two_derivations_onto_one_parent_column_collide() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[derivation(Post, column = "c", filter = published)]),
+            syn::parse_quote!(#[derivation(Post, column = "c")]),
+        ];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("posts.c"), "{message}");
+    }
+
+    #[test]
+    fn a_derivation_colliding_with_a_counter_cache_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let assoc_attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Post, counter_cache)])];
+        let assocs = resolve_associations(&model, &assoc_attrs).expect("assocs");
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "comment_count")])];
+        let message = expect_derivation_error(&model, &attrs, &assocs);
+        assert!(
+            message.contains("posts.comment_count") && message.contains("counter_cache"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn two_derivations_onto_different_parents_may_share_a_column_name() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[derivation(Post, column = "c")]),
+            syn::parse_quote!(#[derivation(Team, column = "c")]),
+        ];
+        let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
+        assert_eq!(decls.len(), 2);
+    }
+
+    // ── #1769 review follow-ups (M1-M12) ──────────────────────────────────
+
+    #[test]
+    fn filter_on_a_raw_identifier_field_names_the_plain_column() {
+        // `r#type` is the Rust spelling; the column is `type`.
+        let map = deriv_field_map(quote! { struct C { pub id: i64, pub r#type: String } });
+        let model: syn::Ident = syn::parse_quote!(C);
+        let filter: syn::Expr = syn::parse_quote!(r#type == "post");
+        let lowered = lower_filter(&filter, &model, &map).expect("lower");
+        assert_eq!(lowered.sql, "CAST({c}.\"type\" AS TEXT) = 'post' {bin}");
+    }
+
+    #[test]
+    fn filter_on_a_diesel_renamed_field_is_rejected() {
+        let map = deriv_field_map(quote! {
+            struct C {
+                pub id: i64,
+                #[diesel(column_name = is_live)]
+                pub published: bool,
+            }
+        });
+        let model: syn::Ident = syn::parse_quote!(C);
+        let filter: syn::Expr = syn::parse_quote!(published);
+        let message = match lower_filter(&filter, &model, &map) {
+            Ok(_) => panic!("expected the renamed field to be rejected"),
+            Err(err) => err.to_string(),
+        };
+        assert!(message.contains("column_name"), "{message}");
+    }
+
+    #[test]
+    fn filter_comparison_over_narrow_integers_lowers_to_both() {
+        for ty in [quote!(i8), quote!(i16), quote!(i32)] {
+            let lowered = lower_one(&ty, &syn::parse_quote!(f >= 3)).expect("lower");
+            assert_eq!(lowered.rust.to_string(), quote! { __r.f >= 3 }.to_string());
+            assert_eq!(lowered.sql, "{c}.\"f\" >= 3");
+        }
+    }
+
+    #[test]
+    fn filter_string_literal_with_a_backslash_is_rejected() {
+        let message = lower_one_err(&quote!(String), &syn::parse_quote!(f == "a\\b"));
+        assert!(message.contains("backslash"), "{message}");
+    }
+
+    #[test]
+    fn filter_string_literal_with_a_control_character_is_rejected() {
+        let message = lower_one_err(&quote!(String), &syn::parse_quote!(f == "a\u{0}b"));
+        assert!(message.contains("backslash"), "{message}");
+    }
+
+    #[test]
+    fn derivation_parent_table_override_is_recorded() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", parent_table = "articles")])];
+        let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
+        assert_eq!(derivation_parent_table(&decls[0]), "articles");
+        assert_eq!(
+            derivation_name(&decls[0], &derivation_parent_table(&decls[0])),
+            "articles.c"
+        );
+    }
+
+    #[test]
+    fn derivation_parent_table_defaults_to_the_inferred_name() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[derivation(Post, column = "c")])];
+        let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
+        assert_eq!(derivation_parent_table(&decls[0]), "posts");
+    }
+
+    #[test]
+    fn derivation_parent_table_must_be_a_plain_identifier() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[derivation(Post, column = "c", parent_table = "posts; DROP TABLE posts")]),
+        ];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("plain identifier"), "{message}");
+    }
+
+    #[test]
+    fn derivation_duplicate_key_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "a", column = "b")])];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("duplicate `column"), "{message}");
+    }
+
+    #[test]
+    fn derivation_fk_must_be_a_plain_identifier() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[derivation(Post, column = "c", fk = "post_id; DROP TABLE posts")]),
+        ];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("plain identifier"), "{message}");
+    }
+
+    #[test]
+    fn derivation_empty_name_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", name = "")])];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("empty"), "{message}");
+    }
+
+    #[test]
+    fn derivation_overlong_name_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let long = "n".repeat(129);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", name = #long)])];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("128"), "{message}");
+    }
+
+    #[test]
+    fn derivation_name_under_the_parking_prefix_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", name = "parked::c")])];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("reserved"), "{message}");
+    }
+
+    #[test]
+    fn derivation_name_with_a_control_character_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", name = "a\nb")])];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("control"), "{message}");
+    }
+
+    #[test]
+    fn derivation_ambiguous_default_fk_is_rejected() {
+        // Two legs to one parent and no `fk =`: the macro must not guess.
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let assoc_attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[belongs_to(Post, fk = post_id, name = post)]),
+            syn::parse_quote!(#[belongs_to(Post, fk = origin_id, name = origin)]),
+        ];
+        let assocs = resolve_associations(&model, &assoc_attrs).expect("assocs");
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[derivation(Post, column = "c")])];
+        let decls = resolve_derivations(&model, &attrs, &assocs).expect("parse ok");
+        let message = match derivation_fk(&model, &decls[0], &assocs) {
+            Ok(fk) => panic!("expected an ambiguity error, got `{fk}`"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            message.contains("post_id") && message.contains("origin_id"),
+            "both candidate keys must be named: {message}"
+        );
+    }
+
+    #[test]
+    fn derivation_ambiguous_default_fk_is_resolved_by_the_override() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let assoc_attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[belongs_to(Post, fk = post_id, name = post)]),
+            syn::parse_quote!(#[belongs_to(Post, fk = origin_id, name = origin)]),
+        ];
+        let assocs = resolve_associations(&model, &assoc_attrs).expect("assocs");
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", fk = origin_id)])];
+        let decls = resolve_derivations(&model, &attrs, &assocs).expect("parse ok");
+        assert_eq!(
+            derivation_fk(&model, &decls[0], &assocs).expect("resolved"),
+            "origin_id"
+        );
+    }
+    // ── emission ──────────────────────────────────────────────────────────
+
+    /// Expand `#[model]` over a child model carrying one `#[derivation]`.
+    fn derivation_model_output(attrs: &TokenStream, body: &TokenStream) -> String {
+        model_macro(
+            TokenStream::new(),
+            quote! {
+                #attrs
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                    pub published: bool,
+                    pub score: i32,
+                    #body
+                }
+            },
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn model_emits_a_derivation_static_and_registers_it() {
+        let generated = derivation_model_output(
+            &quote! {
+                #[derivation(Post, column = "published_comment_count", filter = published)]
+            },
+            &TokenStream::new(),
+        );
+        assert!(
+            generated.contains("__AUTUMN_DERIVATION_Comment_0"),
+            "the definition static must be named per model and index: {generated}"
+        );
+        assert!(
+            generated.contains("DerivationDescriptor"),
+            "the definition must be submitted to the inventory registry: {generated}"
+        );
+        assert!(
+            generated.contains("\"posts.published_comment_count\""),
+            "the default name is `{{parent_table}}.{{column}}`: {generated}"
+        );
+        assert!(
+            generated.contains("\" AND ({c}.\\\"published\\\" = TRUE)\""),
+            "the emitted filter SQL must carry the alias placeholder: {generated}"
+        );
+        assert!(
+            generated.contains("__autumn_derivation_contrib_0"),
+            "the Rust contribution must be emitted as a plain fn: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_emits_a_sum_contribution() {
+        let generated = derivation_model_output(
+            &quote! {
+                #[derivation(Post, column = "visible_score", transform = sum(score), filter = published)]
+            },
+            &TokenStream::new(),
+        );
+        assert!(
+            generated.contains("\"{c}.\\\"score\\\"\""),
+            "the contribution SQL must name the summed column: {generated}"
+        );
+        assert!(
+            generated.contains("i64 :: from (__r . score)"),
+            "the Rust contribution must widen the summed field: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_derivation_cannot_maintain_the_parent_primary_key() {
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Post, column = "id", fk = post_id)]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot maintain `posts.id`"),
+            "the parent primary key is not a maintainable column: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_tenant_id_field_claims_its_column() {
+        // The tenant discriminator is a maintained column in the registry's
+        // sense: a derivation onto it would move the parent between tenants,
+        // so a model carrying one claims it whether or not it keeps a counter
+        // cache of its own.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Doc {
+                    #[id]
+                    pub id: i64,
+                    pub tenant_id: Option<String>,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("CounterCacheClaim") && generated.contains("column : \"tenant_id\""),
+            "a `tenant_id` field must claim its column: {generated}"
+        );
+        let without = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Doc {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !without.contains("CounterCacheClaim"),
+            "a model with neither token nor tenant claims nothing: {without}"
+        );
+    }
+
+    #[test]
+    fn model_deleted_at_field_claims_its_column_and_is_not_a_derivation_target() {
+        // The soft-delete marker is a maintained column in the registry's
+        // sense: a value written into it hides the parent from every
+        // soft-deleting read.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Doc {
+                    #[id]
+                    pub id: i64,
+                    pub deleted_at: Option<chrono::NaiveDateTime>,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("CounterCacheClaim")
+                && generated.contains("column : \"deleted_at\""),
+            "a `deleted_at` field must claim its column: {generated}"
+        );
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Post, column = "deleted_at", fk = post_id)]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot maintain `posts.deleted_at`"),
+            "the soft-delete marker is not a maintainable column: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_derivation_cannot_maintain_the_parent_tenant_id() {
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Post, column = "tenant_id", fk = post_id)]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot maintain `posts.tenant_id`"),
+            "the tenant discriminator is not a maintainable column: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_derivation_tenant_reads_the_child_tenant_as_text() {
+        // The pre-update capture reads the tenant with `CAST(... AS TEXT)`, and
+        // the record side must spell it the same way, so the accessor is
+        // emitted for integer and string fields (`Option` forwarded) and a
+        // field of any other type is rejected.
+        for ty in [quote! { i64 }, quote! { String }, quote! { Option<String> }] {
+            let generated = model_macro(
+                TokenStream::new(),
+                quote! {
+                    #[derivation(Post, column = "reaction_count", fk = post_id, tenant = "org_id")]
+                    pub struct Reaction {
+                        #[id]
+                        pub id: i64,
+                        pub post_id: i64,
+                        pub org_id: #ty,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains("tenant_of : :: core :: option :: Option :: Some"),
+                "a readable tenant field gets an accessor: {generated}"
+            );
+        }
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Post, column = "reaction_count", fk = post_id, tenant = "flag")]
+                pub struct Reaction {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                    pub flag: bool,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("must be an integer or `String` field"),
+            "a tenant the maintenance cannot read as text is rejected: {generated}"
+        );
+        // A plain counter cache with a tenant it cannot read keeps its SQL:
+        // no accessor, no capture of the tenant.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, counter_cache, counter_cache_tenant = "tenant_id")]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("tenant_of : :: core :: option :: Option :: None"),
+            "a leg without the field reads no tenant: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_lock_version_claim_names_the_physical_column() {
+        // The registry matches a derivation's `column` against the claim by
+        // database name, so a `#[diesel(column_name)]` rename must be resolved
+        // rather than recorded under the Rust field name.
+        for rename in [quote! { revision }, quote! { "revision" }] {
+            let generated = model_macro(
+                TokenStream::new(),
+                quote! {
+                    pub struct Doc {
+                        #[id]
+                        pub id: i64,
+                        #[lock_version]
+                        #[diesel(column_name = #rename)]
+                        pub version: i64,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains("column : \"revision\""),
+                "the claim must carry the physical column: {generated}"
+            );
+            assert!(
+                !generated.contains("column : \"version\""),
+                "the Rust field name is not a column on the table: {generated}"
+            );
+        }
+        let plain = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Doc {
+                    #[id]
+                    pub id: i64,
+                    #[lock_version]
+                    pub r#version: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            plain.contains("column : \"version\""),
+            "an unrenamed token claims its (unrawed) field name: {plain}"
+        );
+    }
+
+    #[test]
+    fn model_self_referential_derivation_cannot_maintain_its_fk_or_tenant() {
+        // The grouping key and the tenant discriminator are implicit sources:
+        // every aggregate reads them, so maintaining one onto the same table
+        // would re-parent the row behind the repository's back.
+        for (attr, role) in [
+            (
+                quote! { #[derivation(Node, column = "parent_id", fk = parent_id)] },
+                "foreign key",
+            ),
+            (
+                quote! { #[derivation(Node, column = "org_id", fk = parent_id, tenant = "org_id")] },
+                "tenant column",
+            ),
+        ] {
+            let generated = model_macro(
+                TokenStream::new(),
+                quote! {
+                    #attr
+                    pub struct Node {
+                        #[id]
+                        pub id: i64,
+                        pub parent_id: Option<i64>,
+                        pub org_id: i64,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains(&format!("cannot maintain its {role}")),
+                "{role} is an implicit source of every contribution: {generated}"
+            );
+        }
+        // The same declaration onto another table is fine: the parent's
+        // `parent_id` is an ordinary column there.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Post, column = "parent_id", fk = parent_id)]
+                pub struct Node {
+                    #[id]
+                    pub id: i64,
+                    pub parent_id: Option<i64>,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("cannot maintain its"),
+            "only a self-referential derivation reads the column it maintains: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_derivation_cannot_read_a_column_another_maintainer_writes_on_its_table() {
+        // `child_score` is maintained on `nodes` by direct SQL, so a sibling
+        // reading it (as a sum, or in a filter, onto its own table or another)
+        // would see it move with no delta carrying the change up.
+        for (second, target) in [
+            (
+                quote! { #[derivation(Node, column = "grand_score", fk = parent_id, transform = sum(child_score))] },
+                "sum onto the same table",
+            ),
+            (
+                quote! { #[derivation(Node, column = "hot_children", fk = parent_id, filter = child_score > 0)] },
+                "filter onto the same table",
+            ),
+            (
+                quote! { #[derivation(Tree, column = "total_score", fk = tree_id, transform = sum(child_score))] },
+                "sum onto another table",
+            ),
+        ] {
+            let generated = model_macro(
+                TokenStream::new(),
+                quote! {
+                    #[derivation(Node, column = "child_score", fk = parent_id, transform = sum(score))]
+                    #second
+                    pub struct Node {
+                        #[id]
+                        pub id: i64,
+                        pub parent_id: Option<i64>,
+                        pub tree_id: i64,
+                        pub score: i64,
+                        pub child_score: i64,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains("cannot read `child_score` as a source")
+                    && generated.contains("another `#[derivation]` of this model"),
+                "{target}: {generated}"
+            );
+        }
+        // A `counter_cache` leg back onto the same table maintains its column
+        // the same way.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Node, fk = parent_id, counter_cache = "reply_count")]
+                #[derivation(Node, column = "weighted", fk = parent_id, transform = sum(reply_count))]
+                pub struct Node {
+                    #[id]
+                    pub id: i64,
+                    pub parent_id: Option<i64>,
+                    pub reply_count: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot read `reply_count` as a source")
+                && generated.contains("a `counter_cache` of this model"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn model_derivation_cannot_group_or_scope_by_a_column_a_sibling_maintains() {
+        // The grouping key and the tenant column are read implicitly by every
+        // aggregate, so a sibling maintaining one is the same hole.
+        for (attrs, source) in [
+            (
+                quote! {
+                    #[derivation(Node, column = "parent_id", fk = tree_id)]
+                    #[derivation(Node, column = "child_count", fk = parent_id)]
+                },
+                "parent_id",
+            ),
+            (
+                quote! {
+                    #[derivation(Node, column = "org_id", fk = parent_id)]
+                    #[derivation(Tree, column = "node_count", fk = tree_id, tenant = "org_id")]
+                },
+                "org_id",
+            ),
+        ] {
+            let generated = model_macro(
+                TokenStream::new(),
+                quote! {
+                    #attrs
+                    pub struct Node {
+                        #[id]
+                        pub id: i64,
+                        pub parent_id: Option<i64>,
+                        pub tree_id: i64,
+                        pub org_id: i64,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains(&format!("cannot read `{source}` as a source")),
+                "{source} is an implicit source: {generated}"
+            );
+        }
+        // Reading a column nothing maintains, next to a maintained one, is fine.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Node, column = "child_score", fk = parent_id, transform = sum(score))]
+                #[derivation(Node, column = "child_count", fk = parent_id, filter = score > 0)]
+                pub struct Node {
+                    #[id]
+                    pub id: i64,
+                    pub parent_id: Option<i64>,
+                    pub score: i64,
+                    pub child_score: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("as a source"),
+            "two derivations over an unmaintained source coexist: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_derivation_spec_names_the_physical_pk_and_fk_columns() {
+        // `#[diesel(column_name = ...)]` on the `#[id]` or `fk` field renames
+        // the database column; the spec reaches SQL under the physical name.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Post, column = "reaction_count", fk = article)]
+                pub struct Reaction {
+                    #[id]
+                    #[diesel(column_name = reaction_id)]
+                    pub id: i64,
+                    #[diesel(column_name = "article_id")]
+                    pub article: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("child_pk : \"reaction_id\""),
+            "the child primary key is spelled physically: {generated}"
+        );
+        assert!(
+            generated.contains("fk_column : \"article_id\""),
+            "the foreign key is spelled physically: {generated}"
+        );
+        assert!(
+            !generated.contains("child_pk : \"id\"")
+                && !generated.contains("fk_column : \"article\""),
+            "no Rust-named column reaches SQL: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_self_referential_derivation_cannot_read_the_column_it_maintains() {
+        // Onto its own table, summing (or filtering on) the maintained column
+        // would make a row's new aggregate change its own contribution to its
+        // parent with no hook to carry that change up.
+        for attr in [
+            quote! { #[derivation(Node, column = "score", fk = parent_id, transform = sum(score))] },
+            quote! { #[derivation(Node, column = "score", fk = parent_id, filter = score > 0)] },
+        ] {
+            let generated = model_macro(
+                TokenStream::new(),
+                quote! {
+                    #attr
+                    pub struct Node {
+                        #[id]
+                        pub id: i64,
+                        pub parent_id: Option<i64>,
+                        pub score: i64,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains("cannot read the column it maintains"),
+                "{generated}"
+            );
+        }
+        // Reading another column of its own table is fine.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Node, column = "score", fk = parent_id, transform = sum(weight))]
+                pub struct Node {
+                    #[id]
+                    pub id: i64,
+                    pub parent_id: Option<i64>,
+                    pub score: i64,
+                    pub weight: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("compile_error"),
+            "a self-referential derivation over another column expands: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_counter_cache_spec_carries_neutral_derivation_fields() {
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, counter_cache)]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("contrib_sql : \"1\""),
+            "a counter cache contributes 1 per row: {generated}"
+        );
+        assert!(
+            generated.contains("filter_sql : \"\""),
+            "a counter cache has no filter, so its SQL stays byte-identical: {generated}"
+        );
+        assert!(
+            generated.contains("derivation : :: core :: option :: Option :: None"),
+            "a counter cache is not a derivation: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_parent_table_is_declared_as_a_graph_relation() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "comment_count")] },
+            &TokenStream::new(),
+        );
+        assert!(
+            generated.contains("relations : & [\"posts\"]"),
+            "the maintained parent table must appear in the architecture graph: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_attribute_is_stripped_from_the_generated_struct() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "comment_count")] },
+            &TokenStream::new(),
+        );
+        assert!(
+            !generated.contains("# [derivation"),
+            "`#[derivation]` is consumed by `#[model]`: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_sum_over_a_non_integer_field_is_rejected() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c", transform = sum(published))] },
+            &TokenStream::new(),
+        );
+        assert!(
+            generated.contains("compile_error"),
+            "summing a bool must be a compile error: {generated}"
+        );
+        assert!(generated.contains("integer"), "{generated}");
+    }
+
+    #[test]
+    fn derivation_sum_over_an_option_field_is_rejected() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c", transform = sum(bonus))] },
+            &quote! { pub bonus: Option<i64>, },
+        );
+        assert!(
+            generated.contains("compile_error"),
+            "summing a nullable field must be a compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_over_a_missing_foreign_key_is_rejected() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Team, column = "c")] },
+            &TokenStream::new(),
+        );
+        assert!(
+            generated.contains("compile_error") && generated.contains("team_id"),
+            "the missing foreign key must be named: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_emits_a_phantom_data_guard_for_the_parent_type() {
+        // The parent type is otherwise never named in the expansion, so a typo
+        // would compile and only fail at run time.
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "comment_count")] },
+            &TokenStream::new(),
+        );
+        assert!(
+            generated.contains("PhantomData < Post >"),
+            "the parent type must be type-checked: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_emits_the_parent_table_override() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c", parent_table = "articles")] },
+            &TokenStream::new(),
+        );
+        assert!(
+            generated.contains("parent_table : \"articles\""),
+            "the override must reach the spec and the definition: {generated}"
+        );
+        assert!(
+            generated.contains("\"articles.c\""),
+            "the default name must use the overridden table: {generated}"
+        );
+        assert!(
+            generated.contains("relations : & [\"articles\"]"),
+            "the graph relation must use the overridden table: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_tenant_reaches_both_the_spec_and_the_definition() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c", tenant = "tenant_id")] },
+            &quote! { pub tenant_id: i64, },
+        );
+        let occurrences = generated
+            .matches("tenant_column : :: core :: option :: Option :: Some (\"tenant_id\")")
+            .count();
+        assert_eq!(
+            occurrences, 2,
+            "the tenant column belongs to both the spec and the definition: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_tenant_must_name_a_field_of_the_child() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c", tenant = "tenant_id")] },
+            &TokenStream::new(),
+        );
+        assert!(
+            generated.contains("compile_error") && generated.contains("tenant_id"),
+            "the maintenance scopes by a child column, so it must exist: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_emits_a_bare_read_for_an_i64_sum() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c", transform = sum(weight))] },
+            &quote! { pub weight: i64, },
+        );
+        assert!(
+            generated.contains("__r . weight"),
+            "an i64 field needs no widening: {generated}"
+        );
+        assert!(
+            !generated.contains("i64 :: from"),
+            "`i64::from` is for the narrow widths only: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_sum_over_the_primary_key_is_rejected() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c", transform = sum(id))] },
+            &TokenStream::new(),
+        );
+        assert!(
+            generated.contains("compile_error") && generated.contains("primary key"),
+            "summing the primary key is never an aggregate: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_sum_over_the_foreign_key_is_rejected() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c", transform = sum(post_id))] },
+            &TokenStream::new(),
+        );
+        assert!(
+            generated.contains("compile_error") && generated.contains("foreign key"),
+            "summing the foreign key restates the parent id: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_sum_over_a_diesel_renamed_field_is_rejected() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c", transform = sum(weight))] },
+            &quote! {
+                #[diesel(column_name = mass)]
+                pub weight: i64,
+            },
+        );
+        assert!(
+            generated.contains("compile_error") && generated.contains("column_name"),
+            "the contribution SQL names the Rust field: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_sum_over_a_raw_identifier_field_names_the_plain_column() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c", transform = sum(r#match))] },
+            &quote! { pub r#match: i64, },
+        );
+        assert!(
+            generated.contains("\"{c}.\\\"match\\\"\""),
+            "the column drops the raw-identifier prefix: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_on_a_soft_delete_child_records_it() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c")] },
+            &quote! { pub deleted_at: Option<chrono::NaiveDateTime>, },
+        );
+        assert!(
+            generated.contains("child_soft_delete : true"),
+            "a soft-deleted child is counted by nobody: {generated}"
+        );
+    }
 
     #[test]
     fn has_many_dependent_destroy_is_recorded() {
@@ -6654,6 +13799,1209 @@ mod tests {
         );
     }
 
+    // ── Votable (#1362) parsing ───────────────────────────────────────────
+    //
+    // `#[votable(by = <Reactor>, ...)]` declares a reaction edge table plus an
+    // aggregate column maintained on the model. Every key except `by` is
+    // optional and inferred from conventions, so the defaults are the part
+    // most worth pinning down: they are what makes the attribute a one-liner
+    // on a conventionally-named schema.
+
+    #[test]
+    fn votable_defaults_map_onto_conventional_columns() {
+        // The canonical declaration on a conventionally-named schema: every
+        // column name is inferred, and the inference must land exactly on
+        // `votes(user_id, post_id, value)` + `posts.score`.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, aggregate = sum)])];
+        let spec = resolve_votable(&model, &attrs)
+            .expect("parse ok")
+            .expect("a #[votable] spec");
+        assert_eq!(spec.reactor.to_string(), "User");
+        assert_eq!(spec.aggregate, VoteAggregate::Sum);
+        assert_eq!(spec.name, "vote");
+        assert_eq!(spec.table, "votes");
+        assert_eq!(spec.reactor_fk, "user_id");
+        assert_eq!(spec.target_fk, "post_id");
+        assert_eq!(spec.value_column.as_deref(), Some("value"));
+        assert_eq!(spec.column, "score");
+    }
+
+    #[test]
+    fn votable_defaults_to_sum_when_aggregate_is_omitted() {
+        // The attribute is *votable* — a vote is signed, so `sum` is the
+        // default and `count` is the opt-in.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let bare: Vec<syn::Attribute> = vec![syn::parse_quote!(#[votable(by = User)])];
+        let explicit: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, aggregate = sum)])];
+        let bare = resolve_votable(&model, &bare)
+            .expect("parse ok")
+            .expect("a #[votable] spec");
+        let explicit = resolve_votable(&model, &explicit)
+            .expect("parse ok")
+            .expect("a #[votable] spec");
+        assert_eq!(bare.aggregate, VoteAggregate::Sum);
+        assert_eq!(bare.aggregate, explicit.aggregate);
+        assert_eq!(bare.table, explicit.table);
+        assert_eq!(bare.column, explicit.column);
+        assert_eq!(bare.value_column, explicit.value_column);
+    }
+
+    #[test]
+    fn votable_count_mode_infers_name_count_column() {
+        // `aggregate = count` is unary membership: the aggregate column is
+        // `{name}_count` and the edge table has no value column at all (its
+        // rows are pure membership, like an m2m join row).
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, aggregate = count)])];
+        let spec = resolve_votable(&model, &attrs)
+            .expect("parse ok")
+            .expect("a #[votable] spec");
+        assert_eq!(spec.aggregate, VoteAggregate::Count);
+        assert_eq!(spec.name, "vote");
+        assert_eq!(spec.table, "votes");
+        assert_eq!(spec.column, "vote_count");
+        assert_eq!(
+            spec.value_column, None,
+            "a count-mode edge table stores no value column"
+        );
+    }
+
+    #[test]
+    fn votable_name_override_drives_table_and_column() {
+        // `name` is the single knob a likes feature needs: it drives both the
+        // pluralized table name and the `{name}_count` aggregate column, so
+        // `name = like` yields `likes` / `like_count` with no other overrides.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, aggregate = count, name = like)])];
+        let spec = resolve_votable(&model, &attrs)
+            .expect("parse ok")
+            .expect("a #[votable] spec");
+        assert_eq!(spec.name, "like");
+        assert_eq!(spec.table, "likes");
+        assert_eq!(spec.column, "like_count");
+        assert_eq!(spec.reactor_fk, "user_id");
+        assert_eq!(spec.target_fk, "post_id");
+    }
+
+    #[test]
+    fn votable_explicit_overrides_win() {
+        // Every inferred name has an override for schemas that do not follow
+        // the convention; none of the defaults may leak through.
+        let model: syn::Ident = syn::parse_quote!(Article);
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(
+            #[votable(by = Member, aggregate = sum, name = rating, table = ratings,
+                      reactor_fk = member_id, target_fk = piece_id,
+                      value_column = weight, column = rating_total)]
+        )];
+        let spec = resolve_votable(&model, &attrs)
+            .expect("parse ok")
+            .expect("a #[votable] spec");
+        assert_eq!(spec.reactor.to_string(), "Member");
+        assert_eq!(spec.aggregate, VoteAggregate::Sum);
+        assert_eq!(spec.name, "rating");
+        assert_eq!(spec.table, "ratings");
+        assert_eq!(spec.reactor_fk, "member_id");
+        assert_eq!(spec.target_fk, "piece_id");
+        assert_eq!(spec.value_column.as_deref(), Some("weight"));
+        assert_eq!(spec.column, "rating_total");
+    }
+
+    #[test]
+    fn votable_accepts_string_literal_values() {
+        // Like the association attributes, each value may be spelled as a bare
+        // ident or as a string literal — the two must resolve identically.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let idents: Vec<syn::Attribute> = vec![syn::parse_quote!(
+            #[votable(by = User, name = vote, table = votes, reactor_fk = user_id,
+                      target_fk = post_id, value_column = value, column = score)]
+        )];
+        let literals: Vec<syn::Attribute> = vec![syn::parse_quote!(
+            #[votable(by = User, name = "vote", table = "votes", reactor_fk = "user_id",
+                      target_fk = "post_id", value_column = "value", column = "score")]
+        )];
+        let idents = resolve_votable(&model, &idents)
+            .expect("bare idents parse ok")
+            .expect("a #[votable] spec");
+        let literals = resolve_votable(&model, &literals)
+            .expect("string literals parse ok")
+            .expect("a #[votable] spec");
+        assert_eq!(idents.name, literals.name);
+        assert_eq!(idents.table, literals.table);
+        assert_eq!(idents.reactor_fk, literals.reactor_fk);
+        assert_eq!(idents.target_fk, literals.target_fk);
+        assert_eq!(idents.value_column, literals.value_column);
+        assert_eq!(idents.column, literals.column);
+    }
+
+    #[test]
+    fn votable_requires_by() {
+        // There is no positional head: the reactor model is always named, so a
+        // `#[votable]` with no `by =` must say exactly what to add.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[votable(aggregate = sum)])];
+        let Err(err) = resolve_votable(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires `by = <ReactorModel>`"),
+            "expected the missing-`by` error to name the key, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn votable_rejects_unknown_key() {
+        // A typo'd key must enumerate the accepted vocabulary rather than
+        // being silently ignored.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, aggregat = sum)])];
+        let Err(err) = resolve_votable(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        for key in [
+            "by",
+            "aggregate",
+            "name",
+            "table",
+            "reactor_fk",
+            "target_fk",
+            "value_column",
+            "column",
+        ] {
+            assert!(
+                msg.contains(key),
+                "expected the unknown-key error to enumerate `{key}`, got: {msg}"
+            );
+        }
+        assert!(
+            msg.contains("votable"),
+            "expected the unknown-key error to name the attribute, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn votable_rejects_unknown_aggregate() {
+        // Only the two supported modes exist; `avg`/`star` style ratings are
+        // explicitly out of scope for #1362 and must not resolve to a default.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, aggregate = avg)])];
+        let Err(err) = resolve_votable(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown aggregate `avg`"),
+            "expected the offending aggregate quoted back, got: {msg}"
+        );
+        assert!(
+            msg.contains("sum") && msg.contains("count"),
+            "expected both supported modes named, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn votable_rejects_value_column_in_count_mode() {
+        // A count-mode edge table has no value column, so `value_column = ...`
+        // is a category error rather than a harmless extra key.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(
+            #[votable(by = User, aggregate = count, value_column = value)]
+        )];
+        let Err(err) = resolve_votable(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("value_column"),
+            "expected the offending key named, got: {msg}"
+        );
+        assert!(
+            msg.contains("aggregate = count"),
+            "expected the conflicting mode named, got: {msg}"
+        );
+        assert!(
+            msg.contains("aggregate = sum"),
+            "expected the fix (switch to sum, or drop the key) spelled out, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn votable_rejects_duplicate_attribute() {
+        // At most one `#[votable]` per model: the emitted trait is
+        // `{Model}Reactions` with `react`/`reaction_of`, so a second
+        // declaration would generate colliding methods.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[votable(by = User, aggregate = sum)]),
+            syn::parse_quote!(#[votable(by = User, aggregate = count, name = like)]),
+        ];
+        let Err(err) = resolve_votable(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("at most one `#[votable]` per model"),
+            "expected the one-per-model rule stated, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn votable_rejects_composite_primary_keys() {
+        // PR #2177 review (P1): with two `#[id]` fields the pk resolution
+        // would silently take the first component — S1 could lock, and S5
+        // update, every row sharing it, and distinct targets would collapse
+        // onto one edge key. A composite-keyed model must be a directed
+        // compile error, not a wrong-row runtime hazard.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Enrollment {
+                    #[id]
+                    pub course_id: i64,
+                    #[id]
+                    pub student_id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "expected a compile error for a composite-keyed votable model, \
+             got: {generated}"
+        );
+        assert!(
+            generated.contains("requires a single `i64` primary key")
+                && generated.contains("`course_id`, `student_id`"),
+            "expected the directed composite-key message naming both key \
+             components, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_rejects_non_identifier_string_values() {
+        // Every name-shaped value is spliced into a generated ident through
+        // `format_ident!`, which *panics* on a non-identifier — an opaque
+        // "proc macro panicked" with no span. Each key must instead produce a
+        // directed error naming the offending value.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        for (key, attr) in [
+            (
+                "table",
+                syn::parse_quote!(#[votable(by = User, table = "my votes")]),
+            ),
+            (
+                "name",
+                syn::parse_quote!(#[votable(by = User, name = "my vote")]),
+            ),
+            (
+                "reactor_fk",
+                syn::parse_quote!(#[votable(by = User, reactor_fk = "user id")]),
+            ),
+            (
+                "target_fk",
+                syn::parse_quote!(#[votable(by = User, target_fk = "post-id")]),
+            ),
+            (
+                "value_column",
+                syn::parse_quote!(#[votable(by = User, value_column = "1value")]),
+            ),
+            (
+                "column",
+                syn::parse_quote!(#[votable(by = User, column = "score; DROP TABLE posts")]),
+            ),
+            ("by", syn::parse_quote!(#[votable(by = "Not A Type")])),
+        ] {
+            let attrs: Vec<syn::Attribute> = vec![attr];
+            let Err(err) = resolve_votable(&model, &attrs) else {
+                panic!("expected `{key}` with a non-identifier value to be rejected");
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("is not a valid identifier") || msg.contains("valid model type name"),
+                "expected a directed identifier error for `{key}`, got: {msg}"
+            );
+            assert!(
+                msg.contains(key),
+                "expected the error to name the offending key `{key}`, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn votable_rejects_raw_identifier_values() {
+        // A raw identifier parses as an `Ident` but renders its `r#` prefix
+        // into the generated table/column/module names, silently producing a
+        // column that cannot exist. Reject it with the same directed error
+        // rather than emitting garbage.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, name = r#type)])];
+        let Err(err) = resolve_votable(&model, &attrs) else {
+            panic!("expected a raw-identifier `name` to be rejected");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("is not a valid identifier"),
+            "expected the identifier error, got: {msg}"
+        );
+        assert!(
+            msg.contains("r#"),
+            "expected the error to mention the `r#` prefix, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn votable_rejects_duplicate_key_within_one_attribute() {
+        // A repeated key silently last-writes today, so `by = User, by = Bot`
+        // would compile against the wrong reactor. Reject it, quoting both
+        // values so the mistake is obvious.
+        let model: syn::Ident = syn::parse_quote!(Post);
+
+        let by: Vec<syn::Attribute> = vec![syn::parse_quote!(#[votable(by = User, by = Bot)])];
+        let Err(err) = resolve_votable(&model, &by) else {
+            panic!("expected a duplicate `by` to be rejected");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate `by = ...`"),
+            "expected the duplicate-key error to name the key, got: {msg}"
+        );
+        assert!(
+            msg.contains("User") && msg.contains("Bot"),
+            "expected both the previous and the new value quoted back, got: {msg}"
+        );
+
+        let aggregate: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, aggregate = sum, aggregate = count)])];
+        let Err(err) = resolve_votable(&model, &aggregate) else {
+            panic!("expected a duplicate `aggregate` to be rejected");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate `aggregate = ...`"),
+            "expected the duplicate-key error to name the key, got: {msg}"
+        );
+        assert!(
+            msg.contains("sum") && msg.contains("count"),
+            "expected both the previous and the new value quoted back, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn votable_aggregate_column_must_exist_on_model() {
+        // The hidden edge module declares the aggregate column regardless, so
+        // a missing field would otherwise only surface as a runtime `42703` on
+        // the first vote. Mirror the `shard_key` field-existence check.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "expected a compile error for the missing aggregate column, got: {generated}"
+        );
+        assert!(
+            generated.contains("votable aggregate column `score` not found on model `Post`"),
+            "expected the directed missing-column message, got: {generated}"
+        );
+        assert!(
+            generated.contains("column = "),
+            "expected the error to point at the `column = <field>` override, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_aggregate_column_must_be_i64() {
+        // The aggregate is `SUM(value)` / `COUNT(*)` — BIGINT — projected as
+        // `Int8` in the hidden module and written back as an `i64`. An `i32` or
+        // `Option<i64>` field would otherwise fail as an opaque Diesel
+        // trait-resolution wall inside the generated `react()`.
+        for (ty, rendered) in [
+            (quote! { i32 }, "i32"),
+            (quote! { Option<i64> }, "Option < i64 >"),
+        ] {
+            let generated = model_macro(
+                quote! {},
+                quote! {
+                    #[votable(by = User, aggregate = sum)]
+                    pub struct Post {
+                        #[id]
+                        pub id: i64,
+                        pub score: #ty,
+                    }
+                },
+            )
+            .to_string();
+
+            assert!(
+                generated.contains("compile_error"),
+                "expected a compile error for a `{rendered}` aggregate column, got: {generated}"
+            );
+            assert!(
+                generated
+                    .contains("votable aggregate column `score` on model `Post` must be `i64`"),
+                "expected the directed wrong-type message, got: {generated}"
+            );
+            assert!(
+                generated.contains(&format!("found `{rendered}`")),
+                "expected the offending type quoted back, got: {generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn votable_aggregate_accepts_equivalent_i64_spellings_via_typed_guard() {
+        // PR #2177 review: the macro-level check must only reject spellings
+        // that are *definitely* wrong. `std::primitive::i64` (or an alias) IS
+        // `i64`; token-text equality would reject it. Such spellings pass the
+        // macro and are enforced by the emitted `const` guard instead — which
+        // must also be present in the plain-`i64` case as the backstop for
+        // wrong aliases.
+        for ty in [quote! { std::primitive::i64 }, quote! { i64 }] {
+            let generated = model_macro(
+                quote! {},
+                quote! {
+                    #[votable(by = User, aggregate = sum)]
+                    pub struct Post {
+                        #[id]
+                        pub id: i64,
+                        pub score: #ty,
+                    }
+                },
+            )
+            .to_string();
+
+            assert!(
+                !generated.contains("compile_error"),
+                "an i64-equivalent spelling must not be rejected, got: {generated}"
+            );
+            assert!(
+                generated.contains("__autumn_votable_model . score"),
+                "expected the aggregate-field type guard to be emitted, got: {generated}"
+            );
+        }
+    }
+
+    // ── Votable (#1362) codegen shape ─────────────────────────────────────
+    //
+    // These assert on the *shape* of the emitted token stream (substrings of
+    // `TokenStream::to_string()`, which space-separates tokens). Behaviour is
+    // covered by the Docker-gated integration tests; what matters here is that
+    // the race-safety primitives (immediate transaction, pg-only `FOR UPDATE`,
+    // explicit `ON CONFLICT` arbiter) are actually present in the codegen.
+
+    #[test]
+    fn votable_emits_hidden_edge_table_module() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("mod __autumn_votable_4_post_vote"),
+            "expected a length-prefixed hidden edge-table module, got: {generated}"
+        );
+        assert!(
+            generated.contains("votes (user_id , post_id)"),
+            "expected the edge table keyed on the composite (reactor, target) \
+             pair — the load-bearing ON CONFLICT arbiter, got: {generated}"
+        );
+        assert!(
+            generated.contains("user_id -> Int8") && generated.contains("post_id -> Int8"),
+            "expected non-nullable Int8 fk columns (a NULL target would defeat \
+             the unique arbiter), got: {generated}"
+        );
+        assert!(
+            generated.contains("value -> Int2"),
+            "expected the sum-mode value column typed SMALLINT, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_emits_target_projection_in_the_hidden_module() {
+        // Deliberately self-contained: the target table is projected inside the
+        // hidden module (id + aggregate [+ deleted_at]) rather than referencing
+        // the app's `crate::schema::*`, so the codegen cannot pick up a
+        // conflicting column type and needs no schema module in scope.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("posts (id)"),
+            "expected a minimal target-table projection, got: {generated}"
+        );
+        assert!(
+            generated.contains("score -> Int8"),
+            "expected the aggregate column projected as BIGINT, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_target_projection_keys_on_the_models_real_primary_key() {
+        // PR #2177 review (P1): a model whose `#[id]` field is not named `id`
+        // (e.g. `memo_id`) has no `id` column at all — or worse, an unrelated
+        // one. The hidden projection, the S1 lock, and the S5 aggregate UPDATE
+        // must all key on the resolved primary-key column, never a hard-coded
+        // `id`.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Memo {
+                    #[id]
+                    pub memo_id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("memos (memo_id)"),
+            "expected the target projection keyed on the model's real primary \
+             key, got: {generated}"
+        );
+        assert!(
+            !generated.contains("memos (id)"),
+            "no hard-coded `id` primary key may survive on the target \
+             projection, got: {generated}"
+        );
+        assert!(
+            generated
+                .matches("memos :: memo_id . eq (target_id)")
+                .count()
+                >= 3,
+            "S1 (both backend arms) and S5 must filter the target table on the \
+             resolved primary key, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_emits_reactions_trait_and_blanket_impl() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("trait PostReactions"),
+            "expected a per-model reactions trait, got: {generated}"
+        );
+        assert!(
+            generated.contains("fn react"),
+            "expected the react() helper, got: {generated}"
+        );
+        assert!(
+            generated.contains("fn reaction_of"),
+            "expected the reaction_of() accessor, got: {generated}"
+        );
+        assert!(
+            generated.contains("M2mConnSource < Model = Post >"),
+            "expected the trait blanket-implemented over the repository's \
+             connection source, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_react_runs_in_an_immediate_transaction() {
+        // The edge mutation and the aggregate recompute must commit together,
+        // and the SQLite arm needs `BEGIN IMMEDIATE` (single writer) rather
+        // than a deferred snapshot that upgrades mid-transaction.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("scoped_immediate_transaction"),
+            "expected react() to wrap its statements in the write-path \
+             transaction primitive, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_react_locks_the_target_row_on_pg_only() {
+        // A locking clause is a parse error on SQLite, so the row lock lives in
+        // the `pg` arm of `backend_select!` — the unselected arm is never
+        // type-checked — and SQLite gets its mutual exclusion from BEGIN
+        // IMMEDIATE. `FOR NO KEY UPDATE`, not `FOR UPDATE`: `react()` writes only
+        // a non-key column, and the weaker mode still self-conflicts, keeping
+        // reactions on one target serialized, without conflicting with the `FOR
+        // KEY SHARE` locks Postgres takes for foreign-key checks, so a concurrent
+        // `INSERT INTO comments (post_id) …` does not queue behind a vote.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("backend_select"),
+            "expected the per-backend split, got: {generated}"
+        );
+        // The lock must be part of the S1 locking SELECT itself (same statement
+        // as the existence/soft-delete guard), not merely present somewhere.
+        assert!(
+            generated.contains(
+                "pg => { __autumn_votable_4_post_vote :: posts :: table . filter \
+                 (__autumn_votable_4_post_vote :: posts :: id . eq (target_id)) . select \
+                 (__autumn_votable_4_post_vote :: posts :: id) . for_no_key_update ()"
+            ),
+            "expected FOR NO KEY UPDATE chained onto the pg arm's S1 target \
+             select, got: {generated}"
+        );
+        // …and it must live *only* there: the sqlite arm cannot even parse it.
+        let s1 = generated
+            .split_once("let __target")
+            .expect("the S1 locking select")
+            .1;
+        let pg_arm = s1
+            .split_once("sqlite =>")
+            .expect("the backend_select! sqlite arm")
+            .0;
+        assert!(
+            pg_arm.contains(". for_no_key_update ()"),
+            "expected the row lock inside the pg arm, got: {pg_arm}"
+        );
+        assert_eq!(
+            generated.matches("for_no_key_update").count(),
+            1,
+            "expected exactly one locking clause (pg arm only), got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_react_upserts_with_an_explicit_arbiter() {
+        // An `ON CONFLICT DO UPDATE` with no arbiter is a syntax error, and the
+        // wrong column list raises 42P10 on a table carrying more than one
+        // unique constraint (reddit-clone's `votes` has two).
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        // The full arbiter column list, not just "an on_conflict somewhere": a
+        // regression to a single-column arbiter (`(user_id)`) is exactly the
+        // 42P10 this pins, and would still satisfy a bare `contains`.
+        assert!(
+            generated.contains(
+                "on_conflict ((__autumn_votable_4_post_vote :: votes :: user_id , \
+                 __autumn_votable_4_post_vote :: votes :: post_id ,))"
+            ),
+            "expected the composite (reactor_fk, target_fk) ON CONFLICT \
+             arbiter, got: {generated}"
+        );
+        assert!(
+            generated.contains("do_update"),
+            "expected ON CONFLICT DO UPDATE (not DO NOTHING), got: {generated}"
+        );
+        assert!(
+            generated.contains("excluded"),
+            "expected the conflicting row to take EXCLUDED.value, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_count_mode_react_has_no_value_parameter() {
+        // A count reaction is unary membership, so `react()` drops the `value`
+        // argument entirely rather than taking an ignored one.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = count)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub vote_count: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("trait PostReactions") && generated.contains("fn react"),
+            "expected the reactions trait in count mode too, got: {generated}"
+        );
+        assert!(
+            !generated.contains("value : i16"),
+            "count-mode react() must not take a value parameter, got: {generated}"
+        );
+        assert!(
+            !generated.contains("-> Int2"),
+            "a count-mode edge table has no value column, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_soft_delete_target_gates_the_lock_and_the_update() {
+        // AC6: when the model has a `deleted_at` field, both the locking SELECT
+        // and the aggregate UPDATE carry `deleted_at IS NULL`, so a
+        // soft-deleted target is NotFound and its aggregate is untouched. A
+        // model without the field pays nothing.
+        let soft = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                    pub deleted_at: Option<chrono::NaiveDateTime>,
+                }
+            },
+        )
+        .to_string();
+        let hard = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        // Three sites, all load-bearing: the pg arm's locking S1 select, the
+        // sqlite arm's S1 select, and the S5 aggregate UPDATE. Dropping any one
+        // of them lets a soft-deleted target be reacted on (or its aggregate
+        // rewritten), so count them rather than accepting a single hit.
+        assert!(
+            soft.matches("deleted_at . is_null ()").count() >= 3,
+            "expected the soft-delete guard on both S1 arms and the S5 update \
+             (>= 3 sites), got {}: {soft}",
+            soft.matches("deleted_at . is_null ()").count()
+        );
+        assert!(
+            soft.contains("deleted_at -> Nullable < Timestamp >"),
+            "expected deleted_at projected into the hidden target table, got: {soft}"
+        );
+        assert!(
+            !hard.contains("is_null"),
+            "a model without deleted_at must not emit a soft-delete guard, got: {hard}"
+        );
+    }
+
+    /// The hidden `__autumn_votable_*` module and everything the `#[votable]`
+    /// declaration emits after it. Scoping the tenant assertions to this slice
+    /// keeps them from matching the *rest* of `#[model]`'s codegen, which
+    /// legitimately mentions `tenant_id` for a model that has the column
+    /// (`HasTenantIdColumn`, the insertable selector, …).
+    fn votable_slice(generated: &str) -> &str {
+        let start = generated
+            .find("mod __autumn_votable_")
+            .expect("the votable codegen starts at its hidden module");
+        &generated[start..]
+    }
+
+    #[test]
+    fn votable_tenant_scoped_target_is_filtered_in_s1_s5_and_reaction_of() {
+        // PR #2177 review (P1): through a `#[repository(..., tenant_scoped)]`
+        // repository, filtering the target by primary key alone lets a caller
+        // react to ANOTHER tenant's row — an edge insert plus an aggregate
+        // UPDATE across the tenant boundary. When the model carries a
+        // `tenant_id` column the codegen must project it and emit a
+        // tenant-filtered arm everywhere the target is touched.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub tenant_id: String,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+        let votable = votable_slice(&generated);
+
+        assert!(
+            votable.contains("tenant_id -> Text"),
+            "expected tenant_id projected into the hidden target table, got: {votable}"
+        );
+        assert!(
+            votable.contains("self . __autumn_m2m_tenant_scope ()"),
+            "expected the tenant predicate resolved through the repository's \
+             M2mConnSource, not read from the task-local directly, got: {votable}"
+        );
+
+        // Exactly four tenant-filtered sites, each load-bearing and each the scoped
+        // half of a two-arm match; the other arm is the unfiltered query, taken for a
+        // non-`tenant_scoped` repository or `across_tenants()`:
+        //
+        //   1. S1, `pg` arm     — the locking existence guard,
+        //   2. S1, `sqlite` arm — the same guard without the row lock,
+        //   3. S5               — the aggregate UPDATE,
+        //   4. `reaction_of`    — the tenant EXISTS folded into the edge lookup.
+        //
+        // The arms stay separate whole queries rather than one boxed query with a
+        // conditional predicate, because S1's `pg` arm carries `.for_no_key_update()`.
+        // Pinned exactly: a fifth would mean a duplicated statement, and a third that
+        // some path lost its filter and can write across the tenant boundary again.
+        assert_eq!(
+            votable.matches("tenant_id . eq").count(),
+            4,
+            "expected exactly 4 tenant-filtered target sites (S1 pg, S1 sqlite, \
+             S5, reaction_of's EXISTS), got: {votable}"
+        );
+        // reaction_of's tenant boundary must be a single-snapshot predicate —
+        // an EXISTS on the target inside the edge lookup itself — never a
+        // separate probe statement, which under READ COMMITTED is a TOCTOU
+        // window: a concurrent tenant reassignment lands between probe and
+        // lookup and the foreign edge leaks anyway (PR #2177 review).
+        assert!(
+            votable.contains(":: dsl :: exists"),
+            "reaction_of's tenant check must be an EXISTS folded into the edge \
+             lookup, got: {votable}"
+        );
+        assert!(
+            !votable.contains("__in_tenant"),
+            "the two-statement tenant probe must not survive, got: {votable}"
+        );
+        assert!(
+            votable.contains("for_no_key_update"),
+            "the tenant-filtered pg arm must keep the row lock, got: {votable}"
+        );
+        // Both halves of each match survive: the unfiltered arm is what a
+        // non-tenant_scoped repository (and `across_tenants()`) still takes.
+        // Both halves of every match survive. The unfiltered arm is what a
+        // non-`tenant_scoped` repository — and `across_tenants()` — still
+        // takes, so the target lookup appears twice at each of S1's two
+        // backend arms and at S5, plus once in `reaction_of`'s probe: 3 * 2 + 1.
+        assert_eq!(
+            votable.matches("posts :: id . eq (target_id)").count(),
+            7,
+            "expected a tenant-filtered AND an unfiltered arm at S1 (both \
+             backends) and S5, plus reaction_of's probe, got: {votable}"
+        );
+    }
+
+    #[test]
+    fn votable_model_without_tenant_id_emits_no_tenant_scoping() {
+        // AC: zero query cost. A model with no `tenant_id` column can have no
+        // meaningful `tenant_scoped` repository — its own derived queries would not
+        // compile — so the reaction queries must carry no tenant projection,
+        // predicate, or runtime branch. The one tenant token that must still appear is
+        // the discarded `__autumn_m2m_tenant_scope()?` call in each method: it carries
+        // the cross-shard reject (PR #2177 — `across_tenants()` on a sharded repository
+        // has no single right shard for a reaction), and on a plain repository it is a
+        // constant `Ok(None)`.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+        let votable = votable_slice(&generated);
+
+        assert!(
+            !votable.contains("tenant_id"),
+            "a model without tenant_id must emit no tenant column, predicate, \
+             or projection anywhere in the votable items, got: {votable}"
+        );
+        assert_eq!(
+            votable
+                .matches("self . __autumn_m2m_tenant_scope ()")
+                .count(),
+            2,
+            "react() and reaction_of() must each still call the tenant-scope \
+             method (discarded) so the cross-shard reject fires before any \
+             connection is acquired, got: {votable}"
+        );
+        assert!(
+            !votable.contains("__tenant"),
+            "no tenant runtime branch may survive on a tenant-less model, \
+             got: {votable}"
+        );
+    }
+
+    #[test]
+    fn votable_emits_i64_primary_key_and_reactor_type_guards() {
+        // Two compile-time guards the rest of the codegen silently assumes:
+        //
+        // * the whole reaction surface is typed on `i64` ids (both edge fks are
+        //   `Int8`, `react(reactor_id: i64, target_id: i64)` binds them
+        //   directly), so a UUID- or i32-keyed model must fail *at the model*;
+        // * `by = <Reactor>` is otherwise never mentioned in the emitted code —
+        //   the edge stores a bare `i64` — so a typo'd model name would compile
+        //   silently unless its name resolution is forced.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("const _ : fn (& Post) -> i64"),
+            "expected the i64-primary-key guard, got: {generated}"
+        );
+        assert!(
+            generated.contains("PhantomData < User >"),
+            "expected the reactor-type name-resolution guard, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_react_returns_a_reaction_via_the_hidden_constructor() {
+        // `Reaction` is `#[non_exhaustive]`, so the generated code — which
+        // expands in the *application's* crate — cannot write a struct literal.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("repository :: Reaction :: __new"),
+            "expected the Reaction to be built through its hidden constructor, \
+             got: {generated}"
+        );
+        assert!(
+            !generated.contains("Reaction { value"),
+            "a struct literal would not compile downstream of #[non_exhaustive], \
+             got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_react_fails_loudly_when_the_aggregate_update_hits_no_row() {
+        // Defense in depth (S5): unreachable while S1's lock holds, but if the
+        // lock strength ever regresses, committing an edge whose aggregate was
+        // silently dropped is the one failure mode that leaves the two out of
+        // sync forever.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("let __persisted : usize"),
+            "expected the S5 update's affected-row count to be captured, got: {generated}"
+        );
+        assert!(
+            generated.contains("if __persisted == 0"),
+            "expected a zero-row S5 update to abort the transaction, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_reaction_of_reads_on_a_read_connection() {
+        // `reaction_of` is a read: it routes per the repository's ReadRoute
+        // (replica-eligible) and must NOT mark the read-your-writes pin, which
+        // acquiring the write connection would do. `react` keeps the write one.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("self . __autumn_m2m_read_conn ()"),
+            "expected reaction_of to take a read connection, got: {generated}"
+        );
+        assert_eq!(
+            generated.matches("__autumn_m2m_write_conn").count(),
+            1,
+            "expected exactly one write-connection acquisition (react's), got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_react_doc_warns_that_a_toggle_is_not_idempotent() {
+        // A toggle is not idempotent, and the dangerous corollary is that a
+        // blind retry of a timed-out call can invert the outcome. The generated
+        // rustdoc must say so rather than claiming idempotence.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("Idempotent"),
+            "react() is a toggle — the docs must not claim idempotence, got: {generated}"
+        );
+        assert!(
+            generated.contains("Not idempotent"),
+            "expected the toggle caveat in react()'s docs, got: {generated}"
+        );
+        assert!(
+            generated.contains("idempotency key"),
+            "expected the retry-safety guidance in react()'s docs, got: {generated}"
+        );
+        assert!(
+            generated.contains("does not pin read-your-writes") || generated.contains("read route"),
+            "expected reaction_of's read-routing note, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_attribute_is_stripped_from_the_diesel_struct() {
+        // `#[votable]` is consumed by `#[model]`; re-emitting it onto the
+        // generated Diesel struct would fail with "cannot find attribute
+        // `votable` in this scope".
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("# [votable"),
+            "the votable attribute must not leak onto the emitted struct, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_without_votable_emits_no_reaction_items() {
+        // The reaction surface is opt-in: a model that never declares
+        // `#[votable]` must not gain a trait, a hidden module, or dead code.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("Reactions"),
+            "expected no reactions trait without #[votable], got: {generated}"
+        );
+        assert!(
+            !generated.contains("__autumn_votable"),
+            "expected no hidden edge module without #[votable], got: {generated}"
+        );
+    }
+
     #[test]
     fn lock_version_attr_detected_by_has_attr() {
         let field: syn::Field = syn::parse_quote! {
@@ -6692,6 +15040,101 @@ mod tests {
     }
 
     #[test]
+    fn position_attr_detected_by_has_attr() {
+        let field: syn::Field = syn::parse_quote! {
+            #[position]
+            pub rank: i64
+        };
+        assert!(has_attr(&field, "position"));
+    }
+
+    #[test]
+    fn position_field_is_excluded_from_new() {
+        let field: syn::Field = syn::parse_quote! {
+            #[position]
+            pub rank: i64
+        };
+        // A #[position] field must be absent from NewModel/UpdateModel — the
+        // generated repository assigns and maintains it entirely (#1358).
+        assert!(excluded_from_new(&field));
+    }
+
+    #[test]
+    fn position_bare_attribute_with_args_is_rejected() {
+        let field: syn::Field = syn::parse_quote! {
+            #[position(scope = "board_id")]
+            pub rank: i64
+        };
+        let err = validate_field_schema_markers(&field).unwrap_err();
+        assert!(
+            err.to_string().contains("position"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn position_attribute_is_stripped_from_the_diesel_struct() {
+        // `#[position]` is consumed by `#[model]`; re-emitting it onto the
+        // generated Diesel struct would fail with "cannot find attribute
+        // `position` in this scope".
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Task {
+                    #[id]
+                    pub id: i64,
+                    #[position]
+                    pub rank: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("# [position]"),
+            "the position attribute must not leak onto the emitted struct, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn position_field_excluded_from_new_and_update_structs() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Task {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                    #[position]
+                    pub rank: i64,
+                }
+            },
+        )
+        .to_string();
+
+        let new_struct = generated
+            .split("struct NewTask")
+            .nth(1)
+            .expect("NewTask struct should be emitted");
+        let new_struct_body = &new_struct[..new_struct.find('}').unwrap_or(new_struct.len())];
+        assert!(
+            !new_struct_body.contains("rank"),
+            "NewTask must not contain the server-managed position field, got: {new_struct_body}"
+        );
+
+        let update_struct = generated
+            .split("struct UpdateTask")
+            .nth(1)
+            .expect("UpdateTask struct should be emitted");
+        let update_struct_body =
+            &update_struct[..update_struct.find('}').unwrap_or(update_struct.len())];
+        assert!(
+            !update_struct_body.contains("rank"),
+            "UpdateTask must not contain the server-managed position field, got: {update_struct_body}"
+        );
+    }
+
+    #[test]
     fn encrypted_string_field_is_accepted() {
         let field: syn::Field = syn::parse_quote! {
             #[encrypted]
@@ -6711,6 +15154,1369 @@ mod tests {
         };
         let err = validate_encrypted_field(&field).unwrap_err();
         assert!(err.to_string().contains("searchable"));
+    }
+
+    // ── #1384: `#[translatable]` field attribute ────────────────────────────
+
+    /// #1384 (Codex round 5): the locale-map schema is keyed on the
+    /// `#[translatable]` MARKER, not on the type's leaf name. An application
+    /// type that merely happens to be called `Translated` must keep its
+    /// ordinary `$ref`, or the advertised `OpenAPI` contract would silently
+    /// disagree with what that type actually serializes to.
+    #[test]
+    fn translatable_schema_is_keyed_on_the_attribute_not_the_type_name() {
+        let generated = model_macro(
+            quote! { table = "posts" },
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    #[translatable]
+                    pub title: ::autumn_web::i18n::Translated,
+                    // A user's OWN type with the same leaf name, unmarked.
+                    pub note: domain::Translated,
+                }
+            },
+        )
+        .to_string();
+
+        // The marked field is described inline as a locale-tag -> string map,
+        // so `autumn openapi` emits no reference to a component nothing
+        // registers.
+        assert!(
+            generated.contains("additionalProperties"),
+            "translatable field should carry an inline map schema"
+        );
+        // The unmarked look-alike still gets the ordinary `$ref` branch.
+        assert!(
+            generated.contains("components/schemas"),
+            "an unmarked `Translated` look-alike must keep its $ref"
+        );
+    }
+
+    /// A model with NO translatable field emits no inline map schema at all.
+    #[test]
+    fn an_unmarked_translated_lookalike_alone_emits_no_map_schema() {
+        let generated = model_macro(
+            quote! { table = "posts" },
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub note: domain::Translated,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("additionalProperties"),
+            "no `#[translatable]` field means no locale-map schema"
+        );
+    }
+
+    // ── #1806: `#[collaborative]` field attribute ───────────────────────────
+
+    #[test]
+    fn collaborative_field_is_accepted_on_a_collab_text_column() {
+        let field: syn::Field = syn::parse_quote! {
+            #[collaborative]
+            pub body: CollabText
+        };
+        assert!(validate_collaborative_field(&field).is_ok());
+        let qualified: syn::Field = syn::parse_quote! {
+            #[collaborative]
+            pub body: ::autumn_web::collab::CollabText
+        };
+        assert!(validate_collaborative_field(&qualified).is_ok());
+    }
+
+    #[test]
+    fn collaborative_on_a_plain_string_is_rejected_with_the_fix() {
+        let field: syn::Field = syn::parse_quote! {
+            #[collaborative]
+            pub body: String
+        };
+        let msg = validate_collaborative_field(&field)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("CollabText"), "{msg}");
+    }
+
+    #[test]
+    fn collaborative_option_is_rejected() {
+        // An empty document already models "no text", so a nullable column
+        // would give two ways to say the same thing.
+        let field: syn::Field = syn::parse_quote! {
+            #[collaborative]
+            pub body: Option<CollabText>
+        };
+        assert!(validate_collaborative_field(&field).is_err());
+    }
+
+    #[test]
+    fn collaborative_conflicting_markers_are_rejected_by_name() {
+        for marker in [
+            "encrypted",
+            "classified",
+            "searchable",
+            "translatable",
+            "normalize",
+            "unique",
+            "indexed",
+            "id",
+            "lock_version",
+            "position",
+            "state_machine",
+        ] {
+            // `Attribute` has no `Parse` impl of its own — attributes are
+            // parsed as a list, so go through `parse_outer`.
+            let parsed = syn::parse::Parser::parse_str(
+                syn::Attribute::parse_outer,
+                &format!("#[collaborative] #[{marker}]"),
+            )
+            .expect("both markers parse");
+            let mut field: syn::Field = syn::parse_quote! { pub body: CollabText };
+            field.attrs = parsed;
+            let msg = validate_collaborative_field(&field)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                msg.contains(marker),
+                "the error must name the conflicting marker `{marker}`: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn collaborative_renames_are_rejected_because_they_desync_the_registry() {
+        let serde_renamed: syn::Field = syn::parse_quote! {
+            #[collaborative]
+            #[serde(rename = "text")]
+            pub body: CollabText
+        };
+        assert!(validate_collaborative_field(&serde_renamed).is_err());
+
+        let column_renamed: syn::Field = syn::parse_quote! {
+            #[collaborative]
+            #[diesel(column_name = "content")]
+            pub body: CollabText
+        };
+        assert!(validate_collaborative_field(&column_renamed).is_err());
+    }
+
+    /// Every other way to give the column a wire name the registry does not
+    /// know. `flatten` is the one that hides best: the field still *exists*,
+    /// but its `elems` and `pending` are emitted at the row's top level, so
+    /// `CollabResolver`'s lookup of the registered name finds nothing and the
+    /// conflict quietly falls back to last-write-wins.
+    #[test]
+    fn collaborative_rejects_every_serde_wire_name_override() {
+        for attr in [
+            quote! { #[serde(flatten)] },
+            quote! { #[serde(alias = "text")] },
+            quote! { #[serde(rename = "text")] },
+        ] {
+            let field: syn::Field = syn::parse_quote! {
+                #[collaborative]
+                #attr
+                pub body: CollabText
+            };
+            let msg = validate_collaborative_field(&field)
+                .expect_err("the override must be refused")
+                .to_string();
+            assert!(
+                msg.contains("CollabResolver"),
+                "the error must say what breaks: {msg}"
+            );
+        }
+    }
+
+    /// And every way to drop the column from the serialized row, which leaves
+    /// the resolver nothing to merge for the same end result.
+    #[test]
+    fn collaborative_rejects_serialization_omissions() {
+        for attr in [
+            quote! { #[serde(skip_serializing)] },
+            quote! { #[serde(skip_serializing_if = "Option::is_none")] },
+            quote! { #[serde(default)] },
+            quote! { #[serde(skip_deserializing)] },
+            quote! { #[private] },
+        ] {
+            let field: syn::Field = syn::parse_quote! {
+                #[collaborative]
+                #attr
+                pub body: CollabText
+            };
+            assert!(
+                validate_collaborative_field(&field).is_err(),
+                "an omitted collaborative column cannot be merged: {}",
+                quote! { #attr }
+            );
+        }
+    }
+
+    /// The marker never reaches the Diesel derives, and the generated surface
+    /// is keyed on the Rust field name.
+    #[test]
+    fn collaborative_emits_the_field_surface_and_strips_the_marker() {
+        let generated = model_macro(
+            quote! { table = "notes" },
+            quote! {
+                pub struct Note {
+                    #[id]
+                    pub id: i64,
+                    #[collaborative]
+                    pub body: ::autumn_web::collab::CollabText,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+
+        for expected in [
+            "__AUTUMN_COLLABORATIVE_COLUMNS",
+            "collaborative_fields",
+            "fn collaborative",
+            "fn collaborative_mut",
+            "fn body_text",
+            "fn body_insert",
+            "fn body_remove",
+            "fn body_set_text",
+            "fn body_merge",
+            "CollaborativeColumnDescriptor",
+        ] {
+            assert!(
+                generated.contains(expected),
+                "expected the generated model to carry `{expected}`"
+            );
+        }
+        assert!(
+            !generated.contains("# [collaborative]"),
+            "the marker must be stripped before the Diesel derives see it"
+        );
+    }
+
+    /// A container `rename_all` desyncs the registry from the serialized key,
+    /// which would make `CollabResolver` miss the field and silently fall
+    /// back to last-write-wins — the loss the feature exists to prevent.
+    #[test]
+    fn collaborative_rejects_a_container_rename_all() {
+        let generated = model_macro(
+            quote! { table = "notes" },
+            quote! {
+                #[serde(rename_all = "camelCase")]
+                pub struct Note {
+                    #[id]
+                    pub id: i64,
+                    #[collaborative]
+                    pub note_body: ::autumn_web::collab::CollabText,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("rename_all") && generated.contains("compile_error"),
+            "expected a compile error naming the conflict, got: {generated}"
+        );
+    }
+
+    /// The advertised schema must require `elems`, because the wire type does.
+    #[test]
+    fn collaborative_schema_requires_the_elements_array() {
+        let generated = model_macro(
+            quote! { table = "notes" },
+            quote! {
+                pub struct Note {
+                    #[id]
+                    pub id: i64,
+                    #[collaborative]
+                    pub body: ::autumn_web::collab::CollabText,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("\"required\""),
+            "the collaborative field's schema must mark `elems` required"
+        );
+        // An element record described as a bare object tells a client
+        // nothing: it cannot tell that an id is a string, not an object.
+        for part in ["\"deleted\"", "\"minLength\"", "\"oneOf\""] {
+            assert!(
+                generated.contains(part),
+                "the collaborative field's schema must describe its elements and \
+                 its pending operations; {part} is missing"
+            );
+        }
+    }
+
+    /// A model with no collaborative field expands as before: no const with a
+    /// name, no registry entry, no accessors.
+    #[test]
+    fn a_model_without_the_marker_registers_no_collaborative_column() {
+        let generated = model_macro(
+            quote! { table = "notes" },
+            quote! {
+                pub struct Note {
+                    #[id]
+                    pub id: i64,
+                    // A user's OWN type with the same leaf name, unmarked.
+                    pub body: domain::CollabText,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("CollaborativeColumnDescriptor"),
+            "an unmarked look-alike must register nothing"
+        );
+        assert!(
+            !generated.contains("fn body_text"),
+            "an unmarked look-alike must gain no accessors"
+        );
+    }
+
+    #[test]
+    fn translatable_field_is_accepted_on_a_translated_column() {
+        let field: syn::Field = syn::parse_quote! {
+            #[translatable]
+            pub title: Translated
+        };
+        assert!(validate_translatable_field(&field).is_ok());
+        let qualified: syn::Field = syn::parse_quote! {
+            #[translatable]
+            pub title: ::autumn_web::i18n::Translated
+        };
+        assert!(validate_translatable_field(&qualified).is_ok());
+    }
+
+    #[test]
+    fn translatable_on_a_plain_string_is_rejected_with_the_fix() {
+        let field: syn::Field = syn::parse_quote! {
+            #[translatable]
+            pub title: String
+        };
+        let err = validate_translatable_field(&field).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Translated"), "{msg}");
+    }
+
+    #[test]
+    fn translatable_option_is_rejected() {
+        // The container itself models "no translation" (an empty map), so a
+        // nullable column would give two ways to say the same thing.
+        let field: syn::Field = syn::parse_quote! {
+            #[translatable]
+            pub title: Option<Translated>
+        };
+        assert!(validate_translatable_field(&field).is_err());
+    }
+
+    #[test]
+    fn translatable_plus_encrypted_is_rejected() {
+        let field: syn::Field = syn::parse_quote! {
+            #[translatable]
+            #[encrypted]
+            pub title: Translated
+        };
+        let err = validate_translatable_field(&field).unwrap_err();
+        assert!(err.to_string().contains("encrypted"), "{err}");
+    }
+
+    #[test]
+    fn translatable_plus_searchable_is_rejected() {
+        // The stored column is a JSON container; a tsvector built from it
+        // would index JSON punctuation and locale tags, not the prose.
+        let field: syn::Field = syn::parse_quote! {
+            #[translatable]
+            #[searchable]
+            pub title: Translated
+        };
+        let err = validate_translatable_field(&field).unwrap_err();
+        assert!(err.to_string().contains("searchable"), "{err}");
+    }
+
+    #[test]
+    fn translatable_plus_equality_markers_are_rejected() {
+        for marker in [
+            "unique",
+            "indexed",
+            "normalize",
+            "id",
+            "lock_version",
+            "position",
+        ] {
+            let marker_ident = syn::Ident::new(marker, proc_macro2::Span::call_site());
+            let field: syn::Field = syn::parse_quote! {
+                #[translatable]
+                #[#marker_ident]
+                pub title: Translated
+            };
+            assert!(
+                validate_translatable_field(&field).is_err(),
+                "`#[{marker}]` must not combine with `#[translatable]`"
+            );
+        }
+    }
+
+    #[test]
+    fn translatable_model_emits_accessors_and_registry() {
+        let generated = model_macro(
+            quote! { table = "posts" },
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    #[translatable]
+                    pub title: ::autumn_web::i18n::Translated,
+                    pub body: String,
+                }
+            },
+        )
+        .to_string();
+
+        // The attribute is stripped from the emitted struct (rustc has no
+        // `#[translatable]` attribute of its own).
+        let query_struct = generated
+            .split("pub struct Post")
+            .nth(1)
+            .expect("Post struct emitted");
+        let body = &query_struct[..query_struct.find('}').unwrap_or(query_struct.len())];
+        assert!(
+            !body.contains("translatable"),
+            "attr must be stripped: {body}"
+        );
+
+        // Per-field accessors (AC2 / AC5).
+        for expected in [
+            "fn title_localized",
+            "fn title_in",
+            "fn set_title",
+            "fn title_locales",
+            "fn title_is_translated",
+        ] {
+            assert!(generated.contains(expected), "missing {expected}");
+        }
+        // Model-level, field-name-keyed surface (AC5 wording).
+        for expected in [
+            "fn translatable_fields",
+            "fn available_locales",
+            "fn is_translated",
+            "fn localized",
+            "__AUTUMN_TRANSLATABLE_COLUMNS",
+        ] {
+            assert!(generated.contains(expected), "missing {expected}");
+        }
+        // Registry submission (AC5 observability from outside the model).
+        assert!(generated.contains("TranslatableColumnDescriptor"));
+    }
+
+    #[test]
+    fn model_without_translatable_fields_emits_no_translatable_accessors() {
+        // AC7: purely additive — a model that opts out is untouched apart from
+        // the always-emitted (empty) column constant.
+        let generated = model_macro(
+            quote! { table = "posts" },
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(!generated.contains("TranslatableColumnDescriptor"));
+        assert!(!generated.contains("fn translatable_fields"));
+        assert!(!generated.contains("fn available_locales"));
+        assert!(generated.contains("__AUTUMN_TRANSLATABLE_COLUMNS"));
+    }
+
+    // ── #1191: `#[searchable(embed)]` parsing ───────────────────────────────
+
+    #[test]
+    fn tenant_id_detection_requires_a_string_shaped_column() {
+        assert!(is_string_or_option_string(&syn::parse_quote!(String)));
+        assert!(is_string_or_option_string(&syn::parse_quote!(
+            Option<String>
+        )));
+        assert!(is_string_or_option_string(&syn::parse_quote!(
+            ::std::option::Option<::std::string::String>
+        )));
+        // An unrelated `tenant_id: i64` must NOT make the index tenant-scoped.
+        assert!(!is_string_or_option_string(&syn::parse_quote!(i64)));
+        assert!(!is_string_or_option_string(&syn::parse_quote!(Option<i64>)));
+        assert!(!is_string_or_option_string(&syn::parse_quote!(Uuid)));
+    }
+
+    #[test]
+    fn a_non_string_tenant_id_column_does_not_make_the_index_tenant_scoped() {
+        let input: TokenStream = quote! {
+            #[searchable]
+            pub struct Reading {
+                #[id]
+                pub id: i64,
+                #[searchable]
+                pub label: String,
+                // A sensor reading's "tenant_id" that is really a device id.
+                pub tenant_id: i64,
+            }
+        };
+        let expanded = model_macro(quote! {}, input).to_string();
+        assert!(expanded.contains("SearchIndexed for Reading"), "{expanded}");
+        // The tenant extraction (and the tenant_scoped flag) must be absent.
+        assert!(
+            !expanded.contains("__autumn_tenant"),
+            "a non-String tenant_id must not be extracted: {expanded}"
+        );
+    }
+
+    /// #1771: a rename on the blind-index companion would leave the token
+    /// unprotected under a name version history, the log filter and the CSV
+    /// export do not look for.
+    #[test]
+    fn a_renamed_blind_index_companion_is_refused() {
+        for rename in [
+            quote! { #[serde(rename = "lookup")] },
+            quote! { #[diesel(column_name = lookup)] },
+        ] {
+            let input: TokenStream = quote! {
+                pub struct Note {
+                    pub id: i32,
+                    #[confidential(blind_index)]
+                    pub body: autumn_web::confidential::Sealed,
+                    #rename
+                    pub body_bidx: autumn_web::confidential::BlindIndex,
+                }
+            };
+            let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+            assert!(
+                expanded.contains("is a blind-index companion"),
+                "a renamed companion must be refused: {expanded}"
+            );
+        }
+    }
+
+    /// #1771: a marker that keeps the companion out of the insert leaves the
+    /// client-computed token with nowhere to go.
+    #[test]
+    fn a_write_excluded_blind_index_companion_is_refused() {
+        for marker in [
+            quote! { #[default] },
+            quote! { #[id] },
+            quote! { #[lock_version] },
+            quote! { #[position] },
+        ] {
+            let input: TokenStream = quote! {
+                pub struct Note {
+                    pub id: i32,
+                    #[confidential(blind_index)]
+                    pub body: autumn_web::confidential::Sealed,
+                    #marker
+                    pub body_bidx: autumn_web::confidential::BlindIndex,
+                }
+            };
+            let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+            assert!(
+                expanded.contains("is a blind-index companion"),
+                "a write-excluded companion must be refused: {expanded}"
+            );
+        }
+    }
+
+    /// #1771: a container conversion decides the serialized keys, so a registry
+    /// keyed on the model's own field names cannot see the sealed column through
+    /// it — and version history snapshots the model through `Serialize`.
+    #[test]
+    fn a_serde_shape_conversion_on_a_confidential_model_is_refused() {
+        for conversion in [
+            quote! { #[serde(into = "Wire")] },
+            quote! { #[serde(from = "Wire")] },
+            quote! { #[serde(try_from = "Wire")] },
+            quote! { #[serde(transparent)] },
+        ] {
+            let input: TokenStream = quote! {
+                #conversion
+                pub struct Note {
+                    pub id: i32,
+                    #[confidential]
+                    pub body: autumn_web::confidential::Sealed,
+                }
+            };
+            let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+            assert!(
+                expanded.contains("cannot be combined with `#[confidential]` fields"),
+                "a reshaped confidential model must be refused: {expanded}"
+            );
+        }
+    }
+
+    /// #1771: the container-level counterpart of the field-level omission rule.
+    /// Written on the struct, one attribute reaches both columns without either
+    /// of them carrying an attribute of its own.
+    #[test]
+    fn a_serde_container_default_on_a_confidential_model_is_refused() {
+        for container in [
+            quote! { #[serde(default)] },
+            quote! { #[serde(default = "seed")] },
+        ] {
+            let input: TokenStream = quote! {
+                #container
+                pub struct Note {
+                    pub id: i32,
+                    #[confidential(blind_index)]
+                    pub body: autumn_web::confidential::Sealed,
+                    pub body_bidx: autumn_web::confidential::BlindIndex,
+                }
+            };
+            let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+            assert!(
+                expanded.contains("cannot be combined with `#[confidential]` fields"),
+                "a container-level serde default must be refused: {expanded}"
+            );
+        }
+    }
+
+    /// #1771: both wrappers implement `Default`, so an omitted value is not an
+    /// error. The sealed field becomes an envelope no key opens; the companion
+    /// becomes a random token that matches no envelope.
+    #[test]
+    fn a_confidential_field_omitted_on_input_is_refused() {
+        for (sealed_attr, companion_attr) in [
+            (quote! { #[serde(default)] }, quote! {}),
+            (quote! { #[serde(default = "seed")] }, quote! {}),
+            (quote! { #[serde(skip_deserializing)] }, quote! {}),
+            (quote! {}, quote! { #[serde(default)] }),
+            (quote! {}, quote! { #[serde(default = "seed")] }),
+            (quote! {}, quote! { #[serde(skip_deserializing)] }),
+        ] {
+            let input: TokenStream = quote! {
+                pub struct Note {
+                    pub id: i32,
+                    #sealed_attr
+                    #[confidential(blind_index)]
+                    pub body: autumn_web::confidential::Sealed,
+                    #companion_attr
+                    pub body_bidx: autumn_web::confidential::BlindIndex,
+                }
+            };
+            let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+            assert!(
+                expanded.contains("compile_error"),
+                "a confidential column the client may omit must be refused: {expanded}"
+            );
+        }
+    }
+
+    /// #1771: an alias is accepted on the way in, so a request could deliver the
+    /// envelope or the token under a name no filter knows; `flatten` removes the
+    /// key entirely.
+    #[test]
+    fn a_serde_alias_or_flatten_on_a_confidential_field_or_companion_is_refused() {
+        for (sealed_attr, companion_attr) in [
+            (quote! { #[serde(alias = "lookup")] }, quote! {}),
+            (quote! {}, quote! { #[serde(alias = "lookup")] }),
+            (quote! { #[serde(flatten)] }, quote! {}),
+            (quote! {}, quote! { #[serde(flatten)] }),
+        ] {
+            let input: TokenStream = quote! {
+                pub struct Note {
+                    pub id: i32,
+                    #sealed_attr
+                    #[confidential(blind_index)]
+                    pub body: autumn_web::confidential::Sealed,
+                    #companion_attr
+                    pub body_bidx: autumn_web::confidential::BlindIndex,
+                }
+            };
+            let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+            assert!(
+                expanded.contains("compile_error"),
+                "an aliased confidential column must be refused: {expanded}"
+            );
+        }
+    }
+
+    /// #1771: a skipped column never reaches the version-history snapshot, which
+    /// is built from the `Serialize` view, so it would leave no "changed" marker.
+    /// `skip_serializing_if` counts: a predicate true on both sides of an update
+    /// omits the column from both snapshots.
+    #[test]
+    fn a_confidential_field_that_skips_serialization_is_refused() {
+        for (skip, named) in [
+            (quote! { #[private] }, "private"),
+            (
+                quote! { #[serde(skip_serializing)] },
+                "serde(skip_serializing)",
+            ),
+            (
+                quote! { #[serde(skip_serializing_if = "always")] },
+                "serde(skip_serializing_if = ...)",
+            ),
+        ] {
+            let input: TokenStream = quote! {
+                pub struct Note {
+                    pub id: i32,
+                    #skip
+                    #[confidential]
+                    pub body: autumn_web::confidential::Sealed,
+                }
+            };
+            let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+            assert!(
+                expanded.contains(&format!("cannot use `#[{named}]`")),
+                "a skipped confidential column must be refused by name: {expanded}"
+            );
+        }
+    }
+
+    /// The companion is accepted when it is not renamed.
+    #[test]
+    fn a_plain_blind_index_companion_is_accepted() {
+        let input: TokenStream = quote! {
+            pub struct Note {
+                pub id: i32,
+                #[confidential(blind_index)]
+                pub body: autumn_web::confidential::Sealed,
+                pub body_bidx: autumn_web::confidential::BlindIndex,
+            }
+        };
+        let expanded = model_macro(quote! { table = "notes" }, input).to_string();
+        assert!(!expanded.contains("compile_error"), "{expanded}");
+        assert!(
+            expanded.contains("__AUTUMN_CONFIDENTIAL_COLUMNS"),
+            "{expanded}"
+        );
+    }
+
+    #[test]
+    fn searchable_embed_flag_is_parsed_alongside_the_weight() {
+        let field: syn::Field = syn::parse_quote! {
+            #[searchable(weight = "B", embed)]
+            pub body: String
+        };
+        let cfg = parse_field_searchable(&field).expect("parses");
+        assert!(cfg.embed);
+        assert!(matches!(
+            cfg.kind,
+            FieldSearchable::SearchableWithWeight(ref w) if w == "B"
+        ));
+    }
+
+    #[test]
+    fn searchable_embed_alone_defaults_the_weight() {
+        let field: syn::Field = syn::parse_quote! {
+            #[searchable(embed)]
+            pub body: String
+        };
+        let cfg = parse_field_searchable(&field).expect("parses");
+        assert!(cfg.embed);
+        assert!(matches!(cfg.kind, FieldSearchable::SearchableDefault));
+    }
+
+    #[test]
+    fn searchable_without_embed_leaves_the_flag_off() {
+        let field: syn::Field = syn::parse_quote! {
+            #[searchable(weight = "A")]
+            pub title: String
+        };
+        assert!(!parse_field_searchable(&field).expect("parses").embed);
+
+        let bare: syn::Field = syn::parse_quote! {
+            #[searchable]
+            pub title: String
+        };
+        assert!(!parse_field_searchable(&bare).expect("parses").embed);
+
+        let none: syn::Field = syn::parse_quote! {
+            pub title: String
+        };
+        let cfg = parse_field_searchable(&none).expect("parses");
+        assert!(!cfg.embed);
+        assert!(matches!(cfg.kind, FieldSearchable::NotSearchable));
+    }
+
+    #[test]
+    fn unknown_searchable_key_names_the_supported_set() {
+        let field: syn::Field = syn::parse_quote! {
+            #[searchable(vectorize)]
+            pub body: String
+        };
+        let err = parse_field_searchable(&field).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("weight"), "{message}");
+        assert!(message.contains("embed"), "{message}");
+    }
+
+    #[test]
+    fn duplicate_embed_is_rejected() {
+        let field: syn::Field = syn::parse_quote! {
+            #[searchable(embed, embed)]
+            pub body: String
+        };
+        let err = parse_field_searchable(&field).unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn two_embed_fields_are_rejected_by_the_model_macro() {
+        // A record has ONE embedding; two `embed` fields is ambiguous, so it
+        // must be a compile error rather than a silent last-wins.
+        let input: TokenStream = quote! {
+            #[searchable(language = "english")]
+            pub struct Article {
+                #[id]
+                pub id: i64,
+                #[searchable(weight = "A", embed)]
+                pub title: String,
+                #[searchable(weight = "B", embed)]
+                pub body: String,
+            }
+        };
+        let expanded = model_macro(quote! {}, input).to_string();
+        assert!(
+            expanded.contains("only one field may be marked"),
+            "{expanded}"
+        );
+    }
+
+    #[test]
+    fn embed_without_a_model_level_searchable_is_rejected() {
+        // `#[searchable(embed)]` on a field of a model that is not itself
+        // `#[searchable]` would produce an index nothing ever queries.
+        let input: TokenStream = quote! {
+            pub struct Article {
+                #[id]
+                pub id: i64,
+                #[searchable(embed)]
+                pub body: String,
+            }
+        };
+        let expanded = model_macro(quote! {}, input).to_string();
+        assert!(
+            expanded.contains("requires the model to be marked"),
+            "{expanded}"
+        );
+    }
+
+    // ── #1654: compile-time data classification ─────────────────────────
+
+    fn classified_model() -> String {
+        model_macro(
+            quote! {},
+            quote! {
+                pub struct Customer {
+                    #[id]
+                    pub id: i64,
+                    pub name: String,
+                    #[classified]
+                    pub email: String,
+                }
+            },
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn a_classified_column_is_generated_as_the_taint_wrapper() {
+        let generated = classified_model();
+        assert!(
+            generated.contains("classify :: Classified < String , CustomerEmailClassified >"),
+            "the read struct must carry the classification on the type: {generated}"
+        );
+        assert!(
+            generated.contains("serialize_as = :: autumn_web :: classify :: ClassifiedText"),
+            "the column must round-trip through the opaque Diesel wrapper: {generated}"
+        );
+    }
+
+    #[test]
+    fn the_write_structs_carry_the_classification_too() {
+        // #1654 review round 2 (P1): `NewCustomer`/`UpdateCustomer` are the
+        // primary way an application *receives* a classified value, and their
+        // fields are `pub`. Leaving them as a bare `String` meant a handler
+        // could move the plaintext straight into a serializable view --
+        // `Json(View { email: input.email })` -- releasing personal data with
+        // no boundary and no audit record. `skip_serializing` only stops the
+        // write struct itself from being serialized; it does nothing about the
+        // value being moved out of it.
+        let generated = classified_model();
+        let write_structs = generated
+            .split("pub struct NewCustomer")
+            .nth(1)
+            .expect("the generated write structs");
+        assert!(
+            write_structs.contains("classify :: Classified < String , CustomerEmailClassified >"),
+            "NewCustomer must carry the classification on the field type: {write_structs}"
+        );
+        assert!(
+            write_structs.contains(
+                "Patch < :: autumn_web :: classify :: Classified < String , \
+                 CustomerEmailClassified > >"
+            ),
+            "UpdateCustomer's patch field must carry it too: {write_structs}"
+        );
+        // The unclassified column is untouched, so this is not a blanket rewrite.
+        assert!(
+            write_structs.contains("pub name : String"),
+            "an unclassified column must stay exactly as declared: {write_structs}"
+        );
+    }
+
+    #[test]
+    fn a_classified_model_does_not_derive_serialize() {
+        let generated = classified_model();
+        // `Deserialize` stays: taking personal data in is not a release.
+        assert!(
+            generated.contains("derive (:: serde :: Deserialize)"),
+            "{generated}"
+        );
+        assert!(
+            !generated
+                .contains("derive (:: serde :: Serialize , :: serde :: Deserialize) ] # [ doc"),
+            "{generated}"
+        );
+        let query_struct = generated
+            .split("pub struct Customer")
+            .next()
+            .expect("query struct preamble");
+        assert!(
+            !query_struct.contains(":: serde :: Serialize"),
+            "the read struct must not implement Serialize: {query_struct}"
+        );
+    }
+
+    #[test]
+    fn a_classified_column_publishes_its_field_marker_and_manifest_row() {
+        let generated = classified_model();
+        assert!(
+            generated.contains("struct CustomerEmailClassified"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("classify :: ClassifiedField for CustomerEmailClassified"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("ClassifiedFieldDescriptor"),
+            "the column must reach the data-flow manifest: {generated}"
+        );
+        assert!(
+            generated.contains("module_path !"),
+            "the manifest identity must be module-qualified so two `Customer`s \
+             in different crates cannot share a row: {generated}"
+        );
+        assert!(
+            generated.contains("Classification :: PersonalData"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn the_factory_carries_the_classification_too() {
+        // #2373. The generated factory was the last struct of the family still
+        // holding plaintext: `Customer::factory().email` was a public `String`,
+        // so it could be moved into a serializable view with no boundary and no
+        // audit record, and the factory's derived `Debug` printed the real
+        // value. Classifying only at `build()` time is too late -- the
+        // plaintext is readable on the factory for its whole lifetime. The
+        // factory is emitted in every build, not just tests.
+        let generated = classified_model();
+        // Scope to the struct body: everything after the header up to its
+        // closing brace. Splitting alone would match the whole rest of the
+        // expansion and pass on any other struct's classified field.
+        let after = generated
+            .split("pub struct CustomerFactory")
+            .nth(1)
+            .expect("the generated factory struct");
+        let factory = &after[..after.find('}').expect("struct body ends")];
+        assert!(
+            factory.contains("classify :: Classified < String , CustomerEmailClassified >"),
+            "the factory field must carry the classification: {factory}"
+        );
+        assert!(
+            factory.contains("pub name : String"),
+            "an unclassified column must stay exactly as declared: {factory}"
+        );
+    }
+
+    #[test]
+    fn the_factory_debug_redacts_a_classified_column() {
+        let generated = classified_model();
+        let factory_debug = generated
+            .split("impl :: core :: fmt :: Debug for CustomerFactory")
+            .nth(1)
+            .expect("the factory must get a redacting Debug, not a derived one");
+        let body = &factory_debug[..factory_debug.len().min(400)];
+        assert!(
+            body.contains("<classified>"),
+            "the factory's Debug must redact the classified column: {body}"
+        );
+    }
+
+    #[test]
+    fn the_write_structs_never_serialize_a_classified_column() {
+        // The companion to `the_write_structs_carry_the_classification_too`:
+        // the wrapper stops the value being moved out, and `skip_serializing`
+        // stops the write struct itself from carrying it into a response body.
+        // `skip_serializing` (not `skip`) keeps `Deserialize` intact, which is
+        // what makes the create/PATCH bodies decode at all.
+        let generated = classified_model();
+        assert!(
+            generated.contains("serde (skip_serializing)"),
+            "the write structs must not serialize a classified column: {generated}"
+        );
+    }
+
+    #[test]
+    fn the_changeset_writes_a_classified_column_through_the_opaque_column_type() {
+        let generated = classified_model();
+        let changeset = generated
+            .split("pub struct __CustomerChangeset")
+            .nth(1)
+            .expect("the generated changeset");
+        assert!(
+            changeset.contains("ClassifiedText < CustomerEmailClassified >"),
+            "the changeset must write through the opaque Diesel type: {changeset}"
+        );
+        assert!(
+            changeset.contains(
+                "Option < :: autumn_web :: classify :: Classified < String , \
+                 CustomerEmailClassified > >"
+            ),
+            "and hold the wrapper, not the plaintext: {changeset}"
+        );
+    }
+
+    #[test]
+    fn a_classified_column_is_redacted_from_debug() {
+        let generated = classified_model();
+        assert!(generated.contains("<classified>"), "{generated}");
+    }
+
+    #[test]
+    fn a_classified_model_refuses_the_durable_commit_hook_payload() {
+        let generated = classified_model();
+        assert!(
+            generated.contains("durable commit-hook payload"),
+            "the second, unclassified copy of the record must be refused: {generated}"
+        );
+    }
+
+    #[test]
+    fn a_classified_column_is_not_client_filterable_or_sortable() {
+        // `?filter[email]=` and `?sort=email` are client-controlled. A
+        // classified column in either allowlist is an equality oracle and an
+        // ordering leak that compiles, with no boundary and no manifest row.
+        let generated = classified_model();
+        let filters_start = generated
+            .find("fn __autumn_list_apply_filters")
+            .expect("filter helper must be generated");
+        let orders_start = generated
+            .find("fn __autumn_list_apply_order")
+            .expect("order helper must be generated");
+        let filters = &generated[filters_start..orders_start];
+        assert!(filters.contains("\"name\""), "{filters}");
+        assert!(!filters.contains("\"email\""), "{filters}");
+        // The order helper is the last item in its `impl` block; bound the slice
+        // so the rest of the expansion (which legitimately names the column)
+        // cannot satisfy the assertion.
+        let orders_end = generated[orders_start..]
+            .find("} impl ")
+            .map_or(generated.len(), |o| orders_start + o);
+        let orders = &generated[orders_start..orders_end];
+        assert!(orders.contains("\"name\""), "{orders}");
+        assert!(!orders.contains("\"email\""), "{orders}");
+    }
+
+    #[test]
+    fn every_model_publishes_its_classified_column_list() {
+        assert!(
+            classified_model().contains("__AUTUMN_CLASSIFIED_COLUMNS"),
+            "the column list is what a surface with no compile-time view of the model reads"
+        );
+    }
+
+    #[test]
+    fn classified_is_rejected_on_the_tenant_isolation_key() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Customer {
+                    #[id]
+                    pub id: i64,
+                    #[classified]
+                    pub tenant_id: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot be applied to `tenant_id`"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn an_unclassified_model_is_completely_unchanged() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Widget {
+                    #[id]
+                    pub id: i64,
+                    pub label: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("derive (:: serde :: Serialize , :: serde :: Deserialize)"),
+            "{generated}"
+        );
+        assert!(!generated.contains("Classified"), "{generated}");
+        assert!(!generated.contains("<classified>"), "{generated}");
+    }
+
+    #[test]
+    fn classified_is_rejected_on_a_non_string_column() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Customer {
+                    #[id]
+                    pub id: i64,
+                    #[classified]
+                    pub age: i32,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("only supported on non-null `String` fields"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn classified_rejects_an_unknown_tier() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Customer {
+                    #[id]
+                    pub id: i64,
+                    #[classified(top_secret)]
+                    pub email: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("unsupported `#[classified]` tier"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn classified_rejects_conflicting_column_markers() {
+        for marker in ["encrypted", "searchable", "normalize", "state_machine"] {
+            let marker_ident = format_ident!("{marker}");
+            let extra = if marker == "normalize" {
+                quote! { #[#marker_ident(trim)] }
+            } else if marker == "state_machine" {
+                quote! { #[#marker_ident(transitions(a -> b))] }
+            } else {
+                quote! { #[#marker_ident] }
+            };
+            let generated = model_macro(
+                quote! {},
+                quote! {
+                    pub struct Customer {
+                        #[id]
+                        pub id: i64,
+                        #[classified]
+                        #extra
+                        pub email: String,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains("cannot be combined with"),
+                "`#[classified]` + `#[{marker}]` must be rejected: {generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn classified_rejects_an_unknown_tier_behind_a_bare_marker() {
+        // The bare marker must not short-circuit validation of the attributes
+        // after it, or the column is recorded as `personal_data` while the tier
+        // the author asked for is silently dropped.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Customer {
+                    #[id]
+                    pub id: i64,
+                    #[classified]
+                    #[classified(top_secret)]
+                    pub email: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("unsupported `#[classified]` tier"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn classified_rejects_a_custom_serde_adapter() {
+        for adapter in [
+            quote! { #[serde(with = "my_codec")] },
+            quote! { #[serde(serialize_with = "my_ser")] },
+            quote! { #[serde(deserialize_with = "my_de")] },
+        ] {
+            let generated = model_macro(
+                quote! {},
+                quote! {
+                    pub struct Customer {
+                        #[id]
+                        pub id: i64,
+                        #[classified]
+                        #adapter
+                        pub email: String,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains("cannot be combined with `#[serde(with"),
+                "{generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_conflicting_marker_reports_the_conflict_not_the_string_rule() {
+        // `#[translatable]` implies a non-`String` column, so checking the type
+        // first would bury the reason that tells the author what to do.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Customer {
+                    #[id]
+                    pub id: i64,
+                    #[classified]
+                    #[translatable]
+                    pub bio: Translated,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot be combined with `#[translatable]`"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn classified_rejects_a_serde_rename() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Customer {
+                    #[id]
+                    pub id: i64,
+                    #[classified]
+                    #[serde(rename = "e_mail")]
+                    pub email: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot use `#[serde(rename"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn the_field_marker_camel_cases_a_multi_word_column() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Customer {
+                    #[id]
+                    pub id: i64,
+                    #[classified]
+                    pub home_address_line: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("struct CustomerHomeAddressLineClassified"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn searchable_model_emits_the_search_indexed_impl() {
+        let input: TokenStream = quote! {
+            #[searchable(language = "english")]
+            pub struct Article {
+                #[id]
+                pub id: i64,
+                #[searchable(weight = "A")]
+                pub title: String,
+                #[searchable(weight = "B", embed)]
+                pub body: String,
+            }
+        };
+        let expanded = model_macro(quote! {}, input).to_string();
+        assert!(expanded.contains("SearchIndexed for Article"), "{expanded}");
+        assert!(expanded.contains("SEARCH_EMBED_FIELD"), "{expanded}");
+    }
+
+    #[test]
+    fn non_searchable_model_emits_no_search_indexed_impl() {
+        let input: TokenStream = quote! {
+            pub struct Article {
+                #[id]
+                pub id: i64,
+                pub title: String,
+            }
+        };
+        let expanded = model_macro(quote! {}, input).to_string();
+        assert!(
+            !expanded.contains("SearchIndexed for Article"),
+            "{expanded}"
+        );
+    }
+
+    #[test]
+    fn searchable_model_with_a_non_i64_key_emits_no_search_indexed_impl() {
+        // The plugin index keys on `i64` (as the in-core FTS already does), so
+        // a `Uuid`-keyed model keeps its #842 behaviour and simply has no
+        // pluggable index — rather than emitting an impl that cannot compile.
+        let input: TokenStream = quote! {
+            #[searchable]
+            pub struct Article {
+                #[id]
+                pub id: uuid::Uuid,
+                #[searchable]
+                pub title: String,
+            }
+        };
+        let expanded = model_macro(quote! {}, input).to_string();
+        assert!(
+            !expanded.contains("SearchIndexed for Article"),
+            "{expanded}"
+        );
     }
 
     #[test]
@@ -7001,6 +16807,38 @@ mod tests {
     }
 
     #[test]
+    fn normalize_impl_for_new_is_gated_on_normalize_columns() {
+        // #2634: a model with no `#[normalize]` columns must not get
+        // `impl Normalize for New*` — otherwise the repository probe's `Yes`
+        // arm always wins and `save_many` clones a batch whose normalization
+        // is a guaranteed no-op. The read-model impl and `NormalizedModel`
+        // stay unconditional (public API surface and the finder `None` arm).
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    pub name: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            !generated.contains("normalize :: Normalize for NewUser"),
+            "must NOT generate `impl Normalize for NewUser` with no normalize columns: {generated}"
+        );
+        assert!(
+            generated.contains("normalize :: Normalize for User"),
+            "must keep `impl Normalize for User` (read model): {generated}"
+        );
+        assert!(
+            generated.contains("normalize :: NormalizedModel for User"),
+            "must keep `impl NormalizedModel for User`: {generated}"
+        );
+    }
+
+    #[test]
     fn update_model_drops_non_declarative_validators_but_new_model_keeps_them() {
         // #1719: `Patch<T>` implements validator's per-field declarative traits
         // (length/email/…) but NOT `custom`/`must_match`/`nested`/etc. The
@@ -7135,21 +16973,23 @@ mod tests {
 
     #[test]
     fn update_model_drops_every_non_patch_validator_but_new_model_keeps_them() {
-        // #1751 (residual long tail of #1742/#1719): lock in that the FULL
-        // `NON_PATCH_VALIDATORS` denylist — not just `custom` — is stripped from
-        // the generated `UpdateModel` `Patch<T>` fields while `NewModel` keeps
-        // every one. These four are enforced on create only and are genuinely
-        // unfixable on the PATCH path without the merged-model redesign:
-        //   * `must_match` / `nested` — cross-field / struct-level; no single-
-        //     field `Patch<T>` trait exists for them.
-        //   * `credit_card` (`ValidateCreditCard`) / `non_control_character`
-        //     (`ValidateNonControlCharacter`) — not exported under this
-        //     workspace's `validator` feature set, so no `Patch<T>` impl can be
-        //     written without enabling new features (out of scope for a latent
-        //     case).
-        // This is pure token-level filtering (`model_macro` does not compile the
-        // output), so the combination need not be semantically valid — only that
-        // each validator ident is dropped from the patch struct.
+        // #1751 (the residual tail of #1742/#1719): lock in that the full
+        // `NON_PATCH_VALIDATORS` denylist, not just `custom`, is stripped from the
+        // generated `UpdateModel` `Patch<T>` fields while `NewModel` keeps every one.
+        // These are enforced on create only and are genuinely unfixable on the PATCH
+        // path without the merged-model redesign:
+        //   * `must_match` and `nested` are cross-field or struct-level, and no
+        //     single-field `Patch<T>` trait exists for them. `nested` also carries a
+        //     separate, `Patch<T>`-independent `ValidateExt` hazard even where it does
+        //     compile — see `NON_PATCH_VALIDATORS`'s doc comment — but that is
+        //     orthogonal to this token-level test.
+        //   * `credit_card` (`ValidateCreditCard`) and `non_control_character`
+        //     (`ValidateNonControlCharacter`) are not exported under this workspace's
+        //     `validator` feature set, so no `Patch<T>` impl can be written without
+        //     enabling new features.
+        // This is pure token-level filtering — `model_macro` does not compile its
+        // output — so the combination need not be semantically valid; only that each
+        // validator ident is dropped from the patch struct.
         let output = model_macro(
             TokenStream::new(),
             quote! {
@@ -7352,17 +17192,17 @@ mod tests {
 
     #[test]
     fn update_model_drops_ip_only_on_option_fields_new_model_keeps_all() {
-        // #1719 / Codex P2: `validator` provides no `impl ValidateIp for
-        // Option<T>` (only the `impl<T: ToString> ValidateIp for T` blanket),
-        // so `Patch<Option<String>>: ValidateIp` is unsatisfied and the
-        // generated `UpdateModel` would fail to compile for an `Option<String>`
-        // + `#[validate(ip)]` field. We therefore drop `ip` from the PATCH
-        // fields ONLY when the field is `Option<…>`, while:
-        //   * keeping `ip` on a non-`Option` field (`Patch<String>: ValidateIp`
-        //     holds via the `ToString` blanket),
-        //   * keeping `length` on the `Option` field (validator ships an
-        //     `Option<T>` impl for it, so it must NOT be over-filtered),
-        //   * keeping every validator on `NewModel` (its derive unwraps Option).
+        // #1719 / Codex P2: `validator` provides no `impl ValidateIp for Option<T>`,
+        // only the `impl<T: ToString> ValidateIp for T` blanket, so
+        // `Patch<Option<String>>: ValidateIp` is unsatisfied and the generated
+        // `UpdateModel` would fail to compile for an `Option<String>` field carrying
+        // `#[validate(ip)]`. So `ip` is dropped from the patch fields only when the
+        // field is `Option<…>`, while:
+        //   * `ip` is kept on a non-`Option` field, where `Patch<String>: ValidateIp`
+        //     holds via the `ToString` blanket,
+        //   * `length` is kept on the `Option` field, since validator ships an
+        //     `Option<T>` impl and it must not be over-filtered,
+        //   * every validator is kept on `NewModel`, whose derive unwraps `Option`.
         let output = model_macro(
             TokenStream::new(),
             quote! {

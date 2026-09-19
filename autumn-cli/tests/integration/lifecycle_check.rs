@@ -85,6 +85,113 @@ fn sound_lifecycle_exits_zero() {
     assert!(stdout.contains("sound"), "stdout:\n{stdout}");
 }
 
+/// The guide shows `autumn lifecycle check`'s output verbatim, so a reader can
+/// match what they see in CI against the page. Pins the text report's violation
+/// and frame lines, and every key of the `--format json` artifact, against the
+/// real binary — so a change to either format has to update the page (#1675).
+#[test]
+fn guide_sample_output_matches_the_real_cli() {
+    let guide = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root")
+            .join("docs/guide/lifecycle.md"),
+    )
+    .expect("docs/guide/lifecycle.md exists");
+
+    // The guide's broken lifecycle: `Refunded` is an orphan and `Paid` traps.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "src/order.rs",
+        r"
+use autumn_web::lifecycle;
+
+#[lifecycle(
+    initial = Cart,
+    terminal(Delivered),
+    transitions(
+        Cart -> Placed,
+        Placed -> Paid,
+        Placed -> Delivered,
+    )
+)]
+pub enum OrderState {
+    Cart,
+    Placed,
+    Paid,
+    Delivered,
+    Refunded,
+}
+",
+    );
+
+    let run = run_lifecycle(dir.path(), &["check"]);
+    assert!(
+        !run.status.success(),
+        "a broken lifecycle must exit non-zero"
+    );
+    let text = String::from_utf8_lossy(&run.stdout).into_owned();
+
+    // Collect first, then assert on the count: filtering on the very thing
+    // under test would pass vacuously if the report stopped printing
+    // violations, or renamed the `[kind]` prefix.
+    let violations: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('['))
+        .collect();
+    assert_eq!(
+        violations.len(),
+        2,
+        "expected one reachability and one dead-end line\n{text}"
+    );
+    assert!(violations[0].starts_with("[reachability]"), "{text}");
+    assert!(violations[1].starts_with("[dead-end]"), "{text}");
+    for line in violations {
+        assert!(
+            guide.contains(line),
+            "docs/guide/lifecycle.md is missing a line the CLI really prints:\n  {line}\n\nfull output:\n{text}"
+        );
+    }
+    // The report's frame, not just its findings.
+    for line in [
+        "scanned 1 lifecycle(s) across 1 .rs file(s)",
+        "Result: FAIL",
+    ] {
+        assert!(text.contains(line), "CLI no longer prints `{line}`\n{text}");
+        assert!(guide.contains(line), "guide is missing `{line}`");
+    }
+
+    let json = run_lifecycle(dir.path(), &["check", "--format", "json"]);
+    let json: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("check --format json emits JSON");
+    let lifecycle = json["lifecycles"][0]
+        .as_object()
+        .expect("one lifecycle in the artifact");
+    let found = lifecycle["violations"]
+        .as_array()
+        .expect("violations array");
+    assert_eq!(found.len(), 2, "artifact: {json}");
+    assert_eq!(found[0]["kind"], "reachability", "artifact: {json}");
+    assert_eq!(found[1]["kind"], "dead-end", "artifact: {json}");
+
+    // Every real key must be documented. One-directional by design: the guide's
+    // sample is captured output, so an invented key cannot survive a re-capture.
+    let keys = json
+        .as_object()
+        .expect("object")
+        .keys()
+        .chain(lifecycle.keys())
+        .chain(found[0].as_object().expect("object").keys());
+    for key in keys {
+        assert!(
+            guide.contains(&format!("\"{key}\"")),
+            "docs/guide/lifecycle.md does not document the real JSON key `{key}`"
+        );
+    }
+}
+
 #[test]
 fn unreachable_state_fails_and_is_named() {
     let dir = tempfile::tempdir().unwrap();
@@ -241,6 +348,48 @@ pub enum OrderState {
         "should tag the terminal-source violation\n{stdout}"
     );
     assert!(stdout.contains("FAIL"), "stdout:\n{stdout}");
+}
+
+/// A duplicate edge is a compile error in the macro
+/// (`duplicate transition A -> B`). The gate must never report sound a graph
+/// the build rejects, so it reports the duplicate too.
+#[test]
+fn duplicate_transition_fails_and_is_named() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "src/order.rs",
+        r"
+#[lifecycle(
+    initial = Cart,
+    terminal(Delivered),
+    transitions(
+        Cart -> Placed,
+        Cart -> Placed,
+        Placed -> Delivered,
+    )
+)]
+pub enum OrderState {
+    Cart,
+    Placed,
+    Delivered,
+}
+",
+    );
+    let output = run_lifecycle(dir.path(), &["check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "a duplicate edge must exit non-zero\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[duplicate-transition]"),
+        "should tag the violation\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Cart") && stdout.contains("Placed"),
+        "should name both endpoints\n{stdout}"
+    );
 }
 
 #[test]

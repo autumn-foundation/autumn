@@ -1,0 +1,34 @@
+ setseed 
+---------
+ 
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 500000
+INSERT 0 50000
+INSERT 0 2000
+VACUUM
+  status  | count  
+----------+--------
+ finished | 449973
+ enqueued |  52000
+ failed   |  38320
+ running  |  11707
+(4 rows)
+
+  queue  |  status  | count  
+---------+----------+--------
+ default | enqueued |  44563
+ default | failed   |  32598
+ default | finished | 382424
+ default | running  |   9973
+ high    | enqueued |   4954
+ high    | failed   |   3839
+ high    | finished |  45269
+ high    | running  |   1184
+ low     | enqueued |   2483
+ low     | failed   |   1883
+ low     | finished |  22280
+ low     | running  |    550
+(12 rows)
+

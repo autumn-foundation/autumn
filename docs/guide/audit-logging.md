@@ -186,10 +186,35 @@ and how long you keep them:
   your log store's retention.
 - **JSONL file** → each line is a self-describing JSON object, so `jq`, `grep`,
   or bulk-loading into a warehouse all work; rotate/retain the file with your
-  normal log-rotation tooling.
-- **Custom DB sink** → query with SQL and enforce retention with a scheduled
-  purge of rows past your compliance window. Keep audit rows immutable: grant
-  the app `INSERT`-only, and never `UPDATE`/`DELETE` an existing event.
+  normal log-rotation tooling, or set `retention.audit_archives` and let Autumn
+  prune stale entries in place — see
+  [Data Retention for Framework-Owned Data](data-retention.md).
+
+> **Writing a custom `AuditSink`?** Two things arrived with
+> [framework data retention](data-retention.md):
+>
+> - `AuditEvent` carries a `metadata: BTreeMap<String, String>` map of
+>   action-specific detail, set with `AuditEvent::new(..).with_metadata(k, v)`.
+>   It is empty for most events; a retention sweep uses it to record the
+>   dataset, the cutoff, and the rows removed. Persist it if your sink has
+>   somewhere to put it — it is `#[serde(default)]`, so a sink that ignores it
+>   still round-trips older archives.
+> - `AuditSink::purge_before(cutoff, dry_run)` is a *provided* method that
+>   defaults to reporting `unsupported`, so your existing sink keeps compiling
+>   and `autumn db retention` honestly says the destination cannot be pruned
+>   from here. Override it if your sink stores events somewhere prunable (a
+>   database table, a rotated file set) and you want `retention.audit_archives`
+>   to reach it. A purge must never drop a record it merely failed to parse.
+- **Custom DB sink** → query with SQL. Keep audit rows immutable by default:
+  grant the app `INSERT`-only on the audit table, and never `UPDATE`/`DELETE`
+  an existing event from request-handling code. If you also want automatic
+  retention instead of hand-writing a scheduled purge job, declare
+  `retention(after = "...", basis = created_at)` on the audit table's
+  `#[repository(...)]` — see [Data-Retention Sweeps](retention-sweeps.md) —
+  but know that the sweep runs with the app's own DB credentials, so this
+  requires granting that role `DELETE` (and `UPDATE`, if the repository is
+  also `soft_delete`) on that one table. Everything else stays `INSERT`-only;
+  only the generated sweep gets the extra grant.
 
 Audit logging answers *who did what*. It is a natural foundation for adjacent
 compliance features such as GDPR data export and right-to-erasure workflows —

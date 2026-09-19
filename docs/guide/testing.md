@@ -257,6 +257,12 @@ These mirror Laravel's `actingAs`, Rails' `sign_in`, Django's `force_login`, and
 Phoenix's `log_in_user`. `acting_as` requires a client built via `TestApp::build()`
 with the default in-memory session backend; it panics for `from_router` clients.
 
+`acting_as` sets identity only — authorization still runs, so a user who lacks
+the required role or scope is still denied. Keep at least one test that drives
+the real login handler: see the [authentication guide](./authentication.md) for
+what that test should assert (session-id rotation, non-enumeration, and an
+unusable post-logout cookie).
+
 ---
 
 ## Structural HTML assertions
@@ -323,7 +329,7 @@ no one-container-per-test overhead.
 ```toml
 # Cargo.toml  — use the same version as your [dependencies] entry
 [dev-dependencies]
-autumn-web = { version = "0.5", features = ["test-support"] }
+autumn-web = { version = "0.7", features = ["test-support"] }
 serde_json = "1"
 ```
 
@@ -726,7 +732,8 @@ shared instant — use whichever is more ergonomic for your test.
 ### Signed-URL and scheduler determinism
 
 The same `clock_unix_secs` helper that handlers use is also available for
-framework internals:
+framework internals. The signing half lives behind the non-default `storage`
+feature (`features = ["storage"]`) — see [File Storage](./storage.md):
 
 ```rust
 use autumn_web::time::{TickingClock, clock_unix_secs};

@@ -1,0 +1,7 @@
+error: agent authority: `post(...)` is handed a URL the analysis cannot read, so the hosts `sync` can reach cannot be proven — a `format!`-built URL takes its host from runtime data.
+
+       Pass an absolute literal URL, use a configured client alias (`named("...")`), or declare the host with `#[agent_effect(outbound("https://..."), reason = "...")]`. See docs/guide/agent-authority.md.
+  --> tests/compile-fail/agent_authority_outbound_alias_dynamic_url.rs:37:28
+   |
+37 |     client.named("stripe").post(&callback_url).send().await
+   |                            ^^^^

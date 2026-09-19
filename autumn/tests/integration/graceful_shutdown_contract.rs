@@ -192,3 +192,53 @@ fn probe_draining_is_observable_for_job_runtime_coordination() {
     assert!(probe.is_shutting_down());
     assert!(probe.draining());
 }
+
+// ── In-place upgrade cutover (#1674) ─────────────────────────────────────────
+
+/// An upgrade cutover drains *without* the load-balancer choreography.
+///
+/// The two steps a real shutdown runs first — flipping `/ready` to 503 and
+/// waiting out the prestop grace — exist to let an upstream take this replica
+/// out of rotation before its socket closes. An in-place upgrade has no such
+/// gap to cover: the successor is already accepting on the *same* listening
+/// socket, so flipping readiness would make a live address look unhealthy and
+/// the grace period would delay the handover for nothing.
+///
+/// Asserted against `run()`'s source, the way the other structural contracts in
+/// `app.rs` are: the behaviour itself needs two processes and a real socket
+/// (proven end-to-end by `examples/hot-upgrade`'s `live_upgrade` test), but the
+/// ordering it depends on is worth pinning where a refactor would break it.
+#[test]
+fn an_upgrade_cutover_drains_without_flipping_readiness_or_waiting_out_the_grace() {
+    let source = include_str!("../../src/app.rs");
+    let shutdown_task = source
+        .split_once("let shutdown_task = tokio::spawn(async move {")
+        .expect("run() spawns a shutdown task")
+        .1;
+    let phases = shutdown_task
+        .split_once("shutdown: stopping listener")
+        .expect("the shutdown task stops the listener")
+        .0;
+
+    let (upgrade_branch, signal_branch) = phases
+        .split_once("if upgrade_cutover {")
+        .expect("the drain branches on whether it was started by an upgrade cutover")
+        .1
+        .split_once("} else {")
+        .expect("the cutover and signal drains take different branches");
+
+    assert!(
+        !upgrade_branch.contains("begin_shutdown()"),
+        "an upgrade cutover must NOT flip /ready to 503: the address it is probed on is \
+         still being served, by the successor"
+    );
+    assert!(
+        !upgrade_branch.contains("prestop_grace"),
+        "an upgrade cutover must NOT wait out the prestop grace: the socket never leaves, \
+         so there is no upstream to deregister from"
+    );
+    assert!(
+        signal_branch.contains("begin_shutdown()") && signal_branch.contains("prestop_grace"),
+        "an ordinary SIGTERM drain must still flip readiness and wait out the grace"
+    );
+}

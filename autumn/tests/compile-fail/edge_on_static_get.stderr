@@ -1,0 +1,5 @@
+error: a `#[static_get]` route is already pre-rendered and served CDN-side; `#[edge]` adds nothing
+  --> tests/compile-fail/edge_on_static_get.rs:11:3
+   |
+11 | #[edge]
+   |   ^^^^

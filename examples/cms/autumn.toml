@@ -1,0 +1,32 @@
+# Autumn configuration for cms — a WordPress-core-parity content management
+# system.
+
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[log]
+level = "info"
+
+[health]
+path = "/health"
+
+[database]
+# Matches docker-compose.yml. Point this at your own Postgres in production.
+url = "postgres://autumn:autumn@localhost:5432/cms"
+pool_size = 10
+
+# The media library. `local` keeps uploaded bytes on disk next to the binary,
+# which is what you want in development; swap `backend` to "s3" and add the
+# bucket credentials under `[storage.s3]` to run the same code against object
+# storage.
+[storage]
+backend = "local"
+
+# `root` belongs to the local backend, not to `[storage]` itself.
+[storage.local]
+root = "storage"
+
+[seo]
+# Drives canonical URLs, the Atom/RSS feed's self link, and sitemap.xml.
+base_url = "http://localhost:3000"

@@ -31,7 +31,14 @@ path = "src/main.rs"
 # is refactored so the mutually-exclusive `sqlite` build can select a
 # sqlite-compatible set.
 default = ["tls", "postgres"]
-tls = ["autumn-web/tls"]
+# `autumn-web/acme` rides along because `autumn doctor`'s ACME preflight is not
+# optional to the ACME story: the DNS-01 checks (issue #1620) grade the provider
+# credential with the runtime's OWN `validate_credential`, and probe
+# `_acme-challenge` visibility with the runtime's OWN resolver, so doctor and the
+# server can never disagree about what a usable configuration is. `acme` implies
+# `tls`, so the resolved autumn-web set is a superset of what this feature
+# already selected.
+tls = ["autumn-web/tls", "autumn-web/acme"]
 # The pg-only `autumn-web` features the CLI enables that assume the Postgres
 # runtime and fail to compile under the `sqlite` backend-flip. Only `mail`
 # (its `DbSuppressionStore` is hard-typed to `Pool<AsyncPgConnection>`) is a
@@ -62,11 +69,26 @@ acme = ["tls", "autumn-web/acme"]
 sqlite = ["autumn-web/sqlite", "diesel_migrations/sqlite"]
 
 [dependencies]
-autumn-web = { version = "0.6.0", path = "../autumn", default-features = false, features = [
-    "db", "htmx", "maud", "storage", "i18n", "telemetry-otlp", "redis", "cache-moka", "http-client", "reporting"
+autumn-web = { version = "0.7.0", path = "../autumn", default-features = false, features = [
+    "db", "htmx", "maud", "storage", "i18n", "telemetry-otlp", "redis", "cache-moka", "http-client", "reporting",
+    # `autumn plugin package` / `autumn plugin inspect` read and write the
+    # `.autumn-plugin` container and load the module into the same sandbox the
+    # runtime uses, so the CLI's verdict is the runtime's verdict. Backend-neutral
+    # and purely additive (it adds the pure-Rust `wasmi` interpreter and nothing
+    # else), so it is enabled unconditionally rather than behind a CLI feature —
+    # the sqlite CLI build gets the same commands as the Postgres one.
+    "plugin-sandbox",
+    # `autumn openapi export` parses the spec its child dump emitted and reports
+    # the components that degraded to the opaque `{"type":"object"}` placeholder.
+    # It reuses the framework's own `OpenApiSpec` types and
+    # `openapi::opaque_component_schemas` rather than re-deriving the predicate,
+    # so the exporter and the runtime cannot disagree about what counts as
+    # opaque. Additive and small: the feature's only extra dependency is
+    # `serde_yaml`.
+    "openapi"
 ] }
-autumn-schema-core = { version = "0.6.0", path = "../autumn-schema-core" }
-base64 = "0.22"
+autumn-schema-core = { version = "0.7.0", path = "../autumn-schema-core" }
+base64 = "0.23"
 clap = { version = "4", features = ["derive", "env"] }
 diesel = { workspace = true }
 # File-based migration source (`FileBasedMigrations`) for `autumn schema migrate`.
@@ -89,6 +111,7 @@ chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
+flate2 = "1"
 syn = { workspace = true }
 quote = { workspace = true }
 proc-macro2 = { workspace = true, features = ["span-locations"] }
@@ -110,14 +133,36 @@ directories = "6.0.0"
 libc = "0.2"
 nix = { version = "0.31.2", features = ["fs", "signal", "socket", "user"] }
 
+# Windows daemon lifecycle (#1639). The workspace forbids `unsafe`, so both of
+# these are chosen for having a safe surface: `sysinfo` supplies the process
+# primitives the Unix arms get from `nix` (liveness, start time, terminate, and
+# the parent links the process-tree sweep walks), and `windows-service` wraps the
+# Service Control Manager — registration with boot start and crash-restart
+# failure actions, plus the control-handler dispatcher a service process runs.
+[target.'cfg(windows)'.dependencies]
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+windows-service = "0.8"
+
 [dev-dependencies]
-reqwest = { version = "0.13", features = ["blocking", "rustls"], default-features = false }
+# `form` (urlencoded bodies) is needed by the generated-app e2e gates that drive
+# the real, browser-facing form flow. `cookies` is already unified in from the
+# normal dependency above and is restated here only so the dev-only cookie jar
+# those gates build (a jar-less client can't hold the session a `#[secured]`
+# route requires) does not depend on that unification staying true.
+reqwest = { version = "0.13", features = ["blocking", "cookies", "form", "rustls"], default-features = false }
 proptest = "1.4"
+# Compiles the WAT module fixtures the `plugin package` / `plugin inspect` tests
+# pack, so they need no `wasm32-wasip1` toolchain. Test-only.
+wat = "1"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
 # `blocking` enables the synchronous `SyncRunner` used by the deploy_e2e harness
 # (which is a procedural, non-async test).
 testcontainers = { workspace = true, features = ["blocking"] }
 testcontainers-modules = { workspace = true }
+# Generates the self-signed root the `acme_ca_root` doctor tests feed through the
+# same `CertificateDer::from_pem_file` + `RootCertStore::add` path the runtime
+# uses (issue #1608). Test-only: the CLI itself never mints certificates.
+rcgen = { workspace = true }
 
 [lints]
 workspace = true

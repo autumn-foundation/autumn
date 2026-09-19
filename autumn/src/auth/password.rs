@@ -241,8 +241,10 @@ fn common_passwords() -> &'static HashSet<&'static str> {
 /// - any token of length ≥ 4 is a substring of the (lowercased) password; or
 /// - the password with trailing digits stripped (length ≥ 3) equals a token
 ///   (catches `john2024`).
-fn is_similar_to_context(password: &str, context: &[&str]) -> bool {
-    let pw = password.to_lowercase();
+///
+/// `pw` is the already-lowercased password — shared with the common-corpus
+/// check in [`validate_password`] rather than lowercased again here.
+fn is_similar_to_context(pw: &str, context: &[&str]) -> bool {
     let pw_stripped = pw.trim_end_matches(|c: char| c.is_ascii_digit());
     for raw in context {
         let ctx = raw.trim();
@@ -344,18 +346,27 @@ pub async fn validate_password(
         });
     }
 
+    // Lowercased once and shared: the common-corpus check below and
+    // `is_similar_to_context` both need it, and it's always needed (context
+    // similarity runs unconditionally), so hoisting it here costs nothing
+    // extra when `reject_common` is off and saves one allocation when it's on.
+    let lower = password.to_lowercase();
+
     // 2. Common/weak corpus.
-    if policy.reject_common {
-        let lower = password.to_lowercase();
-        if common_passwords().contains(lower.as_str()) {
-            failures.push(PasswordFailure::TooCommon);
-        }
+    if policy.reject_common && common_passwords().contains(lower.as_str()) {
+        failures.push(PasswordFailure::TooCommon);
     }
 
     // 3. Context similarity.
-    if is_similar_to_context(password, context) {
+    if is_similar_to_context(&lower, context) {
         failures.push(PasswordFailure::SimilarToContext);
     }
+    // Drop explicitly rather than let scope do it: `validate_password` is
+    // async and `lower` would otherwise live in the generated future's state
+    // across the `.await` below, holding the allocation for as long as the
+    // breach-check request is in flight instead of releasing it once the two
+    // synchronous checks above are done with it.
+    drop(lower);
 
     // 4. Breach check.
     if policy.breach_check != BreachCheck::Off {
@@ -510,14 +521,24 @@ mod tests {
 
     #[test]
     fn similarity_helper_ignores_unrelated_and_empty() {
+        // `is_similar_to_context` now takes an already-lowercased password
+        // (callers, i.e. `validate_password`, lowercase once and share it) —
+        // lowercase these inline so the assertions still exercise the same
+        // real-world (mixed-case) inputs as before.
         assert!(!is_similar_to_context(
-            "Tr0ub4dour&3-Staple-Horse",
+            &"Tr0ub4dour&3-Staple-Horse".to_lowercase(),
             &["john@example.com"]
         ));
-        assert!(!is_similar_to_context("Tr0ub4dour&3", &[]));
-        assert!(!is_similar_to_context("Tr0ub4dour&3", &["  "]));
+        assert!(!is_similar_to_context(&"Tr0ub4dour&3".to_lowercase(), &[]));
+        assert!(!is_similar_to_context(
+            &"Tr0ub4dour&3".to_lowercase(),
+            &["  "]
+        ));
         // ".com" (len 3) must not trigger a false positive.
-        assert!(!is_similar_to_context("Tr0ub4dour&3.com", &["a@b.com"]));
+        assert!(!is_similar_to_context(
+            &"Tr0ub4dour&3.com".to_lowercase(),
+            &["a@b.com"]
+        ));
     }
 
     #[tokio::test]

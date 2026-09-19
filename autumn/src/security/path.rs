@@ -96,7 +96,7 @@ fn decode_encoded_slashes(path: &str) -> std::borrow::Cow<'_, str> {
 /// Returns `Some(dot_count)` when `segment` consists solely of one or two
 /// dots, where each dot may be literal (`.`) or percent-encoded (`%2e` /
 /// `%2E`). Returns `None` for every other segment.
-fn dot_segment_len(segment: &str) -> Option<usize> {
+const fn dot_segment_len(segment: &str) -> Option<usize> {
     let bytes = segment.as_bytes();
     let mut i = 0;
     let mut dots = 0usize;

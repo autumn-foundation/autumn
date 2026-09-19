@@ -1,0 +1,7 @@
+error[E0080]: evaluation panicked: agent authority: `purge` performs an unbounded write to `Refund`, which grant `RefundDrafter` does not allow.
+
+              Add `Refund` to the grant's `unbounded_writes: [...]` (listing it under `writes` is not enough — deleting one row and deleting the table are different authorities), or move the effect out of the agent-operable handler. See docs/guide/agent-authority.md.
+  --> tests/compile-fail/agent_authority_unbounded_write.rs:32:10
+   |
+32 |     repo.delete_all().await
+   |          ^^^^^^^^^^ evaluation of `_` failed here

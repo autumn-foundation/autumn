@@ -1,0 +1,5 @@
+error: `dependent`/`on_delete` is not valid on `#[belongs_to]`: the child foreign key lives on this (belongs_to) side, so there is no dependent to cascade — declare the cascade on the parent's `#[has_many]`/`#[has_one]` instead
+  --> tests/compile-fail/model_dependent_on_belongs_to.rs:30:20
+   |
+30 | #[belongs_to(Post, dependent = destroy)]
+   |                    ^^^^^^^^^

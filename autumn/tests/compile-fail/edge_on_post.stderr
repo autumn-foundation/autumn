@@ -1,0 +1,5 @@
+error: `#[edge]` is only supported on `#[get]` routes; the edge lane is read-path only (issue #1790)
+  --> tests/compile-fail/edge_on_post.rs:11:3
+   |
+11 | #[edge]
+   |   ^^^^

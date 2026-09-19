@@ -1,8 +1,12 @@
 //! `autumn seed` -- run the project's seed binary to populate the database.
 //!
-//! Delegates to `cargo run --bin seed` after:
+//! Delegates to `cargo run --bin <seed-bin>` after:
 //!   1. Verifying `src/bin/seed.rs` exists.
-//!   2. Checking for pending migrations via the diesel CLI.
+//!   2. Resolving the seed binary's *target name* from `cargo metadata` (the
+//!      target may be renamed, e.g. `todo-app-seed`; autumn #2639).
+//!   3. Blocking a `--count`/`--model` fake-seed request against a
+//!      `prod`/`production` profile unless `--yes-i-mean-prod` is given.
+//!   4. Checking for pending migrations via the diesel CLI.
 //!
 //! The seed binary receives the active profile through the `AUTUMN_ENV`
 //! environment variable, matching how the rest of the framework resolves
@@ -10,6 +14,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use crate::migrate::is_production_profile_name;
 
 /// Errors surfaced by the seed runner.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -29,6 +35,12 @@ pub enum SeedError {
          to run the project seed binary"
     )]
     IncompleteFakeFlags,
+
+    #[error(
+        "production profile detected; generating faked rows in production requires \
+         explicit confirmation\n  Re-run with --yes-i-mean-prod to proceed."
+    )]
+    ProductionFakeSeedBlocked,
 }
 
 /// Resolve the `--count`/`--model` pair into the fake-seed request, if any.
@@ -53,11 +65,86 @@ fn seed_binary_exists_at(path: &Path) -> bool {
     path.is_file()
 }
 
+/// Resolve the seed binary's cargo target name for a project.
+///
+/// The convention is that the seed binary's source lives at
+/// `<project_dir>/src/bin/seed.rs`, but its *target name* may differ from
+/// `seed` (e.g. `todo-app-seed` after autumn #2639 renamed colliding example
+/// targets). This finds the bin target whose `src_path` is the seed source
+/// and returns its name, so `cargo run --bin` invokes the right target.
+/// Returns `None` when cargo metadata cannot be read or no such target exists;
+/// callers fall back to the conventional `seed` name.
+fn resolve_seed_bin_name(project_dir: &Path, package: Option<&str>) -> Option<String> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--format-version=1", "--no-deps"])
+        .current_dir(project_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    seed_bin_name_from_metadata(&metadata, project_dir, package)
+}
+
+/// Pure core of [`resolve_seed_bin_name`]: given parsed `cargo metadata --no-deps`
+/// output, find the bin target whose source is `<project_dir>/src/bin/seed.rs`.
+fn seed_bin_name_from_metadata(
+    metadata: &serde_json::Value,
+    project_dir: &Path,
+    package: Option<&str>,
+) -> Option<String> {
+    let seed_src = project_dir.join("src/bin/seed.rs");
+    let packages = metadata["packages"].as_array()?;
+    let pkg = match package {
+        Some(name) => packages.iter().find(|p| p["name"].as_str() == Some(name))?,
+        None => packages.iter().find(|p| {
+            p["manifest_path"]
+                .as_str()
+                .and_then(|manifest| Path::new(manifest).parent())
+                .is_some_and(|dir| dir == project_dir)
+        })?,
+    };
+    pkg["targets"].as_array()?.iter().find_map(|t| {
+        let is_bin = t["kind"]
+            .as_array()
+            .is_some_and(|kinds| kinds.iter().any(|k| k == "bin"));
+        let src_matches = t["src_path"]
+            .as_str()
+            .is_some_and(|src| Path::new(src) == seed_src);
+        if is_bin && src_matches {
+            t["name"].as_str().map(str::to_owned)
+        } else {
+            None
+        }
+    })
+}
+
+/// Guard against accidentally mass-inserting faked rows into a production
+/// database. Only fires for an actual fake-seed request (`--count`/`--model`
+/// both given) targeting a `prod`/`production` profile without
+/// `--yes-i-mean-prod` — a plain `autumn seed` (running the project's own
+/// seed binary) is unaffected, matching `autumn migrate`'s existing
+/// production guard scope (see `is_production_profile_name`).
+fn check_production_guard(
+    profile: &str,
+    fake_request: Option<&(usize, String)>,
+    yes_i_mean_prod: bool,
+) -> Result<(), SeedError> {
+    if fake_request.is_some() && is_production_profile_name(profile) && !yes_i_mean_prod {
+        return Err(SeedError::ProductionFakeSeedBlocked);
+    }
+    Ok(())
+}
+
 /// Locate the directory of a Cargo package by name using `cargo metadata`.
 ///
 /// Returns the directory containing the package's `Cargo.toml`, or `None` if
 /// the package cannot be found or `cargo metadata` fails.
-fn find_package_dir(package: &str) -> Option<PathBuf> {
+///
+/// Shared with `autumn console` (see `crate::console`) so both `--package`
+/// flags resolve a workspace member the same way.
+pub fn find_package_dir(package: &str) -> Option<PathBuf> {
     let output = Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .output()
@@ -189,7 +276,19 @@ fn check_pending_migrations(database_url: &str, migrations_dir: &str) -> Result<
 /// that many faked rows for the named model instead of running its hand-written
 /// seed body. Supplying only one of the two is an error; supplying neither
 /// preserves the original behavior (run the project seed binary).
-pub fn run(profile: &str, package: Option<&str>, count: Option<usize>, model: Option<&str>) {
+///
+/// A fake-seed request (`--count`/`--model`) targeting a `prod`/`production`
+/// profile is blocked unless `yes_i_mean_prod` is set, mirroring `autumn
+/// migrate`'s production guard — generating hundreds of faked rows in
+/// production by accident (e.g. a copy-pasted `--profile prod`) should require
+/// explicit confirmation, not a typo-away default.
+pub fn run(
+    profile: &str,
+    package: Option<&str>,
+    count: Option<usize>,
+    model: Option<&str>,
+    yes_i_mean_prod: bool,
+) {
     eprintln!("\u{1F342} autumn seed\n");
     eprintln!("  Profile: {profile}");
 
@@ -200,6 +299,10 @@ pub fn run(profile: &str, package: Option<&str>, count: Option<usize>, model: Op
             std::process::exit(1);
         }
     };
+    if let Err(e) = check_production_guard(profile, fake_request.as_ref(), yes_i_mean_prod) {
+        eprintln!("\u{2717} {e}");
+        std::process::exit(1);
+    }
     if let Some((count, model)) = &fake_request {
         // Do not claim the rows were created: this command only *delegates* the
         // request to the project's seed binary (via AUTUMN_SEED_COUNT/MODEL).
@@ -237,8 +340,15 @@ pub fn run(profile: &str, package: Option<&str>, count: Option<usize>, model: Op
 
     eprintln!("  Running seed binary...\n");
 
+    // The seed binary's *target* name need not be `seed`: projects may rename
+    // the target (autumn #2639 renamed colliding example `seed` targets to
+    // `<crate>-seed`) while keeping the conventional `src/bin/seed.rs` path.
+    // Resolve the real target name from cargo metadata; fall back to `seed`
+    // when metadata is unreadable.
+    let seed_bin =
+        resolve_seed_bin_name(&project_dir, package).unwrap_or_else(|| "seed".to_owned());
     let mut cmd = Command::new("cargo");
-    cmd.args(["run", "--bin", "seed"]);
+    cmd.args(["run", "--bin", &seed_bin]);
     if let Some(pkg) = package {
         cmd.args(["--package", pkg]);
     }
@@ -322,6 +432,64 @@ mod tests {
         );
     }
 
+    // ── check_production_guard (production-fake-seed confirmation) ──────────
+
+    #[test]
+    fn production_guard_blocks_fake_seed_without_confirmation() {
+        let req = Some((200, "Post".to_string()));
+        assert_eq!(
+            check_production_guard("prod", req.as_ref(), false),
+            Err(SeedError::ProductionFakeSeedBlocked)
+        );
+    }
+
+    #[test]
+    fn production_guard_accepts_production_spelling() {
+        let req = Some((200, "Post".to_string()));
+        assert_eq!(
+            check_production_guard("production", req.as_ref(), false),
+            Err(SeedError::ProductionFakeSeedBlocked)
+        );
+    }
+
+    #[test]
+    fn production_guard_is_case_insensitive() {
+        let req = Some((200, "Post".to_string()));
+        assert_eq!(
+            check_production_guard("PROD", req.as_ref(), false),
+            Err(SeedError::ProductionFakeSeedBlocked)
+        );
+    }
+
+    #[test]
+    fn production_guard_allows_fake_seed_with_confirmation() {
+        let req = Some((200, "Post".to_string()));
+        assert_eq!(check_production_guard("prod", req.as_ref(), true), Ok(()));
+    }
+
+    #[test]
+    fn production_guard_allows_non_production_profiles() {
+        let req = Some((200, "Post".to_string()));
+        assert_eq!(check_production_guard("dev", req.as_ref(), false), Ok(()));
+        assert_eq!(check_production_guard("demo", req.as_ref(), false), Ok(()));
+    }
+
+    #[test]
+    fn production_guard_ignores_plain_seed_without_fake_request() {
+        // No --count/--model: running the project's own seed binary against
+        // prod is unaffected by this guard (existing, unrelated behavior).
+        assert_eq!(check_production_guard("prod", None, false), Ok(()));
+    }
+
+    #[test]
+    fn production_fake_seed_blocked_error_mentions_flag() {
+        let msg = SeedError::ProductionFakeSeedBlocked.to_string();
+        assert!(
+            msg.contains("--yes-i-mean-prod"),
+            "error should mention --yes-i-mean-prod, got: {msg}"
+        );
+    }
+
     // ── resolve_fake_request (--count / --model, #1343 AC4) ─────────────────
 
     #[test]
@@ -387,6 +555,79 @@ mod tests {
         std::fs::create_dir_all(&seed_dir).unwrap();
         // seed_dir is a directory, not a file
         assert!(!seed_binary_exists_at(&seed_dir));
+    }
+
+    // ── seed_bin_name_from_metadata ───────────────────────────────────────
+
+    fn seed_metadata() -> serde_json::Value {
+        serde_json::json!({
+            "packages": [
+                {
+                    "name": "todo-app",
+                    "manifest_path": "/projects/todo-app/Cargo.toml",
+                    "targets": [
+                        { "name": "todo-app-seed", "kind": ["bin"], "src_path": "/projects/todo-app/src/bin/seed.rs" },
+                        { "name": "todo-app", "kind": ["bin"], "src_path": "/projects/todo-app/src/main.rs" }
+                    ]
+                },
+                {
+                    "name": "other",
+                    "manifest_path": "/projects/other/Cargo.toml",
+                    "targets": [
+                        { "name": "seed", "kind": ["bin"], "src_path": "/projects/other/src/bin/seed.rs" }
+                    ]
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn seed_bin_name_resolves_renamed_target_by_src_path() {
+        // Regression for autumn #2639: the target name may differ from `seed`.
+        let name =
+            seed_bin_name_from_metadata(&seed_metadata(), Path::new("/projects/todo-app"), None);
+        assert_eq!(name.as_deref(), Some("todo-app-seed"));
+    }
+
+    #[test]
+    fn seed_bin_name_resolves_conventional_seed_target() {
+        let name =
+            seed_bin_name_from_metadata(&seed_metadata(), Path::new("/projects/other"), None);
+        assert_eq!(name.as_deref(), Some("seed"));
+    }
+
+    #[test]
+    fn seed_bin_name_package_filter_selects_the_package() {
+        // With --package, run() resolves project_dir to the package's own
+        // directory via find_package_dir, so pass that directory here.
+        let name = seed_bin_name_from_metadata(
+            &seed_metadata(),
+            Path::new("/projects/todo-app"),
+            Some("todo-app"),
+        );
+        assert_eq!(name.as_deref(), Some("todo-app-seed"));
+    }
+
+    #[test]
+    fn seed_bin_name_returns_none_when_project_has_no_seed_target() {
+        let name =
+            seed_bin_name_from_metadata(&seed_metadata(), Path::new("/projects/missing"), None);
+        assert_eq!(name, None);
+    }
+
+    #[test]
+    fn seed_bin_name_ignores_non_bin_seed_target() {
+        let metadata = serde_json::json!({
+            "packages": [{
+                "name": "lib-only",
+                "manifest_path": "/projects/lib-only/Cargo.toml",
+                "targets": [
+                    { "name": "seed", "kind": ["lib"], "src_path": "/projects/lib-only/src/bin/seed.rs" }
+                ]
+            }]
+        });
+        let name = seed_bin_name_from_metadata(&metadata, Path::new("/projects/lib-only"), None);
+        assert_eq!(name, None);
     }
 
     // ── resolve_database_url_with_env ──────────────────────────────────────

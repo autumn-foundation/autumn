@@ -17,8 +17,18 @@
     --autumn-danger-hover: var(--danger-hover);
     --success: #059669;
     --success-light: #ecfdf5;
+    /* Darker text-safe variant: --success (#059669) on --surface is 3.77:1,
+       below WCAG AA's 4.5:1 normal-text threshold — it was calibrated for the
+       3:1 large-text/border/icon uses it already has (the success-count
+       digits, --success-light backgrounds), not for small foreground text.
+       #065f46 is the same hue used by the framework's own flash-success
+       foreground and clears 4.5:1 against both --surface and --bg. */
+    --success-text: #065f46;
     --warning: #d97706;
     --warning-light: #fffbeb;
+    /* Same rationale as --success-text: --warning on --surface is 3.19:1.
+       #92400e matches the framework's flash-warning foreground. */
+    --warning-text: #92400e;
     --radius: 0.5rem;
     --shadow: 0 1px 3px rgba(0,0,0,0.1), 0 1px 2px rgba(0,0,0,0.06);
     --font-family: system-ui, -apple-system, sans-serif;

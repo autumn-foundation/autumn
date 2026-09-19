@@ -309,7 +309,7 @@ impl AdminModel for PostAdmin {
                 .unwrap_or(false);
 
             let slug = if slug.is_empty() {
-                crate::models::slugify(&title)
+                autumn_web::slugify(&title)
             } else {
                 slug
             };
