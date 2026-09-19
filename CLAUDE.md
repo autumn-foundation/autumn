@@ -5,11 +5,38 @@
 **Never bump the workspace version** (`version` under `[workspace.package]` in
 the root `Cargo.toml`, or any of the `autumn-web = { version = "..." }` /
 `autumn-macros = { version = "..." }` pins that track it) unless the user
-explicitly asks for a release/version bump. Land feature work as new bullets
-under the existing `## [Unreleased]` section in `CHANGELOG.md` — do not create
-a new dated/numbered `## [x.y.0]` section yourself. Cutting a release (bumping
-the version, dating the changelog section, updating install instructions) is a
-separate, deliberate step the user asks for by name.
+explicitly asks for a release/version bump. Cutting a release (bumping the
+version, folding the changelog fragments in, dating the changelog section,
+updating install instructions) is a separate, deliberate step the user asks for
+by name.
+
+## Changelog
+
+**Never edit `CHANGELOG.md` in a feature PR**, and never create a new
+dated/numbered `## [x.y.0]` section. Every PR wrote its note to the top of the
+`## [Unreleased]` section, which is the same few lines every other open PR
+wrote to — so PRs conflicted with each other over text that was never the point
+of either.
+
+Write the note as its own file instead:
+
+```
+changelog.d/<slug>.md
+```
+
+It holds the markdown the section holds: a `### <Kind>` heading and its
+bullets. Two PRs never edit one file, so the conflict cannot happen. See
+`changelog.d/README.md` for the shape, and
+`./scripts/check-changelog-fragments.sh` for the gate.
+
+Not every change needs a note. Write one for what a user of the framework can
+see. A breaking entry keeps the `**Breaking:**` marker and the link to
+`docs/migrations/next.md`: `scripts/check-migration-guides.sh` reads the
+fragments together with the changelog, so the guide is still gated while the
+change is in review.
+
+`scripts/update-changelog.sh` folds every fragment into the changelog at
+release time.
 
 ## Commands
 
@@ -134,7 +161,7 @@ house-pattern testcontainer DB test — `#[ignore = "requires Docker (testcontai
 **no workflow edit**. Do not add a per-test allowlist line.
 
 This sweep compiles the consolidated binary with `--features
-"test-support,offline-sync,ws,mail,redis,i18n"` (db + maud are already defaults), so
+"test-support,offline-sync,ws,mail,redis,i18n,collab"` (db + maud are already defaults), so
 a new Postgres/DB testcontainer test — and now also the previously-unreachable
 `ws`/`mail`/`redis` testcontainer Docker tests — runs automatically. As of
 #1945 the feature set folds in the `ws` `live_broadcast` OOB-fragment suite, the
@@ -143,7 +170,13 @@ a new Postgres/DB testcontainer test — and now also the previously-unreachable
 each is testcontainer-managed (Postgres/Redis in-process), so no CI `services:`
 block is required. As of #1384 the set also folds in `i18n`, so the
 `#[translatable]` per-locale column round-trip suite (`translatable_model`) is
-swept too.
+swept too. As of #1806 it also folds in `collab`, for both halves of the same
+reason: the `#[collaborative]` round-trip suite (`collab_model`) is gated
+`db + collab` and would not otherwise compile into this binary, and
+`collab_offline_merge` is gated `collab + offline-sync` — a pair **no
+workspace member enables**, so `cargo test --workspace` compiles it out and
+this step is the only place it runs. Its non-Docker tests are therefore named
+explicitly in the step, not left to the `--ignored` sweep.
 
 Only **`system-tests`-gated** (browser/Chromium) Docker tests remain excluded —
 they need a Chromium binary this runner does not provide. Consequently, a new

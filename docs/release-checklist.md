@@ -455,9 +455,16 @@ Before pushing the release tag:
 1. **Bump the workspace version** in `Cargo.toml` under `[workspace.package]`.
 2. **Update internal version pins** for inter-crate dependencies
    (e.g. `autumn-web = { version = "X.Y.Z", path = "../autumn" }`).
-3. **Update `CHANGELOG.md`** — move unreleased items under a `## [X.Y.Z]` heading.
-   Every breaking entry carries the `**Breaking:**` marker (or sits under a
+3. **Fold the changelog fragments in** — `./scripts/update-changelog.sh`
+   merges every `changelog.d/` file into `## [Unreleased]` under the kind it
+   declares, then deletes the files. Read the result: it is the release note
+   people get. Then move the items under a `## [X.Y.Z]` heading. Every breaking
+   entry carries the `**Breaking:**` marker (or sits under a
    `### Breaking Changes` heading) and links its migration guide.
+
+   A release PR is the one change allowed to edit `CHANGELOG.md`. Put the
+   literal token `[changelog]` in its body, or apply the `release` label, or
+   `./scripts/check-changelog-fragments.sh` fails it.
 4. **Complete the [Migration Guide Gate](#migration-guide-gate)** — rename
    `docs/migrations/next.md`, repoint the changelog links, and perform and
    record the codemod-first upgrade walk-through.
@@ -474,6 +481,7 @@ Before pushing the release tag:
 7. **Run all gate scripts locally** to catch problems before CI sees the tag:
    ```bash
    ./scripts/check-crate-metadata.sh
+   ./scripts/check-changelog-fragments.sh
    ./scripts/check-release-notes.sh
    ./scripts/check-migration-guides.sh
    ./scripts/check-skill-version-markers.sh

@@ -7,8 +7,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A compensated first deploy now removes its stale proxy route (issue
+  #2270):** when a halted fleet rollout compensated a host's just-completed
+  FIRST deploy, the host was torn down but kamal-proxy kept a route pointing
+  at the now-stopped slot, so its public port answered `502` instead of
+  refusing the connection until the next deploy. `ProxyController` gained
+  `deregister_op` (`kamal-proxy remove`), probed the same way `deploy --help`
+  already is, so a drifted or renamed `remove` subcommand fails the deploy
+  closed before any cutover, never assumed present. The route is removed as
+  its own step, only after the app teardown fully succeeds, so a failure
+  there reports its own outcome (`CompensatedTeardownRouteFailed`) rather
+  than the misleading "still serving, roll it back" — a first deploy has no
+  previous release to roll back to.
+
 ### Added
 
+- **💵 Money as a framework primitive: typed `Money<C>` and an enforced
+  double-entry ledger (issue #1837):** currency lived only in the view layer
+  (`format::number_to_currency` formats a bare `Decimal`), idempotency stopped
+  at the HTTP door (`idempotency.rs` is an `Idempotency-Key` middleware), and
+  there was no ledger at all — so every app that moved money hand-rolled one.
+  `autumn_web::money` adds the primitive, with **zero new dependencies**.
+  - `Money<C>` is an amount in one currency, held as an `i64` count of minor
+    units. The currency is a type parameter, so adding `Money<Usd>` to
+    `Money<Eur>` does not compile. There is **no `f64`** in the value or in any
+    operation on it, and a unit test reads the module source to keep it that
+    way. There are no `+`/`-` operators, because an operator cannot report an
+    overflow: `checked_add`, `checked_sub`, `checked_neg`, `checked_abs`,
+    `checked_mul` and `try_sum` each return `Result<_, MoneyError>`.
+  - `AnyMoney` is the same value with the currency carried as data, for a
+    ledger row whose currency is a `TEXT` column. It rejects what `Money<C>`
+    refuses to compile, with `MoneyError::CurrencyMismatch`.
+  - Rounding is never implicit. `Money::from_decimal` names one of `HalfUp`,
+    `HalfEven`, `HalfDown`, `TowardZero`, `AwayFromZero`, `Floor` or `Ceiling`;
+    `from_decimal_exact` refuses to round at all. `allocate` splits by weights
+    with the largest-remainder method, so the parts always sum back to the
+    whole — a dollar in three is 34/33/33, not 33/33/33 and a lost cent.
+  - 34 ISO 4217 currencies, covering 0, 2 and 3 minor digits.
+  - `autumn_web::money::ledger` is an append-only, double-entry store over
+    three `_autumn_money_*` tables. `post` refuses a transaction whose debits
+    do not equal its credits **before its first `INSERT`**, and also refuses
+    mixed currencies, a one-sided transaction, a zero line, a posting whose
+    currency the account does not hold, and a negative amount (the sign belongs
+    to the side, which keeps `i64::MIN` out of the ledger). It also refuses a
+    posting that would put an account's balance outside `i64`: the tables are
+    append-only, so such a balance could never be read back or repaired.
+  - **`post` must run inside a transaction.** A call on a bare connection is
+    refused with `LedgerError::NotInTransaction` rather than run weakly: the
+    account locks and the balance check only mean something inside one, and a
+    transaction row written without its postings could never be repaired.
+  - Posting twice posts once. Each transaction carries an idempotency key with
+    a `UNIQUE` index behind it; the second call returns
+    `PostOutcome::Replayed` carrying the first call's transaction. The key can
+    be one you already have (`IdempotencyKey::new`) or **derived from the
+    postings themselves** (`IdempotencyKey::derive`), which is what makes a
+    retry collapse with nothing for the caller to remember. The same key for
+    *different* money is a `KeyReuse` conflict, not a silent wrong replay —
+    a stored request hash over the normalized postings is what tells them
+    apart.
+  - `post` takes the connection, so it runs inside `Db::tx` with the
+    application rows the money justifies: they commit or roll back together,
+    and a rolled-back post frees its idempotency key again.
+  - Nothing is rewritten. A trigger on **both** backends aborts an `UPDATE` or
+    `DELETE` of a transaction or a posting, and a statement-level pair on
+    Postgres aborts a `TRUNCATE` (which row triggers do not see). On SQLite an
+    `INSERT OR REPLACE` is refused by `BEFORE INSERT` guards on the row keys.
+    They are guards rather than the `DELETE` triggers because SQLite skips
+    `DELETE` triggers for the row a `REPLACE` removes unless
+    `PRAGMA recursive_triggers` is on, and turning that on globally would
+    change the recursion semantics of every application trigger. One shape is
+    therefore **not** covered: a `REPLACE` that collides on the idempotency key
+    with a fresh row id, in a transaction that re-inserts the deleted id before
+    `COMMIT`. Like `DROP TABLE`, it needs deliberate multi-statement SQL against
+    framework-private tables; the triggers are a guard-rail against operational
+    accidents, not a boundary against arbitrary SQL.
+    `ledger::balance` sums an account's postings; `ledger::trial_balance`
+    makes the global zero-sum invariant queryable from a job or a health
+    check.
+  - A cancelled `post` never half-writes. The postings go in **before** the
+    transaction row they belong to, behind a `DEFERRABLE INITIALLY DEFERRED`
+    foreign key, so a future dropped between the two leaves the enclosing
+    transaction holding postings with no parent — and the database refuses that
+    commit. The other order could commit a transaction row with no postings,
+    which append-only tables could never repair. The ledger therefore ends up
+    with either nothing or one complete balanced transaction; which of the two
+    is not knowable from the cancellation alone, so a caller that races `post`
+    against a timeout settles it by posting the same idempotency key again.
+  - An account never changes currency. It is what `post` checks a posting
+    against, so a change would relabel every stored minor unit and let the next
+    posting in the new currency pass that check. A trigger on both backends
+    refuses it; `set_allow_negative` is unaffected.
+  - One configurable policy per account: `Account::disallow_negative()`. The
+    check reads the balance the posting *would* leave, before anything is
+    written. On Postgres the account rows are held with `SELECT ... FOR
+    UPDATE`, so two concurrent postings cannot both pass it; SQLite has no row
+    lock, so a SQLite app that posts concurrently must retry the transaction.
+  - `MoneyError` and `LedgerError` map to real statuses through `AutumnError` —
+    422 for a refused value or posting, 409 for a reused key, a refused
+    negative balance, or a key another transaction is posting right now.
+  - `Currency` is sealed. An outside implementation could declare an exponent
+    the minor-unit table has no row for and make every conversion wrong by
+    orders of magnitude.
+  - Proved in two tiers. `tests/sqlite_money_ledger.rs` is the golden suite and
+    runs Docker-free on every push; it includes the issue's fault-injection
+    metric — 64 logical charges, each submitted two to four times with a share
+    of the attempts aborted after the ledger wrote but before the enclosing
+    `Db::tx` commits, ending with exactly one balanced transaction per charge
+    and `sum(debits) == sum(credits)` globally. That exercises the rollback
+    path; the windows a *dropped* future opens are covered separately by the
+    two deferred-foreign-key tests, which put the database in exactly those
+    states and check what `COMMIT` does.
+    `tests/integration/money_ledger_postgres.rs` proves the Postgres fork and
+    the races only it can show: eight connections posting the same charge at
+    once collapse to one transaction, and two concurrent payouts from a float
+    that covers one leave exactly one. See `docs/guide/money.md`.
 - **Fleet deploy alerts on a halted rollout or drift (#2267, AC-6 of #1621):**
   `autumn deploy up` now sends a `scheduled_task_failure` alert the moment a
   rollout halts. `autumn deploy status --strict` sends one when it finds
@@ -21,8 +135,118 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   code. A plain `deploy status` (no `--strict`) never sends an alert.
   Neither the drift model nor the `--json` contract changed. See
   `docs/guide/fleet-deploys.md`.
+- **🤝 Collaborative fields: make any record collaboratively editable
+  (`#[collaborative]`, issue #1806):** autumn could broadcast changes
+  (`channels`), show who is online (`presence`) and reconcile offline writes
+  (`sync`), but concurrent edits to one field were resolved by
+  last-write-wins — `sync::resolver` compares `updated_at` and discards the
+  loser, so one of two people typing in the same box loses their characters.
+  There was no convergent-merge seam anywhere in the tree, which left
+  Notion/Figma-grade editing to an external service (Liveblocks, Yjs,
+  PartyKit). The new `collab` feature adds one.
+  - `autumn_web::collab::CollabText` is a text CRDT — a Replicated Growable
+    Array — implemented in-tree with **zero new dependencies**. Replicas that
+    hold the same operations render the same text in any delivery order; an
+    operation that arrives before the character it refers to waits in a buffer
+    instead of being dropped; applying one twice is a no-op, so a reconnect is
+    safe; and an edit anchors to a neighbouring character rather than an
+    index, so it lands where the author meant even when the document changed
+    in flight.
+  - `#[collaborative]` marks the field, mirroring `#[translatable]`: the
+    macro validates the type, refuses the markers that disagree with it,
+    registers the column (`CollaborativeColumnDescriptor`), and generates
+    `body_text()`, `body_insert(..)`, `body_remove(..)`, `body_set_text(..)`,
+    `body_merge(..)` plus the field-name-keyed `collaborative(..)` accessors.
+    Storage is a plain `TEXT` column holding JSON, through the same Diesel
+    codec `Translated` uses; a column that still holds prose decodes as a
+    seeded document, so promoting an existing field keeps its content.
+  - `CollabHub` hosts the live sessions on the seams that already exist:
+    operations fan out over a `Channels` topic, membership comes from
+    `Presence`, and cursors ride a `Cursor` message merged into the
+    participant list. `serve_socket` is the whole client protocol in one call
+    from a `#[ws]` handler. The hub bounds insert size, delete size and
+    document size, because it is a shared authority a single client could
+    otherwise grow without limit.
+  - `CollabResolver` replaces last-write-wins for collaborative fields in the
+    offline-sync engine, so an edit made offline merges on reconnect. Every
+    other column of the same row keeps the wrapped resolver's verdict, and a
+    delete on either side is still a row-level decision — merging would
+    resurrect a deleted row.
+  - Convergence is proven, not asserted: `sim_collab_convergence` exhausts
+    **all 720 interleavings** of a fixed six-operation set and checks every
+    one reaches byte-identical state, then property-tests randomized
+    interleavings across 2–5 replicas with zero dropped operations.
+  - `examples/collab-notes` runs the whole story with `cargo run -p
+    collab-notes` — no database, no container, no external service — and its
+    Chromium smoke drives **two browser pages** editing one field and asserts
+    they converge. See `docs/guide/collaboration.md`.
+  - Scope of this first slice: one CRDT type (text) and one field marker.
+    Lists, maps, counters and trees; rich text and a block model; undo/redo;
+    and `autumn generate model`'s `{collaborative}` DSL marker are all
+    follow-ups. The LWW default for non-collaborative fields is unchanged.
 
 ### Fixed
+
+- **🛣️ Onramp: stop treating `local-dev-quickstart`'s permanent drift as a
+  CI failure [no-plugin]:** nothing here is agent-facing — it's a
+  CI-workflow-only change plus a test split, not new framework surface
+  (`.github/workflows/quickstart-gate.yml`, `autumn-cli/tests/e2e.rs`). The
+  `local-dev-quickstart` job checks a source-built CLI's `autumn new`
+  against the *published* `autumn-web` — and has been red on every run
+  since it was added by #2459, because this repo's own policy (CLAUDE.md:
+  never bump the workspace version outside a deliberate release) guarantees
+  trunk-dev stays ahead of the last release indefinitely. Issue #2620
+  treated that as an incident ("broken for 26 straight CI runs, needs a
+  release") and recommended cutting one; the maintainer's call was that
+  trunk-dev being ahead of the crate release is permanent, not a
+  release-cadence gap to close. A permanent, by-design condition reported
+  as a build failure is exactly the kind of CI red that trains reviewers to
+  stop looking.
+  The job's single step used to run one test that both scaffolds (`autumn
+  new`) and builds the result — an initial fix wrapped the whole job in
+  `continue-on-error: true`, but a review caught that this would silently
+  tolerate a real regression in `autumn new` itself, not just the known
+  build-time drift (neither of the other two quickstart jobs pairs a
+  source-built CLI with the published crate, so nothing else would catch
+  that). Split instead: `autumn_new_succeeds_against_published_autumn_web`
+  is a new, fast test covering only the scaffold step, run in its own
+  hard-gated CI step with no tolerance — `autumn new` has no version pin to
+  drift against, so any failure there is always a real bug. The existing
+  `generated_project_compiles_against_published_autumn_web` (unchanged
+  assertions, now built on a shared `run_autumn_new_against_published`
+  helper) keeps the `cargo build` half, in its own step, and only *that*
+  step carries `continue-on-error: true`. The job still surfaces the exact
+  drifted call site in its log (and still goes fully green the moment a
+  release does catch up), but a run where the known drift fires no longer
+  fails the workflow, while an `autumn new` regression still would. No doc
+  change — the `[patch.crates-io]` workaround `docs/guide/getting-started.md`'s
+  "Local development" section already describes is unchanged and still
+  correct.
+- **🪝 Snag: `autumn_web::pdf` now warns when the 512-level nesting cap
+  drops content (#2801):** `Pdf::render`'s layout walker silently dropped
+  any HTML past 512 levels of tag nesting — no error, no log line —
+  contradicting the module docs' "degrades gracefully" promise. Each
+  render that hits the cap now logs one `tracing::warn!` at target
+  `autumn::pdf`, no matter how many nodes it drops, and the cap plus the
+  warning are documented in `autumn_web::pdf`'s new "Nesting depth limit"
+  section. No shipped example is affected today (`examples/invoice` never
+  nests this deep), but any caller who feeds it recursive content (a
+  comment thread, a nested reply tree) can now detect truncation instead
+  of shipping an incomplete PDF unnoticed.
+- **jobs:** a Postgres relative-delay enqueue (`enqueue_in` and its
+  transactional/after-commit siblings) no longer binds a Rust-computed
+  `chrono::Utc::now() + delay` into `run_at`. The database now computes it
+  (`clock_timestamp() + delay`), closing the last piece of #2111's
+  app-vs-database clock skew: an app host whose clock has drifted from the
+  database's no longer stamps the wrong deadline, and a transactional
+  enqueue (`enqueue_in_on_conn`) no longer measures the delay from when its
+  surrounding transaction happened to start. An explicit `enqueue_at`
+  instant is unaffected — it is inserted exactly as before. Also fixes an
+  unrelated, pre-existing bug the fix surfaced: the Postgres test suite's
+  own migration runner split each `up.sql` file on `;`, which cut a
+  migration's own comment in half wherever the comment contained a
+  semicolon, corrupting the next statement. It now runs each file through
+  `batch_execute` in one round trip. [no-plugin]
 
 - **Frame-forge the SQLite fork for the framework control-plane migrations
   (issue #2699):** `autumn/migrations` — `FRAMEWORK_MIGRATIONS`, backing
@@ -1053,18 +1277,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **sqlite target coverage guard only credits `run:` commands (#2574):**
-  `sqlite_test_targets_are_ci_named` (in
-  `autumn-cli/tests/integration/repo_hygiene.rs`) built its "commands" from
-  every non-comment YAML line, so step *metadata* — e.g. a step literally
-  named `cargo test -p autumn-web --features sqlite --test <target>` —
-  satisfied the guard while no job ran the target. Command collection now
-  tracks `run:`-block membership by indentation (inline `run:`, block
-  `run: |`/`>`, bare `run:`, and `- run:` forms), and only lines inside a
-  `run:` scalar become commands; `\`-continuation joining is unchanged. Two
-  new unit tests pin the behavior (`name:`/`env:` decoys credit nothing;
-  commented-out invocations stay ignored), and the guard still passes on the
-  unmodified workflow set.
+- **The in-process TLS listener now advertises ALPN `[b"h2", b"http/1.1"]`
+  (#2321):** `build_server_config` never set `alpn_protocols`, so rustls
+  completed the handshake with no protocol selected and every browser —
+  every `[server.tls]` deployment, static-cert or ACME — silently fell back
+  to HTTP/1.1, losing multiplexing even though the serve path's
+  `hyper_util::server::conn::auto` already speaks h2 once a client sends the
+  preface. Both TLS modes funnel through `build_server_config_with_client_auth`,
+  which now sets the advertisement once, identically for the server-only and
+  client-auth arms. `h2` is listed first, then `http/1.1`, so ALPN-less and
+  http/1.1-only clients are unaffected. New regression tests pin the ALPN on
+  all three public entry points (`build_server_config`,
+  `build_server_config_with_resolver`, `build_server_config_with_client_auth`
+  with a real client verifier) so an accidental revert to no-ALPN fails the
+  suite. Not covered here: real-browser `wss://`/SSE/graceful-shutdown
+  behavior over h2 — the acceptance criteria ask for Chrome/Firefox
+  verification before the issue is closed, which needs a live listener, not
+  a unit test.
 - **🧭 Wayfinder: redisplay the "Add user" form on failure in `examples/cms`'s
   admin Users screen (error-path 0/5 → 5/5, entered values preserved) [no-plugin]:**
   an error-path inventory of `POST /admin/users` — the
@@ -1378,6 +1607,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   escape now strips one bracket from each side (`[[tag]]` → `[tag]`), matching
   the module's own "same syntax WordPress does" claim, and still suppresses
   expansion of the inner shortcode (#2678).
+- **`autumn db scrub`:** the runtime-config tables are now classified as
+  payload carriers (#2366, item 1). `autumn_runtime_config_values.raw_value`
+  holds the live operator-set override for each key — which can be a secret —
+  and `autumn_runtime_config_changes` is the append-only audit log
+  (`old_value` / `new_value` / `actor`). Both carry the `autumn_` prefix, so
+  introspection excluded them from the classified universe and a successful
+  scrub left them verbatim without even warning. A scrub now warns when they
+  are present and empties them when the app opts in with `[framework] purge`.
+  (Items 2 and 3 — materialized-view refresh order through indirect
+  dependencies, and partition-key columns rewritten through the parent — are
+  still open.)
 - **aws-ecs:** the generated ECS "migrate" task definition now carries the
   full app secret set (`AUTUMN_DATABASE__PRIMARY_URL`,
   `AUTUMN_SECURITY__SIGNING_SECRET`, and `AUTUMN_CACHE__REDIS__URL` when
@@ -1843,6 +2083,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **new `pdf_render` profiling harness; negative result, no fix:** added
+  `autumn/benches/pdf_render.rs`, driving `Pdf::from_html`/`Pdf::render`
+  over a realistic 60-row multi-page invoice (the same shape
+  `examples/invoice`'s `invoice_pdf` handler renders) through the real HTML
+  parser (`pdf::html`) and layout walker/word-wrapper/PDF writer
+  (`pdf::layout`) — the framework's HTML-to-PDF export path had no
+  committed benchmark before this. `valgrind --tool=callgrind`/`dhat`
+  profiling found the top costs are inherent to PDF generation, not
+  autumn's own code: `miniz_oxide`'s DEFLATE compressor (14.1% of
+  instructions, via `printpdf`/`lopdf`'s stream compression), glibc
+  allocator internals (~30.5%), and PDF content-stream float formatting
+  (~10.6%, `printpdf`/`lopdf` serializing text positions/widths) dominate;
+  `printpdf::PdfSaveOptions::optimize` is the only compression toggle
+  exposed, and it also prunes unreferenced objects, so flipping it changes
+  every deployed app's output size/shape — a maintainer call, not an
+  unreviewed autonomous change. Autumn's own `pdf` module code (HTML
+  parsing, glyph-width lookup, word-wrap, the layout walker) is 5.1% of
+  instructions combined, with no single function above 1.35% — under the
+  5%-of-profile bar for chasing a specific target. One hypothesis was
+  measured directly: `layout::Writer::ops` (the per-page PDF-operation
+  buffer) resets to an empty, zero-capacity `Vec` on every page via
+  `mem::take`, so `draw_word`'s per-word pushes re-climb the same
+  doubling-growth curve from scratch on every page of a multi-page
+  document; seeding each new page's buffer with the just-flushed page's
+  length as a capacity hint (consecutive pages flow at similar
+  op-per-line density) measured instructions -1.39%, DHAT allocation
+  bytes -0.80%, blocks -0.07% on this harness — real, but under both the
+  5%-of-instructions and 10%-of-allocations impact floor, so the change
+  was reverted rather than shipped. The harness itself is the lasting
+  artifact, giving `Pdf::render` its first profiling coverage.
 - **🗃️ Ledger: batch `autumn-billing`'s dunning restart re-arm into one
   round trip (insert calls N→1 per restart):** every process restart,
   `dunning::rearm_pending` re-queues every open dunning retry row. It used
