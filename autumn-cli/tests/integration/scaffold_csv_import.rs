@@ -667,9 +667,23 @@ fn a_file_missing_the_expected_columns_is_refused_whole() {
         &["--import"],
     );
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    // Issue #2331: no baked list — the required set is derived from the live
+    // schema at request time, so it can never go stale.
     assert!(
-        routes.contains(r#"const CSV_REQUIRED_COLUMNS: &[&str] = &["published", "note"];"#),
-        "the form-carried columns must be named:\n{routes}"
+        !routes.contains("const CSV_REQUIRED_COLUMNS"),
+        "the required set must not be baked at generation time:\n{routes}"
+    );
+    assert!(
+        routes.contains("fn csv_required_columns() -> Vec<&'static str>"),
+        "the derivation helper must be emitted:\n{routes}"
+    );
+    assert!(
+        routes.contains("(<Post as autumn_web::data::csv::CsvSchema>::csv_columns())"),
+        "the required set must be derived from the LIVE schema:\n{routes}"
+    );
+    assert!(
+        routes.contains(".filter(|column| !CSV_IGNORED_COLUMNS.contains(column))"),
+        "the required set must subtract the columns the import cannot set:\n{routes}"
     );
     let import = handler_slice(&routes, "import");
     // The check precedes the import, because a missing column is a property of
@@ -679,7 +693,7 @@ fn a_file_missing_the_expected_columns_is_refused_whole() {
         .expect("the handler must drive the import engine");
     assert!(
         before_import.contains("read_header(&uploaded[..])")
-            && before_import.contains("CSV_REQUIRED_COLUMNS"),
+            && before_import.contains("csv_required_columns()"),
         "the header must be checked before any row is decoded:\n{import}"
     );
     let (_, after_check) = before_import
@@ -693,6 +707,42 @@ fn a_file_missing_the_expected_columns_is_refused_whole() {
     assert!(
         after_check.contains(r#"missing.join(", ")"#),
         "the refusal must name the missing columns:\n{import}"
+    );
+}
+
+/// Issue #2331: the required set must follow the LIVE export schema, not a
+/// baked generation-time list.
+///
+/// A baked `const CSV_REQUIRED_COLUMNS` goes stale the moment someone edits
+/// the export's `CsvSchema::csv_columns()` — e.g. dropping a column — and
+/// then rejects this app's own export as "missing columns". Deriving the set
+/// at request time from the live schema minus the columns the import cannot
+/// set closes that drift: the schema and the requirement can never disagree.
+#[test]
+fn the_required_columns_are_derived_from_the_live_schema() {
+    let (_tmp, routes) = import_routes("import-live-schema", &[]);
+    assert!(
+        !routes.contains("const CSV_REQUIRED_COLUMNS"),
+        "no generation-time list may remain:\n{routes}"
+    );
+    let helper = fn_slice(&routes, "csv_required_columns");
+    assert!(
+        helper.contains("(<Post as autumn_web::data::csv::CsvSchema>::csv_columns())"),
+        "the helper must read the live schema:\n{helper}"
+    );
+    assert!(
+        helper.contains(".filter(|column| !CSV_IGNORED_COLUMNS.contains(column))"),
+        "the helper must subtract the columns the import cannot set:\n{helper}"
+    );
+    // The header check calls the helper — the trimmed comparison is unchanged.
+    let import = handler_slice(&routes, "import");
+    assert!(
+        import.contains("let missing: Vec<&str> = csv_required_columns()"),
+        "the header check must use the derived set:\n{import}"
+    );
+    assert!(
+        import.contains("found.trim() == *column"),
+        "the header check must still trim:\n{import}"
     );
 }
 
@@ -738,10 +788,12 @@ fn a_bytea_column_is_not_importable() {
         &["--import"],
     );
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
-    // Not settable...
+    // Not settable — and not required either: the required set is the live
+    // schema minus the columns the import cannot set, so `blob` can never
+    // sneak into it.
     assert!(
-        routes.contains(r#"const CSV_REQUIRED_COLUMNS: &[&str] = &["title"];"#),
-        "a Bytea column must not be one the import requires or sets:
+        routes.contains("fn csv_required_columns() -> Vec<&'static str>"),
+        "a Bytea column must not be one the import requires:
 {routes}"
     );
     // ...named on the upload page as a column the import cannot set...
@@ -886,7 +938,7 @@ fn an_all_defaulted_model_refuses_the_import_too() {
     );
     let control = fs::read_to_string(settable.join("src/routes/posts.rs")).unwrap();
     assert!(
-        control.contains(r#"const CSV_REQUIRED_COLUMNS: &[&str] = &["title"];"#),
+        control.contains("fn csv_required_columns() -> Vec<&'static str>"),
         "a model with a settable column must still emit the check:\n{control}"
     );
     assert!(
