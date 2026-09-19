@@ -482,6 +482,13 @@ nix = { version = "0.31.2", features = ["fs"] }
 # link, so only binaries that actually reference it are affected.
 allocation-counter = "0.8.1"
 diesel = { version = "2", features = ["chrono", "postgres"] }
+# `rust_decimal`'s diesel impls (`AsExpression<Numeric>`, `ToSql`/`FromSql` on
+# the Pg backend) back the `#[model]` Postgres-`Decimal` integration test
+# (issue #2597): generated apps get `db-diesel2-postgres` from the model
+# generator's `MODEL_DEPS`, but the `autumn-web` lib itself only enables
+# `serde`, so the in-repo test target needs the feature here. Test-only — the
+# sqlite `cargo build` / `clippy --lib` lanes never build dev-dependencies.
+rust_decimal = { workspace = true, features = ["db-diesel2-postgres"] }
 filetime = "0.2"
 futures.workspace = true
 http.workspace = true

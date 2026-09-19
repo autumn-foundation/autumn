@@ -7725,6 +7725,7 @@ dependencies = [
  "arrayvec",
  "borsh",
  "bytes",
+ "diesel",
  "num-traits",
  "rand 0.8.7",
  "rand 0.9.5",
