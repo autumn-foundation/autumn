@@ -98,6 +98,9 @@ is_breaking_release_type() {
 # Publishable crates.
 CRATES=(
   autumn-macros
+  autumn-macros-support
+  autumn-macros-model
+  autumn-macros-repository
   autumn-web
   autumn-cli
   autumn-admin-plugin

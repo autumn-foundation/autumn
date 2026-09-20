@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A compensated first deploy now removes its stale proxy route (issue
+  #2270):** when a halted fleet rollout compensated a host's just-completed
+  FIRST deploy, the host was torn down but kamal-proxy kept a route pointing
+  at the now-stopped slot, so its public port answered `502` instead of
+  refusing the connection until the next deploy. `ProxyController` gained
+  `deregister_op` (`kamal-proxy remove`), probed the same way `deploy --help`
+  already is, so a drifted or renamed `remove` subcommand fails the deploy
+  closed before any cutover, never assumed present. The route is removed as
+  its own step, only after the app teardown fully succeeds, so a failure
+  there reports its own outcome (`CompensatedTeardownRouteFailed`) rather
+  than the misleading "still serving, roll it back" — a first deploy has no
+  previous release to roll back to.
+
 ### Added
 
 - **💵 Money as a framework primitive: typed `Money<C>` and an enforced
@@ -108,63 +123,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the races only it can show: eight connections posting the same charge at
     once collapse to one transaction, and two concurrent payouts from a float
     that covers one leave exactly one. See `docs/guide/money.md`.
-
-- **📖 Folio: make Autumn's log settings findable, and gate retrieval
-  (questions 12/18 → 18/18, 0 pages added):** `docs/guide/logging-pii.md`
-  carried `[log] level`, `log.format` and the access-log switches under the
-  title "Logging & PII" — the name the README listed it by — so a reader
-  asking how to change the log level read it as a privacy page and never
-  opened it. Searching the title and headings of all 162 guide pages for
-  "log level", "debug logging" or "json logs" returned **zero results**,
-  while the `[log]` section itself appeared in 9 fences across 7 pages: the
-  answer existed, was correct, was linked, and was unreachable by anyone who
-  arrived with words rather than a link. The runtime half of the same
-  question was worse — `PUT /actuator/loggers/{name}`, which changes a live
-  `tracing` subscriber with no redeploy and is the only answer that helps
-  during an incident, appeared on **no reader-facing page at all**: it was
-  documented in `skills/autumn-web/SKILL.md` (a context pack for agents),
-  named in one Spring-comparison table row as a Rust call rather than an
-  endpoint, and otherwise mentioned only in `deployment.md`'s list of
-  endpoints production turns off. This is a findability defect with a
-  coverage tail, so the fix adds no page: `logging-pii.md` is retitled
-  "Logging: log levels, format, and PII scrubbing" (the path, and so every
-  inbound link, is unchanged), opens on the four questions it answers, and
-  gains `## Set the log level`, `### Turn on debug logging for one target`,
-  `## Choose the log format (pretty or JSON)` and `## Change log levels at
-  runtime, without a restart` — the last documenting the request and
-  response shapes, that `applied` and not the status code is what says a
-  change reached the subscriber, that overrides die with the process, and
-  that the endpoint needs `[actuator] sensitive = true`, and — the part that
-  would otherwise be found at 3am — that the `prod` profile turns CSRF on, so
-  the bare `curl` is a `403` there and the page shows both ways through
-  (`[security.csrf] exempt_paths`, or the double-submit cookie/header pair).
-  `[log] level` also accepts `off`, which the runtime endpoint does not, and
-  the page now states the *profile-specific* defaults rather than a flat
-  `info`/`Auto`: `dev` is `debug`/`Pretty`, `prod` is `info`/`Json`, both set
-  outright by smart defaults, and any other profile falls back to
-  `info`/`Auto`. "Why is dev so noisy" has a table to land on. The
-  `Auto` /
-  `Pretty` / `Json` table moves here from `getting-started.md`, which keeps a
-  one-paragraph summary and a link, so the answer has one home rather than
-  two that drift.
-
-  Found by measuring the direction no existing gate measures.
-  `scripts/check-docs-retrieval.sh` (new, wired into CI with its own
-  self-test — run `--self-test` for the count, which grows with the matcher
-  and so is deliberately not pinned here) pairs a reader question with the
-  page that answers it and checks
-  the page says so in its slug, its H1 or a heading — body text deliberately
-  excluded, because "the answer is in there somewhere" is the defect, not the
-  pass condition. The eleven existing docs gates all check a page the reader
-  has already reached, and `check-docs-orphans.sh` checks a path of links to
-  it exists; none asks what the reader actually arrives with, which is not
-  "which link do I click" but "what do I type". Baseline: 18 questions, 6
-  defects, all six this class. After: 0. The 12 that already passed are
-  pinned as a regression set, so a future retitle cannot take them away
-  quietly. Fenced content is excluded from the heading index — a `#` line in
-  a shell or TOML fence is a comment, and indexing one lets a fixture row go
-  green on a code comment on the very page it names.
-
 - **Fleet deploy alerts on a halted rollout or drift (#2267, AC-6 of #1621):**
   `autumn deploy up` now sends a `scheduled_task_failure` alert the moment a
   rollout halts. `autumn deploy status --strict` sends one when it finds
@@ -228,6 +186,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     follow-ups. The LWW default for non-collaborative fields is unchanged.
 
 ### Fixed
+
+- **🌐 Custom domains reach the app in production (issue #2657):** a tenant
+  hostname is never in `[security.trusted_hosts] hosts` — that is the point of
+  the feature — and `TrustedHostPolicy::from_config` read only that list. So a
+  request for `app.clientco.com`, registered, verified, `active` and holding
+  its own certificate, got `400 Invalid Host header` before tenancy resolution
+  ran. Every part below the trusted-host layer was correct; nothing reached it.
+  The only workaround was `hosts = ["*"]`, which turns host validation off for
+  the whole deployment — "custom domains **or** Host-header protection, pick
+  one". The policy now asks the custom-domain registry about a host its static
+  rules do not match, and admits it only while the domain is servable
+  (`active`), which is the rule SNI already applies at the handshake: a
+  `pending_dns` registration is not a way past host validation. The registry is
+  read per request, not captured, because the app publishes it at bind time —
+  after the router is built — so a domain connected or offboarded while the app
+  runs takes effect with no restart. A deployment with no registry pays one
+  extension lookup on the path that was about to answer `400` anyway.
+  The acceptance test for this behaviour called the tenancy extractor
+  directly, so the middleware that rejected the request was never in the path;
+  the new test drives a **mounted router** through the whole stack, and
+  publishes the registry after the build, as production does.
+  `AppState::late_extensions` is the small seam that makes the late read
+  possible. `docs/guide/tls.md` and `docs/guide/deployment.md` now state the
+  interaction.
 
 - **🛣️ Onramp: stop treating `local-dev-quickstart`'s permanent drift as a
   CI failure [no-plugin]:** nothing here is agent-facing — it's a
@@ -1319,6 +1301,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The in-process TLS listener now advertises ALPN `[b"h2", b"http/1.1"]`
+  (#2321):** `build_server_config` never set `alpn_protocols`, so rustls
+  completed the handshake with no protocol selected and every browser —
+  every `[server.tls]` deployment, static-cert or ACME — silently fell back
+  to HTTP/1.1, losing multiplexing even though the serve path's
+  `hyper_util::server::conn::auto` already speaks h2 once a client sends the
+  preface. Both TLS modes funnel through `build_server_config_with_client_auth`,
+  which now sets the advertisement once, identically for the server-only and
+  client-auth arms. `h2` is listed first, then `http/1.1`, so ALPN-less and
+  http/1.1-only clients are unaffected. New regression tests pin the ALPN on
+  all three public entry points (`build_server_config`,
+  `build_server_config_with_resolver`, `build_server_config_with_client_auth`
+  with a real client verifier) so an accidental revert to no-ALPN fails the
+  suite. Not covered here: real-browser `wss://`/SSE/graceful-shutdown
+  behavior over h2 — the acceptance criteria ask for Chrome/Firefox
+  verification before the issue is closed, which needs a live listener, not
+  a unit test.
 - **🧭 Wayfinder: redisplay the "Add user" form on failure in `examples/cms`'s
   admin Users screen (error-path 0/5 → 5/5, entered values preserved) [no-plugin]:**
   an error-path inventory of `POST /admin/users` — the
@@ -1632,6 +1631,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   escape now strips one bracket from each side (`[[tag]]` → `[tag]`), matching
   the module's own "same syntax WordPress does" claim, and still suppresses
   expansion of the inner shortcode (#2678).
+- **`autumn db scrub`:** the runtime-config tables are now classified as
+  payload carriers (#2366, item 1). `autumn_runtime_config_values.raw_value`
+  holds the live operator-set override for each key — which can be a secret —
+  and `autumn_runtime_config_changes` is the append-only audit log
+  (`old_value` / `new_value` / `actor`). Both carry the `autumn_` prefix, so
+  introspection excluded them from the classified universe and a successful
+  scrub left them verbatim without even warning. A scrub now warns when they
+  are present and empties them when the app opts in with `[framework] purge`.
+  (Items 2 and 3 — materialized-view refresh order through indirect
+  dependencies, and partition-key columns rewritten through the parent — are
+  still open.)
 - **aws-ecs:** the generated ECS "migrate" task definition now carries the
   full app secret set (`AUTUMN_DATABASE__PRIMARY_URL`,
   `AUTUMN_SECURITY__SIGNING_SECRET`, and `AUTUMN_CACHE__REDIS__URL` when
