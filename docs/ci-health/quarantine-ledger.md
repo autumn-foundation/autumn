@@ -1520,6 +1520,30 @@ without also filling in the intake form above.
   organic hit has ever been recorded against it, so it was left unchanged
   this pass rather than preemptively rewritten on no evidence of its own.
 
+  **Correction (post-review, via a Codex review comment on PR #2867): the
+  poll-for-terminal fix as first written replaced the race with a second,
+  load-dependent flake of its own.** `PgJobTrackingStore::update`'s own
+  `WHERE key = $1 AND expires_at > $2` guard means a lifecycle write is
+  silently a no-op once the row is already expired — so at the original
+  `ttl_secs: 1`, a `mark_running`/`settle_success` write delayed past one
+  second by ordinary Docker-CI-runner scheduler or database contention would
+  find its own write vetoed, `status` would stay `"pending"` forever, and
+  the poll loop would spin to its 5s deadline and panic — a scenario in
+  which the *original* fixed-sleep version would have passed. Caught on
+  review before this ever ran organically or through another rerun
+  campaign, not discovered empirically. Fixed by two changes together:
+  `ttl_secs` raised from 1 to 10 (comfortable margin over any realistic
+  in-process job-dispatch delay, so the write-guard is no longer plausibly
+  in the poll loop's way) with the poll deadline correspondingly capped at
+  8s (leaving margin under the TTL rather than racing it from the other
+  side); and the post-terminal wait no longer sleeps a fixed guess at all —
+  it queries `GREATEST(EXTRACT(EPOCH FROM (expires_at - NOW())), 0)` on the
+  row directly and sleeps exactly that plus a 300ms margin, so it is correct
+  regardless of how much of the 10s TTL the completion wait already
+  consumed, rather than assuming a fixed 1200ms is always enough. `cargo
+  check`/`cargo clippy -D warnings` clean against the `integration_tests`
+  target after this revision (same command as below, re-run).
+
   **Verification status — not yet closed.** No Docker daemon is available in
   this sandbox (confirmed: `docker ps` fails to reach
   `/var/run/docker.sock`), so the fix could not be exercised against a real
