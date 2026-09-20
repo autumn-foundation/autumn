@@ -140,23 +140,27 @@ itself, so this is scratch-only, reverted after use):
 
 ```bash
 cd /home/user/autumn
-# 0. Back up the file before editing it, rather than reverting via
+# 0. Back up both files this procedure touches into freshly-generated,
+#    collision-proof temp paths (mktemp, not a fixed `.bak` name — a fixed
+#    name is itself a repeat-run hazard: a second interrupted attempt would
+#    overwrite the first attempt's only clean backup, or restore a stale one
+#    over a file that didn't need restoring). Rather than reverting via
 #    `git checkout -- <file>` afterward — that form replaces the whole file
 #    with the index version and would silently discard any *other*
 #    uncommitted edits already sitting in it (see
 #    docs/reports/2026-09-16-onramp-test-sim-compile-gate-negative-result.md
 #    for the same failure mode caught there).
-cp autumn-media-plugin/Cargo.toml autumn-media-plugin/Cargo.toml.bak
+cargo_bak="$(mktemp)"
+cp autumn-media-plugin/Cargo.toml "$cargo_bak"
+probe_path=autumn-media-plugin/tests/snag_seat_race_probe.rs
+probe_bak=""
+[ -e "$probe_path" ] && { probe_bak="$(mktemp)"; cp "$probe_path" "$probe_bak"; }
+
 # 1. Temporarily add to autumn-media-plugin/Cargo.toml [dev-dependencies]:
 #      autumn-web = { path = "../autumn", features = ["sqlite"] }
 
-# 2. Add autumn-media-plugin/tests/snag_seat_race_probe.rs — back up first if
-#    that path is already occupied (e.g. an interrupted earlier attempt),
-#    same reasoning as step 0:
-[ -e autumn-media-plugin/tests/snag_seat_race_probe.rs ] && \
-  cp autumn-media-plugin/tests/snag_seat_race_probe.rs \
-     autumn-media-plugin/tests/snag_seat_race_probe.rs.bak
-cat > autumn-media-plugin/tests/snag_seat_race_probe.rs <<'RUST'
+# 2. Add autumn-media-plugin/tests/snag_seat_race_probe.rs:
+cat > "$probe_path" <<'RUST'
 use std::sync::Arc;
 use autumn_media_plugin::rooms::RoomStore;
 use autumn_media_plugin::rooms_db::DbRoomStore;
@@ -245,13 +249,11 @@ RUST
 cargo test -p autumn-media-plugin --test snag_seat_race_probe -- --nocapture
 
 # 4. Revert both scratch changes — do not commit them. Restore from the
-#    backups made in steps 0 and 2 (not `git checkout -- <file>`, which
+#    mktemp backups made in step 0 (not `git checkout -- <file>`, which
 #    would clobber any unrelated uncommitted edits already in the file):
-mv autumn-media-plugin/Cargo.toml.bak autumn-media-plugin/Cargo.toml
-rm autumn-media-plugin/tests/snag_seat_race_probe.rs
-[ -e autumn-media-plugin/tests/snag_seat_race_probe.rs.bak ] && \
-  mv autumn-media-plugin/tests/snag_seat_race_probe.rs.bak \
-     autumn-media-plugin/tests/snag_seat_race_probe.rs
+mv "$cargo_bak" autumn-media-plugin/Cargo.toml
+rm "$probe_path"
+[ -n "$probe_bak" ] && mv "$probe_bak" "$probe_path"
 ```
 
 ## Why this wasn't committed as a quarantined regression test
