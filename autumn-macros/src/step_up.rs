@@ -615,6 +615,38 @@ mod tests {
     }
 
     #[test]
+    fn owns_replay_when_unguarded() {
+        let generated = step_up_macro(
+            quote! {},
+            quote! {
+                async fn handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("__replay_response"),
+            "an otherwise-unguarded step-up handler's gate must own replay-serving:\n{generated}"
+        );
+    }
+
+    #[test]
+    fn defers_replay_to_an_earlier_gate_when_stacked() {
+        // Simulate `#[secured]` having already expanded and inserted its own
+        // gate parameter ahead of `#[step_up]`'s.
+        let generated = step_up_macro(
+            quote! {},
+            quote! {
+                async fn handler(_g: __AutumnSecuredGate_handler) -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("__replay_response"),
+            "must defer replay-ownership to the earlier-inserted gate:\n{generated}"
+        );
+    }
+
+    #[test]
     fn step_up_injects_method_parameter() {
         let generated = step_up_macro(
             quote! {},
