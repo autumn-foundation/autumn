@@ -1,3 +1,7 @@
+-- Requires pg_stat_statements in shared_preload_libraries (see
+-- ../README.md's "Reproduce" section).
+\set ON_ERROR_STOP on
+
 \echo '=== add the candidate covering partial index ==='
 CREATE INDEX idx_votes_post_id_value_covering ON votes (post_id) INCLUDE (value) WHERE post_id IS NOT NULL;
 ANALYZE votes;

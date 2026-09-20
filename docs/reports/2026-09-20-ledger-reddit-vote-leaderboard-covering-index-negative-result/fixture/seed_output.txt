@@ -10,26 +10,26 @@ INSERT 0 15000
 INSERT 0 44383
 INSERT 0 289065
 INSERT 0 44998
-UPDATE 16732
+UPDATE 16644
 INFO:  vacuuming "reddit_ledger.public.votes"
 INFO:  launched 2 parallel vacuum workers for index vacuuming (planned: 2)
 INFO:  finished vacuuming "reddit_ledger.public.votes": index scans: 1
-pages: 0 removed, 3294 remain, 3294 scanned (100.00% of total)
-tuples: 16732 removed, 378446 remain, 0 are dead but not yet removable
-removable cutoff: 1046, which was 0 XIDs old when operation ended
-new relfrozenxid: 1042, which is 27 XIDs ahead of previous value
+pages: 0 removed, 3293 remain, 3293 scanned (100.00% of total)
+tuples: 16644 removed, 378446 remain, 0 are dead but not yet removable
+removable cutoff: 1106, which was 0 XIDs old when operation ended
+new relfrozenxid: 1102, which is 27 XIDs ahead of previous value
 frozen: 0 pages from table (0.00% of total) had 0 tuples frozen
-index scan needed: 2772 pages from table (84.15% of total) had 16732 dead item identifiers removed
+index scan needed: 2770 pages from table (84.12% of total) had 16644 dead item identifiers removed
 index "votes_pkey": pages: 1040 in total, 0 newly deleted, 0 currently deleted, 0 reusable
-index "votes_unique_post": pages: 2544 in total, 0 newly deleted, 0 currently deleted, 0 reusable
+index "votes_unique_post": pages: 2545 in total, 0 newly deleted, 0 currently deleted, 0 reusable
 index "votes_unique_comment": pages: 743 in total, 0 newly deleted, 0 currently deleted, 0 reusable
-index "idx_votes_user_id": pages: 596 in total, 0 newly deleted, 0 currently deleted, 0 reusable
+index "idx_votes_user_id": pages: 595 in total, 0 newly deleted, 0 currently deleted, 0 reusable
 index "idx_votes_post_id": pages: 583 in total, 0 newly deleted, 0 currently deleted, 0 reusable
 index "idx_votes_comment_id": pages: 396 in total, 0 newly deleted, 0 currently deleted, 0 reusable
-avg read rate: 0.000 MB/s, avg write rate: 0.366 MB/s
-buffer usage: 15319 hits, 0 misses, 4 dirtied
-WAL usage: 14360 records, 1 full page images, 1145233 bytes
-system usage: CPU: user: 0.08 s, system: 0.00 s, elapsed: 0.08 s
+avg read rate: 0.000 MB/s, avg write rate: 0.290 MB/s
+buffer usage: 15315 hits, 0 misses, 4 dirtied
+WAL usage: 14361 records, 1 full page images, 1144264 bytes
+system usage: CPU: user: 0.07 s, system: 0.00 s, elapsed: 0.10 s
 VACUUM
 ANALYZE
  posts | comments | total_votes | post_votes | comment_votes | cold_posts_with_zero_votes | avg_votes_per_cold_post_with_at_least_one 

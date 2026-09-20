@@ -18,6 +18,14 @@
 -- (a changed vote, exactly what `react()` does in production) to produce
 -- real dead tuples, then VACUUM + ANALYZE models the steady state
 -- autovacuum reaches in a live table -- not a pristine just-loaded one.
+--
+-- Prerequisite: `pg_stat_statements` must be in the server's
+-- `shared_preload_libraries` (a `postgresql.conf` change + restart --
+-- `CREATE EXTENSION` alone is not enough) before running this fixture and
+-- ../baseline/queries.sql / ../after/queries.sql. See the README's
+-- "Reproduce" section for the exact commands.
+
+\set ON_ERROR_STOP on
 
 SELECT setseed(0.4152);
 
@@ -85,8 +93,11 @@ ON CONFLICT (user_id, comment_id) DO NOTHING;
 
 -- Realistic churn: ~5% of existing post votes get their value flipped, as
 -- `react()` does on a changed vote -- real dead tuples before VACUUM.
+-- `setseed()` only drives `random()`; `TABLESAMPLE` has its own RNG and is
+-- only reproducible with an explicit `REPEATABLE` seed, so it needs one too.
 UPDATE votes SET value = -value
-WHERE post_id IS NOT NULL AND id IN (SELECT id FROM votes TABLESAMPLE BERNOULLI (5));
+WHERE post_id IS NOT NULL
+  AND id IN (SELECT id FROM votes TABLESAMPLE BERNOULLI (5) REPEATABLE (4152));
 
 VACUUM (VERBOSE) votes;
 ANALYZE users, subreddits, posts, comments, votes;

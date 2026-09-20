@@ -1,3 +1,9 @@
+-- Requires pg_stat_statements in shared_preload_libraries (see
+-- ../README.md's "Reproduce" section) -- without it, pg_stat_statements_reset()
+-- below errors and ON_ERROR_STOP stops the script rather than silently
+-- continuing past a profile that was never collected.
+\set ON_ERROR_STOP on
+
 -- Capture (not profiled -- these run before the reset below, and their
 -- array_agg wrapper is a different statement shape than what front_page
 -- actually sends, so they must not appear in the profiled window). Needed
