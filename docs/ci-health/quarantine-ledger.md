@@ -1547,8 +1547,15 @@ without also filling in the intake form above.
   **Verification status — not yet closed.** No Docker daemon is available in
   this sandbox (confirmed: `docker ps` fails to reach
   `/var/run/docker.sock`), so the fix could not be exercised against a real
-  Postgres container locally; `cargo check` against the `integration_tests`
-  target is the only local verification obtained this pass. Per this role's
+  Postgres container locally. Local verification obtained this pass, on
+  both the original and the corrected version of the fix: `cargo check -p
+  autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n,collab"
+  --test integration_tests` (clean, exit 0) and `cargo clippy` with the same
+  package/features/target plus `-- -D warnings` (clean, exit 0 — the only
+  warning printed is a pre-existing, unrelated `unknown lint:
+  clippy::unused_async_trait_impl` also seen on unrelated builds, not
+  introduced by this change). Neither exercises the container/timing path a
+  real rerun would. Per this role's
   own bar, an after-measurement (0/N on the same harness) is required before
   this entry closes, and that needs the fix merged to `trunk-dev` first
   (`manual-job-tracking-rerun-check.yml` is `workflow_dispatch`-only and —
