@@ -256,7 +256,14 @@
 #   scripts/check-docs-cli.sh              # gate the corpus
 #   scripts/check-docs-cli.sh --list       # print the parsed command surface
 #   scripts/check-docs-cli.sh --list-options  # …with each command's options
+#   scripts/check-docs-cli.sh --list-hidden   # …only the `hide = true` ones
+#   scripts/check-docs-cli.sh --corpus     # the reader-facing pages it reads
+#   scripts/check-docs-cli.sh --resolved   # which command each line names
 #   scripts/check-docs-cli.sh --self-test  # synthetic-corpus tests
+#
+# The last three exist for `scripts/check-docs-scope.sh` and
+# `scripts/check-docs-cli-coverage.sh`, which ask this gate for its corpus,
+# its surface and its reading of a line rather than respelling any of them.
 
 set -euo pipefail
 
@@ -657,7 +664,14 @@ def build_surface(sources):
                     spellings.update(re.findall(r'"([^"]+)"', group))
                 node = {'children': {}, 'positionals': False, 'options': {},
                         'requires_sub': False, 'required_args': 0,
-                        'trailing': False, 'hyphen_slots': []}
+                        'trailing': False, 'hyphen_slots': [],
+                        # `#[command(hide = true)]`: clap keeps the command
+                        # runnable but leaves it out of `--help`, which is the
+                        # author saying it is not a reader's to find.
+                        # `check-docs-cli-coverage.sh` reads this so that
+                        # hiding a command exempts it from the coverage gate
+                        # with no edit to that gate's backlog.
+                        'hidden': bool(re.search(r'\bhide\s*=\s*true', attrs))}
                 if kind == 'tuple':
                     inner = re.search(r'\(\s*(?:pub\s+)?([A-Za-z0-9_:]+)', payload)
                     if inner:
@@ -708,6 +722,7 @@ def build_surface(sources):
             opts = dict(BUILTIN_OPTIONS)
             opts.update(v['options'])
             flat[key] = {'children': set(v['children']),
+                         'hidden': v['hidden'],
                          'positionals': v['positionals'],
                          'options': opts,
                          'requires_sub': v['requires_sub'],
@@ -733,9 +748,9 @@ def build_surface(sources):
             opts.update({'--version': False, '-V': False})
         if 'Cli' in structs:                    # any real `#[arg]` on the root
             opts.update(_options(structs['Cli'], structs))
-        return {'children': set(), 'positionals': False, 'options': opts,
-                'requires_sub': True, 'required_args': 0, 'trailing': False,
-                'hyphen_slots': []}
+        return {'children': set(), 'hidden': False, 'positionals': False,
+                'options': opts, 'requires_sub': True, 'required_args': 0,
+                'trailing': False, 'hyphen_slots': []}
 
     flat = flatten(tree)
     if flat:                                    # only alongside a real surface
@@ -3510,7 +3525,8 @@ def _classify_option(tok, node):
     return 'unknown', 1 if attached else 0
 
 
-def _scan_options_only(tokens, i, node, path, flags, surface, runnable):
+def _scan_options_only(tokens, i, node, path, flags, surface, runnable,
+                       reached=None):
     """Judge the OPTIONS in `tokens[i:]`, resolving no NEW command defects.
 
     Reached once a positional has been met on a node that also has subcommands,
@@ -3539,8 +3555,10 @@ def _scan_options_only(tokens, i, node, path, flags, surface, runnable):
                 # ordinary walk can take over again — including its
                 # `requires_sub` and required-argument checks, which this
                 # options-only mode does not have and must not reimplement.
+                if reached is not None:
+                    reached[0] = path + ' ' + tok
                 return _walk(tokens, i + 1, path + ' ' + tok,
-                             surface, runnable, flags)
+                             surface, runnable, flags, reached)
             filled += 1                         # a value, or another positional
             i += 1
             continue
@@ -3572,7 +3590,7 @@ def _scan_options_only(tokens, i, node, path, flags, surface, runnable):
     return None
 
 
-def resolve(tokens, surface, runnable=False, flags=None):
+def resolve(tokens, surface, runnable=False, flags=None, reached=None):
     """Return the drifted command path, or None when the command resolves.
 
     `flags`, when given, collects `(command path, option)` for every option a
@@ -3624,10 +3642,12 @@ def resolve(tokens, surface, runnable=False, flags=None):
         return None
     if tokens[0] not in surface:
         return 'autumn ' + tokens[0]
-    return _walk(tokens, 1, tokens[0], surface, runnable, flags)
+    if reached is not None:
+        reached[0] = tokens[0]
+    return _walk(tokens, 1, tokens[0], surface, runnable, flags, reached)
 
 
-def _walk(tokens, i, path, surface, runnable, flags):
+def _walk(tokens, i, path, surface, runnable, flags, reached=None):
     """The token walk proper, entered at `tokens[i]` with `path` resolved.
 
     Split out so that `_scan_options_only` can hand control BACK to it once a
@@ -3758,6 +3778,8 @@ def _walk(tokens, i, path, surface, runnable, flags):
             continue
         if tok in node['children']:             # always TOKEN-shaped, so first
             path = path + ' ' + tok
+            if reached is not None:
+                reached[0] = path
             i += 1
             continue
         # The positional check comes BEFORE the `TOKEN` bail, because the
@@ -3779,7 +3801,7 @@ def _walk(tokens, i, path, surface, runnable, flags):
             # be another positional value, or the value of an option, and no
             # further subcommand resolution is attempted.
             return _scan_options_only(tokens, i, node, path, flags,
-                                      surface, runnable)
+                                      surface, runnable, reached)
         if not TOKEN.match(tok):
             return None
         return 'autumn ' + path + ' ' + tok
@@ -6626,6 +6648,19 @@ def main():
               file=sys.stderr)
         return 1
 
+    if MODE == '--list-hidden':
+        # A command whose subtree is hidden is hidden: clap leaves the whole
+        # branch out of `--help`, so a child of a hidden parent is no more
+        # reachable than its parent.
+        hidden = sorted(p for p in surface if p and (
+            surface[p]['hidden']
+            or any(surface[a]['hidden']
+                   for a in surface
+                   if a and p.startswith(a + ' '))))
+        for path in hidden:
+            print(path)
+        return 0
+
     if MODE in ('--list', '--list-options'):
         show_opts = MODE == '--list-options'
         for path in sorted(p for p in surface if p):
@@ -6719,8 +6754,39 @@ def print_corpus():
         print(f)
     return 0
 
+
+def print_resolved():
+    """Print every command path the corpus names: `file<TAB>line<TAB>path`.
+
+    `scripts/check-docs-cli-coverage.sh` runs the surface against the corpus in
+    the OPPOSITE direction to this gate — "is what we shipped written down
+    anywhere?" rather than "is what we wrote still true?" — and it needs the
+    same answer to "which command does this line name?" that the drift half
+    already computes.
+
+    It asks for that answer instead of re-deriving it. A coverage checker that
+    matches command paths against page text with its own regex gets the
+    shallow cases right and the deep ones wrong: `autumn openapi export`
+    satisfying the top-level `export`, `autumn db pull posts` reading its
+    positional as a subcommand, an alias spelling counting for the canonical
+    name. Every one of those is a question `resolve()` already answers, off the
+    clap derive input, with 866 self-tests behind it.
+    """
+    surface = build_surface(cli_sources(ROOT))
+    for f in sorted(corpus(ROOT)):
+        text = (ROOT / f).read_text(errors='replace')
+        for lineno, _display, argv, where in invocations(text):
+            reached = ['']
+            resolve(argv, surface, runnable=where == FENCED_COMMAND,
+                    reached=reached)
+            if reached[0]:
+                print(f'{f}\t{lineno}\t{reached[0]}')
+    return 0
+
+
 sys.exit(self_test() if MODE == '--self-test'
          else print_corpus() if MODE == '--corpus'
+         else print_resolved() if MODE == '--resolved'
          else main())
 PYEOF
 }
@@ -6730,8 +6796,10 @@ case "$mode" in
   --self-test)    run_py --self-test "$root" ;;
   --list)         run_py --list "$root" ;;
   --corpus)       run_py --corpus "$root" ;;
+  --resolved)     run_py --resolved "$root" ;;
+  --list-hidden)  run_py --list-hidden "$root" ;;
   --list-options) run_py --list-options "$root" ;;
   "")             echo "Checking CLI invocations across the reader-facing docs..."
                   run_py --check "$root" ;;
-  *)              echo "usage: $0 [--list|--list-options|--corpus|--self-test]" >&2; exit 2 ;;
+  *)              echo "usage: $0 [--list|--list-options|--list-hidden|--corpus|--resolved|--self-test]" >&2; exit 2 ;;
 esac
