@@ -3050,6 +3050,8 @@ autumn release init --target azure-container-apps   # Terraform scaffold: main.t
 autumn release init --target aws-app-runner      # Fast/minimal AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ECR, App Runner behind a VPC connector, RDS Postgres, Secrets Manager). No CI workflow (#1279); see docs/guide/deployment.md.
 autumn release init --target aws-ecs             # Production AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (VPC, ALB+ACM DNS-validated HTTPS, ECS Fargate w/ circuit-breaker rollback, Application Auto Scaling, RDS, opt-in Redis) + .github/workflows/aws-deploy.yml (#1279); see docs/guide/deployment.md.
 autumn release init --target gcp-cloud-run       # GCP path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (Artifact Registry, Cloud Run, Cloud SQL Postgres behind a VPC connector, Secret Manager, opt-in Memorystore Redis) + .github/workflows/gcp-deploy.yml (#1280); see docs/guide/deployment.md.
+autumn migrate new add_widget_archived_at   # collision-free migration dir: prefer this (or `generate migration`) over hand-creating one — see "Migration version collisions" below
+autumn migrate check-collisions             # CI gate: fails if this branch's migration version collides with the default branch, another pushed branch, or the framework's own migrations
 autumn sbom                      # CycloneDX 1.5 SBOM for this source tree, to stdout (deterministic: no timestamp, content-derived serialNumber) (unreleased, issue #1615)
 autumn sbom --output sbom.cdx.json --locked        # write it; --locked fails when Cargo.lock disagrees with the manifests
 autumn sbom --verify sbom.cdx.json --expect-version 0.8.0   # regenerate + compare component-by-component, and pin the root version; exit 1 with a named diff on drift
@@ -3257,7 +3259,39 @@ legacy migrations applied before the checksum feature existed; use
 `autumn migrate baseline --force <version>` only when a deliberate edit
 is intended and the fork risk is accepted.
 
-### `autumn test` — isolated test DB (0.6.0, issue #1056)
+### Migration version collisions (unreleased — trunk-dev)
+
+Diesel records applied migrations **by version** (the leading
+`YYYYMMDDHHMMSS` directory prefix). If two differently-named migrations
+share a version, a fresh database silently applies only one of them and
+records the version as done — the other is skipped forever, with no error.
+This is the failure mode a hand-typed round timestamp (`...T00:00:00`, the
+top of an hour) invites: two authors reaching for midnight collide, while
+two authors reaching for the actual current second essentially never do.
+
+**Prefer `autumn migrate new <name>` (or `autumn generate migration
+<name>`) over hand-creating a migration directory** — never invent a
+`YYYYMMDDHHMMSS` stamp yourself. `autumn migrate new` picks a version
+guaranteed free across the working tree, every local/remote git branch this
+checkout has fetched, and the framework's own migrations, and creates
+`migrations/<version>_<name>/{up,down}.sql` (empty, with WHY/LOCKING
+guidance comments — same DDL-writing rules as any other migration). Run
+`autumn migrate check-collisions` before pushing (or rely on the CI gate) if
+a collision might have appeared on another branch since.
+
+If a user reports "my migration didn't run" and their app has more than one
+migration source (an installed plugin, a second `AppBuilder::migrations(…)`
+call), a version collision alone is not the cause: the framework
+auto-resolves it (`compute_migration_disambiguation` inside
+`autumn_web::migrate`) by giving the losing migration a deterministic
+substitute version, so both still apply — logged at `INFO`
+("Migration version collision resolved automatically"), not an error. Check
+that log line, or `autumn migrate check-collisions`, if you suspect a
+collision; only a narrow ambiguous-history case on `SQLite` (adopting a
+pre-fork database whose applied history can't be safely rewritten) is
+rejected as a hard error.
+
+### `autumn test` — isolated test DB (unreleased — trunk-dev, issue #1056)
 
 `autumn test` resolves the test DB URL with the same precedence as
 `autumn migrate` (`AUTUMN_DATABASE__PRIMARY_URL` → `AUTUMN_DATABASE__URL` →
@@ -3915,9 +3949,16 @@ tests live in consolidated binaries (`autumn` → `integration_tests`,
 a `mod` line in `tests/integration/mod.rs`, not new `[[test]]` targets.
 
 CI also runs a feature-combination compile gate (35 `autumn-web` feature
-combos via `cargo hack`), a generator-conformance gate, and a plugin
+combos via `cargo hack`), a generator-conformance gate, a plugin
 freshness gate (`scripts/check-plugin-freshness.sh` — user-facing changelog
-entries must ship matching Claude-plugin updates).
+entries must ship matching Claude-plugin updates), and a changelog fragment
+gate (`scripts/check-changelog-fragments.sh`).
+
+Do not edit `CHANGELOG.md` in a PR. A release note goes in its own file,
+`changelog.d/<slug>.md`, holding the markdown the `## [Unreleased]` section
+holds: a `### <Kind>` heading and its bullets. Every PR used to write to the
+top of that section, so every PR conflicted with every other PR. See
+`changelog.d/README.md`.
 
 For docs or generated-app changes, also run the docs smoke procedure in
 `docs/guide/docs-smoke.md`. For public API changes, run doctests for the
@@ -3941,6 +3982,7 @@ touched crate so examples compile from an external-consumer perspective.
 - `CHANGELOG.md`
 - `RELEASE_NOTES.md`
 - `STABILITY.md`
+- `changelog.d/README.md` (where an unreleased note is written)
 - `docs/migrations/README.md` (per-release upgrade guides; `next.md` is the
   rolling draft for unreleased breaking changes)
 - `docs/release-checklist.md`

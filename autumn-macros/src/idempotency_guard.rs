@@ -793,7 +793,7 @@ fn path_matches(path: &syn::Path, expected: &[&str]) -> bool {
     // (already-finalized) output is rooted at instead (Codex review, #2552).
     let root_matches = if expected.first() == Some(&"autumn_web") {
         path.segments.first().is_some_and(|segment| {
-            segment.ident == crate::crate_path::current_target_path_segment()
+            segment.ident == autumn_macros_support::crate_path::current_target_path_segment()
         })
     } else {
         path.segments

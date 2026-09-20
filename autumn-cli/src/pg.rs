@@ -1897,12 +1897,27 @@ mod tests {
         // just appending an `sslmode=require` at the end regardless of
         // position) preserves whichever of the two actually comes last, the
         // same "last one wins" rule that already governs a connection
-        // string with two explicit `sslmode=` occurrences.
-        let sanitized = sanitize_db_url("postgres://host/db?ssl=true&sslmode=disable").unwrap();
-        let config: tokio_postgres::Config = sanitized.parse().unwrap();
-        assert_eq!(
-            config.get_ssl_mode(),
-            tokio_postgres::config::SslMode::Disable
+        // string with two explicit `sslmode=` occurrences. Scopes away
+        // PGSSLROOTCERT/PGSSLCERT/PGSSLKEY so an ambient/racing value set by
+        // another test's `temp_env` call (e.g.
+        // `sanitize_rejects_pgsslcert_env_var_in_url_form`) can't trip the
+        // sslcert/sslkey rejection instead of the translation this test is
+        // actually about.
+        temp_env::with_vars(
+            [
+                ("PGSSLROOTCERT", None::<&str>),
+                ("PGSSLCERT", None::<&str>),
+                ("PGSSLKEY", None::<&str>),
+            ],
+            || {
+                let sanitized =
+                    sanitize_db_url("postgres://host/db?ssl=true&sslmode=disable").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(
+                    config.get_ssl_mode(),
+                    tokio_postgres::config::SslMode::Disable
+                );
+            },
         );
     }
 
@@ -1914,9 +1929,22 @@ mod tests {
         // other `ssl=` value passes through unchanged here and only fails
         // once `tokio_postgres` itself tries to parse it (it has no `ssl`
         // keyword at all), the same as before this translation existed.
-        let sanitized = sanitize_db_url("postgres://host/db?ssl=false").unwrap();
-        let parsed: Result<tokio_postgres::Config, _> = sanitized.parse();
-        assert!(parsed.is_err());
+        // Scopes away PGSSLROOTCERT/PGSSLCERT/PGSSLKEY so an ambient/racing
+        // value set by another test's `temp_env` call can't trip the
+        // sslcert/sslkey rejection instead of the pass-through this test is
+        // actually about.
+        temp_env::with_vars(
+            [
+                ("PGSSLROOTCERT", None::<&str>),
+                ("PGSSLCERT", None::<&str>),
+                ("PGSSLKEY", None::<&str>),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres://host/db?ssl=false").unwrap();
+                let parsed: Result<tokio_postgres::Config, _> = sanitized.parse();
+                assert!(parsed.is_err());
+            },
+        );
     }
 
     #[test]

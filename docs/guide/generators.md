@@ -529,7 +529,7 @@ pub struct Post {
 
 | Generated file                   | Existing concept it maps to                            |
 | -------------------------------- | ------------------------------------------------------ |
-| `src/models/post.rs`             | The [`#[autumn_web::model]`](../../autumn-macros/src/model.rs) macro |
+| `src/models/post.rs`             | The [`#[autumn_web::model]`](../../autumn-macros-model/src/model.rs) macro |
 | `migrations/.../up.sql`          | Diesel migrations consumed by [`autumn migrate`](../../autumn-cli/src/migrate.rs) |
 | `src/schema.rs`                  | The Diesel `table!` block referenced by `#[model]`     |
 | `src/models/mod.rs`              | Standard Rust module aggregator                        |
@@ -1882,8 +1882,8 @@ autumn generate scaffold Bookmark url:String title:String tag:String alive:bool 
 
 | Generated file                        | Existing concept it maps to                                                                |
 | ------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `src/models/<name>.rs`                | [`#[autumn_web::model]`](../../autumn-macros/src/model.rs)                                 |
-| `src/repositories/<name>.rs`          | [`#[autumn_web::repository]`](../../autumn-macros/src/repository.rs)                       |
+| `src/models/<name>.rs`                | [`#[autumn_web::model]`](../../autumn-macros-model/src/model.rs)                                 |
+| `src/repositories/<name>.rs`          | [`#[autumn_web::repository]`](../../autumn-macros-repository/src/repository.rs)                       |
 | `src/routes/<plural>.rs`              | [`#[get]`/`#[post]` route macros](../../autumn-macros/src/route.rs) returning `Maud Markup` |
 | `src/main.rs` `routes![…]`            | The [`routes!` collection macro](../../autumn-macros/src/routes_macro.rs)                  |
 | `migrations/<ts>_create_<plural>/`    | Diesel migrations                                                                          |

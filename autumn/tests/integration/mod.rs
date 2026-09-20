@@ -207,6 +207,8 @@ mod mcp_secured_guard;
 mod mcp_streaming;
 #[cfg(feature = "mcp")]
 mod mcp_structured_query;
+#[cfg(feature = "mcp")]
+mod mcp_throttle_guard;
 mod middleware_introspection;
 mod middleware_pipeline;
 mod middleware_stack_depth;

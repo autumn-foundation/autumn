@@ -1439,34 +1439,55 @@ fn transaction_depth(conn: &mut RuntimeConnection) -> Result<u32, LedgerError> {
 }
 
 /// Write one transaction's postings, in the order they were supplied.
+///
+/// One multi-row `INSERT`, not one per posting (#1837 follow-up). Each
+/// `execute()` is its own parse-prepare-exec round trip, and a transaction can
+/// carry dozens of legs — a payroll run, a marketplace revenue split — that
+/// all belong to the same `INSERT`; the loop was paying that round-trip cost
+/// once per leg instead of once per transaction.
 async fn write_postings(
     conn: &mut RuntimeConnection,
     transaction_id: &str,
     transfer: &Transaction,
 ) -> Result<(), LedgerError> {
+    let postings = transfer.postings();
+    // Bounded by `MAX_POSTINGS`, already enforced by `Transaction::validate`
+    // (which `post` calls before this), so the string this builds is bounded
+    // too.
+    let mut values = String::with_capacity(postings.len().saturating_mul(24));
+    for i in 0..postings.len() {
+        if i > 0 {
+            values.push_str(", ");
+        }
+        let base = i.saturating_mul(5);
+        let _ = write!(
+            values,
+            "({}, {}, {}, {}, {}, {NOW})",
+            ph(base.saturating_add(1)),
+            ph(base.saturating_add(2)),
+            ph(base.saturating_add(3)),
+            ph(base.saturating_add(4)),
+            ph(base.saturating_add(5)),
+        );
+    }
     let sql = format!(
         "INSERT INTO {POSTINGS_TABLE} \
            (transaction_id, seq, account_id, amount_minor, currency, posted_at) \
-         VALUES ({}, {}, {}, {}, {}, {NOW})",
-        ph(1),
-        ph(2),
-        ph(3),
-        ph(4),
-        ph(5)
+         VALUES {values}"
     );
-    for (index, posting) in transfer.postings().iter().enumerate() {
+    let mut query = diesel::sql_query(sql).into_boxed();
+    for (index, posting) in postings.iter().enumerate() {
         let seq = i64::try_from(index).map_err(|_| LedgerError::PostingCount {
-            count: transfer.postings().len(),
+            count: postings.len(),
         })?;
-        diesel::sql_query(sql.clone())
-            .bind::<Text, _>(transaction_id)
+        query = query
+            .bind::<Text, _>(transaction_id.to_owned())
             .bind::<BigInt, _>(seq)
-            .bind::<Text, _>(posting.account_id())
+            .bind::<Text, _>(posting.account_id().to_owned())
             .bind::<BigInt, _>(posting.signed_minor()?)
-            .bind::<Text, _>(posting.amount().currency().code())
-            .execute(conn)
-            .await?;
+            .bind::<Text, _>(posting.amount().currency().code());
     }
+    query.execute(conn).await?;
     Ok(())
 }
 

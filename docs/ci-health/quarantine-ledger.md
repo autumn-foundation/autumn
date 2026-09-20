@@ -1454,3 +1454,144 @@ without also filling in the intake form above.
   clock-step vs. the better-supported worker-refresh race) actually fired —
   each iteration's log is uploaded individually so a failing one doesn't get
   lost in a combined tail.
+- **2026-09-20 update — Tier 1 baseline obtained: 1/50 (2%), same signature;
+  mechanism confirmed by source, not just hypothesis; deterministic fix
+  proposed in this pass's own PR.** `manual-job-tracking-rerun-check.yml` (PR
+  #2845, merged 2026-09-18T15:50Z) was dispatched twice against `trunk-dev`'s
+  tip that same day, both by the time this pass started, neither previously
+  folded into this entry: run 35364903427 failed at the checkout step (a bad
+  `sha` input, `dd664e8e21be34beddd5f9b27280fde1d86ab6d2` — 41 hex characters,
+  one too many — so `actions/checkout` never ran the test loop; 0 iterations
+  executed, not a data point). Run 35365077413, dispatched two minutes later
+  with a corrected `sha`, completed successfully end to end: **`RESULT: 1/50
+  failed, 49/50 passed`**. This is this entry's first same-commit Tier 1
+  rerun-rate baseline, superseding "n=2 organic, not yet campaigned."
+
+  The one failure, iteration 26 (log fetched via `get_job_logs` on job
+  105665441315), is the identical signature already tracked: panic
+  `"record should be past its configured TTL"` at
+  `autumn/tests/integration/job_tracking_stores_integration.rs:264:5`, inside
+  a fresh testcontainers Postgres container built for that iteration alone —
+  confirming the flake is reproducible in isolation, not an artifact of
+  running inside the full `integration_tests` binary alongside 2000+ other
+  tests.
+
+  **Mechanism, now confirmed by direct source reading rather than left as a
+  hypothesis**: `PgJobTrackingStore::update` (`autumn/src/job_tracking.rs`,
+  the `update` method) unconditionally executes
+  `UPDATE autumn_job_tracking SET record = ..., updated_at = $3, expires_at =
+  $4 WHERE key = $1` with `expires_at = self.expires_at(now) = now +
+  ttl_secs` on **every** call — both `mark_running` (called once the job
+  runtime picks up the enqueued job) and `settle_success` (called on
+  completion) route through it unconditionally, with no guard against
+  refreshing a record whose TTL clock the test has already started. This is
+  exactly the "worker-refresh" mechanism this entry already named as the
+  better-supported candidate; reading the store's own `update` method
+  directly (rather than reasoning about it secondhand) removes the
+  "hypothesis" qualifier the prior entries carried. The demoted clock-step
+  candidate remains structurally possible but is not needed to explain this
+  occurrence and was not separately re-investigated this pass.
+
+  **Test-vs-product verdict, rendered**: test defect, not a product defect.
+  Refreshing `expires_at` on every lifecycle write is deliberate, correct
+  store behavior — a job still being worked on should not expire out from
+  under it, the same conclusion this entry already reached when the
+  mechanism was still a hypothesis. The test's fixed
+  `tokio::time::sleep(1_200ms)`, measured from the enqueue-time read, assumes
+  nothing else touches the record before the sleep elapses; that assumption
+  is false whenever the runtime's own job dispatch (`mark_running` and/or
+  `settle_success`) lands inside that 1200ms window, which is a matter of
+  ordinary scheduling latency, not a race in the store.
+
+  **Fix, applied in this pass's own PR**: replaced the fixed sleep with a
+  poll loop (50ms interval, 5s deadline) that reads the tracked record back
+  and waits for `status` to reach a terminal value (`"succeeded"` or
+  `"failed"`) before starting the TTL sleep. Once the job reaches a terminal
+  status, `mark_running`/`settle_success` have made their last write for that
+  key (confirmed via `run_job_handler_inner` in `autumn/src/job.rs`: exactly
+  one `mark_running` call, one settle call, `max_attempts: 1` on the `noop`
+  job used here, no retry path), so nothing further touches `expires_at` and
+  the subsequent 1200ms sleep is racing nothing. This awaits the actual
+  condition (job completion) instead of guessing a sleep duration long enough
+  to usually outrun an unbounded dispatch latency — the fix this role's own
+  process always prefers over a raised timeout. The Redis sibling test
+  (lines 45-117) has the identical race in principle (its own TTL is set by
+  the backend on write, refreshed on every `update` call the same way) but no
+  organic hit has ever been recorded against it, so it was left unchanged
+  this pass rather than preemptively rewritten on no evidence of its own.
+
+  **Correction (post-review, via a Codex review comment on PR #2867): the
+  poll-for-terminal fix as first written replaced the race with a second,
+  load-dependent flake of its own.** `PgJobTrackingStore::update`'s own
+  `WHERE key = $1 AND expires_at > $2` guard means a lifecycle write is
+  silently a no-op once the row is already expired — so at the original
+  `ttl_secs: 1`, a `mark_running`/`settle_success` write delayed past one
+  second by ordinary Docker-CI-runner scheduler or database contention would
+  find its own write vetoed, `status` would stay `"pending"` forever, and
+  the poll loop would spin to its 5s deadline and panic — a scenario in
+  which the *original* fixed-sleep version would have passed. Caught on
+  review before this ever ran organically or through another rerun
+  campaign, not discovered empirically. Fixed by two changes together:
+  `ttl_secs` raised from 1 to 10 (comfortable margin over any realistic
+  in-process job-dispatch delay, so the write-guard is no longer plausibly
+  in the poll loop's way) with the poll deadline correspondingly capped at
+  8s (leaving margin under the TTL rather than racing it from the other
+  side); and the post-terminal wait no longer sleeps a fixed guess at all —
+  it queries `GREATEST(EXTRACT(EPOCH FROM (expires_at - NOW())), 0)` on the
+  row directly and sleeps exactly that plus a 300ms margin, so it is correct
+  regardless of how much of the 10s TTL the completion wait already
+  consumed, rather than assuming a fixed 1200ms is always enough. `cargo
+  check`/`cargo clippy -D warnings` clean against the `integration_tests`
+  target after this revision (same command as below, re-run).
+
+  **Verification status — not yet closed.** No Docker daemon is available in
+  this sandbox (confirmed: `docker ps` fails to reach
+  `/var/run/docker.sock`), so the fix could not be exercised against a real
+  Postgres container locally. Local verification obtained this pass, on
+  both the original and the corrected version of the fix: `cargo check -p
+  autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n,collab"
+  --test integration_tests` (clean, exit 0) and `cargo clippy` with the same
+  package/features/target plus `-- -D warnings` (clean, exit 0 — the only
+  warning printed is a pre-existing, unrelated `unknown lint:
+  clippy::unused_async_trait_impl` also seen on unrelated builds, not
+  introduced by this change). Neither exercises the container/timing path a
+  real rerun would. Per this role's
+  own bar, an after-measurement (0/N on the same harness) is required before
+  this entry closes, and that needs the fix merged to `trunk-dev` first
+  (`manual-job-tracking-rerun-check.yml` is `workflow_dispatch`-only and —
+  per the 2026-09-18 update above — only dispatchable against a workflow
+  already registered on the default branch). **Next step, for whichever pass
+  finds this PR merged**: dispatch `manual-job-tracking-rerun-check.yml` with
+  `iterations: "50"` again against `trunk-dev`'s new tip; 0/50 closes this
+  entry per the intake form above (the revert check for this fix is
+  structural, not a second rerun campaign: reverting the poll loop restores
+  the exact fixed-sleep race the 1/50 result above already reproduced, so a
+  clean 0/50 after the fix is itself the before/after comparison this role's
+  process calls for).
+
+  This pass's organic-hit sampling (2026-09-18T07:33:38Z exclusive to
+  2026-09-20T07:33:19Z, ~72h, two `perPage=100` pages, 200 runs: 143
+  cancelled/47 success/10 failure) found zero new organic hits on
+  `job_tracking_stores_integration` or any of the three `live_upgrade`
+  signatures/`cache_stampede`/`sim_fault_plan`. Of the 10 run-level failures:
+  2 predate this window (already counted in the 2026-09-18 report); 2 are
+  `dependabot/github_actions/dtolnay/rust-toolchain-1.120.0`'s own action-pin
+  bump breaking `MSRV (1.88.0)` and all three `Test (${{ matrix.os }})` jobs
+  on that same branch — squarely that PR's own subject matter, not merged so
+  not affecting anyone else's CI; 2 are `vesper/bugbash-2828-intentional-root`
+  and `claude/project-thread-bk4ejy`, each its own branch's `Clippy` failure
+  (the latter also failing `SQLite runtime`'s own clippy step) — ordinary WIP,
+  not re-triaged past job level given the pattern is already well-established
+  in this ledger; 1 is `dependabot/cargo/validator-0.21.0` repeating its
+  already-documented `fuzz/Cargo.lock` staleness; 1 is
+  `vesper/macro-crate-split` repeating its already-documented
+  in-progress-refactor multi-job break; `claude/stop-changelog-conflicts-0xp5f8`
+  and `claude/intelligent-wright-ebjkn4` were not individually triaged this
+  pass (time-boxed in favor of following through on the job_tracking result
+  above) — noted as a gap rather than silently assumed branch-owned.
+  `manual-macos-contention-check.yml`: still `total_count: 0` against
+  `workflow_dispatch` runs, checked 2026-09-20T~10:0xZ — **12th** straight
+  pass since it became dispatchable 2026-09-08T15:07:44Z (now ~283 hours
+  idle, past 11.5 days). Dispatching it needs a human sign-off for new macOS
+  CI spend per this role's own rules; not dispatched this pass for that
+  reason, flagged again rather than silently carried.
