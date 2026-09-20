@@ -91,6 +91,7 @@ pub async fn list_members(
             &pending_invitations,
             csrf_value(&csrf),
             None,
+            None,
             "",
             "member",
         ),
@@ -107,6 +108,14 @@ pub async fn list_members(
 /// sites (Wayfinder: error-path inventory — the same anti-pattern already
 /// fixed on `/signup` and `/invite/{token}/accept`, but reached through this
 /// form's `create_invitation` handler instead).
+///
+/// `email_error`/`role_error` are separate (rather than one shared
+/// `invite_error`) so each rejection marks `aria-invalid`/shows its message
+/// next to the field that actually caused it: an unrecognized role used to
+/// attach its message to the email input while the role `<select>` quietly
+/// fell back to its first option ("Member") with nothing marked invalid,
+/// misidentifying the field to fix and risking a resubmission that silently
+/// changes the intended role to Member (Codex review finding).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn members_content(
     can_manage: bool,
@@ -116,7 +125,8 @@ pub(crate) fn members_content(
     emails: &std::collections::HashMap<i64, String>,
     pending_invitations: &[Invitation],
     csrf_token: &str,
-    invite_error: Option<&str>,
+    email_error: Option<&str>,
+    role_error: Option<&str>,
     invite_email: &str,
     invite_role: &str,
 ) -> Markup {
@@ -131,16 +141,23 @@ pub(crate) fn members_content(
                         input name="email" type="email" required value=(invite_email)
                               placeholder="teammate@example.com"
                               aria-label="Email to invite"
-                              aria-invalid=(if invite_error.is_some() { "true" } else { "false" })
+                              aria-invalid=(if email_error.is_some() { "true" } else { "false" })
                               class="w-full border rounded px-3 py-2";
-                        @if let Some(error) = invite_error {
+                        @if let Some(error) = email_error {
                             p class="mt-1 text-sm text-red-600" role="alert" { (error) }
                         }
                     }
-                    select name="role" aria-label="Role" class="border rounded px-3 py-2" {
-                        option value="member" selected[invite_role == "member"] { "Member" }
-                        option value="admin" selected[invite_role == "admin"] { "Admin" }
-                        option value="owner" selected[invite_role == "owner"] { "Owner" }
+                    div {
+                        select name="role" aria-label="Role"
+                                aria-invalid=(if role_error.is_some() { "true" } else { "false" })
+                                class="border rounded px-3 py-2" {
+                            option value="member" selected[invite_role == "member"] { "Member" }
+                            option value="admin" selected[invite_role == "admin"] { "Admin" }
+                            option value="owner" selected[invite_role == "owner"] { "Owner" }
+                        }
+                        @if let Some(error) = role_error {
+                            p class="mt-1 text-sm text-red-600" role="alert" { (error) }
+                        }
                     }
                     button type="submit"
                            class="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700" {
@@ -441,6 +458,7 @@ mod tests {
             &[],
             "csrf-abc",
             None,
+            None,
             "",
             "member",
         )
@@ -448,17 +466,17 @@ mod tests {
         assert!(html.contains(r#"action="/invitations""#), "{html}");
         assert!(html.contains(r#"value="csrf-abc""#), "{html}");
         assert!(html.contains(r#"value="""#), "{html}");
-        assert!(html.contains(r#"aria-invalid="false""#), "{html}");
+        assert_eq!(html.matches(r#"aria-invalid="false""#).count(), 2, "{html}");
         assert!(!html.contains(r#"role="alert""#), "{html}");
         assert!(html.contains(r#"option value="member" selected"#), "{html}");
     }
 
-    /// A rejected invite (Wayfinder: error-path inventory) shows the message
-    /// next to the email field, flags it `aria-invalid`, and preserves both
-    /// the typed email and the selected role — the admin only has to fix the
-    /// one bad field, not re-enter the whole form.
+    /// A rejected email (Wayfinder: error-path inventory) shows the message
+    /// next to the email field, flags only that field `aria-invalid`, and
+    /// preserves both the typed email and the selected role — the admin
+    /// only has to fix the one bad field, not re-enter the whole form.
     #[test]
-    fn members_content_invite_form_shows_error_and_preserves_input() {
+    fn members_content_invite_form_shows_email_error_and_preserves_input() {
         let html = members_content(
             true,
             1,
@@ -468,23 +486,72 @@ mod tests {
             &[],
             "csrf-abc",
             Some("Enter a valid email address"),
+            None,
             "not-an-email",
             "admin",
         )
         .into_string();
         assert!(html.contains(r#"role="alert""#), "{html}");
         assert!(html.contains("Enter a valid email address"), "{html}");
-        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
         assert!(html.contains(r#"value="not-an-email""#), "{html}");
         assert!(html.contains(r#"option value="admin" selected"#), "{html}");
         assert!(
             !html.contains(r#"option value="member" selected"#),
             "{html}"
         );
+        // Only the email field is flagged invalid — the role select isn't.
+        let select_start = html.find("<select").expect("role select");
+        assert!(
+            html[..select_start].contains(r#"aria-invalid="true""#),
+            "{html}"
+        );
+        assert!(
+            html[select_start..].contains(r#"aria-invalid="false""#),
+            "{html}"
+        );
+    }
+
+    /// A rejected role (Codex review finding on this PR: an unrecognized
+    /// role used to attach its error to the email field while the role
+    /// `<select>` silently fell back to "Member" with nothing marked
+    /// invalid) must flag the *role* field, not the email field, and leave
+    /// the email untouched.
+    #[test]
+    fn members_content_invite_form_shows_role_error_on_role_field() {
+        let html = members_content(
+            true,
+            1,
+            Role::Owner,
+            &[],
+            &empty_emails(),
+            &[],
+            "csrf-abc",
+            None,
+            Some("Unknown role"),
+            "newbie@acme.test",
+            "super-admin",
+        )
+        .into_string();
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("Unknown role"), "{html}");
+        assert!(html.contains(r#"value="newbie@acme.test""#), "{html}");
+        // The email field must not be flagged invalid — only the role is.
+        let email_input_start = html.find(r#"name="email""#).expect("email input");
+        let select_start = html.find("<select").expect("role select");
+        assert!(
+            html[email_input_start..select_start].contains(r#"aria-invalid="false""#),
+            "{html}"
+        );
+        assert!(
+            html[select_start..].contains(r#"aria-invalid="true""#),
+            "{html}"
+        );
+        // No option matches "super-admin"; none should render as selected.
+        assert!(!html.contains("selected"), "{html}");
     }
 
     /// A non-Admin viewer never sees the invite form at all, error or not —
-    /// `can_manage` gates it independently of `invite_error`.
+    /// `can_manage` gates it independently of the error fields.
     #[test]
     fn members_content_hides_invite_form_when_caller_cannot_manage() {
         let html = members_content(
@@ -495,6 +562,7 @@ mod tests {
             &empty_emails(),
             &[],
             "csrf-abc",
+            None,
             None,
             "",
             "member",

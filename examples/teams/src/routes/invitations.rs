@@ -83,14 +83,18 @@ fn app_base_url() -> String {
     std::env::var("APP_BASE_URL").unwrap_or_else(|_| "http://localhost:3000".to_owned())
 }
 
-/// Redisplay the members page at 422 with `message` shown next to the email
-/// field and the submitted email/role preserved, instead of the generic
-/// JSON/error-page response a bare `Err(...)` would produce. Every call site
-/// in [`create_invitation`] runs after `require_role(Role::Admin)` already
-/// succeeded, so the management controls always render (Wayfinder:
-/// error-path inventory — the same anti-pattern already fixed on
-/// `routes::auth::signup` and this module's own
-/// [`redisplay_accept_signup`], reached here through a different form).
+/// Redisplay the members page at 422 with the rejected field's message shown
+/// next to *that* field and the submitted email/role preserved, instead of
+/// the generic JSON/error-page response a bare `Err(...)` would produce.
+/// Every call site in [`create_invitation`] runs after
+/// `require_role(Role::Admin)` already succeeded, so the management
+/// controls always render (Wayfinder: error-path inventory — the same
+/// anti-pattern already fixed on `routes::auth::signup` and this module's
+/// own [`redisplay_accept_signup`], reached here through a different form).
+///
+/// Exactly one of `email_error`/`role_error` is `Some` per call site — see
+/// `members_content`'s doc comment for why they're kept separate rather
+/// than one shared flag (Codex review finding).
 #[allow(clippy::too_many_arguments)]
 async fn redisplay_members(
     db: &mut Db,
@@ -100,7 +104,8 @@ async fn redisplay_members(
     csrf: &Option<CsrfToken>,
     invite_email: &str,
     invite_role: &str,
-    message: &str,
+    email_error: Option<&str>,
+    role_error: Option<&str>,
 ) -> AutumnResult<Response> {
     let memberships = membership_repo.find_all().await?;
     let pending_invitations: Vec<Invitation> = invitation_repo
@@ -127,7 +132,8 @@ async fn redisplay_members(
                 &emails,
                 &pending_invitations,
                 csrf_value(csrf),
-                Some(message),
+                email_error,
+                role_error,
                 invite_email,
                 invite_role,
             ),
@@ -173,7 +179,8 @@ pub async fn create_invitation(
             &csrf,
             &form.email,
             &form.role,
-            "Enter a valid email address",
+            Some("Enter a valid email address"),
+            None,
         )
         .await;
     }
@@ -186,7 +193,8 @@ pub async fn create_invitation(
             &csrf,
             &form.email,
             &form.role,
-            "Unknown role",
+            None,
+            Some("Unknown role"),
         )
         .await;
     };
@@ -305,7 +313,8 @@ pub async fn create_invitation(
                 &csrf,
                 &email,
                 role.as_str(),
-                "An invitation to this email is already pending for this organization",
+                Some("An invitation to this email is already pending for this organization"),
+                None,
             )
             .await;
         }
