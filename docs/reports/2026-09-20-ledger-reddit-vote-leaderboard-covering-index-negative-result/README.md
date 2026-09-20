@@ -3,9 +3,11 @@
 ## 🎯 Workload
 
 `examples/reddit-clone`'s front page (`GET /`, `routes::posts::front_page`,
-`examples/reddit-clone/src/routes/posts.rs:80-179`) issues three statements: the
-hot-posts listing (`ORDER BY hot_rank DESC LIMIT 25`), the "Top posts by votes"
-leaderboard (`VoteRepository::sum_value_grouped_by_post_id().order_by_aggregate_desc().limit(5)`,
+`examples/reddit-clone/src/routes/posts.rs:80-179`) issues five statements:
+the hot-posts listing (`ORDER BY hot_rank DESC LIMIT 25`), the batched
+`preload(author().subreddit())` for that page of posts (two `id = ANY(...)`
+belongs-to lookups, `posts.rs:176-179`), the "Top posts by votes" leaderboard
+(`VoteRepository::sum_value_grouped_by_post_id().order_by_aggregate_desc().limit(5)`,
 `examples/reddit-clone/src/repositories.rs:86-90`), and a small `id = ANY(...)`
 title lookup for the leaderboard's 5 winners.
 
@@ -14,15 +16,20 @@ instance (schema replayed from `examples/reddit-clone/migrations/`, no
 Docker available in this environment — `pg_stat_statements` loaded via
 `shared_preload_libraries` on a local `postgresql@16` cluster instead of a
 testcontainer): 20,000 users, 50 subreddits, 30,000 posts, 15,000 comments,
-733,609 votes with realistic power-law skew (a long tail of 0-3 organic votes
-per post, plus 200 "hot" posts absorbing the bulk of the volume — 688,614
-post-directed votes, 44,995 comment-directed votes with `NULL post_id`, so
-the leaderboard's `IS NOT NULL` group guard has real rows to exclude, not a
-vacuous predicate). ~5% of existing post votes had their value flipped after
-the bulk load (the same mutation `Post::react()` performs on a changed vote)
-to produce real dead tuples, then `VACUUM` (not `FULL`) + `ANALYZE` models
-the steady state autovacuum reaches on a live table, rather than a pristine
-just-loaded one.
+378,446 votes with real power-law skew (200 "hot" posts, ids 1-200, absorb
+heavy volume from up to 300,000 distinct-user votes; the other 29,800 "cold"
+posts each get 0-3 organic votes from distinct random users, including
+plenty of posts with zero — 333,448 post-directed votes, 44,998
+comment-directed votes with `NULL post_id`, so the leaderboard's
+`IS NOT NULL` group guard has real rows to exclude, not a vacuous
+predicate). `setseed()` makes the fixture fully deterministic — the same
+seed produces the same rows, and therefore the same leaderboard winners,
+on every run; the harness reads those winners back out of the data rather
+than hard-coding ids. ~5% of existing post votes had their value flipped
+after the bulk load (the same mutation `Post::react()` performs on a
+changed vote) to produce real dead tuples, then `VACUUM` (not `FULL`) +
+`ANALYZE` models the steady state autovacuum reaches on a live table,
+rather than a pristine just-loaded one.
 
 Reproduce (no Docker required — points at any reachable Postgres 16):
 
@@ -40,19 +47,28 @@ psql -d reddit_ledger -f docs/reports/2026-09-20-ledger-reddit-vote-leaderboard-
 
 ## 📈 Profile
 
-`pg_stat_statements`, reset immediately before the three front-page
-statements ran once each:
+`pg_stat_statements`, reset immediately before the five front-page
+statements ran once each (the two `array_agg`-wrapped queries that recover
+the seeded fixture's actual hot-post ids and leaderboard winners run
+*before* the reset, so they never appear in this profile — they are not
+statements `front_page` itself issues):
 
-| statement | calls | shared_blks_hit | shared_blks_read | total buffers | % of page's buffers |
-|---|---:|---:|---:|---:|---:|
-| leaderboard: `SUM(value) GROUP BY post_id ... LIMIT 5` | 1 | 5,656 | 749 | **6,405** | **99.30%** |
-| hot-posts listing: `ORDER BY hot_rank DESC LIMIT 25` | 1 | 0 | 27 | 27 | 0.42% |
-| title lookup: `id = ANY($1..$5)` | 1 | 18 | 0 | 18 | 0.28% |
+| statement | calls | total buffers | % of page's buffers |
+|---|---:|---:|---:|
+| leaderboard: `SUM(value) GROUP BY post_id ... LIMIT 5` | 1 | **3,294** | **96.57%** |
+| preload: `SELECT * FROM users WHERE id = ANY(...)` | 1 | 77 | 2.26% |
+| hot-posts listing: `ORDER BY hot_rank DESC LIMIT 25` | 1 | 27 | 0.79% |
+| title lookup: `id = ANY(...)` (leaderboard winners) | 1 | 12 | 0.35% |
+| preload: `SELECT * FROM subreddits WHERE id = ANY(...)` | 1 | 1 | 0.03% |
 
-The leaderboard query is the front page's cost, by two orders of magnitude —
-comfortably clears the "≥5% of total buffers" bar. The other two statements
-are cheap, correctly-indexed point/range lookups (`idx_posts_hot_rank`,
-primary-key `ANY`) and are not touched by this report.
+The leaderboard query is the front page's cost by nearly two orders of
+magnitude — comfortably clears the "≥5% of total buffers" bar. The other
+four statements are cheap, correctly-indexed point/batched lookups
+(`idx_posts_hot_rank`, primary-key `ANY`) and are not touched by this
+report. (The two `preload()` statements are approximated from the schema —
+plain `belongs_to`, no soft-delete/tenant guard on either `users` or
+`subreddits` — not verified byte-identical against the preload macro's
+codegen the way the leaderboard query is, below.)
 
 ## 🧭 Plan
 
@@ -60,10 +76,10 @@ primary-key `ANY`) and are not touched by this report.
 `baseline/output.txt`): `Limit -> Sort (top-N heapsort) -> Finalize
 HashAggregate -> Gather (2 workers) -> Partial HashAggregate -> Parallel Seq
 Scan on votes, Filter: (votes.post_id IS NOT NULL)`. `Rows Removed by
-Filter: 14998` against `229,538` rows returned per worker-loop — the
-`post_id IS NOT NULL` predicate matches 93.9% of the table (688,614 of
-733,609 rows), so this is a near-full-table aggregate by construction, not a
-selective lookup.
+Filter: 14999` against `111,149` rows returned per worker-loop — the
+`post_id IS NOT NULL` predicate matches 88.1% of the table (333,448 of
+378,446 rows), so this is a near-full-table aggregate by construction, not
+a selective lookup.
 
 ## 💡 Hypothesis
 
@@ -83,8 +99,8 @@ Added `CREATE INDEX idx_votes_post_id_value_covering ON votes (post_id)
 INCLUDE (value) WHERE post_id IS NOT NULL;`, `ANALYZE`d, then re-ran the
 identical leaderboard query with `pg_stat_statements` reset.
 
-**The planner did not use it.** Buffers after adding the index: 6,402 —
-statistically the same as baseline's 6,405 (`after/output.txt`), and
+**The planner did not use it.** Buffers after adding the index: 3,294 —
+identical to baseline's 3,294 (`after/output.txt`), and
 `pg_stat_user_indexes.idx_scan` for `idx_votes_post_id_value_covering` is
 **0**. `EXPLAIN` confirms the plan is unchanged: still `Parallel Seq Scan on
 votes`.
@@ -93,31 +109,33 @@ Forcing the issue (`SET enable_seqscan = off` — diagnostic only, never
 shipped, not a fix per this repo's own banned-changes list) does make
 Postgres pick `Parallel Index Only Scan using
 idx_votes_post_id_value_covering`, `Heap Fetches: 0`, and its buffer count
-*is* genuinely lower — `shared hit=3 read=2641` = 2,644 total, a 58.7%
-reduction versus the seq-scan plan's 6,402-6,405. So the index isn't
-inert — the planner's cost model just correctly judges the seq scan cheaper
-at this selectivity (93.9% of the table matches the guard), and it is right
-to: an index nothing ever chooses is a pure write tax on every vote insert,
+*is* genuinely lower — `shared hit=3 read=1280` = 1,283 total, a 61.1%
+reduction versus the seq-scan plan's 3,294. So the index isn't inert — the
+planner's cost model just correctly judges the seq scan cheaper at this
+selectivity (88.1% of the table matches the guard), and it is right to: an
+index nothing ever chooses is a pure write tax on every vote insert,
 forever, for a benefit this workload never collects.
 
 The index was **dropped** after the comparison (`after/output.txt`'s final
 `DROP INDEX` + the empty-of-it `pg_stat_user_indexes` listing that follows
-it). Nothing in this repository is changed by this report.
+it). Nothing in this repository's runtime behavior is changed by this
+report — only the report itself and a doc-comment cross-reference in
+`examples/reddit-clone/src/repositories.rs` are added.
 
 ## 📊 Measurement
 
 | | total buffers (hit+read) | Δ vs baseline | `idx_scan` | plan |
 |---|---:|---:|---:|---|
-| baseline (no covering index) | 6,405 | — | n/a | Parallel Seq Scan |
-| after (covering index present, unforced) | 6,402 | **-0.05%** | **0** | Parallel Seq Scan (unchanged) |
-| after, forced (`enable_seqscan=off`, diagnostic only) | 2,644 | -58.7% | n/a | Parallel Index Only Scan, Heap Fetches: 0 |
+| baseline (no covering index) | 3,294 | — | n/a | Parallel Seq Scan |
+| after (covering index present, unforced) | 3,294 | **0%** | **0** | Parallel Seq Scan (unchanged) |
+| after, forced (`enable_seqscan=off`, diagnostic only) | 1,283 | -61.1% | n/a | Parallel Index Only Scan, Heap Fetches: 0 |
 
 Tool: `pg_stat_statements` (`shared_blks_hit + shared_blks_read`) and
-`pg_stat_user_indexes.idx_scan`, both reset/read within the same `psql`
-session as the query they measure.
+`pg_stat_user_indexes.idx_scan`, both read within the same `psql` session as
+the query they measure.
 
 This does **not** clear the impact floor: the shipped state (no forcing) is
-a 0.05% buffer change, and the index that would unlock the forced 58.7% is
+a 0% buffer change, and the index that would unlock the forced 61.1% is
 never chosen, so its "elimination" of the seq scan doesn't happen. Per this
 repo's own VERIFY step — "Confirm the new index is actually used: `idx_scan`
 incremented in `pg_stat_user_indexes`. A created-but-unused index is a pure
@@ -146,7 +164,8 @@ psql -d reddit_ledger -f docs/reports/2026-09-20-ledger-reddit-vote-leaderboard-
 Raw output: `baseline/output.txt` (profile + `EXPLAIN` before), `after/output.txt`
 (index added, unforced plan unchanged + `idx_scan=0`, forced comparison, then
 dropped). Fixture: `fixture/seed.sql` (+ `fixture/seed_output.txt`, one
-concrete run's row counts).
+concrete run's row counts — reproducible byte-for-byte thanks to
+`setseed()`).
 
 ## Other candidates ruled out this run
 
@@ -161,3 +180,36 @@ already claimed by open PR #2827 ("batch cms `set_post_terms`'s `lock_terms`
 loop"), so it wasn't duplicated here. No other unclaimed N+1 of meaningful
 production scale was found; this codebase's example apps and framework
 crates are, at this point, unusually well-batched.
+
+## Revision note
+
+The first version of this report and fixture had three defects, caught in
+review:
+
+1. The profile omitted `front_page`'s `preload()` statements, so the
+   reported percentage was of an incomplete subset of the page's buffers,
+   not the whole page. Fixed — `preload()`'s two statements are now in the
+   profile (they're a combined 2.29% of page buffers, not enough to change
+   the conclusion).
+2. The title-lookup query's `id = ANY(...)` literal was hand-copied from
+   one fixture run and went stale the moment the (then-unseeded) fixture
+   regenerated with different random data, so it no longer exercised the
+   real leaderboard-winner ids. Fixed two ways: the fixture is now
+   `setseed()`-deterministic, and the harness reads the actual winners back
+   out of the data (`\gset`) instead of hard-coding them, so this can't
+   drift again regardless of future fixture changes.
+3. The "long tail" vote generator drew 400,000 uniform `(user, post)` pairs
+   over 30,000 posts (~13.3 votes/post on average, not the documented 0-3),
+   because `generate_series(1, floor(random() * 4)::int)` inside a
+   `LATERAL` join doesn't force per-outer-row evaluation when its argument
+   doesn't reference an outer column — Postgres decorrelates it and
+   evaluates the random bound *once* for the whole join, applying that
+   single draw to every post. Fixed by materializing the per-post count in
+   its own subquery column first, so the `LATERAL` genuinely references
+   `pc.n_votes` per row and can't be hoisted; the fixture now produces the
+   documented 0-3-per-cold-post long tail (see `fixture/seed.sql`'s
+   comment for the mechanism). The corrected, smaller `votes` table
+   (378,446 rows vs. the first version's 733,609) changes the absolute
+   buffer counts above but not the conclusion — the leaderboard is still
+   ~97% of page buffers, still near-full-table by selectivity, and the
+   covering index is still never chosen by the planner.
