@@ -24,7 +24,7 @@ pub fn infer_table_name(ident: &syn::Ident) -> String {
 /// English pluraliser for a single word: irregulars, sibilant endings
 /// (`+es`), consonant+`y` (`y` → `ies`), otherwise `+s`.
 ///
-/// This is a FAITHFUL copy of [`autumn_web::format::pluralize_word`], which is
+/// This is a FAITHFUL copy of `autumn_web::format::pluralize_word`, which is
 /// the canonical implementation (see `autumn/src/format.rs::pluralize_word`).
 /// It MUST stay in sync with that function: the CLI scaffold's `src/schema.rs`
 /// pluralises table names through `autumn_web::format::pluralize_word` (via

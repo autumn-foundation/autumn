@@ -350,7 +350,7 @@ fn consume_unrecognized_meta(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Resu
 /// The serde attributes on an enum variant, read for `rename` / `skip`.
 ///
 /// Mirrors [`field_serde_serialize_rename`] but over a
-/// [`syn::Variant`](syn::Variant)'s attribute list.
+/// [`syn::Variant`]'s attribute list.
 /// Does this variant carry a `#[serde(alias = "…")]`?
 ///
 /// `alias` is deserialize-only: it adds an accepted input spelling without
@@ -358,7 +358,7 @@ fn consume_unrecognized_meta(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Resu
 /// in a single schema serving both directions, so the derive refuses it
 /// (issue #802).
 ///
-/// Routed through [`consume_unrecognized_meta`] like every other scanner here,
+/// Routed through `consume_unrecognized_meta` like every other scanner here,
 /// so a sibling list-valued attribute — `#[serde(bound(deserialize = "…"),
 /// alias = "legacy")]` — cannot abort the walk before `alias` is reached.
 #[must_use]

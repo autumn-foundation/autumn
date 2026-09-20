@@ -27,8 +27,8 @@
 //! [`current_target`] directly, so they construct the resolved string from
 //! the start rather than needing a later post-hoc rewrite.
 //!
-//! Beyond generated code, several modules ([`crate::idempotency_guard`],
-//! [`crate::agent_authority`], [`crate::mailer`], [`crate::ws`]) *recognize*
+//! Beyond generated code, several `autumn-macros` modules
+//! (`idempotency_guard`, `agent_authority`, `mailer`, `ws`) *recognize*
 //! `::autumn_web`-rooted paths — e.g. to detect that an earlier-expanded
 //! stacked macro (`#[authorize]` before `#[secured]`) already injected a
 //! particular guard call, so a later macro doesn't duplicate or miss it. Once
@@ -358,7 +358,7 @@ fn raw_escape(target: &str) -> (bool, &str) {
 /// Escaped for embedding inside a string literal that gets re-parsed as a
 /// path — the shape `#[serde(crate = "...")]` and
 /// `#[serde(deserialize_with = "...")]` need (`model.rs`, `event.rs`), since
-/// those never pass through the token rewrite [`ident_for_target`] backs
+/// those never pass through the token rewrite `ident_for_target` backs
 /// (see the module doc).
 #[must_use]
 pub fn escaped_target_path_segment(target: &str) -> String {
@@ -377,7 +377,7 @@ pub fn escaped_target_path_segment(target: &str) -> String {
 /// once a keyword rename is in play. A raw identifier `Ident` (`r#type`)
 /// compares equal to the *escaped* string `"r#type"`, not the bare `"type"`
 /// — using [`current_target`] directly here has the same effect as skipping
-/// this module's own [`ident_for_target`] when *emitting* the identifier:
+/// this module's own `ident_for_target` when *emitting* the identifier:
 /// both silently produce a token that no longer matches what it's supposed
 /// to (Codex review, #2552, round 2 of the keyword-rename fix — this
 /// recognizer side was still comparing against the bare name after the
