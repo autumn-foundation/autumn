@@ -92,8 +92,13 @@ HashAggregate -> Gather (2 workers) -> Partial HashAggregate -> Parallel Seq
 Scan on votes, Filter: (votes.post_id IS NOT NULL)`. `Rows Removed by
 Filter: 14999` against `111,149` rows returned per worker-loop — the
 `post_id IS NOT NULL` predicate matches 88.1% of the table (333,448 of
-378,446 rows), so this is a near-full-table aggregate by construction, not
-a selective lookup.
+378,446 rows), so in this fixture's vote mix this is a near-full-table
+aggregate, not a selective lookup. That 88.1% is a property of this
+fixture's post-vote-to-comment-vote ratio, not a schema guarantee — `votes`
+permits either target, and nothing enforces this proportion in production.
+A deployment where comment votes are a much larger share of the table would
+see a more selective guard, and the conclusion below should be re-measured
+against real data before assuming it still holds.
 
 ## 💡 Hypothesis
 

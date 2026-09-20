@@ -84,13 +84,17 @@ pub trait PostRepository {
 // `leaderboard_grouped_aggregate_still_works_after_react` in
 // `tests/votable_pg_integration.rs`.
 //
-// This is a near-full-table scan by construction (`post_id IS NOT NULL`
-// matches the vast majority of `votes` rows), and it's already been checked:
-// a partial covering index — `(post_id) INCLUDE (value) WHERE post_id IS NOT
-// NULL` — does not get chosen by the planner at that selectivity, so it
-// isn't here. See
+// Checked once already: in a production-shaped fixture where post-directed
+// votes were 88.1% of the table (comment votes, which this guard excludes,
+// were a small minority), `post_id IS NOT NULL` was selective enough that a
+// partial covering index — `(post_id) INCLUDE (value) WHERE post_id IS NOT
+// NULL` — never got chosen by the planner over the seq scan. That is a
+// property of *that* vote mix, not a guarantee: a deployment where comment
+// votes are a much larger share of `votes` would see a more selective guard,
+// and the index could earn its keep there. Re-measure against real data
+// before concluding either way — don't just reason from this comment. See
 // `docs/reports/2026-09-20-ledger-reddit-vote-leaderboard-covering-index-negative-result/`
-// before trying another index on this query.
+// for the methodology and the fixture's exact ratio.
 #[autumn_web::repository(Vote, table = "votes")]
 pub trait VoteRepository {
     /// SUM(value) GROUP BY post_id -> `Vec<(post_id, Option<sum>)>`.
