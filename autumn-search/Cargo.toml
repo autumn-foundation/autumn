@@ -45,5 +45,9 @@ tempfile = "3"
 name = "keyword_search"
 harness = false
 
+[[bench]]
+name = "vector_search"
+harness = false
+
 [lints]
 workspace = true
