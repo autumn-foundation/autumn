@@ -21,11 +21,11 @@ instance (schema replayed from `examples/reddit-clone/migrations/`, no
 Docker available in this environment — `pg_stat_statements` loaded via
 `shared_preload_libraries` on a local `postgresql@16` cluster instead of a
 testcontainer): 20,000 users, 50 subreddits, 30,000 posts, 15,000 comments,
-378,446 votes with a real two-tier cardinality gap (not a smooth power-law
+378,338 votes with a real two-tier cardinality gap (not a smooth power-law
 curve — 200 "hot" posts, ids 1-200, absorb heavy, roughly-uniform-among-
 themselves volume from up to 300,000 distinct-user votes; the other 29,800
 "cold" posts each independently get 0-3 organic votes from distinct random
-users, including plenty of posts with zero — 333,448 post-directed votes, 44,998
+users, including plenty of posts with zero — 333,340 post-directed votes, 44,998
 comment-directed votes with `NULL post_id`, so the leaderboard's
 `IS NOT NULL` group guard has real rows to exclude, not a vacuous
 predicate). `setseed()` (plus a `REPEATABLE` seed on the one `TABLESAMPLE`
@@ -96,10 +96,10 @@ statements `front_page` itself issues):
 
 | statement | calls | total buffers | % of page's buffers |
 |---|---:|---:|---:|
-| leaderboard: `SUM(value) GROUP BY post_id ... LIMIT 5` | 1 | **3,293** | **96.46%** |
-| preload: `SELECT * FROM users WHERE id = ANY(...)` | 1 | 77 | 2.26% |
+| leaderboard: `SUM(value) GROUP BY post_id ... LIMIT 5` | 1 | **3,292** | **96.40%** |
+| preload: `SELECT * FROM users WHERE id = ANY(...)` | 1 | 77 | 2.25% |
 | hot-posts listing: `ORDER BY hot_rank DESC LIMIT 25` | 1 | 27 | 0.79% |
-| title lookup: `id = ANY(...)` (leaderboard winners) | 1 | 12 | 0.35% |
+| title lookup: `id = ANY(...)` (leaderboard winners) | 1 | 14 | 0.41% |
 | flag lookup: `autumn_feature_flags WHERE key = $1` | 1 | 2 | 0.06% |
 | runtime-config lookup: `autumn_runtime_config_values WHERE key = $1` | 1 | 2 | 0.06% |
 | preload: `SELECT * FROM subreddits WHERE id = ANY(...)` | 1 | 1 | 0.03% |
@@ -122,9 +122,9 @@ either key skips that lookup entirely.)
 `baseline/output.txt`): `Limit -> Sort (top-N heapsort) -> Finalize
 HashAggregate -> Gather (2 workers) -> Partial HashAggregate -> Parallel Seq
 Scan on votes, Filter: (votes.post_id IS NOT NULL)`. `Rows Removed by
-Filter: 14999` against `111,149` rows returned per worker-loop — the
-`post_id IS NOT NULL` predicate matches 88.1% of the table (333,448 of
-378,446 rows), so in this fixture's vote mix this is a near-full-table
+Filter: 14999` against `111,113` rows returned per worker-loop — the
+`post_id IS NOT NULL` predicate matches 88.1% of the table (333,340 of
+378,338 rows), so in this fixture's vote mix this is a near-full-table
 aggregate, not a selective lookup. That 88.1% is a property of this
 fixture's post-vote-to-comment-vote ratio, not a schema guarantee — `votes`
 permits either target, and nothing enforces this proportion in production.
@@ -150,8 +150,8 @@ Added `CREATE INDEX idx_votes_post_id_value_covering ON votes (post_id)
 INCLUDE (value) WHERE post_id IS NOT NULL;`, `ANALYZE`d, then re-ran the
 identical leaderboard query with `pg_stat_statements` reset.
 
-**The planner did not use it.** Buffers after adding the index: 3,293 —
-identical to baseline's 3,293 (`after/output.txt`), and
+**The planner did not use it.** Buffers after adding the index: 3,292 —
+identical to baseline's 3,292 (`after/output.txt`), and
 `pg_stat_user_indexes.idx_scan` for `idx_votes_post_id_value_covering` is
 **0**. `EXPLAIN` confirms the plan is unchanged: still `Parallel Seq Scan on
 votes`.
@@ -161,15 +161,15 @@ shipped, not a fix per this repo's own banned-changes list) does make
 Postgres pick `Parallel Index Only Scan using
 idx_votes_post_id_value_covering`, `Heap Fetches: 0`, and its buffer count
 *is* genuinely lower — `shared hit=3 read=1280` = 1,283 total, a 61.0%
-reduction versus the seq-scan plan's 3,293. So the index isn't inert.
+reduction versus the seq-scan plan's 3,292. So the index isn't inert.
 
 To be precise about what that does and doesn't establish: `after/output.txt`
 also records `Execution Time:` for both plans (lines 90 and 134) — in the
-exact output committed here, 36.989 ms unforced (seq scan) versus 29.793 ms
+exact output committed here, 39.402 ms unforced (seq scan) versus 29.779 ms
 forced (index-only). Re-running this identical script (or an equivalent
 version of it) several times during this report's review produced 43.9/30.6
 ms, 42.5/41.8 ms (essentially a tie), 44.6/30.7 ms, 44.1/29.6 ms, 50.4/35.2
-ms, 42.7/29.7 ms, and 37.0/29.8 ms — the gap between the two plans swings
+ms, 42.7/29.7 ms, 37.0/29.8 ms, and 39.4/29.8 ms — the gap between the two plans swings
 from "roughly tied" to "index ~30% faster" across otherwise-identical runs,
 which is
 itself the reason this project gates `EXPLAIN ANALYZE` timing on a `>2×`
@@ -199,8 +199,8 @@ report — only the report itself and a doc-comment cross-reference in
 
 | | total buffers (hit+read) | Δ vs baseline | `idx_scan` | plan |
 |---|---:|---:|---:|---|
-| baseline (no covering index) | 3,293 | — | n/a | Parallel Seq Scan |
-| after (covering index present, unforced) | 3,293 | **0%** | **0** | Parallel Seq Scan (unchanged) |
+| baseline (no covering index) | 3,292 | — | n/a | Parallel Seq Scan |
+| after (covering index present, unforced) | 3,292 | **0%** | **0** | Parallel Seq Scan (unchanged) |
 | after, forced (`enable_seqscan=off`, diagnostic only) | 1,283 | -61.0% | n/a | Parallel Index Only Scan, Heap Fetches: 0 |
 
 Tool: `pg_stat_statements` (`shared_blks_hit + shared_blks_read`) and
@@ -447,3 +447,35 @@ A ninth review round caught one more missing statement:
     (0.06% of page buffers, same as the flag lookup); the leaderboard is
     now 96.46% of a 7-statement, 3,414-buffer total (was 96.51% of 6) —
     conclusion unaffected.
+
+A tenth review round caught a determinism bug in the fixture, no fixture
+scale or ratio change:
+
+17. All three vote-insert statements used `SELECT DISTINCT ON (u, p) u, p,
+    (CASE WHEN random() < X THEN 1 ELSE -1 END)::smallint` with no
+    `ORDER BY` — Postgres documents `DISTINCT ON` without an `ORDER BY` as
+    picking an unpredictable row among ties, and the hot-post draw in
+    particular produces many duplicate `(u, p)` pairs, each with its own
+    independent `random()` call for `value`. Which duplicate's value
+    survives was therefore undefined, meaning the exact vote totals — and
+    potentially the leaderboard's top-5 winners — were not actually pinned
+    by `setseed()` the way the rest of this report claims, despite every
+    other value being deterministic. Fixed: restructured all three inserts
+    (cold-post votes, hot-post votes, comment votes) to deduplicate the
+    `(u, p)`/`(u, c)` pair first via a plain `SELECT DISTINCT` (unambiguous,
+    since a duplicate row is identical to its sibling before `value` is
+    computed — there's no extra column to arbitrate between), then draw
+    `value` once per already-unique pair in the outer `SELECT`, so there is
+    never a second candidate value for the same key to lose track of. Re-ran
+    the full pipeline: total votes shifted slightly (378,338 vs. the prior
+    round's 378,446 — the old, non-deterministic dedup could keep or drop a
+    handful of colliding pairs differently run to run; the ~88.1%
+    post-vote/comment-vote split this report's conclusion depends on is
+    unchanged) and the leaderboard's winners changed (ids 41/82/102/154/200,
+    not the prior round's 82/85/119/146/161 — expected, since the earlier
+    winners were never actually pinned). Buffers: leaderboard 3,292 (was
+    3,293, a one-page difference from the slightly smaller table), still
+    96.40% of page buffers; `idx_scan` for the covering index still 0 both
+    before and after adding it; forced index-only plan still 1,283 buffers,
+    a 61.0% reduction. Conclusion unaffected — this was a fixture-determinism
+    fix, not a measurement fix.

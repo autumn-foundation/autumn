@@ -90,36 +90,57 @@ FROM generate_series(1, 15000) AS n;
 -- evaluates it exactly *once* for the whole join, applying one random count
 -- to every post. Referencing `pc.n_votes` is a real correlation, so it
 -- can't be hoisted, and each post gets its own draw.
+-- `DISTINCT ON (u, p)` without an `ORDER BY` was dropped: Postgres documents
+-- that as picking an unpredictable row among ties, and the hot-post draw
+-- below produces plenty of duplicate (u, p) pairs, each with its own
+-- independent `random()` call for `value` -- the deduped-away rows and the
+-- surviving one could disagree, and which one survives is undefined. The
+-- pairs are deduped FIRST with a plain `SELECT DISTINCT u, p` (unambiguous:
+-- a duplicate row is identical to its sibling here, there's no extra column
+-- to arbitrate between), and `value` is drawn fresh, once per already-unique
+-- pair, in the outer SELECT -- there is never a second candidate value for
+-- the same key to lose track of.
 INSERT INTO votes (user_id, post_id, value)
-SELECT DISTINCT ON (u, p) u, p, (CASE WHEN random() < 0.85 THEN 1 ELSE -1 END)::smallint
+SELECT u, p, (CASE WHEN random() < 0.85 THEN 1 ELSE -1 END)::smallint
 FROM (
-    SELECT (1 + floor(random() * 20000))::bigint AS u, pc.id AS p
+    SELECT DISTINCT u, p
     FROM (
-        SELECT p.id, floor(random() * 4)::int AS n_votes
-        FROM posts p WHERE p.id > 200
-    ) pc
-    CROSS JOIN LATERAL generate_series(1, pc.n_votes) AS vote_n
-) t(u, p)
+        SELECT (1 + floor(random() * 20000))::bigint AS u, pc.id AS p
+        FROM (
+            SELECT p.id, floor(random() * 4)::int AS n_votes
+            FROM posts p WHERE p.id > 200
+        ) pc
+        CROSS JOIN LATERAL generate_series(1, pc.n_votes) AS vote_n
+    ) t(u, p)
+) dedup(u, p)
 ON CONFLICT (user_id, post_id) DO NOTHING;
 
--- Hot posts (ids 1-200): heavy additional vote volume (real skew).
+-- Hot posts (ids 1-200): heavy additional vote volume (real skew). Same
+-- dedupe-then-draw shape as the cold-post insert above, for the same reason.
 INSERT INTO votes (user_id, post_id, value)
-SELECT DISTINCT ON (u, p) u, p, (CASE WHEN random() < 0.9 THEN 1 ELSE -1 END)::smallint
+SELECT u, p, (CASE WHEN random() < 0.9 THEN 1 ELSE -1 END)::smallint
 FROM (
-    SELECT (1 + floor(random() * 20000))::bigint AS u,
-           (1 + floor(random() * 200))::bigint AS p
-    FROM generate_series(1, 300000)
-) t(u, p)
+    SELECT DISTINCT u, p
+    FROM (
+        SELECT (1 + floor(random() * 20000))::bigint AS u,
+               (1 + floor(random() * 200))::bigint AS p
+        FROM generate_series(1, 300000)
+    ) t(u, p)
+) dedup(u, p)
 ON CONFLICT (user_id, post_id) DO NOTHING;
 
--- Comment votes: NULL post_id, real rows for the leaderboard's guard to exclude.
+-- Comment votes: NULL post_id, real rows for the leaderboard's guard to
+-- exclude. Same dedupe-then-draw shape as the two vote inserts above.
 INSERT INTO votes (user_id, comment_id, value)
-SELECT DISTINCT ON (u, c) u, c, (CASE WHEN random() < 0.8 THEN 1 ELSE -1 END)::smallint
+SELECT u, c, (CASE WHEN random() < 0.8 THEN 1 ELSE -1 END)::smallint
 FROM (
-    SELECT (1 + floor(random() * 20000))::bigint AS u,
-           (1 + floor(random() * 15000))::bigint AS c
-    FROM generate_series(1, 45000)
-) t(u, c)
+    SELECT DISTINCT u, c
+    FROM (
+        SELECT (1 + floor(random() * 20000))::bigint AS u,
+               (1 + floor(random() * 15000))::bigint AS c
+        FROM generate_series(1, 45000)
+    ) t(u, c)
+) dedup(u, c)
 ON CONFLICT (user_id, comment_id) DO NOTHING;
 
 -- Realistic churn: ~5% of existing post votes get their value flipped, as
