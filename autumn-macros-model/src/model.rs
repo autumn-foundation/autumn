@@ -18,7 +18,8 @@ use syn::parse::Parser as _;
 use syn::{DeriveInput, Field, LitStr};
 
 use crate::commentable::{emit_commentable_items, is_commentable_attr, resolve_commentable};
-use crate::schema::{
+use autumn_macros_support::naming::{infer_table_name, pascal_to_snake, pluralize_word};
+use autumn_macros_support::schema::{
     apply_serde_rename_all_rule, emit_schema_fn_body_full, emit_schema_fn_body_named,
     field_has_skip_serializing_if, field_is_collaborative, field_is_translatable,
     field_serde_serialize_rename, has_attr, is_option_type, serde_bare_word,
@@ -456,7 +457,7 @@ fn parse_votable_attr(attr: &syn::Attribute, model_ident: &syn::Ident) -> syn::R
                 target_fk = Some(value);
             } else if key == "value_column" {
                 check_votable_ident_value(&key, &value, value_span)?;
-                value_column = Some(key.clone());
+                value_column = Some(key);
                 value_column_value = Some(value);
             } else if key == "column" {
                 check_votable_ident_value(&key, &value, value_span)?;
@@ -4502,6 +4503,11 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 // the behaviour lives in the field's `Sealed` type, so the
                 // attribute itself must never reach the Diesel derives.
                 && !a.path().is_ident("confidential")
+                // #2597: `#[decimal_shape(precision = .., scale = ..)]` is a
+                // marker the model macro reads to shape factory `.fake()`
+                // values; the field type carries no such information, so the
+                // attribute itself must never reach the Diesel derives.
+                && !a.path().is_ident("decimal_shape")
         })
         .collect()
 }
@@ -6433,6 +6439,52 @@ fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
     None
 }
 
+/// Parse the declared `decimal{p,s}` shape from a field's
+/// `#[decimal_shape(precision = p, scale = s)]` attribute (issue #2597).
+///
+/// The attribute is emitted by the `autumn generate` model renderer for
+/// `decimal{p,s}` fields; the Rust type (`Decimal`/`SqliteDecimal`) carries
+/// no precision/scale, so the factory `.fake()` cannot do better without it.
+///
+/// Malformed spellings (unknown keys, missing or non-integer values) return
+/// `None`: the field then falls back to the untyped `fake::decimal()`,
+/// exactly as before this attribute existed. The macro's fake inference must
+/// never fail expansion on a best-effort hint, so silent fallback — not a
+/// compile error — is the correct failure mode here.
+fn field_decimal_shape(field: &Field) -> Option<(u32, u32)> {
+    for attr in field
+        .attrs
+        .iter()
+        .filter(|a| a.path().is_ident("decimal_shape"))
+    {
+        let mut precision = None;
+        let mut scale = None;
+        let parsed = attr
+            .parse_nested_meta(|meta| {
+                if meta.path.is_ident("precision") {
+                    let lit: syn::LitInt = meta.value()?.parse()?;
+                    precision = lit.base10_parse::<u32>().ok();
+                    Ok(())
+                } else if meta.path.is_ident("scale") {
+                    let lit: syn::LitInt = meta.value()?.parse()?;
+                    scale = lit.base10_parse::<u32>().ok();
+                    Ok(())
+                } else {
+                    Err(meta
+                        .error("unsupported decimal_shape key (expected `precision` or `scale`)"))
+                }
+            })
+            .is_ok();
+        if !parsed {
+            continue;
+        }
+        if let (Some(p), Some(s)) = (precision, scale) {
+            return Some((p, s));
+        }
+    }
+    None
+}
+
 /// Infer the fake-data expression for a factory field when `.fake()` is active.
 ///
 /// Selection order (per issue #1343):
@@ -6447,24 +6499,38 @@ fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
 ///    `Uuid` → `uuid()`, …).
 /// 3. `Option<T>` wraps the inner expression in `Some(..)`.
 ///
+/// The `decimal_shape` parameter carries the declared `decimal{p,s}` from a
+/// `#[decimal_shape(precision = p, scale = s)]` field attribute (issue #2597),
+/// parsed by [`field_decimal_shape`]; a shaped `Decimal`/`SqliteDecimal`
+/// field draws from `fake::decimal_with(p, s)` so every value fits the column
+/// by construction. `None` keeps the untyped `fake::decimal()`.
+///
 /// Returns `None` when no sensible fake value can be produced — the caller then
 /// leaves the field at its `Default::default()` value. This function must NEVER
 /// emit an expression that fails to compile: when unsure, return `None`.
-fn fake_expr_for_field(ident: &syn::Ident, ty: &syn::Type) -> Option<TokenStream> {
+fn fake_expr_for_field(
+    ident: &syn::Ident,
+    ty: &syn::Type,
+    decimal_shape: Option<(u32, u32)>,
+) -> Option<TokenStream> {
     let raw = ident.to_string();
     let name = raw.strip_prefix("r#").unwrap_or(&raw).to_ascii_lowercase();
 
     // Option<T>: fake the inner value, wrap in Some.
     if let Some(inner) = option_inner_type(ty) {
-        let inner_expr = fake_expr_core(&name, inner)?;
+        let inner_expr = fake_expr_core(&name, inner, decimal_shape)?;
         return Some(quote! { ::core::option::Option::Some(#inner_expr) });
     }
 
-    fake_expr_core(&name, ty)
+    fake_expr_core(&name, ty, decimal_shape)
 }
 
 /// Core inference over a non-`Option` target type. See [`fake_expr_for_field`].
-fn fake_expr_core(name: &str, ty: &syn::Type) -> Option<TokenStream> {
+fn fake_expr_core(
+    name: &str,
+    ty: &syn::Type,
+    decimal_shape: Option<(u32, u32)>,
+) -> Option<TokenStream> {
     let last = ty_last_ident(ty)?;
     match last.as_str() {
         "String" => Some(fake_string_expr(name)),
@@ -6489,12 +6555,20 @@ fn fake_expr_core(name: &str, ty: &syn::Type) -> Option<TokenStream> {
             Some(quote! { (::autumn_web::fake::decimal_f64() as #cast) })
         }
         "bool" => Some(quote! { ::autumn_web::fake::boolean() }),
-        "Decimal" => Some(quote! { ::autumn_web::fake::decimal() }),
+        // Issue #2597: a shaped decimal draws from `fake::decimal_with(p, s)`
+        // so factory values fit the declared `decimal{p,s}` by construction.
+        "Decimal" => Some(decimal_shape.map_or_else(
+            || quote! { ::autumn_web::fake::decimal() },
+            |(p, s)| quote! { ::autumn_web::fake::decimal_with(#p, #s) },
+        )),
         "Uuid" => Some(quote! { ::autumn_web::fake::uuid() }),
         // The SQLite newtypes (issue #1924) wrap exactly those values. Without
         // these arms every faked row falls back to `Default` — one shared nil
         // UUID, which collides on a `:unique` column the first time twice.
-        "SqliteDecimal" => Some(quote! { ::autumn_web::fake::decimal().into() }),
+        "SqliteDecimal" => Some(decimal_shape.map_or_else(
+            || quote! { ::autumn_web::fake::decimal().into() },
+            |(p, s)| quote! { ::autumn_web::fake::decimal_with(#p, #s).into() },
+        )),
         "SqliteUuid" => Some(quote! { ::autumn_web::fake::uuid().into() }),
         // `recent_datetime()` yields `DateTime<Utc>`, so only fake a `DateTime`
         // whose timezone parameter is `Utc`. Other zones (e.g. `Local`,
@@ -6679,8 +6753,9 @@ fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
         // chrono's default `Deserialize` round-trips as-is. Plainer, but honest, rather
         // than a picker whose submission 400s.
         "DateTime" => {
-            let picker_zone = crate::api_doc::unwrap_single_generic(inner_ty, "DateTime")
-                .is_some_and(|tz| matches!(type_name_str(&tz).as_str(), "Utc" | "Local"));
+            let picker_zone =
+                autumn_macros_support::schema::unwrap_single_generic(inner_ty, "DateTime")
+                    .is_some_and(|tz| matches!(type_name_str(&tz).as_str(), "Utc" | "Local"));
             if picker_zone {
                 quote! { ::autumn_web::form::FieldControl::DateTime }
             } else {
@@ -6716,14 +6791,14 @@ fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
 fn datetime_local_serde_attr(ty: &syn::Type) -> Option<TokenStream> {
     let nullable = is_option_type(ty);
     let inner = if nullable {
-        crate::api_doc::unwrap_single_generic(ty, "Option")?
+        autumn_macros_support::schema::unwrap_single_generic(ty, "Option")?
     } else {
         ty.clone()
     };
     let base = match type_name_str(&inner).as_str() {
         "NaiveDateTime" => "deserialize_naive_datetime_local",
         "DateTime" => {
-            let tz = crate::api_doc::unwrap_single_generic(&inner, "DateTime")?;
+            let tz = autumn_macros_support::schema::unwrap_single_generic(&inner, "DateTime")?;
             match type_name_str(&tz).as_str() {
                 "Utc" => "deserialize_datetime_local_utc",
                 "Local" => "deserialize_datetime_local_local",
@@ -6736,8 +6811,9 @@ fn datetime_local_serde_attr(ty: &syn::Type) -> Option<TokenStream> {
     // (it never passes through this crate's own generic `::autumn_web`
     // token rewrite — see `crate_path`'s module doc, #1828), so it must be
     // built from the actively resolved crate name directly.
-    let crate_root =
-        crate::crate_path::escaped_target_path_segment(&crate::crate_path::current_target());
+    let crate_root = autumn_macros_support::crate_path::escaped_target_path_segment(
+        &autumn_macros_support::crate_path::current_target(),
+    );
     if nullable {
         // `deserialize_with` disables serde's implicit missing-`Option`-field
         // -is-`None` handling; `default` restores it so a JSON body may still
@@ -6782,7 +6858,7 @@ fn emit_form_model_impl(
             let field_name = field_name.strip_prefix("r#").unwrap_or(&field_name);
             let label = humanize_field_label(field_name);
             let nullable = is_option_type(&f.ty);
-            let inner = crate::api_doc::unwrap_single_generic(&f.ty, "Option")
+            let inner = autumn_macros_support::schema::unwrap_single_generic(&f.ty, "Option")
                 .unwrap_or_else(|| f.ty.clone());
             let control = form_control_tokens(&inner, nullable);
             let required = !nullable;
@@ -9716,7 +9792,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     expr
                 }
             };
-            fake_expr_for_field(ident, &f.ty).map_or_else(
+            fake_expr_for_field(ident, &f.ty, field_decimal_shape(f)).map_or_else(
                 // No fake expression available for this type: leave the value
                 // as-is (its Default when `.fake()` was requested).
                 || {
@@ -11303,75 +11379,6 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-pub fn infer_table_name(ident: &syn::Ident) -> String {
-    let name = ident.to_string();
-    let snake = pascal_to_snake(&name);
-    // Pluralize only the last snake_case segment, mirroring
-    // `autumn-cli`'s `naming::pluralize`: `blog_post` → `blog_posts`,
-    // `category` → `categories`.
-    let (prefix, last) = snake.rfind('_').map_or(("", snake.as_str()), |idx| {
-        (&snake[..=idx], &snake[idx + 1..])
-    });
-    format!("{prefix}{}", pluralize_word(last))
-}
-
-/// English pluraliser for a single word: irregulars, sibilant endings
-/// (`+es`), consonant+`y` (`y` → `ies`), otherwise `+s`.
-///
-/// This is a FAITHFUL copy of [`autumn_web::format::pluralize_word`], which is
-/// the canonical implementation (see `autumn/src/format.rs::pluralize_word`).
-/// It MUST stay in sync with that function: the CLI scaffold's `src/schema.rs`
-/// pluralises table names through `autumn_web::format::pluralize_word` (via
-/// `naming::pluralize`), and the `#[model]`/`#[repository]` derives here must
-/// produce the same table name so the generated app compiles. It is duplicated
-/// rather than imported because this proc-macro crate cannot depend on
-/// `autumn-web` (that would create a dependency cycle: `autumn-web` depends on
-/// `autumn-macros`).
-fn pluralize_word(word: &str) -> String {
-    if word.is_empty() {
-        return String::new();
-    }
-    match word {
-        "person" => return "people".to_owned(),
-        "child" => return "children".to_owned(),
-        "man" => return "men".to_owned(),
-        "woman" => return "women".to_owned(),
-        "mouse" => return "mice".to_owned(),
-        "goose" => return "geese".to_owned(),
-        _ => {}
-    }
-    let lower = word.to_ascii_lowercase();
-    if lower.ends_with("ss")
-        || lower.ends_with('x')
-        || lower.ends_with('z')
-        || lower.ends_with("ch")
-        || lower.ends_with("sh")
-    {
-        return format!("{word}es");
-    }
-    if lower.ends_with('y') {
-        // 'y' is 1-byte ASCII, so slicing off the last byte stays on a char boundary.
-        let prefix = &word[..word.len() - 1];
-        if let Some(prev) = prefix.chars().next_back()
-            && !"aeiouAEIOU".contains(prev)
-        {
-            return format!("{prefix}ies");
-        }
-    }
-    format!("{word}s")
-}
-
-pub fn pascal_to_snake(s: &str) -> String {
-    let mut result = String::new();
-    for (i, ch) in s.chars().enumerate() {
-        if ch.is_uppercase() && i > 0 {
-            result.push('_');
-        }
-        result.push(ch.to_ascii_lowercase());
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11383,7 +11390,7 @@ mod tests {
         // Narrow types must clamp the range to their own maximum so the `as`
         // cast can't wrap (`1000 as u8 == 232`, `1000 as i8 == -24`).
         let expr = |ty: syn::Type| {
-            fake_expr_core("count", &ty)
+            fake_expr_core("count", &ty, None)
                 .expect("integer type should infer a fake expr")
                 .to_string()
         };
@@ -11420,6 +11427,123 @@ mod tests {
         assert!(
             u128_expr.contains("as u128"),
             "u128 must be matched: {u128_expr}"
+        );
+    }
+
+    // ── Fake decimal shape (#2597) ─────────────────────────────────────────
+    // A `#[decimal_shape(precision = p, scale = s)]` field attribute carries
+    // the generator's declared `decimal{p,s}` into `#[model]`, so the
+    // factory `.fake()` draws from `fake::decimal_with(p, s)` — values that
+    // fit the column by construction — instead of the untyped
+    // `fake::decimal()`.
+
+    #[test]
+    fn decimal_shape_attr_parses_precision_and_scale() {
+        let field: syn::Field = syn::parse_quote! {
+            #[decimal_shape(precision = 5, scale = 2)]
+            pub price: rust_decimal::Decimal
+        };
+        assert_eq!(field_decimal_shape(&field), Some((5, 2)));
+    }
+
+    #[test]
+    fn decimal_shape_attr_absent_yields_no_shape() {
+        let field: syn::Field = syn::parse_quote! {
+            pub price: rust_decimal::Decimal
+        };
+        assert_eq!(field_decimal_shape(&field), None);
+    }
+
+    #[test]
+    fn decimal_shape_attr_malformed_falls_back_to_untyped() {
+        // The macro must never fail expansion on a best-effort hint: unknown
+        // keys, missing values, and non-integer values all fall back to the
+        // untyped `fake::decimal()`, exactly as before the attribute existed.
+        for tokens in [
+            quote! { #[decimal_shape(frobnicate = 1)] pub price: rust_decimal::Decimal },
+            quote! { #[decimal_shape(precision = 5)] pub price: rust_decimal::Decimal },
+            quote! { #[decimal_shape(precision = "five", scale = 2)] pub price: rust_decimal::Decimal },
+        ] {
+            let field: syn::Field = syn::parse_quote!(#tokens);
+            assert_eq!(
+                field_decimal_shape(&field),
+                None,
+                "malformed attribute must fall back: {tokens}"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_shape_attr_stripped_from_user_attrs() {
+        // The marker must not leak onto the generated Diesel query struct —
+        // Diesel doesn't understand it.
+        let field: syn::Field = syn::parse_quote! {
+            #[decimal_shape(precision = 5, scale = 2)]
+            pub price: rust_decimal::Decimal
+        };
+        let attrs = user_attrs(&field);
+        assert!(
+            attrs.iter().all(|a| !a.path().is_ident("decimal_shape")),
+            "`#[decimal_shape]` must be stripped from the query struct's attrs"
+        );
+    }
+
+    #[test]
+    fn shaped_decimal_fake_expr_uses_decimal_with() {
+        let ident: syn::Ident = syn::parse_quote!(price);
+        let ty: syn::Type = syn::parse_quote!(rust_decimal::Decimal);
+
+        let shaped = fake_expr_for_field(&ident, &ty, Some((5, 2)))
+            .expect("Decimal should infer a fake expr")
+            .to_string();
+        assert!(shaped.contains("decimal_with"), "{shaped}");
+        assert!(shaped.contains("5u32"), "{shaped}");
+        assert!(shaped.contains("2u32"), "{shaped}");
+
+        let untyped = fake_expr_for_field(&ident, &ty, None)
+            .expect("Decimal should infer a fake expr")
+            .to_string();
+        assert!(!untyped.contains("decimal_with"), "{untyped}");
+        assert!(untyped.contains("decimal ()"), "{untyped}");
+    }
+
+    #[test]
+    fn shaped_sqlite_decimal_fake_expr_converts() {
+        let ident: syn::Ident = syn::parse_quote!(price);
+        let ty: syn::Type = syn::parse_quote!(autumn_web::db::sqlite_types::SqliteDecimal);
+
+        let shaped = fake_expr_for_field(&ident, &ty, Some((5, 0)))
+            .expect("SqliteDecimal should infer a fake expr")
+            .to_string();
+        assert!(shaped.contains("decimal_with"), "{shaped}");
+        assert!(shaped.contains("into ()"), "{shaped}");
+    }
+
+    #[test]
+    fn model_macro_emits_decimal_with_for_shaped_field() {
+        // End-to-end at the macro level: the generator's attribute flows
+        // through `#[model]` into the factory's `.fake()` binding.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Invoice {
+                    #[id]
+                    pub id: i64,
+                    #[decimal_shape(precision = 5, scale = 2)]
+                    pub amount: rust_decimal::Decimal,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("decimal_with"),
+            "shaped decimal field must draw from fake::decimal_with: {generated}"
+        );
+        // ...and the marker attribute itself must not leak onto the Diesel
+        // structs (`cannot find attribute decimal_shape in this scope`).
+        assert!(
+            !generated.contains("decimal_shape ("),
+            "the marker must be consumed, not re-emitted: {generated}"
         );
     }
 
@@ -17504,24 +17628,6 @@ mod tests {
     }
 
     #[test]
-    fn pascal_to_snake_simple() {
-        assert_eq!(pascal_to_snake("User"), "user");
-    }
-
-    #[test]
-    fn pascal_to_snake_multi_word() {
-        assert_eq!(pascal_to_snake("BlogPost"), "blog_post");
-    }
-
-    #[test]
-    fn pascal_to_snake_three_words() {
-        assert_eq!(
-            pascal_to_snake("UserProfileSettings"),
-            "user_profile_settings"
-        );
-    }
-
-    #[test]
     fn pascal_case_simple() {
         assert_eq!(pascal_case("title"), "Title");
     }
@@ -17534,64 +17640,6 @@ mod tests {
     #[test]
     fn pascal_case_single_char() {
         assert_eq!(pascal_case("x"), "X");
-    }
-
-    #[test]
-    fn infer_table_name_simple() {
-        let ident = syn::Ident::new("User", proc_macro2::Span::call_site());
-        assert_eq!(infer_table_name(&ident), "users");
-    }
-
-    #[test]
-    fn infer_table_name_multi_word() {
-        let ident = syn::Ident::new("BlogPost", proc_macro2::Span::call_site());
-        assert_eq!(infer_table_name(&ident), "blog_posts");
-    }
-
-    // Irregular-plural inference (#1753): the derived table name MUST match the
-    // CLI scaffold's `src/schema.rs`, which pluralises through
-    // `autumn_web::format::pluralize_word`. These mirror the assertions in
-    // `autumn/src/format.rs` and `autumn-cli/src/generate/naming.rs` so all
-    // three implementations agree.
-    #[test]
-    fn infer_table_name_irregular_plurals() {
-        let cases = [
-            ("Category", "categories"),
-            ("Company", "companies"),
-            ("City", "cities"),
-            ("Story", "stories"),
-            ("Box", "boxes"),
-            ("Buzz", "buzzes"),
-            ("Class", "classes"),
-            ("Watch", "watches"),
-            ("Dish", "dishes"),
-            ("Person", "people"),
-            ("Child", "children"),
-            ("Post", "posts"),
-            ("Node", "nodes"),
-            ("Comment", "comments"),
-            ("BlogPost", "blog_posts"),
-            ("Day", "days"),
-        ];
-        for (input, expected) in cases {
-            let ident = syn::Ident::new(input, proc_macro2::Span::call_site());
-            assert_eq!(infer_table_name(&ident), expected, "input: {input}");
-        }
-    }
-
-    #[test]
-    fn pluralize_word_matches_canonical_rules() {
-        assert_eq!(pluralize_word(""), "");
-        assert_eq!(pluralize_word("category"), "categories");
-        assert_eq!(pluralize_word("day"), "days");
-        assert_eq!(pluralize_word("box"), "boxes");
-        assert_eq!(pluralize_word("buzz"), "buzzes");
-        assert_eq!(pluralize_word("class"), "classes");
-        assert_eq!(pluralize_word("watch"), "watches");
-        assert_eq!(pluralize_word("dish"), "dishes");
-        assert_eq!(pluralize_word("person"), "people");
-        assert_eq!(pluralize_word("goose"), "geese");
-        assert_eq!(pluralize_word("post"), "posts");
     }
 
     // ── RED: etag() derivation from #[lock_version] ────────────────────────
@@ -18921,5 +18969,54 @@ mod tests {
             None
         );
         assert_eq!(attr(syn::parse_quote!(DateTime)), None);
+    }
+
+    // ── Rename-pipeline contract (#1828) ────────────────────────────────────
+    // Moved here from `autumn-macros-support::crate_path`'s tests when the DB
+    // macros were split into their own crates: this pipeline couples the
+    // macro's codegen with the shared crate-path rewrite, so it lives with
+    // the macro it exercises.
+
+    fn ts_string(ts: &proc_macro2::TokenStream) -> String {
+        ts.to_string()
+    }
+
+    /// No genuine `::autumn_web` *token* path (crate-root anchored) may
+    /// survive `finalize`. `to_string()` renders a real `:: Ident ::` token
+    /// sequence with spaces around the identifier; a doc comment or string
+    /// literal's *contents* render with no such surrounding space, so this
+    /// specifically will not (and must not) flag those.
+    fn assert_no_leaked_autumn_web_token_path(s: &str) {
+        assert!(
+            !s.contains(":: autumn_web"),
+            "leaked `::autumn_web` token path in: {s}"
+        );
+    }
+
+    #[test]
+    fn model_macro_pipeline_has_no_leaked_autumn_web_after_override() {
+        use autumn_macros_support::crate_path::{finalize, set_target};
+
+        let _guard = set_target(Some("renamed_autumn_web"));
+        let item = quote! {
+            struct Post {
+                #[id]
+                id: i64,
+                title: String,
+            }
+        };
+        let generated = model_macro(quote! {}, item);
+        let rewritten = finalize(generated);
+        let s = ts_string(&rewritten);
+        assert_no_leaked_autumn_web_token_path(&s);
+        assert!(s.contains("renamed_autumn_web"), "got: {s}");
+        // The `deserialize_with`/`#[serde(crate = "...")]` string values this
+        // pipeline builds (issue #1828's original literal-rewrite targets)
+        // must reflect the active target too — proving `current_target()` at
+        // the source beats the removed post-hoc literal rewrite.
+        assert!(
+            s.contains("renamed_autumn_web :: reexports :: serde"),
+            "got: {s}"
+        );
     }
 }

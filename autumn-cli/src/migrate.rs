@@ -29,6 +29,7 @@
 //! 5. `database.url` in `autumn.toml`
 
 pub mod safety;
+pub mod versions;
 
 use std::path::Path;
 use std::process::Command;

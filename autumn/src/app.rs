@@ -5351,28 +5351,55 @@ impl AppBuilder {
         // A duplicate of the listening socket is kept aside so a `SIGUSR2`
         // in-place upgrade (#1674) can hand it to a successor while this process
         // keeps serving through the original. Only a plain TCP listener can be
-        // handed over in this release.
+        // handed over in this release. This runs up front, before the match
+        // consumes `bound_listener` to build the (not yet spawned) accept-loop
+        // future below.
         #[cfg(unix)]
         let mut handoff_socket: Option<crate::upgrade::HandoffSocket> = None;
+        #[cfg(unix)]
+        if let BoundListener::Tcp(listener) = &bound_listener {
+            match crate::upgrade::HandoffSocket::from_listener(listener) {
+                Ok(socket) => handoff_socket = Some(socket),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "could not duplicate the listening socket; in-place upgrade \
+                     (SIGUSR2) will be refused for this process"
+                ),
+            }
+        }
 
-        let server_task = match bound_listener {
+        // Build the accept-loop future per transport; when it goes live
+        // depends on how this process started (see below). The arms differ
+        // only in the connect-info type baked into the
+        // make-service (`SocketAddr` for TCP, `UdsConnectInfo` for Unix
+        // sockets); the shutdown wiring and the resulting `io::Result<()>` are
+        // identical. Handlers extracting `ConnectInfo<SocketAddr>` are
+        // unsupported under a Unix socket — daemon mode is local and
+        // loopback-equivalent.
+        //
+        // The deferred half of #2368: adopting the inherited fd still happens
+        // up front (so a failure to adopt aborts early, as today), but during
+        // an in-place upgrade the successor must not compete for connections
+        // before it can actually serve them: every connection it wins in that
+        // window is answered by the startup barrier with a 503 while the
+        // predecessor is right there, healthy. The predecessor keeps serving
+        // for the whole window; the successor's accept loop goes live once
+        // `run_startup_hooks` has returned `Ok`.
+        //
+        // The deferral applies ONLY to an upgrade successor
+        // (`handoff_requested()`): a cold start spawns its accept loop
+        // immediately, as before, so `/live` and `/startup` stay reachable
+        // behind the startup barrier while the hooks run — a hook that
+        // outlasts a probe threshold must not read as a dead pod.
+        let server_future: std::pin::Pin<
+            Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'static>,
+        > = match bound_listener {
             BoundListener::Tcp(listener) => {
-                #[cfg(unix)]
-                {
-                    match crate::upgrade::HandoffSocket::from_listener(&listener) {
-                        Ok(socket) => handoff_socket = Some(socket),
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            "could not duplicate the listening socket; in-place upgrade \
-                             (SIGUSR2) will be refused for this process"
-                        ),
-                    }
-                }
                 let make_service =
                     axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
                         std::net::SocketAddr,
                     >(service);
-                tokio::spawn(async move {
+                Box::pin(async move {
                     axum::serve(listener, make_service)
                         .with_graceful_shutdown(async move {
                             server_shutdown_wait.cancelled().await;
@@ -5394,7 +5421,7 @@ impl AppBuilder {
                     axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
                         UdsConnectInfo,
                     >(service);
-                tokio::spawn(async move {
+                Box::pin(async move {
                     axum::serve(listener, make_service)
                         .with_graceful_shutdown(async move {
                             server_shutdown_wait.cancelled().await;
@@ -5430,7 +5457,7 @@ impl AppBuilder {
                     axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
                         crate::tls::TlsConnectInfo,
                     >(service);
-                tokio::spawn(async move {
+                Box::pin(async move {
                     axum::serve(listener, make_service)
                         .with_graceful_shutdown(async move {
                             server_shutdown_wait.cancelled().await;
@@ -5439,6 +5466,26 @@ impl AppBuilder {
                 })
             }
         };
+
+        // Whether this process is the successor half of an in-place upgrade
+        // (#1674). Only a successor shares its listening socket with a live
+        // predecessor, so only a successor defers its accept loop past the
+        // startup hooks (#2368). A cold start spawns immediately, exactly as
+        // before this change.
+        let defer_accept_loop = crate::upgrade::handoff_requested();
+        // The accept-loop future while it is not yet live; `None` once it has
+        // been taken to spawn `server_task`.
+        let mut pending_accept: Option<
+            std::pin::Pin<
+                Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'static>,
+            >,
+        > = None;
+        let mut server_task: Option<tokio::task::JoinHandle<std::io::Result<()>>> = None;
+        if defer_accept_loop {
+            pending_accept = Some(server_future);
+        } else {
+            server_task = Some(tokio::spawn(server_future));
+        }
 
         // Cancelled by the in-place upgrade watcher once a successor has taken
         // over the listening socket; the drain below then runs without the
@@ -5621,13 +5668,37 @@ impl AppBuilder {
 
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
             tracing::error!(error = %error, "startup hook failed");
+            // A cold start already spawned the accept loop above, so stop it.
+            // An upgrade successor (#2368) never spawned one, so there is
+            // nothing to abort: the predecessor simply keeps serving through
+            // the adopted socket while this process exits, and no user ever
+            // sees a 503.
+            if let Some(task) = server_task.take() {
+                task.abort();
+            }
             server_shutdown.cancel();
-            server_task.abort();
             // `process::exit` skips `on_shutdown`; stop any managed Postgres.
             #[cfg(feature = "managed-pg")]
             crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);
         }
+
+        // Go live on the accept loop. An upgrade successor (#2368) deferred it
+        // past the hooks; they have now succeeded, so it can serve the
+        // connections it wins on the shared socket — the predecessor has been
+        // serving them until now. A cold start spawned the loop up front, so
+        // `/live` and `/startup` stayed reachable behind the startup barrier
+        // while the hooks ran.
+        let server_task: tokio::task::JoinHandle<std::io::Result<()>> =
+            match (server_task.take(), pending_accept.take()) {
+                (Some(task), _) => task,
+                (None, Some(future)) => tokio::spawn(future),
+                // Unreachable: `pending_accept` is `None` only once it has
+                // been taken to spawn `server_task` on the cold-start path.
+                (None, None) => {
+                    unreachable!("accept-loop future consumed without spawning its task")
+                }
+            };
 
         if !state.probes().is_shutting_down() {
             // Web role runs no cron scheduler (workers/combined only). Skipping
@@ -6183,6 +6254,22 @@ impl AppBuilder {
         let custom_layers =
             install_i18n_bundle_layer(custom_layers, &state, i18n_bundle, &config.i18n);
 
+        // #2405: render through the pre-layer router — the same layer
+        // composition the ISR regeneration path uses
+        // (`partition_custom_layers_for_static_render`, shared with the SSG
+        // serve path) — so the recorded Content-Type and the body on disk are
+        // the handler's own, not the app layer stack's post-layer output. The
+        // serve path applies the drained layers to the cached response at
+        // request time, outside the static-first middleware, so recording the
+        // post-layer output both double-applies the layers (once at
+        // generation, once per request) and — because ISR's type guard sees
+        // the pre-layer response — refuses every regeneration for an app with
+        // a Content-Type-rewriting layer, freezing the route until the next
+        // build. The drained set is dropped: this process exits after the
+        // render; serving is a separate invocation.
+        let (custom_layers, _drained) =
+            crate::router::partition_custom_layers_for_static_render(custom_layers);
+
         // Install the preflighted storage and remember the serving
         // router so static generation hits the same `/_blobs/...`
         // routes the server path serves.
@@ -6200,13 +6287,18 @@ impl AppBuilder {
             .collect();
         finalize_event_bus(sync_listeners, &mut Vec::new(), &state);
 
-        // Build the full router (same as production). Use the inner builder
+        // Build the router for static rendering. Use the inner builder
         // so the custom session store installed via with_session_store(...)
         // is honored during static generation — apps that swap in a custom
         // store specifically to avoid Redis/external backends at build time
         // would otherwise silently fall back to the config-driven backend.
-        // Custom Tower layers registered via .layer(...) are likewise
-        // applied so static output matches the production response pipeline.
+        // Custom Tower layers registered via .layer(...) are deliberately
+        // NOT applied here (#2405): they were drained above, so the render
+        // sees the handler's own response — the same pre-layer composition
+        // ISR regeneration uses. The serve path applies those layers to the
+        // cached response at request time, which is what makes the recorded
+        // Content-Type and the body on disk mean "what the handler declared"
+        // rather than "what the layer stack happened to produce".
         #[cfg_attr(not(feature = "storage"), allow(unused_mut))]
         let mut merge_routers: Vec<axum::Router<AppState>> = Vec::new();
         #[cfg(feature = "storage")]
@@ -15443,6 +15535,81 @@ mod tests {
                  and hooks ({hooks:?}) would spend more"
             );
         }
+    }
+
+    /// The accept loop must go live only after the startup hooks succeed —
+    /// but only for an in-place-upgrade successor.
+    ///
+    /// During an in-place upgrade (#1674) the successor adopts the
+    /// predecessor's listening socket up front, so both processes are
+    /// accepting on the same socket and the kernel hands new connections to
+    /// either — and every connection the successor wins before it can serve is
+    /// answered by the startup barrier with a 503 while the predecessor is
+    /// right there, healthy. Spawning the accept loop only once
+    /// `run_startup_hooks` has returned `Ok` keeps the predecessor serving for
+    /// the whole window, so a slow or failing successor can no longer 503 real
+    /// users (#2368).
+    ///
+    /// The deferral must NOT apply to a cold start: nothing accepts until the
+    /// loop is polled, so holding it back would leave `/live` and `/startup`
+    /// unreachable behind the startup barrier for the whole hook window, and a
+    /// hook that outlasts a probe threshold would read as a dead pod. Source-
+    /// order test in the house style: the ordering is a property of this
+    /// function, and a two-process upgrade test with fd handoff cannot run in
+    /// CI.
+    #[test]
+    fn accept_loop_defers_only_for_upgrade_successor() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let server_start = source
+            .find("pub async fn run(self)")
+            .expect("normal server path should exist");
+        // Bounded at the next path so the search cannot match this test's own
+        // source, which necessarily quotes the strings it is looking for.
+        let build_mode_start = source
+            .find("async fn run_build_mode(self)")
+            .expect("static build path should follow server path");
+        let server_source = &source[server_start..build_mode_start];
+
+        let bound = server_source
+            .find("let server_future:")
+            .expect("the accept-loop future must be built from the bound listener");
+        // The deferral is gated on this process being an upgrade successor —
+        // the one shape where the socket is shared with a live predecessor.
+        let gate = server_source
+            .find("let defer_accept_loop = crate::upgrade::handoff_requested();")
+            .expect("the deferral must be gated on the upgrade handoff");
+        let cold_spawn = server_source
+            .find("server_task = Some(tokio::spawn(server_future));")
+            .expect("a cold start must spawn the accept loop up front, as before");
+        let hooks = server_source
+            .find("run_startup_hooks(&startup_hooks, state.clone())")
+            .expect("startup hooks must run on the normal server path");
+        let deferred_spawn = server_source
+            .find("tokio::spawn(future)")
+            .expect("an upgrade successor must spawn its deferred accept loop after the hooks");
+
+        assert!(
+            bound < gate && gate < cold_spawn && cold_spawn < hooks && hooks < deferred_spawn,
+            "ordering must be: bound listener -> deferral gate -> cold-start spawn \
+             -> startup hooks -> successor's deferred spawn \
+             (bound={bound}, gate={gate}, cold_spawn={cold_spawn}, hooks={hooks}, \
+             deferred_spawn={deferred_spawn})"
+        );
+        // A cold start that already spawned must still abort its loop when a
+        // hook fails; a successor has nothing to abort.
+        assert!(
+            server_source.contains("if let Some(task) = server_task.take()"),
+            "the hook-failure path must abort the cold-start accept loop"
+        );
+        // The old shapes must not come back.
+        assert!(
+            !server_source.contains("let server_task = match bound_listener"),
+            "the accept loop must not be spawned from the bound-listener match"
+        );
+        assert!(
+            !server_source.contains("let server_task = tokio::spawn(server_future);"),
+            "the accept loop must not be unconditionally deferred past the hooks"
+        );
     }
 
     #[test]

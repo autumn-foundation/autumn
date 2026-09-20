@@ -1,9 +1,10 @@
 # Migrating to the next Autumn release (rolling draft)
 
-> **Rolling draft.** This is the in-flight guide for the changes currently
-> under `## [Unreleased]` in [`CHANGELOG.md`](../../CHANGELOG.md). Every PR
-> that lands a breaking change appends a section here and links this file from
-> its changelog entry. At release time the file is renamed to
+> **Rolling draft.** This is the in-flight guide for the changes that are not
+> released yet. Every PR that lands a breaking change appends a section here
+> and links this file from its changelog note — which is a file under
+> [`changelog.d/`](../../changelog.d/README.md), not a line in
+> [`CHANGELOG.md`](../../CHANGELOG.md). At release time the file is renamed to
 > `docs/migrations/<version>.md`, its version placeholders are filled in, and
 > the index in [`README.md`](README.md) is updated — see
 > [`docs/release-checklist.md`](../release-checklist.md), *Migration Guide
@@ -1215,6 +1216,58 @@ changes nothing and is always correct; on any other type it changes what serde
 accepts, so a codemod that added it everywhere would silently widen a request
 contract. `#[model]` is unaffected: its read schema describes a response only,
 so a conditionally-skipped column there stays sound without the attribute.
+
+### Macros: `autumn-macros` no longer holds the database macros (#2809)
+
+**Why:** `autumn-macros` was one 87k-line proc-macro dylib, and a full-crate
+check ran rustc out of memory on a modest machine. The database codegen —
+`#[model]`, `#[commentable]`, `#[repository]`, `#[service]` — now lives in two
+sibling crates, `autumn-macros-model` and `autumn-macros-repository`, so a
+no-database build never compiles it.
+
+**You are affected only if you depend on `autumn-macros` directly.** Nearly
+nobody does. Every `autumn_web::` path is unchanged, so an app that writes
+`use autumn_web::prelude::*` or `autumn_web::{model, repository, service}`
+needs no change at all.
+
+A direct dependant loses these three macro paths. `autumn-macros`'s `db`
+feature still resolves, but it is now an empty no-op: the macros it used to
+switch on are in other crates. Rust does not let a proc-macro crate re-export
+another crate's proc macro, so a compatibility facade in `autumn-macros` is
+not possible.
+
+**Before (`{X.Y}`):**
+
+```toml
+autumn-macros = { version = "{X.Y.Z}", features = ["db"] }
+```
+
+```rust
+#[autumn_macros::model]
+struct Post { id: i32 }
+```
+
+**After (`{(X+1).0}`):**
+
+```toml
+autumn-macros-model = "{X.Z.0}"
+autumn-macros-repository = "{X.Z.0}"
+```
+
+```rust
+#[autumn_macros_model::model]
+struct Post { id: i32 }
+```
+
+`#[repository]` comes from `autumn_macros_repository`; `#[model]`,
+`#[commentable]` and `#[service]` come from `autumn_macros_model`. Depending
+on `autumn-web` instead is the better fix, and the one we recommend: it pins
+both crates for you and keeps the paths you already write.
+
+**Automation:** `manual` — the rewrite needs a new dependency in `Cargo.toml`
+that no codemod may add on the reader's behalf, and the right answer for most
+readers is to depend on `autumn-web` instead, which is a design decision.
+
 
 ## Plugin authors
 
