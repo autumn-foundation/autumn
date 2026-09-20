@@ -56,12 +56,20 @@ LIMIT 5;
 SELECT id, title FROM posts WHERE id = ANY(:'lb_winners'::bigint[]);
 
 \echo '--- pg_stat_statements profile (5 front-page statements) ---'
+-- pg_stat_statements is cluster-wide, not scoped to this database: on a
+-- reused/shared Postgres instance with other databases active, an
+-- unfiltered scan would count their concurrent statements too, corrupting
+-- both the total and the "5 statements" claim. Filter to this database (and
+-- this session's role, since the fixture/profile run as one user) so
+-- unrelated cluster traffic can't leak in.
 SELECT query, calls, shared_blks_hit, shared_blks_read,
        (shared_blks_hit + shared_blks_read) AS total_buffers,
        round(100.0 * (shared_blks_hit + shared_blks_read) /
              sum(shared_blks_hit + shared_blks_read) OVER (), 2) AS pct_of_page_buffers
 FROM pg_stat_statements
 WHERE query NOT ILIKE '%pg_stat_statements%'
+  AND dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+  AND userid = (SELECT oid FROM pg_roles WHERE rolname = current_user)
 ORDER BY total_buffers DESC;
 
 \echo '--- EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) for the leaderboard query ---'

@@ -19,10 +19,15 @@ ORDER BY agg_val DESC NULLS LAST, post_id ASC
 LIMIT 5;
 
 \echo '--- pg_stat_statements after the index exists (unforced) ---'
+-- Same dbid/userid scoping as baseline/queries.sql -- pg_stat_statements is
+-- cluster-wide, so an unfiltered scan on a shared instance could pick up
+-- another database's coincidentally-similar query text.
 SELECT query, calls, shared_blks_hit, shared_blks_read,
        (shared_blks_hit + shared_blks_read) AS total_buffers
 FROM pg_stat_statements
 WHERE query ILIKE '%agg_key%'
+  AND dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+  AND userid = (SELECT oid FROM pg_roles WHERE rolname = current_user)
 ORDER BY total_buffers DESC;
 
 \echo '--- is the new index ever used? (idx_scan must be > 0 to keep it) ---'
