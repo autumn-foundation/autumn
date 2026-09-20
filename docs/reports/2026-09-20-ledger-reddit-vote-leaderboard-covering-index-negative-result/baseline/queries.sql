@@ -43,37 +43,47 @@ SELECT * FROM users WHERE id = ANY(:'hp_author_ids'::bigint[]);
 SELECT * FROM subreddits WHERE id = ANY(:'hp_subreddit_ids'::bigint[]);
 
 -- 4. front_page's top-by-votes leaderboard
--- The codegen (autumn-macros-repository/src/repository.rs:14354-14364,
--- 14396-14398; real trait call verified in
--- examples/reddit-clone/tests/votable_pg_integration.rs:443-449) binds
--- eq/low/high as three REUSED parameters -- each appears twice in the SQL
--- text (`($1 IS NULL OR post_id = $1)`, etc.) but is bound once -- and
--- leaves `LIMIT 5` a literal (`__lim` is `format!`-interpolated into the
--- SQL string, never bound). A plain literal `NULL::bigint` written three
--- times, as an earlier version of this harness did, is textually THREE
--- separate constants to Postgres's query jumbler, not one reused twice --
--- pg_stat_statements then normalizes it to 6 distinct placeholders instead
--- of 3, which doesn't match the shape a real trace of this app would show.
--- PREPARE/EXECUTE reproduces the real reuse structure (verified: the
--- executed plan/buffers are unaffected either way -- a freshly prepared
--- statement's first execution costs itself using the actual bound values,
--- identical to a literal query, so this is a query-*text* fidelity fix,
--- not a plan or buffer-count fix). The one artifact this leaves: the row
--- pg_stat_statements records for this statement carries a
--- `PREPARE leaderboard_lookup (...) AS` prefix that a driver-level bind
--- (as the app's tokio-postgres/diesel-async stack actually sends, via the
--- wire protocol rather than textual PREPARE) would not have -- psql has no
--- clean way to reproduce that without one (its `\bind` meta-command can't
--- pass a typed SQL NULL, only literal text). Cosmetic difference in the
--- recorded query text only.
+-- The codegen (autumn-macros-repository/src/repository.rs:4193-4222 for the
+-- CAST(SUM(...) AS bigint) aggregate expression and quoted "votes"/"value"
+-- identifiers -- table_q at :14133, group_col_q at :14214 -- both
+-- double-quote; 14354-14364, 14396-14398 for the bind layout; real trait
+-- call verified in
+-- examples/reddit-clone/tests/votable_pg_integration.rs:443-449) emits:
+--   SELECT "post_id" AS agg_key, CAST(SUM("value") AS bigint) AS agg_val
+--   FROM "votes" WHERE "post_id" IS NOT NULL AND (...) GROUP BY "post_id"
+--   ORDER BY agg_val DESC NULLS LAST, agg_key ASC LIMIT 5
+-- -- double-quoted identifiers throughout, the SUM cast to bigint (a no-op
+-- here since `value` is `smallint` and Postgres's `sum(smallint)` already
+-- returns `bigint`, but present in the text regardless), and the ORDER BY
+-- tiebreaker referencing the `agg_key` alias, not the raw column. Matched
+-- exactly below -- an earlier version of this harness used unquoted
+-- identifiers, no CAST, and `post_id ASC` for the tiebreaker, none of which
+-- change the plan (Postgres case-folds unquoted lowercase identifiers to
+-- the same name, and `CAST(bigint AS bigint)` is eliminated at parse time),
+-- but which don't match production's `pg_stat_statements` query text
+-- either. eq/low/high are three REUSED parameters -- each appears twice in
+-- the SQL text (`($1 IS NULL OR "post_id" = $1)`, etc.) but is bound once
+-- -- and `LIMIT 5` is a literal (`__lim` is `format!`-interpolated into the
+-- SQL string, never bound). PREPARE/EXECUTE reproduces the reuse structure
+-- (verified: the executed plan/buffers are unaffected either way -- a
+-- freshly prepared statement's first execution costs itself using the
+-- actual bound values, identical to a literal query, so this is a
+-- query-*text* fidelity fix, not a plan or buffer-count fix). The one
+-- artifact this leaves: the row pg_stat_statements records for this
+-- statement carries a `PREPARE leaderboard_lookup (...) AS` prefix that a
+-- driver-level bind (as the app's tokio-postgres/diesel-async stack
+-- actually sends, via the wire protocol rather than textual PREPARE) would
+-- not have -- psql has no clean way to reproduce that without one (its
+-- `\bind` meta-command can't pass a typed SQL NULL, only literal text).
+-- Cosmetic difference in the recorded query text only.
 PREPARE leaderboard_lookup (bigint, bigint, bigint) AS
-SELECT post_id AS agg_key, SUM(value) AS agg_val FROM votes
-WHERE post_id IS NOT NULL
-  AND ($1 IS NULL OR post_id = $1)
-  AND ($2 IS NULL OR post_id >= $2)
-  AND ($3 IS NULL OR post_id <= $3)
-GROUP BY post_id
-ORDER BY agg_val DESC NULLS LAST, post_id ASC
+SELECT "post_id" AS agg_key, CAST(SUM("value") AS bigint) AS agg_val FROM "votes"
+WHERE "post_id" IS NOT NULL
+  AND ($1 IS NULL OR "post_id" = $1)
+  AND ($2 IS NULL OR "post_id" >= $2)
+  AND ($3 IS NULL OR "post_id" <= $3)
+GROUP BY "post_id"
+ORDER BY agg_val DESC NULLS LAST, agg_key ASC
 LIMIT 5;
 EXECUTE leaderboard_lookup(NULL, NULL, NULL);
 DEALLOCATE leaderboard_lookup;
@@ -115,8 +125,8 @@ ORDER BY total_buffers DESC;
 
 \echo '--- EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) for the leaderboard query ---'
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)
-SELECT post_id AS agg_key, SUM(value) AS agg_val FROM votes
-WHERE post_id IS NOT NULL
-GROUP BY post_id
-ORDER BY agg_val DESC NULLS LAST, post_id ASC
+SELECT "post_id" AS agg_key, CAST(SUM("value") AS bigint) AS agg_val FROM "votes"
+WHERE "post_id" IS NOT NULL
+GROUP BY "post_id"
+ORDER BY agg_val DESC NULLS LAST, agg_key ASC
 LIMIT 5;

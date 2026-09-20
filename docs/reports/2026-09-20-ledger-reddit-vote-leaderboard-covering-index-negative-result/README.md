@@ -159,12 +159,12 @@ reduction versus the seq-scan plan's 3,293. So the index isn't inert.
 
 To be precise about what that does and doesn't establish: `after/output.txt`
 also records `Execution Time:` for both plans (lines 90 and 134) — in the
-exact output committed here, 50.434 ms unforced (seq scan) versus 35.151 ms
+exact output committed here, 42.669 ms unforced (seq scan) versus 29.668 ms
 forced (index-only). Re-running this identical script (or an equivalent
 version of it) several times during this report's review produced 43.9/30.6
-ms, 42.5/41.8 ms (essentially a tie), 44.6/30.7 ms, 44.1/29.6 ms, and
-50.4/35.2 ms — the gap between the two plans swings from "roughly tied" to
-"index ~30% faster" across otherwise-identical runs, which is
+ms, 42.5/41.8 ms (essentially a tie), 44.6/30.7 ms, 44.1/29.6 ms, 50.4/35.2
+ms, and 42.7/29.7 ms — the gap between the two plans swings from "roughly
+tied" to "index ~30% faster" across otherwise-identical runs, which is
 itself the reason this project gates `EXPLAIN ANALYZE` timing on a `>2×`
 delta before treating it as evidence at all: none of these three runs clear
 it. So wall-clock isn't used as a claim here either way — whatever number
@@ -399,3 +399,26 @@ A seventh review round caught one more, wording only:
     comment-directed votes, matching the "💸 Write cost" section a few
     paragraphs down, which already scoped it correctly. Fixed: both now
     say "every post-directed vote insert."
+
+An eighth review round caught the deepest fidelity gap yet, still no data
+change:
+
+15. Even after the parameter-reuse fix (item 12), the leaderboard query
+    still wasn't what the codegen actually emits: real Diesel-generated SQL
+    double-quotes every identifier (`table_q`/`group_col_q`,
+    `autumn-macros-repository/src/repository.rs:14133,14214`), wraps the
+    aggregate in `CAST(SUM("value") AS bigint)`
+    (`repository.rs:4193-4222` — needed in general so the result
+    deserializes into the declared value type, though a no-op here since
+    Postgres's `sum(smallint)` already returns `bigint`), and orders by the
+    `agg_key` alias, not the raw column (`repository.rs:14371`). The
+    harness used unquoted identifiers, no `CAST`, and `post_id ASC`.
+    Fixed: both `queries.sql` scripts (the profiled `PREPARE` statement and
+    the supplementary `EXPLAIN` illustrations) now match the codegen
+    exactly — `"post_id"`, `"votes"`, `"value"`, `CAST(...)`, `agg_key ASC`.
+    Re-ran the full pipeline: buffers are unchanged (still 3,293, 96.51%)
+    and `idx_scan` is still 0, confirming quoting/casting/tiebreaker-alias
+    are cosmetic to the plan (Postgres case-folds unquoted lowercase
+    identifiers identically, and `CAST(bigint AS bigint)` is eliminated at
+    parse time) — this was a query-text fidelity fix, not a measurement
+    fix.

@@ -15,16 +15,18 @@ SELECT pg_stat_statements_reset(
 
 \echo '=== unforced: planner choice with the index available ==='
 -- PREPARE/EXECUTE reproduces the real codegen's parameter-reuse structure
--- (3 bound params, each referenced twice) instead of 3 independent literal
--- NULLs -- see baseline/queries.sql's comment on the same statement for why.
+-- (3 bound params, each referenced twice), quoted identifiers, the
+-- CAST(SUM(...) AS bigint) aggregate expression, and the agg_key-alias
+-- ORDER BY tiebreaker -- see baseline/queries.sql's comment on the same
+-- statement for exactly why and where each piece comes from in the codegen.
 PREPARE leaderboard_lookup (bigint, bigint, bigint) AS
-SELECT post_id AS agg_key, SUM(value) AS agg_val FROM votes
-WHERE post_id IS NOT NULL
-  AND ($1 IS NULL OR post_id = $1)
-  AND ($2 IS NULL OR post_id >= $2)
-  AND ($3 IS NULL OR post_id <= $3)
-GROUP BY post_id
-ORDER BY agg_val DESC NULLS LAST, post_id ASC
+SELECT "post_id" AS agg_key, CAST(SUM("value") AS bigint) AS agg_val FROM "votes"
+WHERE "post_id" IS NOT NULL
+  AND ($1 IS NULL OR "post_id" = $1)
+  AND ($2 IS NULL OR "post_id" >= $2)
+  AND ($3 IS NULL OR "post_id" <= $3)
+GROUP BY "post_id"
+ORDER BY agg_val DESC NULLS LAST, agg_key ASC
 LIMIT 5;
 EXECUTE leaderboard_lookup(NULL, NULL, NULL);
 DEALLOCATE leaderboard_lookup;
@@ -49,19 +51,19 @@ ORDER BY indexrelname;
 
 \echo '--- EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS), index present, unforced ---'
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)
-SELECT post_id AS agg_key, SUM(value) AS agg_val FROM votes
-WHERE post_id IS NOT NULL
-GROUP BY post_id
-ORDER BY agg_val DESC NULLS LAST, post_id ASC
+SELECT "post_id" AS agg_key, CAST(SUM("value") AS bigint) AS agg_val FROM "votes"
+WHERE "post_id" IS NOT NULL
+GROUP BY "post_id"
+ORDER BY agg_val DESC NULLS LAST, agg_key ASC
 LIMIT 5;
 
 \echo '=== diagnostic only: force the index path to see its true cost (enable_seqscan=off is never shipped) ==='
 SET enable_seqscan = off;
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)
-SELECT post_id AS agg_key, SUM(value) AS agg_val FROM votes
-WHERE post_id IS NOT NULL
-GROUP BY post_id
-ORDER BY agg_val DESC NULLS LAST, post_id ASC
+SELECT "post_id" AS agg_key, CAST(SUM("value") AS bigint) AS agg_val FROM "votes"
+WHERE "post_id" IS NOT NULL
+GROUP BY "post_id"
+ORDER BY agg_val DESC NULLS LAST, agg_key ASC
 LIMIT 5;
 RESET enable_seqscan;
 
