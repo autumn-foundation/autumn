@@ -631,6 +631,35 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-scope.sh --self-test && ./scripts/check-docs-scope.sh
+      - name: CLI coverage gate
+        # The twelve docs gates above all run docs -> code: "is what we wrote
+        # still true?", which is DRIFT. This one runs code -> docs: "is what we
+        # shipped written down anywhere?", which is COVERAGE. Nothing asked
+        # that before, and the gap is invisible by construction — a gate that
+        # only reads the docs can never notice a command the docs never
+        # mention, so a command can ship, work, carry good `--help` text, be
+        # documented nowhere, and leave the whole tree green.
+        #
+        # That is how all four `autumn token` subcommands — `issue` since
+        # 0.5.x, `list` / `rotate` since 0.6.0 — reached 0.7 with "revoke api
+        # token" returning zero hits across all 160 guide pages. #2821 fixed
+        # the prose and deferred the gate, on the grounds that a correct one
+        # has to reuse `check-docs-cli.sh`'s `resolve()` rather than
+        # re-implement it. It does: surface, corpus, resolved invocations and
+        # the hidden-command set all come from that gate's `--list`,
+        # `--corpus`, `--resolved` and `--list-hidden` modes, so the two cannot
+        # disagree about what a line names. A private matcher gets the shallow
+        # cases right and the deep ones wrong — `autumn openapi export`
+        # satisfying the top-level `export` (a different command, an offline
+        # diagnostic snapshot) was caught in review on the first attempt.
+        #
+        # Not registered in `check-docs-scope.sh`'s SIBLINGS: it spells no
+        # corpus of its own, it asks `check-docs-cli.sh` for that gate's, so
+        # there is no second spelling for the scope gate to reconcile.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-cli-coverage.sh --self-test && ./scripts/check-docs-cli-coverage.sh
       - name: Plugin surface gate
         # The declared plugin API surface (issue #1601) has a compiled half —
         # the `plugin-contract` job below builds `autumn-plugin-reference`
