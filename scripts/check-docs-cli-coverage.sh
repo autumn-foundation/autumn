@@ -222,10 +222,44 @@ def sibling(*args):
     return out.stdout
 
 
+def _parse_list(text):
+    """Command paths out of `check-docs-cli.sh --list`.
+
+    `--list` prints one path per line, then a BLANK LINE, then a one-line
+    human summary. Split on that blank line rather than filtering the
+    summary's wording out of the path list: a command PATH is space-joined
+    segments, so a future `autumn command paths` is a perfectly constructible
+    path that a `'command paths' not in line` filter would drop. It would
+    then leave the gate entirely — out of the denominator AND out of
+    classification — free to be undocumented without ever failing this
+    check, which is the exact defect this gate exists to prevent, arriving
+    through its own parser.
+
+    Structure cannot collide with content, and a parser that cannot find the
+    structure it expects raises rather than guessing: a gate that cannot
+    compute its own question is a gate that fails.
+    """
+    head, sep, tail = text.partition('\n\n')
+    if not sep:
+        raise ValueError(
+            'check-docs-cli.sh --list did not print the expected '
+            '"<paths>, blank line, summary" shape. Its output format moved, '
+            'and guessing which lines are paths is how a real command goes '
+            'missing from this gate silently.')
+    summary = tail.strip()
+    if not re.match(r'^\d+ top-level commands, \d+ command paths,', summary):
+        raise ValueError(
+            f'check-docs-cli.sh --list printed an unrecognised summary line: '
+            f'{summary!r}. Refusing to guess where the paths end.')
+    return [l.strip() for l in head.splitlines() if l.strip()]
+
+
 def surface():
-    lines = [l.strip() for l in sibling('--list').splitlines()]
-    # `--list` ends with a human-readable summary line after a blank line.
-    return [l for l in lines if l and 'command paths' not in l]
+    try:
+        return _parse_list(sibling('--list'))
+    except ValueError as exc:
+        print(f'ERROR: {exc}', file=sys.stderr)
+        sys.exit(2)
 
 
 def aliases():
@@ -537,6 +571,27 @@ def self_test():
                              backlog={'token rotate': 'x'})
     expect('destroy inbound-mail' in after,
            'a command re-gates once its spent entry is removed')
+
+    # The summary line is found by STRUCTURE, not by its wording. Regression
+    # test for the third review finding on this gate: a command path can
+    # legitimately contain the summary's text, and filtering on that text
+    # would drop the command out of the gate altogether.
+    listing = ('console\ncommand\ncommand paths\nwebhook sim\n'
+               '\n4 top-level commands, 4 command paths, 9 option spellings\n')
+    expect(_parse_list(listing)
+           == ['console', 'command', 'command paths', 'webhook sim'],
+           'a command path spelled like the summary survives parsing')
+    expect('4 top-level commands, 4 command paths, 9 option spellings'
+           not in _parse_list(listing),
+           'the summary line itself is not parsed as a command path')
+    for bad, why in (('console\nwebhook\n', 'no blank-line separator'),
+                     ('console\n\nsomething else entirely\n',
+                      'an unrecognised summary line')):
+        try:
+            _parse_list(bad)
+            expect(False, f'{why} must raise rather than guess')
+        except ValueError:
+            expect(True, why)
 
     # The real backlog must be honest: every entry names a real command path,
     # and none of them is already documented.
