@@ -35,11 +35,24 @@
 -- `shared_preload_libraries` (a `postgresql.conf` change + restart --
 -- `CREATE EXTENSION` alone is not enough) before running this fixture and
 -- ../baseline/queries.sql / ../after/queries.sql. See the README's
--- "Reproduce" section for the exact commands.
+-- "Reproduce" section for the exact commands. This also requires the
+-- framework's `autumn_feature_flags` table (migration
+-- `20260530200000_create_feature_flags`) applied first -- `front_page`
+-- calls `flags.enabled("new_ui_preview")`
+-- (examples/reddit-clone/src/routes/posts.rs:195), and with a real primary
+-- database configured that resolves to `PgFlagStore`
+-- (autumn/src/feature_flags.rs:688-706), a cold 1-second cache issues
+-- `SELECT ... FROM autumn_feature_flags WHERE key = $1` -- a sixth
+-- statement this profile has to account for.
 
 \set ON_ERROR_STOP on
 
 SELECT setseed(0.4152);
+
+-- Matches the app's own bootstrap default (examples/reddit-clone/src/feature_flags.rs:30-32):
+-- new_ui_preview at 25% rollout.
+INSERT INTO autumn_feature_flags (key, description, enabled, rollout_pct)
+VALUES ('new_ui_preview', 'Shows the "New UI" banner to early testers', true, 25);
 
 INSERT INTO users (username, password_hash)
 SELECT 'user_' || n, 'x' FROM generate_series(1, 20000) AS n;

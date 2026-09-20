@@ -84,11 +84,23 @@ DEALLOCATE leaderboard_lookup;
 -- would silently stop matching the data on any fixture change).
 SELECT id, title FROM posts WHERE id = ANY(:'lb_winners'::bigint[]);
 
-\echo '--- pg_stat_statements profile (5 front-page statements) ---'
+-- 6. front_page's `flags.enabled("new_ui_preview")` (posts.rs:195). With a
+-- real primary database configured, `build_store` resolves to `PgFlagStore`
+-- (examples/reddit-clone/src/feature_flags.rs:15-18), whose 1-second cache
+-- (autumn/src/feature_flags.rs:688-706) means a request landing on a cold
+-- cache issues this lookup. This profile represents that cold-cache case --
+-- a request within the same second as a prior one for this flag would skip
+-- it. Not wrapped in PREPARE/EXECUTE like statement 4: this one has a
+-- single non-reused parameter, so a literal produces the same normalized
+-- shape either way.
+SELECT key, description, enabled, rollout_pct, actor_allowlist, group_allowlist
+FROM autumn_feature_flags WHERE key = 'new_ui_preview';
+
+\echo '--- pg_stat_statements profile (6 front-page statements) ---'
 -- pg_stat_statements is cluster-wide, not scoped to this database: on a
 -- reused/shared Postgres instance with other databases active, an
 -- unfiltered scan would count their concurrent statements too, corrupting
--- both the total and the "5 statements" claim. Filter to this database (and
+-- both the total and the "6 statements" claim. Filter to this database (and
 -- this session's role, since the fixture/profile run as one user) so
 -- unrelated cluster traffic can't leak in.
 SELECT query, calls, shared_blks_hit, shared_blks_read,

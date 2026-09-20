@@ -3,13 +3,16 @@
 ## 🎯 Workload
 
 `examples/reddit-clone`'s front page (`GET /`, `routes::posts::front_page`,
-`examples/reddit-clone/src/routes/posts.rs:80-179`) issues five statements:
+`examples/reddit-clone/src/routes/posts.rs:80-195`) issues six statements:
 the hot-posts listing (`ORDER BY hot_rank DESC LIMIT 25`), the batched
 `preload(author().subreddit())` for that page of posts (two `id = ANY(...)`
 belongs-to lookups, `posts.rs:176-179`), the "Top posts by votes" leaderboard
 (`VoteRepository::sum_value_grouped_by_post_id().order_by_aggregate_desc().limit(5)`,
-`examples/reddit-clone/src/repositories.rs:86-90`), and a small `id = ANY(...)`
-title lookup for the leaderboard's 5 winners.
+`examples/reddit-clone/src/repositories.rs:86-90`), a small `id = ANY(...)`
+title lookup for the leaderboard's 5 winners, and (with a real primary
+database configured, so `flags`'s `PgFlagStore` is live, and a cold
+1-second cache) `flags.enabled("new_ui_preview")`'s flag lookup
+(`posts.rs:195`).
 
 Profiled against a production-shaped fixture applied to a real Postgres 16
 instance (schema replayed from `examples/reddit-clone/migrations/`, no
@@ -70,6 +73,10 @@ for m in 20260419000000_create_reddit 20260427000000_add_user_avatar \
          20260702000001_create_tags 20260820000000_polymorphic_comments; do
   psql -d reddit_ledger -f examples/reddit-clone/migrations/$m/up.sql
 done
+# Framework migration (autumn/migrations/, not the app's own) -- front_page's
+# flags.enabled("new_ui_preview") call needs this table when a real primary
+# database is configured (see Profile section, statement 6).
+psql -d reddit_ledger -f autumn/migrations/20260530200000_create_feature_flags/up.sql
 psql -d reddit_ledger -f docs/reports/2026-09-20-ledger-reddit-vote-leaderboard-covering-index-negative-result/fixture/seed.sql
 psql -d reddit_ledger -f docs/reports/2026-09-20-ledger-reddit-vote-leaderboard-covering-index-negative-result/baseline/queries.sql
 psql -d reddit_ledger -f docs/reports/2026-09-20-ledger-reddit-vote-leaderboard-covering-index-negative-result/after/queries.sql
@@ -77,7 +84,7 @@ psql -d reddit_ledger -f docs/reports/2026-09-20-ledger-reddit-vote-leaderboard-
 
 ## 📈 Profile
 
-`pg_stat_statements`, reset immediately before the five front-page
+`pg_stat_statements`, reset immediately before the six front-page
 statements ran once each (the two `array_agg`-wrapped queries that recover
 the seeded fixture's actual hot-post ids and leaderboard winners run
 *before* the reset, so they never appear in this profile — they are not
@@ -85,20 +92,23 @@ statements `front_page` itself issues):
 
 | statement | calls | total buffers | % of page's buffers |
 |---|---:|---:|---:|
-| leaderboard: `SUM(value) GROUP BY post_id ... LIMIT 5` | 1 | **3,293** | **96.57%** |
+| leaderboard: `SUM(value) GROUP BY post_id ... LIMIT 5` | 1 | **3,293** | **96.51%** |
 | preload: `SELECT * FROM users WHERE id = ANY(...)` | 1 | 77 | 2.26% |
 | hot-posts listing: `ORDER BY hot_rank DESC LIMIT 25` | 1 | 27 | 0.79% |
 | title lookup: `id = ANY(...)` (leaderboard winners) | 1 | 12 | 0.35% |
+| flag lookup: `autumn_feature_flags WHERE key = $1` | 1 | 2 | 0.06% |
 | preload: `SELECT * FROM subreddits WHERE id = ANY(...)` | 1 | 1 | 0.03% |
 
 The leaderboard query is the front page's cost by nearly two orders of
 magnitude — comfortably clears the "≥5% of total buffers" bar. The other
-four statements are cheap, correctly-indexed point/batched lookups
-(`idx_posts_hot_rank`, primary-key `ANY`) and are not touched by this
-report. (The two `preload()` statements are approximated from the schema —
-plain `belongs_to`, no soft-delete/tenant guard on either `users` or
-`subreddits` — not verified byte-identical against the preload macro's
-codegen the way the leaderboard query is, below.)
+five statements are cheap, correctly-indexed point/batched lookups
+(`idx_posts_hot_rank`, primary-key `ANY`, the flag table's unique `key`
+index) and are not touched by this report. (The two `preload()` statements
+are approximated from the schema — plain `belongs_to`, no soft-delete/
+tenant guard on either `users` or `subreddits` — not verified byte-identical
+against the preload macro's codegen the way the leaderboard query is,
+below. The flag lookup also assumes a cold 1-second cache — a request
+landing within a second of a prior one for this flag skips it entirely.)
 
 ## 🧭 Plan
 
@@ -149,12 +159,12 @@ reduction versus the seq-scan plan's 3,293. So the index isn't inert.
 
 To be precise about what that does and doesn't establish: `after/output.txt`
 also records `Execution Time:` for both plans (lines 90 and 134) — in the
-exact output committed here, 44.144 ms unforced (seq scan) versus 29.616 ms
+exact output committed here, 50.434 ms unforced (seq scan) versus 35.151 ms
 forced (index-only). Re-running this identical script (or an equivalent
 version of it) several times during this report's review produced 43.9/30.6
-ms, 42.5/41.8 ms (essentially a tie), 44.6/30.7 ms, and 44.1/29.6 ms — the
-gap between the two plans swings from "roughly tied" to "index ~30% faster"
-across otherwise-identical runs, which is
+ms, 42.5/41.8 ms (essentially a tie), 44.6/30.7 ms, 44.1/29.6 ms, and
+50.4/35.2 ms — the gap between the two plans swings from "roughly tied" to
+"index ~30% faster" across otherwise-identical runs, which is
 itself the reason this project gates `EXPLAIN ANALYZE` timing on a `>2×`
 delta before treating it as evidence at all: none of these three runs clear
 it. So wall-clock isn't used as a claim here either way — whatever number
@@ -355,9 +365,26 @@ A fifth review round caught two more:
     the plan or buffer counts (a freshly prepared statement's first
     execution costs itself with the actual bound values, same as a
     literal query) — re-ran the full pipeline; buffers are unchanged
-    (3,293, still 96.57%). One residual, and irreducible via `psql`,
-    fidelity gap remains: `pg_stat_statements` records this statement
-    with a `PREPARE leaderboard_lookup (...) AS` prefix that a real
-    driver-level bind (extended query protocol, no textual `PREPARE`)
-    wouldn't have; see the comment on the statement in
+    (3,293, 96.51%–96.57% depending on which round's total buffer
+    denominator this is measured against — see item 13). One residual,
+    and irreducible via `psql`, fidelity gap remains: `pg_stat_statements`
+    records this statement with a `PREPARE leaderboard_lookup (...) AS`
+    prefix that a real driver-level bind (extended query protocol, no
+    textual `PREPARE`) wouldn't have; see the comment on the statement in
     `baseline/queries.sql` for why.
+
+A sixth review round caught one more, the largest gap found:
+
+13. The profile was still missing a real statement `front_page` issues:
+    `flags.enabled("new_ui_preview")` (`posts.rs:195`), which — with a real
+    primary database configured, so `flags` resolves to `PgFlagStore`
+    rather than the in-memory fallback — queries `autumn_feature_flags`
+    on a cold 1-second cache (`autumn/src/feature_flags.rs:688-706`).
+    Fixed: added the framework's `autumn_feature_flags` migration and a
+    seeded `new_ui_preview` row (matching the app's own bootstrap default,
+    25% rollout) to the fixture, added the query as statement 6, and
+    updated the "Reproduce" section with the extra migration. Re-ran the
+    full pipeline: the flag lookup is 2 buffers (0.06% of page buffers),
+    the leaderboard is now 96.51% of a 6-statement, 3,412-buffer total
+    (was 96.57% of a 5-statement, 3,410-buffer total) — the conclusion is
+    unaffected, the new statement barely moves the denominator.
