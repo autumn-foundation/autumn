@@ -257,6 +257,7 @@
 #   scripts/check-docs-cli.sh --list       # print the parsed command surface
 #   scripts/check-docs-cli.sh --list-options  # …with each command's options
 #   scripts/check-docs-cli.sh --list-hidden   # …only the `hide = true` ones
+#   scripts/check-docs-cli.sh --list-aliases  # alias -> canonical spelling
 #   scripts/check-docs-cli.sh --corpus     # the reader-facing pages it reads
 #   scripts/check-docs-cli.sh --resolved   # which command each line names
 #   scripts/check-docs-cli.sh --self-test  # synthetic-corpus tests
@@ -657,12 +658,18 @@ def build_surface(sources):
                 if not re.match(r'^[A-Z]', name):
                     continue
                 rename = re.search(r'\bname\s*=\s*"([^"]+)"', attrs)
-                spellings = {rename.group(1) if rename else kebab(name)}
+                # The spelling clap shows in `--help`. The aliases below are
+                # additional ways to TYPE this same command, not commands of
+                # their own, so consumers that ask "which command is this?"
+                # need to be able to collapse them back onto this one.
+                canonical = rename.group(1) if rename else kebab(name)
+                spellings = {canonical}
                 for a in re.findall(r'\b(?:visible_)?alias\s*=\s*"([^"]+)"', attrs):
                     spellings.add(a)
                 for group in re.findall(r'\b(?:visible_)?aliases\s*=\s*\[([^\]]*)\]', attrs):
                     spellings.update(re.findall(r'"([^"]+)"', group))
-                node = {'children': {}, 'positionals': False, 'options': {},
+                node = {'children': {}, 'canonical': canonical,
+                        'positionals': False, 'options': {},
                         'requires_sub': False, 'required_args': 0,
                         'trailing': False, 'hyphen_slots': [],
                         # `#[command(hide = true)]`: clap keeps the command
@@ -712,16 +719,21 @@ def build_surface(sources):
 
     tree = build('Commands')
 
-    def flatten(t, prefix=''):
+    def flatten(t, prefix='', canon_prefix=''):
         flat = {}
         for k, v in t.items():
             key = (prefix + ' ' + k).strip()
+            # Built segment by segment, so an alias at ANY level collapses:
+            # `autumn c` and a hypothetical `autumn c <sub>` both canonicalise
+            # through `console`, which a whole-path table would miss.
+            canon = (canon_prefix + ' ' + v['canonical']).strip()
             # clap gives every command `--help`/`-h`, and the root's
             # `#[command(version)]` gives `--version`/`-V`. They are declared
             # nowhere in the derive input, so without this they read as drift.
             opts = dict(BUILTIN_OPTIONS)
             opts.update(v['options'])
             flat[key] = {'children': set(v['children']),
+                         'canonical': canon,
                          'hidden': v['hidden'],
                          'positionals': v['positionals'],
                          'options': opts,
@@ -729,7 +741,7 @@ def build_surface(sources):
                          'required_args': v['required_args'],
                          'trailing': v['trailing'],
                          'hyphen_slots': v['hyphen_slots']}
-            flat.update(flatten(v['children'], key))
+            flat.update(flatten(v['children'], key, canon))
         return flat
 
     def root_node():
@@ -748,7 +760,8 @@ def build_surface(sources):
             opts.update({'--version': False, '-V': False})
         if 'Cli' in structs:                    # any real `#[arg]` on the root
             opts.update(_options(structs['Cli'], structs))
-        return {'children': set(), 'hidden': False, 'positionals': False,
+        return {'children': set(), 'canonical': '', 'hidden': False,
+                'positionals': False,
                 'options': opts, 'requires_sub': True, 'required_args': 0,
                 'trailing': False, 'hyphen_slots': []}
 
@@ -6648,6 +6661,17 @@ def main():
               file=sys.stderr)
         return 1
 
+    if MODE == '--list-aliases':
+        # `alias<TAB>canonical`, for every spelling that is not the canonical
+        # one. An alias is another way to TYPE a command, not another command:
+        # `autumn c` and `autumn console` are one thing, and a consumer that
+        # compares spellings rather than commands counts them as two.
+        for path in sorted(p for p in surface if p):
+            canon = surface[path]['canonical']
+            if canon and canon != path:
+                print(f'{path}\t{canon}')
+        return 0
+
     if MODE == '--list-hidden':
         # A command whose subtree is hidden is hidden: clap leaves the whole
         # branch out of `--help`, so a child of a hidden parent is no more
@@ -6798,8 +6822,9 @@ case "$mode" in
   --corpus)       run_py --corpus "$root" ;;
   --resolved)     run_py --resolved "$root" ;;
   --list-hidden)  run_py --list-hidden "$root" ;;
+  --list-aliases) run_py --list-aliases "$root" ;;
   --list-options) run_py --list-options "$root" ;;
   "")             echo "Checking CLI invocations across the reader-facing docs..."
                   run_py --check "$root" ;;
-  *)              echo "usage: $0 [--list|--list-options|--list-hidden|--corpus|--resolved|--self-test]" >&2; exit 2 ;;
+  *)              echo "usage: $0 [--list|--list-options|--list-hidden|--list-aliases|--corpus|--resolved|--self-test]" >&2; exit 2 ;;
 esac

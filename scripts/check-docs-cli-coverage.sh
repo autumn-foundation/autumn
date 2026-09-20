@@ -53,6 +53,21 @@
 # the lesson `check-docs-scope.sh` already exists to enforce over the corpus
 # definitions.
 #
+# ALIASES COLLAPSE ONTO THE CANONICAL COMMAND FIRST. `#[command(visible_alias
+# = "c")]` makes `autumn c` another way to TYPE `autumn console`, not another
+# command, and the sibling's surface lists both spellings as paths. Comparing
+# spellings therefore demands that BOTH be documented independently, so a page
+# that documents `autumn console` properly leaves `autumn c` looking
+# undocumented — and the gate's advice would be to write the alias into the
+# docs, which is the opposite of what a reader needs. Both sides are mapped
+# through `--list-aliases` before anything is compared, segment by segment, so
+# an alias at any level of a path collapses.
+#
+# This was latent rather than live when the gate landed: the corpus happens to
+# write both `autumn c` and `autumn console`, which masked it. Rewriting the
+# two `autumn c` lines to the canonical spelling reproduced it exactly —
+# `defects: 1, autumn c`.
+#
 # WHAT COUNTS AS COVERAGE. A command path is covered when some reader-facing
 # page names it or names a DESCENDANT of it. A descendant covers its ancestors
 # because a page writing `autumn token issue` has by definition written
@@ -193,6 +208,17 @@ def surface():
     return [l for l in lines if l and 'command paths' not in l]
 
 
+def aliases():
+    """`{alias path: canonical path}` for every non-canonical spelling."""
+    out = {}
+    for line in sibling('--list-aliases').splitlines():
+        if not line.strip():
+            continue
+        alias, canon = line.split('\t')
+        out[alias] = canon
+    return out
+
+
 def documented():
     """The set of command paths the reader-facing corpus names."""
     paths = set()
@@ -204,9 +230,16 @@ def documented():
     return paths
 
 
-def covered(path, docd):
-    """Named outright, or named by a descendant (which writes the ancestor)."""
-    return any(r == path or r.startswith(path + ' ') for r in docd)
+def covered(path, docd, alias_map=None):
+    """Named outright, or named by a descendant (which writes the ancestor).
+
+    Both sides are canonicalised first: an alias is another spelling of the
+    same command, so documenting either spelling documents the command.
+    """
+    alias_map = alias_map or {}
+    path = alias_map.get(path, path)
+    return any(r == path or r.startswith(path + ' ')
+               for r in (alias_map.get(d, d) for d in docd))
 
 
 def destroy_rule_stated():
@@ -216,9 +249,15 @@ def destroy_rule_stated():
     return bool(DESTROY_RULE.search(page.read_text(errors='replace')))
 
 
-def classify(paths, docd, hidden, rule_stated, backlog):
-    """Split the surface into covered / exempt / defect, with the reason."""
-    uncovered = [p for p in paths if not covered(p, docd)]
+def classify(paths, docd, hidden, rule_stated, backlog, alias_map=None):
+    """Split the surface into covered / exempt / defect, with the reason.
+
+    An alias spelling is never judged on its own: it is the same command as
+    its canonical path, which is judged once under that name.
+    """
+    alias_map = alias_map or {}
+    uncovered = [p for p in paths
+                 if p not in alias_map and not covered(p, docd, alias_map)]
     exempt, defects = {}, []
     for p in uncovered:
         if p in hidden:
@@ -226,7 +265,7 @@ def classify(paths, docd, hidden, rule_stated, backlog):
             continue
         if rule_stated and p.startswith('destroy '):
             counterpart = 'generate ' + p[len('destroy '):]
-            if covered(counterpart, docd):
+            if covered(counterpart, docd, alias_map):
                 exempt[p] = f'covered by the family rule: `{counterpart}` is documented'
                 continue
         if p in backlog:
@@ -246,24 +285,36 @@ def main():
         return 2
 
     docd = documented()
+    alias_map = aliases()
     hidden = set(l.strip() for l in sibling('--list-hidden').splitlines() if l.strip())
     rule_stated = destroy_rule_stated()
     corpus_size = len([l for l in sibling('--corpus').splitlines() if l.strip()])
 
     uncovered, exempt, defects = classify(paths, docd, hidden, rule_stated,
-                                          BACKLOG)
-    covered_n = len(paths) - len(uncovered)
+                                          BACKLOG, alias_map)
+    # An alias is not a command to document, so it is not counted as one on
+    # either side of the ratio.
+    commands = [p for p in paths if p not in alias_map]
+    covered_n = len(commands) - len(uncovered)
 
     if MODE == '--list':
         for p in paths:
-            mark = 'documented' if covered(p, docd) else exempt.get(p, 'DEFECT')
+            if p in alias_map:
+                mark = f'alias of `{alias_map[p]}`'
+            elif covered(p, docd, alias_map):
+                mark = 'documented'
+            else:
+                mark = exempt.get(p, 'DEFECT')
             print(f'{p}\t{mark}')
         return 0
 
     print(f'corpus: {corpus_size} reader-facing markdown files')
-    print(f'surface: {len(paths)} command paths parsed from autumn-cli/src')
-    print(f'documented: {covered_n}/{len(paths)} '
-          f'({covered_n * 100 // len(paths)}%)')
+    print(f'surface: {len(commands)} command paths parsed from autumn-cli/src'
+          + (f' ({len(alias_map)} alias spelling'
+             f'{"" if len(alias_map) == 1 else "s"} folded onto the canonical '
+             f'command)' if alias_map else ''))
+    print(f'documented: {covered_n}/{len(commands)} '
+          f'({covered_n * 100 // len(commands)}%)')
     by_reason = {}
     for p, why in exempt.items():
         key = ('hidden' if why.startswith('hidden')
@@ -278,7 +329,7 @@ def main():
 
     # A backlog entry that became documented has to leave the list, or the
     # list stops distinguishing live waivers from finished work.
-    stale = sorted(p for p in BACKLOG if covered(p, docd))
+    stale = sorted(p for p in BACKLOG if covered(p, docd, alias_map))
     unknown = sorted(p for p in BACKLOG if p not in paths)
 
     print(f'defects: {len(defects)}'
@@ -362,6 +413,32 @@ def self_test():
     expect(not covered('db pu', docd), 'a partial segment is not coverage')
     expect(not covered('cons', docd), 'a partial top-level name is not coverage')
 
+    # An alias is another way to TYPE a command, not a command of its own.
+    # Documenting either spelling documents the one command, and the alias
+    # spelling is never judged or counted on its own. Regression test for the
+    # review finding on this gate: with the corpus writing only `autumn
+    # console`, comparing spellings reported `autumn c` undocumented.
+    amap = {'c': 'console', 'c seed': 'console seed'}
+    expect(covered('c', {'console'}, amap),
+           'the canonical spelling covers its alias')
+    expect(covered('console', {'c'}, amap),
+           'the alias spelling covers the canonical command')
+    expect(covered('c seed', {'console seed'}, amap),
+           'an alias collapses at every level of the path')
+    expect(not covered('console', {'consoleee'}, amap),
+           'canonicalising must not make unrelated spellings match')
+
+    _u, _e, alias_defects = classify(['console', 'c'], {'console'}, set(),
+                                     rule_stated=True, backlog={},
+                                     alias_map=amap)
+    expect(not alias_defects,
+           'an alias of a documented command is not a defect')
+    _u, _e, alias_defects2 = classify(['console', 'c'], set(), set(),
+                                      rule_stated=True, backlog={},
+                                      alias_map=amap)
+    expect(alias_defects2 == ['console'],
+           'an undocumented command is reported ONCE, under its canonical name')
+
     paths = ['token issue', 'token rotate', 'export', 'destroy model',
              'destroy policy', 'generate model', 'serve run-service']
     hidden = {'serve run-service'}
@@ -397,9 +474,12 @@ def self_test():
     real = surface()
     if real:
         real_docd = documented()
+        real_aliases = aliases()
         expect(all(p in real for p in BACKLOG),
                'every BACKLOG entry names a real command path')
-        expect(not any(covered(p, real_docd) for p in BACKLOG),
+        expect(not any(p in real_aliases for p in BACKLOG),
+               'no BACKLOG entry is an alias spelling rather than a command')
+        expect(not any(covered(p, real_docd, real_aliases) for p in BACKLOG),
                'no BACKLOG entry is already documented')
 
     print(f'self-test: {passed} passed, {failed} failed')

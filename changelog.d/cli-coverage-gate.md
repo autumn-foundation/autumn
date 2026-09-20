@@ -1,7 +1,7 @@
 ### Testing
 
 - **📖 Folio: gate the direction the docs gates never ran (CLI coverage
-  172/194, 0 defects, backlog 10):** the corpus carried twelve docs gates and
+  171/193, 0 defects, backlog 10):** the corpus carried twelve docs gates and
   every one of them ran docs → code — "is what we wrote still true?", which is
   drift. None asked "is what we shipped written down anywhere?", which is
   coverage, so a command could ship, work, carry good `--help` text and
@@ -26,7 +26,11 @@
   other way, which is the asymmetry that let `autumn token` look documented
   while all four of its subcommands were invisible.
 
-  Of 194 command paths, 172 are documented. Eleven `destroy` subcommands are
+  Of 193 command paths, 171 are documented — the surface net of alias
+  spellings, which are folded onto the canonical command first: a
+  `#[command(visible_alias = "c")]` makes `autumn c` another way to *type*
+  `autumn console`, not a second command to document, and comparing spellings
+  would demand both be written down independently. Eleven `destroy` subcommands are
   exempt under the reversal rule `generators.md` states over the family — an
   exemption conditional on both halves and checked on both: the rule sentence
   must still be on the page (delete it and all eleven report), and the matching
