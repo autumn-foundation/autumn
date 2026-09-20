@@ -18,7 +18,8 @@ use syn::parse::Parser as _;
 use syn::{DeriveInput, Field, LitStr};
 
 use crate::commentable::{emit_commentable_items, is_commentable_attr, resolve_commentable};
-use crate::schema::{
+use autumn_macros_support::naming::{infer_table_name, pascal_to_snake, pluralize_word};
+use autumn_macros_support::schema::{
     apply_serde_rename_all_rule, emit_schema_fn_body_full, emit_schema_fn_body_named,
     field_has_skip_serializing_if, field_is_collaborative, field_is_translatable,
     field_serde_serialize_rename, has_attr, is_option_type, serde_bare_word,
@@ -456,7 +457,7 @@ fn parse_votable_attr(attr: &syn::Attribute, model_ident: &syn::Ident) -> syn::R
                 target_fk = Some(value);
             } else if key == "value_column" {
                 check_votable_ident_value(&key, &value, value_span)?;
-                value_column = Some(key.clone());
+                value_column = Some(key);
                 value_column_value = Some(value);
             } else if key == "column" {
                 check_votable_ident_value(&key, &value, value_span)?;
@@ -6752,8 +6753,9 @@ fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
         // chrono's default `Deserialize` round-trips as-is. Plainer, but honest, rather
         // than a picker whose submission 400s.
         "DateTime" => {
-            let picker_zone = crate::api_doc::unwrap_single_generic(inner_ty, "DateTime")
-                .is_some_and(|tz| matches!(type_name_str(&tz).as_str(), "Utc" | "Local"));
+            let picker_zone =
+                autumn_macros_support::schema::unwrap_single_generic(inner_ty, "DateTime")
+                    .is_some_and(|tz| matches!(type_name_str(&tz).as_str(), "Utc" | "Local"));
             if picker_zone {
                 quote! { ::autumn_web::form::FieldControl::DateTime }
             } else {
@@ -6789,14 +6791,14 @@ fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
 fn datetime_local_serde_attr(ty: &syn::Type) -> Option<TokenStream> {
     let nullable = is_option_type(ty);
     let inner = if nullable {
-        crate::api_doc::unwrap_single_generic(ty, "Option")?
+        autumn_macros_support::schema::unwrap_single_generic(ty, "Option")?
     } else {
         ty.clone()
     };
     let base = match type_name_str(&inner).as_str() {
         "NaiveDateTime" => "deserialize_naive_datetime_local",
         "DateTime" => {
-            let tz = crate::api_doc::unwrap_single_generic(&inner, "DateTime")?;
+            let tz = autumn_macros_support::schema::unwrap_single_generic(&inner, "DateTime")?;
             match type_name_str(&tz).as_str() {
                 "Utc" => "deserialize_datetime_local_utc",
                 "Local" => "deserialize_datetime_local_local",
@@ -6809,8 +6811,9 @@ fn datetime_local_serde_attr(ty: &syn::Type) -> Option<TokenStream> {
     // (it never passes through this crate's own generic `::autumn_web`
     // token rewrite — see `crate_path`'s module doc, #1828), so it must be
     // built from the actively resolved crate name directly.
-    let crate_root =
-        crate::crate_path::escaped_target_path_segment(&crate::crate_path::current_target());
+    let crate_root = autumn_macros_support::crate_path::escaped_target_path_segment(
+        &autumn_macros_support::crate_path::current_target(),
+    );
     if nullable {
         // `deserialize_with` disables serde's implicit missing-`Option`-field
         // -is-`None` handling; `default` restores it so a JSON body may still
@@ -6855,7 +6858,7 @@ fn emit_form_model_impl(
             let field_name = field_name.strip_prefix("r#").unwrap_or(&field_name);
             let label = humanize_field_label(field_name);
             let nullable = is_option_type(&f.ty);
-            let inner = crate::api_doc::unwrap_single_generic(&f.ty, "Option")
+            let inner = autumn_macros_support::schema::unwrap_single_generic(&f.ty, "Option")
                 .unwrap_or_else(|| f.ty.clone());
             let control = form_control_tokens(&inner, nullable);
             let required = !nullable;
@@ -11374,75 +11377,6 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // ── Polymorphic comments (#[commentable], #1367) ────────────────────
         #commentable_items
     }
-}
-
-pub fn infer_table_name(ident: &syn::Ident) -> String {
-    let name = ident.to_string();
-    let snake = pascal_to_snake(&name);
-    // Pluralize only the last snake_case segment, mirroring
-    // `autumn-cli`'s `naming::pluralize`: `blog_post` → `blog_posts`,
-    // `category` → `categories`.
-    let (prefix, last) = snake.rfind('_').map_or(("", snake.as_str()), |idx| {
-        (&snake[..=idx], &snake[idx + 1..])
-    });
-    format!("{prefix}{}", pluralize_word(last))
-}
-
-/// English pluraliser for a single word: irregulars, sibilant endings
-/// (`+es`), consonant+`y` (`y` → `ies`), otherwise `+s`.
-///
-/// This is a FAITHFUL copy of [`autumn_web::format::pluralize_word`], which is
-/// the canonical implementation (see `autumn/src/format.rs::pluralize_word`).
-/// It MUST stay in sync with that function: the CLI scaffold's `src/schema.rs`
-/// pluralises table names through `autumn_web::format::pluralize_word` (via
-/// `naming::pluralize`), and the `#[model]`/`#[repository]` derives here must
-/// produce the same table name so the generated app compiles. It is duplicated
-/// rather than imported because this proc-macro crate cannot depend on
-/// `autumn-web` (that would create a dependency cycle: `autumn-web` depends on
-/// `autumn-macros`).
-fn pluralize_word(word: &str) -> String {
-    if word.is_empty() {
-        return String::new();
-    }
-    match word {
-        "person" => return "people".to_owned(),
-        "child" => return "children".to_owned(),
-        "man" => return "men".to_owned(),
-        "woman" => return "women".to_owned(),
-        "mouse" => return "mice".to_owned(),
-        "goose" => return "geese".to_owned(),
-        _ => {}
-    }
-    let lower = word.to_ascii_lowercase();
-    if lower.ends_with("ss")
-        || lower.ends_with('x')
-        || lower.ends_with('z')
-        || lower.ends_with("ch")
-        || lower.ends_with("sh")
-    {
-        return format!("{word}es");
-    }
-    if lower.ends_with('y') {
-        // 'y' is 1-byte ASCII, so slicing off the last byte stays on a char boundary.
-        let prefix = &word[..word.len() - 1];
-        if let Some(prev) = prefix.chars().next_back()
-            && !"aeiouAEIOU".contains(prev)
-        {
-            return format!("{prefix}ies");
-        }
-    }
-    format!("{word}s")
-}
-
-pub fn pascal_to_snake(s: &str) -> String {
-    let mut result = String::new();
-    for (i, ch) in s.chars().enumerate() {
-        if ch.is_uppercase() && i > 0 {
-            result.push('_');
-        }
-        result.push(ch.to_ascii_lowercase());
-    }
-    result
 }
 
 #[cfg(test)]
@@ -17694,24 +17628,6 @@ mod tests {
     }
 
     #[test]
-    fn pascal_to_snake_simple() {
-        assert_eq!(pascal_to_snake("User"), "user");
-    }
-
-    #[test]
-    fn pascal_to_snake_multi_word() {
-        assert_eq!(pascal_to_snake("BlogPost"), "blog_post");
-    }
-
-    #[test]
-    fn pascal_to_snake_three_words() {
-        assert_eq!(
-            pascal_to_snake("UserProfileSettings"),
-            "user_profile_settings"
-        );
-    }
-
-    #[test]
     fn pascal_case_simple() {
         assert_eq!(pascal_case("title"), "Title");
     }
@@ -17724,64 +17640,6 @@ mod tests {
     #[test]
     fn pascal_case_single_char() {
         assert_eq!(pascal_case("x"), "X");
-    }
-
-    #[test]
-    fn infer_table_name_simple() {
-        let ident = syn::Ident::new("User", proc_macro2::Span::call_site());
-        assert_eq!(infer_table_name(&ident), "users");
-    }
-
-    #[test]
-    fn infer_table_name_multi_word() {
-        let ident = syn::Ident::new("BlogPost", proc_macro2::Span::call_site());
-        assert_eq!(infer_table_name(&ident), "blog_posts");
-    }
-
-    // Irregular-plural inference (#1753): the derived table name MUST match the
-    // CLI scaffold's `src/schema.rs`, which pluralises through
-    // `autumn_web::format::pluralize_word`. These mirror the assertions in
-    // `autumn/src/format.rs` and `autumn-cli/src/generate/naming.rs` so all
-    // three implementations agree.
-    #[test]
-    fn infer_table_name_irregular_plurals() {
-        let cases = [
-            ("Category", "categories"),
-            ("Company", "companies"),
-            ("City", "cities"),
-            ("Story", "stories"),
-            ("Box", "boxes"),
-            ("Buzz", "buzzes"),
-            ("Class", "classes"),
-            ("Watch", "watches"),
-            ("Dish", "dishes"),
-            ("Person", "people"),
-            ("Child", "children"),
-            ("Post", "posts"),
-            ("Node", "nodes"),
-            ("Comment", "comments"),
-            ("BlogPost", "blog_posts"),
-            ("Day", "days"),
-        ];
-        for (input, expected) in cases {
-            let ident = syn::Ident::new(input, proc_macro2::Span::call_site());
-            assert_eq!(infer_table_name(&ident), expected, "input: {input}");
-        }
-    }
-
-    #[test]
-    fn pluralize_word_matches_canonical_rules() {
-        assert_eq!(pluralize_word(""), "");
-        assert_eq!(pluralize_word("category"), "categories");
-        assert_eq!(pluralize_word("day"), "days");
-        assert_eq!(pluralize_word("box"), "boxes");
-        assert_eq!(pluralize_word("buzz"), "buzzes");
-        assert_eq!(pluralize_word("class"), "classes");
-        assert_eq!(pluralize_word("watch"), "watches");
-        assert_eq!(pluralize_word("dish"), "dishes");
-        assert_eq!(pluralize_word("person"), "people");
-        assert_eq!(pluralize_word("goose"), "geese");
-        assert_eq!(pluralize_word("post"), "posts");
     }
 
     // ── RED: etag() derivation from #[lock_version] ────────────────────────
@@ -19111,5 +18969,54 @@ mod tests {
             None
         );
         assert_eq!(attr(syn::parse_quote!(DateTime)), None);
+    }
+
+    // ── Rename-pipeline contract (#1828) ────────────────────────────────────
+    // Moved here from `autumn-macros-support::crate_path`'s tests when the DB
+    // macros were split into their own crates: this pipeline couples the
+    // macro's codegen with the shared crate-path rewrite, so it lives with
+    // the macro it exercises.
+
+    fn ts_string(ts: &proc_macro2::TokenStream) -> String {
+        ts.to_string()
+    }
+
+    /// No genuine `::autumn_web` *token* path (crate-root anchored) may
+    /// survive `finalize`. `to_string()` renders a real `:: Ident ::` token
+    /// sequence with spaces around the identifier; a doc comment or string
+    /// literal's *contents* render with no such surrounding space, so this
+    /// specifically will not (and must not) flag those.
+    fn assert_no_leaked_autumn_web_token_path(s: &str) {
+        assert!(
+            !s.contains(":: autumn_web"),
+            "leaked `::autumn_web` token path in: {s}"
+        );
+    }
+
+    #[test]
+    fn model_macro_pipeline_has_no_leaked_autumn_web_after_override() {
+        use autumn_macros_support::crate_path::{finalize, set_target};
+
+        let _guard = set_target(Some("renamed_autumn_web"));
+        let item = quote! {
+            struct Post {
+                #[id]
+                id: i64,
+                title: String,
+            }
+        };
+        let generated = model_macro(quote! {}, item);
+        let rewritten = finalize(generated);
+        let s = ts_string(&rewritten);
+        assert_no_leaked_autumn_web_token_path(&s);
+        assert!(s.contains("renamed_autumn_web"), "got: {s}");
+        // The `deserialize_with`/`#[serde(crate = "...")]` string values this
+        // pipeline builds (issue #1828's original literal-rewrite targets)
+        // must reflect the active target too — proving `current_target()` at
+        // the source beats the removed post-hoc literal rewrite.
+        assert!(
+            s.contains("renamed_autumn_web :: reexports :: serde"),
+            "got: {s}"
+        );
     }
 }

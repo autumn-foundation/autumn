@@ -62,7 +62,7 @@ fn is_guard_response_path(path: &syn::Path) -> bool {
     // actively resolved name, or a genuine match is missed.
     path.segments.len() == GUARD_RESPONSE_PATH.len()
         && path.segments.first().is_some_and(|segment| {
-            segment.ident == crate::crate_path::current_target_path_segment()
+            segment.ident == autumn_macros_support::crate_path::current_target_path_segment()
         })
         && path
             .segments

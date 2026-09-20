@@ -33,8 +33,11 @@ pub use autumn_macros::ws;
 pub use autumn_macros::{
     api_doc, authorize, cached, delete, event, feature_flag, get, job, jobs, listener, listeners,
     main, oauth2_callback, one_off_tasks, patch, paths, post, public, put, query_budget, routes,
-    scheduled, secured, service, static_get, static_routes, step_up, task, tasks, throttle,
+    scheduled, secured, static_get, static_routes, step_up, task, tasks, throttle,
 };
+/// Define a service for cross-model orchestration and non-DB side effects.
+#[cfg(feature = "db")]
+pub use autumn_macros_model::service;
 
 /// Service-to-service wire contracts (#1755): mark an endpoint, derive a DTO's
 /// wire shape, and check a caller's call sites against the callee.

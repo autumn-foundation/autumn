@@ -324,6 +324,9 @@ mod tests {
     const NON_PLUGIN_MEMBERS: &[&str] = &[
         "autumn",
         "autumn-macros",
+        "autumn-macros-model",
+        "autumn-macros-repository",
+        "autumn-macros-support",
         "autumn-cli",
         "autumn-schema-core",
         "autumn-edge",
@@ -335,6 +338,9 @@ mod tests {
     const PUBLISHED_NON_PLUGIN_MEMBERS: &[&str] = &[
         "autumn",
         "autumn-macros",
+        "autumn-macros-model",
+        "autumn-macros-repository",
+        "autumn-macros-support",
         "autumn-cli",
         "autumn-schema-core",
         "autumn-edge",
