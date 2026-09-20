@@ -97,11 +97,25 @@ FROM generate_series(1, 15000) AS n;
 -- surviving one could disagree, and which one survives is undefined. The
 -- pairs are deduped FIRST with a plain `SELECT DISTINCT u, p` (unambiguous:
 -- a duplicate row is identical to its sibling here, there's no extra column
--- to arbitrate between), and `value` is drawn fresh, once per already-unique
--- pair, in the outer SELECT -- there is never a second candidate value for
--- the same key to lose track of.
+-- to arbitrate between).
+--
+-- `value` is computed from `hashtext(...)`, not `random()`. A second
+-- determinism gap remains even once the pair is deduped first: which
+-- `random()` *call* in the session's seeded sequence a given pair receives
+-- depends on the row order `SELECT DISTINCT` happens to emit them in, and
+-- that order is not part of the SQL standard's or Postgres's contract for
+-- `DISTINCT` -- a different `DISTINCT` strategy (hash- vs. sort-based
+-- unique), worker count, or `work_mem` could feed the same pair a
+-- different draw and flip its vote, even though every pair still gets
+-- exactly one draw. `hashtext` makes `value` a pure function of the pair
+-- itself (plus a per-block salt, so cold/hot/comment votes don't share a
+-- pattern), so no evaluation order can change which value a pair gets.
+-- `hashtext` can return `INT_MIN`, which `abs()` on `int` can't represent
+-- (overflows); casting to `bigint` first avoids that.
 INSERT INTO votes (user_id, post_id, value)
-SELECT u, p, (CASE WHEN random() < 0.85 THEN 1 ELSE -1 END)::smallint
+SELECT u, p,
+       (CASE WHEN (abs(hashtext(u::text || ':' || p::text || ':cold')::bigint) % 100) < 85
+             THEN 1 ELSE -1 END)::smallint
 FROM (
     SELECT DISTINCT u, p
     FROM (
@@ -116,9 +130,12 @@ FROM (
 ON CONFLICT (user_id, post_id) DO NOTHING;
 
 -- Hot posts (ids 1-200): heavy additional vote volume (real skew). Same
--- dedupe-then-draw shape as the cold-post insert above, for the same reason.
+-- dedupe-then-draw shape and hash-based `value` as the cold-post insert
+-- above, for the same reason.
 INSERT INTO votes (user_id, post_id, value)
-SELECT u, p, (CASE WHEN random() < 0.9 THEN 1 ELSE -1 END)::smallint
+SELECT u, p,
+       (CASE WHEN (abs(hashtext(u::text || ':' || p::text || ':hot')::bigint) % 100) < 90
+             THEN 1 ELSE -1 END)::smallint
 FROM (
     SELECT DISTINCT u, p
     FROM (
@@ -130,9 +147,12 @@ FROM (
 ON CONFLICT (user_id, post_id) DO NOTHING;
 
 -- Comment votes: NULL post_id, real rows for the leaderboard's guard to
--- exclude. Same dedupe-then-draw shape as the two vote inserts above.
+-- exclude. Same dedupe-then-draw shape and hash-based `value` as the two
+-- vote inserts above.
 INSERT INTO votes (user_id, comment_id, value)
-SELECT u, c, (CASE WHEN random() < 0.8 THEN 1 ELSE -1 END)::smallint
+SELECT u, c,
+       (CASE WHEN (abs(hashtext(u::text || ':' || c::text || ':comment')::bigint) % 100) < 80
+             THEN 1 ELSE -1 END)::smallint
 FROM (
     SELECT DISTINCT u, c
     FROM (
