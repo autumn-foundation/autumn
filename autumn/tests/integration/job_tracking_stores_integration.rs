@@ -250,8 +250,47 @@ async fn postgres_backend_persists_tracked_job_and_expires_it() {
         "expected a status field: {record}"
     );
 
-    // The 1s TTL configured above should push expires_at into the past;
-    // lazy expiry means the row itself isn't deleted, only ignored on read.
+    // `PgJobTrackingStore::update` (job_tracking.rs) unconditionally rewrites
+    // `expires_at` to `now + ttl` on every lifecycle write, not only on
+    // enqueue — `mark_running` and `settle_success` both go through it. A
+    // fixed sleep measured from the read above races the job runtime's own
+    // dispatch: if `mark_running` or `settle_success` lands after the read
+    // but before the sleep elapses, it pushes `expires_at` back out and the
+    // TTL check below can see a record that hasn't expired yet, even though
+    // the *original* enqueue-time expiry already passed
+    // (docs/ci-health/quarantine-ledger.md, "record should be past its
+    // configured TTL", 1/50 same-commit rerun rate — confirmed by CI-native
+    // rerun campaign). Refreshing `expires_at` on every lifecycle write is
+    // deliberate, correct store behavior (a job still being worked on
+    // shouldn't expire out from under it), so the fix is in this test: await
+    // the job's own terminal status — the point after which nothing will
+    // touch `expires_at` again for this key — before starting the TTL clock,
+    // instead of guessing a sleep long enough to outrun a write whose timing
+    // this test doesn't control.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let row = diesel::sql_query(
+            "SELECT record::TEXT AS record FROM autumn_job_tracking WHERE key = $1",
+        )
+        .bind::<diesel::sql_types::Text, _>(&key)
+        .get_result::<RecordRow>(&mut *conn)
+        .await
+        .expect("tracked record should still exist while polling for completion");
+        let record: Value = serde_json::from_str(&row.record).expect("stored record is valid JSON");
+        if record["status"] == "succeeded" || record["status"] == "failed" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "noop job never reached a terminal tracked status within 5s: {record}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The 1s TTL configured above should now push expires_at into the past —
+    // the job is terminal, so `mark_running`/`settle_success` have made their
+    // last write and nothing else will touch `expires_at` for this key.
+    // Lazy expiry means the row itself isn't deleted, only ignored on read.
     tokio::time::sleep(Duration::from_millis(1_200)).await;
     let expired = diesel::sql_query(
         "SELECT (expires_at <= NOW()) AS expired FROM autumn_job_tracking WHERE key = $1",
