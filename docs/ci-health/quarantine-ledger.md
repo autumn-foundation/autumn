@@ -868,12 +868,37 @@ _None as of 2026-09-05._
   entry's own framing above (structural, not a second campaign): the 1/50
   result already reproduces the pre-fix race on iteration 26 of that run, so
   this clean 0/50 on the merged fix is the completing half of that
-  before/after pair. Entry closed: rerun-rate baseline established (1/50 →
-  0/50), mechanism confirmed by source (not hypothesis), test-vs-product
-  verdict rendered (test defect), fix applied and CI-natively verified twice
-  over (PR #2867's own `Test (Docker)` run, plus this dedicated 50-iteration
-  harness), ledger and reports updated throughout, review findings from two
-  Codex passes addressed and resolved before merge.
+  before/after pair.
+
+  **Scope of this closure — corrected (post-review, via a Codex review
+  comment on PR #2874): closing this entry closes the CI flake, not the
+  broader clock-comparison question the entry's own analysis raised.** The
+  0/50 result exercises the fixed, single-process test only — it confirms
+  the *worker-refresh* mechanism (the same clock, `mark_running`/
+  `settle_success` refreshing `expires_at` inside the test's own sleep
+  window) was iteration 26's cause and that this test no longer races it.
+  It says nothing about, and does not test, the separate risk the
+  2026-09-11 update's ninth correction (above) already flagged and left
+  explicitly unresolved: a `web`/`worker` split-replica deployment
+  compares `expires_at` (stamped by one host's clock) against Postgres's
+  `NOW()` or another host's clock, and nothing in this codebase bounds
+  that skew. That risk was never confirmed as the cause of *any* observed
+  failure (the two organic hits and the 1/50 CI-native failure are all
+  now attributed to the single-process worker-refresh mechanism), so it
+  does not block closing *this* flake — but closing the flake must not
+  read as resolving it too. Filed as its own tracked item, issue #2875,
+  so it has a durable home now that this entry moves to "Closed entries"
+  and stops being sampled daily.
+
+  With that scope correction: entry closed for the CI flake specifically —
+  rerun-rate baseline established (1/50 → 0/50), mechanism confirmed by
+  source (not hypothesis), test-vs-product verdict rendered for *this*
+  failure (test defect, single-process worker-refresh race), fix applied
+  and CI-natively verified twice over (PR #2867's own `Test (Docker)` run,
+  plus this dedicated 50-iteration harness), ledger and reports updated
+  throughout, review findings from three Codex review passes across two
+  PRs addressed and resolved before merge. The cross-host clock-skew
+  question is separately tracked in issue #2875, not closed by this entry.
 
   This pass's organic-hit sampling (2026-09-18T07:33:38Z exclusive to
   2026-09-20T07:33:19Z, ~72h, two `perPage=100` pages, 200 runs: 143
