@@ -99,17 +99,36 @@ reference to when the job runtime would actually run the job.
 
 ## 🔧 Treatment
 
-**Fix, in this pass's own PR**: `autumn/tests/integration/job_tracking_stores_integration.rs`'s
-`postgres_backend_persists_tracked_job_and_expires_it` now polls the tracked
-record (50ms interval, 5s deadline) until `status` reaches a terminal value
-(`"succeeded"`/`"failed"`) before starting the TTL sleep, instead of sleeping
-a fixed 1200ms from the initial enqueue-time read. Once the job is terminal,
-`mark_running`/`settle_success` have made their last write for that key
-(confirmed structurally: one `mark_running` call, one settle call,
-`max_attempts: 1` on the `noop` job this test uses, no retry path) — so the
-1200ms TTL sleep that follows is racing nothing. This awaits the actual
-condition instead of widening the sleep to outrun an unbounded dispatch
-latency, per this role's own standing preference.
+**Fix, in this pass's own PR — revised once during review (see Diagnosis
+addendum below)**: `autumn/tests/integration/job_tracking_stores_integration.rs`'s
+`postgres_backend_persists_tracked_job_and_expires_it` now configures a 10s
+TTL (raised from the original 1s) and polls the tracked record (50ms
+interval, 8s deadline) until `status` reaches a terminal value
+(`"succeeded"`/`"failed"`) before starting the TTL wait, instead of sleeping
+a fixed 1200ms from the initial enqueue-time read against a 1s TTL. Once the
+job is terminal, `mark_running`/`settle_success` have made their last write
+for that key (confirmed structurally: one `mark_running` call, one settle
+call, `max_attempts: 1` on the `noop` job this test uses, no retry path).
+Rather than sleep a further fixed guess, the test then queries Postgres for
+the row's actual remaining TTL (`GREATEST(EXTRACT(EPOCH FROM (expires_at -
+NOW())), 0)`) and sleeps exactly that plus a 300ms margin — correct
+regardless of how much of the 10s TTL the completion wait already consumed.
+This awaits the actual condition instead of widening a sleep to outrun an
+unbounded dispatch latency, per this role's own standing preference.
+
+**Diagnosis addendum — the first version of this fix had its own flake,
+caught on review, not empirically.** A Codex review comment on PR #2867
+pointed out that `PgJobTrackingStore::update`'s own `WHERE key = $1 AND
+expires_at > $2` guard makes a lifecycle write a silent no-op once the row
+is already expired. At the original `ttl_secs: 1`, a `mark_running`/
+`settle_success` write delayed past one second by ordinary Docker-CI-runner
+scheduler or database contention would find its own write vetoed — `status`
+would stay `"pending"` forever, and the poll loop's original 5s deadline
+would panic on a timeout that describes nothing about the TTL check itself.
+That is a second, load-dependent flake, in a scenario where the *original*
+fixed-sleep version would have passed. Fixed as described above (10s TTL,
+8s poll cap, remaining-TTL-based wait) before this ever ran organically or
+through another rerun campaign.
 
 **Not touched**: the Redis sibling test (same file, lines 45-117) has the
 identical race in principle — its own TTL write goes through the same
