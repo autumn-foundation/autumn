@@ -177,8 +177,10 @@ to"** or "the seq scan is faster." Postgres's cost model weighs
 `seq_page_cost` and judged the seq scan cheaper at 88.1% selectivity;
 buffers say the index path touches less. Either way, the planner does not
 choose it, so shipping it collects none of that buffer win in practice: an
-index nothing ever chooses is a pure write tax on every vote insert,
-forever, for a benefit this workload never actually gets in return.
+index nothing ever chooses is a pure write tax on every post-directed vote
+insert (the partial predicate excludes comment votes, so those pay
+nothing), forever, for a benefit this workload never actually gets in
+return.
 
 The index was **dropped** after the comparison (`after/output.txt`'s final
 `DROP INDEX` + the empty-of-it `pg_stat_user_indexes` listing that follows
@@ -388,3 +390,12 @@ A sixth review round caught one more, the largest gap found:
     the leaderboard is now 96.51% of a 6-statement, 3,412-buffer total
     (was 96.57% of a 5-statement, 3,410-buffer total) — the conclusion is
     unaffected, the new statement barely moves the denominator.
+
+A seventh review round caught one more, wording only:
+
+14. The "🔧 Change" section's closing line said the covering index would
+    have been "a pure write tax on every vote insert," which overstates it
+    — the partial predicate (`WHERE post_id IS NOT NULL`) excludes
+    comment-directed votes, matching the "💸 Write cost" section a few
+    paragraphs down, which already scoped it correctly. Fixed: both now
+    say "every post-directed vote insert."
