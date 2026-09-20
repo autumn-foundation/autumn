@@ -14,14 +14,20 @@ SELECT pg_stat_statements_reset(
 );
 
 \echo '=== unforced: planner choice with the index available ==='
+-- PREPARE/EXECUTE reproduces the real codegen's parameter-reuse structure
+-- (3 bound params, each referenced twice) instead of 3 independent literal
+-- NULLs -- see baseline/queries.sql's comment on the same statement for why.
+PREPARE leaderboard_lookup (bigint, bigint, bigint) AS
 SELECT post_id AS agg_key, SUM(value) AS agg_val FROM votes
 WHERE post_id IS NOT NULL
-  AND (NULL::bigint IS NULL OR post_id = NULL::bigint)
-  AND (NULL::bigint IS NULL OR post_id >= NULL::bigint)
-  AND (NULL::bigint IS NULL OR post_id <= NULL::bigint)
+  AND ($1 IS NULL OR post_id = $1)
+  AND ($2 IS NULL OR post_id >= $2)
+  AND ($3 IS NULL OR post_id <= $3)
 GROUP BY post_id
 ORDER BY agg_val DESC NULLS LAST, post_id ASC
 LIMIT 5;
+EXECUTE leaderboard_lookup(NULL, NULL, NULL);
+DEALLOCATE leaderboard_lookup;
 
 \echo '--- pg_stat_statements after the index exists (unforced) ---'
 -- Same dbid/userid scoping as baseline/queries.sql -- pg_stat_statements is

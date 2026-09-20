@@ -43,18 +43,40 @@ SELECT * FROM users WHERE id = ANY(:'hp_author_ids'::bigint[]);
 SELECT * FROM subreddits WHERE id = ANY(:'hp_subreddit_ids'::bigint[]);
 
 -- 4. front_page's top-by-votes leaderboard
--- (byte-identical to the SQL `VoteRepository::sum_value_grouped_by_post_id()
---  .order_by_aggregate_desc().limit(5)` sends -- codegen in
---  autumn-macros-repository/src/repository.rs:14362-14374; verified against
---  the real trait call in examples/reddit-clone/tests/votable_pg_integration.rs:443-449)
+-- The codegen (autumn-macros-repository/src/repository.rs:14354-14364,
+-- 14396-14398; real trait call verified in
+-- examples/reddit-clone/tests/votable_pg_integration.rs:443-449) binds
+-- eq/low/high as three REUSED parameters -- each appears twice in the SQL
+-- text (`($1 IS NULL OR post_id = $1)`, etc.) but is bound once -- and
+-- leaves `LIMIT 5` a literal (`__lim` is `format!`-interpolated into the
+-- SQL string, never bound). A plain literal `NULL::bigint` written three
+-- times, as an earlier version of this harness did, is textually THREE
+-- separate constants to Postgres's query jumbler, not one reused twice --
+-- pg_stat_statements then normalizes it to 6 distinct placeholders instead
+-- of 3, which doesn't match the shape a real trace of this app would show.
+-- PREPARE/EXECUTE reproduces the real reuse structure (verified: the
+-- executed plan/buffers are unaffected either way -- a freshly prepared
+-- statement's first execution costs itself using the actual bound values,
+-- identical to a literal query, so this is a query-*text* fidelity fix,
+-- not a plan or buffer-count fix). The one artifact this leaves: the row
+-- pg_stat_statements records for this statement carries a
+-- `PREPARE leaderboard_lookup (...) AS` prefix that a driver-level bind
+-- (as the app's tokio-postgres/diesel-async stack actually sends, via the
+-- wire protocol rather than textual PREPARE) would not have -- psql has no
+-- clean way to reproduce that without one (its `\bind` meta-command can't
+-- pass a typed SQL NULL, only literal text). Cosmetic difference in the
+-- recorded query text only.
+PREPARE leaderboard_lookup (bigint, bigint, bigint) AS
 SELECT post_id AS agg_key, SUM(value) AS agg_val FROM votes
 WHERE post_id IS NOT NULL
-  AND (NULL::bigint IS NULL OR post_id = NULL::bigint)
-  AND (NULL::bigint IS NULL OR post_id >= NULL::bigint)
-  AND (NULL::bigint IS NULL OR post_id <= NULL::bigint)
+  AND ($1 IS NULL OR post_id = $1)
+  AND ($2 IS NULL OR post_id >= $2)
+  AND ($3 IS NULL OR post_id <= $3)
 GROUP BY post_id
 ORDER BY agg_val DESC NULLS LAST, post_id ASC
 LIMIT 5;
+EXECUTE leaderboard_lookup(NULL, NULL, NULL);
+DEALLOCATE leaderboard_lookup;
 
 -- 5. front_page's title resolution for the leaderboard's actual top ids
 -- (captured above, not hard-coded -- this fixture is seeded but the winners

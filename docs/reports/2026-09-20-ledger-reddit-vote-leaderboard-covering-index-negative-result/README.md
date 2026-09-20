@@ -148,12 +148,13 @@ idx_votes_post_id_value_covering`, `Heap Fetches: 0`, and its buffer count
 reduction versus the seq-scan plan's 3,293. So the index isn't inert.
 
 To be precise about what that does and doesn't establish: `after/output.txt`
-also records `Execution Time:` for both plans (lines 87 and 131) — in the
-exact output committed here, 44.551 ms unforced (seq scan) versus 30.726 ms
-forced (index-only). Re-running this identical script several times during
-this report's review produced 43.9/30.6 ms, 42.5/41.8 ms (essentially a
-tie), and 44.6/30.7 ms — the gap between the two plans swings from "roughly
-tied" to "index ~30% faster" across otherwise-identical runs, which is
+also records `Execution Time:` for both plans (lines 90 and 134) — in the
+exact output committed here, 44.144 ms unforced (seq scan) versus 29.616 ms
+forced (index-only). Re-running this identical script (or an equivalent
+version of it) several times during this report's review produced 43.9/30.6
+ms, 42.5/41.8 ms (essentially a tie), 44.6/30.7 ms, and 44.1/29.6 ms — the
+gap between the two plans swings from "roughly tied" to "index ~30% faster"
+across otherwise-identical runs, which is
 itself the reason this project gates `EXPLAIN ANALYZE` timing on a `>2×`
 delta before treating it as evidence at all: none of these three runs clear
 it. So wall-clock isn't used as a claim here either way — whatever number
@@ -333,3 +334,30 @@ change:
     `NOW()`, so complete rows are never identical across runs. Fixed: the
     header now states the same scoped claim (randomized values and
     winners, not complete rows) as the README.
+
+A fifth review round caught two more:
+
+11. `examples/reddit-clone/src/repositories.rs`'s doc-comment had the
+    selectivity direction backwards: it said `post_id IS NOT NULL` "was
+    selective enough" that the index never got chosen, when a *higher*
+    match rate (88.1%) is *lower* selectivity, and lower selectivity is
+    exactly why the seq scan wins. Fixed: now says "was NOT selective
+    enough."
+12. The leaderboard query's `eq`/`low`/`high` guard was written as three
+    independent `NULL::bigint` literals, but the real codegen binds them
+    as three *reused* parameters (`$1` appears twice in the SQL text for
+    the eq guard, `$2` twice for low, `$3` twice for high) — three literal
+    constants normalize to 6 distinct `pg_stat_statements` placeholders,
+    not matching the shape a real trace of this app would show. Fixed:
+    both `queries.sql` scripts now issue the leaderboard query via
+    `PREPARE ... EXECUTE ... DEALLOCATE`, which reproduces the real reuse
+    structure. Verified this changes only the recorded query *text*, not
+    the plan or buffer counts (a freshly prepared statement's first
+    execution costs itself with the actual bound values, same as a
+    literal query) — re-ran the full pipeline; buffers are unchanged
+    (3,293, still 96.57%). One residual, and irreducible via `psql`,
+    fidelity gap remains: `pg_stat_statements` records this statement
+    with a `PREPARE leaderboard_lookup (...) AS` prefix that a real
+    driver-level bind (extended query protocol, no textual `PREPARE`)
+    wouldn't have; see the comment on the statement in
+    `baseline/queries.sql` for why.
