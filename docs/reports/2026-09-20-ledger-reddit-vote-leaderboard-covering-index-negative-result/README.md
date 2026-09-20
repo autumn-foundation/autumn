@@ -147,19 +147,21 @@ idx_votes_post_id_value_covering`, `Heap Fetches: 0`, and its buffer count
 reduction versus the seq-scan plan's 3,293. So the index isn't inert.
 
 To be precise about what that does and doesn't establish: `after/output.txt`
-also records `Execution Time:` for both plans (lines 87 and 131) —
-42.511 ms unforced (seq scan) versus 41.774 ms forced (index-only) in the
-version of this run committed here, essentially a tie; an earlier run of
-the same script (before an unrelated fixture fix that doesn't touch this
-query) recorded a starker 43.905 ms vs. 30.560 ms. Neither delta clears
-this project's own admissibility bar for `EXPLAIN ANALYZE` timings (`>2×`,
-this repo's rule for when `actual time=`/`Execution Time:` counts as
-evidence at all) — and the fact that the gap swings between "roughly tied"
-and "index 30% faster" across two otherwise-identical runs is itself the
-reason that bar exists. So wall-clock isn't used as a claim here either
-way, and the fair description of what happened is **"the planner doesn't
-select this index," not "the planner is right not to"** or "the seq scan is
-faster." Postgres's cost model weighs `random_page_cost` against
+also records `Execution Time:` for both plans (lines 87 and 131) — in the
+exact output committed here, 44.551 ms unforced (seq scan) versus 30.726 ms
+forced (index-only). Re-running this identical script several times during
+this report's review produced 43.9/30.6 ms, 42.5/41.8 ms (essentially a
+tie), and 44.6/30.7 ms — the gap between the two plans swings from "roughly
+tied" to "index ~30% faster" across otherwise-identical runs, which is
+itself the reason this project gates `EXPLAIN ANALYZE` timing on a `>2×`
+delta before treating it as evidence at all: none of these three runs clear
+it. So wall-clock isn't used as a claim here either way — whatever number
+`after/output.txt` happens to show on any given run, re-running this script
+can and does produce a different one, and that instability is the point,
+not a data point to explain away. The fair description of what happened is
+**"the planner doesn't select this index," not "the planner is right not
+to"** or "the seq scan is faster." Postgres's cost model weighs
+`random_page_cost` against
 `seq_page_cost` and judged the seq scan cheaper at 88.1% selectivity;
 buffers say the index path touches less. Either way, the planner does not
 choose it, so shipping it collects none of that buffer win in practice: an
@@ -214,8 +216,10 @@ psql -d reddit_ledger -f docs/reports/2026-09-20-ledger-reddit-vote-leaderboard-
 Raw output: `baseline/output.txt` (profile + `EXPLAIN` before), `after/output.txt`
 (index added, unforced plan unchanged + `idx_scan=0`, forced comparison, then
 dropped). Fixture: `fixture/seed.sql` (+ `fixture/seed_output.txt`, one
-concrete run's row counts — reproducible byte-for-byte thanks to
-`setseed()`).
+concrete run's row counts and ratios — the *randomized values* `setseed()`
+and the `TABLESAMPLE ... REPEATABLE` seed pin are reproducible; the raw file
+itself is not byte-for-byte across runs (`created_at` timestamps, `VACUUM`'s
+wall-clock/XID/I/O counters), same caveat as above).
 
 ## Other candidates ruled out this run
 
@@ -278,11 +282,34 @@ A second review round on the fix caught three more:
    section above now states the prerequisite and the setup commands, and all
    three `.sql` scripts start with `\set ON_ERROR_STOP on`.
 6. The "🔧 Change" section asserted Postgres's plan choice was "right," which
-   overreached — this run's own `after/output.txt` shows the *forced*
-   index-only plan finishing faster (30.560 ms vs. 43.905 ms), a direction
-   that agrees with the buffer evidence but doesn't clear this project's own
-   `>2×` bar for treating `EXPLAIN ANALYZE` timing as evidence at all. Fixed:
+   overreached — a run's `after/output.txt` showed the *forced* index-only
+   plan finishing faster, a direction that agrees with the buffer evidence
+   but doesn't clear this project's own `>2×` bar for treating
+   `EXPLAIN ANALYZE` timing as evidence at all (and, as later re-runs
+   showed, isn't even a stable direction — see the "🔧 Change" section's own
+   discussion of run-to-run variance). Fixed:
    the section now says only what the measurements support — the planner
    doesn't select the index, so shipping it collects none of its buffer win
    in practice — without characterizing that choice as correct or the
    seq-scan plan as faster.
+
+A third review round caught three more:
+
+7. `pg_stat_statements` is cluster-wide: the bare `pg_stat_statements_reset()`
+   in `baseline/queries.sql` and `after/queries.sql` clears statistics for
+   every database and role on the server, not just this fixture's, which
+   would disrupt unrelated monitoring on a shared/reused instance even
+   though the reads were already scoped to this database/role. Fixed: both
+   scripts now pass `pg_stat_statements_reset(userid, dbid)` scoped to
+   `current_user`/`current_database()`.
+8. The wall-clock narrative and the fixture-reproducibility claim had gone
+   stale against the freshly re-run `after/output.txt` and
+   `fixture/seed_output.txt` (this report was re-run several times over the
+   course of review, and each re-run changes the exact ms figures and raw
+   timestamps those files contain). Fixed: the "🔧 Change" section now cites
+   the actual numbers in the currently-committed `after/output.txt` and
+   describes the range observed across re-runs instead of a single pair of
+   numbers that the next re-run would immediately invalidate; the
+   "Reproduce" section's fixture note now says explicitly that the
+   *randomized values* are reproducible, not the raw output file
+   byte-for-byte.

@@ -6,7 +6,12 @@
 CREATE INDEX idx_votes_post_id_value_covering ON votes (post_id) INCLUDE (value) WHERE post_id IS NOT NULL;
 ANALYZE votes;
 
-SELECT pg_stat_statements_reset();
+-- Scoped reset -- see baseline/queries.sql for why the bare, no-argument
+-- form isn't used here.
+SELECT pg_stat_statements_reset(
+    (SELECT oid FROM pg_roles WHERE rolname = current_user),
+    (SELECT oid FROM pg_database WHERE datname = current_database())
+);
 
 \echo '=== unforced: planner choice with the index available ==='
 SELECT post_id AS agg_key, SUM(value) AS agg_val FROM votes

@@ -21,7 +21,14 @@ FROM (
     WHERE post_id IS NOT NULL GROUP BY post_id ORDER BY s DESC NULLS LAST, post_id ASC LIMIT 5
 ) w \gset lb_
 
-SELECT pg_stat_statements_reset();
+-- Scoped reset: the bare pg_stat_statements_reset() clears stats for every
+-- database and role in the cluster, which on a shared/reused server would
+-- disrupt unrelated monitoring even though the reads above are scoped.
+-- Passing userid/dbid resets only this session's statements.
+SELECT pg_stat_statements_reset(
+    (SELECT oid FROM pg_roles WHERE rolname = current_user),
+    (SELECT oid FROM pg_database WHERE datname = current_database())
+);
 
 -- 1. front_page's hot_posts listing
 SELECT id, title, slug, body, url, author_id, subreddit_id, score, hot_rank, comment_count, created_at, updated_at

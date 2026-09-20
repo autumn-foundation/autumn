@@ -36,7 +36,7 @@ ANALYZE
  idx_votes_post_id                |        3 |        44385
  idx_votes_post_id_value_covering |        0 |            0
  idx_votes_user_id                |        0 |            0
- votes_pkey                       |        4 |            4
+ votes_pkey                       |        0 |            0
  votes_unique_comment             |    44998 |            0
  votes_unique_post                |   333448 |            0
 (7 rows)
@@ -44,91 +44,91 @@ ANALYZE
 --- EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS), index present, unforced ---
                                                                          QUERY PLAN                                                                         
 ------------------------------------------------------------------------------------------------------------------------------------------------------------
- Limit  (cost=7503.78..7503.79 rows=5 width=16) (actual time=41.495..41.578 rows=5 loops=1)
+ Limit  (cost=7553.71..7553.73 rows=5 width=16) (actual time=44.395..44.504 rows=5 loops=1)
    Output: post_id, (sum(value))
    Buffers: shared hit=3293
-   ->  Sort  (cost=7503.78..7513.29 rows=3804 width=16) (actual time=41.493..41.575 rows=5 loops=1)
+   ->  Sort  (cost=7553.71..7563.73 rows=4005 width=16) (actual time=44.394..44.501 rows=5 loops=1)
          Output: post_id, (sum(value))
          Sort Key: (sum(votes.value)) DESC NULLS LAST, votes.post_id
          Sort Method: top-N heapsort  Memory: 25kB
          Buffers: shared hit=3293
-         ->  Finalize HashAggregate  (cost=7402.55..7440.59 rows=3804 width=16) (actual time=37.311..39.660 rows=22469 loops=1)
+         ->  Finalize HashAggregate  (cost=7447.14..7487.19 rows=4005 width=16) (actual time=40.200..42.501 rows=22469 loops=1)
                Output: post_id, sum(value)
                Group Key: votes.post_id
                Batches: 1  Memory Usage: 2321kB
                Buffers: shared hit=3293
-               ->  Gather  (cost=6565.67..7364.51 rows=7608 width=16) (actual time=26.498..31.124 rows=35036 loops=1)
+               ->  Gather  (cost=6566.04..7407.09 rows=8010 width=16) (actual time=29.460..34.140 rows=34848 loops=1)
                      Output: post_id, (PARTIAL sum(value))
                      Workers Planned: 2
                      Workers Launched: 2
                      Buffers: shared hit=3293
-                     ->  Partial HashAggregate  (cost=5565.67..5603.71 rows=3804 width=16) (actual time=24.539..26.061 rows=11679 loops=3)
+                     ->  Partial HashAggregate  (cost=5566.04..5606.09 rows=4005 width=16) (actual time=27.109..28.655 rows=11616 loops=3)
                            Output: post_id, PARTIAL sum(value)
                            Group Key: votes.post_id
                            Batches: 1  Memory Usage: 1809kB
                            Buffers: shared hit=3293
-                           Worker 0:  actual time=23.445..24.669 rows=8887 loops=1
+                           Worker 0:  actual time=25.664..26.952 rows=8259 loops=1
                              Batches: 1  Memory Usage: 1169kB
-                             Buffers: shared hit=923
-                           Worker 1:  actual time=23.830..24.978 rows=10124 loops=1
+                             Buffers: shared hit=1045
+                           Worker 1:  actual time=26.403..27.519 rows=10381 loops=1
                              Batches: 1  Memory Usage: 1169kB
-                             Buffers: shared hit=1111
-                           ->  Parallel Seq Scan on public.votes  (cost=0.00..4869.86 rows=139163 width=10) (actual time=0.008..10.436 rows=111149 loops=3)
+                             Buffers: shared hit=1009
+                           ->  Parallel Seq Scan on public.votes  (cost=0.00..4869.86 rows=139237 width=10) (actual time=0.009..11.488 rows=111149 loops=3)
                                  Output: id, user_id, post_id, comment_id, value, created_at
                                  Filter: (votes.post_id IS NOT NULL)
                                  Rows Removed by Filter: 14999
                                  Buffers: shared hit=3293
-                                 Worker 0:  actual time=0.009..10.742 rows=92904 loops=1
-                                   Buffers: shared hit=923
-                                 Worker 1:  actual time=0.010..10.262 rows=114674 loops=1
-                                   Buffers: shared hit=1111
- Query Identifier: -7914371478982112603
- Planning Time: 0.081 ms
- Execution Time: 41.628 ms
+                                 Worker 0:  actual time=0.010..11.364 rows=106330 loops=1
+                                   Buffers: shared hit=1045
+                                 Worker 1:  actual time=0.011..11.406 rows=105321 loops=1
+                                   Buffers: shared hit=1009
+ Query Identifier: -4926840715770637666
+ Planning Time: 0.069 ms
+ Execution Time: 44.551 ms
 (41 rows)
 
 === diagnostic only: force the index path to see its true cost (enable_seqscan=off is never shipped) ===
 SET
                                                                                                 QUERY PLAN                                                                                                
 ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Limit  (cost=10843.92..10843.94 rows=5 width=16) (actual time=29.475..29.554 rows=5 loops=1)
+ Limit  (cost=10895.49..10895.50 rows=5 width=16) (actual time=30.601..30.685 rows=5 loops=1)
    Output: post_id, (sum(value))
    Buffers: shared hit=3 read=1280
-   ->  Sort  (cost=10843.92..10853.43 rows=3804 width=16) (actual time=29.473..29.551 rows=5 loops=1)
+   ->  Sort  (cost=10895.49..10905.50 rows=4005 width=16) (actual time=30.599..30.682 rows=5 loops=1)
          Output: post_id, (sum(value))
          Sort Key: (sum(votes.value)) DESC NULLS LAST, votes.post_id
          Sort Method: top-N heapsort  Memory: 25kB
          Buffers: shared hit=3 read=1280
-         ->  Finalize HashAggregate  (cost=10742.70..10780.74 rows=3804 width=16) (actual time=25.119..27.553 rows=22469 loops=1)
+         ->  Finalize HashAggregate  (cost=10788.91..10828.96 rows=4005 width=16) (actual time=26.119..28.703 rows=22469 loops=1)
                Output: post_id, sum(value)
                Group Key: votes.post_id
                Batches: 1  Memory Usage: 2321kB
                Buffers: shared hit=3 read=1280
-               ->  Gather  (cost=1000.42..10704.66 rows=7608 width=16) (actual time=0.430..20.915 rows=22922 loops=1)
+               ->  Gather  (cost=1000.42..10748.86 rows=8010 width=16) (actual time=0.394..21.530 rows=22916 loops=1)
                      Output: post_id, (PARTIAL sum(value))
                      Workers Planned: 2
                      Workers Launched: 2
                      Buffers: shared hit=3 read=1280
-                     ->  Partial GroupAggregate  (cost=0.42..8943.86 rows=3804 width=16) (actual time=0.156..20.246 rows=7641 loops=3)
+                     ->  Partial GroupAggregate  (cost=0.42..8947.86 rows=4005 width=16) (actual time=0.192..20.912 rows=7639 loops=3)
                            Output: post_id, PARTIAL sum(value)
                            Group Key: votes.post_id
                            Buffers: shared hit=3 read=1280
-                           Worker 0:  actual time=0.108..20.537 rows=11052 loops=1
-                             Buffers: shared hit=1 read=440
-                           Worker 1:  actual time=0.074..20.838 rows=11211 loops=1
-                             Buffers: shared hit=1 read=447
-                           ->  Parallel Index Only Scan using idx_votes_post_id_value_covering on public.votes  (cost=0.42..8210.01 rows=139163 width=10) (actual time=0.042..12.760 rows=111149 loops=3)
+                           Worker 0:  actual time=0.196..21.128 rows=10304 loops=1
+                             Buffers: shared hit=1 read=422
+                           Worker 1:  actual time=0.125..21.737 rows=11385 loops=1
+                             Buffers: shared hit=1 read=431
+                           ->  Parallel Index Only Scan using idx_votes_post_id_value_covering on public.votes  (cost=0.42..8211.63 rows=139237 width=10) (actual time=0.074..13.000 rows=111149 loops=3)
                                  Output: post_id, value
                                  Heap Fetches: 0
                                  Buffers: shared hit=3 read=1280
-                                 Worker 0:  actual time=0.057..12.799 rows=114840 loops=1
-                                   Buffers: shared hit=1 read=440
-                                 Worker 1:  actual time=0.033..12.966 rows=116557 loops=1
-                                   Buffers: shared hit=1 read=447
+                                 Worker 0:  actual time=0.106..12.793 rows=110142 loops=1
+                                   Buffers: shared hit=1 read=422
+                                 Worker 1:  actual time=0.081..13.619 rows=112381 loops=1
+                                   Buffers: shared hit=1 read=431
  Settings: enable_seqscan = 'off'
- Query Identifier: -7914371478982112603
- Planning Time: 0.122 ms
- Execution Time: 29.597 ms
+ Query Identifier: -4926840715770637666
+ Planning Time: 0.095 ms
+ Execution Time: 30.726 ms
 (38 rows)
 
 RESET
