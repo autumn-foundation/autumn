@@ -142,6 +142,7 @@ import html
 import re
 import subprocess
 import sys
+import unicodedata
 import urllib.parse
 
 root = sys.argv[1]
@@ -423,7 +424,7 @@ def _text_renders(text, pos, close, pairs=None, resolved=frozenset()):
     # CommonMark settles on the source: `&#32;` is not whitespace yet, so
     # `*&#32;*` opens emphasis while `* *` does not. Decoding before the
     # strip made those two identical and rejected the valid one.
-    if not decode_char_refs(strip_emphasis(text[pos + 1:close - 1])).strip():
+    if not visible(decode_char_refs(strip_emphasis(text[pos + 1:close - 1]))).strip():
         return False
     for q in range(pos + 1, close - 1):
         if text[q] != "[" or (q and text[q - 1] == "!"):
@@ -746,6 +747,24 @@ CHAR_REF = re.compile(
 
 def decode_char_refs(s):
     return CHAR_REF.sub(lambda m: html.unescape(m.group(0)), s)
+
+
+def visible(s):
+    """`s` without the characters that occupy no width.
+
+    Unicode FORMAT characters — category `Cf`: the zero-width space, the
+    zero-width joiners, the word joiner, the byte-order mark, the bidi
+    controls, the soft hyphen — render nothing and give a reader nothing to
+    see or aim at. `str.strip()` keeps them, so `[&#8203;](alpha.md)` looked
+    like an anchor holding content and a whole index could be written in
+    navigation nobody can click.
+
+    The category is the rule rather than a list of code points, because a
+    list would be a guess at which invisible characters someone might use.
+    The sentinels this scan leaves where a rendered image or code span stood
+    are category `So`, so they are not touched.
+    """
+    return "".join(c for c in s if unicodedata.category(c) != "Cf")
 
 
 # `*`, `_` and `~` when they form emphasis, strong emphasis or strikethrough.
@@ -5941,6 +5960,52 @@ self_test() {
     > "$tmp/raw_img_lookalike/README.md"
   _commit raw_img_lookalike
   _case "a tag starting with img is not an image" 1 raw_img_lookalike
+
+  # 290. A ZERO-WIDTH character occupies no width, so a label made only of
+  #      one is an anchor a reader can neither see nor aim at. `str.strip()`
+  #      keeps it — it is not whitespace — so the label looked like content
+  #      and a whole index could be written in invisible navigation.
+  _scaffold zero_width_label
+  printf '# A\n' > "$tmp/zero_width_label/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/zero_width_label/docs/guide/index.md"
+  printf '[&#8203;](docs/guide/index.md)\n' \
+    > "$tmp/zero_width_label/README.md"
+  _commit zero_width_label
+  _case "a zero-width label renders nothing" 1 zero_width_label
+
+  # 291. The same on the INDEX side, where such a row lists a page a reader
+  #      cannot see listed.
+  _scaffold zero_width_row
+  printf '# A\n' > "$tmp/zero_width_row/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [&#8203;](alpha.md)\n' \
+    > "$tmp/zero_width_row/docs/guide/index.md"
+  printf '[Guide](docs/guide/index.md)\n' > "$tmp/zero_width_row/README.md"
+  _commit zero_width_row
+  _case "a zero-width row lists nothing" 1 zero_width_row
+
+  # 292. The rule is the Unicode FORMAT category, not a list of code points,
+  #      so the byte-order mark goes the same way as the zero-width space
+  #      without having been named.
+  _scaffold zero_width_bom
+  printf '# A\n' > "$tmp/zero_width_bom/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/zero_width_bom/docs/guide/index.md"
+  printf '[&#65279;](docs/guide/index.md)\n' \
+    > "$tmp/zero_width_bom/README.md"
+  _commit zero_width_bom
+  _case "a byte-order mark renders nothing either" 1 zero_width_bom
+
+  # 293. ...and a zero-width character BESIDE real text takes nothing away
+  #      from it, so the label is still content.
+  _scaffold zero_width_with_text
+  printf '# A\n' > "$tmp/zero_width_with_text/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/zero_width_with_text/docs/guide/index.md"
+  printf '[&#8203;Guide](docs/guide/index.md)\n' \
+    > "$tmp/zero_width_with_text/README.md"
+  _commit zero_width_with_text
+  _case "a zero-width beside text keeps the text" 0 zero_width_with_text
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
