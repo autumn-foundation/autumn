@@ -114,6 +114,17 @@ step "./scripts/check-sqlite-unification.sh   (self-test + manifest gate; no too
 step "./scripts/check-example-bin-names.sh   (self-test + manifest gate; no toolchain)"
 ./scripts/check-example-bin-names.sh
 
+# --- 1f. Changelog fragment gate ---------------------------------------------
+# Mirrors ci.yml `migration-guides` job:
+# `./scripts/check-changelog-fragments.sh`. Same shape as the gates above —
+# seconds, no toolchain, self-testing. It is here because the thing it catches
+# is cheapest to fix before the push: a release note written into CHANGELOG.md
+# instead of its own `changelog.d/` file, which is the line every other open PR
+# also edits.
+step "./scripts/check-changelog-fragments.sh   (self-test + changelog notes; no toolchain)"
+./scripts/check-changelog-fragments.sh --self-test >/dev/null
+./scripts/check-changelog-fragments.sh
+
 # --- 2. Formatting -----------------------------------------------------------
 # Mirrors ci.yml `lint` job: `cargo fmt --all -- --check`.
 step "cargo fmt --all -- --check"

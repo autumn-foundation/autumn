@@ -196,6 +196,27 @@ jobs:
         # queueing behind ~20 minutes of workspace clippy in `lint` — and a
         # clippy failure can't stop it from running.
         run: ./scripts/check-migration-guides.sh
+      - name: Changelog fragment gate
+        # A release note used to go straight into CHANGELOG.md, at the top of
+        # the `## [Unreleased]` section — the same few lines every other open
+        # PR wrote to, so every PR conflicted with every other PR over text
+        # that was never the point of either. A note is now its own file under
+        # `changelog.d/`, and this step keeps it that way: it fails a PR that
+        # edits CHANGELOG.md, and fails a fragment the release tooling and the
+        # migration-guide gate above could not read.
+        #
+        # A release commit is exempt through the `release` label or a
+        # [changelog] token in the PR body. CI does not re-run on `labeled`,
+        # so the token is the reliable one: put it in the release PR body when
+        # you open it.
+        #
+        # Shares this docs-only job for the same reason as the gates around
+        # it: no toolchain, no cache, reports in seconds.
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          CHANGELOG_RELEASE_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'release') }}
+        run: ./scripts/check-changelog-fragments.sh --self-test && ./scripts/check-changelog-fragments.sh
       - name: Migration version gate
         # Framework, plugin and app migrations share one version space: diesel
         # keys `__diesel_schema_migrations` on the 14-digit version and
@@ -639,6 +660,35 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-scope.sh --self-test && ./scripts/check-docs-scope.sh
+      - name: CLI coverage gate
+        # The twelve docs gates above all run docs -> code: "is what we wrote
+        # still true?", which is DRIFT. This one runs code -> docs: "is what we
+        # shipped written down anywhere?", which is COVERAGE. Nothing asked
+        # that before, and the gap is invisible by construction — a gate that
+        # only reads the docs can never notice a command the docs never
+        # mention, so a command can ship, work, carry good `--help` text, be
+        # documented nowhere, and leave the whole tree green.
+        #
+        # That is how all four `autumn token` subcommands — `issue` since
+        # 0.5.x, `list` / `rotate` since 0.6.0 — reached 0.7 with "revoke api
+        # token" returning zero hits across all 160 guide pages. #2821 fixed
+        # the prose and deferred the gate, on the grounds that a correct one
+        # has to reuse `check-docs-cli.sh`'s `resolve()` rather than
+        # re-implement it. It does: surface, corpus, resolved invocations and
+        # the hidden-command set all come from that gate's `--list`,
+        # `--corpus`, `--resolved` and `--list-hidden` modes, so the two cannot
+        # disagree about what a line names. A private matcher gets the shallow
+        # cases right and the deep ones wrong — `autumn openapi export`
+        # satisfying the top-level `export` (a different command, an offline
+        # diagnostic snapshot) was caught in review on the first attempt.
+        #
+        # Not registered in `check-docs-scope.sh`'s SIBLINGS: it spells no
+        # corpus of its own, it asks `check-docs-cli.sh` for that gate's, so
+        # there is no second spelling for the scope gate to reconcile.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-cli-coverage.sh --self-test && ./scripts/check-docs-cli-coverage.sh
       - name: Plugin surface gate
         # The declared plugin API surface (issue #1601) has a compiled half —
         # the `plugin-contract` job below builds `autumn-plugin-reference`
@@ -690,6 +740,39 @@ jobs:
         # autumn-admin-plugin. The reference plugin proves the DECLARED surface;
         # the admin plugin proves a real, non-trivial consumer of it.
         run: cargo check -p autumn-admin-plugin --all-targets
+
+  migration-collisions:
+    name: Diesel migration version collisions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # `autumn migrate check-collisions` compares this branch's migration
+          # versions against every other pushed branch, which needs the
+          # remote-tracking refs a shallow (default) checkout doesn't fetch.
+          # Without this, the gate still runs — it degrades to a working-tree
+          # -only check with a loud warning rather than failing closed — but
+          # would silently lose the cross-branch half of the protection on
+          # every PR in this repo's own CI.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Migration version collision gate
+        # Diesel records applied migrations BY VERSION (the leading
+        # `YYYYMMDDHHMMSS` directory prefix). When two directories share one
+        # version, a fresh database runs exactly one of them and records the
+        # version as done -- the other is skipped forever, with no error
+        # anywhere. This is the enforcing half of `autumn migrate new`, which
+        # hands out a collision-free version at generation time; this gate
+        # catches a collision that generator could not see (a branch pushed
+        # after, a teammate's concurrent PR) before it reaches the default
+        # branch, on the push that introduced it rather than after both land.
+        #
+        # Framework-owned migrations live in `autumn/migrations`, not a
+        # repository-root `migrations/`, so this runs from within `autumn/` —
+        # exactly like a downstream app would run it from its own project
+        # root once `autumn migrate check-collisions` ships in a release.
+        run: (cd autumn && cargo run -p autumn-cli --bin autumn -- migrate check-collisions)
 
   supply-chain:
     name: Supply chain (cargo-deny)
@@ -1349,6 +1432,15 @@ jobs:
         # budget, and these are typical single-Postgres-container tests
         # (seconds to low minutes each), so +30 min is a conservative margin.
         timeout-minutes: 75
+        env:
+          # `feature_flags_pg_integration` below builds with `managed-pg-bundled`,
+          # which compiles `postgresql_embedded`; its build script downloads
+          # Postgres binaries via the GitHub API and, unauthenticated, hits the
+          # 60 req/hr rate limit and fails the build with a 403 (2026-09-16, run
+          # 35126796648). Authenticate with the job's token to get the higher
+          # rate limit, as the `coverage` job and the Windows Tier 1 journey job
+          # already do.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
           cargo test -p autumn-web --test repository_shard_replica_routing -- --ignored
@@ -2075,6 +2167,7 @@ jobs:
             --test sqlite_upsert_isolation \
             --test sqlite_votable \
             --test sqlite_derivation \
+            --test sqlite_money_ledger \
             --test sqlite_dependent_destroy \
             --test sqlite_tracked_sessions \
             --test sqlite_commit_hook_worker \
@@ -2082,6 +2175,7 @@ jobs:
             --test sim_chaos \
             --test sim_fault_plan_db \
             --test sqlite_jobs_scheduler_e2e \
+            --test confidential_repository_bidx \
             --test sim_sqlite_substrate \
             --test sim_sqlite_integration \
             --test sim_chaos_crash

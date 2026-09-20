@@ -272,7 +272,24 @@ ROOT = pathlib.Path(sys.argv[2])
 
 # ── Truth set ────────────────────────────────────────────────────────────────
 
-MACRO_SRC = ROOT / "autumn-macros" / "src"
+# The macro crate split (#2809) moved `model.rs`, `repository.rs` and
+# `service.rs` into sibling proc-macro crates. File names stay unique across
+# the roots, so `OWNERS` below still names a bare file.
+MACRO_SRCS = (
+    ROOT / "autumn-macros" / "src",
+    ROOT / "autumn-macros-model" / "src",
+    ROOT / "autumn-macros-repository" / "src",
+)
+
+
+def macro_src(name):
+    """The first macro source root that holds `name`, else `None`."""
+    for root in MACRO_SRCS:
+        path = root / name
+        if path.exists():
+            return path
+    return None
+
 
 # The source file that owns each attribute macro's argument grammar. Keyed by
 # the macro name as it is written at a call site.
@@ -689,11 +706,11 @@ def accepted_keys():
         sources = [
             strip_test_mods(
                 strip_rust_comments(
-                    (MACRO_SRC / f).read_text(encoding="utf-8", errors="replace")
+                    macro_src(f).read_text(encoding="utf-8", errors="replace")
                 )
             )
             for f in filenames
-            if (MACRO_SRC / f).exists()
+            if macro_src(f) is not None
         ]
         if not sources:
             out[macro] = set()
@@ -3882,13 +3899,13 @@ def self_test():
         names = (owned,) if isinstance(owned, str) else owned
         have = set(names)
         text = "\n".join(
-            (MACRO_SRC / f).read_text(encoding="utf-8", errors="replace")
+            macro_src(f).read_text(encoding="utf-8", errors="replace")
             for f in names
-            if (MACRO_SRC / f).exists()
+            if macro_src(f) is not None
         )
         for module, _ in set(forward_call.findall(text)):
             target = f"{module}.rs"
-            if (MACRO_SRC / target).exists() and target not in have:
+            if macro_src(target) is not None and target not in have:
                 check(f"{macro} covers forwarded {target}", target, "(registered)")
     check("oauth2_callback accepts route keys", "timeout_ms" in accepted["oauth2_callback"], True)
     check(
@@ -4345,7 +4362,11 @@ def self_test():
     # Every exported attribute macro is registered. An unregistered one is not
     # a permissive read but no read at all: its pages go ungated while the gate
     # still reports a clean run.
-    lib = (MACRO_SRC / "lib.rs").read_text(encoding="utf-8", errors="replace")
+    lib = "\n".join(
+        (root / "lib.rs").read_text(encoding="utf-8", errors="replace")
+        for root in MACRO_SRCS
+        if (root / "lib.rs").exists()
+    )
     exported = set()
     for block in lib.split("#[proc_macro_attribute]")[1:]:
         found = re.search(r"pub fn ([a-z_0-9]+)\s*\(", block)

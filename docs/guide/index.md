@@ -155,6 +155,7 @@ Looking for the API reference instead? That is
 ## Product features
 
 - [Billing](billing.md) — Stripe checkout and portal, entitlement gating, and dunning retries
+- [Money and the Ledger](money.md) — holding amounts without rounding them away, and moving money without double-charging or losing it
 - [A/B Experiments](experiments.md) — assigning users to variants and reading the results
 - [Feature Flags](feature-flags.md) — turning a feature on for some users and not others
 - [Admin Panel](admin.md) — the generated CRUD backoffice, and restricting who reaches it

@@ -258,6 +258,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Signed Webhook Intake](docs/guide/signed-webhooks.md) — webhooks arriving **in**: verifying a sender's signature, replay protection, and the intake route
 - [Outbound Signed Webhooks](docs/guide/outbound-webhooks.md) — sending outbound webhooks **out** to endpoints your own users/customers register: `WebhookSubscription`, `WebhookOutboundManager::dispatch()`, the retrying `autumn_webhook_delivery` job, and dead-letter inspection and replay under `/actuator/webhooks/*`
 - [Billing](docs/guide/billing.md) — `autumn-billing`: Stripe checkout and portal, a webhook-fed local mirror, the `Entitled<Plan>` gate, and durable dunning retries
+- [Money and the Ledger](docs/guide/money.md) — typed `Money<C>`, currency-safe arithmetic and rounding, and the append-only double-entry ledger with idempotent posting that commits inside your `Db::tx`
 - [Platform Support](docs/guide/platform-support.md) — the Windows tier policy: which commands run natively, which need WSL2, and the `windows-latest` CI job that gates the native journey
 - [Docs Smoke Procedure](docs/guide/docs-smoke.md) - release gate for first-run docs
 - [Release Checklist](docs/release-checklist.md)
