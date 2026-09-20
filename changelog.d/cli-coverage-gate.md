@@ -38,6 +38,11 @@
   `destroy policy` are *not* exempt. One is exempt as `#[command(hide = true)]`,
   read out of the derive input, so hiding a command exempts it with no edit to
   the gate. The remaining ten are a triaged backlog carrying a reason each; a
-  newly shipped undocumented command is not on that list and fails, and an
-  entry that becomes documented fails too, so the list cannot rot into
-  unauditable waivers.
+  newly shipped undocumented command is not on that list and fails. An entry
+  earns its place only by being the *only* thing keeping its command out of the
+  defect list, and fails the moment that stops being true — decided by
+  re-running the exemption rules with no backlog at all, so documentation,
+  `hide = true` and the family rule all spend an entry alike. Checking only for
+  documentation was not enough: a spent entry goes on waiving its command after
+  the exemption that superseded it goes away, which would have let `destroy
+  inbound-mail` stay silently waived while the other eleven re-gated.

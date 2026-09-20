@@ -105,10 +105,30 @@
 #      corpus that does not yet pass it; it is not a place to put new work. A
 #      newly shipped undocumented command is NOT on the list and fails.
 #
-#      The list is exact in both directions. An entry that becomes documented
-#      fails too, with "remove it from the backlog" — otherwise the list rots
-#      into a set of waivers nobody can tell from live ones, which is how a
-#      baseline file stops meaning anything.
+#      The list is exact in both directions. An entry earns its place only by
+#      being the ONLY thing keeping its command out of the defect list, and it
+#      fails the moment that stops being true — otherwise the list rots into a
+#      set of waivers nobody can tell from live ones, which is how a baseline
+#      file stops meaning anything.
+#
+#      "Documented" is not the only way it stops being true, and checking only
+#      that was wrong. An entry is equally spent once ANOTHER exemption
+#      accounts for its command, and leaving it there then defeats that other
+#      exemption's own conditionality. Worked example, reproduced before it was
+#      fixed: `destroy inbound-mail` is backlogged because `generate
+#      inbound-mail` is undocumented. Document `generate inbound-mail`, and the
+#      family rule takes over — the backlog entry is now dead weight, and
+#      nothing said so. Delete the reversal sentence from `generators.md`
+#      afterwards and the other eleven `destroy` subcommands re-gate while
+#      `destroy inbound-mail` alone stays silently waived, by a line whose
+#      stated reason ("stranded by `generate inbound-mail`") is no longer even
+#      true.
+#
+#      So staleness is decided by asking what the gate would do WITHOUT the
+#      backlog: whatever does not then land in `defects` is accounted for by
+#      something else, whether that is documentation, `hide = true`, or the
+#      family rule. That question cannot drift from the exemption rules,
+#      because it is those rules, run again.
 #
 # WHAT IT DELIBERATELY DOES NOT CHECK: whether the page that names a command
 # explains it WELL, or whether a reader searching their own words would land
@@ -327,10 +347,18 @@ def main():
         print(f'note: {DESTROY_RULE_PAGE} no longer states the `destroy` '
               f'reversal rule, so the family exemption has lapsed.')
 
-    # A backlog entry that became documented has to leave the list, or the
-    # list stops distinguishing live waivers from finished work.
-    stale = sorted(p for p in BACKLOG if covered(p, docd, alias_map))
+    # A backlog entry that is no longer the thing holding its command back
+    # has to leave the list, or the list stops distinguishing live waivers
+    # from finished work. Answered by re-running the exemption rules with no
+    # backlog at all: anything that does not land in `defects` that way is
+    # already accounted for by documentation, `hide = true`, or the family
+    # rule, and its entry is spent.
     unknown = sorted(p for p in BACKLOG if p not in paths)
+    _u, without_backlog_exempt, without_backlog = classify(
+        paths, docd, hidden, rule_stated, {}, alias_map)
+    still_needed = set(without_backlog)
+    stale = sorted(p for p in BACKLOG
+                   if p not in unknown and p not in still_needed)
 
     print(f'defects: {len(defects)}'
           + (f' ({len(stale)} stale backlog entr'
@@ -362,12 +390,20 @@ def main():
     if stale:
         print()
         for p in stale:
-            print(f'  autumn {p} — now documented; remove it from BACKLOG '
-                  f'in scripts/check-docs-cli-coverage.sh')
+            # The reason comes from the run WITHOUT the backlog, because in
+            # the live classification the backlog won the tie and recorded
+            # itself as the reason.
+            why = ('now documented' if covered(p, docd, alias_map)
+                   else without_backlog_exempt.get(
+                       p, 'now covered by another exemption'))
+            print(f'  autumn {p} — {why}; remove it from BACKLOG in '
+                  f'scripts/check-docs-cli-coverage.sh')
         print()
         print('A backlog entry outliving the gap it describes turns the list '
-              'into waivers nobody can audit. Delete the entry in the same '
-              'change that documents the command.')
+              'into waivers nobody can audit — and a spent entry keeps '
+              'waiving its command after the exemption that superseded it '
+              'goes away. Delete the entry in the same change that accounts '
+              'for the command.')
 
     if unknown:
         print()
@@ -469,6 +505,39 @@ def self_test():
     expect('export' in defects3,
            'a command NOT on the backlog still fails')
 
+    # A backlog entry is spent once ANYTHING else accounts for its command,
+    # not only once it is documented. Regression test for the second review
+    # finding on this gate: leaving a superseded entry in place defeats the
+    # conditionality of the exemption that superseded it.
+    def spent(paths_, docd_, hidden_, rule_, backlog_, amap=None):
+        _u, _e, without = classify(paths_, docd_, hidden_, rule_, {}, amap)
+        return sorted(p for p in backlog_
+                      if p in paths_ and p not in set(without))
+
+    bl = {'destroy inbound-mail': 'x', 'generate inbound-mail': 'x',
+          'token rotate': 'x'}
+    ps = ['destroy inbound-mail', 'generate inbound-mail', 'token rotate']
+
+    expect(spent(ps, set(), set(), True, bl) == [],
+           'an entry whose command nothing else accounts for is NOT stale')
+    expect(spent(ps, {'generate inbound-mail'}, set(), True, bl)
+           == ['destroy inbound-mail', 'generate inbound-mail'],
+           'documenting `generate X` spends BOTH its own entry and `destroy X`')
+    expect(spent(ps, set(), {'token rotate'}, True, bl) == ['token rotate'],
+           'hiding a command spends its backlog entry')
+    expect(spent(ps, {'generate inbound-mail'}, set(), False, bl)
+           == ['generate inbound-mail'],
+           'with the family rule gone, `destroy X` needs its entry again')
+
+    # The sequence that made this a defect rather than untidiness: once the
+    # superseded entry is gone, removing the family rule must re-gate the
+    # command instead of leaving it silently waived.
+    _u, _e, after = classify(ps, {'generate inbound-mail'}, set(),
+                             rule_stated=False,
+                             backlog={'token rotate': 'x'})
+    expect('destroy inbound-mail' in after,
+           'a command re-gates once its spent entry is removed')
+
     # The real backlog must be honest: every entry names a real command path,
     # and none of them is already documented.
     real = surface()
@@ -479,8 +548,11 @@ def self_test():
                'every BACKLOG entry names a real command path')
         expect(not any(p in real_aliases for p in BACKLOG),
                'no BACKLOG entry is an alias spelling rather than a command')
-        expect(not any(covered(p, real_docd, real_aliases) for p in BACKLOG),
-               'no BACKLOG entry is already documented')
+        real_hidden = set(l.strip() for l
+                          in sibling('--list-hidden').splitlines() if l.strip())
+        expect(not spent(real, real_docd, real_hidden, destroy_rule_stated(),
+                         BACKLOG, real_aliases),
+               'no BACKLOG entry is already accounted for by something else')
 
     print(f'self-test: {passed} passed, {failed} failed')
     return 1 if failed else 0
