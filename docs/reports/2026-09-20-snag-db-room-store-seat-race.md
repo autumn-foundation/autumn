@@ -140,6 +140,13 @@ itself, so this is scratch-only, reverted after use):
 
 ```bash
 cd /home/user/autumn
+# 0. Back up the file before editing it, rather than reverting via
+#    `git checkout -- <file>` afterward — that form replaces the whole file
+#    with the index version and would silently discard any *other*
+#    uncommitted edits already sitting in it (see
+#    docs/reports/2026-09-16-onramp-test-sim-compile-gate-negative-result.md
+#    for the same failure mode caught there).
+cp autumn-media-plugin/Cargo.toml autumn-media-plugin/Cargo.toml.bak
 # 1. Temporarily add to autumn-media-plugin/Cargo.toml [dev-dependencies]:
 #      autumn-web = { path = "../autumn", features = ["sqlite"] }
 
@@ -232,8 +239,10 @@ RUST
 #    trials aggregated across runs — a single 40-trial run may show 0):
 cargo test -p autumn-media-plugin --test snag_seat_race_probe -- --nocapture
 
-# 4. Revert both scratch changes — do not commit them:
-git checkout -- autumn-media-plugin/Cargo.toml
+# 4. Revert both scratch changes — do not commit them. Restore from the
+#    backup made in step 0 (not `git checkout -- <file>`, which would
+#    clobber any unrelated uncommitted edits already in the file):
+mv autumn-media-plugin/Cargo.toml.bak autumn-media-plugin/Cargo.toml
 rm autumn-media-plugin/tests/snag_seat_race_probe.rs
 ```
 
