@@ -280,7 +280,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Per-User Time Zones](docs/guide/time-zones.md) — rendering timestamps in each user's own time zone: the `TimeZone` extractor resolving their IANA zone, `set_time_zone_in_session`, `local_datetime`, and pairing it with the `Clock` extractor so date/time rendering stays deterministic and test-injectable
 - [Cloud-Native Guide](docs/guide/cloud-native.md)
 - [Capacity Contracts](docs/guide/capacity-contracts.md)
-- [Logging & PII](docs/guide/logging-pii.md)
+- [Logging: levels, format & PII](docs/guide/logging-pii.md)
 - [Failure Capsules](docs/guide/failure-capsules.md) — `[failure_capture]` records a failing request, its database traffic and its clock reads as one replayable file; `autumn replay` re-runs it offline
 - [Edge Capsules](docs/guide/edge.md) — `#[edge]` compiles read-path routes into a portable `wasm32-wasip1` artifact a CDN can run, byte-identical to the origin and falling back to it for anything the edge cannot serve (experimental)
 - [Wire Contracts](docs/guide/wire-contracts.md) — `#[endpoint]` turns a typed handler into a contract, `wire_client!` generates the caller's typed client from it, and `#[contract_checked]` fails the caller's build at the call site when a request or response field the caller actually reads or sets stops matching — including the two breaks the type checker cannot see, a new required field behind `..Default::default()` and a serde-skipped field (experimental)

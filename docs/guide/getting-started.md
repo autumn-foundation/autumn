@@ -1298,11 +1298,14 @@ so a `.env` file can never switch the active profile.
 
 ### Log format behavior
 
-| Format   | Behavior                                                 |
-|----------|----------------------------------------------------------|
-| `Auto`   | Pretty in development, JSON when the profile is production |
-| `Pretty` | Always human-readable, colorized                         |
-| `Json`   | Always structured JSON                                   |
+`Auto` renders pretty lines unless the profile is production, then JSON.
+`Pretty` and `Json` pin it either way. The profile usually decides this before
+`Auto` ever does: `dev` defaults to `Pretty` and `prod` to `Json` outright,
+which is why the same binary reads well on a laptop and parses in production
+without the config changing. The same goes for the level — `dev` defaults to
+`debug`, `prod` to `info`. [Logging](logging-pii.md#choose-the-log-format-pretty-or-json)
+is where the log settings are documented in full, including how to change a log
+level on a running process.
 
 ### Running without a database
 

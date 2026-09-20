@@ -2506,6 +2506,17 @@ Published 0.5.0 behavior:
   (prelude re-export).
 - `actuator.prometheus` exposes the Prometheus scrape endpoint independently
   of sensitive actuator mode.
+- Verbosity and shape are `[log] level` / `[log] format` (or
+  `AUTUMN_LOG__LEVEL` / `AUTUMN_LOG__FORMAT`). `level` takes the full
+  `tracing` filter syntax, so `"info,my_app::orders=debug"` raises one target
+  without raising the floor; `format` is `Auto` (pretty unless the profile is
+  production, then JSON), `Pretty` or `Json`. The profile sets both outright
+  before those defaults apply: `dev` is `debug`/`Pretty`, `prod` is
+  `info`/`Json`, any other profile falls back to `info`/`Auto`. Both are read
+  once, at
+  startup — see "Runtime log levels" below for changing one on a running
+  process. Every `[log]` knob, the access log and the PII scrubber included,
+  is documented on one page: `docs/guide/logging-pii.md`.
 
 ### Runtime log levels (0.6.0)
 
@@ -2527,8 +2538,13 @@ The response now carries `"applied": true` and `"status":"ok"` only when the
 change actually reached a reload-capable subscriber; otherwise it reports
 `"status":"recorded"` / `"applied": false` rather than a false-positive `ok`.
 Overrides stay ephemeral — a restart resets to the configured `log.level`.
-Invalid levels still return `400`. `GET /actuator/loggers` keeps reporting
-`current_level` + overrides, now matching real emission.
+Invalid levels still return `400` — as does a target name carrying an
+`EnvFilter` metacharacter (`=`, `,`, `[`, `]`, `{`, `}`, whitespace), so a
+malformed directive never reaches the subscriber. `GET /actuator/loggers`
+keeps reporting `current_level` + overrides, now matching real emission. The
+reader-facing version of this, with the full request/response shapes, is
+"Change log levels at runtime, without a restart" in
+`docs/guide/logging-pii.md` — point a user there rather than restating it.
 
 ### Build & git provenance on `/actuator/info` (0.6.0)
 
