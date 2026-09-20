@@ -1,13 +1,14 @@
 $ cargo test -p autumn-web --test integration_tests --features "mcp,test-support" mcp_throttle_guard -- --nocapture
 
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 12m 01s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8m 26s
      Running tests/integration_tests.rs (target/debug/deps/integration_tests-ac3a8bc2a33f2a63)
 
-running 2 tests
-test integration::mcp_throttle_guard::throttle_denies_the_mcp_call_that_exceeds_the_per_ip_limit ... ok
+running 3 tests
+test integration::mcp_throttle_guard::throttle_denies_the_mcp_call_via_default_config_connect_info ... ok
 test integration::mcp_throttle_guard::throttle_keys_independently_per_ip_over_mcp_dispatch ... ok
+test integration::mcp_throttle_guard::throttle_denies_the_mcp_call_that_exceeds_the_per_ip_limit ... ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2295 filtered out; finished in 0.01s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2295 filtered out; finished in 0.02s
 
 [exited with code 0]
 
@@ -15,7 +16,33 @@ $ cargo fmt --all -- --check
 [clean, no output]
 
 $ cargo clippy -p autumn-web --test integration_tests --features "mcp,test-support" -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9m 39s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4m 25s
 [exited with code 0 — the one "unknown lint: clippy::unused_async_trait_impl" warning printed is
  pre-existing workspace lint config noise unrelated to this change, and does not fail the -D
  warnings gate]
+
+---
+
+Revision history:
+
+1. Initial commit had 2 tests (X-Forwarded-For only), neither holding
+   `autumn_web::security::TEST_LOCK` around the process-wide throttle
+   registry. Codex review (comment 4056862993, P1) correctly flagged this as
+   a real cross-test flakiness risk under `cargo test --workspace`'s full
+   parallelism: a sibling throttle test's `__throttle_registry_reset()` could
+   clear this test's bucket entry mid-run. Fixed by adopting the established
+   `TEST_LOCK`-then-reset-then-hold-through-assertions idiom from
+   `throttle_route.rs`.
+
+2. Codex review (comment 4056862994, P2) correctly flagged that both tests
+   resolved the caller only through `X-Forwarded-For` header forwarding
+   (`trust_forwarded_headers = true`), so removing `apply_replay_extensions`'s
+   separate `ConnectInfo(ctx.peer)` propagation — the mechanism a
+   default-config app (no `trust_forwarded_headers`, the common case)
+   actually depends on — would leave both tests green. Added a third test,
+   `throttle_denies_the_mcp_call_via_default_config_connect_info`, that
+   builds a raw request with `ConnectInfo` inserted directly (the
+   `security/rate_limit_xff_bypass.rs` pattern) against default config with
+   no forwarded-header trust and no XFF header, isolating that second
+   mechanism. All 3 tests above are the result after both fixes; see commit
+   history on the PR for the pre-fix version Codex reviewed.

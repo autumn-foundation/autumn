@@ -56,14 +56,15 @@ does not, by itself, cover this one.
 Test: `autumn/tests/integration/mcp_throttle_guard.rs`:
 - `throttle_denies_the_mcp_call_that_exceeds_the_per_ip_limit`
 - `throttle_keys_independently_per_ip_over_mcp_dispatch`
+- `throttle_denies_the_mcp_call_via_default_config_connect_info`
 
 ```
 cargo test -p autumn-web --test integration_tests --features "mcp,test-support" \
   mcp_throttle_guard -- --nocapture
 ```
 
-Result: **pass, both directions** — no bypass. See `after.txt` for the full
-run. A `#[throttle(limit = 2, per = "60s", key = "ip")]` handler exposed via
+Result: **pass, all three** — no bypass. See `after.txt` for the full run. A
+`#[throttle(limit = 2, per = "60s", key = "ip")]` handler exposed via
 `#[api_doc(mcp)]`:
 
 - allows the first 2 `tools/call` requests from one `X-Forwarded-For`
@@ -72,7 +73,17 @@ run. A `#[throttle(limit = 2, per = "60s", key = "ip")]` handler exposed via
   surfaces a non-2xx dispatched status rather than swallowing it);
 - gives a second caller, identified by a *different* `X-Forwarded-For` value,
   its own independent budget rather than inheriting the first caller's
-  exhausted bucket or a shared/absent identity.
+  exhausted bucket or a shared/absent identity;
+- **with `trust_forwarded_headers` at its production-default `false` and no
+  `X-Forwarded-For` sent at all** — so the only way `#[throttle(key = "ip")]`
+  can resolve a caller is through the raw `ConnectInfo` peer
+  `mcp::apply_replay_extensions` forwards from the `/mcp` envelope's own
+  connection — the same 2-allow/1-deny pattern holds, and a distinct
+  `ConnectInfo` peer again gets its own budget. This third test was added
+  after a Codex review round (see `after.txt`'s revision history) pointed out
+  the first two tests, keying only through forwarded headers, would stay
+  green even if the `ConnectInfo`-forwarding mechanism this finding is
+  actually about were removed.
 
 ## 🔎 Root cause of the fail-safe behavior
 
@@ -112,27 +123,36 @@ replay" — so a strict per-route budget is never silently relaxed to the
 
 None — no bug found. Regression test added at
 `autumn/tests/integration/mcp_throttle_guard.rs`, registered in
-`autumn/tests/integration/mod.rs` under `#[cfg(feature = "mcp")]`. The test
-pins the actual mechanism (the 3rd call from one IP is denied with the real
-429 surfaced, not swallowed; a distinct IP gets an independent budget) so it
-fails loudly — not vacuously — if a future change to MCP dispatch,
-`#[throttle]`'s expansion, `FORWARDED_HEADERS`, or `apply_replay_extensions`'s
-peer-forwarding ever reopens the fail-open branch for a real MCP caller.
+`autumn/tests/integration/mod.rs` under `#[cfg(feature = "mcp")]`. The tests
+pin the actual mechanism (the 3rd call from one identity is denied with the
+real 429 surfaced, not swallowed; a distinct identity gets an independent
+budget — proven once through forwarded headers and once through a raw
+`ConnectInfo` peer with header-trust off) so they fail loudly — not
+vacuously — if a future change to MCP dispatch, `#[throttle]`'s expansion,
+`FORWARDED_HEADERS`, or `apply_replay_extensions`'s peer-forwarding ever
+reopens the fail-open branch for a real MCP caller.
 
 ## ✅ Verification
 
 - `cargo fmt --all -- --check` — clean.
-- `cargo test -p autumn-web --test integration_tests --features "mcp,test-support" mcp_throttle_guard` — 2/2 pass (`after.txt`).
+- `cargo test -p autumn-web --test integration_tests --features "mcp,test-support" mcp_throttle_guard` — 3/3 pass (`after.txt`).
 - `cargo clippy -p autumn-web --test integration_tests --features "mcp,test-support" -- -D warnings` — clean (the one printed warning, `unknown lint: clippy::unused_async_trait_impl`, is pre-existing workspace lint-config noise unrelated to this file and does not fail the gate).
 - Re-attack: tried keying on `principal`/`token` structurally — those read
   `RateLimitPrincipal`/session or the `Authorization` header, both of which
   `FORWARDED_HEADERS` and `apply_replay_extensions` also forward
   (`identity`/`Cookie`/`Authorization`), so the same "real identity survives
-  dispatch" argument applies; not duplicated as a third test since this
+  dispatch" argument applies; not duplicated as a fourth test since this
   reproduction specifically targeted the `key = "ip"` case, the one that
   depends on connection-level state (`ConnectInfo`) rather than
   application-level state (session/header), and is therefore the one most
   plausible to have been dropped by a synthetic, in-process dispatch.
+- Two-round Codex review on the PR (`chatgpt-codex-connector[bot]`) flagged,
+  and this revision fixes, two real gaps in the *test's* rigor (not in the
+  framework): missing `TEST_LOCK` isolation around the process-wide throttle
+  registry (flakiness under full workspace parallelism), and the first two
+  tests only exercising the header-forwarding mechanism rather than the
+  `ConnectInfo`-forwarding mechanism the threat model is actually about. Both
+  fixed; see `after.txt`'s revision history.
 
 ## 📡 Blast radius
 
