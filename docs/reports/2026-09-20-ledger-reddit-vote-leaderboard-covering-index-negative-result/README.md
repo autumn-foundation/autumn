@@ -22,10 +22,16 @@ posts each get 0-3 organic votes from distinct random users, including
 plenty of posts with zero — 333,448 post-directed votes, 44,998
 comment-directed votes with `NULL post_id`, so the leaderboard's
 `IS NOT NULL` group guard has real rows to exclude, not a vacuous
-predicate). `setseed()` makes the fixture fully deterministic — the same
-seed produces the same rows, and therefore the same leaderboard winners,
-on every run; the harness reads those winners back out of the data rather
-than hard-coding ids. ~5% of existing post votes had their value flipped
+predicate). `setseed()` (plus a `REPEATABLE` seed on the one `TABLESAMPLE`
+call, below) makes every *randomized* value — which user voted on what,
+with which value, who authored which post — deterministic, and therefore
+makes the leaderboard's winners deterministic too; the harness reads those
+winners back out of the data rather than hard-coding ids, so it can't drift
+regardless. That does **not** make the raw committed output byte-identical
+across runs: `created_at` columns default to `NOW()`, and `EXPLAIN`/`VACUUM`
+output carries wall-clock time, XIDs and I/O counts that vary run to run by
+nature — only the row *values* that matter to this report (vote targets,
+values, and the winners they produce) are pinned. ~5% of existing post votes had their value flipped
 after the bulk load (the same mutation `Post::react()` performs on a
 changed vote) to produce real dead tuples, then `VACUUM` (not `FULL`) +
 `ANALYZE` models the steady state autovacuum reaches on a live table,
@@ -43,8 +49,17 @@ query scripts below fail at `pg_stat_statements_reset()` /
 instead of finishing silently with no measurements collected.
 
 ```sh
-# One-time server setup (skip if pg_stat_statements is already preloaded):
+# One-time server setup (skip if pg_stat_statements is already preloaded).
+# `postgresql.conf` only honors the LAST `shared_preload_libraries` line it
+# finds, so blindly appending a new one -- rather than editing the existing
+# line -- silently drops whatever was already preloaded (pgaudit,
+# auto_explain, ...) on the next restart. On a server that doesn't already
+# set this (a throwaway/local cluster, as used for this report), appending
+# is fine:
 echo "shared_preload_libraries = 'pg_stat_statements'" >> /etc/postgresql/16/main/postgresql.conf
+# On a server that already sets shared_preload_libraries, edit that
+# existing line instead, e.g.:
+#   shared_preload_libraries = 'pgaudit,pg_stat_statements'
 echo "pg_stat_statements.track = all" >> /etc/postgresql/16/main/postgresql.conf
 service postgresql restart   # or: pg_ctl restart / your platform's equivalent
 
