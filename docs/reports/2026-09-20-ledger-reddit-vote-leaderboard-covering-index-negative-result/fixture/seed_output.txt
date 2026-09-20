@@ -1,0 +1,33 @@
+INSERT 0 20000
+INSERT 0 50
+INSERT 0 30000
+INSERT 0 15000
+INSERT 0 399870
+INSERT 0 288744
+INSERT 0 44995
+UPDATE 34554
+INFO:  vacuuming "reddit_ledger.public.votes"
+INFO:  launched 2 parallel vacuum workers for index vacuuming (planned: 2)
+INFO:  finished vacuuming "reddit_ledger.public.votes": index scans: 1
+pages: 0 removed, 6402 remain, 6402 scanned (100.00% of total)
+tuples: 34554 removed, 733609 remain, 0 are dead but not yet removable
+removable cutoff: 930, which was 0 XIDs old when operation ended
+frozen: 0 pages from table (0.00% of total) had 0 tuples frozen
+index scan needed: 5728 pages from table (89.47% of total) had 34554 dead item identifiers removed
+index "votes_pkey": pages: 2014 in total, 0 newly deleted, 0 currently deleted, 0 reusable
+index "votes_unique_post": pages: 4989 in total, 0 newly deleted, 0 currently deleted, 0 reusable
+index "votes_unique_comment": pages: 1296 in total, 0 newly deleted, 0 currently deleted, 0 reusable
+index "idx_votes_user_id": pages: 788 in total, 0 newly deleted, 0 currently deleted, 0 reusable
+index "idx_votes_post_id": pages: 1015 in total, 0 newly deleted, 0 currently deleted, 0 reusable
+index "idx_votes_comment_id": pages: 693 in total, 0 newly deleted, 0 currently deleted, 0 reusable
+avg read rate: 100.201 MB/s, avg write rate: 102.660 MB/s
+buffer usage: 26900 hits, 2486 misses, 2547 dirtied
+WAL usage: 28179 records, 0 full page images, 2249774 bytes
+system usage: CPU: user: 0.10 s, system: 0.00 s, elapsed: 0.19 s
+VACUUM
+ANALYZE
+ posts | comments | total_votes | post_votes | comment_votes 
+-------+----------+-------------+------------+---------------
+ 30000 |    15000 |      733609 |     688614 |         44995
+(1 row)
+

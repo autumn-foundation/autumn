@@ -1,0 +1,114 @@
+ pg_stat_statements_reset 
+--------------------------
+ 
+(1 row)
+
+  id   |   title    |    slug    | body | url | author_id | subreddit_id | score |     hot_rank      | comment_count |         created_at         |         updated_at         
+-------+------------+------------+------+-----+-----------+--------------+-------+-------------------+---------------+----------------------------+----------------------------
+ 11880 | Post 11880 | post-11880 |      |     |     15366 |            8 |     0 | 999.9656554953269 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+ 29364 | Post 29364 | post-29364 |      |     |     19787 |           19 |     0 |  999.922985098099 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+  8460 | Post 8460  | post-8460  |      |     |     16134 |           40 |     0 | 999.8874157640321 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+ 15584 | Post 15584 | post-15584 |      |     |      5826 |           32 |     0 |  999.842946578938 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+  6607 | Post 6607  | post-6607  |      |     |      5359 |            2 |     0 | 999.8352987847081 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+  2956 | Post 2956  | post-2956  |      |     |     14627 |           11 |     0 | 999.8218400969116 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+  9134 | Post 9134  | post-9134  |      |     |     13449 |            1 |     0 | 999.7998034958688 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+  2804 | Post 2804  | post-2804  |      |     |     12020 |           49 |     0 | 999.7740778614627 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+  6179 | Post 6179  | post-6179  |      |     |     18639 |            8 |     0 | 999.7525587696367 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+ 23359 | Post 23359 | post-23359 |      |     |     17238 |           16 |     0 | 999.7031304670622 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+ 17717 | Post 17717 | post-17717 |      |     |     10077 |           45 |     0 | 999.6496000797628 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+ 16188 | Post 16188 | post-16188 |      |     |      5141 |           35 |     0 | 999.6490263273812 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+ 14950 | Post 14950 | post-14950 |      |     |     12995 |           16 |     0 | 999.6340610469861 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+ 25900 | Post 25900 | post-25900 |      |     |     18843 |           26 |     0 | 999.6151405780652 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+ 26278 | Post 26278 | post-26278 |      |     |     14088 |            7 |     0 | 999.5852549979483 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+ 17488 | Post 17488 | post-17488 |      |     |      7233 |           14 |     0 | 999.5434913935317 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+ 26214 | Post 26214 | post-26214 |      |     |      2121 |           42 |     0 | 999.4911678233798 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+ 15680 | Post 15680 | post-15680 |      |     |     17899 |           19 |     0 | 999.4729054029954 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+  7492 | Post 7492  | post-7492  |      |     |      5768 |           14 |     0 | 999.4595075457755 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+  8896 | Post 8896  | post-8896  |      |     |     10157 |           10 |     0 | 999.4519624654152 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+  6749 | Post 6749  | post-6749  |      |     |     14658 |           33 |     0 | 999.4486651057488 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+ 10709 | Post 10709 | post-10709 |      |     |      7695 |           47 |     0 |  999.428419064734 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+  3472 | Post 3472  | post-3472  |      |     |      5707 |           21 |     0 | 999.4178376987896 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+   608 | Post 608   | post-608   |      |     |      2470 |           10 |     0 | 999.4102330146619 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+ 18813 | Post 18813 | post-18813 |      |     |     17347 |           36 |     0 | 999.4057573053179 |             0 | 2026-09-20 17:24:24.585675 | 2026-09-20 17:24:24.585675
+(25 rows)
+
+ agg_key | agg_val 
+---------+---------
+      43 |    1132
+     155 |    1130
+     157 |    1128
+      21 |    1120
+     135 |    1119
+(5 rows)
+
+ id  |  title   
+-----+----------
+ 126 | Post 126
+ 144 | Post 144
+ 186 | Post 186
+ 193 | Post 193
+ 194 | Post 194
+(5 rows)
+
+--- pg_stat_statements profile ---
+                                                       query                                                        | calls | shared_blks_hit | shared_blks_read | total_buffers | pct_of_page_buffers 
+--------------------------------------------------------------------------------------------------------------------+-------+-----------------+------------------+---------------+---------------------
+ SELECT post_id AS agg_key, SUM(value) AS agg_val FROM votes                                                       +|     1 |            5656 |              749 |          6405 |               99.30
+ WHERE post_id IS NOT NULL                                                                                         +|       |                 |                  |               | 
+   AND ($1::bigint IS NULL OR post_id = $2::bigint)                                                                +|       |                 |                  |               | 
+   AND ($3::bigint IS NULL OR post_id >= $4::bigint)                                                               +|       |                 |                  |               | 
+   AND ($5::bigint IS NULL OR post_id <= $6::bigint)                                                               +|       |                 |                  |               | 
+ GROUP BY post_id                                                                                                  +|       |                 |                  |               | 
+ ORDER BY agg_val DESC NULLS LAST, post_id ASC                                                                     +|       |                 |                  |               | 
+ LIMIT $7                                                                                                           |       |                 |                  |               | 
+ SELECT id, title, slug, body, url, author_id, subreddit_id, score, hot_rank, comment_count, created_at, updated_at+|     1 |               0 |               27 |            27 |                0.42
+ FROM posts ORDER BY hot_rank DESC LIMIT $1                                                                         |       |                 |                  |               | 
+ SELECT id, title FROM posts WHERE id = ANY(ARRAY[$1,$2,$3,$4,$5])                                                  |     1 |              18 |                0 |            18 |                0.28
+(3 rows)
+
+--- EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) for the leaderboard query ---
+                                                                         QUERY PLAN                                                                         
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=16473.98..16473.99 rows=5 width=16) (actual time=80.770..80.861 rows=5 loops=1)
+   Output: post_id, (sum(value))
+   Buffers: shared hit=5749 read=653
+   ->  Sort  (cost=16473.98..16520.45 rows=18589 width=16) (actual time=80.768..80.858 rows=5 loops=1)
+         Output: post_id, (sum(value))
+         Sort Key: (sum(votes.value)) DESC NULLS LAST, votes.post_id
+         Sort Method: top-N heapsort  Memory: 25kB
+         Buffers: shared hit=5749 read=653
+         ->  Finalize HashAggregate  (cost=15979.33..16165.22 rows=18589 width=16) (actual time=76.113..78.824 rows=30000 loops=1)
+               Output: post_id, sum(value)
+               Group Key: votes.post_id
+               Batches: 1  Memory Usage: 3601kB
+               Buffers: shared hit=5749 read=653
+               ->  Gather  (cost=11889.75..15793.44 rows=37178 width=16) (actual time=53.105..61.295 rows=88762 loops=1)
+                     Output: post_id, (PARTIAL sum(value))
+                     Workers Planned: 2
+                     Workers Launched: 2
+                     Buffers: shared hit=5749 read=653
+                     ->  Partial HashAggregate  (cost=10889.75..11075.64 rows=18589 width=16) (actual time=50.891..54.568 rows=29587 loops=3)
+                           Output: post_id, PARTIAL sum(value)
+                           Group Key: votes.post_id
+                           Batches: 1  Memory Usage: 3601kB
+                           Buffers: shared hit=5749 read=653
+                           Worker 0:  actual time=49.578..53.322 rows=29256 loops=1
+                             Batches: 1  Memory Usage: 3601kB
+                             Buffers: shared hit=1586 read=192
+                           Worker 1:  actual time=50.155..53.952 rows=29651 loops=1
+                             Batches: 1  Memory Usage: 3601kB
+                             Buffers: shared hit=1914 read=234
+                           ->  Parallel Seq Scan on public.votes  (cost=0.00..9458.70 rows=286210 width=10) (actual time=0.006..18.382 rows=229538 loops=3)
+                                 Output: id, user_id, post_id, comment_id, value, created_at
+                                 Filter: (votes.post_id IS NOT NULL)
+                                 Rows Removed by Filter: 14998
+                                 Buffers: shared hit=5749 read=653
+                                 Worker 0:  actual time=0.006..18.079 rows=191845 loops=1
+                                   Buffers: shared hit=1586 read=192
+                                 Worker 1:  actual time=0.006..18.333 rows=230457 loops=1
+                                   Buffers: shared hit=1914 read=234
+ Query Identifier: 3454114392480208014
+ Planning Time: 0.071 ms
+ Execution Time: 81.233 ms
+(41 rows)
+
