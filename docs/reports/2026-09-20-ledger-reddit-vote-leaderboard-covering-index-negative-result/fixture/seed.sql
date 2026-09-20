@@ -5,14 +5,26 @@
 -- comment votes with NULL post_id are genuinely present -- the leaderboard's
 -- `IS NOT NULL` guard has real rows to exclude, not a vacuous predicate).
 --
--- Vote shape (real power-law skew, not a uniform draw): the 29,800 "cold"
--- posts each get 0-3 organic votes from distinct random users (one
--- `generate_series(1, 0..3)` per post -- 0 is a real, common outcome, not
--- clamped away), while 200 "hot" posts (ids 1-200) separately absorb heavy
--- volume from up to 300,000 distinct-user votes. ~40,000 comment votes.
--- Seeded with `setseed()` so every run of this script produces the exact
--- same rows -- required for the leaderboard's actual top-5 winners (and
--- therefore the title-lookup query that depends on them) to be reproducible.
+-- Vote shape: a two-tier distribution, not a smooth power law -- the
+-- 29,800 "cold" posts each independently get 0-3 organic votes from
+-- distinct random users (one `generate_series(1, 0..3)` per post -- 0 is a
+-- real, common outcome, not clamped away), while 200 "hot" posts (ids
+-- 1-200) separately absorb heavy, roughly-uniform-among-themselves volume
+-- from up to 300,000 distinct-user votes drawn uniformly across just those
+-- 200 ids. That's a real cardinality gap between the two tiers (not a
+-- Zipfian rank-frequency curve within either tier), which is what this
+-- report's conclusion actually depends on: total row count and the
+-- post-vote/comment-vote split, not the shape of vote concentration among
+-- individual hot posts. ~40,000 comment votes.
+--
+-- `setseed()` (below) and a `REPEATABLE` seed on the churn step's
+-- `TABLESAMPLE` (further down) make every *randomized value* this script
+-- produces deterministic -- who voted on what, with which value, and
+-- therefore the leaderboard's actual top-5 winners, which the
+-- title-lookup query depends on being reproducible. They do **not** make
+-- the complete rows or this script's raw output byte-for-byte across runs:
+-- every table here defaults `created_at` to `NOW()`, which the inserts
+-- below don't override.
 --
 -- ~5% of existing post votes get their value flipped after the bulk load
 -- (a changed vote, exactly what `react()` does in production) to produce

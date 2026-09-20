@@ -16,10 +16,11 @@ instance (schema replayed from `examples/reddit-clone/migrations/`, no
 Docker available in this environment — `pg_stat_statements` loaded via
 `shared_preload_libraries` on a local `postgresql@16` cluster instead of a
 testcontainer): 20,000 users, 50 subreddits, 30,000 posts, 15,000 comments,
-378,446 votes with real power-law skew (200 "hot" posts, ids 1-200, absorb
-heavy volume from up to 300,000 distinct-user votes; the other 29,800 "cold"
-posts each get 0-3 organic votes from distinct random users, including
-plenty of posts with zero — 333,448 post-directed votes, 44,998
+378,446 votes with a real two-tier cardinality gap (not a smooth power-law
+curve — 200 "hot" posts, ids 1-200, absorb heavy, roughly-uniform-among-
+themselves volume from up to 300,000 distinct-user votes; the other 29,800
+"cold" posts each independently get 0-3 organic votes from distinct random
+users, including plenty of posts with zero — 333,448 post-directed votes, 44,998
 comment-directed votes with `NULL post_id`, so the leaderboard's
 `IS NOT NULL` group guard has real rows to exclude, not a vacuous
 predicate). `setseed()` (plus a `REPEATABLE` seed on the one `TABLESAMPLE`
@@ -313,3 +314,22 @@ A third review round caught three more:
    "Reproduce" section's fixture note now says explicitly that the
    *randomized values* are reproducible, not the raw output file
    byte-for-byte.
+
+A fourth review round caught two more, both terminology/scope, no data
+change:
+
+9. "Power-law skew" overclaimed the vote generator's actual shape: the 200
+   hot posts are drawn *uniformly* across just those 200 ids (so they land
+   at roughly equal counts, not a Zipfian rank-frequency decay), and the
+   29,800 cold posts each draw independently. That's a real two-tier
+   cardinality gap, which is what this report's conclusion depends on
+   (total row count and the post-vote/comment-vote split) — but it isn't a
+   power law, and calling it one overclaimed the fixture's realism. Fixed:
+   `fixture/seed.sql` and this README now say "two-tier," not "power-law."
+10. `fixture/seed.sql`'s own header comment still said `setseed()` makes
+    "every run of this script produce the exact same rows," which is the
+    same overclaim item 8 already fixed in the README but missed in the
+    fixture file itself — every table here defaults `created_at` to
+    `NOW()`, so complete rows are never identical across runs. Fixed: the
+    header now states the same scoped claim (randomized values and
+    winners, not complete rows) as the README.
