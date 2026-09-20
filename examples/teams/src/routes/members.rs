@@ -42,7 +42,7 @@ use super::layout::{csrf_value, layout};
 
 /// Count how many `owner` members remain in the active organization. Used to
 /// block demoting/removing the last one.
-fn owner_count(memberships: &[Membership]) -> usize {
+pub(crate) fn owner_count(memberships: &[Membership]) -> usize {
     memberships
         .iter()
         .filter(|m| m.role == Role::Owner.as_str())
@@ -82,19 +82,65 @@ pub async fn list_members(
         "Members",
         true,
         csrf_value(&csrf),
-        html! {
+        members_content(
+            can_manage,
+            owners,
+            caller_role,
+            &memberships,
+            &emails,
+            &pending_invitations,
+            csrf_value(&csrf),
+            None,
+            "",
+            "member",
+        ),
+    );
+    Ok(page.into_response())
+}
+
+/// The members list + management page body: roster, pending invitations,
+/// and (for an Admin+) the "Send Invitation" form. Shared between
+/// [`list_members`]'s clean GET render and
+/// `routes::invitations::create_invitation`'s redisplay on a rejected
+/// email/role/duplicate invitation, so the roster and pending-invitations
+/// list never have to be reconstructed differently between the two call
+/// sites (Wayfinder: error-path inventory — the same anti-pattern already
+/// fixed on `/signup` and `/invite/{token}/accept`, but reached through this
+/// form's `create_invitation` handler instead).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn members_content(
+    can_manage: bool,
+    owners: usize,
+    caller_role: Role,
+    memberships: &[Membership],
+    emails: &std::collections::HashMap<i64, String>,
+    pending_invitations: &[Invitation],
+    csrf_token: &str,
+    invite_error: Option<&str>,
+    invite_email: &str,
+    invite_role: &str,
+) -> Markup {
+    html! {
             h1 class="text-2xl font-bold mb-6" { "Members" }
 
             @if can_manage {
                 form action="/invitations" method="post"
-                     class="flex gap-2 mb-6 bg-white rounded-lg shadow p-4" {
-                    input type="hidden" name="_csrf" value=(csrf_value(&csrf));
-                    input name="email" type="email" required placeholder="teammate@example.com"
-                          aria-label="Email to invite" class="flex-1 border rounded px-3 py-2";
+                     class="flex gap-2 items-start mb-6 bg-white rounded-lg shadow p-4" {
+                    input type="hidden" name="_csrf" value=(csrf_token);
+                    div class="flex-1" {
+                        input name="email" type="email" required value=(invite_email)
+                              placeholder="teammate@example.com"
+                              aria-label="Email to invite"
+                              aria-invalid=(if invite_error.is_some() { "true" } else { "false" })
+                              class="w-full border rounded px-3 py-2";
+                        @if let Some(error) = invite_error {
+                            p class="mt-1 text-sm text-red-600" role="alert" { (error) }
+                        }
+                    }
                     select name="role" aria-label="Role" class="border rounded px-3 py-2" {
-                        option value="member" { "Member" }
-                        option value="admin" { "Admin" }
-                        option value="owner" { "Owner" }
+                        option value="member" selected[invite_role == "member"] { "Member" }
+                        option value="admin" selected[invite_role == "admin"] { "Admin" }
+                        option value="owner" selected[invite_role == "owner"] { "Owner" }
                     }
                     button type="submit"
                            class="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700" {
@@ -104,7 +150,7 @@ pub async fn list_members(
             }
 
             ul class="space-y-2 mb-8" {
-                @for membership in &memberships {
+                @for membership in memberships {
                     li class="bg-white rounded-lg shadow p-4 flex items-center justify-between" {
                         div {
                             span class="font-medium" {
@@ -123,7 +169,7 @@ pub async fn list_members(
                                 @let locked = membership.role == Role::Owner.as_str()
                                     && (caller_role != Role::Owner || owners <= 1);
                                 form action={"/members/" (membership.id) "/role"} method="post" class="flex items-center gap-1" {
-                                    input type="hidden" name="_csrf" value=(csrf_value(&csrf));
+                                    input type="hidden" name="_csrf" value=(csrf_token);
                                     select name="role" aria-label="Change role" disabled[locked] {
                                         option value="member" selected[membership.role == "member"] { "Member" }
                                         option value="admin" selected[membership.role == "admin"] { "Admin" }
@@ -133,7 +179,7 @@ pub async fn list_members(
                                            class="text-xs px-2 py-1 border rounded hover:bg-gray-50" { "Update" }
                                 }
                                 form action={"/members/" (membership.id) "/remove"} method="post" {
-                                    input type="hidden" name="_csrf" value=(csrf_value(&csrf));
+                                    input type="hidden" name="_csrf" value=(csrf_token);
                                     button type="submit" disabled[locked]
                                            class="text-xs px-2 py-1 border rounded text-red-600 hover:bg-red-50 \
                                                   disabled:text-gray-300 disabled:hover:bg-transparent" {
@@ -149,7 +195,7 @@ pub async fn list_members(
             @if can_manage {
                 h2 class="text-lg font-bold mb-3" { "Pending invitations" }
                 ul class="space-y-2" {
-                    @for invitation in &pending_invitations {
+                    @for invitation in pending_invitations {
                         li class="bg-white rounded-lg shadow p-4 flex items-center justify-between" {
                             div {
                                 span class="font-medium" { (invitation.email) }
@@ -157,13 +203,13 @@ pub async fn list_members(
                             }
                             div class="flex items-center gap-2" {
                                 form action={"/invitations/" (invitation.id) "/resend"} method="post" {
-                                    input type="hidden" name="_csrf" value=(csrf_value(&csrf));
+                                    input type="hidden" name="_csrf" value=(csrf_token);
                                     button type="submit" class="text-xs px-2 py-1 border rounded hover:bg-gray-50" {
                                         "Resend"
                                     }
                                 }
                                 form action={"/invitations/" (invitation.id) "/revoke"} method="post" {
-                                    input type="hidden" name="_csrf" value=(csrf_value(&csrf));
+                                    input type="hidden" name="_csrf" value=(csrf_token);
                                     button type="submit"
                                            class="text-xs px-2 py-1 border rounded text-red-600 hover:bg-red-50" {
                                         "Revoke"
@@ -177,12 +223,10 @@ pub async fn list_members(
                     }
                 }
             }
-        },
-    );
-    Ok(page.into_response())
+    }
 }
 
-async fn load_emails(
+pub(crate) async fn load_emails(
     db: &mut Db,
     user_ids: &[i64],
 ) -> AutumnResult<std::collections::HashMap<i64, String>> {
@@ -374,4 +418,88 @@ pub async fn remove_member(
     .await?;
 
     Ok(Redirect::to("/members").into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_emails() -> std::collections::HashMap<i64, String> {
+        std::collections::HashMap::new()
+    }
+
+    /// Baseline (no error): the invite form is present with an empty email
+    /// and no alert — this is what `list_members`'s own GET renders.
+    #[test]
+    fn members_content_invite_form_clean_when_no_error() {
+        let html = members_content(
+            true,
+            1,
+            Role::Owner,
+            &[],
+            &empty_emails(),
+            &[],
+            "csrf-abc",
+            None,
+            "",
+            "member",
+        )
+        .into_string();
+        assert!(html.contains(r#"action="/invitations""#), "{html}");
+        assert!(html.contains(r#"value="csrf-abc""#), "{html}");
+        assert!(html.contains(r#"value="""#), "{html}");
+        assert!(html.contains(r#"aria-invalid="false""#), "{html}");
+        assert!(!html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains(r#"option value="member" selected"#), "{html}");
+    }
+
+    /// A rejected invite (Wayfinder: error-path inventory) shows the message
+    /// next to the email field, flags it `aria-invalid`, and preserves both
+    /// the typed email and the selected role — the admin only has to fix the
+    /// one bad field, not re-enter the whole form.
+    #[test]
+    fn members_content_invite_form_shows_error_and_preserves_input() {
+        let html = members_content(
+            true,
+            1,
+            Role::Owner,
+            &[],
+            &empty_emails(),
+            &[],
+            "csrf-abc",
+            Some("Enter a valid email address"),
+            "not-an-email",
+            "admin",
+        )
+        .into_string();
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("Enter a valid email address"), "{html}");
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"value="not-an-email""#), "{html}");
+        assert!(html.contains(r#"option value="admin" selected"#), "{html}");
+        assert!(
+            !html.contains(r#"option value="member" selected"#),
+            "{html}"
+        );
+    }
+
+    /// A non-Admin viewer never sees the invite form at all, error or not —
+    /// `can_manage` gates it independently of `invite_error`.
+    #[test]
+    fn members_content_hides_invite_form_when_caller_cannot_manage() {
+        let html = members_content(
+            false,
+            1,
+            Role::Member,
+            &[],
+            &empty_emails(),
+            &[],
+            "csrf-abc",
+            None,
+            "",
+            "member",
+        )
+        .into_string();
+        assert!(!html.contains(r#"action="/invitations""#), "{html}");
+    }
 }

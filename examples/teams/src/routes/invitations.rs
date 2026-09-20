@@ -37,14 +37,15 @@ use serde::Deserialize;
 use crate::mailers::invitation_mailer::InvitationMailer;
 use crate::models::{Invitation, InviteForm, Membership, NewUser, User};
 use crate::repositories::{
-    InvitationRepository, OrganizationRepository, PgInvitationRepository, PgMembershipRepository,
-    PgOrganizationRepository,
+    InvitationRepository, MembershipRepository, OrganizationRepository, PgInvitationRepository,
+    PgMembershipRepository, PgOrganizationRepository,
 };
 use crate::role::{Role, require_role};
 use crate::schema::{invitations, memberships, users};
 
 use super::auth::establish_session;
 use super::layout::{csrf_value, invitation_error_page, layout};
+use super::members::{load_emails, members_content, owner_count};
 
 const INVITATION_TTL_DAYS: i64 = 7;
 
@@ -82,18 +83,74 @@ fn app_base_url() -> String {
     std::env::var("APP_BASE_URL").unwrap_or_else(|_| "http://localhost:3000".to_owned())
 }
 
+/// Redisplay the members page at 422 with `message` shown next to the email
+/// field and the submitted email/role preserved, instead of the generic
+/// JSON/error-page response a bare `Err(...)` would produce. Every call site
+/// in [`create_invitation`] runs after `require_role(Role::Admin)` already
+/// succeeded, so the management controls always render (Wayfinder:
+/// error-path inventory — the same anti-pattern already fixed on
+/// `routes::auth::signup` and this module's own
+/// [`redisplay_accept_signup`], reached here through a different form).
+#[allow(clippy::too_many_arguments)]
+async fn redisplay_members(
+    db: &mut Db,
+    caller_role: Role,
+    membership_repo: &PgMembershipRepository,
+    invitation_repo: &PgInvitationRepository,
+    csrf: &Option<CsrfToken>,
+    invite_email: &str,
+    invite_role: &str,
+    message: &str,
+) -> AutumnResult<Response> {
+    let memberships = membership_repo.find_all().await?;
+    let pending_invitations: Vec<Invitation> = invitation_repo
+        .find_all()
+        .await?
+        .into_iter()
+        .filter(|i| i.status == "pending")
+        .collect();
+    let user_ids: Vec<i64> = memberships.iter().map(|m| m.user_id).collect();
+    let emails = load_emails(db, &user_ids).await?;
+    let owners = owner_count(&memberships);
+
+    Ok((
+        StatusCode::UNPROCESSABLE_ENTITY,
+        layout(
+            "Members",
+            true,
+            csrf_value(csrf),
+            members_content(
+                true,
+                owners,
+                caller_role,
+                &memberships,
+                &emails,
+                &pending_invitations,
+                csrf_value(csrf),
+                Some(message),
+                invite_email,
+                invite_role,
+            ),
+        ),
+    )
+        .into_response())
+}
+
 /// Send an invitation into the *active* organization. Gated `Admin` or
 /// higher (issue #1261 AC7); inviting someone as `Owner` itself requires the
 /// caller to already be an `Owner` — otherwise an Admin could mint a fresh
 /// Owner account of their own choosing.
 #[post("/invitations")]
+#[allow(clippy::too_many_arguments)]
 pub async fn create_invitation(
     session: Session,
     Tenant(tenant_id): Tenant,
     mut db: Db,
     org_repo: PgOrganizationRepository,
     membership_repo: PgMembershipRepository,
+    invitation_repo: PgInvitationRepository,
     mailer: Mailer,
+    csrf: Option<CsrfToken>,
     Form(form): Form<InviteForm>,
 ) -> AutumnResult<Response> {
     let caller_role = require_role(&session, &membership_repo, Role::Admin).await?;
@@ -102,13 +159,36 @@ pub async fn create_invitation(
     };
 
     let email = form.email.trim().to_lowercase();
+    // Both of these used to `Err(...)` out to the generic JSON/error-page
+    // response, dropping the admin off the members page and losing the
+    // email they'd typed; they now redisplay the same members page the
+    // duplicate-invitation conflict below already redisplays, with the
+    // entered email preserved (Wayfinder: error-path inventory).
     if !email.contains('@') || email.len() > 254 {
-        return Err(AutumnError::unprocessable_msg(
+        return redisplay_members(
+            &mut db,
+            caller_role,
+            &membership_repo,
+            &invitation_repo,
+            &csrf,
+            &form.email,
+            &form.role,
             "Enter a valid email address",
-        ));
+        )
+        .await;
     }
     let Some(role) = Role::parse(&form.role) else {
-        return Err(AutumnError::unprocessable_msg("Unknown role"));
+        return redisplay_members(
+            &mut db,
+            caller_role,
+            &membership_repo,
+            &invitation_repo,
+            &csrf,
+            &form.email,
+            &form.role,
+            "Unknown role",
+        )
+        .await;
     };
     if role == Role::Owner && caller_role != Role::Owner {
         return Err(AutumnError::forbidden_msg(
@@ -127,81 +207,86 @@ pub async fn create_invitation(
     let token_hash = hash_api_token(&raw_token);
     let insert_email = email.clone();
     let insert_role = role.as_str().to_owned();
-    db.tx(move |conn| {
-        async move {
-            // Revalidate the inviter's own membership inside the
-            // transaction, instead of trusting the `require_role` result
-            // computed before it — another request could have demoted or
-            // removed the inviter while this one was still building the
-            // invitation (Codex review finding).
-            let inviter_membership: Option<Membership> = memberships::table
-                .filter(memberships::tenant_id.eq(&tenant_id))
-                .filter(memberships::user_id.eq(inviter_id))
-                .select(Membership::as_select())
-                .for_update()
-                .first(conn)
-                .await
-                .optional()?;
-            let Some(inviter_membership) = inviter_membership else {
-                return Err(AutumnError::unauthorized_msg("no active organization"));
-            };
-            let Some(current_caller_role) = Role::parse(&inviter_membership.role) else {
-                return Err(AutumnError::forbidden_msg("insufficient permissions"));
-            };
-            if !current_caller_role.at_least(Role::Admin) {
-                return Err(AutumnError::forbidden_msg("insufficient permissions"));
-            }
-            if role == Role::Owner && current_caller_role != Role::Owner {
-                return Err(AutumnError::forbidden_msg(
-                    "Only an owner can invite someone as owner",
-                ));
-            }
+    let tx_result: Result<(), AutumnError> = db
+        .tx(move |conn| {
+            async move {
+                // Revalidate the inviter's own membership inside the
+                // transaction, instead of trusting the `require_role` result
+                // computed before it — another request could have demoted or
+                // removed the inviter while this one was still building the
+                // invitation (Codex review finding).
+                let inviter_membership: Option<Membership> = memberships::table
+                    .filter(memberships::tenant_id.eq(&tenant_id))
+                    .filter(memberships::user_id.eq(inviter_id))
+                    .select(Membership::as_select())
+                    .for_update()
+                    .first(conn)
+                    .await
+                    .optional()?;
+                let Some(inviter_membership) = inviter_membership else {
+                    return Err(AutumnError::unauthorized_msg("no active organization"));
+                };
+                let Some(current_caller_role) = Role::parse(&inviter_membership.role) else {
+                    return Err(AutumnError::forbidden_msg("insufficient permissions"));
+                };
+                if !current_caller_role.at_least(Role::Admin) {
+                    return Err(AutumnError::forbidden_msg("insufficient permissions"));
+                }
+                if role == Role::Owner && current_caller_role != Role::Owner {
+                    return Err(AutumnError::forbidden_msg(
+                        "Only an owner can invite someone as owner",
+                    ));
+                }
 
-            // Revoke any other still-pending invitation to this email in
-            // this organization before creating the new one — otherwise
-            // both tokens would stay independently valid, and accepting
-            // one would leave the other pending indefinitely (the same
-            // lingering-token issue `accept_invitation` guards against for
-            // an already-a-member accept, but here at creation time for
-            // two never-yet-accepted invitations to the same address).
-            diesel::update(
-                invitations::table
-                    .filter(invitations::tenant_id.eq(&tenant_id))
-                    .filter(invitations::email.eq(&insert_email))
-                    .filter(invitations::status.eq("pending")),
-            )
-            .set(invitations::status.eq("revoked"))
-            .execute(conn)
-            .await?;
-
-            diesel::insert_into(invitations::table)
-                .values(&InsertInvitation {
-                    tenant_id,
-                    email: insert_email,
-                    role: insert_role,
-                    token_hash,
-                    status: "pending".to_owned(),
-                    invited_by_user_id: inviter_id,
-                    expires_at: chrono::Utc::now().naive_utc()
-                        + chrono::Duration::days(INVITATION_TTL_DAYS),
-                })
+                // Revoke any other still-pending invitation to this email in
+                // this organization before creating the new one — otherwise
+                // both tokens would stay independently valid, and accepting
+                // one would leave the other pending indefinitely (the same
+                // lingering-token issue `accept_invitation` guards against for
+                // an already-a-member accept, but here at creation time for
+                // two never-yet-accepted invitations to the same address).
+                diesel::update(
+                    invitations::table
+                        .filter(invitations::tenant_id.eq(&tenant_id))
+                        .filter(invitations::email.eq(&insert_email))
+                        .filter(invitations::status.eq("pending")),
+                )
+                .set(invitations::status.eq("revoked"))
                 .execute(conn)
                 .await?;
 
-            Ok::<_, AutumnError>(())
-        }
-        .scope_boxed()
-    })
-    .await
-    .map_err(|err| {
-        // Two concurrent requests for the same (tenant_id, email) can both
-        // pass the revoke step (a no-op when no prior pending row exists)
-        // and then race to insert here — the transaction alone doesn't
-        // serialize them, since there's no existing row for either to lock.
-        // `idx_invitations_pending_email` (a partial unique index on
-        // `(tenant_id, email) WHERE status = 'pending'`, see the migration)
-        // is the backstop: the loser's INSERT fails closed instead of
-        // leaving two live pending tokens for the same invitee.
+                diesel::insert_into(invitations::table)
+                    .values(&InsertInvitation {
+                        tenant_id,
+                        email: insert_email,
+                        role: insert_role,
+                        token_hash,
+                        status: "pending".to_owned(),
+                        invited_by_user_id: inviter_id,
+                        expires_at: chrono::Utc::now().naive_utc()
+                            + chrono::Duration::days(INVITATION_TTL_DAYS),
+                    })
+                    .execute(conn)
+                    .await?;
+
+                Ok::<_, AutumnError>(())
+            }
+            .scope_boxed()
+        })
+        .await;
+    // Two concurrent requests for the same (tenant_id, email) can both pass
+    // the revoke step above (a no-op when no prior pending row exists) and
+    // then race to insert here — the transaction alone doesn't serialize
+    // them, since there's no existing row for either to lock.
+    // `idx_invitations_pending_email` (a partial unique index on
+    // `(tenant_id, email) WHERE status = 'pending'`, see the migration) is
+    // the backstop: the loser's INSERT fails closed instead of leaving two
+    // live pending tokens for the same invitee. That loser used to `Err(...)`
+    // out to the generic JSON/error-page response same as the two checks
+    // above; it now redisplays the members page too, rather than converting
+    // to a friendlier message only to still drop the admin off the page
+    // (Wayfinder: error-path inventory).
+    if let Err(err) = tx_result {
         if autumn_web::error::unique_violation_field(
             &err,
             &[(
@@ -212,13 +297,20 @@ pub async fn create_invitation(
         )
         .is_some()
         {
-            AutumnError::conflict_msg(
+            return redisplay_members(
+                &mut db,
+                caller_role,
+                &membership_repo,
+                &invitation_repo,
+                &csrf,
+                &email,
+                role.as_str(),
                 "An invitation to this email is already pending for this organization",
             )
-        } else {
-            err
+            .await;
         }
-    })?;
+        return Err(err);
+    }
 
     let accept_url = format!("{}/invite/{raw_token}", app_base_url());
     // Sent synchronously (not `deliver_later_invite`): the success metric is
