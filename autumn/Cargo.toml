@@ -636,6 +636,14 @@ harness = false
 name = "throttle_check"
 harness = false
 
+# Drives `money::ledger::post` (issue #1837) against an in-memory SQLite
+# database — no Docker needed, unlike `repository_crud`/`money_ledger_postgres`.
+# See the file header for the exact commands.
+[[bench]]
+name = "ledger_post"
+harness = false
+required-features = ["sqlite"]
+
 # W6 PR3 seed-sweep runner (issue #1797): CI-facing driver for
 # `sim::sweep::sweep_proptest`. `required-features` (not a `#![cfg(...)]` file
 # guard, since a `[[bin]]` target — unlike a `[[test]]` — is simply skipped by
