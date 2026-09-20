@@ -106,7 +106,21 @@ SELECT id, title FROM posts WHERE id = ANY(:'lb_winners'::bigint[]);
 SELECT key, description, enabled, rollout_pct, actor_allowlist, group_allowlist
 FROM autumn_feature_flags WHERE key = 'new_ui_preview';
 
-\echo '--- pg_stat_statements profile (6 front-page statements) ---'
+-- 7. front_page's `posts_per_page()` (posts.rs:47-52), which reads the
+-- `posts_per_page` runtime-config key via `crate::config_svc().get(...)`
+-- and feeds statement 1's `LIMIT`. With a real primary database configured,
+-- `config_svc()`'s store resolves to `PgConfigStore`
+-- (examples/reddit-clone/src/lib.rs:32-49), whose 1-second cache
+-- (autumn/src/runtime_config.rs:1130-1158) means a cold-cache request
+-- issues this lookup -- same shape and same caveat as statement 6's flag
+-- lookup. No row is seeded for this key (an operator who never overrode
+-- `posts_per_page` is the common case), so `get_raw` returns no rows and
+-- the app falls back to its schema default (25, matching the `LIMIT 25`
+-- statement 1 already uses) -- the query still executes and is still
+-- profiled; it just touches less than it would with a row present.
+SELECT raw_value FROM autumn_runtime_config_values WHERE key = 'posts_per_page';
+
+\echo '--- pg_stat_statements profile (7 front-page statements) ---'
 -- pg_stat_statements is cluster-wide, not scoped to this database: on a
 -- reused/shared Postgres instance with other databases active, an
 -- unfiltered scan would count their concurrent statements too, corrupting

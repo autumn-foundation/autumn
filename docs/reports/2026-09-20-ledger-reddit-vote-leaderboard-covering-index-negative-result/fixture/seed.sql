@@ -43,7 +43,13 @@
 -- database configured that resolves to `PgFlagStore`
 -- (autumn/src/feature_flags.rs:688-706), a cold 1-second cache issues
 -- `SELECT ... FROM autumn_feature_flags WHERE key = $1` -- a sixth
--- statement this profile has to account for.
+-- statement this profile has to account for. Same story for the
+-- `autumn_runtime_config_values` table (migration
+-- `20260530000000_create_runtime_config`): `posts_per_page()`
+-- (posts.rs:47-52) reads the `posts_per_page` config key via
+-- `config_svc()`, which resolves to `PgConfigStore`
+-- (examples/reddit-clone/src/lib.rs:32-49) with the same 1-second-cache
+-- shape (autumn/src/runtime_config.rs:1130-1158) -- a seventh statement.
 
 \set ON_ERROR_STOP on
 

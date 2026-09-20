@@ -3,16 +3,18 @@
 ## 🎯 Workload
 
 `examples/reddit-clone`'s front page (`GET /`, `routes::posts::front_page`,
-`examples/reddit-clone/src/routes/posts.rs:80-195`) issues six statements:
+`examples/reddit-clone/src/routes/posts.rs:47-195`) issues seven statements:
 the hot-posts listing (`ORDER BY hot_rank DESC LIMIT 25`), the batched
 `preload(author().subreddit())` for that page of posts (two `id = ANY(...)`
 belongs-to lookups, `posts.rs:176-179`), the "Top posts by votes" leaderboard
 (`VoteRepository::sum_value_grouped_by_post_id().order_by_aggregate_desc().limit(5)`,
 `examples/reddit-clone/src/repositories.rs:86-90`), a small `id = ANY(...)`
-title lookup for the leaderboard's 5 winners, and (with a real primary
-database configured, so `flags`'s `PgFlagStore` is live, and a cold
-1-second cache) `flags.enabled("new_ui_preview")`'s flag lookup
-(`posts.rs:195`).
+title lookup for the leaderboard's 5 winners, and — with a real primary
+database configured, so both `PgFlagStore` and `PgConfigStore` are live
+instead of their in-memory fallbacks, and a cold 1-second cache — two
+config-backed lookups: `flags.enabled("new_ui_preview")` (`posts.rs:195`)
+and `posts_per_page()`'s runtime-config read (`posts.rs:47-52`, which feeds
+statement 1's `LIMIT`).
 
 Profiled against a production-shaped fixture applied to a real Postgres 16
 instance (schema replayed from `examples/reddit-clone/migrations/`, no
@@ -73,10 +75,12 @@ for m in 20260419000000_create_reddit 20260427000000_add_user_avatar \
          20260702000001_create_tags 20260820000000_polymorphic_comments; do
   psql -d reddit_ledger -f examples/reddit-clone/migrations/$m/up.sql
 done
-# Framework migration (autumn/migrations/, not the app's own) -- front_page's
-# flags.enabled("new_ui_preview") call needs this table when a real primary
-# database is configured (see Profile section, statement 6).
+# Framework migrations (autumn/migrations/, not the app's own) -- front_page's
+# flags.enabled("new_ui_preview") and posts_per_page() calls need these
+# tables when a real primary database is configured (see Profile section,
+# statements 6 and 7).
 psql -d reddit_ledger -f autumn/migrations/20260530200000_create_feature_flags/up.sql
+psql -d reddit_ledger -f autumn/migrations/20260530000000_create_runtime_config/up.sql
 psql -d reddit_ledger -f docs/reports/2026-09-20-ledger-reddit-vote-leaderboard-covering-index-negative-result/fixture/seed.sql
 psql -d reddit_ledger -f docs/reports/2026-09-20-ledger-reddit-vote-leaderboard-covering-index-negative-result/baseline/queries.sql
 psql -d reddit_ledger -f docs/reports/2026-09-20-ledger-reddit-vote-leaderboard-covering-index-negative-result/after/queries.sql
@@ -84,7 +88,7 @@ psql -d reddit_ledger -f docs/reports/2026-09-20-ledger-reddit-vote-leaderboard-
 
 ## 📈 Profile
 
-`pg_stat_statements`, reset immediately before the six front-page
+`pg_stat_statements`, reset immediately before the seven front-page
 statements ran once each (the two `array_agg`-wrapped queries that recover
 the seeded fixture's actual hot-post ids and leaderboard winners run
 *before* the reset, so they never appear in this profile — they are not
@@ -92,23 +96,25 @@ statements `front_page` itself issues):
 
 | statement | calls | total buffers | % of page's buffers |
 |---|---:|---:|---:|
-| leaderboard: `SUM(value) GROUP BY post_id ... LIMIT 5` | 1 | **3,293** | **96.51%** |
+| leaderboard: `SUM(value) GROUP BY post_id ... LIMIT 5` | 1 | **3,293** | **96.46%** |
 | preload: `SELECT * FROM users WHERE id = ANY(...)` | 1 | 77 | 2.26% |
 | hot-posts listing: `ORDER BY hot_rank DESC LIMIT 25` | 1 | 27 | 0.79% |
 | title lookup: `id = ANY(...)` (leaderboard winners) | 1 | 12 | 0.35% |
 | flag lookup: `autumn_feature_flags WHERE key = $1` | 1 | 2 | 0.06% |
+| runtime-config lookup: `autumn_runtime_config_values WHERE key = $1` | 1 | 2 | 0.06% |
 | preload: `SELECT * FROM subreddits WHERE id = ANY(...)` | 1 | 1 | 0.03% |
 
 The leaderboard query is the front page's cost by nearly two orders of
 magnitude — comfortably clears the "≥5% of total buffers" bar. The other
-five statements are cheap, correctly-indexed point/batched lookups
-(`idx_posts_hot_rank`, primary-key `ANY`, the flag table's unique `key`
-index) and are not touched by this report. (The two `preload()` statements
-are approximated from the schema — plain `belongs_to`, no soft-delete/
-tenant guard on either `users` or `subreddits` — not verified byte-identical
-against the preload macro's codegen the way the leaderboard query is,
-below. The flag lookup also assumes a cold 1-second cache — a request
-landing within a second of a prior one for this flag skips it entirely.)
+six statements are cheap, correctly-indexed point/batched lookups
+(`idx_posts_hot_rank`, primary-key `ANY`, the flag/config tables' unique
+`key` indexes) and are not touched by this report. (The two `preload()`
+statements are approximated from the schema — plain `belongs_to`, no
+soft-delete/tenant guard on either `users` or `subreddits` — not verified
+byte-identical against the preload macro's codegen the way the leaderboard
+query is, below. The flag and runtime-config lookups also assume a cold
+1-second cache — a request landing within a second of a prior one for
+either key skips that lookup entirely.)
 
 ## 🧭 Plan
 
@@ -159,12 +165,13 @@ reduction versus the seq-scan plan's 3,293. So the index isn't inert.
 
 To be precise about what that does and doesn't establish: `after/output.txt`
 also records `Execution Time:` for both plans (lines 90 and 134) — in the
-exact output committed here, 42.669 ms unforced (seq scan) versus 29.668 ms
+exact output committed here, 36.989 ms unforced (seq scan) versus 29.793 ms
 forced (index-only). Re-running this identical script (or an equivalent
 version of it) several times during this report's review produced 43.9/30.6
 ms, 42.5/41.8 ms (essentially a tie), 44.6/30.7 ms, 44.1/29.6 ms, 50.4/35.2
-ms, and 42.7/29.7 ms — the gap between the two plans swings from "roughly
-tied" to "index ~30% faster" across otherwise-identical runs, which is
+ms, 42.7/29.7 ms, and 37.0/29.8 ms — the gap between the two plans swings
+from "roughly tied" to "index ~30% faster" across otherwise-identical runs,
+which is
 itself the reason this project gates `EXPLAIN ANALYZE` timing on a `>2×`
 delta before treating it as evidence at all: none of these three runs clear
 it. So wall-clock isn't used as a claim here either way — whatever number
@@ -422,3 +429,21 @@ change:
     identifiers identically, and `CAST(bigint AS bigint)` is eliminated at
     parse time) — this was a query-text fidelity fix, not a measurement
     fix.
+
+A ninth review round caught one more missing statement:
+
+16. Same class of gap as item 13's flag lookup: `posts_per_page()`
+    (`posts.rs:47-52`) reads the `posts_per_page` runtime-config key via
+    `config_svc()`, which — with a real primary database configured —
+    resolves to `PgConfigStore` (`examples/reddit-clone/src/lib.rs:32-49`)
+    with the same 1-second cold-cache shape
+    (`autumn/src/runtime_config.rs:1130-1158`). This feeds statement 1's
+    `LIMIT` and was missing from the profile. Fixed: added the framework's
+    `autumn_runtime_config_values` migration (no seed row — an operator who
+    never overrode `posts_per_page` is the common case, and the query still
+    executes and is still profiled either way) to the fixture, added the
+    lookup as statement 7, and updated the "Reproduce" section's migration
+    list. Re-ran the full pipeline: the runtime-config lookup is 2 buffers
+    (0.06% of page buffers, same as the flag lookup); the leaderboard is
+    now 96.46% of a 7-statement, 3,414-buffer total (was 96.51% of 6) —
+    conclusion unaffected.
