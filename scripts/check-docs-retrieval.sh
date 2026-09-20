@@ -439,6 +439,29 @@ def defn_extent(lines, i, col=0):
 CONTAINER_MARKER = re.compile(r'^ {0,3}(?:>[ \t]?|(?:[-*+]|\d{1,9}[.)])[ \t]+)')
 
 
+LIST_MARKER = re.compile(r'^( {0,3})((?:[-*+]|\d{1,9}[.)]))([ \t]+)')
+
+
+def marker_width(text):
+    """How many columns a list marker and its padding occupy, or 0.
+
+    CommonMark pads a marker with 1 to 4 spaces. A run of FIVE or more is
+    one space of padding and the rest is content indentation — so
+    `-     ## Heading` is an indented code block inside the item, not a
+    heading, and taking the whole run would index it as one.
+
+    A tab in the run counts as a single space of padding, which errs toward
+    the SMALLER column: the content then reads as indented code, which hides
+    text rather than inventing it.
+    """
+    m = LIST_MARKER.match(text)
+    if not m:
+        return 0
+    pad = m.group(3)
+    width = 1 if ('\t' in pad or len(pad) > 4) else len(pad)
+    return len(m.group(1)) + len(m.group(2)) + width
+
+
 def container_text(line, col, opened):
     """A line's text read from the open list item's content column.
 
@@ -816,6 +839,7 @@ def index():
         list_col = 0            # content column of the open list item
         para = []
         para_depth = 0
+        para_col = 0            # the list column the paragraph sits in
         lines = text.splitlines()
         for idx, line in enumerate(lines):
             # Every block below — a fence, a raw HTML block, a comment — ends
@@ -957,10 +981,10 @@ def index():
             if body_now.strip() and fence is None and html_block is None:
                 if indent_now < list_col:
                     list_col = 0            # dedented out of the item
-                mark = CONTAINER_MARKER.match(body_now[list_col:]) \
-                    if indent_now >= list_col else None
-                if mark and not mark.group(0).lstrip(' \t').startswith('>'):
-                    list_col += mark.end()
+                width = marker_width(body_now[list_col:]) \
+                    if indent_now >= list_col else 0
+                if width:
+                    list_col += width
                     opened_here = True
             content_now = container_text(line, list_col, opened_here)
 
@@ -1139,7 +1163,14 @@ def index():
             # indexed a LIST ITEM as a heading. A comment asserting a
             # property is not the same as enforcing it.
             depth, body = unquote(line)
-            if para and depth == para_depth:
+            # Read from the ITEM's content column, like everything else: a
+            # setext heading belongs to the item that holds it, so `- Secret
+            # runtime logger` over `  ---` is a heading inside the list. The
+            # column has to MATCH, the way the quote depth does — an
+            # unindented `---` under an item's text has left the item, and is
+            # a thematic break rather than an underline.
+            body = container_text(line, list_col, opened_here)
+            if para and depth == para_depth and list_col == para_col:
                 under = re.match(r'^ {0,3}(=+|-+)\s*$', body)
                 if under:
                     # CommonMark promotes the WHOLE preceding paragraph, which
@@ -1183,6 +1214,7 @@ def index():
                 if is_paragraph(body) and not is_heading:
                     para.append(body)
                     para_depth = depth
+                    para_col = list_col
                 else:
                     para = []       # a blank line or a block ends the paragraph
                 continue
@@ -2593,7 +2625,43 @@ self_test() {
     > "$c147/scripts/docs-retrieval-questions.tsv"
   check "an undefined reference is still visible text" pass "$c147"
 
-  # 148. A comment line and a blank line in the fixture are skipped.
+  # 148. A marker takes 1-4 spaces of padding. FIVE or more is one space of
+  #      padding and the rest is content indent, so this is indented code.
+  local c148="$tmp/c148"; make_corpus "$c148"
+  printf '# Page\n\n-     ## Secret runtime logger\n' \
+    > "$c148/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c148/scripts/docs-retrieval-questions.tsv"
+  check "five spaces after a marker are indented code" fail "$c148"
+
+  # 149. …while four are padding, and the heading is a heading. The control
+  #      on 148, which "always take one space" would fail.
+  local c149="$tmp/c149"; make_corpus "$c149"
+  printf '# Page\n\n-    ## Secret runtime logger\n' \
+    > "$c149/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c149/scripts/docs-retrieval-questions.tsv"
+  check "four spaces after a marker are padding" pass "$c149"
+
+  # 150. A SETEXT heading inside a list item is a heading: its text and its
+  #      underline share the item's content column.
+  local c150="$tmp/c150"; make_corpus "$c150"
+  printf '# Page\n\n- Secret runtime logger\n  ---\n' \
+    > "$c150/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c150/scripts/docs-retrieval-questions.tsv"
+  check "a setext heading inside a list item is indexed" pass "$c150"
+
+  # 151. …and an underline that has LEFT the item is a thematic break, not
+  #      an underline. The control on 150, and what test 46 has always said.
+  local c151="$tmp/c151"; make_corpus "$c151"
+  printf '# Page\n\n- Secret runtime logger\n---\n' \
+    > "$c151/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c151/scripts/docs-retrieval-questions.tsv"
+  check "an unindented underline does not promote an item" fail "$c151"
+
+  # 152. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
