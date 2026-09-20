@@ -1305,7 +1305,14 @@ def list_content_col(expanded):
 
     `expanded` must already have had its tabs expanded and any block-quote
     marker removed, so a column really is a column.
+
+    A THEMATIC BREAK is not a list item, however much `* * *` looks like a
+    bullet followed by content. Reading it as one kept a content column of
+    two open across the `<hr>`, so the four-space line beneath it missed the
+    code threshold and its link was counted as a route.
     """
+    if THEMATIC.match(expanded):
+        return None
     m = _LIST_COL.match(expanded)
     if m is None:
         return None
@@ -1478,6 +1485,7 @@ def readable(text, resolved=None):
     # below read exactly as it did before list columns were tracked at all.
     # A stack rather than one number because a line that dedents out of a
     # nested item lands in the enclosing one, not at the margin.
+    # Each entry is `(content column, quote depth it was opened at)`.
     list_cols = []
     list_col = 0
 
@@ -1552,11 +1560,19 @@ def readable(text, resolved=None):
             # Resetting straight to zero called it margin-relative code and
             # rejected a valid README, because one column cannot describe
             # two open containers. The columns are a STACK.
-            if not LIST_ITEM.match(content):
-                while list_cols and indent < list_cols[-1]:
+            # An item opened INSIDE a quote does not survive leaving it.
+            # `> - quoted item`, a blank line, then a four-space link: the
+            # blank line ends the quote, so that link is margin-relative
+            # code — but the quoted item's column stayed open and lifted the
+            # threshold past it. Each column remembers the quote depth it
+            # was opened at, and a shallower line drops every deeper one.
+            while list_cols and list_cols[-1][1] > depth:
+                list_cols.pop()
+            if not (LIST_ITEM.match(content) and not THEMATIC.match(content)):
+                while list_cols and indent < list_cols[-1][0]:
                     list_cols.pop()
-                list_col = list_cols[-1] if list_cols else 0
-                in_list = bool(list_cols)
+            list_col = list_cols[-1][0] if list_cols else 0
+            in_list = bool(list_cols)
             # A block inside a list item is measured from the item's CONTENT
             # column too, not from the margin: under `100. Example:` the
             # content column is five, so a five-space `~~~md` is a fence at
@@ -1607,9 +1623,9 @@ def readable(text, resolved=None):
             if col is not None:
                 # A new item at or inside the current column NESTS; one
                 # further left closes the items it has dedented out of.
-                while list_cols and indent < list_cols[-1]:
+                while list_cols and indent < list_cols[-1][0]:
                     list_cols.pop()
-                list_cols.append(col)
+                list_cols.append((col, depth))
                 in_list = True
                 list_col = col
                 # An OVERPADDED marker puts code on the marker's own line.
@@ -2040,6 +2056,20 @@ def readable(text, resolved=None):
             tag = INLINE_TAG.match(text, i)
             if tag:
                 blank_to(i, tag.end())
+                # A raw `<img>` RENDERS, so a link whose label is one is a
+                # link a reader can see and click:
+                # `[<img alt="Guide" src="icon.png">](docs/guide/index.md)`
+                # is a valid route. Blanking the tag left the label empty and
+                # the link was rejected as invisible — the same mistake a
+                # markdown image would have caused before `IMAGE_MARK`, in
+                # the one spelling that sentinel did not cover.
+                #
+                # `img` alone, because `img` alone is what both renderers
+                # were checked against. Other replaced elements (`<video>`,
+                # `<svg>`, `<iframe>`) would plausibly qualify; guessing at
+                # them would trade a verified fix for an unverified one.
+                if re.match(r"<img[\s/>]", text[i:i + 5], re.I):
+                    out[i] = IMAGE_MARK
                 i = tag.end()
                 continue
             para = re.compile(r"\n[ \t]*\n").search(text, i)
@@ -5850,6 +5880,67 @@ self_test() {
     > "$tmp/nested_ref_inline/README.md"
   _commit nested_ref_inline
   _case "an inline tail blocks the shortcut" 1 nested_ref_inline
+
+  # 285. A THEMATIC BREAK is not a list item, however much `* * *` looks
+  #      like a bullet with content. Reading it as one held a content column
+  #      of two open across the `<hr>`, so the four-space line under it
+  #      missed the code threshold and its link counted as a route.
+  _scaffold thematic_not_item
+  printf '# A\n' > "$tmp/thematic_not_item/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/thematic_not_item/docs/guide/index.md"
+  printf '* * *\n\n    [Guide](docs/guide/index.md)\n' \
+    > "$tmp/thematic_not_item/README.md"
+  _commit thematic_not_item
+  _case "a thematic break opens no list item" 1 thematic_not_item
+
+  # 286. An item opened INSIDE a quote does not survive leaving it. The
+  #      blank line ends the quote, so the four-space line is margin code —
+  #      but the quoted item's column stayed open and lifted the threshold
+  #      past it. Each column now remembers the depth it was opened at.
+  _scaffold quoted_list_escapes
+  printf '# A\n' > "$tmp/quoted_list_escapes/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/quoted_list_escapes/docs/guide/index.md"
+  printf '> - quoted item\n\n    [Guide](docs/guide/index.md)\n' \
+    > "$tmp/quoted_list_escapes/README.md"
+  _commit quoted_list_escapes
+  _case "a quoted item's column ends with its quote" 1 quoted_list_escapes
+
+  # 287. ...while the same item's column DOES hold inside the quote, so a
+  #      link at its content column there is still a route.
+  _scaffold quoted_list_holds
+  printf '# A\n' > "$tmp/quoted_list_holds/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/quoted_list_holds/docs/guide/index.md"
+  printf '> - quoted item\n>\n>     [Guide](docs/guide/index.md)\n' \
+    > "$tmp/quoted_list_holds/README.md"
+  _commit quoted_list_holds
+  _case "a quoted item's column holds inside its quote" 0 quoted_list_holds
+
+  # 288. A raw `<img>` RENDERS, so a link whose whole label is one is a
+  #      link a reader can see and click. Blanking the tag left the label
+  #      empty and rejected a valid route — the one spelling `IMAGE_MARK`
+  #      did not cover.
+  _scaffold raw_img_label
+  printf '# A\n' > "$tmp/raw_img_label/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/raw_img_label/docs/guide/index.md"
+  printf '[<img alt="Guide" src="icon.png">](docs/guide/index.md)\n' \
+    > "$tmp/raw_img_label/README.md"
+  _commit raw_img_label
+  _case "a raw image label is visible content" 0 raw_img_label
+
+  # 289. A tag that merely STARTS with `img` is not one, and an empty
+  #      element still renders nothing, so neither becomes a route.
+  _scaffold raw_img_lookalike
+  printf '# A\n' > "$tmp/raw_img_lookalike/docs/guide/alpha.md"
+  printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \
+    > "$tmp/raw_img_lookalike/docs/guide/index.md"
+  printf '[<imgx a="1">](docs/guide/index.md)\n' \
+    > "$tmp/raw_img_lookalike/README.md"
+  _commit raw_img_lookalike
+  _case "a tag starting with img is not an image" 1 raw_img_lookalike
 
   echo "self-test: $pass/$total passed"
   [ "$pass" -eq "$total" ]
