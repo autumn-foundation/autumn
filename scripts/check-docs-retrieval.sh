@@ -366,7 +366,7 @@ def _title_runs(text, n, body_at):
             return not nxt[end:].strip(), n
 
 
-def defn_extent(lines, i):
+def defn_extent(lines, i, col=0):
     """`(label, line count)` for a link reference definition starting at
     `lines[i]`, or `(None, 0)` if there is none.
 
@@ -380,6 +380,11 @@ def defn_extent(lines, i):
     whole extent first means never owing anything.
     """
     depth, body = unquote(lines[i])
+    # A definition a LIST ITEM holds is still a definition, and applies to
+    # the whole document — so the item's marker comes off before the label is
+    # read, and its continuation lines are read from the item's content
+    # column, which is where they are indented to.
+    body = uncontain(body) if col else body
     label, after = _defn_at(body)
     if label is None:
         return None, 0
@@ -393,7 +398,13 @@ def defn_extent(lines, i):
         if k >= len(lines):
             return None
         d, b = unquote(lines[k])
-        return b.strip() if d == depth and b.strip() else None
+        if d != depth or not b.strip():
+            return None
+        # Inside an item, a continuation line is indented to its content
+        # column; a line that dedents past it has left the item.
+        if col and (len(b) - len(b.lstrip(' '))) < col:
+            return None
+        return b.strip()
 
     n = i + 1
     rest = body[after:].strip()
@@ -426,6 +437,20 @@ def defn_extent(lines, i):
 
 
 CONTAINER_MARKER = re.compile(r'^ {0,3}(?:>[ \t]?|(?:[-*+]|\d{1,9}[.)])[ \t]+)')
+
+
+def container_text(line, col, opened):
+    """A line's text read from the open list item's content column.
+
+    On the line that OPENS an item the marker occupies those columns, so the
+    content starts at `col` whatever the line's own indent is. On a
+    CONTINUATION line it starts there only once the line is indented that
+    far — a line that dedents past it has left the item.
+    """
+    body = unquote(line)[1]
+    if opened or (len(body) - len(body.lstrip(' '))) >= col:
+        return body[col:]
+    return body
 
 
 def list_indent(line):
@@ -788,6 +813,7 @@ def index():
         comment_depth = 0
         html_block = None       # (kind, owning quote depth)
         skip = 0                # lines a definition has already claimed
+        list_col = 0            # content column of the open list item
         para = []
         para_depth = 0
         lines = text.splitlines()
@@ -806,6 +832,8 @@ def index():
             # line. Read from the RAW line, before any comment is stripped,
             # because that is the line the container structure is made of.
             container = unquote(line)[0]
+            body_now = unquote(line)[1]
+            indent_now = len(body_now) - len(body_now.lstrip(' '))
 
             # Lines a definition already claimed. Nothing in one is visible,
             # and nothing in one can open a block: the lookahead that claimed
@@ -870,6 +898,13 @@ def index():
             # Type 7 — one complete tag alone on its line, any name — is
             # tracked too, below the type-6 check so the named tags keep
             # their own rule. It also ends at a blank line.
+            if (html_block is not None and html_block[2]
+                    and body_now.strip() and indent_now < html_block[2]):
+                # A block a LIST ITEM owns ends where the item does — the
+                # first non-blank line dedented past its content column —
+                # the same rule the fence path uses. Placed with the other
+                # state check, because the branch below consumes the line.
+                html_block = None
             if (html_block is not None and html_block[1]
                     and container < html_block[1]):
                 # The quote that held it ended, so the block did. This line is
@@ -911,7 +946,25 @@ def index():
             # columns, so it cannot precede a fence at all. `\s{0,3}` let a
             # tabbed line close a fence that is still open, exposing hidden
             # content to the index.
-            bare = uncontain(line)
+            # The open list item's content column, carried across lines.
+            # A list item is continued by INDENTATION, so without this the
+            # scanner cannot tell an item's content from an indented code
+            # block, cannot end a block the item owns, and cannot see a
+            # definition the item holds. One level deep, deliberately: the
+            # nesting this corpus has is one, and a stack that is never
+            # exercised is a stack that is wrong.
+            opened_here = False
+            if body_now.strip() and fence is None and html_block is None:
+                if indent_now < list_col:
+                    list_col = 0            # dedented out of the item
+                mark = CONTAINER_MARKER.match(body_now[list_col:]) \
+                    if indent_now >= list_col else None
+                if mark and not mark.group(0).lstrip(' \t').startswith('>'):
+                    list_col += mark.end()
+                    opened_here = True
+            content_now = container_text(line, list_col, opened_here)
+
+            bare = content_now
             # Whether a LIST marker was stripped to get there. A marker means
             # a new list item begins on this line, so its delimiter is that
             # item's first content and cannot close a fence that belongs to
@@ -924,7 +977,7 @@ def index():
             # also marks the limit here — a fence opened inside an item and
             # left unclosed there runs on past the list, rather than ending
             # with it, and that needs container widths to fix.
-            listed = bare != unquote(line)[1]
+            listed = uncontain(line) != body_now
             if fence is not None and fence[1] and container < fence[1]:
                 fence = None        # the quote that held the fence ended
             if fence is not None and fence[2]:
@@ -988,7 +1041,7 @@ def index():
                               bare, re.I)
             if opener:
                 tag = opener.group(1).lower()
-                html_block = (tag, container)
+                html_block = (tag, container, list_col)
                 para = []
                 if not re.search(rf'</{tag}\s*>', line, re.I):
                     continue
@@ -999,14 +1052,14 @@ def index():
             if re.match(r'^ {0,3}<\?', bare):
                 # CommonMark type 3: a processing instruction runs to `?>`,
                 # and nothing inside it is Markdown.
-                html_block = ('#pi', container)
+                html_block = ('#pi', container, list_col)
                 para = []
                 if '?>' in line:
                     html_block = None
                 continue
 
             if re.match(r'^ {0,3}<!\[CDATA\[', bare):
-                html_block = ('#cdata', container)   # type 5, ends at `]]>`
+                html_block = ('#cdata', container, list_col)   # type 5, ends at `]]>`
                 para = []
                 if ']]>' in line:
                     html_block = None
@@ -1014,14 +1067,14 @@ def index():
 
             if re.match(r'^ {0,3}<![A-Za-z]', bare):
                 # type 4 (`<!DOCTYPE …`), ends at `>`
-                html_block = ('#decl', container)
+                html_block = ('#decl', container, list_col)
                 para = []
                 if '>' in line:
                     html_block = None
                 continue
 
             if re.match(rf'^ {{0,3}}</?{CONTAINER_TAGS}(?=[\s/>]|$)', bare, re.I):
-                html_block = ('#blank', container)
+                html_block = ('#blank', container, list_col)
                 para = []
                 continue
 
@@ -1037,14 +1090,17 @@ def index():
             # `not para` because type 7, alone among the seven, cannot
             # interrupt a paragraph.
             if not para and TYPE7_TAG.match(bare):
-                html_block = ('#blank', container)
+                html_block = ('#blank', container, list_col)
                 continue
 
             # A four-space-indented line with no paragraph open is an
             # indented CODE block, so a `<!--` in it is literal and must not
             # put the scanner into comment state — which would suppress every
             # heading until some later `-->`.
-            if not para and re.match(r'^(    |\t)', line):
+            # Measured from the ITEM's content column, not from the margin:
+            # after `10. item`, a four-space line is that item's content and
+            # a `## Heading` in it is a heading a reader sees.
+            if not para and re.match(r'^(    |\t)', content_now):
                 continue
 
             # Whether this is a heading is decided on the RAW line, before
@@ -1102,7 +1158,11 @@ def index():
             # heading once the comment is stripped. It must NOT gate the
             # setext path above it, which is how that check was dead on
             # arrival the first time it was written.
-            m = re.match(r'^ {0,3}(#{1,6})\s+(.*\S)\s*$', uncontain(line)) \
+            # From the item's column, and from the UNCOMMENTED line: `line`
+            # has been through `uncomment` by here, and it is the visible
+            # text that gets indexed.
+            m = re.match(r'^ {0,3}(#{1,6})\s+(.*\S)\s*$',
+                         container_text(line, list_col, opened_here)) \
                 if is_heading else None
             if not m:
                 # Only a plain, non-blank text line can be setext text. A
@@ -1115,7 +1175,7 @@ def index():
                 # INTERRUPT one, so after prose the same line is continuation
                 # text and the `---` under it makes a heading of both.
                 if not para:
-                    label, span = defn_extent(lines, idx)
+                    label, span = defn_extent(lines, idx, list_col)
                     if label is not None:
                         defined.add(ref_label(label))
                         skip = span - 1
@@ -2480,7 +2540,60 @@ self_test() {
     > "$c141/scripts/docs-retrieval-questions.tsv"
   check "a list-owned fence holds while the item continues" fail "$c141"
 
-  # 142. A comment line and a blank line in the fixture are skipped.
+  # 142. Four spaces inside a list ITEM are that item's content, not an
+  #      indented code block, so a heading in them is a heading.
+  local c142="$tmp/c142"; make_corpus "$c142"
+  printf '# Page\n\n10. item\n\n    ## Secret runtime logger\n' \
+    > "$c142/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c142/scripts/docs-retrieval-questions.tsv"
+  check "four spaces inside a list item are content" pass "$c142"
+
+  # 143. …and four spaces with NO list open are still indented code. The
+  #      control on 142.
+  local c143="$tmp/c143"; make_corpus "$c143"
+  printf '# Page\n\n    ## Secret runtime logger\n' \
+    > "$c143/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c143/scripts/docs-retrieval-questions.tsv"
+  check "four spaces with no list open are code" fail "$c143"
+
+  # 144. A raw HTML block a list item owns ends when the item does, the same
+  #      way its fence now does.
+  local c144="$tmp/c144"; make_corpus "$c144"
+  printf '# Page\n\n- <script>\n  var x\n\n## Secret runtime logger\n' \
+    > "$c144/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c144/scripts/docs-retrieval-questions.tsv"
+  check "a list-owned html block ends with the item" pass "$c144"
+
+  # 145. …and holds while the item continues. The control on 144.
+  local c145="$tmp/c145"; make_corpus "$c145"
+  printf '# Page\n\n- <script>\n  # Secret runtime logger\n  var x\n' \
+    > "$c145/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c145/scripts/docs-retrieval-questions.tsv"
+  check "a list-owned html block holds inside the item" fail "$c145"
+
+  # 146. A definition a list item holds still defines, document-wide, so a
+  #      reference to it elsewhere is a link and its label is invisible.
+  local c146="$tmp/c146"; make_corpus "$c146"
+  printf '# Page\n\n- [secret runtime logger]: /x\n\n## [Overview][secret runtime logger]\n' \
+    > "$c146/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c146/scripts/docs-retrieval-questions.tsv"
+  check "a definition inside a list item still defines" fail "$c146"
+
+  # 147. …and with no definition anywhere the reference is visible text. The
+  #      control on 146.
+  local c147="$tmp/c147"; make_corpus "$c147"
+  printf '# Page\n\n## [Overview][secret runtime logger]\n' \
+    > "$c147/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c147/scripts/docs-retrieval-questions.tsv"
+  check "an undefined reference is still visible text" pass "$c147"
+
+  # 148. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
