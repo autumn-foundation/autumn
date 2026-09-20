@@ -28,10 +28,13 @@ themselves volume from up to 300,000 distinct-user votes; the other 29,800
 users, including plenty of posts with zero — 333,302 post-directed votes, 44,998
 comment-directed votes with `NULL post_id`, so the leaderboard's
 `IS NOT NULL` group guard has real rows to exclude, not a vacuous
-predicate). `setseed()` (plus a `REPEATABLE` seed on the one `TABLESAMPLE`
-call, below) makes every *randomized* value — which user voted on what,
-with which value, who authored which post — deterministic, and therefore
-makes the leaderboard's winners deterministic too; the harness reads those
+predicate). `setseed()` (which drives which users/posts/comments get drawn
+into a pair) plus `hashtext()` on each pair's own logical key (which drives
+a vote's `value` and whether it gets churned, so it can't drift with
+Postgres's row-order or physical-layout choices) makes every *randomized*
+value — which user voted on what, with which value, who authored which
+post — deterministic, and therefore makes the leaderboard's winners
+deterministic too; the harness reads those
 winners back out of the data rather than hard-coding ids, so it can't drift
 regardless. That does **not** make the raw committed output byte-identical
 across runs: `created_at` columns default to `NOW()`, and `EXPLAIN`/`VACUUM`
@@ -96,10 +99,10 @@ statements `front_page` itself issues):
 
 | statement | calls | total buffers | % of page's buffers |
 |---|---:|---:|---:|
-| leaderboard: `SUM(value) GROUP BY post_id ... LIMIT 5` | 1 | **3,292** | **96.45%** |
+| leaderboard: `SUM(value) GROUP BY post_id ... LIMIT 5` | 1 | **3,292** | **96.43%** |
 | preload: `SELECT * FROM users WHERE id = ANY(...)` | 1 | 77 | 2.26% |
 | hot-posts listing: `ORDER BY hot_rank DESC LIMIT 25` | 1 | 27 | 0.79% |
-| title lookup: `id = ANY(...)` (leaderboard winners) | 1 | 12 | 0.35% |
+| title lookup: `id = ANY(...)` (leaderboard winners) | 1 | 13 | 0.38% |
 | flag lookup: `autumn_feature_flags WHERE key = $1` | 1 | 2 | 0.06% |
 | runtime-config lookup: `autumn_runtime_config_values WHERE key = $1` | 1 | 2 | 0.06% |
 | preload: `SELECT * FROM subreddits WHERE id = ANY(...)` | 1 | 1 | 0.03% |
@@ -165,11 +168,11 @@ reduction versus the seq-scan plan's 3,292. So the index isn't inert.
 
 To be precise about what that does and doesn't establish: `after/output.txt`
 also records `Execution Time:` for both plans (lines 90 and 134) — in the
-exact output committed here, 45.421 ms unforced (seq scan) versus 31.899 ms
+exact output committed here, 42.673 ms unforced (seq scan) versus 32.617 ms
 forced (index-only). Re-running this identical script (or an equivalent
 version of it) several times during this report's review produced 43.9/30.6
 ms, 42.5/41.8 ms (essentially a tie), 44.6/30.7 ms, 44.1/29.6 ms, 50.4/35.2
-ms, 42.7/29.7 ms, 37.0/29.8 ms, 39.4/29.8 ms, and 45.4/31.9 ms — the gap between the two plans swings
+ms, 42.7/29.7 ms, 37.0/29.8 ms, 39.4/29.8 ms, 45.4/31.9 ms, and 42.7/32.6 ms — the gap between the two plans swings
 from "roughly tied" to "index ~30% faster" across otherwise-identical runs,
 which is
 itself the reason this project gates `EXPLAIN ANALYZE` timing on a `>2×`
@@ -238,7 +241,7 @@ Raw output: `baseline/output.txt` (profile + `EXPLAIN` before), `after/output.tx
 (index added, unforced plan unchanged + `idx_scan=0`, forced comparison, then
 dropped). Fixture: `fixture/seed.sql` (+ `fixture/seed_output.txt`, one
 concrete run's row counts and ratios — the *randomized values* `setseed()`
-and the `TABLESAMPLE ... REPEATABLE` seed pin are reproducible; the raw file
+and `hashtext()` pin are reproducible; the raw file
 itself is not byte-for-byte across runs (`created_at` timestamps, `VACUUM`'s
 wall-clock/XID/I/O counters), same caveat as above).
 
@@ -507,3 +510,35 @@ same fix:
     (96.45% of page buffers), `idx_scan` for the covering index still 0
     before and after adding it, and the forced index-only plan is still
     1,283 buffers, a 61.0% reduction. Conclusion unaffected.
+
+A twelfth review round caught the same class of gap one step further down
+the fixture, in the churn step:
+
+19. The churn step selected candidates with `id IN (SELECT id FROM votes
+    TABLESAMPLE BERNOULLI (5) REPEATABLE (4152))` — reproducible in the
+    sense that a given seed samples the same *physical* tuples every time,
+    but that was the wrong invariant once item 18 stopped guaranteeing the
+    vote inserts' row order: `TABLESAMPLE` samples by block/tuple position,
+    and which logical `(user_id, post_id)` vote lands at a given physical
+    position depends on insertion order, which — per item 18 — Postgres
+    doesn't guarantee. A different upstream plan could still sample "the
+    same physical tuples" while silently churning different votes. Fixed:
+    replaced the `TABLESAMPLE`/subquery with
+    `(abs(hashtext(user_id::text || ':' || post_id::text || ':churn')::bigint) % 100) < 5`,
+    selecting churn candidates by the vote's own logical key instead of its
+    physical position — no `TABLESAMPLE`, no `REPEATABLE` seed, no
+    dependency on insertion order. (First draft of this fix hashed the
+    surrogate `id` column instead — wrong, since `id` is itself assigned in
+    insertion order by the table's sequence and so inherits the exact
+    dependency being removed; caught before committing and hashed
+    `user_id`/`post_id` instead.) Verified directly: reseeded and re-ran
+    the fixture from scratch twice more and diffed the leaderboard
+    aggregate — both runs again produced the exact same 5 `(post_id, sum)`
+    pairs (82/1163, 41/1150, 119/1119, 196/1117, 100/1115) and the same
+    total vote count (378,300). Re-ran the full pipeline: leaderboard
+    still 3,292 buffers (96.43% of page buffers — the title lookup shifted
+    by one buffer, 13 vs. item 18's 12, from the different winners), `idx_scan`
+    for the covering index still 0 before and after adding it, forced
+    index-only plan still 1,283 buffers, a 61.0% reduction. Conclusion
+    unaffected — no more `random()`- or physical-order-dependent value in
+    this fixture.

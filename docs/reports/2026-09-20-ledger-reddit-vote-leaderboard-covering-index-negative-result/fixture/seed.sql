@@ -17,14 +17,18 @@
 -- post-vote/comment-vote split, not the shape of vote concentration among
 -- individual hot posts. ~40,000 comment votes.
 --
--- `setseed()` (below) and a `REPEATABLE` seed on the churn step's
--- `TABLESAMPLE` (further down) make every *randomized value* this script
--- produces deterministic -- who voted on what, with which value, and
--- therefore the leaderboard's actual top-5 winners, which the
--- title-lookup query depends on being reproducible. They do **not** make
--- the complete rows or this script's raw output byte-for-byte across runs:
--- every table here defaults `created_at` to `NOW()`, which the inserts
--- below don't override.
+-- `setseed()` (below) drives which users/posts/comments get drawn into a
+-- vote pair; every value derived from a pair afterward (a vote's `value`,
+-- and which votes get churned) is computed with `hashtext()` on the pair's
+-- own logical key rather than `random()`, so it can't drift with Postgres's
+-- row-order or physical-layout choices the way a naive `random()`-per-row
+-- or `TABLESAMPLE`-per-block draw could. Together these make every
+-- *randomized value* this script produces deterministic -- who voted on
+-- what, with which value, and therefore the leaderboard's actual top-5
+-- winners, which the title-lookup query depends on being reproducible.
+-- They do **not** make the complete rows or this script's raw output
+-- byte-for-byte across runs: every table here defaults `created_at` to
+-- `NOW()`, which the inserts below don't override.
 --
 -- ~5% of existing post votes get their value flipped after the bulk load
 -- (a changed vote, exactly what `react()` does in production) to produce
@@ -165,11 +169,24 @@ ON CONFLICT (user_id, comment_id) DO NOTHING;
 
 -- Realistic churn: ~5% of existing post votes get their value flipped, as
 -- `react()` does on a changed vote -- real dead tuples before VACUUM.
--- `setseed()` only drives `random()`; `TABLESAMPLE` has its own RNG and is
--- only reproducible with an explicit `REPEATABLE` seed, so it needs one too.
+--
+-- Originally `id IN (SELECT id FROM votes TABLESAMPLE BERNOULLI (5)
+-- REPEATABLE (4152))`: reproducible in the sense that a given seed samples
+-- the same *physical* tuples every time, but that's the wrong invariant
+-- once the vote inserts above only guarantee their logical (user_id,
+-- post_id) pairs and values, not the row order they're inserted in (i.e.
+-- their physical heap position). A different `work_mem` or `DISTINCT` plan
+-- upstream changes which logical vote lands at which physical position, so
+-- "the same physical tuples" silently becomes "different votes flipped."
+-- Selecting on `hashtext(user_id, post_id, salt)` instead makes churn a
+-- pure function of the vote's own logical key, with no dependency on
+-- physical layout or insertion order -- the same fix pattern as `value`'s
+-- `hashtext()` above. Deliberately *not* `hashtext(id, ...)`: `id` is a
+-- surrogate assigned in insertion order by the sequence, so it inherits
+-- the exact same order-dependency this fix exists to remove.
 UPDATE votes SET value = -value
 WHERE post_id IS NOT NULL
-  AND id IN (SELECT id FROM votes TABLESAMPLE BERNOULLI (5) REPEATABLE (4152));
+  AND (abs(hashtext(user_id::text || ':' || post_id::text || ':churn')::bigint) % 100) < 5;
 
 VACUUM (VERBOSE) votes;
 ANALYZE users, subreddits, posts, comments, votes;

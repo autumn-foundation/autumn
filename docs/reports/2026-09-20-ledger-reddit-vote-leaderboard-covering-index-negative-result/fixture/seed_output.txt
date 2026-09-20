@@ -11,26 +11,26 @@ INSERT 0 15000
 INSERT 0 44344
 INSERT 0 288958
 INSERT 0 44998
-UPDATE 16641
-psql:docs/reports/2026-09-20-ledger-reddit-vote-leaderboard-covering-index-negative-result/fixture/seed.sql:174: INFO:  vacuuming "reddit_ledger.public.votes"
-psql:docs/reports/2026-09-20-ledger-reddit-vote-leaderboard-covering-index-negative-result/fixture/seed.sql:174: INFO:  launched 2 parallel vacuum workers for index vacuuming (planned: 2)
-psql:docs/reports/2026-09-20-ledger-reddit-vote-leaderboard-covering-index-negative-result/fixture/seed.sql:174: INFO:  finished vacuuming "reddit_ledger.public.votes": index scans: 1
+UPDATE 16706
+psql:docs/reports/2026-09-20-ledger-reddit-vote-leaderboard-covering-index-negative-result/fixture/seed.sql:191: INFO:  vacuuming "reddit_ledger.public.votes"
+psql:docs/reports/2026-09-20-ledger-reddit-vote-leaderboard-covering-index-negative-result/fixture/seed.sql:191: INFO:  launched 2 parallel vacuum workers for index vacuuming (planned: 2)
+psql:docs/reports/2026-09-20-ledger-reddit-vote-leaderboard-covering-index-negative-result/fixture/seed.sql:191: INFO:  finished vacuuming "reddit_ledger.public.votes": index scans: 1
 pages: 0 removed, 3292 remain, 3292 scanned (100.00% of total)
-tuples: 16641 removed, 378300 remain, 0 are dead but not yet removable
-removable cutoff: 1554, which was 0 XIDs old when operation ended
-new relfrozenxid: 1550, which is 6 XIDs ahead of previous value
+tuples: 16706 removed, 378300 remain, 0 are dead but not yet removable
+removable cutoff: 1592, which was 0 XIDs old when operation ended
+new relfrozenxid: 1588, which is 6 XIDs ahead of previous value
 frozen: 0 pages from table (0.00% of total) had 0 tuples frozen
-index scan needed: 2769 pages from table (84.11% of total) had 16641 dead item identifiers removed
+index scan needed: 2772 pages from table (84.20% of total) had 16706 dead item identifiers removed
 index "votes_pkey": pages: 1040 in total, 0 newly deleted, 0 currently deleted, 0 reusable
-index "votes_unique_post": pages: 1930 in total, 0 newly deleted, 0 currently deleted, 0 reusable
+index "votes_unique_post": pages: 1933 in total, 0 newly deleted, 0 currently deleted, 0 reusable
 index "votes_unique_comment": pages: 838 in total, 0 newly deleted, 0 currently deleted, 0 reusable
-index "idx_votes_user_id": pages: 555 in total, 0 newly deleted, 0 currently deleted, 0 reusable
+index "idx_votes_user_id": pages: 557 in total, 0 newly deleted, 0 currently deleted, 0 reusable
 index "idx_votes_post_id": pages: 584 in total, 0 newly deleted, 0 currently deleted, 0 reusable
 index "idx_votes_comment_id": pages: 398 in total, 0 newly deleted, 0 currently deleted, 0 reusable
-avg read rate: 0.000 MB/s, avg write rate: 0.291 MB/s
-buffer usage: 14755 hits, 0 misses, 4 dirtied
-WAL usage: 13855 records, 1 full page images, 1114852 bytes
-system usage: CPU: user: 0.09 s, system: 0.00 s, elapsed: 0.10 s
+avg read rate: 0.000 MB/s, avg write rate: 0.248 MB/s
+buffer usage: 14763 hits, 0 misses, 4 dirtied
+WAL usage: 13867 records, 1 full page images, 1116667 bytes
+system usage: CPU: user: 0.11 s, system: 0.01 s, elapsed: 0.12 s
 VACUUM
 ANALYZE
  posts | comments | total_votes | post_votes | comment_votes | cold_posts_with_zero_votes | avg_votes_per_cold_post_with_at_least_one 
