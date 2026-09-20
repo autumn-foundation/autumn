@@ -1,0 +1,21 @@
+$ cargo test -p autumn-web --test integration_tests --features "mcp,test-support" mcp_throttle_guard -- --nocapture
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12m 01s
+     Running tests/integration_tests.rs (target/debug/deps/integration_tests-ac3a8bc2a33f2a63)
+
+running 2 tests
+test integration::mcp_throttle_guard::throttle_denies_the_mcp_call_that_exceeds_the_per_ip_limit ... ok
+test integration::mcp_throttle_guard::throttle_keys_independently_per_ip_over_mcp_dispatch ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2295 filtered out; finished in 0.01s
+
+[exited with code 0]
+
+$ cargo fmt --all -- --check
+[clean, no output]
+
+$ cargo clippy -p autumn-web --test integration_tests --features "mcp,test-support" -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9m 39s
+[exited with code 0 — the one "unknown lint: clippy::unused_async_trait_impl" warning printed is
+ pre-existing workspace lint config noise unrelated to this change, and does not fail the -D
+ warnings gate]
