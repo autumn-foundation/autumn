@@ -290,6 +290,19 @@ def _dest_end(text):
         end = _closes_at(text, 1, '>')
         if end < 0:
             return -1              # `<` with no `>` is not a destination
+        # CommonMark: what sits between the brackets holds no line ending and
+        # no UNESCAPED `<` or `>`. The `>` half is what `_closes_at` found;
+        # the `<` half is this. Spaces are fine in here — that is the whole
+        # point of the bracketed form — so the only thing separating a real
+        # destination from prose is the bracket rules themselves.
+        i = 1
+        while i < end - 1:
+            if _escaped(text, i):
+                i += 2
+                continue
+            if text[i] == '<':
+                return -1
+            i += 1
         return end
     i, depth = 0, 0
     while i < len(text):
@@ -413,6 +426,25 @@ def defn_extent(lines, i):
 
 
 CONTAINER_MARKER = re.compile(r'^ {0,3}(?:>[ \t]?|(?:[-*+]|\d{1,9}[.)])[ \t]+)')
+
+
+def list_indent(line):
+    """The column a list item's CONTENT starts at, or 0 if the line opens no
+    item.
+
+    A quote repeats its marker on every line; a list item does not, and is
+    continued by INDENTATION instead. So a block a list item owns cannot be
+    tracked by counting markers — it has to remember the column, and end when
+    a non-blank line dedents past it.
+    """
+    body = unquote(line)[1]
+    n = 0
+    while True:
+        m = CONTAINER_MARKER.match(body)
+        if not m or body[m.start():m.end()].lstrip(' \t').startswith('>'):
+            return n
+        n += m.end()
+        body = body[m.end():]
 
 
 def uncontain(line):
@@ -895,6 +927,16 @@ def index():
             listed = bare != unquote(line)[1]
             if fence is not None and fence[1] and container < fence[1]:
                 fence = None        # the quote that held the fence ended
+            if fence is not None and fence[2]:
+                # A fence a LIST ITEM owns ends when the item does, and an
+                # item ends at the first non-blank line that dedents past its
+                # content column. Without this the fence ran to EOF and
+                # suppressed every heading after the list — the limit the
+                # previous round wrote down rather than fixed.
+                body_here = unquote(line)[1]
+                if body_here.strip() and (len(body_here)
+                                          - len(body_here.lstrip(' '))) < fence[2]:
+                    fence = None
             marker = re.match(r'^ {0,3}(`{3,}|~{3,})(.*)$', bare)
             if marker:
                 run, rest = marker.group(1), marker.group(2)
@@ -919,7 +961,7 @@ def index():
                     # closer, so a top-level fence containing `> ``` ` used to
                     # close on it and index everything after as visible text —
                     # a false positive `uncontain` introduced.
-                    fence = (run, container)
+                    fence = (run, container, list_indent(line))
                 elif (container == fence[1] and not listed
                       and run[0] == fence[0][0]
                       and len(run) >= len(fence[0])
@@ -2402,7 +2444,43 @@ self_test() {
     > "$c137/scripts/docs-retrieval-questions.tsv"
   check "a complete tag still opens a block" fail "$c137"
 
-  # 138. A comment line and a blank line in the fixture are skipped.
+  # 138. An angle destination holds no UNESCAPED `<`, so this is not a
+  #      definition and the line is the visible text it looks like.
+  local c138="$tmp/c138"; make_corpus "$c138"
+  printf '# Page\n\n[foo]: <secret runtime logger<oops>\n---\n' \
+    > "$c138/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c138/scripts/docs-retrieval-questions.tsv"
+  check "an unescaped angle bracket voids a destination" pass "$c138"
+
+  # 139. …while spaces inside the brackets are fine — that is what the
+  #      bracketed form is FOR. The control on 138.
+  local c139="$tmp/c139"; make_corpus "$c139"
+  printf '# Page\n\n[foo]: <secret runtime logger>\n---\n' \
+    > "$c139/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c139/scripts/docs-retrieval-questions.tsv"
+  check "spaces inside an angle destination are legal" fail "$c139"
+
+  # 140. A fence a LIST ITEM owns ends when the item does: a non-blank line
+  #      dedented past the item's content column closes it.
+  local c140="$tmp/c140"; make_corpus "$c140"
+  printf '# Page\n\n- ```\n  hidden\n\n## Secret runtime logger\n' \
+    > "$c140/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c140/scripts/docs-retrieval-questions.tsv"
+  check "a list-owned fence ends when the item ends" pass "$c140"
+
+  # 141. …and while the item CONTINUES, the fence still hides what is in it.
+  #      The control on 140, which "always close on the next line" would fail.
+  local c141="$tmp/c141"; make_corpus "$c141"
+  printf '# Page\n\n- ```\n  # Secret runtime logger\n  still fenced\n' \
+    > "$c141/docs/guide/md.md"
+  printf 'secret runtime logger\tdocs/guide/md.md\n' \
+    > "$c141/scripts/docs-retrieval-questions.tsv"
+  check "a list-owned fence holds while the item continues" fail "$c141"
+
+  # 142. A comment line and a blank line in the fixture are skipped.
   local c8="$tmp/c8"; make_corpus "$c8"
   printf '# Pagination\n' > "$c8/docs/guide/pagination.md"
   printf '# a comment\n\npagination\tdocs/guide/pagination.md\n' \
