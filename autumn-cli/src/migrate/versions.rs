@@ -229,9 +229,30 @@ fn migration_dirs_at_ref(git_ref: &str, migrations_dir_name: &str) -> Vec<String
 /// (`autumn_web::migrate::FRAMEWORK_MIGRATIONS`) -- so a freshly generated
 /// app migration cannot collide with the framework release this app depends
 /// on, without the app needing its own copy of the framework's history.
+///
+/// Empty when `DATABASE_URL` names a `SQLite` target: a default (non-
+/// `sqlite`-feature) CLI build still embeds the `PostgreSQL`-flavored
+/// `FRAMEWORK_MIGRATIONS`, but `run_single_target_sqlite` (issue #2058)
+/// applies only the project's own migrations against that target and never
+/// touches the framework set at all -- so treating those names as claimed
+/// would fail `check-collisions`/`migrate new` over a version that can never
+/// actually collide in this project. Anything else (unset, unparsable, or a
+/// `PostgreSQL` URL) keeps the check as-is: this only ever narrows the set,
+/// never widens it, so a caller that cannot determine the target keeps the
+/// stricter default.
 fn framework_migration_names() -> Vec<String> {
     use autumn_web::reexports::diesel::migration::{Migration, MigrationSource};
     use autumn_web::reexports::diesel::pg::Pg;
+
+    if matches!(
+        std::env::var("DATABASE_URL")
+            .ok()
+            .as_deref()
+            .and_then(autumn_web::config::DatabaseBackend::detect),
+        Some(autumn_web::config::DatabaseBackend::Sqlite)
+    ) {
+        return Vec::new();
+    }
 
     let migrations: Vec<Box<dyn Migration<Pg>>> = autumn_web::migrate::FRAMEWORK_MIGRATIONS
         .migrations()
@@ -350,25 +371,69 @@ fn validate_migration_name(name: &str) -> Result<(), String> {
     }
 }
 
-/// `autumn migrate new <name>` -- create `migrations/<version>_<name>/` with
-/// a version that will not collide with any migration this checkout can
-/// see: the working tree, every local and remote-tracking git branch, and
-/// this CLI's own compiled-in framework migrations.
-pub fn run_new(name: &str) {
-    if let Err(e) = validate_migration_name(name) {
-        eprintln!("error: {e}");
-        std::process::exit(2);
-    }
+/// Guards the scan-allocate-create critical section in [`run_new`] against
+/// two concurrent invocations picking the same free version: different
+/// migration names produce different directory paths, so `create_dir_all`
+/// alone does not catch the race -- both processes would snapshot the same
+/// `taken` set and each successfully create its own, differently-named,
+/// same-version directory. Held for the lifetime of the scan/allocate/create
+/// sequence and removed on drop (including on an early `process::exit` via
+/// the `Drop` impl running first) so a crashed holder cannot wedge every
+/// future `migrate new` forever.
+struct NewMigrationLock {
+    path: std::path::PathBuf,
+}
 
-    let migrations_dir = Path::new(DEFAULT_MIGRATIONS_DIR);
-    if !migrations_dir.exists() {
-        eprintln!(
-            "\u{2717} Migrations directory not found: {DEFAULT_MIGRATIONS_DIR}/\n  Create it \
-             with `diesel setup`."
-        );
-        std::process::exit(1);
+impl NewMigrationLock {
+    /// Exclusively creates `<migrations_dir>/.autumn-migrate-new.lock`,
+    /// retrying briefly against a concurrent holder rather than failing
+    /// immediately -- the critical section this guards is a handful of
+    /// filesystem/`git` calls, not a long-held resource, so a few seconds of
+    /// backoff comfortably outlasts a legitimate concurrent run.
+    fn acquire(migrations_dir: &Path) -> Result<Self, String> {
+        let path = migrations_dir.join(".autumn-migrate-new.lock");
+        for attempt in 0..50 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Self { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if attempt == 0 {
+                        eprintln!(
+                            "note: another `autumn migrate new` looks to be in progress \
+                             ({}); waiting for it to finish\u{2026}",
+                            path.display()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) => {
+                    return Err(format!("cannot create {}: {e}", path.display()));
+                }
+            }
+        }
+        Err(format!(
+            "{} still exists after 5s -- if no `autumn migrate new` is actually running, \
+             remove it and retry",
+            path.display()
+        ))
     }
+}
 
+impl Drop for NewMigrationLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// The part of [`run_new`] that runs while [`NewMigrationLock`] is held.
+/// Returns `Err` instead of calling `std::process::exit` directly: `exit`
+/// does not run destructors, so calling it from inside the locked section
+/// would leak the lock file and wedge every future `migrate new` behind it.
+/// `run_new` lets the lock drop first and only then acts on the result.
+fn run_new_locked(migrations_dir: &Path, name: &str) -> Result<std::path::PathBuf, String> {
     let mut taken: BTreeSet<String> = local_migration_entries(migrations_dir)
         .iter()
         .filter_map(|d| version_prefix(d))
@@ -380,30 +445,20 @@ pub fn run_new(name: &str) {
             }
         }
     }
-    for name in framework_migration_names() {
-        if let Some(v) = version_prefix(&name) {
+    for fw_name in framework_migration_names() {
+        if let Some(v) = version_prefix(&fw_name) {
             taken.insert(v);
         }
     }
 
-    let version = match resolve_free_version(&taken, Utc::now().naive_utc()) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-    };
+    let version = resolve_free_version(&taken, Utc::now().naive_utc())?;
 
     let dir_name = format!("{version}_{name}");
     let dir = migrations_dir.join(&dir_name);
     if dir.exists() {
-        eprintln!("error: {} already exists", dir.display());
-        std::process::exit(1);
+        return Err(format!("{} already exists", dir.display()));
     }
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("error: cannot create {}: {e}", dir.display());
-        std::process::exit(1);
-    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
 
     let up_sql = format!(
         "-- {name}\n\
@@ -425,19 +480,50 @@ pub fn run_new(name: &str) {
          -- operator act rather than a silent DELETE.\n"
     );
 
-    if let Err(e) = std::fs::write(dir.join("up.sql"), up_sql) {
-        eprintln!("error: cannot write {}: {e}", dir.join("up.sql").display());
-        std::process::exit(1);
+    std::fs::write(dir.join("up.sql"), up_sql)
+        .map_err(|e| format!("cannot write {}: {e}", dir.join("up.sql").display()))?;
+    std::fs::write(dir.join("down.sql"), down_sql)
+        .map_err(|e| format!("cannot write {}: {e}", dir.join("down.sql").display()))?;
+
+    Ok(dir)
+}
+
+/// `autumn migrate new <name>` -- create `migrations/<version>_<name>/` with
+/// a version that will not collide with any migration this checkout can
+/// see: the working tree, every local and remote-tracking git branch, and
+/// this CLI's own compiled-in framework migrations.
+pub fn run_new(name: &str) {
+    if let Err(e) = validate_migration_name(name) {
+        eprintln!("error: {e}");
+        std::process::exit(2);
     }
-    if let Err(e) = std::fs::write(dir.join("down.sql"), down_sql) {
+
+    let migrations_dir = Path::new(DEFAULT_MIGRATIONS_DIR);
+    if !migrations_dir.exists() {
         eprintln!(
-            "error: cannot write {}: {e}",
-            dir.join("down.sql").display()
+            "\u{2717} Migrations directory not found: {DEFAULT_MIGRATIONS_DIR}/\n  Create it \
+             with `diesel setup`."
         );
         std::process::exit(1);
     }
 
-    println!("{}", dir.display());
+    let lock = match NewMigrationLock::acquire(migrations_dir) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let result = run_new_locked(migrations_dir, name);
+    drop(lock);
+
+    match result {
+        Ok(dir) => println!("{}", dir.display()),
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// The remote-tracking ref for the repository's default branch.
@@ -697,32 +783,43 @@ pub fn run_check_collisions() {
         if names.len() < 2 {
             continue;
         }
-        // A framework claimant makes this checkout's own concern ON ITS
-        // OWN -- FRAMEWORK_MIGRATIONS isn't scoped to any git branch, it's
-        // compiled into the exact CLI binary running this check right now,
-        // so a dependency bump that introduces a colliding framework
-        // migration is never "some other branch's problem" the way `others`
-        // exists to capture, even when the OTHER claimant already shipped
-        // on the default branch and neither name is a NEW working-tree
-        // entry.
+        // A framework claimant is compiled into the exact CLI binary
+        // running this check, not scoped to any git branch -- so unlike a
+        // plain branch-vs-branch collision, it is never "some other
+        // checkout's problem" once it collides with something THIS checkout
+        // is actually introducing. It is NOT sufficient on its own, though:
+        // `FRAMEWORK_MIGRATIONS` includes long-standing compatibility shims
+        // (e.g. the `00000000000000` back-compat version several pre-
+        // existing apps' own genesis migrations intentionally share) that
+        // collide with migrations already shipped on the default branch, and
+        // a migration that exists only on some OTHER verified branch is that
+        // branch's own collision to fail on -- neither is something this
+        // checkout can fix by renumbering. A framework claimant only makes
+        // the collision THIS checkout's concern when it collides with a
+        // migration THIS checkout is actually introducing (working-tree-only
+        // against a verified default-branch baseline, same as the plain
+        // case below).
         let has_framework_claimant = names.iter().any(|n| framework_names.contains(n));
 
-        // Otherwise, attributing a collision to THIS checkout needs one of
-        // two things AND a working-tree-only member: a verified
-        // default-branch baseline (so "not in default_branch_entries"
-        // reliably means "not already on trunk"), or every claimant coming
-        // from the working tree alone (a same-checkout duplicate is real
-        // regardless of branch state -- it needs no branch data at all).
+        // Attributing a collision to THIS checkout needs one of two things
+        // AND a working-tree-only member: a verified default-branch baseline
+        // (so "not in default_branch_entries" reliably means "not already on
+        // trunk"), or every claimant coming from the working tree alone (a
+        // same-checkout duplicate is real regardless of branch state -- it
+        // needs no branch data at all; a framework claimant never qualifies
+        // for this fallback, since it is never a member of `working_tree`).
         // Without either, a name that's only "in working_tree_only" because
         // the default branch couldn't be verified might already be shipped,
         // unchanged, on that branch -- misattributing a pre-existing
-        // collision between two OTHER branches to this checkout instead of
-        // counting it under `others`.
+        // collision to this checkout instead of counting it under `others`.
         let purely_local = names.iter().all(|n| working_tree.contains(n));
-        let attributable_via_working_tree = (default_verified || purely_local)
-            && names.iter().any(|n| working_tree_only.contains(n));
+        let has_working_tree_only_member = names.iter().any(|n| working_tree_only.contains(n));
+        let attributable_via_working_tree =
+            (default_verified || purely_local) && has_working_tree_only_member;
+        let attributable_via_framework =
+            has_framework_claimant && default_verified && has_working_tree_only_member;
 
-        if has_framework_claimant || attributable_via_working_tree {
+        if attributable_via_framework || attributable_via_working_tree {
             mine.push((version.clone(), names.clone()));
         } else {
             others += 1;

@@ -2941,8 +2941,9 @@ enum MigrateCommands {
     ///
     /// # Example
     ///
-    ///   autumn migrate new `add_widget_archived_at`
+    ///   autumn migrate new add_widget_archived_at
     #[command(verbatim_doc_comment)]
+    #[allow(clippy::doc_markdown)]
     New {
         /// `snake_case` name for the migration (no leading digit — the CLI
         /// treats everything up to the first `_` as part of the version).
