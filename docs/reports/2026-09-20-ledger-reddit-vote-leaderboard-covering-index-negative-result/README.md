@@ -69,7 +69,13 @@ echo "shared_preload_libraries = 'pg_stat_statements'" >> /etc/postgresql/16/mai
 # On a server that already sets shared_preload_libraries, edit that
 # existing line instead, e.g.:
 #   shared_preload_libraries = 'pgaudit,pg_stat_statements'
-echo "pg_stat_statements.track = all" >> /etc/postgresql/16/main/postgresql.conf
+#
+# pg_stat_statements.track is intentionally left at its default (`top`):
+# every statement profiled below is issued directly by psql, none of them
+# run inside a PL/pgSQL function, so there's nothing nested to capture --
+# and blindly appending `= all` here would have the same last-line-wins
+# problem as shared_preload_libraries above, silently widening collection
+# scope (and overhead) for every other workload on a shared server.
 service postgresql restart   # or: pg_ctl restart / your platform's equivalent
 
 createdb reddit_ledger
@@ -542,3 +548,19 @@ the fixture, in the churn step:
     index-only plan still 1,283 buffers, a 61.0% reduction. Conclusion
     unaffected — no more `random()`- or physical-order-dependent value in
     this fixture.
+
+A thirteenth review round caught a setup-instruction issue, no data
+change:
+
+20. The one-time server setup block appended `pg_stat_statements.track =
+    all` the same way it once blindly appended `shared_preload_libraries`
+    (item 9's fix) — on a server that already sets `track`,
+    `postgresql.conf`'s last-line-wins semantics would silently override
+    it, widening collection scope (and overhead, since `all` also tracks
+    statements nested inside functions) for every other workload on a
+    shared instance. It also wasn't buying anything here: every statement
+    this report profiles is issued directly by `psql`, never from inside a
+    PL/pgSQL function, so the default `top` setting already captures all of
+    them. Fixed: removed the line — `pg_stat_statements.track` is left at
+    its default, with a comment explaining why `all` was never needed. No
+    fixture or query change, so no re-run.
