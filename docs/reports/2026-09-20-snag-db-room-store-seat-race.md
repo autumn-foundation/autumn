@@ -150,7 +150,12 @@ cp autumn-media-plugin/Cargo.toml autumn-media-plugin/Cargo.toml.bak
 # 1. Temporarily add to autumn-media-plugin/Cargo.toml [dev-dependencies]:
 #      autumn-web = { path = "../autumn", features = ["sqlite"] }
 
-# 2. Add autumn-media-plugin/tests/snag_seat_race_probe.rs:
+# 2. Add autumn-media-plugin/tests/snag_seat_race_probe.rs — back up first if
+#    that path is already occupied (e.g. an interrupted earlier attempt),
+#    same reasoning as step 0:
+[ -e autumn-media-plugin/tests/snag_seat_race_probe.rs ] && \
+  cp autumn-media-plugin/tests/snag_seat_race_probe.rs \
+     autumn-media-plugin/tests/snag_seat_race_probe.rs.bak
 cat > autumn-media-plugin/tests/snag_seat_race_probe.rs <<'RUST'
 use std::sync::Arc;
 use autumn_media_plugin::rooms::RoomStore;
@@ -240,10 +245,13 @@ RUST
 cargo test -p autumn-media-plugin --test snag_seat_race_probe -- --nocapture
 
 # 4. Revert both scratch changes — do not commit them. Restore from the
-#    backup made in step 0 (not `git checkout -- <file>`, which would
-#    clobber any unrelated uncommitted edits already in the file):
+#    backups made in steps 0 and 2 (not `git checkout -- <file>`, which
+#    would clobber any unrelated uncommitted edits already in the file):
 mv autumn-media-plugin/Cargo.toml.bak autumn-media-plugin/Cargo.toml
 rm autumn-media-plugin/tests/snag_seat_race_probe.rs
+[ -e autumn-media-plugin/tests/snag_seat_race_probe.rs.bak ] && \
+  mv autumn-media-plugin/tests/snag_seat_race_probe.rs.bak \
+     autumn-media-plugin/tests/snag_seat_race_probe.rs
 ```
 
 ## Why this wasn't committed as a quarantined regression test
