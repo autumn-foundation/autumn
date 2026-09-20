@@ -144,17 +144,19 @@ cd /home/user/autumn
 #    collision-proof temp paths (mktemp, not a fixed `.bak` name — a fixed
 #    name is itself a repeat-run hazard: a second interrupted attempt would
 #    overwrite the first attempt's only clean backup, or restore a stale one
-#    over a file that didn't need restoring). Rather than reverting via
+#    over a file that didn't need restoring), with `cp -p` so the backup
+#    (and the file the cleanup step restores from it) keeps the original's
+#    mode/timestamps instead of inheriting mktemp's 0600. Rather than reverting via
 #    `git checkout -- <file>` afterward — that form replaces the whole file
 #    with the index version and would silently discard any *other*
 #    uncommitted edits already sitting in it (see
 #    docs/reports/2026-09-16-onramp-test-sim-compile-gate-negative-result.md
 #    for the same failure mode caught there).
 cargo_bak="$(mktemp)"
-cp autumn-media-plugin/Cargo.toml "$cargo_bak"
+cp -p autumn-media-plugin/Cargo.toml "$cargo_bak"
 probe_path=autumn-media-plugin/tests/snag_seat_race_probe.rs
 probe_bak=""
-[ -e "$probe_path" ] && { probe_bak="$(mktemp)"; cp "$probe_path" "$probe_bak"; }
+[ -e "$probe_path" ] && { probe_bak="$(mktemp)"; cp -p "$probe_path" "$probe_bak"; }
 
 # 1. Temporarily add to autumn-media-plugin/Cargo.toml [dev-dependencies]:
 #      autumn-web = { path = "../autumn", features = ["sqlite"] }
