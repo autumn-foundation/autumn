@@ -646,13 +646,20 @@ report already scoped (`autumn-cli/src/templates/Cargo.toml.tmpl`,
 # commit.)
 
 # Pin the exact toolchain this assay measured with (caught by Codex review
-# on PR #2882: the repo ships no rust-toolchain.toml, so a bare `cargo`
-# resolves whatever "stable" means on the machine running this recipe --
-# not necessarily rustc/cargo 1.94.1, the version every number in this
-# report was measured on, and compiler codegen/incremental behavior can
-# shift between versions):
+# on PR #2882, twice: first that this pin was missing at all -- the repo
+# ships no rust-toolchain.toml, so a bare `cargo` resolves whatever
+# "stable" means on the machine running this recipe, not necessarily
+# rustc/cargo 1.94.1, the version every number in this report was measured
+# on; then that the pin itself could fail silently -- `rustup toolchain
+# install` is a fallible network operation, and without `set -e` or an
+# explicit check, a failed install would leave every later bare `cargo`
+# silently using whatever default was already active, defeating the pin
+# with no error. Fixed by aborting on failure and verifying the resolved
+# version before measuring anything):
+set -e
 rustup toolchain install 1.94.1
 rustup override set 1.94.1   # scoped to this worktree; every bare `cargo` below now resolves to it
+[ "$(rustc --version)" = "rustc 1.94.1 (e408947bf 2026-03-25)" ] || { echo "toolchain pin failed: got $(rustc --version)" >&2; exit 1; }
 
 # Pre-warm deps + autumn-web once:
 cargo build -p hello
