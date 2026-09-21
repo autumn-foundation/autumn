@@ -698,6 +698,24 @@ body:has(#story-theme-midnight:checked) .autumn-comments-error {
 body:has(#story-theme-midnight:checked) .autumn-chart {
     --primary: #a78bfa;
 }
+/* Every `:focus-visible` keyboard outline in widgets.css is `2px solid
+   var(--primary)` too — a fourth role hitting the same conflict (review
+   follow-up: 2.87:1 on --surface, short of WCAG 1.4.11's 3:1 non-text
+   floor), unfixed by any of the overrides above since none of them touch
+   `outline-color`. Swept every such selector in widgets.css, plus this
+   gallery's own theme-switch pill below. */
+body:has(#story-theme-midnight:checked) .alert__dismiss:has(.alert__dismiss-toggle:focus-visible),
+body:has(#story-theme-midnight:checked) .autumn-feed__more:focus-visible,
+body:has(#story-theme-midnight:checked) .autumn-reaction-button:focus-visible,
+body:has(#story-theme-midnight:checked) .autumn-consent-banner__button:focus-visible,
+body:has(#story-theme-midnight:checked) .autumn-bulk-actions button:focus-visible,
+body:has(#story-theme-midnight:checked) .autumn-bulk-select:focus-visible,
+body:has(#story-theme-midnight:checked) .autumn-comment-reply-toggle:focus-visible,
+body:has(#story-theme-midnight:checked) .autumn-comment-input:focus-visible,
+body:has(#story-theme-midnight:checked) .autumn-comment-submit:focus-visible,
+body:has(#story-theme-midnight:checked) .story-theme-switch input[type='radio']:focus-visible + label {
+    outline-color: #a78bfa;
+}
 
 .story-theme-switch { display: flex; align-items: center; gap: 0.4rem; padding: 0.6rem 1.25rem; border-bottom: 1px solid var(--border); background: var(--surface); }
 .story-theme-switch legend { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-right: 0.25rem; padding: 0; }
@@ -775,9 +793,15 @@ fn theme_switch() -> maud::Markup {
 ///    `modal_trigger`, `confirm_action`, `nav_bar`, and the autocomplete
 ///    widget's selection wiring.
 ///
-/// Neither script needs a CSP nonce: the framework's default policy keeps
-/// `'self'` in `script-src` in both plain and nonce modes.
+/// Neither script needs a CSP nonce itself: the framework's default policy
+/// keeps `'self'` in `script-src` in both plain and nonce modes. htmx does,
+/// though, indirectly — it injects its own default loading-indicator
+/// `<style>` at startup, and needs the nonce told to it via an
+/// `htmx-config` meta tag (its documented mechanism) or that injected tag
+/// has none and nonce-mode `style-src` (no `'unsafe-inline'`) blocks it
+/// (review follow-up).
 ///
+
 /// Most widgets' action URLs stay synthetic 404s-on-submit by design (e.g.
 /// Confirm action, Bulk actions) — see each story's own comment. Two
 /// typeahead stories (Active search, Autocomplete) get real demo backends
@@ -812,6 +836,9 @@ fn story_page(
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " — Autumn stories" }
                 link rel="stylesheet" href=(crate::ui::WIDGETS_CSS_PATH);
+                @if let Some(n) = nonce {
+                    meta name="htmx-config" content=(format!(r#"{{"inlineStyleNonce":"{}"}}"#, n.value()));
+                }
                 @for src in scripts {
                     script src=(src) defer {}
                 }
@@ -1345,6 +1372,32 @@ mod tests {
         assert!(
             plain.contains("<style>") && !plain.contains("nonce="),
             "without the security layer no nonce attribute is emitted: {plain}"
+        );
+    }
+
+    // U16 (interactivity follow-up): htmx injects its own default loading-
+    // indicator <style> at startup; under nonce-mode CSP it needs that
+    // nonce told to it via an htmx-config meta tag (its documented
+    // mechanism), or the tag it injects has none and gets blocked the same
+    // way the reported CSP violation did.
+    #[cfg(feature = "htmx")]
+    #[test]
+    fn story_pages_tell_htmx_the_csp_nonce_via_meta_tag() {
+        let nonce = crate::security::CspNonce::new_for_tests("test-nonce-value");
+        let registry = StoryRegistry::new(vec![demo_story("Display", "Card")]);
+
+        let with_nonce = render_story_index(&registry, Some(&nonce)).into_string();
+        assert!(
+            with_nonce.contains(
+                r#"<meta name="htmx-config" content="{&quot;inlineStyleNonce&quot;:&quot;test-nonce-value&quot;}">"#
+            ),
+            "story page must tell htmx the CSP nonce via htmx-config: {with_nonce}"
+        );
+
+        let plain = render_story_index(&registry, None).into_string();
+        assert!(
+            !plain.contains("htmx-config"),
+            "without the security layer no htmx-config meta tag is needed: {plain}"
         );
     }
 
