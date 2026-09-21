@@ -634,23 +634,28 @@ body:has(#story-theme-midnight:checked) {
 }
 /* --primary (#7c3aed) and --danger (#dc2626, from tokens.css's default,
    unset above) are each also the *only* colors widgets.css ships for text
-   that isn't inside a button or a chip — e.g. `.autumn-feed__more`,
-   `.autumn-comment-reply-toggle`, this file's own `.story-breadcrumb a`
-   (all `color: var(--primary)`), and `.autumn-comments-error` (`color:
-   var(--danger)`) — a role with no token of its own, alongside the
-   button-fill role above and the *-light-chip role before it. All three
-   roles read the same variable but need different lightness in dark mode:
-   button-fill wants it dark (for white text), plain text wants it light
-   (for surface contrast) — mutually exclusive for one shared value
-   (review follow-up: --primary at the button-fill shade was 2.87:1 on
-   --surface; --danger lightened to fix that promptly broke the confirm
-   button in the same way, 2.77:1). Giving plain text its own token is a
-   widgets.css-wide change (every such usage, not just the four named
-   here) well past this PR's scope of theming the gallery, so this
-   overrides exactly the elements review flagged, scoped to Midnight only
-   — a real fix for what's evidenced, not a workaround, but narrower than
-   the underlying gap. See PR #2887 for the proposed follow-up (dedicated
-   text-color tokens in tokens.css). */
+   and graphical marks that aren't inside a button or a chip — e.g.
+   `.autumn-feed__more`, `.autumn-comment-reply-toggle`, this file's own
+   `.story-breadcrumb a` (all `color: var(--primary)`), the chart line/
+   point/bar SVG marks (`stroke`/`fill: var(--primary)` — deliberately, per
+   widgets.css's own comment: 'charts re-theme by overriding --primary'),
+   and `.autumn-comments-error` (`color: var(--danger)`) — a role with no
+   token of its own, alongside the button-fill role above and the
+   *-light-chip role before it. All three roles read the same variable but
+   need different lightness in dark mode: button-fill wants it dark (for
+   white text), plain text/marks want it light (for surface contrast) —
+   mutually exclusive for one shared value (review follow-up, three
+   rounds: --primary at the button-fill shade was 2.87:1 on --surface for
+   text and, separately, 2.87:1 again for the chart marks, which only need
+   WCAG 1.4.11's 3:1 graphical-object threshold rather than 4.5:1 but still
+   fell short; --danger lightened to fix its own text case promptly broke
+   its confirm button the same way, 2.77:1). Giving plain text/marks their
+   own token is a widgets.css-wide change (every such usage, not just the
+   ones named here) well past this PR's scope of theming the gallery, so
+   this overrides exactly the elements review flagged, scoped to Midnight
+   only — a real fix for what's evidenced, not a workaround, but narrower
+   than the underlying gap. See PR #2887 for the proposed follow-up
+   (dedicated text/mark-color tokens in tokens.css). */
 body:has(#story-theme-midnight:checked) .autumn-feed__more,
 body:has(#story-theme-midnight:checked) .autumn-comment-reply-toggle,
 body:has(#story-theme-midnight:checked) .story-breadcrumb a {
@@ -659,6 +664,13 @@ body:has(#story-theme-midnight:checked) .story-breadcrumb a {
 body:has(#story-theme-midnight:checked) .autumn-comments-error {
     color: #f87171;
     border-color: #f87171;
+}
+/* Charts read `var(--primary)` directly for every stroke/fill (by design —
+   see the comment above), so redeclaring the custom property itself,
+   scoped to `.autumn-chart`, re-themes every mark inside it in one
+   declaration instead of overriding each `.autumn-chart__*` rule. */
+body:has(#story-theme-midnight:checked) .autumn-chart {
+    --primary: #a78bfa;
 }
 
 .story-theme-switch { display: flex; align-items: center; gap: 0.4rem; padding: 0.6rem 1.25rem; border-bottom: 1px solid var(--border); background: var(--surface); }
