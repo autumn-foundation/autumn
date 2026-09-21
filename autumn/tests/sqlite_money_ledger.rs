@@ -1193,7 +1193,7 @@ async fn duplicated_retried_and_killed_charges_post_exactly_once() {
     );
 }
 
-// ── Real concurrency (Snag) ─────────────────────────────────────────────────
+// ── Real concurrency ─────────────────────────────────────────────────────────
 
 /// Whether `err` looks like the `SQLite` write contention
 /// `autumn/src/money/ledger.rs` documents (`SQLITE_BUSY_SNAPSHOT`, or
@@ -1216,7 +1216,9 @@ fn is_sqlite_contention(err: &autumn_web::AutumnError) -> bool {
 /// file), disallow it going negative, then have `racers` tasks each race a
 /// genuinely distinct $80 withdrawal against it, synchronized in waves of
 /// `pool_size` by a `tokio::sync::Barrier` so they actually overlap instead of
-/// trickling through the pool one at a time (Codex #2880).
+/// trickling through the pool one at a time (an unsynchronized race can
+/// otherwise serialize cleanly through the pool and never produce real
+/// contention).
 ///
 /// `racers` must be a clean multiple of `pool_size`, checked below: a
 /// `Barrier::new(pool_size)` releases each full wave of `pool_size` arrivals,
@@ -1231,8 +1233,7 @@ fn is_sqlite_contention(err: &autumn_web::AutumnError) -> bool {
 /// Returns `(posted, refused_negative, contention_errors)`. Every non-posted
 /// outcome is classified — a `NegativeBalance` refusal, or recognized `SQLite`
 /// lock/busy contention — and anything else panics, so a bug that made every
-/// attempt fail for an unrelated reason can never read as this test passing
-/// (Codex #2880).
+/// attempt fail for an unrelated reason can never read as this test passing.
 async fn fund_wallet_and_race_withdrawals(
     pool: &SqlitePool,
     racers: usize,
@@ -1356,8 +1357,7 @@ async fn fund_wallet_and_race_withdrawals(
 /// tempfile-backed database (page/WAL-level `SQLITE_BUSY_SNAPSHOT`, the
 /// configuration the module's doc actually describes and the one "normal"
 /// `SQLite` deployments use) exercise genuinely different `SQLite` locking
-/// paths — Codex #2880 caught that the first version of this test only ever
-/// drove the `cache=shared` path.
+/// paths, so both are exercised rather than only one.
 ///
 /// `expect_exactly_one_winner` is `true` for file-backed WAL, where ordinary
 /// `SQLITE_BUSY` (racing for the write lock itself, before anyone has
@@ -1383,7 +1383,7 @@ async fn race_withdrawals_against_disallow_negative_wallet(
         // so the first racer to actually acquire the lock cannot have a stale
         // read snapshot (nobody committed before it) and must succeed. Zero
         // winners in a wave would mean this test never drove real contention
-        // at all (Codex #2880).
+        // at all.
         assert_eq!(
             posted, 1,
             "expected exactly one of {racers} concurrent $80 withdrawals to post \
@@ -1396,10 +1396,9 @@ async fn race_withdrawals_against_disallow_negative_wallet(
         // empirically: a losing run finishes in ~0.2s, nowhere near the 5s
         // `busy_timeout` this pool sets), so a whole wave can leave
         // `posted == 0` — repro'd directly, not theorized. `posted <= 1` is
-        // the real invariant (no double-spend); the panic above is what
-        // actually closes Codex's finding on #2880, by making sure every
-        // non-posted outcome is a *recognized* refusal rather than a
-        // silently swallowed, unrelated error.
+        // the real invariant (no double-spend); classifying every non-posted
+        // outcome above as a *recognized* refusal, rather than silently
+        // swallowing it, is what makes that assertion meaningful.
         assert!(
             posted <= 1,
             "double-spend: {posted} of {racers} concurrent $80 withdrawals posted \
@@ -1441,10 +1440,10 @@ async fn concurrent_withdrawals_cannot_double_spend_a_disallow_negative_wallet()
 /// `sqlite_connection_pragmas`'s doc in `autumn/src/db.rs`), giving the
 /// page/WAL-level `SQLITE_BUSY_SNAPSHOT` contention `autumn/src/money/ledger.rs`
 /// and `docs/guide/money.md` actually describe, and the configuration
-/// "normal" `SQLite` deployments use. Codex on #2880: the `cache=shared`
-/// test above never exercises this path, so a regression specific to it
-/// (e.g. a double-spend under file-backed WAL contention) would go
-/// undetected without this second test.
+/// "normal" `SQLite` deployments use. The `cache=shared` test above never
+/// exercises this path, so a regression specific to it (e.g. a double-spend
+/// under file-backed WAL contention) would go undetected without this
+/// second test.
 #[tokio::test]
 async fn concurrent_withdrawals_cannot_double_spend_a_disallow_negative_wallet_file_backed() {
     let tmp = tempfile::TempDir::new().expect("temp dir");
