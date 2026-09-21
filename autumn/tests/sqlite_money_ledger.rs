@@ -1211,35 +1211,44 @@ fn is_sqlite_contention(err: &autumn_web::AutumnError) -> bool {
     message.contains("lock") || message.contains("busy")
 }
 
-/// Every test above races nothing, or races through a pool of size 1 (which
-/// makes `pool.get()` itself the serializer). This is raced for real, against
-/// `pool`, by distinct `tokio::spawn` tasks each with their own checked-out
-/// connection.
+/// Fund `wallet:racer` to $100 (debited, since it is an asset account here —
+/// the reverse of `platform:cash`'s liability-side siblings elsewhere in this
+/// file), disallow it going negative, then have `racers` tasks each race a
+/// genuinely distinct $80 withdrawal against it, synchronized in waves of
+/// `pool_size` by a `tokio::sync::Barrier` so they actually overlap instead of
+/// trickling through the pool one at a time (Codex #2880).
 ///
-/// The oracle is the module's own doc (`autumn/src/money/ledger.rs`, the
-/// `check_resulting_balances` rustdoc): a disallow-negative account "gets the
-/// balance this transaction *would* leave, not the one it has", and the
-/// figure it checks is "exact" — under concurrency, not only sequentially.
+/// `racers` must be a clean multiple of `pool_size`, checked below: a
+/// `Barrier::new(pool_size)` releases each full wave of `pool_size` arrivals,
+/// but a *partial* final wave can never reach `pool_size` arrivals — there
+/// are no more racers left to spawn — so it hangs forever waiting for parties
+/// that will never come. `pool_size` sizes the barrier rather than `racers`
+/// itself for the same reason: only `pool_size` connections can ever be
+/// checked out at once, so a barrier of `racers` would deadlock every other
+/// racer waiting on a connection none of the first `pool_size` will release
+/// until the barrier itself releases them.
 ///
-/// A wallet is funded to $100 (an asset account: funded by a debit, spent by a
-/// credit — the reverse of `platform:cash`'s liability-side siblings above).
-/// `RACERS` tasks then race a genuinely distinct $80 withdrawal each (not the
-/// same idempotency key, so this never exercises the replay path). At most
-/// one may ever post; the framework must refuse the rest, and the stored
-/// balance must account for exactly what posted.
-///
-/// Two callers below give `pool` a different target on purpose: `cache=shared`
-/// (table-level `SQLITE_LOCKED`, found real contention filed as #2881) and a
-/// tempfile-backed database (page/WAL-level `SQLITE_BUSY_SNAPSHOT`, the
-/// configuration the module's doc actually describes and the one "normal"
-/// `SQLite` deployments use) exercise genuinely different `SQLite` locking
-/// paths — Codex #2880 caught that the first version of this test only ever
-/// drove the `cache=shared` path.
-async fn race_withdrawals_against_disallow_negative_wallet(pool: SqlitePool, racers: usize) {
+/// Returns `(posted, refused_negative, contention_errors)`. Every non-posted
+/// outcome is classified — a `NegativeBalance` refusal, or recognized `SQLite`
+/// lock/busy contention — and anything else panics, so a bug that made every
+/// attempt fail for an unrelated reason can never read as this test passing
+/// (Codex #2880).
+async fn fund_wallet_and_race_withdrawals(
+    pool: &SqlitePool,
+    racers: usize,
+    pool_size: usize,
+) -> (i64, i64, i64) {
     use autumn_web::db::Db;
 
+    assert_eq!(
+        racers % pool_size,
+        0,
+        "racers ({racers}) must be a multiple of pool_size ({pool_size}), or the \
+         final wave's barrier can never fill and this hangs forever"
+    );
+
     {
-        let mut db = Db::connect_for_test(&pool).await.expect("db checkout");
+        let mut db = Db::connect_for_test(pool).await.expect("db checkout");
         db.tx(|conn| {
             async move {
                 ledger::ensure_account(conn, Account::new("wallet:racer", Usd::currency())).await?;
@@ -1262,11 +1271,17 @@ async fn race_withdrawals_against_disallow_negative_wallet(pool: SqlitePool, rac
         .expect("funding posts");
     }
 
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(pool_size.min(racers)));
     let mut handles = Vec::with_capacity(racers);
     for i in 0..racers {
         let pool = pool.clone();
+        let barrier = std::sync::Arc::clone(&barrier);
         handles.push(tokio::spawn(async move {
             let mut db = Db::connect_for_test(&pool).await.expect("db checkout");
+            // Wait for a full wave of connections before any of them writes,
+            // so this actually overlaps instead of trickling through the pool
+            // one at a time.
+            barrier.wait().await;
             db.tx(|conn| {
                 async move {
                     let withdraw = Transaction::new(
@@ -1299,7 +1314,7 @@ async fn race_withdrawals_against_disallow_negative_wallet(pool: SqlitePool, rac
                     refused_negative += 1;
                 } else if is_sqlite_contention(&err) {
                     // Lost a real SQLite write race (contention this test
-                    // deliberately creates by racing 100 tasks over 8
+                    // deliberately creates by racing 96 tasks over 8
                     // connections against one row): `SQLITE_BUSY_SNAPSHOT` or
                     // "database is locked", per the module's own doc. Money
                     // moved zero times either way.
@@ -1316,24 +1331,82 @@ async fn race_withdrawals_against_disallow_negative_wallet(pool: SqlitePool, rac
         }
     }
 
-    // NOT exactly one: under `cache=shared` + `mode=memory` (this pool's
-    // target), `SQLite` gives table-level `SQLITE_LOCKED` contention, not the
-    // page/WAL-level `SQLITE_BUSY_SNAPSHOT` the module's doc describes for a
-    // file-backed database — and `SQLITE_LOCKED` from a shared-cache table
-    // lock is NOT retried by `busy_timeout` (confirmed empirically: a losing
-    // run here finishes in ~0.2s, not anywhere near the 5s `busy_timeout`
-    // this pool sets). With 100 tasks racing 8 connections over one table,
-    // that can genuinely leave `posted == 0` for a whole round — repro'd
-    // directly, not theorized. `posted <= 1` is the real invariant (no
-    // double-spend); the panic above is what actually closes Codex's finding
-    // on #2880, by making sure every one of the 99+ non-posted outcomes is a
-    // *recognized* refusal rather than a silently swallowed, unrelated error.
-    assert!(
-        posted <= 1,
-        "double-spend: {posted} of {racers} concurrent $80 withdrawals posted \
-         against a $100 disallow-negative wallet (refused_negative={refused_negative}, \
-         contention_errors={contention_errors})"
-    );
+    (posted, refused_negative, contention_errors)
+}
+
+/// Every test above races nothing, or races through a pool of size 1 (which
+/// makes `pool.get()` itself the serializer). This is raced for real, against
+/// `pool`, by distinct `tokio::spawn` tasks each with their own checked-out
+/// connection.
+///
+/// The oracle is the module's own doc (`autumn/src/money/ledger.rs`, the
+/// `check_resulting_balances` rustdoc): a disallow-negative account "gets the
+/// balance this transaction *would* leave, not the one it has", and the
+/// figure it checks is "exact" — under concurrency, not only sequentially.
+///
+/// A wallet is funded to $100 (an asset account: funded by a debit, spent by a
+/// credit — the reverse of `platform:cash`'s liability-side siblings above).
+/// `racers` tasks then race a genuinely distinct $80 withdrawal each (not the
+/// same idempotency key, so this never exercises the replay path). See
+/// [`fund_wallet_and_race_withdrawals`] for the funding and synchronization
+/// details.
+///
+/// Two callers below give `pool` a different target on purpose: `cache=shared`
+/// (table-level `SQLITE_LOCKED`, found real contention filed as #2881) and a
+/// tempfile-backed database (page/WAL-level `SQLITE_BUSY_SNAPSHOT`, the
+/// configuration the module's doc actually describes and the one "normal"
+/// `SQLite` deployments use) exercise genuinely different `SQLite` locking
+/// paths — Codex #2880 caught that the first version of this test only ever
+/// drove the `cache=shared` path.
+///
+/// `expect_exactly_one_winner` is `true` for file-backed WAL, where ordinary
+/// `SQLITE_BUSY` (racing for the write lock itself, before anyone has
+/// committed) *is* retried by `busy_timeout`, so exactly one racer commits
+/// per wave: the read snapshot every racer holds is only invalidated by a
+/// commit that already happened, and nobody can have committed before
+/// whichever racer is first to actually acquire the lock. It is `false` for
+/// `cache=shared`, where table-level `SQLITE_LOCKED` bypasses the busy
+/// handler entirely and a whole wave can lose (#2881) — there, only "at most
+/// one" is safe to assert.
+async fn race_withdrawals_against_disallow_negative_wallet(
+    pool: SqlitePool,
+    racers: usize,
+    pool_size: usize,
+    expect_exactly_one_winner: bool,
+) {
+    let (posted, refused_negative, contention_errors) =
+        fund_wallet_and_race_withdrawals(&pool, racers, pool_size).await;
+
+    if expect_exactly_one_winner {
+        // File-backed WAL: ordinary `SQLITE_BUSY` (racing for the write lock
+        // itself, before anyone has committed) *is* retried by `busy_timeout`,
+        // so the first racer to actually acquire the lock cannot have a stale
+        // read snapshot (nobody committed before it) and must succeed. Zero
+        // winners in a wave would mean this test never drove real contention
+        // at all (Codex #2880).
+        assert_eq!(
+            posted, 1,
+            "expected exactly one of {racers} concurrent $80 withdrawals to post \
+             against a $100 disallow-negative wallet on file-backed WAL \
+             (refused_negative={refused_negative}, contention_errors={contention_errors})"
+        );
+    } else {
+        // `cache=shared` + `mode=memory`: table-level `SQLITE_LOCKED`
+        // contention bypasses the busy handler entirely (#2881, confirmed
+        // empirically: a losing run finishes in ~0.2s, nowhere near the 5s
+        // `busy_timeout` this pool sets), so a whole wave can leave
+        // `posted == 0` — repro'd directly, not theorized. `posted <= 1` is
+        // the real invariant (no double-spend); the panic above is what
+        // actually closes Codex's finding on #2880, by making sure every
+        // non-posted outcome is a *recognized* refusal rather than a
+        // silently swallowed, unrelated error.
+        assert!(
+            posted <= 1,
+            "double-spend: {posted} of {racers} concurrent $80 withdrawals posted \
+             against a $100 disallow-negative wallet (refused_negative={refused_negative}, \
+             contention_errors={contention_errors})"
+        );
+    }
 
     let mut conn = pool.get().await.expect("checkout");
     let balance = ledger::balance(&mut conn, "wallet:racer")
@@ -1360,7 +1433,7 @@ async fn race_withdrawals_against_disallow_negative_wallet(pool: SqlitePool, rac
 #[tokio::test]
 async fn concurrent_withdrawals_cannot_double_spend_a_disallow_negative_wallet() {
     let pool = boot_pool_sized("mlg_double_spend", 8).await;
-    race_withdrawals_against_disallow_negative_wallet(pool, 100).await;
+    race_withdrawals_against_disallow_negative_wallet(pool, 96, 8, false).await;
 }
 
 /// The tempfile-backed path: a real file, so `journal_mode = WAL` actually
@@ -1393,7 +1466,7 @@ async fn concurrent_withdrawals_cannot_double_spend_a_disallow_negative_wallet_f
         }
     }
 
-    race_withdrawals_against_disallow_negative_wallet(pool, 100).await;
+    race_withdrawals_against_disallow_negative_wallet(pool, 96, 8, true).await;
 
     // The tempdir must outlive every connection's use of the file.
     drop(tmp);
