@@ -60,6 +60,13 @@ of this PR).
   single-digit-second p95); a change below 10% would not move a project
   meaningfully within that budget either way, while ≥10% is large enough to
   be a real, statable input to a human's decision.
+  **Note added after measuring (not a change to the pre-registered line
+  itself — see the correction in Apparatus): this line was, and remains,
+  defined over compile-and-link wall time specifically, which is what this
+  apparatus measures. Whether the real `RustRouteEditHello` gate's own
+  end-to-end percentage (which also includes file-watcher and health-check
+  latency this apparatus doesn't measure) clears the same 10% is a related
+  but distinct question this assay does not answer.**
 - **Conditions:** same sandbox/box class Onramp's report used (4 vCPU,
   rustc/cargo 1.94.1), `examples/hello` (path-depends on `autumn-web`), deps
   and `autumn-web` pre-warmed. Wall clock via `date +%s.%N` (no
@@ -123,12 +130,23 @@ the stub below and **📊 Assay**.)
 **Stubs / shortcuts (the complete list):**
 - Measures `cargo build -p hello` directly, not the actual `autumn dev`
   live-reload loop `dev-loop-latency.yml` gates (file-watcher trigger latency
-  and the health-check poll after the binary restarts are not included) —
-  compile+link is the dominant, and the only debuginfo-sensitive, component
-  of that loop, but the absolute numbers here are not directly comparable to
-  the gate's own reported figures, only the *relative* delta between
-  conditions is (same caveat shape Onramp's own report gave for its
-  cold-build proxy).
+  and the health-check poll after the binary restarts are not included).
+  **Correction (caught by Codex review on PR #2882): an earlier draft of
+  this stub claimed "only the relative delta between conditions" carries
+  over to the real gate. That's not right either.** File-watcher and
+  health-check latency, if debuginfo-insensitive and roughly fixed, still
+  changes the *percentage* once added to the denominator — a toy example:
+  4s→3s is -25%, but if a fixed 1s of overhead is added to both (5s→4s),
+  the same 1s of absolute saving reads as only -20%. So every percentage in
+  this report (including the ones that clear the pre-registered 10% line)
+  is a **compile-and-link-time percentage**, not a validated claim about the
+  full end-to-end `RustRouteEditHello` loop's own percentage — which could
+  sit below this report's numbers, by an amount this assay did not measure
+  or bound. What *is* comparable, and unaffected by this dilution concern,
+  is absolute wall-clock savings for the compile step itself (real seconds
+  removed from every warm edit), and the direction of every effect measured.
+  Bounding or measuring the omitted watcher/health-check overhead is a
+  concrete follow-up, not yet done here.
 - Uses `examples/hello` (a workspace member of this monorepo), not the actual
   `autumn new`-scaffolded no-DB daemon project — same Onramp-flagged gap 1,
   still open, not closed by this assay.
@@ -190,8 +208,21 @@ warm-up; see Apparatus), n=6 per condition (2 rounds × 3 samples):
 | `debug = 0` (none) | 2.630, 2.597, 2.622, 2.512, 2.584, 2.491 | 2.591 | 2.573 | 0.058 |
 | `debug = "line-tables-only"` | 2.560, 2.499, 2.472, 2.532, 2.517, 2.681 | 2.524 | 2.543 | 0.074 |
 
-Relative to baseline median: **`debug=0` -35.75%**, **`line-tables-only`
--37.39%**.
+Relative to baseline median: **`debug=0` -35.75%** (paired: both `debug=0`
+and this baseline came from the same continuous script run, interleaved —
+see Apparatus), **`line-tables-only` -37.39%, unpaired** (caught by Codex
+review on PR #2882: `line-tables-only`'s valid samples came from a later,
+separate rerun after the TOML-quoting bug was found and fixed — see
+Apparatus — not from this same continuous run the baseline row above came
+from. This report's own `limited` measurement later in the session showed
+baseline drifting by several percent between measurement windows roughly
+40 minutes apart; `line-tables-only`'s rerun happened closer in time than
+that, but with no contemporaneous baseline re-measured alongside it, this
+percentage divides a real, later-measured numerator by an earlier-measured
+denominator with unknown drift between them. Treat -37.39% as a nominal
+comparison, not a paired one — real drift and real effect are confounded in
+this specific number the same way session drift and TOML-quoting bug fix are
+already confounded in `line-tables-only`'s block-independence problem below).
 
 A fourth condition, `debug = 1` (`limited` — the actual level Onramp's
 report measured as its own "`-C debuginfo=1`"; see the terminology
@@ -322,13 +353,18 @@ baseline-vs-`debug=0` comparison specifically still holds despite the
 concerns above: both conditions were genuinely independently entered twice
 (see Apparatus), and the effect size (~35%, baseline block means
 4.025s/4.045s vs. `debug=0`'s 2.617s/2.529s) is far too large for plausible
-block-to-block noise to close. The baseline-vs-`line-tables-only` comparison
-rests on weaker footing given `line-tables-only`'s single independent
-period, but the same logic applies to a lesser degree: a ~37% gap between
-baseline's two genuinely independent blocks and `line-tables-only`'s one
-measured period is not the kind of thing this assay's known confounds
-(warm-up exclusion, sandbox noise on the order of tens of milliseconds)
-could produce by chance. All three baseline-vs-reduced-condition comparisons
+block-to-block noise to close. The baseline-vs-`line-tables-only` comparison rests on weaker footing on two
+separate counts: `line-tables-only`'s single independent period (this
+paragraph), and its unpaired baseline denominator (see the correction where
+this figure is first reported, above) — but the same rough logic still
+applies: a gap this large (baseline's two genuinely independent blocks vs.
+`line-tables-only`'s one measured period) is not the kind of thing this
+assay's known confounds (warm-up exclusion, sandbox noise on the order of
+tens of milliseconds, or the baseline drift the `limited` measurement
+found — a few percent over ~40 minutes, not enough alone to manufacture a
+gap this size) could produce by chance. The *direction* (faster than
+baseline) is solid; the specific *-37.39%* figure is not, for the two
+reasons above. All three baseline-vs-reduced-condition comparisons
 in this report (`debug=0`, `line-tables-only`, and `limited` against its own
 paired baseline) are a clean separation, not a borderline call the way
 Onramp's cold-build `debug=0` number was against its 20% floor.
@@ -344,12 +380,19 @@ in as if it happened on every edit.
 
 ## 🏁 Verdict
 
-**Pursue** (material) — against the pre-set 10% line: both reduced debuginfo
-levels change warm-edit median rebuild time by far more than 10% (-35.75% /
--37.39%), the opposite direction of the risk this assay was chartered to
-probe. This is not a hidden recurring *cost* the Onramp report's open gap
-worried about — it is a large recurring *win*, on the far more frequent warm
-loop, that stacks with the (borderline) one-time cold-start win.
+**Pursue** (material) — against the pre-set 10% line, measured over
+compile-and-link wall time (see the correction in **⚖️ Pre-registration**/
+**🧪 Apparatus**: this assay doesn't measure, and this verdict doesn't claim
+anything about, the *full* `RustRouteEditHello` loop's own end-to-end
+percentage, which also includes file-watcher and health-check latency):
+every reduced debuginfo level measured changes warm-edit median
+compile-and-link time by far more than 10% (`limited` -26.45%, `debug=0`
+-35.75%, `line-tables-only` -37.39% nominal — see below), the opposite
+direction of the risk this assay was chartered to probe. This is not a
+hidden recurring *cost* the Onramp report's open gap worried about — it is a
+large recurring *win* on the compile-and-link portion of the far more
+frequent warm loop, that stacks with the (borderline) one-time cold-start
+win.
 
 This changes the shape of the pending decision, not just its confidence:
 
@@ -414,6 +457,12 @@ report already scoped (`autumn-cli/src/templates/Cargo.toml.tmpl`,
   `autumn new`-scaffolded project via `cold_start_driver.rs`, not
   `examples/hello`/`-p autumn-web` proxies, before shipping a template
   default change.
+- New: measure or bound the `autumn dev` live-reload loop's own
+  file-watcher-trigger and health-check-poll latency, which this assay's
+  compile-and-link-only apparatus omits — needed to know whether the real
+  `RustRouteEditHello` gate's own end-to-end percentage clears 10% too, or
+  is diluted below it by fixed, debuginfo-insensitive overhead (see the
+  correction in **🧪 Apparatus**).
 - Re-measure `debug=0`'s cold-build number above the noise floor / on a
   dedicated or CI-caliber box, per Onramp's report (only relevant if
   `debug=0` rather than `limited` is the level under consideration —
