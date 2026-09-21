@@ -125,8 +125,13 @@ as reported since nothing in this pass contradicts them directly — but
 given `list` just demonstrably missed a real, `bans`-confirmed dependency
 chain, they should be read as this tool's view, not a fully independent
 cross-check. The **duplicate-name count specifically is corrected to 76,
-unchanged**, since `check bans` is both the metric's stated source and the
-one CI's own gate (`cargo deny check bans`, warn-level) actually runs.
+unchanged**, since `check bans` is this metric's stated source — **not**,
+as an earlier draft wrongly claimed, because CI runs it: `ci.yml`'s
+`supply-chain` job runs `check-advisories.sh` and `cargo deny check
+licenses sources` only, and `deny.toml`'s own `[bans]` comment says so
+explicitly ("`bans` ... is intentionally not run in CI"). A Codex review
+comment on this PR caught that false claim; `check bans` is the correct
+*audit* tool for this metric, a local/self-run check, not a CI gate.
 
 **Duplicate-version breakdown, from `cargo deny check bans`, same three
 categories as last week** (76 names, matching last week's 76 — not
@@ -370,9 +375,13 @@ cargo info rsa
 cargo info instant
 cargo info aws-sdk-s3@1.123.0
 
-# duplicate-name spot check outside the deny.toml-scanned graph
-grep -A1 '^name = "bitflags"' Cargo.lock
-grep -A1 '^name = "parking_lot"' Cargo.lock
+# duplicate-count source of truth — cargo deny check bans, not cargo deny list
+cargo deny check bans 2>&1 | grep -c '^warning\[duplicate\]: found'
+
+# reproduce the bitflags/parking_lot/parking_lot_core chain as genuinely
+# in-scope (not just present somewhere in Cargo.lock) — exact deny.toml
+# feature set, all targets, matching the chain cargo deny check bans traces
+cargo tree -p autumn-web --no-default-features --features "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme,edge,plugin-sandbox" -e normal,build --target all -i parking_lot@0.11.2
 
 # Dependabot queue health — is:open matters, last week's query omitted it
 # (search via the GitHub API/MCP: author:app/dependabot is:open)
@@ -473,8 +482,11 @@ grep -A1 '^name = "parking_lot"' Cargo.lock
    caught by a further Codex review comment on this PR.** An earlier draft
    claimed the duplicate-name count fell 76→68 with `bitflags`/
    `parking_lot`/`parking_lot_core` "dropping out." Wrong: `cargo deny check
-   bans` (this metric's actual stated source, and the tool CI itself runs
-   for it) still reports 76, unchanged, and directly confirms all three
+   bans` (this metric's actual stated source — **not** a CI gate, per a
+   further Codex correction; `ci.yml`'s `supply-chain` job never runs
+   `check bans`, only `check-advisories.sh` and `check licenses sources`,
+   matching `deny.toml`'s own "`bans` ... intentionally not run in CI"
+   comment) still reports 76, unchanged, and directly confirms all three
    names via a real traced dependency path (see "Graph facts" above). The
    real finding underneath the mistake: `cargo deny list --format json` —
    used for this report's node/crate-name counts, per both this and last
