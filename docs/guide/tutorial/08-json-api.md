@@ -44,15 +44,22 @@ Expected project state with both HTML and JSON routes.
 
 ---
 
-> **Not written yet.** This chapter's narrative doesn't exist yet. The Getting
-> Started guide's
+> **Not written yet.** This chapter's narrative doesn't exist yet. For the
+> actual JSON API this chapter's goal describes, see
+> [`examples/todo-app/src/routes/api.rs`](../../../examples/todo-app/src/routes/api.rs)
+> — that's the reference implementation this tutorial builds toward. Its
+> `list_json`/`create_json` handlers are declared as `#[get("/todos")]` /
+> `#[post("/todos")]` but mounted at `/api/todos` via `.scoped("/api", ...)`
+> in `main.rs` (see the `.scoped(...)` call there), matching this chapter's
+> goal — but that scope also requires a bearer token
+> (`POST /api/tokens` first), which is more than this chapter's "testable
+> with curl" goal implies; drop the `RequireApiToken` extractor for an
+> unauthenticated version instead if you don't want that step yet. The
+> Getting Started guide's
 > ["Query the database"](../getting-started.md#query-the-database) section
-> shows the same `Json<T>` request/response pattern this chapter needs — but
-> mounts its list handler at `GET /todos` rather than `GET /api/todos`, so
-> it isn't a drop-in copy of this chapter's goal. For the actual working
-> `/api/todos` endpoints, see
-> [`examples/todo-app/src/routes/api.rs`](../../../examples/todo-app/src/routes/api.rs),
-> then continue to [Chapter 9 — Error Handling](09-errors.md).
+> shows the same `Json<T>` request/response pattern without the token
+> layer. Continue to
+> [Chapter 9 — Error Handling](09-errors.md) once yours responds to curl.
 
 ---
 

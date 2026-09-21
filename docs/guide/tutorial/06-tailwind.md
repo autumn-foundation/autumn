@@ -41,13 +41,17 @@ Expected project state with styled templates.
 
 ---
 
-> **Not written yet.** This chapter's narrative doesn't exist yet. The same
-> ground — the same todo app, the same API — is already covered and tested in
-> the Getting Started guide's
+> **Not written yet.** This chapter's narrative doesn't exist yet. For the
+> actual Tailwind config and classes this chapter's goal describes, see
+> [`examples/todo-app/tailwind.config.js`](../../../examples/todo-app/tailwind.config.js)
+> and the class names used throughout
+> [`examples/todo-app/src/routes/todos.rs`](../../../examples/todo-app/src/routes/todos.rs)
+> — that's the reference implementation this tutorial builds toward. The
+> Getting Started guide's
 > ["Style with Tailwind CSS"](../getting-started.md#style-with-tailwind-css)
-> section. Read that, then continue to
-> [Chapter 7 — Interactivity with htmx](07-htmx.md). You can also check the
-> finished code in [`examples/todo-app/`](../../../examples/todo-app/).
+> section explains how the `build.rs` pipeline works in general, which
+> applies here without adaptation. Continue to
+> [Chapter 7 — Interactivity with htmx](07-htmx.md) once yours is styled.
 
 ---
 

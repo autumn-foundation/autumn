@@ -43,13 +43,17 @@ Expected project state with the new route structure.
 
 ---
 
-> **Not written yet.** This chapter's narrative doesn't exist yet. The same
-> ground — the same todo app, the same API — is already covered and tested in
-> the Getting Started guide's
-> ["Routing essentials"](../getting-started.md#routing-essentials) section.
-> Read that, then continue to
-> [Chapter 3 — Database Setup](03-database.md). You can also check the
-> finished code in [`examples/todo-app/`](../../../examples/todo-app/).
+> **Not written yet.** This chapter's narrative doesn't exist yet. For the
+> actual routes this chapter's goal describes (the root-to-`/todos` redirect,
+> the `GET /todos` handler), see
+> [`examples/todo-app/src/routes/todos.rs`](../../../examples/todo-app/src/routes/todos.rs)
+> — that's the reference implementation this tutorial builds toward, and it's
+> covered by CI's example-fleet gate. For the general concept of how route
+> macros work, the Getting Started guide's
+> ["Routing essentials"](../getting-started.md#routing-essentials) section
+> explains it, though its examples (`/users/{id}`, `/items`) are generic, not
+> this app's routes. Continue to
+> [Chapter 3 — Database Setup](03-database.md) once you've wired up your own.
 
 ---
 

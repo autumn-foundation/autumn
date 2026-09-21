@@ -50,13 +50,18 @@ Expected project state with database configured and migration applied.
 
 ---
 
-> **Not written yet.** This chapter's narrative doesn't exist yet. The same
-> ground — the same todo app, the same API — is already covered and tested in
-> the Getting Started guide's
-> ["Add a database"](../getting-started.md#add-a-database) section. Read
-> that, then continue to
-> [Chapter 4 — Models and Queries](04-models.md). You can also check the
-> finished code in [`examples/todo-app/`](../../../examples/todo-app/).
+> **Not written yet.** This chapter's narrative doesn't exist yet. For the
+> actual Postgres/Diesel setup this chapter's goal describes, see
+> [`examples/todo-app/docker-compose.yml`](../../../examples/todo-app/docker-compose.yml)
+> and
+> [`examples/todo-app/migrations/00000000000000_create_todos/`](../../../examples/todo-app/migrations/00000000000000_create_todos/)
+> — that's the reference implementation this tutorial builds toward. The
+> Getting Started guide's
+> ["Add a database"](../getting-started.md#add-a-database) section walks
+> through the same setup steps in general (docker-compose, Diesel CLI,
+> `autumn.toml`) and applies here without adaptation, since database setup
+> isn't app-specific. Continue to
+> [Chapter 4 — Models and Queries](04-models.md) once your database is up.
 
 ---
 
