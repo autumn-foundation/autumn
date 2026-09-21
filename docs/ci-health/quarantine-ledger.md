@@ -1551,28 +1551,56 @@ without also filling in the intake form above.
   no second page was needed) — 75 runs in-window: 55 cancelled, 15 success,
   5 failure. All 5 failures triaged at job level:
   - Run 35540844428 (`claude/friendly-ritchie-d36hku`, PR #2842, a docs-only
-    change) failed both `Test (macos-latest)` — `autumn-macros-support`'s own
-    unit test `crate_path::tests::resolve_autumn_web_name_dashed_rename_is_sanitized`
-    (`left: "autumn_web", right: "autumn_web_05"`), unrelated to this docs PR
-    and not matching any tracked signature — and `SQLite runtime
-    (feature=sqlite)`, a **new** signature logged below as its own entry.
-  - Run 35523247491 (`claude/macro-split-decomposition-jalk90`, an
-    in-progress crate-split/rename branch, no open PR) failed the same two
-    jobs: `SQLite runtime (feature=sqlite)` with the identical new signature,
-    and `Test (Docker)` with a repeat of the already-**closed**
+    change touching only `ci.yml`, `README.md`, `changelog.d/`, `docs/guide/`,
+    `scripts/check-docs-retrieval.sh`, and `skills/autumn-web/SKILL.md` — no
+    Rust source, confirmed by reading the PR's own file list) failed both
+    `Test (macos-latest)` and `SQLite runtime (feature=sqlite)`.
+    **Correction (post-review, via a Codex review comment on PR #2883): the
+    `Test (macos-latest)` failure was originally dismissed here as
+    "unrelated ... branch-owned," which is wrong — the PR's diff cannot own
+    a failure in code it never touches.** The failing test,
+    `autumn-macros-support`'s own unit test
+    `crate_path::tests::resolve_autumn_web_name_dashed_rename_is_sanitized`
+    (`left: "autumn_web", right: "autumn_web_05"`), is therefore an organic,
+    not-yet-diagnosed hit — logged below as its own new entry, same as the
+    SQLite finding. `SQLite runtime (feature=sqlite)` is the other new
+    signature logged below.
+  - Run 35523247491 (`claude/macro-split-decomposition-jalk90`, head
+    `30729276b2f8a50b76b70110c0aeb4ca9596c59a`, "Move the repository macro's
+    HTTP and retention slabs into their own modules," no open PR — the
+    branch ref no longer exists on origin) failed the same two jobs:
+    `SQLite runtime (feature=sqlite)` with the identical new signature, and
+    `Test (Docker)` with a repeat of the already-**closed**
     `job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it`
     panic (`"record should be past its configured TTL"` at
     `job_tracking_stores_integration.rs:264:5` — the pre-fix line number, not
-    the post-fix poll-based version). **Not a reopening**: this run completed
-    2026-09-20T17:54:02Z, before the fix (PR #2867, merged
-    2026-09-20T19:35:35Z UTC) and the ledger close-out (PR #2874, merged
-    2026-09-20T22:09:37Z UTC) — this branch's base predates both, so it is
-    still running the old, known-~2%-flaky test body. Consistent with the
-    closed entry's own baseline, not evidence against it.
-  - Run 35530941996 (`claude/epic-meitner-eh6w1m`) failed `Test (Docker)`
-    with the **same** pre-fix `job_tracking_stores_integration` signature
-    (completed 2026-09-20T20:15:19Z, also before the 22:09:37Z UTC
-    fix/close) — same explanation, same non-reopening.
+    the post-fix poll-based version). **Not a reopening.**
+    **Correction (post-review, via a Codex review comment on PR #2883): the
+    original version of this entry claimed this branch's pre-fix status was
+    "verified by git ancestry," but the `git merge-base --is-ancestor`
+    command actually run only checked PR #2870's (`claude/epic-meitner-eh6w1m`)
+    base commit, not this branch's — the two were conflated in prose.** This
+    branch's actual head commit, fetched via the GitHub API (the branch ref
+    itself is gone from origin, so a local `git merge-base` isn't possible
+    against it anymore), has `committer.date: 2026-09-20T16:34:05Z`, and the
+    CI run itself started `2026-09-20T16:36:30Z` — both well before the fix's
+    merge at `2026-09-20T19:35:35Z` UTC. Combined with the panic's exact
+    pre-fix line number and message text (which the post-fix version of the
+    test no longer contains at all, having been rewritten to a polling loop),
+    this is strong evidence of a pre-fix run, but by commit timestamp and
+    source-text matching, not literal ancestry — corrected to say so.
+  - Run 35530941996 (`claude/epic-meitner-eh6w1m`, PR #2870) failed
+    `Test (Docker)` with the **same** pre-fix `job_tracking_stores_integration`
+    signature (completed 2026-09-20T20:15:19Z, also before the 22:09:37Z UTC
+    fix/close) — same explanation, same non-reopening. **This is the one
+    branch actually checked by `git merge-base --is-ancestor`**: PR #2870's
+    base sha `9800221460975e7b3ee75a8490e392cb4b489f82` (confirmed via the
+    GitHub API against `head=claude/epic-meitner-eh6w1m`) is not a
+    descendant of the fix commit `0a0986b` (`git merge-base --is-ancestor
+    0a0986b 9800221...` exits 1) — the ancestry evidence in the original
+    version of this pass's report belongs to this branch alone, not to the
+    `macro-split-decomposition-jalk90` branch above, which is corrected
+    there.
   - Run 35539828393 (`claude/intelligent-wright-ebjkn4`, closing the gap the
     2026-09-20 report left open for this branch) failed `Test (Docker)` on
     `examples/saas`'s own
@@ -1796,4 +1824,58 @@ without also filling in the intake form above.
   green rerun on the same PR, or `SQLite runtime` wasn't a required check at
   merge time, was not independently confirmed this pass — out of scope for
   today's time-boxed triage.
+
+### `crate_path::tests::resolve_autumn_web_name_dashed_rename_is_sanitized`
+
+- **New, 2026-09-21 — opened after a correction, not at first triage.**
+  Originally dismissed in this pass's own organic-hit sampling as
+  "unrelated ... branch-owned," on the (wrong) assumption that a failure on
+  a branch implies the branch caused it. **Correction (post-review, via a
+  Codex review comment on PR #2883): PR #2842 is a pure docs change — its
+  full file list is `ci.yml`, `README.md`, a `changelog.d/` fragment, five
+  `docs/guide/*.md` pages, `scripts/check-docs-retrieval.sh` (new),
+  `scripts/docs-retrieval-questions.tsv` (new), and `skills/autumn-web/SKILL.md`
+  — no Rust source at all, let alone `autumn-macros-support`, so it cannot
+  own a failure in that crate's own unit test.** Reclassified as an organic,
+  undiagnosed hit.
+  - Run 106162503374 (part of run 35540844428, branch
+    `claude/friendly-ritchie-d36hku`, PR #2842), `Test (macos-latest)`,
+    2026-09-20T23:26:40Z: `assertion `left == right` failed`, `left:
+    "autumn_web"`, `right: "autumn_web_05"`, at
+    `autumn-macros-support/src/crate_path.rs:708:9`.
+- **n=1** — a single organic hit, macOS only (the same commit's
+  `Test (ubuntu-latest)`, `Test (windows-latest)`, and `Test (Docker)` all
+  passed the same test; not independently checked against every other job
+  in the matrix).
+- **Mechanism — source read, hypothesis not confirmed.** The failing test
+  (`autumn-macros-support/src/crate_path.rs:693-709`) writes a fixture
+  `Cargo.toml` declaring a dashed rename (`autumn-web-05 = { package =
+  "autumn-web", version = "0.5" }`) to a fresh temp directory, then calls
+  `resolve_autumn_web_name()` with `CARGO_MANIFEST_DIR` temporarily pointed
+  at that directory via `temp_env::with_var` (`with_fixture_manifest`,
+  lines 619-627 — its own doc comment already names the hazard: "restores
+  the previous value even if `f` panics" and (line 619) "concurrently by
+  default"). `resolve_autumn_web_name` (`crate_path.rs:94-105`) delegates to
+  `proc_macro_crate::crate_name("autumn-web")` and falls back to the
+  unrenamed `DEFAULT_NAME` ("autumn_web") on any `Err` or `FoundCrate::Itself`
+  — which is exactly the value observed, meaning `crate_name` did not see the
+  fixture manifest as a dependency declaring `autumn-web` under a rename.
+  `temp_env::with_var` is documented to serialize concurrent callers via an
+  internal process-wide lock specifically to make this pattern safe under
+  parallel test execution, so the leading (**unconfirmed**) hypothesis is
+  narrower than "a lock is missing": either `proc_macro_crate::crate_name`
+  reads or caches something outside that lock's coverage (its own internal
+  state, or a `cargo metadata` subprocess whose env capture doesn't align
+  with the lock's window), or a third, unaudited path also sets
+  `CARGO_MANIFEST_DIR` without going through `temp_env`. Not traced further
+  this pass — third-party crate internals (`proc-macro-crate`) were not
+  read.
+- **Test-vs-product verdict: not rendered.** This is `autumn-macros-support`
+  test-only code (a fixture-manifest helper and its assertion), not a
+  production request path, so a confirmed mechanism here would very likely
+  be a test-defect finding — but that's not yet confirmed, only likely.
+- **Not campaigned, no fix PR**: n=1, no baseline of any kind. Next step:
+  reproduce locally with repeated `cargo test -p autumn-macros-support
+  crate_path:: --test-threads=<N>` runs to see whether increasing
+  parallelism reproduces it, before deciding whether a harness is warranted.
 
