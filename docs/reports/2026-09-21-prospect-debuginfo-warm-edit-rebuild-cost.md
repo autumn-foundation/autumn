@@ -691,6 +691,15 @@ rustup toolchain install 1.94.1
 rustup override set 1.94.1   # scoped to this worktree; every bare `cargo` below now resolves to it
 [ "$(rustc --version)" = "rustc 1.94.1 (e408947bf 2026-03-25)" ] || { echo "toolchain pin failed: got $(rustc --version)" >&2; exit 1; }
 
+# Force incremental compilation on regardless of the calling shell's
+# environment (caught by Codex review on PR #2882: the sibling Onramp
+# report's own Reproduce section exports CARGO_INCREMENTAL=0 for its cold-
+# build measurements -- a real risk if both recipes are run in the same
+# shell session, since that var would silently make every build below
+# non-incremental, measuring a completely different quantity than the
+# warm/incremental edits this report is about, with no error):
+export CARGO_INCREMENTAL=1
+
 # Pre-warm deps + autumn-web once:
 cargo build -p hello
 
