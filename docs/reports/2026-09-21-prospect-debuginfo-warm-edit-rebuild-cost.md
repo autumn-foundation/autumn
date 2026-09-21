@@ -256,7 +256,15 @@ two still-open items neither report has closed:
 ## 🔬 Reproduce
 
 ```bash
-# From the repository root. Pre-warm deps + autumn-web once:
+# Run this from a disposable clone or worktree, not a working copy with
+# uncommitted changes (caught by Codex review on PR #2882: the `git
+# checkout -- ...` revert step below discards *any* uncommitted edits to
+# these two files, not just the experiment's own, and this recipe neither
+# requires a clean tree nor backs up what was there first):
+#   git worktree add /tmp/prospect-debuginfo-repro trunk-dev
+#   cd /tmp/prospect-debuginfo-repro
+
+# Pre-warm deps + autumn-web once:
 cargo build -p hello
 
 # One condition's block (repeat per condition; see Apparatus for why
@@ -272,15 +280,23 @@ EOF
 cargo build -p hello
 
 # Then, 3+ times, alternating the literal so each edit is a real recompile.
-# Check cargo's own exit status explicitly (caught by Codex review on PR
-# #2882: the original semicolon-chained `date; cargo build; date` form here
-# still ran the trailing `date` and looked "successful" even when `cargo
-# build` failed -- the exact failure mode this report's Apparatus section
-# says invalidated the first `d1` pass) and abort rather than silently
-# recording a fast failure as a real sample:
-sed -i 's/"Hello, Autumn![^"]*"/"Hello, Autumn! vN"/' examples/hello/src/main.rs
-S=$(date +%s.%N); cargo build -p hello || { echo "cargo build failed" >&2; exit 1; }; E=$(date +%s.%N)
-echo "$E - $S" | bc   # no /usr/bin/time in this sandbox
+# Use an actually-incrementing counter (caught by Codex review on PR #2882:
+# a literal `vN` in the sed pattern below is not a variable -- every
+# invocation after the first replaces "Hello, Autumn! vN" with the
+# byte-identical "Hello, Autumn! vN", which is not a real edit and cannot
+# reproduce the reported samples) and check cargo's own exit status
+# explicitly (caught in the same review round: the original semicolon-chained
+# `date; cargo build; date` form here still ran the trailing `date` and
+# looked "successful" even when `cargo build` failed -- the exact failure
+# mode this report's Apparatus section says invalidated the first `d1` pass)
+# rather than silently recording a fast failure as a real sample:
+i=0
+while [ "$i" -lt 3 ]; do
+  i=$((i + 1))
+  sed -i "s/\"Hello, Autumn![^\"]*\"/\"Hello, Autumn! v${i}\"/" examples/hello/src/main.rs
+  S=$(date +%s.%N); cargo build -p hello || { echo "cargo build failed" >&2; exit 1; }; E=$(date +%s.%N)
+  echo "$E - $S" | bc   # no /usr/bin/time in this sandbox
+done
 
 # Revert between conditions:
 git checkout -- Cargo.toml examples/hello/src/main.rs
