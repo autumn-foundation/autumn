@@ -198,12 +198,9 @@ the stub below and **📊 Assay**.)
   session and read measurably lower (see **📊 Assay**) — a real reminder
   that this sandbox's baseline itself drifts. **`debug=0` and `limited` are
   each compared against a baseline measured in the same narrow window as
-  their own samples; `line-tables-only` is not (caught by Codex review on
-  PR #2882: an earlier draft of this sentence claimed this held for every
-  reduced condition, which conflicts with the unpaired-baseline correction
-  in **📊 Assay** for `line-tables-only` specifically — its valid samples
-  came from a rerun done later than, and not re-paired with, the baseline
-  row it's divided by).**
+  their own samples, and so, after two attempts, is `line-tables-only` — see
+  the correction in **📊 Assay** for the history of why this took two
+  tries.**
 
 ## 📊 Assay
 
@@ -220,32 +217,56 @@ and this baseline came from the same continuous script run, interleaved —
 see Apparatus).
 
 **`debug = "line-tables-only"` is deliberately left out of the table above
-(caught by Codex review on PR #2882, twelfth round, on top of the
-block-independence problem already found): its original -37.39% divided a
-numerator from a later, separate rerun by this table's earlier-measured
-baseline — unpaired — and by the time that was caught, this report had
-already shown baseline drifting by 20-30% between some windows, not "a few
-percent" as an earlier draft claimed. That's large enough that neither the
-direction nor the magnitude of the original number could be trusted. Rather
-than keep hedging, it was re-measured properly: paired against a
-contemporaneous baseline, in the same narrow window, with the pair order
-reversed between rounds from the start** (`line-tables-only` first in round
-1, baseline first in round 2 — avoiding the order confound found and fixed
-for the other two conditions, see the robustness checks below):
+and took two more attempts to measure validly, both caught by Codex
+review on PR #2882:**
 
-| Condition (3rd window, paired + order-reversed) | samples (s) | median | mean | stdev |
+1. **(twelfth round)** Its original -37.39% divided a numerator from a
+   later, separate rerun by this table's earlier-measured baseline —
+   unpaired — and by the time that was caught, this report had already
+   shown baseline drifting by 20-30% between some windows, not "a few
+   percent" as an earlier draft claimed. Re-measured paired against a
+   contemporaneous baseline with the pair order reversed between rounds:
+   `line-tables-only` (round 1) → baseline (round 1) → baseline (round 2)
+   → `line-tables-only` (round 2), giving -39.31%.
+2. **(thirteenth round)** That fix broke a different way: the two
+   *baseline* blocks in that sequence ran back to back with no intervening
+   condition change — the identical continuously-held-state bug already
+   found for the original `line-tables-only` rerun, just on the other
+   condition this time. `line-tables-only`'s own two blocks were genuinely
+   separated; baseline's weren't.
+
+**Re-measured a third time, mirroring the pattern that worked cleanly for
+`debug=0` and `limited`: simple alternation for two properly-separated
+blocks each (both conditions' occurrences separated by a real intervening
+entry to the other), plus one further single reversed pair as an
+order-robustness check — the same two-part treatment already given to
+`debug=0` and `limited`, rather than trying to fold both properties into
+one clever sequence:**
+
+| Condition (4th window, primary) | samples (s) | median | mean | stdev |
 |---|---|---|---|---|
-| `debug = "line-tables-only"` | 3.724, 3.152, 3.015, 2.760, 2.582, 2.693 | 2.888 | 2.988 | 0.418 |
-| baseline (re-measured, same window) | 4.805, 4.845, 4.591, 4.714, 4.550, 4.801 | 4.758 | 4.718 | 0.122 |
+| `debug = "line-tables-only"` | 2.696, 2.761, 2.631, 2.606, 2.596, 2.622 | 2.627 | 2.652 | 0.064 |
+| baseline (same window) | 4.834, 4.613, 4.240, 4.924, 4.043, 4.683 | 4.648 | 4.556 | 0.345 |
 
 Relative to this window's own baseline median: **`line-tables-only`
--39.31%**. Block means (2 independent blocks each, order reversed between
-rounds): `line-tables-only` = [3.297s, 2.678s], baseline = [4.747s,
-4.688s] — no overlap. This is now this report's best-designed comparison
-for any single condition (paired baseline *and* order-reversed from the
-start, rather than checked after the fact), and it confirms the original
-nominal number's direction and rough magnitude despite that number's
-invalid methodology.
+-43.49%**. Block means (2 independent blocks each, alternating —
+`line-tables-only`,baseline,`line-tables-only`,baseline, no two
+same-condition blocks adjacent): `line-tables-only` = [2.696s, 2.608s],
+baseline = [4.562s, 4.550s] — no overlap.
+
+| Condition (order-reversed single pair) | samples (s) | median | mean |
+|---|---|---|---|
+| baseline (leads this time) | 4.592, 3.872, 4.344 | 4.344 | 4.269 |
+| `line-tables-only` | 2.758, 2.602, 2.569 | 2.602 | 2.643 |
+
+Relative: **`line-tables-only` -40.10%** — consistent with the primary
+measurement's -43.49% despite the reversed order. `line-tables-only` now
+has the most thoroughly checked single-condition result in this report:
+properly independent blocks *and* an order-reversal check, matching or
+exceeding the rigor applied to `debug=0` and `limited`, and its three
+successive measurement attempts (-37.39% invalid, -39.31% invalid,
+-43.49%/-40.10% valid) all agree on direction and rough magnitude despite
+each attempt's own methodology problem.
 
 A fourth condition, `debug = 1` (`limited` — the actual level Onramp's
 report measured as its own "`-C debuginfo=1`"; see the terminology
@@ -440,13 +461,12 @@ vs. 4.032s in the original window). Combined with the analogous check for
 now held up under order reversal — the strongest evidence in this report
 against a pure position/order artifact driving any of its findings.
 
-The original baseline-vs-`line-tables-only` pairing (the discarded -37.39%
-figure, see above) rested on weaker footing on two separate counts:
-`line-tables-only`'s single independent measured period, and its unpaired
-baseline denominator. Both are moot now — the properly-paired,
-order-reversed -39.31% replacement measurement above has neither problem:
-2 independent blocks, a contemporaneous baseline, order reversed between
-rounds. All three baseline-vs-reduced-condition comparisons
+The original baseline-vs-`line-tables-only` pairings (the discarded -37.39%
+and -39.31% figures, see above) each rested on their own independence or
+pairing problem. Both are moot now — the final measurement above has
+neither problem: 2 genuinely independent, alternating blocks, a
+contemporaneous baseline, and its own separate order-reversal check.
+All three baseline-vs-reduced-condition comparisons
 in this report (`debug=0`, `line-tables-only`, and `limited`, each against
 its own contemporaneously-paired baseline) are now a clean separation, not
 a borderline call the way Onramp's cold-build `debug=0` number was against
@@ -471,8 +491,8 @@ percentage, which also includes file-watcher and health-check latency):
 every reduced debuginfo level measured changes warm-edit median
 compile-and-link time by far more than 10% (`limited` ~26-28%, replicated
 under reversed order; `debug=0` ~36-39%, likewise replicated under reversed
-order; `line-tables-only` -39.31%, properly paired and order-reversed after
-an invalid earlier attempt was discarded — see below), the
+order; `line-tables-only` ~40-43%, likewise replicated under reversed order,
+after two earlier invalid attempts were discarded — see below), the
 opposite direction of the risk this assay was chartered to probe. This is not a
 hidden recurring *cost* the Onramp report's open gap worried about — it is a
 large recurring *win* on the compile-and-link portion of the far more
@@ -508,14 +528,15 @@ This changes the shape of the pending decision, not just its confidence:
    measured separately and by coincidence, not because it was the level
    Onramp evaluated) beats `limited` on the warm-edit axis is still
    unmeasured, though for a narrower reason now.** `line-tables-only` now
-   has its own solid, properly-paired, order-reversed result against
-   baseline (-39.31%, replacing an earlier invalid attempt — see the
-   correction in **📊 Assay**), on par with `debug=0`'s and `limited`'s own
-   comparisons. But it was measured in a third window, against its own
-   baseline, never head-to-head with `limited` in the same window — so
-   there still isn't a valid `line-tables-only`-vs-`limited` comparison,
-   just three separately-solid `condition`-vs-baseline comparisons that
-   can't be safely subtracted from each other across windows. `line-tables-only`
+   has its own solid, properly-paired, order-reversal-checked result against
+   baseline (~40-43%, after two earlier invalid attempts — see the
+   correction in **📊 Assay**), on par with or exceeding `debug=0`'s and
+   `limited`'s own comparisons in rigor. But it was measured in its own
+   window, against its own baseline, never head-to-head with `limited` in
+   the same window — so there still isn't a valid
+   `line-tables-only`-vs-`limited` comparison, just three separately-solid
+   `condition`-vs-baseline comparisons that can't be safely subtracted from
+   each other across windows. `line-tables-only`
    was also never directly verified (by this report or Onramp's) to
    preserve backtrace file:line resolution the way `limited` was — it
    likely does, since line tables are in the name, but that's an
@@ -650,22 +671,37 @@ run_block() {
 
 # IMPORTANT (caught by Codex review on PR #2882, sixth round): this
 # round-robin is a CORRECTED FOLLOW-UP DESIGN, not a literal replay of how
-# this report's own numbers were collected. The real sessions ran as three
+# this report's own numbers were collected. The real sessions ran as six
 # separate sequences, none of which is this loop:
 #   1. baseline -> debug=0 -> line-tables-only(buggy,discarded) ->
 #      line-tables-only(buggy,discarded) -> baseline -> debug=0
 #      (the buggy line-tables-only entries used unquoted TOML and never
 #      really measured anything; see the stub in Apparatus)
 #   2. A separate rerun, later: line-tables-only -> line-tables-only
-#      (fixed TOML quoting, but back to back -- see the pseudoreplication
-#      correction in Assay)
+#      (fixed TOML quoting, but back to back -- discarded, see the
+#      pseudoreplication correction in Assay)
 #   3. A separate run, later still: limited -> baseline -> limited ->
 #      baseline, then (a fourth, reversed-order pair added after a
 #      reviewer flagged the order confound below): baseline -> limited
 #      -- see the robustness check in Assay
+#   4. A separate run checking the debug=0/baseline order confound the
+#      same way: debug=0 -> baseline (reversed from the main sequence's
+#      baseline -> debug=0) -- see the robustness check in Assay
+#   5. A separate attempt at a properly-paired line-tables-only
+#      measurement: line-tables-only -> baseline -> baseline ->
+#      line-tables-only (discarded -- the two baseline blocks ran back
+#      to back with no intervening condition change, the same bug as
+#      run 2 above, just on the other condition; see Assay)
+#   6. The run that actually produced this report's final line-tables-only
+#      numbers: line-tables-only -> baseline -> line-tables-only ->
+#      baseline (alternating, both conditions properly separated), then a
+#      fifth, reversed-order single pair: baseline -> line-tables-only --
+#      see Assay
 #
 # TWO FURTHER CORRECTIONS on this recipe itself (caught by Codex review on
-# PR #2882, tenth round):
+# PR #2882, tenth and twelfth rounds) -- the real run-5/run-6 mistake above
+# (baseline's blocks landing adjacent) doesn't recur in the loop below,
+# which was designed with that failure mode already in mind:
 #
 # 1. "Every block pays a genuine fresh re-entry" (an earlier draft's claim
 #    here) is WRONG. Cargo keeps every profile fingerprint's build
