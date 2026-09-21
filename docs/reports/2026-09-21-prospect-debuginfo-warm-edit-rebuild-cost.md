@@ -96,9 +96,11 @@ decision is about, not `RUSTFLAGS`), pay one full-graph rebuild to enter the
 block (excluded from the measurement — not representative of a real dev
 loop), then take 3 timed single-line edits to `hello()`'s return string
 (alternated to a fresh literal each time, so every sample is a real
-recompile, never a no-op). Two rounds, condition order interleaved
-(baseline → d0 → d1 → d1 → baseline → d0) to control for drift across the
-~35-minute session, matching the 2026-09-16 report's methodology.
+recompile, never a no-op). Planned as two rounds with condition order
+interleaved (baseline → d0 → d1 → d1 → baseline → d0) to control for drift
+across the ~35-minute session, matching the 2026-09-16 report's methodology
+— realized as planned for baseline and `debuginfo=0`, but not for
+`debuginfo=1`; see the stub below and the correction in **📊 Assay**.
 
 **Stubs / shortcuts (the complete list):**
 - Measures `cargo build -p hello` directly, not the actual `autumn dev`
@@ -127,6 +129,21 @@ recompile, never a no-op). Two rounds, condition order interleaved
   re-run in full before this report was written. `baseline` and `d0`'s
   first-pass numbers were unaffected (verified against a surviving build log
   showing a genuine `unoptimized` 2.40s build) and are used as-is.
+- **That `d1` re-run cost this assay `debuginfo=1`'s independent-block
+  design (caught by Codex review on PR #2882, third round on the same
+  paragraph): the rerun script ran `run_block 1 d1 ...` immediately followed
+  by `run_block 2 d1 ...`, never returning to another condition in between,
+  so the two logged "blocks" are one continuously-held measurement period,
+  not two independent re-entries** — confirmed by the second block's own
+  warm-up build taking 2.5s, not the ~200s a genuine fresh entry costs
+  elsewhere in this apparatus, and by re-reading the rerun script itself
+  (`warm_edit_d1_rerun.sh`, apparatus scratch, not committed — per
+  Containment, apparatus never merges — but its logic is reproducible: the
+  same `set_profile`/`run_block` pair the **🔬 Reproduce** section below
+  gives, called twice in a row for the same condition with no other
+  condition in between). `baseline` and `debuginfo=0` do not have this
+  problem; only `debuginfo=1` does. See **📊 Assay**/**🏁 Verdict** for what
+  this does and doesn't allow this report to claim.
 
 ## 📊 Assay
 
@@ -142,43 +159,51 @@ warm-up; see Apparatus), n=6 per condition (2 rounds × 3 samples):
 Relative to baseline median: **`debuginfo=0` -35.75%**, **`debuginfo=1`
 -37.39%**.
 
-**Correction (caught by Codex review on PR #2882, two rounds): an earlier
-draft of this paragraph compared the `debuginfo=1`-vs-`debuginfo=0`
-percentage delta (-2.56%) directly against the two conditions' stdevs in
-seconds — invalid, mixed units. The next draft fixed that by running a
-Welch's t-test treating all 6 samples per condition as independent (t ≈
--0.76, df ≈ 9.5, not significant) — which the second review round correctly
-called pseudoreplication: the 3 samples within one block share that block's
-warm-up/cache/thermal state, and are not independent draws, so `n=6`/`df≈9.5`
-overstates this design's real power. The two truly independent units per
-condition are the *blocks*, not the 18 individual builds. Redone at the
-block level:** block means, `debuginfo=0` = [2.617s, 2.529s],
-`debuginfo=1` = [2.510s, 2.577s]. With only 2 independent blocks per
-condition, no formal significance test is meaningful here (a t-test needs
-more than 2 units per group to say anything) — the honest statement is
-qualitative: the two conditions' block means interleave (2.510 < 2.529 <
-2.577 < 2.617) rather than one condition's blocks both sitting above the
-other's, which is consistent with "no large, consistent difference" but is
-not a statistical proof, and a design with more independent
-(freshly-entered, fully randomized) blocks per condition would be needed to
-say more. This also means the baseline-vs-reduced comparison below rests on
-the same 2-independent-blocks-per-condition footing — noted explicitly
-there, since its effect size is what carries that comparison despite the
-same limitation, unlike the `debuginfo=1`-vs-`debuginfo=0` comparison, where
-the effect is small enough that the limitation matters. Unlike this ambiguity,
-Onramp's cold-build report found a large, clearly resolved gap between the
-two levels (~18% vs ~8.7%).
+**Correction (caught by Codex review on PR #2882, three rounds on this one
+paragraph): draft 1 compared the `debuginfo=1`-vs-`debuginfo=0` percentage
+delta directly against stdevs in seconds — invalid, mixed units. Draft 2
+fixed that with a Welch's t-test treating all 6 samples per condition as
+independent — which round 2 correctly called pseudoreplication (3 samples
+within one block share that block's warm-up/cache/thermal state) and which
+this draft redid at the block level, treating each condition's 2 logged
+blocks as 2 independent units. Round 3 caught that this was *still* wrong
+for `debuginfo=1` specifically: its "2 blocks" were produced by
+`run_block 1 d1 ...; run_block 2 d1 ...` back to back in the rerun that fixed
+the TOML-quoting bug (see Apparatus), with no other condition entered in
+between — `set_profile` writes byte-identical `Cargo.toml` content both
+times, and block 2's own warm-up build took 2.5s, not the ~200s a genuine
+fresh re-entry costs (confirmed against `warm_edit_d1_rerun.sh` in this PR's
+own history). So `debuginfo=1` has **one** independently-entered measurement
+period (6 back-to-back builds under continuously-held state), not two, while
+baseline and `debuginfo=0` each genuinely do have two (separated by real
+intervening condition changes — see the block order in Apparatus). That
+asymmetry means there is no valid way to compare `debuginfo=1` against
+`debuginfo=0` at the block level either: one side has 1 independent unit,
+the other has 2. The honest statement is simply that this design cannot
+support a rigorous claim about whether the two reduced levels differ from
+each other — not "no evidence of a difference," not "within noise," just
+not measured with enough independent repetition to say. A follow-up
+assay would need every condition, `debuginfo=1` included, entered
+independently and interleaved at least twice, the same way baseline and
+`debuginfo=0` already were here. Onramp's cold-build report, by contrast,
+found a large, clearly resolved gap between the two levels (~18% vs ~8.7%)
+that this design flaw doesn't call into question.
 
 Baseline's sample range doesn't overlap either reduced condition's (baseline
 min 3.951 > both reduced-condition maxima; `debuginfo=0` and `debuginfo=1`
-overlap each other completely) — and unlike the `debuginfo=1`-vs-`debuginfo=0`
-comparison above, this effect is large enough (baseline block means 4.025s/
-4.045s vs. both reduced conditions' block means all below 2.62s) that the
-same 2-blocks-per-condition limitation doesn't put the conclusion in doubt:
-no plausible block-to-block noise closes a ~35% gap that both baseline
-blocks clear by well over a second. Still a clean separation, not a
-borderline call the way Onramp's cold-build `debuginfo=0` number
-was against its 20% floor.
+overlap each other completely). The baseline-vs-`debuginfo=0` comparison
+specifically still holds despite the concerns above: both conditions were
+genuinely independently entered twice (see Apparatus), and the effect size
+(~35%, baseline block means 4.025s/4.045s vs. `debuginfo=0`'s 2.617s/2.529s)
+is far too large for plausible block-to-block noise to close. The
+baseline-vs-`debuginfo=1` comparison rests on weaker footing given
+`debuginfo=1`'s single independent period, but the same logic applies to a
+lesser degree: a ~37% gap between baseline's two genuinely independent
+blocks and `debuginfo=1`'s one measured period is not the kind of thing this
+assay's known confounds (warm-up exclusion, sandbox noise on the order of
+tens of milliseconds) could produce by chance. Both baseline comparisons are
+a clean separation, not a borderline call the way Onramp's cold-build
+`debuginfo=0` number was against its 20% floor.
 
 **Worst case probed:** the warm-up (first-in-block) samples, deliberately
 excluded from the table above because they are not steady-state, are
@@ -205,49 +230,50 @@ This changes the shape of the pending decision, not just its confidence:
    permanent backtrace-quality cost" — the compile-time side of the ledger is
    bigger than Onramp's report alone showed, because most of a
    development session's builds are warm edits, not cold starts.
-2. **`debuginfo=1` (line-tables-only) is no longer clearly the "smaller win"
-   option.** On the cold build, Onramp measured it giving less than half of
+2. **Whether `debuginfo=1` (line-tables-only) is still the "smaller win"
+   option on the warm-edit axis is genuinely unmeasured, not resolved either
+   way.** On the cold build, Onramp measured it giving less than half of
    `debuginfo=0`'s saving (8.7% vs 18%), a large, clearly-resolved gap. On the
    warm edit — the loop a developer actually sits in for most of a session —
-   this assay's design (2 independent blocks per condition; see the
-   pseudoreplication correction in **📊 Assay**) is too underpowered for a
-   formal significance claim, but the two conditions' block-level means
-   interleave with each other (`debuginfo=0`: 2.617s/2.529s;
-   `debuginfo=1`: 2.510s/2.577s) rather than one condition's blocks both
-   sitting clearly above the other's. That is qualitatively different from
-   "we don't know" — it's "no consistent direction showed up across the two
-   blocks we ran" — but it is weaker evidence than this report's earlier
-   drafts claimed, and a design with more independent blocks would be needed
-   to state a real bound. What it still does is reopen the choice Onramp's
-   report posed as a hard trade (bigger win vs. keeping backtraces): nothing
-   in this data points to line-tables-only's full file:line backtrace
-   resolution for local frames (the quality property Onramp's report
-   measured directly) costing more than `debuginfo=0` on the warm-edit axis
-   — a claim that cuts against the cold-build case's clear gap, and that a
-   properly-powered follow-up could sharpen in either direction.
+   this assay's `debuginfo=1` data came from one continuously-held
+   measurement period rather than two independently-entered ones (see the
+   correction in **📊 Assay**, caught over three rounds of review), so there
+   is no valid comparison to `debuginfo=0` to report here, in either
+   direction. That does still reopen the choice Onramp's report posed as a
+   hard trade (bigger cold-start win vs. keeping backtraces) in one sense:
+   the assumption that `debuginfo=1` is *automatically* the smaller warm-edit
+   win too, just because it was on the cold build, no longer has anything
+   backing it — but neither does the opposite. A properly-designed follow-up
+   (both levels entered independently and interleaved at least twice each,
+   the way baseline and `debuginfo=0` were here) is needed before anyone can
+   say which level is cheaper on the warm-edit axis.
 
 This still does not resolve the decision by itself — gap 1 (the actual
 scaffolded no-DB daemon project, not `examples/hello`) remains open, Onramp's
 own cold-build number is still shy of its 20% floor pending re-measurement
-above the noise floor, and (per the pseudoreplication correction above) the
-`debuginfo=1`-vs-`debuginfo=0` comparison specifically needs a better-powered
-follow-up before its own number can be trusted. But it removes "we don't know
-if this is a hidden recurring cost" from the open-questions list, and
-replaces it with a specific, load-bearing number the decider can weigh: the
-recurring win over baseline is large and robust to this design's limitations,
-and nothing in this data suggests `debuginfo=1` gives up much of it relative
-to `debuginfo=0`.
+above the noise floor, and (per the correction above) the
+`debuginfo=1`-vs-`debuginfo=0` comparison specifically was not validly
+measured at all and needs a redo, not just a better-powered version. But it
+removes "we don't know if this is a hidden recurring cost" from the
+open-questions list, and replaces it with a specific, load-bearing number
+the decider can weigh: the
+recurring win over baseline is large for both reduced levels and robust to
+this design's limitations, but whether `debuginfo=1` keeps most of
+`debuginfo=0`'s recurring win specifically, or gives up more of it than the
+cold-build case's ratio would suggest, is not answered by this assay and
+needs its own properly-blocked measurement.
 
 ## 💰 Cost to productionize
 
 Not a new build — this assay feeds an existing decision (issue #2795) rather
 than proposing new code. If the maintainer picks `debug = "line-tables-only"`
-for the generated-project templates' `[profile.dev]` (the option this
-assay's finding makes more attractive, since it now captures ~99% of the
-warm-edit win alongside its already-known backtrace-preservation property):
-the change itself is the one line Onramp's report already scoped
-(`autumn-cli/src/templates/Cargo.toml.tmpl`, `Cargo.api.toml.tmpl`), plus the
-two still-open items neither report has closed:
+for the generated-project templates' `[profile.dev]` (a defensible choice on
+backtrace-quality grounds alone, and this assay establishes it captures a
+large recurring warm-edit win over baseline in its own right — just not,
+per the correction above, a confirmed comparison against `debuginfo=0`'s
+warm-edit number specifically): the change itself is the one line Onramp's
+report already scoped (`autumn-cli/src/templates/Cargo.toml.tmpl`,
+`Cargo.api.toml.tmpl`), plus the still-open items neither report has closed:
 
 - Gap 1 (still open, either report): re-measure against the actual
   `autumn new`-scaffolded project via `cold_start_driver.rs`, not
@@ -256,6 +282,12 @@ two still-open items neither report has closed:
 - Re-measure `debuginfo=0`'s cold-build number above the noise floor / on a
   dedicated or CI-caliber box, per Onramp's report (only relevant if
   `debuginfo=0` rather than `debuginfo=1` is the level under consideration).
+- New: a properly-blocked `debuginfo=1`-vs-`debuginfo=0` warm-edit
+  comparison, if the choice between the two specific levels (rather than
+  "reduced vs. baseline") matters to the decider. This assay's own attempt
+  doesn't answer it (see the correction in **📊 Assay**) — a redo needs both
+  levels independently entered and interleaved at least twice each, the way
+  baseline and `debuginfo=0` were here.
 - Which build agents' gates: `cold-start-latency.yml` needs a green run
   against the new template default before it merges. **`dev-loop-latency.yml`
   does not yet give equivalent evidence for the warm-edit path — caught by
@@ -326,8 +358,15 @@ run_block() {
   done
 }
 
-# Full two-round, interleaved condition order this assay actually used:
-for cond in "" 0 line-tables-only line-tables-only "" 0; do
+# Full two-round, properly interleaved (round-robin) condition order -- NOT
+# what this assay's own `debuginfo=1` data actually came from (caught by
+# Codex review on PR #2882: this assay's real d1 rerun ran two blocks back
+# to back with no other condition in between, so d1's two "blocks" were one
+# continuously-held period, not two independent re-entries -- see the stub
+# in Apparatus and the correction in Assay). Every condition's two
+# occurrences are separated by the other two here, so every block -- d1
+# included -- pays a genuine fresh full-graph rebuild on entry:
+for cond in "" 0 line-tables-only "" 0 line-tables-only; do
   echo "== condition: '${cond:-baseline}' =="
   run_block "$cond"
 done
