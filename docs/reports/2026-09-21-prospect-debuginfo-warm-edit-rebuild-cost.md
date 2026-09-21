@@ -257,49 +257,59 @@ two still-open items neither report has closed:
 
 ```bash
 # Run this from a disposable clone or worktree, not a working copy with
-# uncommitted changes (caught by Codex review on PR #2882: the `git
-# checkout -- ...` revert step below discards *any* uncommitted edits to
-# these two files, not just the experiment's own, and this recipe neither
-# requires a clean tree nor backs up what was there first):
+# uncommitted changes (caught by Codex review on PR #2882: the revert step
+# discards *any* uncommitted edits to these two files, not just the
+# experiment's own, and this recipe neither requires a clean tree nor backs
+# up what was there first):
 #   git worktree add /tmp/prospect-debuginfo-repro trunk-dev
 #   cd /tmp/prospect-debuginfo-repro
 
 # Pre-warm deps + autumn-web once:
 cargo build -p hello
 
-# One condition's block (repeat per condition; see Apparatus for why
-# switching conditions mid-session is not representative and each needs its
-# own warm-up):
-cat >> Cargo.toml <<'EOF'
+set_profile() {   # "" (baseline/no override), "0", or "line-tables-only"
+  git checkout -- Cargo.toml
+  if [ -n "$1" ]; then
+    if [ "$1" = "0" ] || [ "$1" = "1" ] || [ "$1" = "2" ]; then
+      printf '\n[profile.dev]\ndebug = %s\n' "$1" >> Cargo.toml   # integer: unquoted
+    else
+      printf '\n[profile.dev]\ndebug = "%s"\n' "$1" >> Cargo.toml # string: must be quoted!
+    fi
+  fi
+}
 
-[profile.dev]
-debug = 0            # or: debug = "line-tables-only"   (must be quoted!)
-EOF
+# One condition's block: enter the condition, pay the one full-graph rebuild
+# (excluded from timing -- see Apparatus for why switching conditions
+# mid-session is not representative and each needs its own warm-up), then
+# take 3 timed edits with an actually-incrementing counter (caught by Codex
+# review on PR #2882: an earlier draft's sed used the literal string "vN",
+# not a variable, so every invocation after the first rewrote the file to
+# byte-identical content -- not a real edit) and check cargo's own exit
+# status explicitly (caught in the same review round: `date; cargo build;
+# date` chained with plain semicolons still "succeeds" when `cargo build`
+# fails -- the exact failure mode this report's Apparatus section says
+# invalidated the first `d1` pass):
+run_block() {
+  set_profile "$1"
+  sed -i 's/"Hello, Autumn![^"]*"/"Hello, Autumn! warmup"/' examples/hello/src/main.rs
+  cargo build -p hello || { echo "cargo build failed (warm-up)" >&2; exit 1; }
+  i=0
+  while [ "$i" -lt 3 ]; do
+    i=$((i + 1))
+    sed -i "s/\"Hello, Autumn![^\"]*\"/\"Hello, Autumn! v${i}\"/" examples/hello/src/main.rs
+    S=$(date +%s.%N); cargo build -p hello || { echo "cargo build failed" >&2; exit 1; }; E=$(date +%s.%N)
+    echo "$E - $S" | bc   # no /usr/bin/time in this sandbox
+  done
+}
 
-# Pay the one full-graph rebuild to enter the block (excluded from timing):
-cargo build -p hello
-
-# Then, 3+ times, alternating the literal so each edit is a real recompile.
-# Use an actually-incrementing counter (caught by Codex review on PR #2882:
-# a literal `vN` in the sed pattern below is not a variable -- every
-# invocation after the first replaces "Hello, Autumn! vN" with the
-# byte-identical "Hello, Autumn! vN", which is not a real edit and cannot
-# reproduce the reported samples) and check cargo's own exit status
-# explicitly (caught in the same review round: the original semicolon-chained
-# `date; cargo build; date` form here still ran the trailing `date` and
-# looked "successful" even when `cargo build` failed -- the exact failure
-# mode this report's Apparatus section says invalidated the first `d1` pass)
-# rather than silently recording a fast failure as a real sample:
-i=0
-while [ "$i" -lt 3 ]; do
-  i=$((i + 1))
-  sed -i "s/\"Hello, Autumn![^\"]*\"/\"Hello, Autumn! v${i}\"/" examples/hello/src/main.rs
-  S=$(date +%s.%N); cargo build -p hello || { echo "cargo build failed" >&2; exit 1; }; E=$(date +%s.%N)
-  echo "$E - $S" | bc   # no /usr/bin/time in this sandbox
+# Full two-round, interleaved condition order this assay actually used:
+for cond in "" 0 line-tables-only line-tables-only "" 0; do
+  echo "== condition: '${cond:-baseline}' =="
+  run_block "$cond"
 done
 
-# Revert between conditions:
-git checkout -- Cargo.toml examples/hello/src/main.rs
+set_profile ""
+git checkout -- examples/hello/src/main.rs
 
 # Sanity check for the TOML-quoting bug this assay hit: a manifest parse
 # error makes `cargo build` fail (and "finish") in tens of milliseconds, not
