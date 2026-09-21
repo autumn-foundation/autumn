@@ -253,6 +253,30 @@ own content — confirmed by the green run above.
 - `#[cached]` (`autumn-macros/src/cached.rs`) — already fixed 2026-09-05;
   confirmed still folding `CURRENT_TENANT` in (`autumn-macros/src/cached.rs`
   around the `__autumn_tenant_key_component` binding).
+- **Known limitation, NOT fixed here — `CURRENT_TENANT` is never scoped on
+  `tenancy.public_paths` routes, even when a handler independently resolves a
+  real per-request tenant** (Codex review, PR #2884). `tenancy_middleware`
+  early-returns for `is_public_path` routes (`tenancy.rs:627-628`) without
+  ever calling `CURRENT_TENANT.scope(...)`, while the `Tenant` extractor's
+  fallback (`tenancy.rs:44-50`) independently re-resolves and returns a real
+  tenant from headers/domain on exactly such a route — `is_public_path`'s own
+  doc comment states the contract explicitly: "exempt from tenant
+  resolution," not just exempt from *requiring* one. A handler on a public
+  path that extracts `Tenant` and caches tenant-varying content (a
+  tenant-branded public storefront, a public pricing page) would still
+  collide across tenants after this fix, because every `CURRENT_TENANT`-only
+  primitive — this one and `#[cached]`'s identical
+  `__autumn_tenant_key_component` — sees `None` there regardless. This
+  predates this PR (confirmed present, unfixed, in `#[cached]`'s own
+  2026-09-05 fix) and is not specific to fragment caching: it is a
+  framework-wide gap in every `CURRENT_TENANT`-ambient primitive. Closing it
+  means changing what "public path" means in `tenancy_middleware` —
+  best-effort resolving and scoping `CURRENT_TENANT` even on a path that
+  doesn't reject a missing tenant — which touches every request through a
+  public path (health probes, static assets, the login page) and is a
+  materially larger, more architecturally significant change than this PR's
+  key fix. Flagged for a maintainer decision on prioritizing a dedicated
+  `tenancy_middleware` fix; not folded into this PR.
 - `get_or_compute` / `get_or_compute_with` (`autumn/src/cache/read_through.rs`)
   — take a caller-supplied key directly (no macro/helper builds it), the same
   "raw primitive, caller's responsibility" shape as `cache_fragment`'s
