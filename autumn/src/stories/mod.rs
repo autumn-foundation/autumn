@@ -466,9 +466,26 @@ body:has(#story-theme-midnight:checked) {
        shade) because white text sits directly on --primary throughout the
        widget set (checked pills, buttons, …): #7c3aed keeps that pairing at
        ~5.7:1 contrast, comfortably above WCAG AA's 4.5:1 for normal text —
-       a lighter violet dropped as low as 3.33:1 (review follow-up). */
+       a lighter violet dropped as low as 3.33:1 (review follow-up).
+
+       --primary-light also needed its own override here, NOT a darker tint
+       to match this theme's dark surfaces: text=var(--primary) on
+       bg=var(--primary-light) (hovered sidebar links, the selected
+       autocomplete option) needs the *opposite* of the button pairing above
+       — with primary that dark, only a light background clears 4.5:1
+       (review follow-up: the dark tint this carried before was 2.46:1). So
+       this reuses tokens.css's own default --primary-light (#ede9fe)
+       unchanged — the identical pairing already proven in the light theme
+       — rendering as a deliberately bright chip against the dark chrome,
+       ~4.8:1. Same reasoning for --danger: the built-in Comment thread
+       story renders it directly on --surface (no chip involved), so it
+       needs the light-on-dark direction too — tokens.css's #dc2626 was
+       3.39:1 there. --danger-light gets a dark tint to match (the mirror
+       image of --primary-light), since --danger is now the light color in
+       that pairing. */
     --bg: #14151c; --surface: #1d1f2b; --text: #e7e7ee; --text-muted: #9497ab;
-    --border: #2e3040; --primary: #7c3aed; --primary-hover: #6d28d9; --primary-light: #2b2650;
+    --border: #2e3040; --primary: #7c3aed; --primary-hover: #6d28d9; --primary-light: #ede9fe;
+    --danger: #f87171; --danger-light: #3f1d1d;
     --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 4px 14px rgba(0, 0, 0, 0.3);
 }
 
