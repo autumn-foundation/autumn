@@ -695,6 +695,15 @@ body:has(#story-theme-midnight:checked) .autumn-job-status__error {
 body:has(#story-theme-midnight:checked) .autumn-comments-error {
     border-color: #f87171;
 }
+/* Same text-on-surface conflict as --danger above, mirrored for --success:
+   `.autumn-job-status__success` is the only widgets.css rule that renders
+   var(--success) as direct text rather than in a self-contained chip
+   (badge--success/alert-success pair it with --success-light, which stays
+   unaffected by this theme), and the default shade is 4.34:1 on Midnight's
+   --surface, just short of 4.5:1. */
+body:has(#story-theme-midnight:checked) .autumn-job-status__success {
+    color: #34d399;
+}
 /* Charts and the upload progress fill both read `var(--primary)` directly
    for a non-text mark (stroke/fill, and `::before`'s background-color —
    by design, see the comment above), so redeclaring the custom property
@@ -758,8 +767,17 @@ body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:n
    `var(--text-muted)` in every theme (it's the near-white widgets.css
    fallback in the three light themes, and Midnight's own dark override),
    so using it here instead of `var(--border)` clears 4.5:1 everywhere
-   without per-theme fixed colors (review follow-up). */
-.wizard-step__number {
+   without per-theme fixed colors (review follow-up). Both the bare
+   `.wizard-step__number` and widgets.css's own two-class
+   `.wizard-step--upcoming .wizard-step__number` need the override: the
+   upcoming-state rule redeclares the identical `var(--border)` background
+   explicitly (the widget always renders one of --completed/--current/
+   --upcoming, never the bare class alone) and its two-class selector
+   otherwise outranks this one on specificity regardless of source order,
+   so leaving it out left the actual rendered state unfixed (review
+   follow-up). */
+.wizard-step__number,
+.wizard-step--upcoming .wizard-step__number {
     background-color: var(--surface-muted, #f1f5f9);
 }
 
