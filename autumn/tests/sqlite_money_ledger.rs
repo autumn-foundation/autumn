@@ -1195,6 +1195,22 @@ async fn duplicated_retried_and_killed_charges_post_exactly_once() {
 
 // ── Real concurrency (Snag) ─────────────────────────────────────────────────
 
+/// Whether `err` looks like the `SQLite` write contention
+/// `autumn/src/money/ledger.rs` documents (`SQLITE_BUSY_SNAPSHOT`, or
+/// `Db::tx`'s deferred transaction leaving a racing writer with "database is
+/// locked") rather than an application-level `LedgerError`.
+///
+/// Deliberately narrow: this exists so the concurrency test below can tell
+/// "lost a real write race" apart from "something unrelated broke", not to
+/// classify every possible database error as expected.
+fn is_sqlite_contention(err: &autumn_web::AutumnError) -> bool {
+    let Some(LedgerError::Database(_)) = err.downcast_ref::<LedgerError>() else {
+        return false;
+    };
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("lock") || message.contains("busy")
+}
+
 /// Every test above races nothing, or races through a pool of size 1 (which
 /// makes `pool.get()` itself the serializer). This is the one test in this
 /// file where distinct `tokio::spawn` tasks, each with its own checked-out
@@ -1268,23 +1284,54 @@ async fn concurrent_withdrawals_cannot_double_spend_a_disallow_negative_wallet()
     }
 
     let mut posted = 0i64;
+    let mut refused_negative = 0i64;
+    let mut contention_errors = 0i64;
     for handle in handles {
         match handle.await.expect("task join") {
             Ok(outcome) if outcome.is_posted() => posted += 1,
             Ok(_) => panic!("a distinct idempotency key can never replay"),
-            // Refused for a negative balance, or lost a real SQLite write race
-            // (contention this test deliberately creates by racing 100 tasks
-            // over 8 connections against one row) — either way it must not
-            // post, which the assertions below check for every non-`Posted`
-            // outcome uniformly.
-            Err(_) => {}
+            Err(err) => {
+                if matches!(
+                    err.downcast_ref::<LedgerError>(),
+                    Some(LedgerError::NegativeBalance { .. })
+                ) {
+                    refused_negative += 1;
+                } else if is_sqlite_contention(&err) {
+                    // Lost a real SQLite write race (contention this test
+                    // deliberately creates by racing 100 tasks over 8
+                    // connections against one row): `SQLITE_BUSY_SNAPSHOT` or
+                    // "database is locked", per the module's own doc. Money
+                    // moved zero times either way.
+                    contention_errors += 1;
+                } else {
+                    panic!(
+                        "unexpected error racing a concurrent withdrawal — not a \
+                         negative-balance refusal and not recognized SQLite \
+                         contention, so this cannot be waved through as \
+                         expected under contention: {err:?}"
+                    );
+                }
+            }
         }
     }
 
+    // NOT exactly one: under `cache=shared` + `mode=memory` (this pool's
+    // target), `SQLite` gives table-level `SQLITE_LOCKED` contention, not the
+    // page/WAL-level `SQLITE_BUSY_SNAPSHOT` the module's doc describes for a
+    // file-backed database — and `SQLITE_LOCKED` from a shared-cache table
+    // lock is NOT retried by `busy_timeout` (confirmed empirically: a losing
+    // run here finishes in ~0.2s, not anywhere near the 5s `busy_timeout`
+    // this pool sets). With 100 tasks racing 8 connections over one table,
+    // that can genuinely leave `posted == 0` for a whole round — repro'd
+    // directly, not theorized. `posted <= 1` is the real invariant (no
+    // double-spend); the panic above is what actually closes Codex's finding
+    // on #2880, by making sure every one of the 99+ non-posted outcomes is a
+    // *recognized* refusal rather than a silently swallowed, unrelated error.
     assert!(
         posted <= 1,
         "double-spend: {posted} of {RACERS} concurrent $80 withdrawals posted \
-         against a $100 disallow-negative wallet"
+         against a $100 disallow-negative wallet (refused_negative={refused_negative}, \
+         contention_errors={contention_errors})"
     );
 
     let mut conn = pool.get().await.expect("checkout");
