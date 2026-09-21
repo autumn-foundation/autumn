@@ -713,6 +713,16 @@ body:has(#story-theme-midnight:checked) .autumn-chart,
 body:has(#story-theme-midnight:checked) .autumn-upload-bar {
     --primary: #a78bfa;
 }
+/* The wizard's own completed-step connector (`.wizard-step--completed +
+   .wizard-step::before`) is the same non-text `var(--primary)` mark as
+   the two above (2.87:1 on --surface, short of the 3:1 floor), but can't
+   use the same custom-property redeclare trick: it's a sibling
+   combinator, not a descendant, so a property set on the completed step
+   wouldn't inherit to it. Overriding the resolved background-color
+   directly instead. */
+body:has(#story-theme-midnight:checked) .wizard-step--completed + .wizard-step::before {
+    background-color: #a78bfa;
+}
 /* Every `:focus-visible` keyboard outline in widgets.css is `2px solid
    var(--primary)` too — a fourth role hitting the same conflict (review
    follow-up: 2.87:1 on --surface, short of WCAG 1.4.11's 3:1 non-text
