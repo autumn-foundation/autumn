@@ -210,14 +210,19 @@ pub async fn create(
                             .get_result(conn)
                             .await?;
 
-                        for (i, link) in links.into_iter().enumerate() {
+                        let new_links: Vec<NewCollectionLink> = links
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, link)| NewCollectionLink {
+                                collection_id: created.id,
+                                label: link.label,
+                                url: link.url,
+                                position: i as i32,
+                            })
+                            .collect();
+                        if !new_links.is_empty() {
                             diesel::insert_into(collection_links::table)
-                                .values(&NewCollectionLink {
-                                    collection_id: created.id,
-                                    label: link.label,
-                                    url: link.url,
-                                    position: i as i32,
-                                })
+                                .values(&new_links)
                                 .execute(conn)
                                 .await?;
                         }
@@ -328,14 +333,19 @@ pub async fn update(
                     .execute(conn)
                     .await?;
 
-                    for (i, link) in links.into_iter().enumerate() {
+                    let new_links: Vec<NewCollectionLink> = links
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, link)| NewCollectionLink {
+                            collection_id: id,
+                            label: link.label,
+                            url: link.url,
+                            position: i as i32,
+                        })
+                        .collect();
+                    if !new_links.is_empty() {
                         diesel::insert_into(collection_links::table)
-                            .values(&NewCollectionLink {
-                                collection_id: id,
-                                label: link.label,
-                                url: link.url,
-                                position: i as i32,
-                            })
+                            .values(&new_links)
                             .execute(conn)
                             .await?;
                     }
