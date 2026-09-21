@@ -663,16 +663,29 @@ body:has(#story-theme-midnight:checked) {
    WCAG 1.4.11's 3:1 graphical-object threshold rather than 4.5:1 but still
    fell short; --danger lightened to fix its own text case promptly broke
    its confirm button the same way, 2.77:1). Giving plain text/marks their
-   own token is a widgets.css-wide change (every such usage, not just the
-   ones named here) well past this PR's scope of theming the gallery, so
-   this overrides exactly the elements review flagged, scoped to Midnight
-   only — a real fix for what's evidenced, not a workaround, but narrower
-   than the underlying gap. See PR #2887 for the proposed follow-up
-   (dedicated text/mark-color tokens in tokens.css). */
+   own token is a widgets.css-wide change well past this PR's scope of
+   theming the gallery, so this overrides plain-text-color usage instead —
+   every `color: var(--primary)` rule in widgets.css that isn't paired
+   with `background: var(--primary-light)` (that pairing is the
+   already-fixed chip role, e.g. the selected autocomplete option) — a
+   real fix for the actual gap, not a one-off patch for whichever
+   selector a story happened to render and review happened to catch
+   first (four of these eight were found that way, across four rounds).
+   See PR #2887 for the proposed follow-up (dedicated text/mark-color
+   tokens in tokens.css, so this whole list stops needing upkeep by
+   hand). */
 body:has(#story-theme-midnight:checked) .autumn-feed__more,
 body:has(#story-theme-midnight:checked) .autumn-comment-reply-toggle,
+body:has(#story-theme-midnight:checked) .autumn-nav__item a:hover,
+body:has(#story-theme-midnight:checked) .autumn-locale-switcher a:hover,
+body:has(#story-theme-midnight:checked) .autumn-breadcrumb__link:hover,
+body:has(#story-theme-midnight:checked) .autumn-reaction-active,
+body:has(#story-theme-midnight:checked) .wizard-step--completed .wizard-step__label,
 body:has(#story-theme-midnight:checked) .story-breadcrumb a {
     color: #a78bfa;
+}
+body:has(#story-theme-midnight:checked) .autumn-reaction-active {
+    border-color: #a78bfa;
 }
 body:has(#story-theme-midnight:checked) .autumn-comments-error {
     color: #f87171;
