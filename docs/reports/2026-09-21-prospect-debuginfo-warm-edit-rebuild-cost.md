@@ -390,7 +390,29 @@ baseline-vs-`debug=0` comparison specifically still holds despite the
 concerns above: both conditions were genuinely independently entered twice
 (see Apparatus), and the effect size (~35%, baseline block means
 4.025s/4.045s vs. `debug=0`'s 2.617s/2.529s) is far too large for plausible
-block-to-block noise to close. The baseline-vs-`line-tables-only` comparison rests on weaker footing on two
+block-to-block noise to close.
+
+**Robustness check (caught by Codex review on PR #2882, eleventh round):
+this comparison has the identical order confound already found and checked
+for `limited` — baseline is always first in its pair, `debug=0` always
+second, in both real occurrences (see the block order in Apparatus). Rather
+than assert this doesn't matter, it was checked the same way: a third pair,
+order reversed (`debug=0` first, then baseline), run later in the session.**
+
+| Condition (3rd window, reversed order) | samples (s) | median | mean |
+|---|---|---|---|
+| `debug=0` (position 1 this time) | 3.018, 3.062, 2.906 | 3.018 | 2.995 |
+| baseline (position 2 this time) | 5.104, 4.942, 4.655 | 4.942 | 4.900 |
+
+Relative to this window's own baseline: **`debug=0` -38.93%** — again
+closely matching the original, opposite-order pairing's -35.75%, and again
+under a substantially different absolute baseline level (4.942s median here
+vs. 4.032s in the original window). Combined with the analogous check for
+`limited`, both of this report's genuinely-block-designed comparisons have
+now held up under order reversal — the strongest evidence in this report
+against a pure position/order artifact driving any of its findings.
+
+The baseline-vs-`line-tables-only` comparison rests on weaker footing on two
 separate counts: `line-tables-only`'s single independent period (this
 paragraph), and its unpaired baseline denominator (see the correction where
 this figure is first reported, above) — but the same rough logic still
@@ -423,9 +445,10 @@ compile-and-link wall time (see the correction in **⚖️ Pre-registration**/
 anything about, the *full* `RustRouteEditHello` loop's own end-to-end
 percentage, which also includes file-watcher and health-check latency):
 every reduced debuginfo level measured changes warm-edit median
-compile-and-link time by far more than 10% (`limited` -26.45%, `debug=0`
--35.75%, `line-tables-only` -37.39% nominal — see below), the opposite
-direction of the risk this assay was chartered to probe. This is not a
+compile-and-link time by far more than 10% (`limited` ~26-28%, replicated
+under reversed order; `debug=0` ~36-39%, likewise replicated under reversed
+order; `line-tables-only` -37.39% nominal, not replicated — see below), the
+opposite direction of the risk this assay was chartered to probe. This is not a
 hidden recurring *cost* the Onramp report's open gap worried about — it is a
 large recurring *win* on the compile-and-link portion of the far more
 frequent warm loop, that stacks with the (borderline) one-time cold-start
