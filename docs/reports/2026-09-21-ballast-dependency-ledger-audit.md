@@ -75,7 +75,7 @@ subtrees pulled by other feature combinations):
 | Unique crate names | 704 | 686 | −18 |
 | Direct (non-dev) deps referenced by workspace members | 134 | 138 | +4 |
 | Workspace members | 33 | 37 | +4 |
-| Duplicate crate names (`cargo deny check bans`, warn-level) | 76 | 68 | −8 |
+| Duplicate crate names (`cargo deny check bans`, warn-level) | 76 | 76 | 0 |
 
 **Correction, from a Codex review comment on this PR**: an earlier draft of
 this section attributed the +4 workspace members to the macro-crate split
@@ -92,48 +92,62 @@ never touch `Cargo.toml`'s `members` array at all — they were named in the
 earlier draft only because they were recent and thematically nearby, not
 because they were checked.
 
-**The node/duplicate counts falling is a genuine, reproducible result of this
-pass's own commands, not a methodology artifact** — `git status` was clean
-before and after every check in this pass, so nothing here comes from a
-lockfile drifting under the audit. But I'm not asserting a specific root
-cause for *why* it fell: three Dependabot-authored PRs merged in the window
-between the two passes (`5f7a63a` tokio-postgres-rustls, `ff39144` diesel,
-`be63a93` a 5-update `rust-deps` group batch — see the pain-ledger section
-below) are the obvious candidate mechanism, and `bitflags`/`parking_lot`/
-`parking_lot_core` specifically dropped out of this week's duplicate list
-after appearing in last week's. But a spot check found those exact crate
-names *still* have multiple versions in the raw `Cargo.lock` (`bitflags`
-1.3.2 + 2.13.1; `parking_lot` 0.11.2 + 0.12.5; `parking_lot_core` 0.8.6 +
-0.9.12 — **corrected, from a Codex review comment on this PR**: an earlier
-draft attributed all four version numbers to `parking_lot` alone; 0.8.6 and
-0.9.12 belong to `parking_lot_core` specifically, not `parking_lot`) —
-they're just not reachable within `deny.toml`'s scanned feature set via
-`cargo tree -i` on the
-default host target. So the honest statement is: within the graph this
-harness actually gates, duplicates and node count both fell; the raw lockfile
-still carries the old versions for other feature/target combinations outside
-that scan. Not investigated further this pass — the mechanism doesn't change
-this pass's conclusion, and last week's report already had to walk back two
-overclaims from under-verified mechanism guesses, so this one is left as an
-open question rather than a third correction cycle.
+**Retracted, from a Codex review comment on this PR that turned out to be
+right on a much bigger question than wording.** An earlier draft of this
+report claimed the duplicate-name count fell from 76 to 68 and that
+`bitflags`/`parking_lot`/`parking_lot_core` specifically "dropped out" of
+the list — based on `cargo deny list --format json`, the same tool used for
+the node/name counts above. That number was wrong, and the mechanism claim
+with it. `cargo deny list` is a **license-grouping** view, not the tool this
+report's own duplicate-count row is labeled with; the actual duplicate
+count comes from `cargo deny check bans`, which this pass re-ran directly:
 
-**Duplicate-version breakdown, same three categories as last week** (68
-names, was 76): RustCrypto 0.9/0.10-era split (23 names, unchanged:
-`aes`, `base16ct`, `block-buffer`, `cipher`, `const-oid`, `crypto-bigint`,
-`crypto-common`, `der`, `digest`, `ecdsa`, `elliptic-curve`, `ff`, `group`,
-`hmac`, `inout`, `md-5`, `p256`, `pkcs8`, `rfc6979`, `sec1`, `sha2`,
-`signature`, `spki`); `windows-sys`/`windows_*` shims (10 names, up from 8:
-`windows-sys`, `windows-targets`, and 8 per-target `windows_*` crates — the
-listed pair now spans 0.52.x/0.53.x instead of both being unified, worth a
-future pass's attention but not actioned here); general ecosystem
-major-version splits (35 names: `base64`, `cpufeatures`, `darling`/
-`darling_core`/`darling_macro`, `downcast-rs`, `getrandom`, `hashbrown`,
-`heck`, `http`, `http-body`, `lru`, `miniz_oxide`, `nom`, `num-bigint`,
-`phf`/`phf_shared`, `quick-error`, `r-efi`, `rand`/`rand_chacha`/
-`rand_core`, `reqwest`, `spin`, `strum`/`strum_macros`, `syn`, `thiserror`/
-`thiserror-impl`, `toml`/`toml_datetime`, `tower-http`, `tungstenite`,
-`wasi`, `winnow`). Still `multiple-versions = "warn"`, deliberately not
-CI-gated, per `deny.toml`'s own rationale; not actioned this pass.
+```
+$ cargo deny check bans 2>&1 | grep -c '^warning\[duplicate\]: found'
+76
+```
+
+**76, not 68 — unchanged from last week, not down 8.** `bans`'s own output
+traces the real chain for all three "missing" names, confirming they were
+never gone: `bitflags` 1.3.2 → `parking_lot_core` 0.8.6 → `parking_lot`
+0.11.2, reached from `reqwest-retry`/`wasm-timer` → `postgresql_archive` →
+`postgresql_embedded` → `autumn-web` — the exact same
+`managed-pg-bundled`-gated chain this file's own `RUSTSEC-2024-0384`
+(`instant`) waiver already documents as in-scope. Independently confirmed
+with `cargo tree -p autumn-web --features <deny.toml's exact feature list>
+--target all -i parking_lot@0.11.2`, which shows the identical path — `list`
+simply doesn't surface it (root cause not pinned down this pass: `list` and
+`check bans` may apply `[graph]`/target resolution differently; worth a
+harness-level follow-up rather than more guessing here, see follow-up 9).
+So: node/crate-name counts (791→764, 704→686) still come from `cargo deny
+list`, consistent with both prior passes' stated methodology, and are left
+as reported since nothing in this pass contradicts them directly — but
+given `list` just demonstrably missed a real, `bans`-confirmed dependency
+chain, they should be read as this tool's view, not a fully independent
+cross-check. The **duplicate-name count specifically is corrected to 76,
+unchanged**, since `check bans` is both the metric's stated source and the
+one CI's own gate (`cargo deny check bans`, warn-level) actually runs.
+
+**Duplicate-version breakdown, from `cargo deny check bans`, same three
+categories as last week** (76 names, matching last week's 76 — not
+independently diffed name-for-name against that report's list, since it
+was given as "45 and others" rather than exhaustively): RustCrypto
+0.9/0.10-era split (23 names, unchanged: `aes`, `base16ct`, `block-buffer`,
+`cipher`, `const-oid`, `crypto-bigint`, `crypto-common`, `der`, `digest`,
+`ecdsa`, `elliptic-curve`, `ff`, `group`, `hmac`, `inout`, `md-5`, `p256`,
+`pkcs8`, `rfc6979`, `sec1`, `sha2`, `signature`, `spki`); `windows-sys`/
+`windows_*` shims (10 names: `windows-sys`, `windows-targets`, and 8
+per-target `windows_*` crates); general ecosystem major-version splits (43
+names: `base64`, `bitflags`, `cpufeatures`, `darling`/`darling_core`/
+`darling_macro`, `downcast-rs`, `etcetera`, `foldhash`, `getrandom`,
+`hashbrown`, `heck`, `http`, `http-body`, `lru`, `miniz_oxide`, `nom`,
+`num-bigint`, `parking_lot`/`parking_lot_core`, `phf`/`phf_shared`,
+`r-efi`, `rand`/`rand_chacha`/`rand_core`, `redox_syscall`, `reqwest`,
+`spin`, `strum`/`strum_macros`, `syn`, `thiserror`/`thiserror-impl`,
+`toml`/`toml_datetime`, `tower-http`, `tungstenite`, `wasi`, `wasite`,
+`webpki-roots`, `whoami`, `winnow`). Still `multiple-versions = "warn"`,
+deliberately not CI-gated, per `deny.toml`'s own rationale; not actioned
+this pass.
 
 **Scheduled batch, all three graphs** (bare `cargo update --dry-run
 --verbose`, never `--workspace` — see last week's report for why that flag
@@ -220,11 +234,24 @@ component of a `0.x.y` version counts as major, the same way `1.x→2.x`
 would for a stable crate) — `tokio-tungstenite` 0.29→0.30, `sha1`
 0.10.6→0.11.0, `x509-parser` 0.16.0→0.18.1, `matchit` 0.8.4→0.9.2,
 `rand_chacha` 0.9.0→0.10.0, `rand` 0.9.4→0.10.2. `rust-deps` only groups
-`minor`/`patch`, and no group anywhere in this file covers `major` updates
-at all. So these six sitting as individual PRs isn't evidence anything was
+`minor`/`patch`, and none of the six matches `axum-ecosystem` or
+`diesel-ecosystem`'s patterns either — **narrowed, from a third Codex
+review comment on this PR**: an earlier draft of this paragraph said "no
+group anywhere in this file covers `major` updates at all," which overstates
+it. `axum-ecosystem` and `diesel-ecosystem` both omit `update-types`
+entirely, so — per Dependabot's default — they *do* cover major bumps for
+their own patterns (`axum*`/`tower*`/`http` and `diesel*`/
+`libsqlite3-sys`); it's only the catch-all `rust-deps` group, the one whose
+`"*"` pattern would otherwise catch these six, that excludes majors. So the
+precise statement is: these six packages have no group that covers them at
+a major version, because `rust-deps` is the only group whose pattern
+reaches them and its `update-types` filter excludes majors — not that this
+file has no major-covering group at all. So these six sitting as individual
+PRs isn't evidence anything was
 orphaned when the grouping config changed — it's exactly what the *current*
-config produces for a major bump today, same as it would have on the day
-`rust-deps` was created. The real (and much less alarming) finding is just:
+config produces for a major bump on an `rust-deps`-scoped package today,
+same as it would have on the day `rust-deps` was created. The real (and
+much less alarming) finding is just:
 six individual major-bump `cargo` PRs, like the two individual
 `github-actions` PRs, have sat un-reviewed for 64–69 days. That's a review-
 backlog fact, not a configuration gap — reconciling `dependabot.yml` would
@@ -242,7 +269,7 @@ in the 28–69 day band gives **ten**, not eight: the seven at 69 days
 
 This is **not** a Ballast finding to act on directly — merging, closing, or
 nudging any of these 13 PRs is a human call (several are exactly the kind of
-major-bump review no group in this config ever covers, and #2615 is
+major-bump review the `rust-deps` catch-all never covers, and #2615 is
 explicitly an "ask before" toolchain change) — but it's a materially
 different picture than "two stale PRs" and worth a maintainer's attention:
 **10 of the 13** are old enough (28–69 days) to be queue rot rather than
@@ -309,7 +336,7 @@ None to the dependency graph. This report is the only artifact.
 | Root/SQLite licenses + sources | clean | clean |
 | Crate@version nodes / names / direct deps (root) | 791 / 704 / 134 | 764 / 686 / 138 |
 | Workspace members | 33 | 37 |
-| Duplicate crate names (warn-level) | 76 | 68 |
+| Duplicate crate names (warn-level, `cargo deny check bans`) | 76 | 76 |
 | Scheduled batch, root graph | 74 packages, Dependabot's territory | 92 packages, still Dependabot's territory |
 | Scheduled batch, `fuzz/` graph | 58 packages, uncovered by any process | 66 packages, still uncovered |
 | Scheduled batch, `island-flock/` graph | 29 packages, uncovered, MSRV unconfirmed | 31 packages, still uncovered, still unconfirmed |
@@ -396,10 +423,15 @@ grep -A1 '^name = "parking_lot"' Cargo.lock
    defines no groups at all, and the six `cargo` PRs (`tokio-tungstenite`,
    `sha1`, `x509-parser`, `matchit`, `rand_chacha`, `rand`) are individual
    because every one is a semver-major transition under Dependabot's own
-   pre-1.0 convention, and `rust-deps` only groups `minor`/`patch` — no
-   group in this file covers majors, so nothing was ever "orphaned" by a
+   pre-1.0 convention, and `rust-deps` — the only group whose `"*"` pattern
+   reaches these six packages — only groups `minor`/`patch` (**narrowed
+   further, per a third Codex comment**: `axum-ecosystem`/`diesel-ecosystem`
+   do cover majors for their own patterns; it's specifically the catch-all
+   group these six fall under that excludes majors, not every group in the
+   file), so nothing was ever "orphaned" by a
    config change; this is what the current config has always produced for
-   a major bump. See the corrected mechanism in the evidence section above.
+   a major bump on a `rust-deps`-scoped package. See the corrected mechanism
+   in the evidence section above.
    The real, narrower finding: 8 individual PRs (2 actions, 6 cargo-major)
    have simply sat unreviewed for 64–69 days, plus #2179 (42d) and #2302
    (28d) — a review-backlog fact, not a configuration gap. Still not
@@ -437,11 +469,21 @@ grep -A1 '^name = "parking_lot"' Cargo.lock
    this repo's own advisory gate can't see. That last case would be a real
    gap in the harness this charter otherwise treats as mature, and would
    turn this from a ledger report into a security-response pass.
-9. The duplicate-count and node-count drop this pass (see "Graph facts"
-   above) is reported without a confirmed mechanism — `bitflags` and
-   `parking_lot`/`parking_lot_core` dropped out of the deny.toml-scanned
-   duplicate list, but both still carry multiple versions in the raw
-   `Cargo.lock` outside that scan. Worth a future pass's attention if the
-   trend continues or reverses; not chased further here to avoid a third
-   correction cycle on an under-verified mechanism claim (see the two such
-   corrections in last week's report).
+9. **Retracted, then replaced with a real harness-methodology finding —
+   caught by a further Codex review comment on this PR.** An earlier draft
+   claimed the duplicate-name count fell 76→68 with `bitflags`/
+   `parking_lot`/`parking_lot_core` "dropping out." Wrong: `cargo deny check
+   bans` (this metric's actual stated source, and the tool CI itself runs
+   for it) still reports 76, unchanged, and directly confirms all three
+   names via a real traced dependency path (see "Graph facts" above). The
+   real finding underneath the mistake: `cargo deny list --format json` —
+   used for this report's node/crate-name counts, per both this and last
+   week's stated methodology — silently missed a chain `check bans` finds
+   without trouble. That's worth a dedicated harness-level follow-up on its
+   own: pin down why `list` and `check bans` disagree (a `[graph]` or target
+   resolution difference between the two subcommands is the leading
+   hypothesis, unconfirmed), and decide whether `list`-derived node/name
+   counts are trustworthy for this report's purposes at all, or whether
+   every graph-facts metric should move to a `check bans`-equivalent source.
+   Not resolved this pass — flagged here rather than guessed at, per this
+   charter's own evidentiary bar.
