@@ -564,8 +564,19 @@ report already scoped (`autumn-cli/src/templates/Cargo.toml.tmpl`,
 # discards *any* uncommitted edits to these two files, not just the
 # experiment's own, and this recipe neither requires a clean tree nor backs
 # up what was there first):
-#   git worktree add --detach /tmp/prospect-debuginfo-repro origin/trunk-dev
+#   git worktree add --detach /tmp/prospect-debuginfo-repro c2086d6add265a4f1227d6c70b7548fec31dc5ab
 #   cd /tmp/prospect-debuginfo-repro
+# (caught by Codex review on PR #2882: an earlier draft pinned this to the
+# floating `origin/trunk-dev` ref, which a future run could resolve to
+# different source and dependencies than this assay actually measured, and
+# which doesn't even exist as a ref in every checkout. Pinned instead to
+# this PR's actual base commit -- trunk-dev's tip when this assay's
+# apparatus ran against `examples/hello`/`Cargo.toml`, neither of which
+# this PR touches -- so a reproduction builds the exact code this report's
+# numbers came from. If reproducing much later, `git log --before=... -1
+# origin/trunk-dev` or the base shown on
+# https://github.com/autumn-foundation/autumn/pull/2882 finds the same
+# commit.)
 
 # Pre-warm deps + autumn-web once:
 cargo build -p hello
