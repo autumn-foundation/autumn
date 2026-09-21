@@ -136,8 +136,16 @@ always reports 0 in this repo):
 | `fuzz/` (rust-version 1.88.0) | 58 packages | 66 packages |
 | `examples/island-flock/` (no declared `rust-version`; reflects this sandbox's 1.94.1 toolchain) | 29 packages | 31 packages |
 
-All three grew, consistent with a week of upstream releases accumulating
-against an unmoved lockfile. As established last week: the root graph's
+All three grew — but not, as an earlier draft of this line claimed, because
+all three lockfiles sat unmoved against a week of upstream releases.
+**Corrected, from a Codex review comment on this PR**: this report's own
+pain-ledger section (below) names three merges that touched lockfiles in
+this window — `5f7a63a` updated both `Cargo.lock` and `fuzz/Cargo.lock`;
+`ff39144` and `be63a93` each updated `Cargo.lock` again on top of that.
+Only `examples/island-flock/Cargo.lock` was genuinely untouched. So the
+root and `fuzz/` batch counts grew *net* of real merged movement this week,
+not against a static baseline — the accumulation was partially offset by
+those merges, not absent. As established last week: the root graph's
 batch material is Dependabot's territory (`directory: /` in
 `dependabot.yml`) and actively worked by humans; the `fuzz/` and
 `island-flock/` batches remain **uncovered by any process** —
@@ -244,8 +252,13 @@ enumerate GitHub's native Dependabot alerts (no `list_dependabot_alerts`-
 shaped tool is loaded, and the repo's Security tab isn't reachable through
 `search_issues`/`search_code`), so I can't say from this pass alone whether
 the 15 are: (a) non-Rust ecosystems `cargo-deny` never scans at all — this
-repo has npm tooling under `examples/island-flock` (its own `package.json`
-for `wasm-bindgen`/build tooling) and a Python `django` dependency under
+repo has an npm manifest under `examples/react-graphql/frontend/`
+(`package.json`/`package-lock.json`; **corrected** — an earlier draft of
+this paragraph said `examples/island-flock`, which has no npm manifest of
+its own, only Cargo manifests and a direct `wasm-bindgen-cli` invocation;
+a second Codex review comment caught this same mistake surviving in this
+paragraph after the follow-up section below it was already fixed) and a
+Python `django` dependency under
 `benchmarks/runtime/django` (the same one #2179 above bumps), neither
 RustSec-covered; or (b) genuinely GHSA-only advisories for Cargo crates that
 haven't propagated into the RustSec advisory database `cargo-deny` consumes,
