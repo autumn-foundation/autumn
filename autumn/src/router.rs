@@ -1481,6 +1481,13 @@ fn collect_framework_get_paths(config: &AutumnConfig) -> std::collections::HashS
     if config.stories.enabled {
         claimed.insert(crate::stories::STORIES_PATH.to_owned());
         claimed.insert("/_stories/{slug}".to_owned());
+        // The Active search / Autocomplete / Infinite feed stories' live
+        // demo backends (review follow-up — these three were missing from
+        // the preflight, so a colliding OpenAPI/MCP mount here would panic
+        // in `router.merge` instead of surfacing the typed collision error).
+        claimed.insert("/_stories/demo/search".to_owned());
+        claimed.insert("/_stories/demo/tags/search".to_owned());
+        claimed.insert("/_stories/demo/posts/feed".to_owned());
     }
     // The default unsubscribe endpoint merges a GET (+POST) at `UNSUBSCRIBE_PATH`
     // before the late-merged OpenAPI/MCP routers, so reserve it too — otherwise an
@@ -10296,6 +10303,44 @@ enabled = true
                 field: "openapi_json_path",
                 ref path,
             } if path == crate::stories::STORIES_PATH
+        ));
+    }
+
+    #[cfg(all(feature = "openapi", feature = "maud"))]
+    #[tokio::test]
+    async fn try_build_router_rejects_openapi_path_on_story_gallery_demo_route() {
+        // Review follow-up: the Active search / Autocomplete / Infinite feed
+        // stories' live demo backends merge GETs the same way the index/detail
+        // routes above do, but were missing from the preflight reservation —
+        // an OpenAPI mount here would panic in `router.merge` instead of
+        // surfacing this typed collision.
+        let mut config = AutumnConfig::default();
+        config.stories.enabled = true;
+        let openapi = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
+            .openapi_json_path("/_stories/demo/search");
+        let ctx = RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
+            declared_routes: Vec::new(),
+            custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
+            error_page_renderer: None,
+            session_store: None,
+            openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
+        };
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx).expect_err(
+            "story gallery demo search path should be reserved while stories are enabled",
+        );
+        assert!(matches!(
+            err,
+            RouterBuildError::OpenApiPathCollision {
+                field: "openapi_json_path",
+                ref path,
+            } if path == "/_stories/demo/search"
         ));
     }
 

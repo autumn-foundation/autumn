@@ -40,10 +40,19 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                     p { em { "For reference — not live — what your handler returns when nothing matches:" } }
                     (active_search_empty_state("No posts matched your search."))
                     // Compose the pieces yourself when you need custom layout
-                    // between the input and the results container:
+                    // between the input and the results container: this needs
+                    // its own config, targeting its own results container —
+                    // reusing `config` above would target
+                    // "#post-search-results" (the first demo's), leaving this
+                    // one empty on a successful response (review follow-up).
                     div {
-                        (active_search_input("post-search-split", "Search posts", &config))
-                        (active_search_results("post-search-split"))
+                        (active_search_input(
+                            "post-search-split",
+                            "Search posts",
+                            &ActiveSearchConfig::new("/_stories/demo/search", "#post-search-split-results")
+                                .placeholder("Search posts…"),
+                        ))
+                        (active_search_results("post-search-split-results"))
                     }
                 }
             }
