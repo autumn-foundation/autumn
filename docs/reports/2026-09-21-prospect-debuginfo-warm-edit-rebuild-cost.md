@@ -584,8 +584,8 @@ run_block() {
 
 # IMPORTANT (caught by Codex review on PR #2882, sixth round): this
 # round-robin is a CORRECTED FOLLOW-UP DESIGN, not a literal replay of how
-# this report's own numbers were collected. The real sessions ran as two
-# separate sequences, neither of which is this loop:
+# this report's own numbers were collected. The real sessions ran as three
+# separate sequences, none of which is this loop:
 #   1. baseline -> debug=0 -> line-tables-only(buggy,discarded) ->
 #      line-tables-only(buggy,discarded) -> baseline -> debug=0
 #      (the buggy line-tables-only entries used unquoted TOML and never
@@ -593,15 +593,42 @@ run_block() {
 #   2. A separate rerun, later: line-tables-only -> line-tables-only
 #      (fixed TOML quoting, but back to back -- see the pseudoreplication
 #      correction in Assay)
-#   3. A separate run, later still: limited -> baseline -> limited -> baseline
-# Running THIS script instead -- covering all four conditions in a genuine
-# round-robin, each pair separated by the other three -- does not
-# reproduce any of those three real sequences or their exact numbers; it is
-# the design a follow-up assay should use to get a result this report's own
-# apparatus couldn't validly produce for line-tables-only-vs-limited. Every
-# condition's two occurrences are separated by the other three here, so
-# every block pays a genuine fresh re-entry:
-for cond in "" 0 line-tables-only 1 "" 0 line-tables-only 1; do
+#   3. A separate run, later still: limited -> baseline -> limited ->
+#      baseline, then (a fourth, reversed-order pair added after a
+#      reviewer flagged the order confound below): baseline -> limited
+#      -- see the robustness check in Assay
+#
+# TWO FURTHER CORRECTIONS on this recipe itself (caught by Codex review on
+# PR #2882, tenth round):
+#
+# 1. "Every block pays a genuine fresh re-entry" (an earlier draft's claim
+#    here) is WRONG. Cargo keeps every profile fingerprint's build
+#    artifacts in the shared target/ directory; set_profile only rewrites
+#    Cargo.toml, never cleans target/. So only each condition's first-ever
+#    visit in the whole session pays the ~200s full-graph rebuild --
+#    returning to an already-visited condition reuses its cached rlibs
+#    cheaply (seconds, not minutes), exactly what this report's own data
+#    shows (compare the ~200s first-visit warm-ups in Assay's "worst case
+#    probed" paragraph to every later revisit's few-second one). That's
+#    fine for the "real condition change happened" argument (Cargo.toml's
+#    content did genuinely change, and real wall-clock time and other
+#    builds happened in between), but it is NOT "genuine fresh re-entry"
+#    in the sense of a from-scratch rebuild, and a rigorous follow-up that
+#    wants that property needs a clean target/ (or a fresh worktree) per
+#    block, not just a manifest rewrite.
+#
+# 2. The round-robin below originally repeated the exact same order twice
+#    (round 2 = round 1), which still confounds each condition with a
+#    fixed position -- a systematic within-session drift (this report's
+#    own baseline measurements varied a lot across widely-separated
+#    windows) would bias every condition identically across both rounds
+#    rather than cancel out. Fixed below with a practical two-round
+#    counterbalance (round 2 = round 1 rotated, not repeated) so no
+#    condition holds the same relative position twice -- still not a full
+#    randomized/multi-round design (that needs more than 2 rounds), so a
+#    follow-up wanting to fully retire the order-confound question should
+#    add more, ideally randomized, rounds:
+for cond in "" 0 line-tables-only 1 line-tables-only 1 "" 0; do
   echo "== condition: '${cond:-baseline}' =="
   run_block "$cond"
 done
