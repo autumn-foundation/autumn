@@ -42,6 +42,16 @@ pub const STORIES_PATH: &str = "/_stories";
 /// Route template for a single story's detail page.
 const STORY_DETAIL_PATH: &str = "/_stories/{slug}";
 
+/// Demo backend for the "Active search" story. See [`demo_search`].
+const STORIES_DEMO_SEARCH_PATH: &str = "/_stories/demo/search";
+
+/// Demo backend for the "Autocomplete" story. See [`demo_tag_search`].
+const STORIES_DEMO_TAG_SEARCH_PATH: &str = "/_stories/demo/tags/search";
+
+/// Demo backend for the "Infinite feed" story's sentinel. See
+/// [`demo_infinite_feed`].
+const STORIES_DEMO_FEED_PATH: &str = "/_stories/demo/posts/feed";
+
 /// Derive a URL slug from a story name: lowercase, alphanumeric runs joined
 /// by single `-`, everything else (punctuation, whitespace, non-ASCII)
 /// treated as a separator.
@@ -355,6 +365,118 @@ where
                 },
             ),
         )
+        // Demo backends for the two typeahead stories (Active search,
+        // Autocomplete) — see `demo_search`/`demo_tag_search` below for why
+        // these two specifically get real handlers where every other
+        // story's action URL stays a synthetic 404-on-submit (already the
+        // documented pattern for e.g. Confirm action / Avatar). Namespaced
+        // under `/_stories/demo/*`, the same convention `confirm_action`'s
+        // story already uses (`/_stories/demo/delete-post`), so a real app's
+        // own routes can never collide with these.
+        .route(STORIES_DEMO_SEARCH_PATH, axum::routing::get(demo_search))
+        .route(
+            STORIES_DEMO_TAG_SEARCH_PATH,
+            axum::routing::get(demo_tag_search),
+        )
+        .route(
+            STORIES_DEMO_FEED_PATH,
+            axum::routing::get(demo_infinite_feed),
+        )
+}
+
+/// Query params `demo_search` and `demo_tag_search` both accept — the `q`
+/// param [`ActiveSearchConfig`](crate::widgets::ActiveSearchConfig) and
+/// [`AutocompleteConfig`](crate::widgets::AutocompleteConfig) both default
+/// `param_name`/`query_param` to.
+#[derive(serde::Deserialize)]
+struct DemoQuery {
+    #[serde(default)]
+    q: String,
+}
+
+/// Demo backend for the "Active search" story's action — mounted at
+/// [`STORIES_DEMO_SEARCH_PATH`]. Filters a small fixed post list
+/// case-insensitively by `q`, returning the same
+/// [`active_search_empty_state`](crate::widgets::active_search_empty_state)
+/// the story documents for the no-matches case.
+async fn demo_search(
+    crate::extract::Query(DemoQuery { q }): crate::extract::Query<DemoQuery>,
+) -> Html<String> {
+    const POSTS: &[&str] = &[
+        "The Long Autumn",
+        "Falling Leaves",
+        "Autumn in Practice",
+        "Shipping Widgets",
+    ];
+    let query = q.to_lowercase();
+    let matches: Vec<&str> = POSTS
+        .iter()
+        .copied()
+        .filter(|title| query.is_empty() || title.to_lowercase().contains(&query))
+        .collect();
+    let markup = if matches.is_empty() {
+        crate::widgets::active_search_empty_state("No posts matched your search.")
+    } else {
+        maud::html! {
+            ul class="story-demo-results" {
+                @for title in matches {
+                    li { (title) }
+                }
+            }
+        }
+    };
+    Html(markup.into_string())
+}
+
+/// Demo backend for the "Autocomplete" story's `/tags/search`-shaped action
+/// — mounted at [`STORIES_DEMO_TAG_SEARCH_PATH`]. Filters a small fixed tag
+/// list case-insensitively by the `q` query param, rendering matches with
+/// the same [`autocomplete_option`](crate::widgets::autocomplete_option) /
+/// [`autocomplete_empty_state`](crate::widgets::autocomplete_empty_state)
+/// the story's source already documents.
+async fn demo_tag_search(
+    crate::extract::Query(DemoQuery { q }): crate::extract::Query<DemoQuery>,
+) -> Html<String> {
+    const TAGS: &[(&str, &str)] = &[("42", "rust"), ("7", "web"), ("13", "axum"), ("21", "htmx")];
+    let query = q.to_lowercase();
+    let matches: Vec<(&str, &str)> = TAGS
+        .iter()
+        .copied()
+        .filter(|(_, label)| query.is_empty() || label.to_lowercase().contains(&query))
+        .collect();
+    let markup = if matches.is_empty() {
+        crate::widgets::autocomplete_empty_state("No matching tags.")
+    } else {
+        maud::html! {
+            @for (value, label) in matches {
+                (crate::widgets::autocomplete_option(value, label))
+            }
+        }
+    };
+    Html(markup.into_string())
+}
+
+/// Demo backend for the "Infinite feed" story's sentinel — mounted at
+/// [`STORIES_DEMO_FEED_PATH`].
+///
+/// Exists only so loading `htmx.min.js` (needed for the two typeahead
+/// demos above) doesn't turn this *specific* story into a visible
+/// regression: unlike every other action URL in the gallery, this one's
+/// [`FeedMode::Reveal`](crate::widgets::FeedMode::Reveal) sentinel fires
+/// `hx-trigger="revealed, click"` — htmx auto-requests it the moment the
+/// element scrolls into view, no click required, so visiting the story page
+/// alone would have 404-swapped it without the visitor doing anything. This
+/// always returns a terminal page (no further cursor), matching what the
+/// story's own `feed_page` snippet already documents as "the last page".
+async fn demo_infinite_feed() -> Html<String> {
+    let markup = crate::widgets::feed_page(
+        maud::html! {
+            article class="post" { h3 { "Loaded live via a real request." } }
+        },
+        None,
+        &crate::widgets::FeedConfig::new(STORIES_DEMO_FEED_PATH),
+    );
+    Html(markup.into_string())
 }
 
 fn registry_from_state(state: &AppState) -> StoryRegistry {
@@ -580,16 +702,33 @@ fn theme_switch() -> maud::Markup {
     }
 }
 
-/// Full HTML document shell: framework widget stylesheet + widget runtime
-/// script + gallery chrome.
+/// Full HTML document shell: framework widget stylesheet + htmx + widget
+/// runtime script + gallery chrome.
 ///
-/// Interactive widgets (`modal_trigger`, `confirm_action`, `nav_bar`, …) emit
-/// `data-*` hooks wired by the framework's `autumn-widgets.js` runtime, so the
-/// shell loads that same-origin script (always mounted under the `htmx`
-/// feature) alongside the stylesheet — otherwise the live previews of those
-/// stories would be inert in browsers that need the JS fallback. The script
-/// needs no CSP nonce: the framework's default policy keeps `'self'` in
-/// `script-src` in both plain and nonce modes.
+/// Loads two same-origin scripts (both always mounted under the `htmx`
+/// feature), in this order so `defer` preserves it regardless of download
+/// timing:
+///
+/// 1. `htmx.min.js` — every `hx-get`/`hx-post`-driven widget (active search,
+///    autocomplete, reaction controls, comment threads, the infinite feed
+///    sentinel, …) renders correct `hx-*` attributes either way (see each
+///    story's "Rendered HTML" tab), but they stay inert without htmx itself
+///    on the page to process them.
+/// 2. `autumn-widgets.js` — the framework's own `data-*`-hook runtime for
+///    `modal_trigger`, `confirm_action`, `nav_bar`, and the autocomplete
+///    widget's selection wiring.
+///
+/// Neither script needs a CSP nonce: the framework's default policy keeps
+/// `'self'` in `script-src` in both plain and nonce modes.
+///
+/// Most widgets' action URLs stay synthetic 404s-on-submit by design (e.g.
+/// Confirm action, Bulk actions) — see each story's own comment. Two
+/// typeahead stories (Active search, Autocomplete) get real demo backends
+/// instead (`demo_search`, `demo_tag_search`), since a search box that
+/// visibly does nothing while typing reads as broken rather than as a
+/// deliberately-inert mockup; the Infinite feed story gets one too
+/// (`demo_infinite_feed`) purely to stop its auto-firing `revealed` trigger
+/// from 404-swapping on page load — see that function's doc comment.
 ///
 /// When the security layer's per-request CSP nonce is active
 /// (`security.headers.csp_nonce.enabled = true`, which drops
@@ -602,9 +741,12 @@ fn story_page(
     nonce: Option<&crate::security::CspNonce>,
 ) -> maud::Markup {
     #[cfg(feature = "htmx")]
-    let widgets_js: Option<&str> = Some(crate::htmx::AUTUMN_WIDGETS_JS_PATH);
+    let scripts: &[&str] = &[
+        crate::htmx::HTMX_JS_PATH,
+        crate::htmx::AUTUMN_WIDGETS_JS_PATH,
+    ];
     #[cfg(not(feature = "htmx"))]
-    let widgets_js: Option<&str> = None;
+    let scripts: &[&str] = &[];
     maud::html! {
         (maud::DOCTYPE)
         html lang="en" {
@@ -613,7 +755,7 @@ fn story_page(
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " — Autumn stories" }
                 link rel="stylesheet" href=(crate::ui::WIDGETS_CSS_PATH);
-                @if let Some(src) = widgets_js {
+                @for src in scripts {
                     script src=(src) defer {}
                 }
                 style nonce=[nonce.map(crate::security::CspNonce::value)] {
@@ -1214,6 +1356,126 @@ mod tests {
                 && !index.contains(" onchange="),
             "the theme switcher must stay pure-CSS (:has()), no inline script \
              or event handler, to hold under a strict script-src CSP: {index}"
+        );
+    }
+
+    // U12 (interactivity follow-up): every hx-*-driven widget stayed inert
+    // because htmx.min.js was never loaded, only the framework's own
+    // data-*-hook runtime was. Both must load, htmx first (both `defer`, so
+    // document order fixes execution order — autumn-widgets.js's
+    // autocomplete wiring can assume htmx is already present).
+    #[cfg(feature = "htmx")]
+    #[test]
+    fn story_page_loads_htmx_before_the_widgets_runtime() {
+        let page = render_story_index(&StoryRegistry::default(), None).into_string();
+        let htmx_at = page
+            .find(crate::htmx::HTMX_JS_PATH)
+            .expect("story page must load htmx.min.js");
+        let widgets_at = page
+            .find(crate::htmx::AUTUMN_WIDGETS_JS_PATH)
+            .expect("story page must load autumn-widgets.js");
+        assert!(
+            htmx_at < widgets_at,
+            "htmx.min.js must appear before autumn-widgets.js so `defer` \
+             preserves that execution order: {page}"
+        );
+    }
+
+    // U13 (interactivity follow-up): the two typeahead stories point at real
+    // demo backends now (not the synthetic 404-on-submit URLs most other
+    // stories use), and since the URL is a plain string literal in the
+    // story's own source — not a reference to the route const, which would
+    // show up literally in the public "Source" tab — nothing else catches
+    // the two drifting apart. Guard it here instead.
+    #[test]
+    fn typeahead_stories_point_at_their_registered_demo_routes() {
+        let registry = builtin();
+        let active_search = registry
+            .find("active-search")
+            .expect("active-search story exists");
+        assert!(
+            active_search.source().contains(STORIES_DEMO_SEARCH_PATH),
+            "Active search story must point at STORIES_DEMO_SEARCH_PATH \
+             ({STORIES_DEMO_SEARCH_PATH}): {}",
+            active_search.source()
+        );
+
+        let autocomplete = registry
+            .find("autocomplete")
+            .expect("autocomplete story exists");
+        assert!(
+            autocomplete.source().contains(STORIES_DEMO_TAG_SEARCH_PATH),
+            "Autocomplete story must point at STORIES_DEMO_TAG_SEARCH_PATH \
+             ({STORIES_DEMO_TAG_SEARCH_PATH}): {}",
+            autocomplete.source()
+        );
+
+        let feed = registry
+            .find("infinite-feed")
+            .expect("infinite-feed story exists");
+        assert!(
+            feed.source().contains(STORIES_DEMO_FEED_PATH),
+            "Infinite feed story must point at STORIES_DEMO_FEED_PATH \
+             ({STORIES_DEMO_FEED_PATH}), or its Reveal-mode sentinel \
+             404-swaps on page load with no visitor action: {}",
+            feed.source()
+        );
+    }
+
+    // U14 (interactivity follow-up): the demo handlers backing those routes
+    // actually filter, case-insensitively, and fall back to the same empty
+    // states the stories document.
+    #[tokio::test]
+    async fn demo_search_filters_case_insensitively_with_empty_state_fallback() {
+        let hit = demo_search(crate::extract::Query(DemoQuery {
+            q: "AUTUMN".to_owned(),
+        }))
+        .await
+        .0;
+        assert!(hit.contains("The Long Autumn"), "{hit}");
+        assert!(hit.contains("Autumn in Practice"), "{hit}");
+        assert!(!hit.contains("Falling Leaves"), "{hit}");
+
+        let miss = demo_search(crate::extract::Query(DemoQuery {
+            q: "nonexistent".to_owned(),
+        }))
+        .await
+        .0;
+        assert!(
+            miss.contains("No posts matched your search."),
+            "no-match query must fall back to active_search_empty_state: {miss}"
+        );
+    }
+
+    #[tokio::test]
+    async fn demo_tag_search_filters_case_insensitively_with_empty_state_fallback() {
+        let hit = demo_tag_search(crate::extract::Query(DemoQuery { q: "RU".to_owned() }))
+            .await
+            .0;
+        assert!(hit.contains("rust"), "{hit}");
+        assert!(!hit.contains("axum"), "{hit}");
+
+        let miss = demo_tag_search(crate::extract::Query(DemoQuery {
+            q: "nonexistent".to_owned(),
+        }))
+        .await
+        .0;
+        assert!(
+            miss.contains("No matching tags."),
+            "no-match query must fall back to autocomplete_empty_state: {miss}"
+        );
+    }
+
+    // U15 (interactivity follow-up): the feed demo must terminate (no
+    // further sentinel) — otherwise it would just keep auto-firing.
+    #[tokio::test]
+    async fn demo_infinite_feed_returns_a_terminal_page_with_no_further_sentinel() {
+        let body = demo_infinite_feed().await.0;
+        assert!(body.contains("Loaded live via a real request."), "{body}");
+        assert!(
+            !body.contains("autumn-feed__sentinel"),
+            "a next_cursor of None must emit no further sentinel, or the \
+             `revealed` trigger keeps auto-firing forever: {body}"
         );
     }
 }

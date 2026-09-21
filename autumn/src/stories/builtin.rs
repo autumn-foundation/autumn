@@ -27,7 +27,12 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                     active_search_input, active_search_results,
                 };
 
-                let config = ActiveSearchConfig::new("/search", "#post-search-results")
+                // A real, live-wired demo — unlike most story action URLs,
+                // which stay synthetic 404s on purpose (see e.g. the Confirm
+                // action or Bulk actions stories): a search box that visibly
+                // does nothing while typing reads as broken. The gallery
+                // itself serves this path (see `stories::demo_search`).
+                let config = ActiveSearchConfig::new("/_stories/demo/search", "#post-search-results")
                     .placeholder("Search posts…");
                 maud::html! {
                     (active_search("post-search", "Search posts", &config))
@@ -51,7 +56,9 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                     autocomplete_option,
                 };
 
-                let config = AutocompleteConfig::new("/tags/search", "tag_id")
+                // Real, live-wired demo — see the Active search story above
+                // for why (and `stories::demo_tag_search` for the handler).
+                let config = AutocompleteConfig::new("/_stories/demo/tags/search", "tag_id")
                     .placeholder("Start typing a tag…");
                 maud::html! {
                     (autocomplete_input("tag-picker", "Tag", &config))
@@ -413,13 +420,19 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                 let next = maud::html! {
                     article class="post" { h3 { "Third post" } }
                 };
-                let config = FeedConfig::new("/posts/feed").mode(FeedMode::Reveal);
+                // Reveal mode's sentinel fires on scroll-into-view with no
+                // click needed (`hx-trigger="revealed, click"`), so this
+                // points at a real demo backend rather than the synthetic
+                // 404 URLs most other stories use — otherwise the sentinel
+                // below would 404-swap the instant this page loads, not on
+                // any visitor action. See `stories::demo_infinite_feed`.
+                let config = FeedConfig::new("/_stories/demo/posts/feed").mode(FeedMode::Reveal);
                 maud::html! {
                     // Initial view: the feed container + an auto-loading sentinel.
                     (infinite_feed(items, Some("eyJpZCI6Mn0"), &config))
                     // The fragment a handler returns for each append (here the
                     // last page, so no further sentinel is emitted):
-                    (feed_page(next, None, &FeedConfig::new("/posts/feed").button()))
+                    (feed_page(next, None, &FeedConfig::new("/_stories/demo/posts/feed").button()))
                 }
             }
         },
