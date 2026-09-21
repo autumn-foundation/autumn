@@ -174,6 +174,31 @@ roughly 8 of the 13 are old enough (28–69 days) to be queue rot rather than
 normal review lag, and the oldest seven don't fit the current grouping
 config at all.
 
+**Discrepancy surfaced by this pass's own `git push`, not investigated
+further — flagged rather than assessed.** Pushing this report's commit
+(`cb7abac`) printed GitHub's own remote message: "GitHub found 15
+vulnerabilities on autumn-foundation/autumn's default branch (2 high, 9
+moderate, 4 low)" pointing at `/security/dependabot`. That is a materially
+different number from this pass's own harness result (0 unwaived advisories
+across all 5 RustSec-based graphs). I do not have tooling in this session to
+enumerate GitHub's native Dependabot alerts (no `list_dependabot_alerts`-
+shaped tool is loaded, and the repo's Security tab isn't reachable through
+`search_issues`/`search_code`), so I can't say from this pass alone whether
+the 15 are: (a) non-Rust ecosystems `cargo-deny` never scans at all — this
+repo has npm tooling under `examples/island-flock` (its own `package.json`
+for `wasm-bindgen`/build tooling) and a Python `django` dependency under
+`benchmarks/runtime/django` (the same one #2179 above bumps), neither
+RustSec-covered; or (b) genuinely GHSA-only advisories for Cargo crates that
+haven't propagated into the RustSec advisory database `cargo-deny` consumes,
+which would be a real gate gap; or (c) advisories already in this repo's
+`[advisories] ignore` waiver lists, which GitHub's dependency graph has no
+way to know are deliberately waived. This charter treats "a severity score
+without a reachability verdict" as inadmissible, so I'm not scoring these 15
+— I'm flagging that the harness this repo actually gates on and the
+number GitHub's UI surfaces disagree, by exactly the gap (2 high severity)
+that "outdated" vs. "reachable" is supposed to resolve. Recorded as a new,
+higher-priority follow-up below rather than guessed at.
+
 ## 💡 Mechanism / forcing fact
 
 None, for Ballast to act on directly this pass. Every Tier-1 check reruns
@@ -282,7 +307,22 @@ grep -A1 '^name = "parking_lot"' Cargo.lock
    `dependabot.yml` with two more directory entries, or have Ballast own
    satellite-graph batches on its own cadence. Still a human decision, not
    actioned here.
-8. The duplicate-count and node-count drop this pass (see "Graph facts"
+8. **New this pass, highest priority of the open items.** GitHub's native
+   Dependabot alert count for the default branch (15: 2 high, 9 moderate, 4
+   low, per the `git push` remote message) does not match this pass's own
+   harness result (0 unwaived RustSec advisories across all 5 graphs). Needs
+   a human — or a future pass with GitHub Security-tab API access this
+   session didn't have — to open `/security/dependabot` directly and join
+   each of the 15 against this repo's existing waivers and its non-Rust
+   dependency files (`examples/island-flock/package.json`,
+   `benchmarks/runtime/django`'s Python deps) to determine how many are
+   already covered/waived, how many are non-Rust and outside `cargo-deny`'s
+   scope entirely, and — most importantly — whether any of the 2 "high"
+   alerts are a Cargo-ecosystem advisory that RustSec doesn't yet carry and
+   this repo's own advisory gate can't see. That last case would be a real
+   gap in the harness this charter otherwise treats as mature, and would
+   turn this from a ledger report into a security-response pass.
+9. The duplicate-count and node-count drop this pass (see "Graph facts"
    above) is reported without a confirmed mechanism — `bitflags` and
    `parking_lot`/`parking_lot_core` dropped out of the deny.toml-scanned
    duplicate list, but both still carry multiple versions in the raw
