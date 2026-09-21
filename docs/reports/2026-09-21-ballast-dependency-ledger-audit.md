@@ -278,7 +278,11 @@ clean, every existing waiver's underlying fact is unchanged and not yet at
 its review-by date, and the two structural gaps this charter would want
 closed — satellite-graph batch coverage (follow-up 7) and the
 Ballast/Dependabot division of labor (follow-up 5) — are still open human
-decisions, now three weeks running with no update. The queue-health finding
+decisions, unresolved one week after they were first raised in the
+2026-09-14 report (**corrected from "three weeks" per a Codex review
+comment on this PR** — both were "New this pass" in that report, not
+carried from the first 09-07 pass, so this is only their second
+appearance, one week open, not three). The queue-health finding
 above doesn't change the class of this pass: it's evidence for whoever makes
 those two decisions, not itself a security response, removal, upgrade, or
 addition this pass can rehearse and merge.
@@ -340,9 +344,16 @@ grep -A1 '^name = "parking_lot"' Cargo.lock
 
 ## Follow-ups still open
 
-1. Waivers sharing the **2026-10-01** review-by date (root `deny.toml`'s
-   three, plus `fuzz/deny.toml`'s `RUSTSEC-2023-0071`): re-checked this pass,
-   all still hold. 10 days out — revisit properly at that date, not before.
+1. Waivers sharing the **2026-10-01** review-by date — all **five** unique
+   ones (root `deny.toml`'s three; `fuzz/deny.toml`'s repeated
+   `RUSTSEC-2023-0071`; and `island-flock/deny.toml`'s
+   `RUSTSEC-2024-0370`/`RUSTSEC-2025-0141`, **added to this line per a
+   Codex review comment on this PR** — an earlier draft listed only the
+   root+fuzz four here, which would have left `proc-macro-error` unscheduled
+   for re-review on the date itself): re-checked this pass, all still hold
+   (`RUSTSEC-2025-0141`'s reachability remains undetermined rather than
+   resolved, per follow-up 2, but its waiver's own review-by date is
+   unchanged). 10 days out — revisit properly at that date, not before.
 2. `examples/island-flock/deny.toml`'s `RUSTSEC-2025-0141` (`bincode`,
    `yew`-internal, "undetermined" not "unreachable"): still unresolved.
    `git log --since=2026-09-14 -- examples/island-flock
