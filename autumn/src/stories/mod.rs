@@ -619,9 +619,16 @@ body:has(#story-theme-midnight:checked) {
        mode needs its own dark fallback for the same reason --primary-light
        needed its own value above: --text-muted is light here, so it
        reads at only 2.64:1 on the undeclared light default (review
-       follow-up). */
+       follow-up).
+
+       --border needed lightening too: form controls (e.g.
+       .autumn-autocomplete__input) sit on --surface with only this border
+       as their visible boundary, and the original tint (matched to the
+       other dark surfaces, not against them) was 1.26:1 — WCAG 1.4.11
+       wants 3:1 for a UI component boundary, not the 4.5:1 text threshold
+       above (review follow-up). */
     --bg: #14151c; --surface: #1d1f2b; --text: #e7e7ee; --text-muted: #9497ab;
-    --border: #2e3040; --primary: #7c3aed; --primary-hover: #6d28d9; --primary-light: #ede9fe;
+    --border: #666b8c; --primary: #7c3aed; --primary-hover: #6d28d9; --primary-light: #ede9fe;
     --surface-muted: #23253a;
     --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 4px 14px rgba(0, 0, 0, 0.3);
 }
