@@ -446,14 +446,17 @@ which still is not the same as measuring any two of them against each other
 in one shared window. That three-way comparison remains a real open item
 (see **💰 Cost to productionize**).
 
-Baseline's sample range doesn't overlap either reduced condition's in the
-main table (baseline min 3.951 > both reduced-condition maxima; `debug=0`
-and `line-tables-only` overlap each other completely). The
-baseline-vs-`debug=0` comparison specifically still holds despite the
-concerns above: both conditions were genuinely independently entered twice
-(see Apparatus), and the effect size (~35%, baseline block means
-4.025s/4.045s vs. `debug=0`'s 2.617s/2.529s) is far too large for plausible
-block-to-block noise to close.
+**Correction (caught by Codex review on PR #2882, fourteenth round): an
+earlier draft of this sentence compared `debug=0`'s and `line-tables-only`'s
+sample ranges as if both still came from the same table/window — they
+don't, since `line-tables-only` was moved out to its own properly-measured
+window above. Restated with only what's still true:** in the main table,
+baseline's sample range doesn't overlap `debug=0`'s (baseline min 3.951 >
+`debug=0`'s max 2.630). The baseline-vs-`debug=0` comparison specifically
+still holds despite the concerns above: both conditions were genuinely
+independently entered twice (see Apparatus), and the effect size (~35%,
+baseline block means 4.025s/4.045s vs. `debug=0`'s 2.617s/2.529s) is far
+too large for plausible block-to-block noise to close.
 
 **Robustness check (caught by Codex review on PR #2882, eleventh round):
 this comparison has the identical order confound already found and checked
