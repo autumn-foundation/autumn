@@ -99,14 +99,16 @@ fn fragment_key(
     identity: &str,
     version: impl std::fmt::Display,
 ) -> String {
-    match tenant {
-        Some(tenant) => format!(
-            "{prefix}tenant={}:{tenant}:{}:{identity}:{version}",
-            tenant.len(),
-            identity.len()
-        ),
-        None => format!("{prefix}{}:{identity}:{version}", identity.len()),
-    }
+    tenant.map_or_else(
+        || format!("{prefix}{}:{identity}:{version}", identity.len()),
+        |tenant| {
+            format!(
+                "{prefix}tenant={}:{tenant}:{}:{identity}:{version}",
+                tenant.len(),
+                identity.len()
+            )
+        },
+    )
 }
 
 /// Cache a rendered Maud fragment keyed by `(identity, version)`, plus the
