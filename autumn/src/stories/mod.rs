@@ -747,6 +747,21 @@ body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:n
 body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(6):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(6) {
     border-bottom-color: #a78bfa;
 }
+/* Unlike the --primary/--danger conflicts above, this one isn't Midnight-
+   specific: `.wizard-step__number`'s idle state pairs `var(--border)`
+   (background) with `var(--text-muted)` (text), and in every one of the
+   four gallery palettes those two tokens land within a few points of the
+   same luminance (1.11:1 up to 1.8:1, all far short of the 4.5:1 text
+   floor) — even pure black text on the Autumn border color only reaches
+   4.48:1, so no foreground swap alone can fix it; the background itself
+   has to change. `var(--surface-muted)` is already far enough from
+   `var(--text-muted)` in every theme (it's the near-white widgets.css
+   fallback in the three light themes, and Midnight's own dark override),
+   so using it here instead of `var(--border)` clears 4.5:1 everywhere
+   without per-theme fixed colors (review follow-up). */
+.wizard-step__number {
+    background-color: var(--surface-muted, #f1f5f9);
+}
 
 .story-theme-switch { display: flex; align-items: center; gap: 0.4rem; padding: 0.6rem 1.25rem; border-bottom: 1px solid var(--border); background: var(--surface); }
 .story-theme-switch legend { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-right: 0.25rem; padding: 0; }
