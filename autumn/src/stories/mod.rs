@@ -716,6 +716,31 @@ body:has(#story-theme-midnight:checked) .autumn-comment-submit:focus-visible,
 body:has(#story-theme-midnight:checked) .story-theme-switch input[type='radio']:focus-visible + label {
     outline-color: #a78bfa;
 }
+/* Same conflict again, fifth and sixth roles: :focus/:hover border-color
+   (input focus rings, hover borders) and the tabs active-indicator
+   border-bottom-color — both non-text UI, same 3:1 floor, same 2.87:1
+   shortfall (review follow-up). Doing every remaining `var(--primary)`
+   usage in widgets.css in one pass this time, rather than per-round:
+   between this block, the outline block above, and the color block
+   below, every such usage widgets.css has is now covered. */
+body:has(#story-theme-midnight:checked) .autumn-field__input:focus,
+body:has(#story-theme-midnight:checked) .autumn-search__input:focus,
+body:has(#story-theme-midnight:checked) .autumn-autocomplete__input:focus,
+body:has(#story-theme-midnight:checked) .autumn-feed__more:hover,
+body:has(#story-theme-midnight:checked) .autumn-consent-banner__button:hover,
+body:has(#story-theme-midnight:checked) .autumn-bulk-actions button:hover,
+body:has(#story-theme-midnight:checked) .autumn-comment-submit:hover {
+    border-color: #a78bfa;
+}
+body:has(#story-theme-midnight:checked) .autumn-tabs__tab--active,
+body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(1):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(1),
+body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(2):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(2),
+body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(3):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(3),
+body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(4):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(4),
+body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(5):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(5),
+body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(6):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(6) {
+    border-bottom-color: #a78bfa;
+}
 
 .story-theme-switch { display: flex; align-items: center; gap: 0.4rem; padding: 0.6rem 1.25rem; border-bottom: 1px solid var(--border); background: var(--surface); }
 .story-theme-switch legend { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-right: 0.25rem; padding: 0; }
@@ -801,7 +826,6 @@ fn theme_switch() -> maud::Markup {
 /// has none and nonce-mode `style-src` (no `'unsafe-inline'`) blocks it
 /// (review follow-up).
 ///
-
 /// Most widgets' action URLs stay synthetic 404s-on-submit by design (e.g.
 /// Confirm action, Bulk actions) — see each story's own comment. Two
 /// typeahead stories (Active search, Autocomplete) get real demo backends

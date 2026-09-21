@@ -35,7 +35,16 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                 let config = ActiveSearchConfig::new("/_stories/demo/search", "#post-search-results")
                     .placeholder("Search posts…");
                 maud::html! {
-                    p { em { "Try it — this box is live, searching a small demo post list." } }
+                    // The claim below only holds when htmx is actually on
+                    // the page — story_page only loads it under the `htmx`
+                    // feature (review follow-up: a maud-only, no-htmx build
+                    // still compiles this story, and its hx-* attributes
+                    // stay inert without htmx there to process them).
+                    @if cfg!(feature = "htmx") {
+                        p { em { "Try it — this box is live, searching a small demo post list." } }
+                    } @else {
+                        p { em { "This box would be live with the htmx feature enabled — hx-* attributes need htmx on the page to do anything." } }
+                    }
                     (active_search("post-search", "Search posts", &config))
                     p { em { "For reference — not live — what your handler returns when nothing matches:" } }
                     (active_search_empty_state("No posts matched your search."))
@@ -71,7 +80,13 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                 let config = AutocompleteConfig::new("/_stories/demo/tags/search", "tag_id")
                     .placeholder("Start typing a tag…");
                 maud::html! {
-                    p { em { "Try it — this box is live, matching against a small demo tag list." } }
+                    // See the Active search story above for why this is
+                    // conditional (review follow-up).
+                    @if cfg!(feature = "htmx") {
+                        p { em { "Try it — this box is live, matching against a small demo tag list." } }
+                    } @else {
+                        p { em { "This box would be live with the htmx feature enabled — hx-* attributes need htmx on the page to do anything." } }
+                    }
                     (autocomplete_input("tag-picker", "Tag", &config))
                     p { em { "For reference — not live — the two shapes your handler returns:" } }
                     // One matching option, as your handler would render it:
