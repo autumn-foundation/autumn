@@ -106,13 +106,18 @@ fn notes(state: &AppState) -> AutumnResult<Arc<Notes>> {
 async fn index(State(state): State<AppState>) -> AutumnResult<Markup> {
     let all = notes(&state)?.all();
     Ok(html! {
-        (page_head("Collaborative notes"))
-        body {
-            h1 { "Collaborative notes" }
-            p { "Open one note in two browser windows and type in both." }
-            ul {
-                @for note in &all {
-                    li { a href=(format!("/notes/{}", note.id)) { (note.title) } }
+        (maud::DOCTYPE)
+        html lang="en" {
+            (page_head("Collaborative notes"))
+            body {
+                main id="main-content" {
+                    h1 { "Collaborative notes" }
+                    p { "Open one note in two browser windows and type in both." }
+                    ul {
+                        @for note in &all {
+                            li { a href=(format!("/notes/{}", note.id)) { (note.title) } }
+                        }
+                    }
                 }
             }
         }
@@ -128,20 +133,25 @@ async fn editor(State(state): State<AppState>, id: Path<i64>) -> AutumnResult<Ma
         .ok_or_else(|| AutumnError::not_found_msg("no such note"))?;
     let socket = format!("/notes/{}/collab", note.id);
     Ok(html! {
-        (page_head(&note.title))
-        body {
-            h1 { (note.title) }
-            p { a href="/" { "← all notes" } }
-            main {
-                textarea id="editor" rows="14" cols="60" data-socket=(socket)
-                    aria-label="Note body" {}
-                aside {
-                    h2 { "Editing now" }
-                    ul id="roster" {}
-                    p id="status" { "connecting…" }
+        (maud::DOCTYPE)
+        html lang="en" {
+            (page_head(&note.title))
+            body {
+                main id="main-content" {
+                    h1 { (note.title) }
+                    p { a href="/" { "← all notes" } }
+                    div class="editor-layout" {
+                        textarea id="editor" rows="14" cols="60" data-socket=(socket)
+                            aria-label="Note body" {}
+                        aside {
+                            h2 { "Editing now" }
+                            ul id="roster" {}
+                            p id="status" { "connecting…" }
+                        }
+                    }
+                    script src=(asset_url("collab.js")) defer {}
                 }
             }
-            script src=(asset_url("collab.js")) defer {}
         }
     })
 }
@@ -202,16 +212,17 @@ async fn collaborate(state: AppState, hub: CollabHub, id: Path<i64>) -> impl WsH
 
 fn page_head(title: &str) -> Markup {
     html! {
-        (maud::DOCTYPE)
-        meta charset="utf-8";
-        meta name="viewport" content="width=device-width, initial-scale=1";
-        title { (title) }
-        style {
-            "body{font-family:system-ui,sans-serif;margin:2rem;max-width:60rem}"
-            "main{display:flex;gap:2rem;align-items:flex-start}"
-            "textarea{font:1rem/1.5 ui-monospace,monospace;padding:.5rem}"
-            "aside{min-width:12rem}"
-            "#status{color:#666;font-size:.9rem}"
+        head {
+            meta charset="utf-8";
+            meta name="viewport" content="width=device-width, initial-scale=1";
+            title { (title) }
+            style {
+                "body{font-family:system-ui,sans-serif;margin:2rem;max-width:60rem}"
+                ".editor-layout{display:flex;gap:2rem;align-items:flex-start}"
+                "textarea{font:1rem/1.5 ui-monospace,monospace;padding:.5rem}"
+                "aside{min-width:12rem}"
+                "#status{color:#666;font-size:.9rem}"
+            }
         }
     }
 }
