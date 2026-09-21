@@ -30,7 +30,14 @@ cargo deny check bans                         → bans ok (warn-level; not CI-ga
 Identical outcome to both prior passes on every check.
 
 **Waivers, independently re-checked against current upstream state** (not
-taken on faith from the pin comment):
+taken on faith from the pin comment). This is the **root `deny.toml`'s three
+unique waivers only** — the ledger carries five unique waived RUSTSEC ids in
+total across all policies (`fuzz/deny.toml` repeats the root's
+`RUSTSEC-2023-0071` rather than adding a new one, but
+`examples/island-flock/deny.toml` carries two of its own,
+`RUSTSEC-2024-0370` and `RUSTSEC-2025-0141`, covered separately right after
+this table — an earlier draft's "3/3" measurement-table line conflated the
+two scopes, flagged by a Codex review comment on this PR):
 
 | RUSTSEC id | Crate | 2026-09-14 | 2026-09-21 | Changed? |
 | --- | --- | --- | --- | --- |
@@ -40,6 +47,17 @@ taken on faith from the pin comment):
 
 All three review-by dates are **2026-10-01**, now 10 days out — not due this
 pass.
+
+**The two `island-flock`-only waivers, re-checked this pass too** (not run
+last pass as a distinct check, only inspected via the "no relevant git
+activity" angle in follow-up 2): `RUSTSEC-2024-0370` (`proc-macro-error`,
+unmaintained) — `cargo info proc-macro-error` still shows max version
+1.0.4, unchanged, and the waiver's own reasoning (build-time-only,
+`yew-macro`'s proc-macro dependency, never linked into the compiled wasm
+output) doesn't depend on anything that moved. `RUSTSEC-2025-0141`
+(`bincode`) remains reachability **undetermined**, not "valid" in the same
+sense as the other four — see follow-up 2 for why that one stays open
+rather than closed. Same review-by date, 2026-10-01, for both.
 
 **Graph facts, root workspace** (`cargo deny list --format json`, same
 methodology as both prior passes — the deny.toml-scanned graph: default +
@@ -54,10 +72,20 @@ subtrees pulled by other feature combinations):
 | Workspace members | 33 | 37 | +4 |
 | Duplicate crate names (`cargo deny check bans`, warn-level) | 76 | 68 | −8 |
 
-Real feature landings explain the +4 workspace members: `git log` shows the
-macro-crate split (#2809, `autumn-macros` → four crates) landed this week,
-alongside confidential-fields (#1771/#2819) and dunning-batching (#2748/#2816)
-work already merged before last week's pass but continuing to add surface.
+**Correction, from a Codex review comment on this PR**: an earlier draft of
+this section attributed the +4 workspace members to the macro-crate split
+plus confidential-fields and dunning-batching work "continuing to add
+surface" — wrong, and not checked against the actual `Cargo.toml` diffs
+before writing it. Verified directly (`git show <commit> -- Cargo.toml`) for
+every commit that touched the root `Cargo.toml` since 09-14: the macro-crate
+split (`9800221`, #2809) added exactly three members
+(`autumn-macros-model`, `autumn-macros-repository`, `autumn-macros-support`);
+collaborative fields (`b88f78b`, #1806/#2814) added exactly one
+(`examples/collab-notes`) three days earlier. That's the full +4. The
+confidential-fields (`0f1b0c0`) and dunning-batching (`6d333f5`) commits
+never touch `Cargo.toml`'s `members` array at all — they were named in the
+earlier draft only because they were recent and thematically nearby, not
+because they were checked.
 
 **The node/duplicate counts falling is a genuine, reproducible result of this
 pass's own commands, not a methodology artifact** — `git status` was clean
@@ -151,28 +179,46 @@ Dependabot PRs, several materially older than what was previously reported:
 
 Spot-checked #1891 directly (`pull_request_read`): it's `mergeable_state:
 unstable` and GitHub has disabled automatic rebases on it ("has been open
-for over 30 days"), i.e. it is genuinely stuck, not just quiet. #1894–#1899
-and #2081 are all the same age and shape — seven individual, ungrouped
-`cargo`/`actions` bumps from a single day (2026-07-13) plus one more from
-2026-07-19, none matching the *current* `dependabot.yml` grouping config
-(`rust-deps`/`axum-ecosystem`/`diesel-ecosystem`), which suggests they
-predate that grouping being added and were never reconciled — Dependabot
-doesn't auto-close a PR just because its own config changed shape under it.
-#2302 (`validator`) is the one flagged as stale last week too, now 28 days
-(was 3+ weeks) and still unresolved, comment count 1. #2179 (`django`) is
-now 42 days (was 5+ weeks), still open, in a directory nothing else in this
-report's scope touches. #2615 (the toolchain bump) is correctly still open
-pending a human "ask before" decision per the charter, unchanged from last
-week. #2613 and #2792 are new since last week's pass and not yet stale.
+for over 30 days"), i.e. it is genuinely stuck, not just quiet.
+
+**Correction, from a Codex review comment on this PR**: an earlier draft
+lumped #1891 (`actions/checkout`) in with #1894–#1899 as "seven ungrouped
+legacy bumps" that "predate the current grouping config" — wrong for #1891
+specifically. `dependabot.yml`'s `github-actions` ecosystem stanza defines
+no `groups:` at all (re-checked directly, see the earlier `.github/
+dependabot.yml` excerpt), so an individual PR is exactly what that config
+asks for — #1891 isn't a grouping-config leftover, it's just old and stuck.
+The same applies to #2081 (`actions/upload-artifact`), also a `github-actions`
+PR. That leaves **six** genuinely orphaned `cargo`-ecosystem PRs from
+2026-07-13 (#1894 `tokio-tungstenite`, #1895 `sha1`, #1896 `x509-parser`,
+#1897 `matchit`, #1898 `rand_chacha`, #1899 `rand`) that plausibly predate
+`dependabot.yml`'s current `rust-deps`/`axum-ecosystem`/`diesel-ecosystem`
+grouping and were never reconciled — none of the six is `axum*`/`diesel*`/
+`tokio` (the `rust-deps` exclude-patterns), so each one's package now matches
+the `rust-deps` group's `"*"` pattern going forward, yet Dependabot hasn't
+superseded any of them the way it superseded #2616/#2629 into a fresh grouped
+diff last week (per the 09-14 report's pain-ledger section) — worth a human
+checking why, not assumed here.
+
+Also corrected: the age-range total. #2302 (`validator`) is the one flagged
+as stale last week too, now 28 days (was 3+ weeks) and still unresolved,
+comment count 1. #2179 (`django`) is now 42 days (was 5+ weeks), still open,
+in a directory nothing else in this report's scope touches. #2615 (the
+toolchain bump) is correctly still open pending a human "ask before" decision
+per the charter, unchanged from last week. #2613 and #2792 are new since last
+week's pass and not yet stale. Counting every PR in the table whose age falls
+in the 28–69 day band gives **ten**, not eight: the seven at 69 days
+(#1891 + the six `cargo` PRs above), #2081 at 64, #2179 at 42, #2302 at 28.
 
 This is **not** a Ballast finding to act on directly — merging, closing, or
 nudging any of these 13 PRs is a human call (several are exactly the kind of
 individual-bump review the charter prefers to see grouped, and #2615 is
 explicitly an "ask before" toolchain change) — but it's a materially
 different picture than "two stale PRs" and worth a maintainer's attention:
-roughly 8 of the 13 are old enough (28–69 days) to be queue rot rather than
-normal review lag, and the oldest seven don't fit the current grouping
-config at all.
+**10 of the 13** are old enough (28–69 days) to be queue rot rather than
+normal review lag, of which six (not seven — #1891 is correctly ungrouped
+by design) are `cargo`-ecosystem PRs that don't fit the current grouping
+config.
 
 **Discrepancy surfaced by this pass's own `git push`, not investigated
 further — flagged rather than assessed.** Pushing this report's commit
@@ -228,9 +274,10 @@ None to the dependency graph. This report is the only artifact.
 | Scheduled batch, root graph | 74 packages, Dependabot's territory | 92 packages, still Dependabot's territory |
 | Scheduled batch, `fuzz/` graph | 58 packages, uncovered by any process | 66 packages, still uncovered |
 | Scheduled batch, `island-flock/` graph | 29 packages, uncovered, MSRV unconfirmed | 31 packages, still uncovered, still unconfirmed |
-| Open Dependabot PRs | not checked with `is:open` | 13, of which ~8 are 28–69 days old |
+| Open Dependabot PRs | not checked with `is:open` | 13, of which 10 are 28–69 days old |
 | Wildcard ranges / unpinned git refs | 0 / 0 | 0 / 0 |
-| Existing waivers still valid on re-check | 3/3 | 3/3 |
+| Existing waivers re-checked (root graph only) | 3/3 | 3/3 |
+| Existing waivers re-checked (satellite-only: `island-flock/deny.toml`) | not tallied separately | 2/2 unchanged (`RUSTSEC-2024-0370` still unmaintained/unreachable; `RUSTSEC-2025-0141` still open — reachability undetermined, not "valid", see follow-up 2) |
 
 ## 🔬 Reproduce
 
@@ -291,16 +338,25 @@ grep -A1 '^name = "parking_lot"' Cargo.lock
    catches a new unwaived advisory or disallowed license on every
    Dependabot PR mechanically; what's still uncovered is reachability
    judgment and usage/cost analysis on Dependabot's own bumps specifically.
-6. **Narrowed this pass.** Last week flagged "two stale Dependabot PRs" as a
-   queue-health observation; this pass's `is:open`-filtered query found the
-   real number is 13 open, ~8 of them 28–69 days old (see the pain-ledger
-   table above), including seven from a single day (2026-07-13) that predate
-   the current grouping config and don't match any of its patterns. Still
-   not something this pass acts on (closing or merging any of them is a
-   human call, and #2615 is explicitly an "ask before" toolchain bump), but
-   the scale of the backlog is materially different from what either prior
-   pass reported, and is worth a maintainer pass of its own — reconciling
-   or closing the seven ungrouped legacy PRs, at minimum.
+6. **Narrowed this pass, then corrected once more during its own review.**
+   Last week flagged "two stale Dependabot PRs" as a queue-health
+   observation; this pass's `is:open`-filtered query found the real number
+   is 13 open, **10** of them 28–69 days old (see the pain-ledger table
+   above — an earlier draft said "~8", undercounting; a Codex review
+   comment on this PR caught it). Of the seven at 69 days, **six** are
+   `cargo`-ecosystem PRs that plausibly predate the current grouping config
+   and don't match any of its group patterns; the seventh, #1891, is a
+   `github-actions` PR that's individual **by design** (that ecosystem's
+   `dependabot.yml` stanza defines no groups at all) — a second Codex
+   comment caught an earlier draft folding it into the same "legacy
+   grouping leftover" bucket it doesn't belong in. Still not something this
+   pass acts on (closing or merging any of them is a human call, and #2615
+   is explicitly an "ask before" toolchain bump), but the scale of the
+   backlog is materially different from what either prior pass reported,
+   and is worth a maintainer pass of its own — reconciling or closing the
+   six orphaned `cargo` PRs, at minimum, and separately deciding whether
+   #1891/#2081 (both `github-actions`, both stuck) need anything beyond
+   ordinary review.
 7. The `fuzz/` (66 packages) and `island-flock/` (31 packages) scheduled
    batches remain uncovered by any process — `dependabot.yml` unchanged
    since the decision was raised. Same two options as last week: extend
