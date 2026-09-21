@@ -160,10 +160,12 @@ warm-edit axis, and a larger sample would be needed to state a tighter bound
 — unlike the cold-build case, where Onramp's report found a large, clearly
 resolved gap between them (~18% vs ~8.7%, no such ambiguity).
 
-No condition's sample range overlaps another's (baseline min 3.951 > both
-reduced-condition maxima; `debuginfo=0`/`debuginfo=1` overlap each other
-completely) — a clean separation on 6 samples each, not a borderline call
-the way Onramp's cold-build `debuginfo=0` number was against its 20% floor.
+Baseline's sample range doesn't overlap either reduced condition's (baseline
+min 3.951 > both reduced-condition maxima; `debuginfo=0` and `debuginfo=1`
+overlap each other completely, consistent with the Welch's-test result
+above) — the baseline-vs-reduced effect is a clean separation on 6 samples
+each, not a borderline call the way Onramp's cold-build `debuginfo=0` number
+was against its 20% floor.
 
 **Worst case probed:** the warm-up (first-in-block) samples, deliberately
 excluded from the table above because they are not steady-state, are
@@ -261,7 +263,7 @@ two still-open items neither report has closed:
 # discards *any* uncommitted edits to these two files, not just the
 # experiment's own, and this recipe neither requires a clean tree nor backs
 # up what was there first):
-#   git worktree add /tmp/prospect-debuginfo-repro trunk-dev
+#   git worktree add --detach /tmp/prospect-debuginfo-repro origin/trunk-dev
 #   cd /tmp/prospect-debuginfo-repro
 
 # Pre-warm deps + autumn-web once:
@@ -298,7 +300,7 @@ run_block() {
     i=$((i + 1))
     sed -i "s/\"Hello, Autumn![^\"]*\"/\"Hello, Autumn! v${i}\"/" examples/hello/src/main.rs
     S=$(date +%s.%N); cargo build -p hello || { echo "cargo build failed" >&2; exit 1; }; E=$(date +%s.%N)
-    echo "$E - $S" | bc   # no /usr/bin/time in this sandbox
+    awk -v s="$S" -v e="$E" 'BEGIN { printf "%.3f\n", e - s }'   # no /usr/bin/time in this sandbox
   done
 }
 
