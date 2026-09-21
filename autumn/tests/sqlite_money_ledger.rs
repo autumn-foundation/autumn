@@ -1212,10 +1212,9 @@ fn is_sqlite_contention(err: &autumn_web::AutumnError) -> bool {
 }
 
 /// Every test above races nothing, or races through a pool of size 1 (which
-/// makes `pool.get()` itself the serializer). This is the one test in this
-/// file where distinct `tokio::spawn` tasks, each with its own checked-out
-/// connection from a pool of 8, actually submit to the ledger at the same
-/// instant.
+/// makes `pool.get()` itself the serializer). This is raced for real, against
+/// `pool`, by distinct `tokio::spawn` tasks each with their own checked-out
+/// connection.
 ///
 /// The oracle is the module's own doc (`autumn/src/money/ledger.rs`, the
 /// `check_resulting_balances` rustdoc): a disallow-negative account "gets the
@@ -1224,18 +1223,20 @@ fn is_sqlite_contention(err: &autumn_web::AutumnError) -> bool {
 ///
 /// A wallet is funded to $100 (an asset account: funded by a debit, spent by a
 /// credit — the reverse of `platform:cash`'s liability-side siblings above).
-/// 100 tasks then race a genuinely distinct $80 withdrawal each (not the same
-/// idempotency key, so this never exercises the replay path). At most one may
-/// ever post; the framework must refuse the rest, and the stored balance must
-/// account for exactly what posted.
-#[tokio::test]
-async fn concurrent_withdrawals_cannot_double_spend_a_disallow_negative_wallet() {
+/// `RACERS` tasks then race a genuinely distinct $80 withdrawal each (not the
+/// same idempotency key, so this never exercises the replay path). At most
+/// one may ever post; the framework must refuse the rest, and the stored
+/// balance must account for exactly what posted.
+///
+/// Two callers below give `pool` a different target on purpose: `cache=shared`
+/// (table-level `SQLITE_LOCKED`, found real contention filed as #2881) and a
+/// tempfile-backed database (page/WAL-level `SQLITE_BUSY_SNAPSHOT`, the
+/// configuration the module's doc actually describes and the one "normal"
+/// `SQLite` deployments use) exercise genuinely different `SQLite` locking
+/// paths — Codex #2880 caught that the first version of this test only ever
+/// drove the `cache=shared` path.
+async fn race_withdrawals_against_disallow_negative_wallet(pool: SqlitePool, racers: usize) {
     use autumn_web::db::Db;
-
-    const RACERS: usize = 100;
-    const POOL_SIZE: usize = 8;
-
-    let pool = boot_pool_sized("mlg_double_spend", POOL_SIZE).await;
 
     {
         let mut db = Db::connect_for_test(&pool).await.expect("db checkout");
@@ -1261,8 +1262,8 @@ async fn concurrent_withdrawals_cannot_double_spend_a_disallow_negative_wallet()
         .expect("funding posts");
     }
 
-    let mut handles = Vec::with_capacity(RACERS);
-    for i in 0..RACERS {
+    let mut handles = Vec::with_capacity(racers);
+    for i in 0..racers {
         let pool = pool.clone();
         handles.push(tokio::spawn(async move {
             let mut db = Db::connect_for_test(&pool).await.expect("db checkout");
@@ -1329,7 +1330,7 @@ async fn concurrent_withdrawals_cannot_double_spend_a_disallow_negative_wallet()
     // *recognized* refusal rather than a silently swallowed, unrelated error.
     assert!(
         posted <= 1,
-        "double-spend: {posted} of {RACERS} concurrent $80 withdrawals posted \
+        "double-spend: {posted} of {racers} concurrent $80 withdrawals posted \
          against a $100 disallow-negative wallet (refused_negative={refused_negative}, \
          contention_errors={contention_errors})"
     );
@@ -1349,4 +1350,51 @@ async fn concurrent_withdrawals_cannot_double_spend_a_disallow_negative_wallet()
         "the ledger's own stored balance went negative: {balance}"
     );
     assert_books_balance(&mut conn).await;
+}
+
+/// The `cache=shared` + `mode=memory` path: table-level `SQLITE_LOCKED`
+/// contention, no busy-handler retry (#2881). A framework-supported,
+/// deliberately shareable-across-a-pool configuration
+/// (`sqlite_target_is_memory`'s doc in `autumn/src/db.rs`), not merely a test
+/// convenience.
+#[tokio::test]
+async fn concurrent_withdrawals_cannot_double_spend_a_disallow_negative_wallet() {
+    let pool = boot_pool_sized("mlg_double_spend", 8).await;
+    race_withdrawals_against_disallow_negative_wallet(pool, 100).await;
+}
+
+/// The tempfile-backed path: a real file, so `journal_mode = WAL` actually
+/// takes effect (it is a no-op for a pure in-memory database — see
+/// `sqlite_connection_pragmas`'s doc in `autumn/src/db.rs`), giving the
+/// page/WAL-level `SQLITE_BUSY_SNAPSHOT` contention `autumn/src/money/ledger.rs`
+/// and `docs/guide/money.md` actually describe, and the configuration
+/// "normal" `SQLite` deployments use. Codex on #2880: the `cache=shared`
+/// test above never exercises this path, so a regression specific to it
+/// (e.g. a double-spend under file-backed WAL contention) would go
+/// undetected without this second test.
+#[tokio::test]
+async fn concurrent_withdrawals_cannot_double_spend_a_disallow_negative_wallet_file_backed() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let db_path = tmp.path().join("double_spend.db");
+    let config = DatabaseConfig {
+        url: Some(format!("sqlite://{}", db_path.display())),
+        primary_pool_size: Some(8),
+        ..Default::default()
+    };
+    let pool: SqlitePool = create_pool(&config)
+        .expect("sqlite pool builds")
+        .expect("a url is configured");
+    {
+        let mut conn = pool.get().await.expect("checkout");
+        for ddl in [LEDGER_UP, ORDERS_UP] {
+            conn.batch_execute(ddl)
+                .await
+                .unwrap_or_else(|err| panic!("apply DDL: {err}\n{ddl}"));
+        }
+    }
+
+    race_withdrawals_against_disallow_negative_wallet(pool, 100).await;
+
+    // The tempdir must outlive every connection's use of the file.
+    drop(tmp);
 }
