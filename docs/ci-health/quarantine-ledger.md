@@ -1542,6 +1542,53 @@ without also filling in the intake form above.
   `.github/workflows/manual-job-tracking-rerun-check.yml` — see the dated
   update on the `job_tracking_stores_integration` entry below for why now,
   what it does, and why it isn't dispatchable yet.
+- **2026-09-21 update — 13th consecutive pass, harness still undispatched;
+  zero new hits on any of the three `live_upgrade` signatures.** Sampled
+  `ci.yml` `pull_request` runs from the 2026-09-20 report's own cutoff
+  (2026-09-20T07:33:19Z, exclusive) to 2026-09-21T09:55:07Z (~26.4h, one
+  `perPage=100`/`page=1` query whose own span, 2026-09-19T01:29:40Z–
+  2026-09-21T09:55:07Z, fully covers the window with margin on both ends, so
+  no second page was needed) — 75 runs in-window: 55 cancelled, 15 success,
+  5 failure. All 5 failures triaged at job level:
+  - Run 35540844428 (`claude/friendly-ritchie-d36hku`, PR #2842, a docs-only
+    change) failed both `Test (macos-latest)` — `autumn-macros-support`'s own
+    unit test `crate_path::tests::resolve_autumn_web_name_dashed_rename_is_sanitized`
+    (`left: "autumn_web", right: "autumn_web_05"`), unrelated to this docs PR
+    and not matching any tracked signature — and `SQLite runtime
+    (feature=sqlite)`, a **new** signature logged below as its own entry.
+  - Run 35523247491 (`claude/macro-split-decomposition-jalk90`, an
+    in-progress crate-split/rename branch, no open PR) failed the same two
+    jobs: `SQLite runtime (feature=sqlite)` with the identical new signature,
+    and `Test (Docker)` with a repeat of the already-**closed**
+    `job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it`
+    panic (`"record should be past its configured TTL"` at
+    `job_tracking_stores_integration.rs:264:5` — the pre-fix line number, not
+    the post-fix poll-based version). **Not a reopening**: this run completed
+    2026-09-20T17:54:02Z, before the fix (PR #2867, merged
+    2026-09-20T19:35:35Z UTC) and the ledger close-out (PR #2874, merged
+    2026-09-20T22:09:37Z UTC) — this branch's base predates both, so it is
+    still running the old, known-~2%-flaky test body. Consistent with the
+    closed entry's own baseline, not evidence against it.
+  - Run 35530941996 (`claude/epic-meitner-eh6w1m`) failed `Test (Docker)`
+    with the **same** pre-fix `job_tracking_stores_integration` signature
+    (completed 2026-09-20T20:15:19Z, also before the 22:09:37Z UTC
+    fix/close) — same explanation, same non-reopening.
+  - Run 35539828393 (`claude/intelligent-wright-ebjkn4`, closing the gap the
+    2026-09-20 report left open for this branch) failed `Test (Docker)` on
+    `examples/saas`'s own
+    `create_project_failure_redisplays_the_dashboard_with_name_preserved`
+    (`./tests/integration_test.rs:537`) — branch-owned WIP in an unrelated
+    example app, not matching any tracked signature.
+  - Run 35522888590 (`dependabot/github_actions/dtolnay/rust-toolchain-1.120.0`)
+    repeats its already-documented own action-pin-bump break (`SQLite runtime
+    (feature=sqlite)`, `MSRV (1.88.0)`) — that PR's own subject matter,
+    unmerged.
+
+  `manual-macos-contention-check.yml`: still `total_count: 0` against
+  `workflow_dispatch` runs, checked 2026-09-21T~10:0xZ — **13th** straight
+  pass since it became dispatchable 2026-09-08T15:07:44Z (now ~306.8 hours
+  idle, past 12.75 days). Still needs a human sign-off for new macOS CI
+  spend; not dispatched this pass for that reason.
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
   committed as `.github/workflows/manual-macos-contention-check.yml`, gated
@@ -1618,6 +1665,9 @@ without also filling in the intake form above.
 - **2026-09-18 update**: no repeat in the ~21.6h window sampled this pass
   (see the `live_upgrade` entry's 2026-09-18 dated update above for the
   window and method).
+- **2026-09-21 update**: no repeat in the ~26.4h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-21 dated update above for the
+  window and method).
 
 ### `sim_fault_plan::same_seed_replays_a_byte_identical_outcome_100_times`
 
@@ -1645,4 +1695,87 @@ without also filling in the intake form above.
 - **2026-09-18 update**: no repeat in the ~21.6h window sampled this pass
   (see the `live_upgrade` entry's 2026-09-18 dated update above for the
   window and method). Still n=1, still not campaigned.
+- **2026-09-21 update**: no repeat in the ~26.4h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-21 dated update above for the
+  window and method). Still n=1, still not campaigned.
+
+### `sqlite_jobs_scheduler_e2e::sqlite_job_backend_tracks_job_status_durably`
+
+- **New, 2026-09-21.** Two organic hits in the ~26.4h window sampled this
+  pass, both on the `SQLite runtime (feature=sqlite)` job, both the identical
+  panic:
+  ```
+  tracked enqueue: AutumnError { status: 500, inner: StringError("sqlite job
+  enqueue failed: ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
+  constraint"), ... }
+  ```
+  at `autumn/tests/sqlite_jobs_scheduler_e2e.rs:1301:6`.
+  - Run 106158118450 (run 35540844428, branch `claude/friendly-ritchie-d36hku`,
+    PR #2842 "Folio: make Autumn's log settings findable" — **docs-only**, "0
+    pages added" by its own title, merged as `4a448ab`), 2026-09-20T22:20:48Z.
+  - Run 106110875320 (run 35523247491, branch
+    `claude/macro-split-decomposition-jalk90`, an in-progress
+    autumn-macros crate-split/rename branch, no open PR),
+    2026-09-20T16:50:08Z.
+- **Not branch-owned**: PR #2842 is a pure docs change (confirmed by its own
+  title/scope) touching no job or SQLite code, yet hit the byte-identical
+  failure as an unrelated in-progress refactor branch. That rules out either
+  branch's own diff as the cause and points at a pre-existing race in
+  `trunk-dev` itself (in the product code, the test, or both) rather than WIP.
+- **Mechanism — confirmed source location, unconfirmed cause.** The panic
+  originates in `SqliteJobBackend`'s enqueue path
+  (`autumn/src/job/sqlite.rs:429-432`): the `INSERT ... ON CONFLICT (name,
+  unique_key) WHERE unique_key IS NOT NULL AND status IN ('enqueued',
+  'running') DO NOTHING` targets a **partial unique index** unconditionally,
+  for every job — including this test's `sqlite_tracked_job`, which declares
+  no `JobUniqueness` at all. SQLite requires an `ON CONFLICT` target to match
+  an existing index's column list AND partial-index predicate exactly; this
+  specific error text is what SQLite raises on a target/index *mismatch*, not
+  on a duplicate-value constraint violation — i.e. the index this clause
+  expects did not exist, in the expected shape, on this connection at
+  execution time.
+
+  Leading (**unconfirmed**) hypothesis: a readiness race between the fresh
+  per-test SQLite pool's migrations (which must be what creates this partial
+  index) and `job::start_runtime`/`enqueue_tracked` being able to submit work
+  before that migration has completed. Checked `build_sqlite_pool` (test
+  helper, `sqlite_jobs_scheduler_e2e.rs:78-88`) and `create_pool`
+  (`autumn/src/db.rs:1768`): `create_pool` is synchronous and does not itself
+  run migrations, so the pool handed to `start_runtime` carries no migration
+  guarantee from that call alone. Time-boxed before tracing exactly where/when
+  the migration creating this index runs relative to `start_runtime`
+  accepting its first enqueue — **this hypothesis is not confirmed**.
+
+  **Ruled out**: cross-test interference via the process-global
+  `GLOBAL_JOB_CLIENT` this test depends on
+  (`autumn_web::job_tracking::enqueue_tracked` routes through
+  `job::global_job_client()`, per `autumn/src/job_tracking.rs:1134`). Checked
+  every test in this same file (`sqlite_jobs_scheduler_e2e.rs`) that calls
+  `job::start_runtime`: all of them hold `global_job_runtime_test_lock()`
+  first. The tests that do *not* hold that lock
+  (`in_process_scheduler_coordinator_fires_a_task_on_sqlite`,
+  `distributed_lock_*_on_sqlite`, `sqlite_scheduler_lease_*`,
+  `sqlite_tracking_store_*`) build their own scoped coordinator/lock/store
+  instances against their own local `pool`, never `start_runtime` or the
+  global client — so they do not appear able to race this test's global-state
+  window. Not exhaustively verified across every other file that might
+  compile into the same `SQLite runtime (feature=sqlite)` job's test
+  binaries, but no interference path found within this file.
+- **Test-vs-product verdict: not yet rendered.** Could be a test-file-local
+  migration-ordering gap, or a genuine readiness gap in `start_runtime`'s
+  public contract (accepting enqueues before the schema it depends on is
+  guaranteed present) — the second would be a product defect, not a test
+  defect. Undetermined.
+- **Not campaigned, no fix PR**: n=2, no Tier 1 rerun-rate baseline — this
+  role's hard gate does not permit a fix PR on this evidence alone. Next
+  step: a same-commit rerun harness for this test against the
+  `SQLite runtime (feature=sqlite)` feature set (same pattern as
+  `.github/workflows/manual-job-tracking-rerun-check.yml`), and tracing the
+  exact migration/readiness ordering in `job::start_runtime` before
+  proposing any fix.
+- **Does not appear to have blocked either PR**: #2842 merged
+  (`4a448ab`); whether that specific failing run was superseded by a later
+  green rerun on the same PR, or `SQLite runtime` wasn't a required check at
+  merge time, was not independently confirmed this pass — out of scope for
+  today's time-boxed triage.
 
