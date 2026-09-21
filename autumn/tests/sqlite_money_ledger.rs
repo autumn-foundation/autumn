@@ -56,9 +56,20 @@ const ORDERS_UP: &str = "CREATE TABLE ml_orders (\
  )";
 
 async fn boot_pool(db_name: &str) -> SqlitePool {
+    boot_pool_sized(db_name, 1).await
+}
+
+/// Like [`boot_pool`], but with more than the one connection every other test
+/// in this file uses.
+///
+/// Every test above this point shares a pool of size 1, which makes
+/// `pool.get()` itself serialize every "concurrent" attempt — there has never
+/// been a test in this file where two `SQLite` connections actually raced the
+/// ledger at the same time. This exists for the one test that does that.
+async fn boot_pool_sized(db_name: &str, pool_size: usize) -> SqlitePool {
     let config = DatabaseConfig {
         url: Some(format!("sqlite://file:{db_name}?mode=memory&cache=shared")),
-        primary_pool_size: Some(1),
+        primary_pool_size: Some(pool_size),
         ..Default::default()
     };
     let pool: SqlitePool = create_pool(&config)
@@ -1180,4 +1191,115 @@ async fn duplicated_retried_and_killed_charges_post_exactly_once() {
         0,
         "no transaction may be unbalanced"
     );
+}
+
+// ── Real concurrency (Snag) ─────────────────────────────────────────────────
+
+/// Every test above races nothing, or races through a pool of size 1 (which
+/// makes `pool.get()` itself the serializer). This is the one test in this
+/// file where distinct `tokio::spawn` tasks, each with its own checked-out
+/// connection from a pool of 8, actually submit to the ledger at the same
+/// instant.
+///
+/// The oracle is the module's own doc (`autumn/src/money/ledger.rs`, the
+/// `check_resulting_balances` rustdoc): a disallow-negative account "gets the
+/// balance this transaction *would* leave, not the one it has", and the
+/// figure it checks is "exact" — under concurrency, not only sequentially.
+///
+/// A wallet is funded to $100 (an asset account: funded by a debit, spent by a
+/// credit — the reverse of `platform:cash`'s liability-side siblings above).
+/// 100 tasks then race a genuinely distinct $80 withdrawal each (not the same
+/// idempotency key, so this never exercises the replay path). At most one may
+/// ever post; the framework must refuse the rest, and the stored balance must
+/// account for exactly what posted.
+#[tokio::test]
+async fn concurrent_withdrawals_cannot_double_spend_a_disallow_negative_wallet() {
+    use autumn_web::db::Db;
+
+    const RACERS: usize = 100;
+    const POOL_SIZE: usize = 8;
+
+    let pool = boot_pool_sized("mlg_double_spend", POOL_SIZE).await;
+
+    {
+        let mut db = Db::connect_for_test(&pool).await.expect("db checkout");
+        db.tx(|conn| {
+            async move {
+                ledger::ensure_account(conn, Account::new("wallet:racer", Usd::currency())).await?;
+                ledger::ensure_account(conn, Account::new("platform:cash", Usd::currency()))
+                    .await?;
+                let fund = Transaction::new(
+                    IdempotencyKey::new("fund").expect("key"),
+                    vec![
+                        Posting::debit("wallet:racer", usd(10_000)),
+                        Posting::credit("platform:cash", usd(10_000)),
+                    ],
+                );
+                ledger::post(conn, &fund).await?;
+                ledger::set_allow_negative(conn, "wallet:racer", false).await?;
+                Ok::<_, autumn_web::AutumnError>(())
+            }
+            .scope_boxed()
+        })
+        .await
+        .expect("funding posts");
+    }
+
+    let mut handles = Vec::with_capacity(RACERS);
+    for i in 0..RACERS {
+        let pool = pool.clone();
+        handles.push(tokio::spawn(async move {
+            let mut db = Db::connect_for_test(&pool).await.expect("db checkout");
+            db.tx(|conn| {
+                async move {
+                    let withdraw = Transaction::new(
+                        IdempotencyKey::new(format!("withdraw:{i}")).expect("key"),
+                        vec![
+                            Posting::credit("wallet:racer", usd(8_000)),
+                            Posting::debit("platform:cash", usd(8_000)),
+                        ],
+                    );
+                    ledger::post(conn, &withdraw).await
+                }
+                .scope_boxed()
+            })
+            .await
+        }));
+    }
+
+    let mut posted = 0i64;
+    for handle in handles {
+        match handle.await.expect("task join") {
+            Ok(outcome) if outcome.is_posted() => posted += 1,
+            Ok(_) => panic!("a distinct idempotency key can never replay"),
+            // Refused for a negative balance, or lost a real SQLite write race
+            // (contention this test deliberately creates by racing 100 tasks
+            // over 8 connections against one row) — either way it must not
+            // post, which the assertions below check for every non-`Posted`
+            // outcome uniformly.
+            Err(_) => {}
+        }
+    }
+
+    assert!(
+        posted <= 1,
+        "double-spend: {posted} of {RACERS} concurrent $80 withdrawals posted \
+         against a $100 disallow-negative wallet"
+    );
+
+    let mut conn = pool.get().await.expect("checkout");
+    let balance = ledger::balance(&mut conn, "wallet:racer")
+        .await
+        .expect("balance")
+        .minor();
+    assert_eq!(
+        balance,
+        10_000 - posted * 8_000,
+        "stored balance must equal funded minus every transaction that actually posted"
+    );
+    assert!(
+        balance >= 0,
+        "the ledger's own stored balance went negative: {balance}"
+    );
+    assert_books_balance(&mut conn).await;
 }
