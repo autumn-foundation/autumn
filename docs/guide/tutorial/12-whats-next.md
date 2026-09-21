@@ -56,7 +56,7 @@ sending a pull request.
 
 ---
 
-> **Chapters 2, 3, 5, 6, and 8, and part of Chapter 7, aren't written yet** —
+> **Chapters 2, 3, 4, 5, 6, and 8, and part of Chapter 7, aren't written yet** —
 > see those chapters for pointers to the equivalent, already-working ground
 > in the [Getting Started guide](../getting-started.md).
 

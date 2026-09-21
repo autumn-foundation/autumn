@@ -44,13 +44,15 @@ Expected project state with both HTML and JSON routes.
 
 ---
 
-> **Not written yet.** This chapter's narrative doesn't exist yet. The same
-> ground — the same todo app, the same `Json<T>` list/create handlers — is
-> already covered and tested in the Getting Started guide's
-> ["Query the database"](../getting-started.md#query-the-database) section.
-> Read that, then continue to
-> [Chapter 9 — Error Handling](09-errors.md). You can also check the finished
-> code in [`examples/todo-app/`](../../../examples/todo-app/).
+> **Not written yet.** This chapter's narrative doesn't exist yet. The Getting
+> Started guide's
+> ["Query the database"](../getting-started.md#query-the-database) section
+> shows the same `Json<T>` request/response pattern this chapter needs — but
+> mounts its list handler at `GET /todos` rather than `GET /api/todos`, so
+> it isn't a drop-in copy of this chapter's goal. For the actual working
+> `/api/todos` endpoints, see
+> [`examples/todo-app/src/routes/api.rs`](../../../examples/todo-app/src/routes/api.rs),
+> then continue to [Chapter 9 — Error Handling](09-errors.md).
 
 ---
 
