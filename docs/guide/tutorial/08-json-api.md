@@ -52,12 +52,14 @@ Expected project state with both HTML and JSON routes.
 > `#[post("/todos")]` but mounted at `/api/todos` via `.scoped("/api", ...)`
 > in `main.rs` (see the `.scoped(...)` call there), matching this chapter's
 > goal — but that scope also requires a bearer token
-> (`POST /api/tokens` first), which is more than this chapter's "testable
-> with curl" goal implies; drop the `RequireApiToken` extractor for an
-> unauthenticated version instead if you don't want that step yet. The
-> Getting Started guide's
-> ["Query the database"](../getting-started.md#query-the-database) section
-> shows the same `Json<T>` request/response pattern without the token
+> (`POST /api/tokens` first) via a `RequireApiToken` Tower layer, and the
+> handlers themselves take an `ApiToken` extractor that depends on it, which
+> is more than this chapter's "testable with curl" goal implies. Don't just
+> drop the `RequireApiToken` layer — the handlers still take an `ApiToken`
+> extractor and would 401 with nothing populating it. For unauthenticated
+> `list`/`create` handlers instead, copy the Getting Started guide's
+> ["Query the database"](../getting-started.md#query-the-database) section,
+> which shows the same `Json<T>` request/response pattern without the token
 > layer. Continue to
 > [Chapter 9 — Error Handling](09-errors.md) once yours responds to curl.
 
