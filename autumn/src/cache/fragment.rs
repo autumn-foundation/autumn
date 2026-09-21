@@ -36,8 +36,8 @@ use maud::{Markup, PreEscaped};
 
 use super::{Cache, get_cached, insert_cached};
 
-/// The ambient tenant folded into every fragment cache key (Warden
-/// 2026-09-21, `docs/security/2026-09-21-fragment-cache-tenant-key/`).
+/// The ambient tenant, when one is resolved, folded into a fragment cache
+/// key (Warden 2026-09-21, `docs/security/2026-09-21-fragment-cache-tenant-key/`).
 ///
 /// A fragment's `identity` is commonly a record's own primary key
 /// (`docs/guide/fragment-caching.md`'s own Quick Start:
@@ -60,31 +60,65 @@ use super::{Cache, get_cached, insert_cached};
 /// instead of being the one primitive where it silently doesn't apply.
 ///
 /// `None` outside any tenancy-resolved request context (a single-tenant app,
-/// a non-request caller) — the key is unchanged there, exactly like
-/// `#[cached]`'s `Option<String>` component.
-fn tenant_key_component() -> String {
-    let tenant = crate::tenancy::CURRENT_TENANT
+/// a non-request caller) — callers must build the *exact* pre-fix key in
+/// that case (see [`fragment_key`]), unchanged, so an app upgrading with
+/// existing cache entries (a permanent, `ttl = None` Redis entry has no
+/// other way to expire) does not go cold across the board merely because
+/// this primitive learned about tenancy.
+///
+/// Preserves `CURRENT_TENANT`'s own `Option` discriminant rather than
+/// collapsing it to a string: an *empty* resolved tenant id (`Some(String::new())`,
+/// reachable through the public `with_tenant`) must stay distinguishable
+/// from no tenant context at all (`None`) — collapsing both to the same
+/// empty-string component would let an app that resolves an empty tenant id
+/// alias the no-tenant case instead of getting its own isolated slot.
+fn tenant_key_component() -> Option<String> {
+    crate::tenancy::CURRENT_TENANT
         .try_with(Clone::clone)
         .ok()
         .flatten()
-        .unwrap_or_default();
-    // Length-prefixed for the same reason `identity` is below: without this,
-    // an absent tenant (empty string) could alias a tenant whose id happens
-    // to be a prefix of the next segment. Keeping the guarantee local to this
-    // module rather than relying on `TenancyConfig` rejecting an empty
-    // resolved tenant id elsewhere.
-    format!("{}:{tenant}", tenant.len())
 }
 
-/// Cache a rendered Maud fragment keyed by `(tenant, identity, version)`.
+/// Build a fragment cache key from an optional tenant, a `Display` identity,
+/// and a `Display` version.
+///
+/// `identity` is length-prefixed so a `:` inside it cannot shift the
+/// identity/version boundary and alias two distinct fragments — e.g.
+/// (identity="a:b", version="c") must not collide with (identity="a",
+/// version="b:c"). The byte length pins where the identity ends.
+///
+/// `tenant` is `None` for the exact pre-fix key (no tenant segment at all).
+/// `Some(tenant)` — including an empty string — is folded in behind a
+/// literal, non-numeric `tenant=` marker that can never collide with the
+/// `None` key's leading decimal identity-length, and is itself
+/// length-prefixed so distinct tenant ids (including the empty one) can
+/// never alias each other.
+fn fragment_key(
+    prefix: &str,
+    tenant: Option<&str>,
+    identity: &str,
+    version: impl std::fmt::Display,
+) -> String {
+    match tenant {
+        Some(tenant) => format!(
+            "{prefix}tenant={}:{tenant}:{}:{identity}:{version}",
+            tenant.len(),
+            identity.len()
+        ),
+        None => format!("{prefix}{}:{identity}:{version}", identity.len()),
+    }
+}
+
+/// Cache a rendered Maud fragment keyed by `(identity, version)`, plus the
+/// ambient tenant when a tenant context is resolved.
 ///
 /// - **Hit**: returns the cached `Markup` without running `render`.
 /// - **Miss**: calls `render()`, stores the result, and returns it.
 /// - **No cache** (`cache = None`): calls `render()` on every call — no panic.
 ///
-/// The cache key folds in the ambient resolved tenant (see
-/// [`tenant_key_component`]) ahead of `identity` and `version` (each
-/// length-prefixed so a `:` inside either can't alias two fragments).
+/// The cache key folds in the ambient resolved tenant ahead of `identity`
+/// and `version` when a tenant context is resolved; outside one, the key is
+/// the exact pre-fix `(identity, version)` key.
 /// Storing the rendered `String` via [`insert_cached`] means the fragment
 /// works with both the moka in-process backend and the Redis shared backend
 /// (which serializes via serde JSON), and honours an optional TTL.
@@ -109,13 +143,9 @@ pub fn cache_fragment(
         return render();
     };
 
-    // Length-prefix the identity so a `:` inside it cannot shift the
-    // identity/version boundary and alias two distinct fragments — e.g.
-    // (identity="a:b", version="c") must not collide with (identity="a",
-    // version="b:c"). The byte length pins where the identity ends.
     let identity = identity.to_string();
     let tenant = tenant_key_component();
-    let key = format!("fragment:{tenant}:{}:{identity}:{version}", identity.len());
+    let key = fragment_key("fragment:", tenant.as_deref(), &identity, version);
 
     if let Some(html) = get_cached::<String>(cache, &key) {
         // Hit: reconstruct Markup from the cached String without re-escaping.
@@ -219,13 +249,16 @@ pub fn cache_fragment_in(
     // prefix `MokaCache` matches on and `RedisCache` builds its `SCAN MATCH`
     // from, so the declared id and the runtime key space finally agree. The
     // ambient tenant (see `tenant_key_component`) is folded in *after* that
-    // prefix so a namespace sweep is unaffected by which tenant wrote a given
-    // entry.
+    // prefix — when resolved — so a namespace sweep is unaffected by which
+    // tenant wrote a given entry; when unresolved, the key is the exact
+    // pre-fix `{namespace}:fragment:{identity}:{version}` key.
     let identity = identity.to_string();
     let tenant = tenant_key_component();
-    let key = format!(
-        "{namespace}:fragment:{tenant}:{}:{identity}:{version}",
-        identity.len()
+    let key = fragment_key(
+        &format!("{namespace}:fragment:"),
+        tenant.as_deref(),
+        &identity,
+        version,
     );
 
     if let Some(html) = get_cached::<String>(cache, &key) {
@@ -907,6 +940,61 @@ mod tests {
             counter.load(Ordering::SeqCst),
             2,
             "no cache → always render"
+        );
+    }
+
+    // ── Compatibility: no tenant resolved → exact pre-fix key (Codex review
+    // round 2, PR #2884) ────────────────────────────────────────────────────
+
+    #[test]
+    fn no_tenant_context_reads_a_pre_fix_legacy_key() {
+        // An app upgrading with an existing, permanent (`ttl = None`) cache
+        // entry must not go cold across the board just because this
+        // primitive learned about tenancy. Hand-write the exact key the
+        // pre-fix `cache_fragment` computed and confirm a post-fix call with
+        // no tenant context resolved (`CURRENT_TENANT` unset — the case
+        // every other plain `#[test]` in this module runs under) still
+        // reads it.
+        let cache = make_cache(100);
+        let identity = "post:1";
+        let legacy_key = format!("fragment:{}:{identity}:v1", identity.len());
+        crate::cache::insert_cached(&cache, &legacy_key, "legacy markup".to_owned(), None);
+
+        let markup = cache_fragment(Some(&cache), identity, "v1", None, || {
+            panic!("must hit the pre-existing legacy key, not re-render")
+        });
+        assert_eq!(markup.into_string(), "legacy markup");
+    }
+
+    // ── Security: an empty resolved tenant must not alias no tenant context
+    // (Codex review round 2, PR #2884) ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn empty_string_tenant_does_not_alias_no_tenant_context() {
+        // `Some(String::new())` (reachable through the public `with_tenant`)
+        // must not collapse to the same key component as `None` (no tenant
+        // context at all) — otherwise an app that resolves an empty tenant
+        // id would alias whatever the no-tenant/background-job entry holds.
+        let cache = make_cache(100);
+        let identity = "post:1";
+
+        let outside_any_tenant = cache_fragment(Some(&cache), identity, "v1", None, || {
+            html! { p { "no-tenant-context" } }
+        });
+
+        let empty_tenant = crate::tenancy::with_tenant(String::new(), async {
+            cache_fragment(Some(&cache), identity, "v1", None, || {
+                html! { p { "empty-string-tenant" } }
+            })
+        })
+        .await;
+
+        assert_eq!(outside_any_tenant.into_string(), "<p>no-tenant-context</p>");
+        assert_eq!(
+            empty_tenant.into_string(),
+            "<p>empty-string-tenant</p>",
+            "an empty resolved tenant must get its own isolated cache slot, not alias the \
+             no-tenant entry"
         );
     }
 }
