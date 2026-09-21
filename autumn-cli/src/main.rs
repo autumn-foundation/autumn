@@ -3813,7 +3813,13 @@ enum GenerateCommands {
     /// When an owner column (`user_id`, `author_id`, or `owner_id`) is present,
     /// the generated `can_update`/`can_delete` allow the record owner or an
     /// `admin`, and the scope filters lists to the current user's rows.
-    /// Otherwise those default-deny with a `TODO` marker.
+    ///
+    /// When NO owner column is detected there is no ownership rule to emit, so
+    /// `can_update`/`can_delete` fall back to an authentication check under a
+    /// `SECURITY TODO` marker: any signed-in user may update or delete any row.
+    /// That is a placeholder, not a policy — replace it with a real per-record
+    /// rule before production. (The `Scope` does deny by default: it lists no
+    /// rows until its own `TODO` filter is written.)
     ///
     /// Requires the target model to already exist (`src/models/<snake>.rs`).
     /// Run `autumn generate model <Pascal>` (or `scaffold`) first.

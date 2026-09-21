@@ -11,9 +11,14 @@
 //! - `src/main.rs` — `mod policies;` declaration plus `.policy::<...>(...)` and
 //!   `.scope::<...>(...)` wired into the app builder chain.
 //!
-//! When no owner column can be detected, `can_update`/`can_delete` and the
-//! scope default-deny with a `// TODO` marker so the developer fills in the
-//! real ownership rule — safe-by-default until then.
+//! When no owner column can be detected there is no ownership rule to emit,
+//! and the two halves diverge rather than both denying. `can_update`/
+//! `can_delete` fall back to `ctx.is_authenticated()` under a `// SECURITY
+//! TODO` marker — any signed-in user may update or delete any row — because
+//! default-denying them would 403 a freshly generated app on its own edit form
+//! (issue #1830). The scope, which nothing depends on to succeed, does deny:
+//! it returns no rows until its `// TODO` filter is written. Neither half is a
+//! finished rule; both are placeholders for a real per-record one.
 //!
 //! Requires the target model to already exist (`src/models/<snake>.rs`); run
 //! `autumn generate model <Pascal>` (or `scaffold`) first.
