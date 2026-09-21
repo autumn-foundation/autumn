@@ -61,9 +61,11 @@ Expected project state with database configured and migration applied.
 > to the same end state (a configured `autumn.toml`, Postgres running, the
 > `todos` table migrated) — but via a different path than this chapter's
 > stated goal: a bare `docker run` rather than Docker Compose, and Autumn's
-> own `autumn generate migration` / `autumn migrate` rather than installing
-> and running the Diesel CLI directly. Either path works; adapt if you want
-> this chapter's exact tools. Continue to
+> own `autumn generate migration` / `autumn migrate` rather than typing
+> `diesel migration generate` / `diesel migration run` yourself. You still
+> need the Diesel CLI installed either way — `autumn migrate` shells out to
+> `diesel migration run` under the hood (see that section's Prerequisites).
+> Either path works; adapt if you want this chapter's exact tools. Continue to
 > [Chapter 4 — Models and Queries](04-models.md) once your database is up.
 
 ---

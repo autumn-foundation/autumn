@@ -37,8 +37,9 @@ nothing, removing it from the page.
 > Responses") aren't written yet.** The same ground — the same toggle/delete
 > todo example — is already covered and tested in the Getting Started guide's
 > ["Add interactivity with htmx"](../getting-started.md#add-interactivity-with-htmx)
-> section. Read that first, then come back here — the rest of this chapter,
-> starting below, is written.
+> section. Read that first, then come back here — the next section, "Falling
+> Back to Plain HTML Forms," is written; the sections after it are not (each
+> is marked below).
 
 ### Falling Back to Plain HTML Forms
 
