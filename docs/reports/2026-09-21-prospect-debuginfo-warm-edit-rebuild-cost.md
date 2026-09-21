@@ -254,6 +254,33 @@ Relative to this window's own baseline median: **`line-tables-only`
 same-condition blocks adjacent): `line-tables-only` = [2.696s, 2.608s],
 baseline = [4.562s, 4.550s] — no overlap.
 
+**On what "independent" means here (raised by Codex review on PR #2882,
+fifteenth round): since the Reproduce section's own correction already
+says a revisited condition reuses cached `target/` artifacts rather than
+rebuilding from scratch, does that undermine calling the two blocks
+independent?** No, and it's worth being precise about why, since the two
+properties are different. Artifact *reuse* (the same compiled dependency
+rlibs backing every sample of a given condition, first block and second
+alike) is not a flaw here — it's expected and correct: every sample within
+a condition should link against that condition's own consistently-built
+artifacts, exactly as a real project would. What "independent" refers to is
+*temporal/noise* independence — whether whatever transient system state
+(a competing process, a momentary I/O or scheduling hiccup) affected one
+block is decorrelated from what affected the other — which comes from real
+wall-clock separation and a real, different condition's build happening in
+between, not from whether `target/` was rebuilt from scratch. Both blocks
+here have that: real time passed, and a real `baseline` build ran between
+them. The one residual, unruled-out possibility this design doesn't
+eliminate is OS-level page-cache warmth for the specific rlib files
+themselves (block 2 relinking against files block 1 already pulled into
+page cache, if they survived the intervening baseline build's own I/O) —
+a real, if second-order, mechanism, and a fully rigorous design would use
+an isolated `target/` per block to close it out entirely. But at the
+effect sizes here (~35-45%, hundreds of milliseconds to seconds) it is not
+a plausible sole explanation: relinking a few-MB-to-tens-of-MB rlib from a
+warm page cache instead of a cold one is a millisecond-scale effect, not
+the kind of gap these comparisons show.
+
 | Condition (order-reversed single pair) | samples (s) | median | mean |
 |---|---|---|---|
 | baseline (leads this time) | 4.592, 3.872, 4.344 | 4.344 | 4.269 |
