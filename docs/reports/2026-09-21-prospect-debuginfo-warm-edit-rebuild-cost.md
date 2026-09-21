@@ -140,10 +140,25 @@ warm-up; see Apparatus), n=6 per condition (2 rounds × 3 samples):
 | `-C debuginfo=1` (line-tables-only) | 2.560, 2.499, 2.472, 2.532, 2.517, 2.681 | 2.524 | 2.543 | 0.074 |
 
 Relative to baseline median: **`debuginfo=0` -35.75%**, **`debuginfo=1`
--37.39%**. The two reduced levels are within noise of each other
-(`debuginfo=1` vs `debuginfo=0`: **-2.56%**, smaller than either condition's
-own stdev) — unlike the cold-build case, where Onramp's report found a real
-gap between them (~18% vs ~8.7%).
+-37.39%**.
+
+**Correction (caught by Codex review on PR #2882): an earlier draft of this
+paragraph compared the `debuginfo=1`-vs-`debuginfo=0` percentage delta
+(-2.56%) directly against the two conditions' stdevs in seconds (0.058,
+0.074) and called it "smaller than either condition's own stdev" — invalid,
+since it compares a dimensionless percentage to an absolute quantity in
+different units. Redone properly:** mean `debuginfo=0` = 2.5727s (sd
+0.0580), mean `debuginfo=1` = 2.5435s (sd 0.0738); the mean difference is
+-0.0292s (-1.14% of `debuginfo=0`'s mean). A Welch's t-test (unequal
+variance, n=6 each) gives t ≈ -0.76, df ≈ 9.5 — not statistically
+significant at conventional thresholds. That is a **failure to find a
+difference on n=6 samples per condition**, not a demonstrated equivalence:
+this sample size cannot rule out a true difference of similar magnitude to
+the observed one. The honest statement is narrower than the first draft's:
+this data does not show `debuginfo=1` costing more than `debuginfo=0` on the
+warm-edit axis, and a larger sample would be needed to state a tighter bound
+— unlike the cold-build case, where Onramp's report found a large, clearly
+resolved gap between them (~18% vs ~8.7%, no such ambiguity).
 
 No condition's sample range overlaps another's (baseline min 3.951 > both
 reduced-condition maxima; `debuginfo=0`/`debuginfo=1` overlap each other
@@ -177,15 +192,19 @@ This changes the shape of the pending decision, not just its confidence:
    development session's builds are warm edits, not cold starts.
 2. **`debuginfo=1` (line-tables-only) is no longer clearly the "smaller win"
    option.** On the cold build, Onramp measured it giving less than half of
-   `debuginfo=0`'s saving (8.7% vs 18%). On the warm edit — the loop a
-   developer actually sits in for most of a session — the two are
-   statistically indistinguishable (-37.39% vs -35.75%, a 2.56% gap smaller
-   than either condition's own run-to-run noise). That reopens the choice
-   Onramp's report posed as a hard trade (bigger win vs. keeping backtraces):
-   on the warm-edit axis specifically, line-tables-only keeps full
-   file:line backtrace resolution for local frames (the quality property
-   Onramp's report measured directly) at effectively no compile-time cost
-   relative to the more aggressive `debuginfo=0` option.
+   `debuginfo=0`'s saving (8.7% vs 18%), a large, clearly-resolved gap. On the
+   warm edit — the loop a developer actually sits in for most of a session —
+   this assay's n=6-per-condition sample found no statistically significant
+   difference between the two (mean difference -0.0292s / -1.14%, Welch's
+   t ≈ -0.76, df ≈ 9.5; see the correction in **📊 Assay**), though that is a
+   failure to find a difference on a small sample, not a proof the two are
+   equal. That still reopens the choice Onramp's report posed as a hard trade
+   (bigger win vs. keeping backtraces): on the warm-edit axis specifically,
+   this data gives no evidence that line-tables-only's full file:line
+   backtrace resolution for local frames (the quality property Onramp's
+   report measured directly) costs anything extra relative to the more
+   aggressive `debuginfo=0` option — a claim a larger sample could sharpen
+   further, in either direction.
 
 This still does not resolve the decision by itself — gap 1 (the actual
 scaffolded no-DB daemon project, not `examples/hello`) remains open, and
@@ -213,12 +232,26 @@ two still-open items neither report has closed:
 - Re-measure `debuginfo=0`'s cold-build number above the noise floor / on a
   dedicated or CI-caliber box, per Onramp's report (only relevant if
   `debuginfo=0` rather than `debuginfo=1` is the level under consideration).
-- Which build agents' gates: `dev-loop-latency.yml`'s `budget-table` /
-  measurement jobs and `cold-start-latency.yml` both need a green run against
-  the new template default before it merges; Keystone should be looped in
-  before committing to a template default change, per its own
-  architecture-review remit, since this is a permanent trade-off for every
-  generated project, not a PR-level call.
+- Which build agents' gates: `cold-start-latency.yml` needs a green run
+  against the new template default before it merges. **`dev-loop-latency.yml`
+  does not yet give equivalent evidence for the warm-edit path — caught by
+  Codex review on PR #2882, correcting this report's first draft, which
+  wrongly treated a green run of it as validation.** Its `measure` job (not
+  gated to PRs; scheduled/manual only) calls `autumn dev-loop-bench` without
+  `--dry-run`, which reaches `dev_loop_bench::run`'s live branch — but that
+  branch calls `build_placeholder_results` (`autumn-cli/src/dev_loop_bench.rs:455-459`),
+  which computes every change class's stats from `compute_stats(&[])` (zero
+  samples, so every field is `0`) and therefore always passes every budget.
+  The live HTTP-polling measurement driver referenced in that function's own
+  comment is not wired up yet. So today, a green `dev-loop-latency.yml` run
+  is not evidence about a template default change — before shipping one, the
+  live driver needs to exist (a separate, larger prerequisite this assay did
+  not scope) or the change needs its own ad hoc measurement of the kind this
+  assay performed, repeated against the real scaffolded project (gap 1,
+  above). Keystone should be looped in before committing to a template
+  default change either way, per its own architecture-review remit, since
+  this is a permanent trade-off for every generated project, not a PR-level
+  call.
 
 ## 🔬 Reproduce
 
@@ -238,9 +271,16 @@ EOF
 # Pay the one full-graph rebuild to enter the block (excluded from timing):
 cargo build -p hello
 
-# Then, 3+ times, alternating the literal so each edit is a real recompile:
+# Then, 3+ times, alternating the literal so each edit is a real recompile.
+# Check cargo's own exit status explicitly (caught by Codex review on PR
+# #2882: the original semicolon-chained `date; cargo build; date` form here
+# still ran the trailing `date` and looked "successful" even when `cargo
+# build` failed -- the exact failure mode this report's Apparatus section
+# says invalidated the first `d1` pass) and abort rather than silently
+# recording a fast failure as a real sample:
 sed -i 's/"Hello, Autumn![^"]*"/"Hello, Autumn! vN"/' examples/hello/src/main.rs
-date +%s.%N; cargo build -p hello; date +%s.%N   # no /usr/bin/time in this sandbox
+S=$(date +%s.%N); cargo build -p hello || { echo "cargo build failed" >&2; exit 1; }; E=$(date +%s.%N)
+echo "$E - $S" | bc   # no /usr/bin/time in this sandbox
 
 # Revert between conditions:
 git checkout -- Cargo.toml examples/hello/src/main.rs
