@@ -45,7 +45,13 @@ Expected project state with full Maud templates rendering database content.
 
 ---
 
-*Content coming in Sprint 12.*
+> **Not written yet.** This chapter's narrative doesn't exist yet. The same
+> ground — the same todo app, the same API — is already covered and tested in
+> the Getting Started guide's
+> ["Render HTML with Maud"](../getting-started.md#render-html-with-maud)
+> section. Read that, then continue to
+> [Chapter 6 — Styling with Tailwind CSS](06-tailwind.md). You can also check
+> the finished code in [`examples/todo-app/`](../../../examples/todo-app/).
 
 ---
 

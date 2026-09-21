@@ -44,7 +44,13 @@ Expected project state with both HTML and JSON routes.
 
 ---
 
-*Content coming in Sprint 12.*
+> **Not written yet.** This chapter's narrative doesn't exist yet. The same
+> ground — the same todo app, the same `Json<T>` list/create handlers — is
+> already covered and tested in the Getting Started guide's
+> ["Query the database"](../getting-started.md#query-the-database) section.
+> Read that, then continue to
+> [Chapter 9 — Error Handling](09-errors.md). You can also check the finished
+> code in [`examples/todo-app/`](../../../examples/todo-app/).
 
 ---
 

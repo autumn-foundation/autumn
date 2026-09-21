@@ -50,7 +50,13 @@ Expected project state with database configured and migration applied.
 
 ---
 
-*Content coming in Sprint 12.*
+> **Not written yet.** This chapter's narrative doesn't exist yet. The same
+> ground — the same todo app, the same API — is already covered and tested in
+> the Getting Started guide's
+> ["Add a database"](../getting-started.md#add-a-database) section. Read
+> that, then continue to
+> [Chapter 4 — Models and Queries](04-models.md). You can also check the
+> finished code in [`examples/todo-app/`](../../../examples/todo-app/).
 
 ---
 

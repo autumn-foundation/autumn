@@ -33,6 +33,13 @@ Adding `hx-delete="/todos/{id}"` to the delete button. The server deletes
 the record and returns an empty string. htmx replaces the element with
 nothing, removing it from the page.
 
+> **Sections above ("What htmx Does" through "Delete: `hx-delete` and Empty
+> Responses") aren't written yet.** The same ground — the same toggle/delete
+> todo example — is already covered and tested in the Getting Started guide's
+> ["Add interactivity with htmx"](../getting-started.md#add-interactivity-with-htmx)
+> section. Read that first, then come back here — the rest of this chapter,
+> starting below, is written.
+
 ### Falling Back to Plain HTML Forms
 
 htmx is the enhancement, not the requirement. Native browser forms can
@@ -85,20 +92,20 @@ inputs already in place.
 ### Understanding `hx-target` and `hx-swap`
 
 How htmx knows which element to update and how to update it. The `outerHTML`
-swap strategy vs. `innerHTML`.
+swap strategy vs. `innerHTML`. (Not written yet — see the
+[htmx section](../getting-started.md#add-interactivity-with-htmx) linked
+above; the attribute table there covers this.)
 
 ### The Fragment Pattern
 
 Returning partial HTML (a single `<li>`, not a full page) from htmx
-endpoints. Why this works and how it differs from SPA patterns.
+endpoints. Why this works and how it differs from SPA patterns. (Not written
+yet.)
 
 ### Checkpoint
 
-Expected project state with interactive toggle and delete.
-
----
-
-*Content coming in Sprint 12.*
+Expected project state with interactive toggle and delete. (Not written yet
+— compare against [`examples/todo-app/`](../../../examples/todo-app/).)
 
 ---
 

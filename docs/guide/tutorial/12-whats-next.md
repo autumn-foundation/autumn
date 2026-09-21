@@ -3,9 +3,10 @@
 **Goal:** By the end of this chapter, you will have a complete, working todo
 application and a clear picture of where to go from here.
 
-This tutorial tracks the published Autumn 0.4.x line and Rust 1.88.0+ as of
-2026-05-11. If you are following `trunk` from a checkout, confirm the
-workspace version before copying dependency snippets.
+This tutorial tracks Rust 1.88.0+ and whatever `autumn-cli` version
+[Chapter 1](01-project-setup.md) told you to install. If you are following
+`trunk` from a checkout instead, confirm the workspace version before
+copying dependency snippets.
 
 ---
 
@@ -49,11 +50,15 @@ tutorial omitted. Then branch out into the newer example apps:
 
 ### Community
 
-Where to ask questions, report bugs, and contribute.
+This project's home is its GitHub repository. Open an issue for bugs or
+questions, and see [CONTRIBUTING.md](../../../CONTRIBUTING.md) before
+sending a pull request.
 
 ---
 
-*Content coming in Sprint 12.*
+> **Chapters 2, 3, 5, 6, and 8, and part of Chapter 7, aren't written yet** —
+> see those chapters for pointers to the equivalent, already-working ground
+> in the [Getting Started guide](../getting-started.md).
 
 ---
 
