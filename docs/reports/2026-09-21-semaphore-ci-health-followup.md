@@ -173,7 +173,9 @@ and no replacement mechanism has surfaced yet.
 
 **Next step for `crate_path::tests::resolve_autumn_web_name_dashed_rename_is_sanitized`**:
 reproduce locally with repeated `cargo test -p autumn-macros-support
-crate_path:: --test-threads=<N>` runs at varying `N` to see whether
+crate_path:: -- --test-threads=<N>` runs (the `--` separator matters —
+`--test-threads` is a libtest argument, not a cargo one, and omitting it
+fails before any test runs) at varying `N` to see whether
 parallelism reproduces it, before deciding whether a dedicated harness is
 warranted at n=1.
 

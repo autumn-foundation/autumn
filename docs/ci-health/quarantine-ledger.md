@@ -1876,6 +1876,8 @@ without also filling in the intake form above.
   be a test-defect finding — but that's not yet confirmed, only likely.
 - **Not campaigned, no fix PR**: n=1, no baseline of any kind. Next step:
   reproduce locally with repeated `cargo test -p autumn-macros-support
-  crate_path:: --test-threads=<N>` runs to see whether increasing
-  parallelism reproduces it, before deciding whether a harness is warranted.
+  crate_path:: -- --test-threads=<N>` runs (note the `--` separator —
+  `--test-threads` is a libtest argument, not a cargo one; omitting it fails
+  before any test runs at all) to see whether increasing parallelism
+  reproduces it, before deciding whether a harness is warranted.
 
