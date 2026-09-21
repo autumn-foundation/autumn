@@ -466,7 +466,15 @@ cargo tree -p autumn-web --no-default-features --features "ws,presence,flash,cac
    since the decision was raised. Same two options as last week: extend
    `dependabot.yml` with two more directory entries, or have Ballast own
    satellite-graph batches on its own cadence. Still a human decision, not
-   actioned here.
+   actioned here. **Restored this pass, caught by a Codex review comment**:
+   last week's version of this item also carried a second, separate open
+   question that an earlier draft of this report dropped —
+   `examples/island-flock/Cargo.toml` still declares no `rust-version` at
+   all (re-checked directly: just `edition = "2024"`), unlike the root and
+   `fuzz/` graphs (both `1.88.0`). Without one, there's no MSRV floor for
+   `cargo update` to respect and no way to state "this batch is MSRV-safe"
+   the way the other two graphs' scheduled-batch rows in this report can —
+   still an open human decision, not actioned here either.
 8. **New this pass, highest priority of the open items.** GitHub's native
    Dependabot alert count for the default branch (15: 2 high, 9 moderate, 4
    low, per the `git push` remote message) does not match this pass's own
