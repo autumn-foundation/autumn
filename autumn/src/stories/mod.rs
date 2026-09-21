@@ -687,15 +687,21 @@ body:has(#story-theme-midnight:checked) .story-breadcrumb a {
 body:has(#story-theme-midnight:checked) .autumn-reaction-active {
     border-color: #a78bfa;
 }
-body:has(#story-theme-midnight:checked) .autumn-comments-error {
+body:has(#story-theme-midnight:checked) .autumn-comments-error,
+body:has(#story-theme-midnight:checked) .autumn-field__error,
+body:has(#story-theme-midnight:checked) .autumn-job-status__error {
     color: #f87171;
+}
+body:has(#story-theme-midnight:checked) .autumn-comments-error {
     border-color: #f87171;
 }
-/* Charts read `var(--primary)` directly for every stroke/fill (by design —
-   see the comment above), so redeclaring the custom property itself,
-   scoped to `.autumn-chart`, re-themes every mark inside it in one
-   declaration instead of overriding each `.autumn-chart__*` rule. */
-body:has(#story-theme-midnight:checked) .autumn-chart {
+/* Charts and the upload progress fill both read `var(--primary)` directly
+   for a non-text mark (stroke/fill, and `::before`'s background-color —
+   by design, see the comment above), so redeclaring the custom property
+   itself, scoped to the mark's container, re-themes it in one declaration
+   instead of overriding each individual rule. */
+body:has(#story-theme-midnight:checked) .autumn-chart,
+body:has(#story-theme-midnight:checked) .autumn-upload-bar {
     --primary: #a78bfa;
 }
 /* Every `:focus-visible` keyboard outline in widgets.css is `2px solid
