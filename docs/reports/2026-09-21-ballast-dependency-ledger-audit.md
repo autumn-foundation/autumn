@@ -115,7 +115,11 @@ never gone: `bitflags` 1.3.2 → `parking_lot_core` 0.8.6 → `parking_lot`
 `managed-pg-bundled`-gated chain this file's own `RUSTSEC-2024-0384`
 (`instant`) waiver already documents as in-scope. Independently confirmed
 with `cargo tree -p autumn-web --features <deny.toml's exact feature list>
---target all -i parking_lot@0.11.2`, which shows the identical path — `list`
+--target all -i bitflags@1.3.2` (rooted at the bottom of the chain — `-i`
+inverts to show *dependents*, so focusing on `parking_lot` itself would
+omit `parking_lot_core` and `bitflags` below it, which is what an earlier
+draft's probe did; caught by a Codex review comment on this PR), which
+shows the identical three-crate path — `list`
 simply doesn't surface it (root cause not pinned down this pass: `list` and
 `check bans` may apply `[graph]`/target resolution differently; worth a
 harness-level follow-up rather than more guessing here, see follow-up 9).
@@ -378,10 +382,16 @@ cargo info aws-sdk-s3@1.123.0
 # duplicate-count source of truth — cargo deny check bans, not cargo deny list
 cargo deny check bans 2>&1 | grep -c '^warning\[duplicate\]: found'
 
-# reproduce the bitflags/parking_lot/parking_lot_core chain as genuinely
+# reproduce the bitflags/parking_lot_core/parking_lot chain as genuinely
 # in-scope (not just present somewhere in Cargo.lock) — exact deny.toml
-# feature set, all targets, matching the chain cargo deny check bans traces
-cargo tree -p autumn-web --no-default-features --features "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme,edge,plugin-sandbox" -e normal,build --target all -i parking_lot@0.11.2
+# feature set, all targets, matching the chain cargo deny check bans traces.
+# -i inverts to show DEPENDENTS of the focused package, so it must be rooted
+# at the bottom of the chain (bitflags) to show all three crates in one
+# probe — rooting it at parking_lot itself only shows what depends on
+# parking_lot, omitting parking_lot_core and bitflags below it (caught by a
+# Codex review comment on this PR after the first version of this command
+# used -i parking_lot@0.11.2, which cannot reproduce the full chain)
+cargo tree -p autumn-web --no-default-features --features "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme,edge,plugin-sandbox" -e normal,build --target all -i bitflags@1.3.2
 
 # Dependabot queue health — is:open matters, last week's query omitted it
 # (search via the GitHub API/MCP: author:app/dependabot is:open)
