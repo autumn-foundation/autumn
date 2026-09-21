@@ -35,8 +35,9 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                 let config = ActiveSearchConfig::new("/_stories/demo/search", "#post-search-results")
                     .placeholder("Search posts…");
                 maud::html! {
+                    p { em { "Try it — this box is live, searching a small demo post list." } }
                     (active_search("post-search", "Search posts", &config))
-                    // What your handler returns when nothing matches:
+                    p { em { "For reference — not live — what your handler returns when nothing matches:" } }
                     (active_search_empty_state("No posts matched your search."))
                     // Compose the pieces yourself when you need custom layout
                     // between the input and the results container:
@@ -61,7 +62,9 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                 let config = AutocompleteConfig::new("/_stories/demo/tags/search", "tag_id")
                     .placeholder("Start typing a tag…");
                 maud::html! {
+                    p { em { "Try it — this box is live, matching against a small demo tag list." } }
                     (autocomplete_input("tag-picker", "Tag", &config))
+                    p { em { "For reference — not live — the two shapes your handler returns:" } }
                     // One matching option, as your handler would render it:
                     (autocomplete_option("42", "rust"))
                     // And the empty state when nothing matches:
