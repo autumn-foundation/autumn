@@ -1735,16 +1735,32 @@ without also filling in the intake form above.
   expects did not exist, in the expected shape, on this connection at
   execution time.
 
-  Leading (**unconfirmed**) hypothesis: a readiness race between the fresh
-  per-test SQLite pool's migrations (which must be what creates this partial
-  index) and `job::start_runtime`/`enqueue_tracked` being able to submit work
-  before that migration has completed. Checked `build_sqlite_pool` (test
-  helper, `sqlite_jobs_scheduler_e2e.rs:78-88`) and `create_pool`
-  (`autumn/src/db.rs:1768`): `create_pool` is synchronous and does not itself
-  run migrations, so the pool handed to `start_runtime` carries no migration
-  guarantee from that call alone. Time-boxed before tracing exactly where/when
-  the migration creating this index runs relative to `start_runtime`
-  accepting its first enqueue — **this hypothesis is not confirmed**.
+  **Correction (post-review, via a Codex review comment on PR #2883): the
+  original version of this entry's leading hypothesis — a readiness race
+  between the fresh per-test SQLite pool's migrations and
+  `start_runtime`/`enqueue_tracked` being able to submit work before that
+  migration completed — is wrong, and contradicted by the queue path itself,
+  not merely unconfirmed.** `enqueue_job_at` (`autumn/src/job/sqlite.rs:391`)
+  calls `let pool = queue_handle.ready().await?;` *before* obtaining a
+  connection or executing the insert. `SqliteJobQueue::ready`
+  (`autumn/src/job/sqlite.rs:253-258`) awaits
+  `self.schema.get_or_try_init(|| ensure_schema(&self.pool))` — a
+  `tokio::sync::OnceCell` — and `ensure_schema`
+  (`autumn/src/job/sqlite.rs:269-305`) is what creates
+  `idx_autumn_jobs_unique_inflight`, the exact partial unique index this
+  clause's `ON CONFLICT (name, unique_key) WHERE unique_key IS NOT NULL AND
+  status IN ('enqueued', 'running')` target names, via a synchronously
+  awaited `CREATE UNIQUE INDEX IF NOT EXISTS`. Read and confirmed directly
+  against `autumn/src/job/sqlite.rs` (not taken on the reviewer's word
+  alone): every enqueue through this queue handle awaits schema creation
+  first, so an enqueue cannot structurally overtake it. **This rules out
+  migration/readiness ordering as the mechanism, not just leaves it
+  unconfirmed.** The actual cause is open again — candidates not yet
+  investigated include a second insert code path that doesn't route through
+  `ready()`, a SQLite-version-specific quirk in how the partial-index
+  predicate is matched against the `ON CONFLICT` target, or a stale/reused
+  database file — but none of these has been checked against source or a
+  reproduction yet.
 
   **Ruled out**: cross-test interference via the process-global
   `GLOBAL_JOB_CLIENT` this test depends on
@@ -1761,18 +1777,20 @@ without also filling in the intake form above.
   window. Not exhaustively verified across every other file that might
   compile into the same `SQLite runtime (feature=sqlite)` job's test
   binaries, but no interference path found within this file.
-- **Test-vs-product verdict: not yet rendered.** Could be a test-file-local
-  migration-ordering gap, or a genuine readiness gap in `start_runtime`'s
-  public contract (accepting enqueues before the schema it depends on is
-  guaranteed present) — the second would be a product defect, not a test
-  defect. Undetermined.
+- **Test-vs-product verdict: not yet rendered.** The readiness-gap framing
+  above is now ruled out (schema creation is synchronously awaited ahead of
+  every enqueue), so the open candidates — a second, unaudited enqueue path
+  that bypasses `ready()`; a SQLite-version-specific `ON CONFLICT`
+  partial-index matching quirk; a stale/reused database file — have not yet
+  been sorted into test-defect vs. product-defect. Undetermined.
 - **Not campaigned, no fix PR**: n=2, no Tier 1 rerun-rate baseline — this
-  role's hard gate does not permit a fix PR on this evidence alone. Next
-  step: a same-commit rerun harness for this test against the
+  role's hard gate does not permit a fix PR on this evidence alone, and the
+  mechanism itself is now back to unconfirmed after the correction above.
+  Next step: a same-commit rerun harness for this test against the
   `SQLite runtime (feature=sqlite)` feature set (same pattern as
-  `.github/workflows/manual-job-tracking-rerun-check.yml`), and tracing the
-  exact migration/readiness ordering in `job::start_runtime` before
-  proposing any fix.
+  `.github/workflows/manual-job-tracking-rerun-check.yml`) to reproduce it
+  on demand, since source-reading alone has now ruled out one hypothesis
+  without surfacing a replacement.
 - **Does not appear to have blocked either PR**: #2842 merged
   (`4a448ab`); whether that specific failing run was superseded by a later
   green rerun on the same PR, or `SQLite runtime` wasn't a required check at

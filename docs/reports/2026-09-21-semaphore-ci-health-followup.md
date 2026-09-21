@@ -74,14 +74,24 @@ partial predicate, not on an ordinary duplicate-value violation — so the
 index this clause expects did not exist, in the expected shape, on this
 connection at execution time.
 
-Leading, **unconfirmed** hypothesis: a readiness race between the fresh
-per-test SQLite pool's migrations (presumably what creates this partial
-index) and `job::start_runtime`/`enqueue_tracked` being able to submit work
-before that migration completes. `create_pool` (`autumn/src/db.rs:1768`) is
-synchronous and does not itself run migrations, so nothing in the pool
-construction call guarantees the index exists before `start_runtime` returns
-— but tracing exactly where/when the migration runs relative to readiness
-was time-boxed out of this pass.
+**Correction (post-review, via a Codex review comment on PR #2883): the
+migration/readiness-race hypothesis below is wrong, not just unconfirmed —
+ruled out by the queue path itself.** `enqueue_job_at`
+(`autumn/src/job/sqlite.rs:391`) calls `queue_handle.ready().await?` before
+obtaining a connection or executing the insert; `SqliteJobQueue::ready`
+(`autumn/src/job/sqlite.rs:253-258`) awaits `ensure_schema` through a
+`tokio::sync::OnceCell`, and `ensure_schema`
+(`autumn/src/job/sqlite.rs:269-305`) is what creates
+`idx_autumn_jobs_unique_inflight` — the exact partial index the `ON CONFLICT`
+clause targets — via a synchronously awaited `CREATE UNIQUE INDEX IF NOT
+EXISTS`. Confirmed directly against source, not taken on the reviewer's word:
+every enqueue through this queue handle awaits schema creation first, so an
+enqueue cannot structurally overtake it. The original (now-withdrawn)
+framing follows, struck through for the record: ~~a readiness race between
+the fresh per-test SQLite pool's migrations and
+`job::start_runtime`/`enqueue_tracked` being able to submit work before that
+migration completes~~. The actual mechanism is open again; see the ledger
+entry's own correction for the remaining, not-yet-investigated candidates.
 
 **Ruled out**: cross-test interference via the process-global
 `GLOBAL_JOB_CLIENT` this test depends on. Every test in
@@ -92,10 +102,11 @@ the global client — so they don't appear able to race this test's
 global-state window (checked within this file; not exhaustively checked
 against every other file that might share the same test binary).
 
-**Test-vs-product verdict: not rendered.** Could be a test-local
-migration-ordering gap, or a real readiness gap in `start_runtime`'s public
-contract — the latter would be a product defect. Undetermined pending
-further tracing.
+**Test-vs-product verdict: not rendered.** The readiness-gap framing above is
+now ruled out; the open candidates (a second enqueue path that bypasses
+`ready()`, a SQLite-version-specific `ON CONFLICT` partial-index matching
+quirk, a stale/reused database file) haven't been sorted into test-defect vs.
+product-defect yet. Undetermined.
 
 ## 🔧 Treatment
 
@@ -108,10 +119,9 @@ quarantined" section with full intake-quality detail instead.
 
 **Next step**: build a same-commit rerun harness for this test against the
 `SQLite runtime (feature=sqlite)` feature set — same pattern as
-`.github/workflows/manual-job-tracking-rerun-check.yml` — to get a Tier 1
-baseline, and trace `job::start_runtime`'s migration/readiness ordering
-directly to confirm or rule out the hypothesis above before proposing any
-fix.
+`.github/workflows/manual-job-tracking-rerun-check.yml` — to reproduce it on
+demand, since the migration/readiness hypothesis is now ruled out by source
+and no replacement mechanism has surfaced yet.
 
 ## 📊 Measurement
 
