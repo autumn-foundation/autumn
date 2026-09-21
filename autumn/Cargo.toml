@@ -437,7 +437,7 @@ secrecy = { version = "0.10.3", features = ["serde"] }
 lru = "0.18.0"
 hmac = "0.12"
 sha2 = "0.10"
-infer = { version = "0.16", optional = true }
+infer = { version = "0.22", optional = true }
 sha1 = { version = "0.10", optional = true }
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"], optional = true }
 # `zeroize` wipes the AES round-key schedule and the GHASH subkey when a cipher
