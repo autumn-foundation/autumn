@@ -561,13 +561,26 @@ body {
     background: var(--bg);
     transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
 
+    /* The pale first-draft --border and --primary here both failed contrast
+       (review follow-up, verified independently across all three light
+       themes, none of it yet flagged when this comment was written):
+       --border read at ~1.3:1 against --surface in every one of them
+       (pastel-on-near-white, picked to look subtle, not checked against
+       what it sits on) — WCAG 1.4.11 wants 3:1. And unlike Midnight,
+       darkening --primary here has no downside to weigh: --primary-light
+       is the *light* end of the pair already, so a darker --primary only
+       ever increases contrast, for both the white-text button case and
+       the primary-on-primary-light case (e.g. #c2540a on #fbe4cd was
+       3.74:1, short of text's 4.5:1). No role conflict like Midnight's —
+       just needed darkening. Ocean and Forest below get the same two
+       fixes, values picked the same way. */
     --bg: #fdf8f2;
     --surface: #fffaf4;
     --text: #2b1c10;
     --text-muted: #7a6a58;
-    --border: #ecdcc8;
-    --primary: #c2540a;
-    --primary-hover: #a3470b;
+    --border: #8a6f52;
+    --primary: #a8470c;
+    --primary-hover: #83380a;
     --primary-light: #fbe4cd;
     --radius: 0.6rem;
     --shadow: 0 1px 3px rgba(43, 28, 16, 0.12), 0 4px 14px rgba(43, 28, 16, 0.08);
@@ -575,12 +588,12 @@ body {
 
 body:has(#story-theme-ocean:checked) {
     --bg: #f0f7fb; --surface: #ffffff; --text: #0f2a3d; --text-muted: #52717f;
-    --border: #cfe4ec; --primary: #0e7490; --primary-hover: #0b5a70; --primary-light: #d7f0f5;
+    --border: #6b93a6; --primary: #0a5f78; --primary-hover: #084c60; --primary-light: #d7f0f5;
     --shadow: 0 1px 3px rgba(15, 42, 61, 0.12), 0 4px 14px rgba(15, 42, 61, 0.08);
 }
 body:has(#story-theme-forest:checked) {
     --bg: #f3f8f1; --surface: #ffffff; --text: #1b2e18; --text-muted: #5c7256;
-    --border: #d7e8d2; --primary: #2e7d32; --primary-hover: #25662a; --primary-light: #dcefdb;
+    --border: #5c8a52; --primary: #256829; --primary-hover: #1d5320; --primary-light: #dcefdb;
     --shadow: 0 1px 3px rgba(27, 46, 24, 0.12), 0 4px 14px rgba(27, 46, 24, 0.08);
 }
 body:has(#story-theme-midnight:checked) {
