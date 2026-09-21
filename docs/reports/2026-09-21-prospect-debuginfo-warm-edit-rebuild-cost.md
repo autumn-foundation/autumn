@@ -6,9 +6,24 @@ The 2026-09-17 Onramp findings report
 (`docs/reports/2026-09-17-onramp-devprofile-debuginfo-cold-start-findings.md`,
 PR #2829, issue #2795) measured `-C debuginfo=0` giving a ~18% cold-start
 build win (close to, but on the honest pooled number just under, Onramp's own
-20% floor) and `-C debuginfo=1` (line-tables-only) an ~8.7% win, but named two
+20% floor) and `RUSTFLAGS="-C debuginfo=1"` an ~8.7% win, but named two
 explicit gaps before a human could decide which level (if any) to set in the
-generated-project templates' `[profile.dev]`. Gap 2, verbatim: *"Only the cold
+generated-project templates' `[profile.dev]`.
+
+**Terminology correction (caught by Codex review on PR #2882): that report's
+own prose calls its `-C debuginfo=1` condition "line-tables-only," but
+`rustc -C help` on this same toolchain lists `line-tables-only` and `limited`
+(the level numeric `1` maps to) as distinct values — "debug info emission
+level (0-2, none, line-directives-only, line-tables-only, limited, or
+full)". They are not the same setting.** Onramp's report measured `1`/
+`limited`; this report's own first drafts inherited its "line-tables-only"
+label and then, independently, set up an apparatus using the actually-named
+`line-tables-only` Cargo profile value — a *different*, more minimal level
+than the one Onramp measured. Both mistakes are corrected below: Onramp's
+condition is called `limited` here, and this assay's original
+`line-tables-only` condition is kept but no longer treated as the same thing.
+
+Gap 2, verbatim: *"Only the cold
 build was measured. A `[profile.dev]` override in the generated-project
 templates changes every subsequent `cargo build`/`cargo run`/`cargo test`
 too, including the warm, incremental rebuilds `dev-loop-latency.yml` and
@@ -97,10 +112,13 @@ block (excluded from the measurement — not representative of a real dev
 loop), then take 3 timed single-line edits to `hello()`'s return string
 (alternated to a fresh literal each time, so every sample is a real
 recompile, never a no-op). Planned as two rounds with condition order
-interleaved (baseline → d0 → d1 → d1 → baseline → d0) to control for drift
-across the ~35-minute session, matching the 2026-09-16 report's methodology
-— realized as planned for baseline and `debuginfo=0`, but not for
-`debuginfo=1`; see the stub below and the correction in **📊 Assay**.
+interleaved (baseline → `debug=0` → `line-tables-only` → `line-tables-only`
+→ baseline → `debug=0`) to control for drift across the ~35-minute session,
+matching the 2026-09-16 report's methodology — realized as planned for
+baseline and `debug=0`, but not for `line-tables-only`; see the stub below
+and the correction in **📊 Assay**. (A fourth condition, `debug=1`/`limited`,
+was added afterward in its own separately-interleaved pair of blocks — see
+the stub below and **📊 Assay**.)
 
 **Stubs / shortcuts (the complete list):**
 - Measures `cargo build -p hello` directly, not the actual `autumn dev`
@@ -129,7 +147,7 @@ across the ~35-minute session, matching the 2026-09-16 report's methodology
   re-run in full before this report was written. `baseline` and `d0`'s
   first-pass numbers were unaffected (verified against a surviving build log
   showing a genuine `unoptimized` 2.40s build) and are used as-is.
-- **That `d1` re-run cost this assay `debuginfo=1`'s independent-block
+- **That `d1` re-run cost this assay `line-tables-only`'s independent-block
   design (caught by Codex review on PR #2882, third round on the same
   paragraph): the rerun script ran `run_block 1 d1 ...` immediately followed
   by `run_block 2 d1 ...`, never returning to another condition in between,
@@ -142,8 +160,24 @@ across the ~35-minute session, matching the 2026-09-16 report's methodology
   same `set_profile`/`run_block` pair the **🔬 Reproduce** section below
   gives, called twice in a row for the same condition with no other
   condition in between). `baseline` and `debuginfo=0` do not have this
-  problem; only `debuginfo=1` does. See **📊 Assay**/**🏁 Verdict** for what
-  this does and doesn't allow this report to claim.
+  problem; only `line-tables-only` does. See **📊 Assay**/**🏁 Verdict** for
+  what this does and doesn't allow this report to claim.
+- **`debug = "line-tables-only"` is not the same rustc setting as Onramp's
+  `-C debuginfo=1` (caught by Codex review on PR #2882, fourth round):**
+  see the terminology correction in **🎯 Question**. Rather than leave this
+  as an unmeasured gap, a fourth condition — `debug = 1` (`limited`, the
+  actual numeric level Onramp's report used) — was measured after this
+  finding, with its own pair of genuinely independent blocks (interleaved
+  with a fresh `baseline` pair, not with the other conditions above, since
+  by this point in the session baseline/`debuginfo=0`/`line-tables-only` all
+  had cached rlibs and could no longer force `limited`'s fingerprint out via
+  a cheap switch — `baseline` was cheapest to alternate with). Its own
+  paired baseline numbers are reported separately from the main table's, not
+  pooled with them, because they came roughly 40 minutes later in the
+  session and read measurably lower (see **📊 Assay**) — a real reminder
+  that this sandbox's baseline itself drifts, which is exactly why each
+  reduced condition here is compared against a baseline measured in the same
+  narrow window, not a fixed constant.
 
 ## 📊 Assay
 
@@ -153,65 +187,101 @@ warm-up; see Apparatus), n=6 per condition (2 rounds × 3 samples):
 | Condition | samples (s) | median | mean | stdev |
 |---|---|---|---|---|
 | baseline (`debug=2`, current default) | 4.022, 4.101, 3.951, 3.998, 4.096, 4.042 | 4.032 | 4.035 | 0.058 |
-| `-C debuginfo=0` (none) | 2.630, 2.597, 2.622, 2.512, 2.584, 2.491 | 2.591 | 2.573 | 0.058 |
-| `-C debuginfo=1` (line-tables-only) | 2.560, 2.499, 2.472, 2.532, 2.517, 2.681 | 2.524 | 2.543 | 0.074 |
+| `debug = 0` (none) | 2.630, 2.597, 2.622, 2.512, 2.584, 2.491 | 2.591 | 2.573 | 0.058 |
+| `debug = "line-tables-only"` | 2.560, 2.499, 2.472, 2.532, 2.517, 2.681 | 2.524 | 2.543 | 0.074 |
 
-Relative to baseline median: **`debuginfo=0` -35.75%**, **`debuginfo=1`
+Relative to baseline median: **`debug=0` -35.75%**, **`line-tables-only`
 -37.39%**.
 
-**Correction (caught by Codex review on PR #2882, three rounds on this one
-paragraph): draft 1 compared the `debuginfo=1`-vs-`debuginfo=0` percentage
-delta directly against stdevs in seconds — invalid, mixed units. Draft 2
-fixed that with a Welch's t-test treating all 6 samples per condition as
-independent — which round 2 correctly called pseudoreplication (3 samples
-within one block share that block's warm-up/cache/thermal state) and which
-this draft redid at the block level, treating each condition's 2 logged
-blocks as 2 independent units. Round 3 caught that this was *still* wrong
-for `debuginfo=1` specifically: its "2 blocks" were produced by
-`run_block 1 d1 ...; run_block 2 d1 ...` back to back in the rerun that fixed
-the TOML-quoting bug (see Apparatus), with no other condition entered in
-between — `set_profile` writes byte-identical `Cargo.toml` content both
-times, and block 2's own warm-up build took 2.5s, not the ~200s a genuine
-fresh re-entry costs (confirmed against `warm_edit_d1_rerun.sh` in this PR's
-own history). So `debuginfo=1` has **one** independently-entered measurement
-period (6 back-to-back builds under continuously-held state), not two, while
-baseline and `debuginfo=0` each genuinely do have two (separated by real
-intervening condition changes — see the block order in Apparatus). That
-asymmetry means there is no valid way to compare `debuginfo=1` against
-`debuginfo=0` at the block level either: one side has 1 independent unit,
-the other has 2. The honest statement is simply that this design cannot
-support a rigorous claim about whether the two reduced levels differ from
-each other — not "no evidence of a difference," not "within noise," just
-not measured with enough independent repetition to say. A follow-up
-assay would need every condition, `debuginfo=1` included, entered
-independently and interleaved at least twice, the same way baseline and
-`debuginfo=0` already were here. Onramp's cold-build report, by contrast,
-found a large, clearly resolved gap between the two levels (~18% vs ~8.7%)
-that this design flaw doesn't call into question.
+A fourth condition, `debug = 1` (`limited` — the actual level Onramp's
+report measured as its own "`-C debuginfo=1`"; see the terminology
+correction in **🎯 Question**), was measured separately, ~40 minutes later in
+the session, against its own freshly-paired baseline rather than the table
+above (this sandbox's baseline itself drifted between the two measurement
+windows — see below):
 
-Baseline's sample range doesn't overlap either reduced condition's (baseline
-min 3.951 > both reduced-condition maxima; `debuginfo=0` and `debuginfo=1`
-overlap each other completely). The baseline-vs-`debuginfo=0` comparison
-specifically still holds despite the concerns above: both conditions were
-genuinely independently entered twice (see Apparatus), and the effect size
-(~35%, baseline block means 4.025s/4.045s vs. `debuginfo=0`'s 2.617s/2.529s)
-is far too large for plausible block-to-block noise to close. The
-baseline-vs-`debuginfo=1` comparison rests on weaker footing given
-`debuginfo=1`'s single independent period, but the same logic applies to a
-lesser degree: a ~37% gap between baseline's two genuinely independent
-blocks and `debuginfo=1`'s one measured period is not the kind of thing this
-assay's known confounds (warm-up exclusion, sandbox noise on the order of
-tens of milliseconds) could produce by chance. Both baseline comparisons are
-a clean separation, not a borderline call the way Onramp's cold-build
-`debuginfo=0` number was against its 20% floor.
+| Condition (2nd window) | samples (s) | median | mean | stdev |
+|---|---|---|---|---|
+| baseline (`debug=2`, re-measured) | 3.774, 3.860, 3.830, 3.698, 3.878, 3.758 | 3.802 | 3.800 | 0.068 |
+| `debug = 1` (`limited`) | 2.815, 2.848, 2.823, 2.601, 2.778, 2.729 | 2.796 | 2.766 | 0.091 |
+
+Relative to this window's own baseline median: **`limited` -26.45%**. Block
+means (2 genuinely independent blocks each, interleaved
+`limited`/`baseline`/`limited`/`baseline`): `limited` = [2.829s, 2.703s],
+baseline (2nd window) = [3.821s, 3.778s] — no overlap, a clean separation
+the same way the first window's baseline-vs-`debug=0` comparison was.
+
+**This is the report's most decision-relevant new number: on the exact
+setting Onramp's report measured, the warm-edit win (-26.45%) is roughly
+three times the cold-build win Onramp found for the same setting (-8.7%).**
+Onramp's report treated `debuginfo=1` as the safe-but-smaller-win option;
+this assay shows that framing undersold it on the axis that matters most for
+total developer time, because it only looked at the one-time cold build.
+Unlike the `line-tables-only`-vs-`debug=0` comparison earlier in this report
+(unmeasurable — see below), this `limited`-vs-its-own-baseline comparison
+and its cross-report comparison to Onramp's own `limited` number are both
+methodologically sound: two genuinely independent blocks each, and a valid
+apples-to-apples setting match confirmed via `rustc -C help`.
+
+**Correction (caught by Codex review on PR #2882, three rounds on this one
+paragraph, about the original two-condition table only — the `limited` data
+above came later and doesn't have this problem): draft 1 compared the
+`line-tables-only`-vs-`debug=0` percentage delta directly against stdevs in
+seconds — invalid, mixed units. Draft 2 fixed that with a Welch's t-test
+treating all 6 samples per condition as independent — which round 2
+correctly called pseudoreplication (3 samples within one block share that
+block's warm-up/cache/thermal state) and which this draft redid at the block
+level, treating each condition's 2 logged blocks as 2 independent units.
+Round 3 caught that this was *still* wrong for `line-tables-only`
+specifically: its "2 blocks" were produced by `run_block 1 d1 ...;
+run_block 2 d1 ...` back to back in the rerun that fixed the TOML-quoting
+bug (see Apparatus), with no other condition entered in between —
+`set_profile` writes byte-identical `Cargo.toml` content both times, and
+block 2's own warm-up build took 2.5s, not the ~200s a genuine fresh
+re-entry costs (confirmed against `warm_edit_d1_rerun.sh`, apparatus scratch
+described in Apparatus). So `line-tables-only` has **one**
+independently-entered measurement period (6 back-to-back builds under
+continuously-held state), not two, while baseline and `debug=0` each
+genuinely do have two (separated by real intervening condition changes —
+see the block order in Apparatus). That asymmetry means there is no valid
+way to compare `line-tables-only` against `debug=0` at the block level
+either: one side has 1 independent unit, the other has 2. The honest
+statement is simply that this design cannot support a rigorous claim about
+whether the two reduced levels differ from each other — not "no evidence of
+a difference," not "within noise," just not measured with enough
+independent repetition to say. (This is separate from, and doesn't affect,
+the `limited`-vs-`debug=0` question, which this report doesn't address
+either — `limited` was only measured against its own baseline, not against
+`debug=0` or `line-tables-only`.) Onramp's cold-build report, by contrast,
+found a large, clearly resolved gap between `debug=0` and `limited` (~18% vs
+~8.7%) that this design flaw doesn't call into question.
+
+Baseline's sample range doesn't overlap either reduced condition's in the
+main table (baseline min 3.951 > both reduced-condition maxima; `debug=0`
+and `line-tables-only` overlap each other completely). The
+baseline-vs-`debug=0` comparison specifically still holds despite the
+concerns above: both conditions were genuinely independently entered twice
+(see Apparatus), and the effect size (~35%, baseline block means
+4.025s/4.045s vs. `debug=0`'s 2.617s/2.529s) is far too large for plausible
+block-to-block noise to close. The baseline-vs-`line-tables-only` comparison
+rests on weaker footing given `line-tables-only`'s single independent
+period, but the same logic applies to a lesser degree: a ~37% gap between
+baseline's two genuinely independent blocks and `line-tables-only`'s one
+measured period is not the kind of thing this assay's known confounds
+(warm-up exclusion, sandbox noise on the order of tens of milliseconds)
+could produce by chance. All three baseline-vs-reduced-condition comparisons
+in this report (`debug=0`, `line-tables-only`, and `limited` against its own
+paired baseline) are a clean separation, not a borderline call the way
+Onramp's cold-build `debug=0` number was against its 20% floor.
 
 **Worst case probed:** the warm-up (first-in-block) samples, deliberately
-excluded from the table above because they are not steady-state, are
-themselves informative: baseline/`d0`/`d1` warm-ups ran 8.5s / 198.7s (first
-entry into that condition, full-graph rebuild) / 200.9s (same, first entry) —
-confirming the one-time "switching tax" is real and large, which is exactly
-why it's excluded from a measurement about the *recurring* per-edit cost, not
-folded in as if it happened on every edit.
+excluded from the tables above because they are not steady-state, are
+themselves informative: `debug=0`'s and `line-tables-only`'s first-ever
+entries cost 198.7s and 200.9s respectively (full-graph rebuild), and
+`limited`'s cost 216.987s — confirming the one-time "switching tax" is real
+and large across every reduced level measured, which is exactly why it's
+excluded from a measurement about the *recurring* per-edit cost, not folded
+in as if it happened on every edit.
 
 ## 🏁 Verdict
 
@@ -230,48 +300,46 @@ This changes the shape of the pending decision, not just its confidence:
    permanent backtrace-quality cost" — the compile-time side of the ledger is
    bigger than Onramp's report alone showed, because most of a
    development session's builds are warm edits, not cold starts.
-2. **Whether `debuginfo=1` (line-tables-only) is still the "smaller win"
-   option on the warm-edit axis is genuinely unmeasured, not resolved either
-   way.** On the cold build, Onramp measured it giving less than half of
-   `debuginfo=0`'s saving (8.7% vs 18%), a large, clearly-resolved gap. On the
-   warm edit — the loop a developer actually sits in for most of a session —
-   this assay's `debuginfo=1` data came from one continuously-held
-   measurement period rather than two independently-entered ones (see the
-   correction in **📊 Assay**, caught over three rounds of review), so there
-   is no valid comparison to `debuginfo=0` to report here, in either
-   direction. That does still reopen the choice Onramp's report posed as a
-   hard trade (bigger cold-start win vs. keeping backtraces) in one sense:
-   the assumption that `debuginfo=1` is *automatically* the smaller warm-edit
-   win too, just because it was on the cold build, no longer has anything
-   backing it — but neither does the opposite. A properly-designed follow-up
-   (both levels entered independently and interleaved at least twice each,
-   the way baseline and `debuginfo=0` were here) is needed before anyone can
-   say which level is cheaper on the warm-edit axis.
+2. **`limited` (`debug = 1`, the actual level Onramp's report evaluated and
+   confirmed preserves backtrace file:line resolution) is not the
+   safe-but-smaller-win option on the warm-edit axis — it's a large win
+   there too, and proportionally larger than it was on the cold build.**
+   Onramp measured `limited` at ~8.7% on the cold build, well under its 20%
+   floor. This assay measured the same setting at ~26.45% on the warm edit —
+   over the 10% materiality line by a wide margin, and using genuinely
+   independent, interleaved blocks (see **📊 Assay**), so this comparison is
+   trustworthy in a way the one below isn't.
+3. **Whether `line-tables-only` (an even more minimal, distinct rustc level
+   — see the terminology correction in **🎯 Question** — that this assay
+   measured separately and by coincidence, not because it was the level
+   Onramp evaluated) beats `limited` on the warm-edit axis is genuinely
+   unmeasured, not resolved either way.** This assay's own attempt at that
+   comparison came from one continuously-held measurement period rather than
+   two independently-entered ones (see the correction in **📊 Assay**, caught
+   over three rounds of review) — not measured with enough independent
+   repetition to say which is cheaper. `line-tables-only` was also never
+   directly verified (by this report or Onramp's) to preserve backtrace
+   file:line resolution the way `limited` was — it likely does, since line
+   tables are in the name, but that's an inference, not a measurement.
 
 This still does not resolve the decision by itself — gap 1 (the actual
-scaffolded no-DB daemon project, not `examples/hello`) remains open, Onramp's
-own cold-build number is still shy of its 20% floor pending re-measurement
-above the noise floor, and (per the correction above) the
-`debuginfo=1`-vs-`debuginfo=0` comparison specifically was not validly
-measured at all and needs a redo, not just a better-powered version. But it
-removes "we don't know if this is a hidden recurring cost" from the
-open-questions list, and replaces it with a specific, load-bearing number
-the decider can weigh: the
-recurring win over baseline is large for both reduced levels and robust to
-this design's limitations, but whether `debuginfo=1` keeps most of
-`debuginfo=0`'s recurring win specifically, or gives up more of it than the
-cold-build case's ratio would suggest, is not answered by this assay and
-needs its own properly-blocked measurement.
+scaffolded no-DB daemon project, not `examples/hello`) remains open, and
+Onramp's own `debug=0` cold-build number is still shy of its 20% floor
+pending re-measurement above the noise floor. But it removes "we don't know
+if this is a hidden recurring cost" from the open-questions list, and
+replaces it with a specific, load-bearing number the decider can weigh for
+the option Onramp's report actually evaluated for backtrace quality: `limited`
+carries a large, validated recurring win, not just a marginal cold-start one.
 
 ## 💰 Cost to productionize
 
 Not a new build — this assay feeds an existing decision (issue #2795) rather
-than proposing new code. If the maintainer picks `debug = "line-tables-only"`
-for the generated-project templates' `[profile.dev]` (a defensible choice on
-backtrace-quality grounds alone, and this assay establishes it captures a
-large recurring warm-edit win over baseline in its own right — just not,
-per the correction above, a confirmed comparison against `debuginfo=0`'s
-warm-edit number specifically): the change itself is the one line Onramp's
+than proposing new code. If the maintainer picks `debug = 1` (`limited`) for
+the generated-project templates' `[profile.dev]` (the option with the
+strongest evidence behind it: Onramp's report already verified it preserves
+backtrace file:line resolution, and this assay adds a validated, large
+recurring warm-edit win — both measurements of the *same* rustc setting,
+confirmed via `rustc -C help`): the change itself is the one line Onramp's
 report already scoped (`autumn-cli/src/templates/Cargo.toml.tmpl`,
 `Cargo.api.toml.tmpl`), plus the still-open items neither report has closed:
 
@@ -279,15 +347,15 @@ report already scoped (`autumn-cli/src/templates/Cargo.toml.tmpl`,
   `autumn new`-scaffolded project via `cold_start_driver.rs`, not
   `examples/hello`/`-p autumn-web` proxies, before shipping a template
   default change.
-- Re-measure `debuginfo=0`'s cold-build number above the noise floor / on a
+- Re-measure `debug=0`'s cold-build number above the noise floor / on a
   dedicated or CI-caliber box, per Onramp's report (only relevant if
-  `debuginfo=0` rather than `debuginfo=1` is the level under consideration).
-- New: a properly-blocked `debuginfo=1`-vs-`debuginfo=0` warm-edit
-  comparison, if the choice between the two specific levels (rather than
-  "reduced vs. baseline") matters to the decider. This assay's own attempt
-  doesn't answer it (see the correction in **📊 Assay**) — a redo needs both
-  levels independently entered and interleaved at least twice each, the way
-  baseline and `debuginfo=0` were here.
+  `debug=0` rather than `limited` is the level under consideration — `debug=0`
+  does not preserve backtrace file:line resolution, per Onramp's report).
+- New: a properly-blocked `line-tables-only`-vs-`limited` warm-edit
+  comparison, only needed if the decider wants to consider `line-tables-only`
+  specifically instead of `limited` — this assay's own attempt doesn't
+  answer it (see the correction in **📊 Assay**), and `line-tables-only`'s
+  backtrace-quality property is itself unverified, unlike `limited`'s.
 - Which build agents' gates: `cold-start-latency.yml` needs a green run
   against the new template default before it merges. **`dev-loop-latency.yml`
   does not yet give equivalent evidence for the warm-edit path — caught by
@@ -323,7 +391,7 @@ report already scoped (`autumn-cli/src/templates/Cargo.toml.tmpl`,
 # Pre-warm deps + autumn-web once:
 cargo build -p hello
 
-set_profile() {   # "" (baseline/no override), "0", or "line-tables-only"
+set_profile() {   # "" (baseline/no override), "0", "1" (limited), or "line-tables-only"
   git checkout -- Cargo.toml
   if [ -n "$1" ]; then
     if [ "$1" = "0" ] || [ "$1" = "1" ] || [ "$1" = "2" ]; then
@@ -358,15 +426,18 @@ run_block() {
   done
 }
 
-# Full two-round, properly interleaved (round-robin) condition order -- NOT
-# what this assay's own `debuginfo=1` data actually came from (caught by
-# Codex review on PR #2882: this assay's real d1 rerun ran two blocks back
-# to back with no other condition in between, so d1's two "blocks" were one
-# continuously-held period, not two independent re-entries -- see the stub
-# in Apparatus and the correction in Assay). Every condition's two
-# occurrences are separated by the other two here, so every block -- d1
-# included -- pays a genuine fresh full-graph rebuild on entry:
-for cond in "" 0 line-tables-only "" 0 line-tables-only; do
+# Full two-round, properly interleaved (round-robin) condition order,
+# covering all four conditions this report measures -- including `1`
+# (`limited`, the actual level Onramp's report evaluated; distinct from
+# `line-tables-only`, see the terminology correction in Question). NOT what
+# this assay's own `line-tables-only` data actually came from (caught by
+# Codex review on PR #2882: this assay's real rerun of that condition ran
+# two blocks back to back with no other condition in between, so its two
+# "blocks" were one continuously-held period, not two independent
+# re-entries -- see the stub in Apparatus and the correction in Assay).
+# Every condition's two occurrences are separated by the other three here,
+# so every block pays a genuine fresh re-entry:
+for cond in "" 0 line-tables-only 1 "" 0 line-tables-only 1; do
   echo "== condition: '${cond:-baseline}' =="
   run_block "$cond"
 done
