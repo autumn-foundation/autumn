@@ -12,7 +12,7 @@
 ### Documentation
 
 - **docs:** document `autumn generate policy` in the
-  [code generators guide](../docs/guide/generators.md). The command that writes
+  [code generators guide](docs/guide/generators.md). The command that writes
   the `Policy`/`Scope` pair appeared nowhere in the guide, so readers of the
   authorization guide hand-wrote what a generator emits. The new section covers
   both owner-column cases, and `docs/guide/authorization.md` now links to it.
