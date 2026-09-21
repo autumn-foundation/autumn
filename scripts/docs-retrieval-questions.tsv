@@ -51,3 +51,20 @@ debug logging	docs/guide/logging-pii.md
 log format	docs/guide/logging-pii.md
 json logs	docs/guide/logging-pii.md
 change log level at runtime	docs/guide/logging-pii.md
+
+# --- The policy generator -------------------------------------------------
+# `autumn generate policy` — the command that writes the `Policy`/`Scope` pair
+# `authorization.md` spends 328 lines on — appeared in the corpus zero times
+# across all 164 guide pages. So a reader already standing on the page that
+# DOES answer "record level authorization" (it passes, and has since the
+# baseline) was left hand-writing what a generator emits. Coverage, not
+# findability: no second page was splitting the rank, there was no page at all.
+generate policy	docs/guide/generators.md
+# "policy generator" and "scaffold a policy" both MISS and are deliberately not
+# admitted. The matcher is per-place by design — one slug, H1 or heading must
+# carry every word — and `generators.md` splits these across two of them
+# ("Generators" in the slug and H1, "policy" in the new heading). Closing them
+# means a heading that exists to satisfy this file, which is writing for the
+# matcher rather than the reader. They are a findability question about
+# phrasing, a different class from the coverage defect this PR closes, and they
+# get their own change on their own evidence — same reasoning as "gzip" above.
