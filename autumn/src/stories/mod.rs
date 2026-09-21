@@ -482,11 +482,42 @@ body:has(#story-theme-midnight:checked) {
        needs the light-on-dark direction too — tokens.css's #dc2626 was
        3.39:1 there. --danger-light gets a dark tint to match (the mirror
        image of --primary-light), since --danger is now the light color in
-       that pairing. */
+       that pairing.
+
+       --surface-muted isn't a tokens.css variable at all — widgets.css's
+       badge component reads it as `var(--surface-muted, #f1f5f9)`, a
+       standalone fallback nothing else declares. Every other theme here
+       leaves it unset and gets that light fallback, which is fine paired
+       with their (dark-ish, light-surface-appropriate) --text-muted. Dark
+       mode needs its own dark fallback for the same reason --primary-light
+       needed its own value above: --text-muted is light here, so it
+       reads at only 2.64:1 on the undeclared light default (review
+       follow-up). */
     --bg: #14151c; --surface: #1d1f2b; --text: #e7e7ee; --text-muted: #9497ab;
     --border: #2e3040; --primary: #7c3aed; --primary-hover: #6d28d9; --primary-light: #ede9fe;
-    --danger: #f87171; --danger-light: #3f1d1d;
+    --danger: #f87171; --danger-light: #3f1d1d; --surface-muted: #23253a;
     --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 4px 14px rgba(0, 0, 0, 0.3);
+}
+/* --primary (#7c3aed) is also the *only* link-text color widgets.css ships
+   — e.g. `.autumn-feed__more`, `.autumn-comment-reply-toggle`, and this
+   file's own `.story-breadcrumb a` all set `color: var(--primary)` — a
+   third role with no token of its own, alongside the button-fill role
+   above and the primary-light-chip role before it. All three read the same
+   --primary but need different lightness in dark mode: button-fill wants
+   it dark (for white text), link-text wants it light (for surface
+   contrast) — mutually exclusive for one shared value, and confirmed by
+   review follow-up (2.87:1 on --surface, 3.19:1 on --bg with the button-fill
+   shade). Giving link text its own token is a widgets.css-wide change
+   (every `color: var(--primary)` text usage, not just the three named
+   above) well past this PR's scope of theming the gallery, so this
+   overrides the concrete elements review flagged with a lighter violet
+   scoped to Midnight only — a real fix for what's evidenced, not a
+   workaround, but narrower than the underlying gap. See PR #2887 for the
+   proposed follow-up (a --link token in tokens.css). */
+body:has(#story-theme-midnight:checked) .autumn-feed__more,
+body:has(#story-theme-midnight:checked) .autumn-comment-reply-toggle,
+body:has(#story-theme-midnight:checked) .story-breadcrumb a {
+    color: #a78bfa;
 }
 
 .story-theme-switch { display: flex; align-items: center; gap: 0.4rem; padding: 0.6rem 1.25rem; border-bottom: 1px solid var(--border); background: var(--surface); }
