@@ -39,9 +39,14 @@ Query Identifier: -2031661649392160844
 Planning Time: 0.021 ms
 Trigger RI_ConstraintTrigger_c_16494 for constraint collection_links_collection_id_fkey: time=0.058 calls=3
 Execution Time: 0.117 ms
+=== pg_stat_statements: create (2,500 links, chunked insert) ===
+calls=2      buffers=20057    INSERT INTO "collection_links" ("collection_id", "label", "url", "position") VALUES ($1, $2, $3, $4), ... [1,000 value tuples, $1..$4000]
+calls=1      buffers=5013     INSERT INTO "collection_links" ("collection_id", "label", "url", "position") VALUES ($1, $2, $3, $4), ... [500 value tuples, $1..$2000]
+-- INSERT INTO collection_links: calls=3 buffers=25070 --
+
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.30s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.56s
 
 Equivalence assertions (all passed in this run, part of the same test):
   - create: 200 persisted rows == 200 submitted (label, url, position), in order.
@@ -50,6 +55,13 @@ Equivalence assertions (all passed in this run, part of the same test):
   - empty submission: 0 persisted rows, parent still created.
   - duplicate-content submission (two identical label+url rows): both persisted,
     not deduplicated.
+  - bind-parameter chunking (post-review addition, see PR #2888 review
+    thread): a 2,500-link create succeeds and issues exactly 3 INSERT
+    statements (two 1,000-row chunks + one 500-row chunk, chunk size =
+    (MAX_BIND_PARAMS / 4).clamp(1, 1000) = 1000), not 1 (which would risk a
+    bind-parameter overflow at real scale beyond this fixture) and not 2,500
+    (which would mean the batching fix had regressed). All 2,500 persisted
+    rows match the submitted input in order across the chunk boundary.
   - independent equivalence: a parallel collection built with a one-by-one
     reference INSERT loop (the pre-fix shape, reimplemented standalone for this
     comparison only) produced byte-identical rows to the batched route's output

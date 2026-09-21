@@ -91,14 +91,21 @@ database's physical insertion order.
 
 ## 🔧 Change
 
-`examples/wiki/src/routes/collections.rs`: in both `create` and `update`,
-collect the per-row `NewCollectionLink` values into a `Vec` first, then
-issue one `diesel::insert_into(collection_links::table).values(&new_links)`
-for the whole set — guarded by `if !new_links.is_empty()` (a zero-row
-`VALUES` clause is invalid, and an empty submission is a real case: a
-collection with no links yet). No schema change, no new index, no migration
-— purely a call-site rewrite. `update`'s `DELETE` (already one statement)
-is untouched.
+`examples/wiki/src/routes/collections.rs`: `create` and `update` now share a
+new `insert_links` helper that collects the per-row `NewCollectionLink`
+values into a `Vec`, then issues one `diesel::insert_into(collection_links::table).values(chunk)`
+per `chunk_size`-sized chunk instead of one `INSERT` per row — guarded so a
+zero-row set (a collection with no links yet is a real case) issues no
+statement at all. `chunk_size = (MAX_BIND_PARAMS / 4).clamp(1, 1000)`, the
+same convention generated repository bulk-inserts already use
+(`autumn-macros-repository`): a single unbounded multi-row `INSERT` would
+have worked for any realistic form but would fail outright at 16,384+ links
+(4 bind params/row × 16,384 ≥ Postgres's 65,535-parameter cap) — a size a
+request can reach well under the default body-size limit, so a huge-but-legal
+submission must still succeed, just as multiple statements. (Caught in
+review — see `after/output.txt`'s 2,500-link chunking scenario, added
+post-review, for the regression test.) No schema change, no new index, no
+migration. `update`'s `DELETE` (already one statement) is untouched.
 
 ## 📊 Measurement
 
@@ -109,6 +116,7 @@ is untouched.
 | `update` (replace w/ 200) | INSERT statements | 200 | **1** | `pg_stat_statements.calls` |
 | `update` | INSERT buffers (hit+read) | 2,005 | 2,005 | `pg_stat_statements` |
 | `update` | DELETE statements | 1 | 1 | `pg_stat_statements.calls` |
+| `create` (2,500 links) | INSERT statements | n/a (would be 2,500) | **3** | `pg_stat_statements.calls` |
 | both | temp blocks written | 0 | 0 | `pg_stat_statements` |
 
 Buffers are unchanged (same rows, same pages touched, same bytes) — this is
@@ -135,6 +143,10 @@ All of the following are asserted in the same test run
 - **Duplicate content**: two link rows with identical `label`+`url` (legal —
   `collection_links` has no uniqueness constraint beyond `id`) both persist;
   the batched insert does not deduplicate.
+- **Chunk-boundary integrity**: a 2,500-link `create` (crossing the 1,000-row
+  chunk size twice) persists all 2,500 rows, in submitted order, across the
+  chunk boundary — and succeeds at all, rather than failing with a
+  bind-parameter overflow.
 - **Independent cross-check**: a separate collection is built with a
   standalone one-by-one reference `INSERT` loop (the pre-fix shape,
   reimplemented in the test only for this comparison) against the same

@@ -33,7 +33,11 @@
 //! The two profiled requests each carry 200 links — plausible for a
 //! "developer resources" or "further reading" page accumulated over years —
 //! against a collection that is *not* part of the background set, so its
-//! own row and its links are cleanly attributable in the profile.
+//! own row and its links are cleanly attributable in the profile. A third,
+//! separate scenario submits 2,500 links to exercise the fix's chunking
+//! (one multi-row `INSERT` per 1,000 rows, `MAX_BIND_PARAMS`-bounded) across
+//! more than one chunk, per review feedback on the original single
+//! unbounded `INSERT` (autumn#2888).
 
 #![allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
 
@@ -439,6 +443,39 @@ async fn collection_links_batch_profile() {
         dup_persisted.len(),
         2,
         "both duplicate-content rows must be persisted, not deduplicated"
+    );
+
+    // Bind-parameter chunking: a single un-chunked `INSERT ... VALUES` for
+    // this table needs 4 bind params per row, so 16,384+ links in one
+    // statement would exceed Postgres's 65,535-parameter limit — well within
+    // what the default request-body-size limit allows through. 2,500 links
+    // crosses the fix's 1,000-row chunk boundary (twice), so this exercises
+    // >1 chunk without needing anywhere near the actual bind-param ceiling.
+    const NUM_LARGE_LINKS: usize = 2_500;
+    let large_links = make_links("Bulk", NUM_LARGE_LINKS);
+    let large_body = collection_form_body("Bulk Collection", &large_links);
+    reset_stats(&mut conn);
+    let resp = post_collection_form(&client, "/collections", &large_body).await;
+    assert_eq!(
+        resp.status,
+        303,
+        "a 2,500-link submission must still succeed; body was: {}",
+        resp.text()
+    );
+    let large_profile = print_profile(&mut conn, "create (2,500 links, chunked insert)");
+    assert_eq!(
+        large_profile.0, 3,
+        "2,500 links at a 1,000-row chunk size must issue exactly 3 INSERT \
+         statements (1,000 + 1,000 + 500) — 1 would risk a bind-parameter \
+         overflow at real scale, 2,500 would mean chunking regressed to \
+         one-per-row"
+    );
+    let large_id = new_collection_id(&mut conn, "Bulk Collection");
+    let large_persisted = links_for(&mut conn, large_id);
+    assert_eq!(
+        large_persisted,
+        expected_for(&large_links),
+        "chunked insert must persist every link, across chunk boundaries, in order"
     );
 
     // === independent equivalence check: batched route output vs. a

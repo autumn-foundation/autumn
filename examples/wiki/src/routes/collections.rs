@@ -120,6 +120,41 @@ async fn load_links(db: &mut Db, collection_id: i64) -> AutumnResult<Vec<Collect
         .await?)
 }
 
+/// Insert `links` for `collection_id` as one multi-row `INSERT` per chunk,
+/// rather than one `INSERT` per row (the Ledger fix this module carries).
+/// Chunked, not a single statement, because a submission at or beyond
+/// `MAX_BIND_PARAMS / 4` rows (4 bind params per link) would otherwise
+/// exceed Postgres's per-statement bind-parameter limit — the same reason
+/// generated repository bulk-inserts (`autumn-macros-repository`) chunk by
+/// `MAX_BIND_PARAMS / column_count`. Capped at 1,000 rows per chunk to match
+/// that convention; a real form is nowhere near either bound, but a request
+/// this large fits comfortably under the default body-size limit, so it must
+/// still succeed rather than fail with a bind-parameter overflow.
+async fn insert_links(
+    conn: &mut autumn_web::db::PooledConnection,
+    collection_id: i64,
+    links: Vec<LinkForm>,
+) -> Result<(), diesel::result::Error> {
+    let new_links: Vec<NewCollectionLink> = links
+        .into_iter()
+        .enumerate()
+        .map(|(i, link)| NewCollectionLink {
+            collection_id,
+            label: link.label,
+            url: link.url,
+            position: i as i32,
+        })
+        .collect();
+    let chunk_size = (autumn_web::repository::MAX_BIND_PARAMS / 4).clamp(1, 1000);
+    for chunk in new_links.chunks(chunk_size) {
+        diesel::insert_into(collection_links::table)
+            .values(chunk)
+            .execute(conn)
+            .await?;
+    }
+    Ok(())
+}
+
 #[get("/collections")]
 pub async fn list(mut db: Db) -> AutumnResult<Markup> {
     let all: Vec<Collection> = collections::table
@@ -210,22 +245,7 @@ pub async fn create(
                             .get_result(conn)
                             .await?;
 
-                        let new_links: Vec<NewCollectionLink> = links
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, link)| NewCollectionLink {
-                                collection_id: created.id,
-                                label: link.label,
-                                url: link.url,
-                                position: i as i32,
-                            })
-                            .collect();
-                        if !new_links.is_empty() {
-                            diesel::insert_into(collection_links::table)
-                                .values(&new_links)
-                                .execute(conn)
-                                .await?;
-                        }
+                        insert_links(conn, created.id, links).await?;
 
                         Ok::<_, AutumnError>(created.id)
                     }
@@ -333,22 +353,7 @@ pub async fn update(
                     .execute(conn)
                     .await?;
 
-                    let new_links: Vec<NewCollectionLink> = links
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, link)| NewCollectionLink {
-                            collection_id: id,
-                            label: link.label,
-                            url: link.url,
-                            position: i as i32,
-                        })
-                        .collect();
-                    if !new_links.is_empty() {
-                        diesel::insert_into(collection_links::table)
-                            .values(&new_links)
-                            .execute(conn)
-                            .await?;
-                    }
+                    insert_links(conn, id, links).await?;
 
                     Ok::<_, AutumnError>(())
                 }
