@@ -142,29 +142,42 @@ warm-up; see Apparatus), n=6 per condition (2 rounds × 3 samples):
 Relative to baseline median: **`debuginfo=0` -35.75%**, **`debuginfo=1`
 -37.39%**.
 
-**Correction (caught by Codex review on PR #2882): an earlier draft of this
-paragraph compared the `debuginfo=1`-vs-`debuginfo=0` percentage delta
-(-2.56%) directly against the two conditions' stdevs in seconds (0.058,
-0.074) and called it "smaller than either condition's own stdev" — invalid,
-since it compares a dimensionless percentage to an absolute quantity in
-different units. Redone properly:** mean `debuginfo=0` = 2.5727s (sd
-0.0580), mean `debuginfo=1` = 2.5435s (sd 0.0738); the mean difference is
--0.0292s (-1.14% of `debuginfo=0`'s mean). A Welch's t-test (unequal
-variance, n=6 each) gives t ≈ -0.76, df ≈ 9.5 — not statistically
-significant at conventional thresholds. That is a **failure to find a
-difference on n=6 samples per condition**, not a demonstrated equivalence:
-this sample size cannot rule out a true difference of similar magnitude to
-the observed one. The honest statement is narrower than the first draft's:
-this data does not show `debuginfo=1` costing more than `debuginfo=0` on the
-warm-edit axis, and a larger sample would be needed to state a tighter bound
-— unlike the cold-build case, where Onramp's report found a large, clearly
-resolved gap between them (~18% vs ~8.7%, no such ambiguity).
+**Correction (caught by Codex review on PR #2882, two rounds): an earlier
+draft of this paragraph compared the `debuginfo=1`-vs-`debuginfo=0`
+percentage delta (-2.56%) directly against the two conditions' stdevs in
+seconds — invalid, mixed units. The next draft fixed that by running a
+Welch's t-test treating all 6 samples per condition as independent (t ≈
+-0.76, df ≈ 9.5, not significant) — which the second review round correctly
+called pseudoreplication: the 3 samples within one block share that block's
+warm-up/cache/thermal state, and are not independent draws, so `n=6`/`df≈9.5`
+overstates this design's real power. The two truly independent units per
+condition are the *blocks*, not the 18 individual builds. Redone at the
+block level:** block means, `debuginfo=0` = [2.617s, 2.529s],
+`debuginfo=1` = [2.510s, 2.577s]. With only 2 independent blocks per
+condition, no formal significance test is meaningful here (a t-test needs
+more than 2 units per group to say anything) — the honest statement is
+qualitative: the two conditions' block means interleave (2.510 < 2.529 <
+2.577 < 2.617) rather than one condition's blocks both sitting above the
+other's, which is consistent with "no large, consistent difference" but is
+not a statistical proof, and a design with more independent
+(freshly-entered, fully randomized) blocks per condition would be needed to
+say more. This also means the baseline-vs-reduced comparison below rests on
+the same 2-independent-blocks-per-condition footing — noted explicitly
+there, since its effect size is what carries that comparison despite the
+same limitation, unlike the `debuginfo=1`-vs-`debuginfo=0` comparison, where
+the effect is small enough that the limitation matters. Unlike this ambiguity,
+Onramp's cold-build report found a large, clearly resolved gap between the
+two levels (~18% vs ~8.7%).
 
 Baseline's sample range doesn't overlap either reduced condition's (baseline
 min 3.951 > both reduced-condition maxima; `debuginfo=0` and `debuginfo=1`
-overlap each other completely, consistent with the Welch's-test result
-above) — the baseline-vs-reduced effect is a clean separation on 6 samples
-each, not a borderline call the way Onramp's cold-build `debuginfo=0` number
+overlap each other completely) — and unlike the `debuginfo=1`-vs-`debuginfo=0`
+comparison above, this effect is large enough (baseline block means 4.025s/
+4.045s vs. both reduced conditions' block means all below 2.62s) that the
+same 2-blocks-per-condition limitation doesn't put the conclusion in doubt:
+no plausible block-to-block noise closes a ~35% gap that both baseline
+blocks clear by well over a second. Still a clean separation, not a
+borderline call the way Onramp's cold-build `debuginfo=0` number
 was against its 20% floor.
 
 **Worst case probed:** the warm-up (first-in-block) samples, deliberately
@@ -196,25 +209,34 @@ This changes the shape of the pending decision, not just its confidence:
    option.** On the cold build, Onramp measured it giving less than half of
    `debuginfo=0`'s saving (8.7% vs 18%), a large, clearly-resolved gap. On the
    warm edit — the loop a developer actually sits in for most of a session —
-   this assay's n=6-per-condition sample found no statistically significant
-   difference between the two (mean difference -0.0292s / -1.14%, Welch's
-   t ≈ -0.76, df ≈ 9.5; see the correction in **📊 Assay**), though that is a
-   failure to find a difference on a small sample, not a proof the two are
-   equal. That still reopens the choice Onramp's report posed as a hard trade
-   (bigger win vs. keeping backtraces): on the warm-edit axis specifically,
-   this data gives no evidence that line-tables-only's full file:line
-   backtrace resolution for local frames (the quality property Onramp's
-   report measured directly) costs anything extra relative to the more
-   aggressive `debuginfo=0` option — a claim a larger sample could sharpen
-   further, in either direction.
+   this assay's design (2 independent blocks per condition; see the
+   pseudoreplication correction in **📊 Assay**) is too underpowered for a
+   formal significance claim, but the two conditions' block-level means
+   interleave with each other (`debuginfo=0`: 2.617s/2.529s;
+   `debuginfo=1`: 2.510s/2.577s) rather than one condition's blocks both
+   sitting clearly above the other's. That is qualitatively different from
+   "we don't know" — it's "no consistent direction showed up across the two
+   blocks we ran" — but it is weaker evidence than this report's earlier
+   drafts claimed, and a design with more independent blocks would be needed
+   to state a real bound. What it still does is reopen the choice Onramp's
+   report posed as a hard trade (bigger win vs. keeping backtraces): nothing
+   in this data points to line-tables-only's full file:line backtrace
+   resolution for local frames (the quality property Onramp's report
+   measured directly) costing more than `debuginfo=0` on the warm-edit axis
+   — a claim that cuts against the cold-build case's clear gap, and that a
+   properly-powered follow-up could sharpen in either direction.
 
 This still does not resolve the decision by itself — gap 1 (the actual
-scaffolded no-DB daemon project, not `examples/hello`) remains open, and
-Onramp's own cold-build number is still shy of its 20% floor pending
-re-measurement above the noise floor. But it removes "we don't know if this
-is a hidden recurring cost" from the open-questions list, and replaces it
-with a specific, load-bearing number the decider can weigh: the recurring win
-is large, and `debuginfo=1` captures nearly all of it.
+scaffolded no-DB daemon project, not `examples/hello`) remains open, Onramp's
+own cold-build number is still shy of its 20% floor pending re-measurement
+above the noise floor, and (per the pseudoreplication correction above) the
+`debuginfo=1`-vs-`debuginfo=0` comparison specifically needs a better-powered
+follow-up before its own number can be trusted. But it removes "we don't know
+if this is a hidden recurring cost" from the open-questions list, and
+replaces it with a specific, load-bearing number the decider can weigh: the
+recurring win over baseline is large and robust to this design's limitations,
+and nothing in this data suggests `debuginfo=1` gives up much of it relative
+to `debuginfo=0`.
 
 ## 💰 Cost to productionize
 
