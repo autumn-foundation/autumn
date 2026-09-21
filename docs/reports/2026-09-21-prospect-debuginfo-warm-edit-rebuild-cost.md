@@ -247,6 +247,36 @@ means (2 genuinely independent blocks each, interleaved
 baseline (2nd window) = [3.821s, 3.778s] — no overlap, a clean separation
 the same way the first window's baseline-vs-`debug=0` comparison was.
 
+**Correction and robustness check (caught by Codex review on PR #2882,
+tenth round): the sequence above is `limited → baseline → limited →
+baseline` — `limited` is always the first condition in its pair,
+`baseline` always second. Condition is perfectly confounded with
+within-pair position, so a transition/cache/thermal/load effect tied to
+"first vs. second in pair" rather than to the compiler flag could produce
+the same pattern; non-overlapping block means don't rule that out on their
+own.** Rather than leave this as a caveat, a third pair was run with the
+order *reversed* — `baseline` first, `limited` second — later in the
+session:
+
+| Condition (3rd window, reversed order) | samples (s) | median | mean |
+|---|---|---|---|
+| baseline (position 1 this time) | 4.831, 5.006, 4.248 | 4.831 | 4.695 |
+| `limited` (position 2 this time) | 3.492, 3.166, 3.750 | 3.492 | 3.469 |
+
+Relative to this window's own baseline: **`limited` -27.72%** — consistent
+in both direction and magnitude with the -26.45% from the original,
+opposite-order pairing, even though this window's absolute baseline
+(4.831s median) reads noticeably higher than either earlier window's
+(4.032s, 3.802s) — this sandbox's baseline is evidently noisier across
+widely-separated windows than the earlier "a few percent" characterization
+suggested. That the *relative* effect held steady (-26.45% vs. -27.72%)
+across both a reversed position and a substantially different absolute load
+level is stronger evidence against a pure order/position artifact than
+either single pairing alone would be. Not a full ABBA counterbalance (one
+reversed pair, not a repeated one), so this doesn't fully retire the
+concern — but it meaningfully reduces it, and this is now the strongest
+warm-edit evidence in this report for any condition.
+
 **Correction (caught by Codex review on PR #2882, fifth round): the first
 draft of this paragraph called the -26.45% (warm) vs. -8.7% (cold) figures
 "roughly three times" as if that ratio were itself a measured, meaningful
@@ -266,8 +296,10 @@ two separate observations rather than one derived ratio:** on the *cold*
 build, Onramp measured `limited` giving a thin, weakly-replicated ~8.7%
 saving, well under its own 20% floor. On the *warm* edit, this assay
 measured `limited` giving a properly-replicated (2 independent blocks,
-6 samples, no overlap with its own paired baseline) ~26.45% saving, well
-over this assay's 10% materiality line. Both numbers stand on their own
+6 samples, no overlap with its own paired baseline, and reproduced at
+~27.72% in a third, order-reversed pair — see the robustness check above)
+~26-28% saving, well over this assay's 10% materiality line. Both numbers
+stand on their own
 apparatus's own footing; neither multiplies into the other. What they
 jointly support is qualitative, not a multiplier: `limited` is not a
 option whose benefit is confined to the one-time cold build, the way
@@ -417,9 +449,10 @@ This changes the shape of the pending decision, not just its confidence:
    on the cold build (from a thin, single-block sample of a different,
    non-incremental workload — see the correction in **📊 Assay**, this is
    not a number to build a ratio on). This assay measured the same setting
-   at ~26.45% on the warm edit, from a properly-replicated, genuinely
-   independent, interleaved design (see **📊 Assay**) — trustworthy on its
-   own terms, in a way the comparison in point 3 below isn't. The two
+   at ~26-28% on the warm edit, from a properly-replicated, genuinely
+   independent, interleaved design that also held up under a reversed
+   measurement order (see **📊 Assay**) — trustworthy on its own terms, in a
+   way the comparison in point 3 below isn't. The two
    numbers aren't combinable into a multiplier, but together they say
    `limited` is not a marginal, cold-build-only lever.
 3. **Whether `line-tables-only` (an even more minimal, distinct rustc level
