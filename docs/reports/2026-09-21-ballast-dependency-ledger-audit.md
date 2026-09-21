@@ -189,16 +189,29 @@ no `groups:` at all (re-checked directly, see the earlier `.github/
 dependabot.yml` excerpt), so an individual PR is exactly what that config
 asks for — #1891 isn't a grouping-config leftover, it's just old and stuck.
 The same applies to #2081 (`actions/upload-artifact`), also a `github-actions`
-PR. That leaves **six** genuinely orphaned `cargo`-ecosystem PRs from
-2026-07-13 (#1894 `tokio-tungstenite`, #1895 `sha1`, #1896 `x509-parser`,
-#1897 `matchit`, #1898 `rand_chacha`, #1899 `rand`) that plausibly predate
-`dependabot.yml`'s current `rust-deps`/`axum-ecosystem`/`diesel-ecosystem`
-grouping and were never reconciled — none of the six is `axum*`/`diesel*`/
-`tokio` (the `rust-deps` exclude-patterns), so each one's package now matches
-the `rust-deps` group's `"*"` pattern going forward, yet Dependabot hasn't
-superseded any of them the way it superseded #2616/#2629 into a fresh grouped
-diff last week (per the 09-14 report's pain-ledger section) — worth a human
-checking why, not assumed here.
+PR.
+
+**Second correction, from a further Codex review comment on the same
+commit**: the first correction above still got the *mechanism* for the
+remaining six `cargo` PRs wrong, even after fixing the actions-PR miscount.
+It called them "orphaned" from a config change that predates them — but
+`rust-deps`' `update-types: [minor, patch]` (see the `dependabot.yml`
+excerpt earlier in this report) excludes them for a much simpler, timing-
+independent reason: every one of the six is a **semver-major** transition
+under Dependabot's own pre-1.0 convention (a change in the leading nonzero
+component of a `0.x.y` version counts as major, the same way `1.x→2.x`
+would for a stable crate) — `tokio-tungstenite` 0.29→0.30, `sha1`
+0.10.6→0.11.0, `x509-parser` 0.16.0→0.18.1, `matchit` 0.8.4→0.9.2,
+`rand_chacha` 0.9.0→0.10.0, `rand` 0.9.4→0.10.2. `rust-deps` only groups
+`minor`/`patch`, and no group anywhere in this file covers `major` updates
+at all. So these six sitting as individual PRs isn't evidence anything was
+orphaned when the grouping config changed — it's exactly what the *current*
+config produces for a major bump today, same as it would have on the day
+`rust-deps` was created. The real (and much less alarming) finding is just:
+six individual major-bump `cargo` PRs, like the two individual
+`github-actions` PRs, have sat un-reviewed for 64–69 days. That's a review-
+backlog fact, not a configuration gap — reconciling `dependabot.yml` would
+not make any of these six disappear on its own.
 
 Also corrected: the age-range total. #2302 (`validator`) is the one flagged
 as stale last week too, now 28 days (was 3+ weeks) and still unresolved,
@@ -212,13 +225,13 @@ in the 28–69 day band gives **ten**, not eight: the seven at 69 days
 
 This is **not** a Ballast finding to act on directly — merging, closing, or
 nudging any of these 13 PRs is a human call (several are exactly the kind of
-individual-bump review the charter prefers to see grouped, and #2615 is
+major-bump review no group in this config ever covers, and #2615 is
 explicitly an "ask before" toolchain change) — but it's a materially
 different picture than "two stale PRs" and worth a maintainer's attention:
 **10 of the 13** are old enough (28–69 days) to be queue rot rather than
-normal review lag, of which six (not seven — #1891 is correctly ungrouped
-by design) are `cargo`-ecosystem PRs that don't fit the current grouping
-config.
+normal review lag: two `github-actions` PRs and six `cargo` major-bump PRs,
+all individual by design under the current config, simply unreviewed for
+64–69 days, plus #2179 (42 days) and #2302 (28 days).
 
 **Discrepancy surfaced by this pass's own `git push`, not investigated
 further — flagged rather than assessed.** Pushing this report's commit
@@ -338,25 +351,32 @@ grep -A1 '^name = "parking_lot"' Cargo.lock
    catches a new unwaived advisory or disallowed license on every
    Dependabot PR mechanically; what's still uncovered is reachability
    judgment and usage/cost analysis on Dependabot's own bumps specifically.
-6. **Narrowed this pass, then corrected once more during its own review.**
+6. **Narrowed this pass, then corrected twice more during its own review.**
    Last week flagged "two stale Dependabot PRs" as a queue-health
    observation; this pass's `is:open`-filtered query found the real number
-   is 13 open, **10** of them 28–69 days old (see the pain-ledger table
-   above — an earlier draft said "~8", undercounting; a Codex review
-   comment on this PR caught it). Of the seven at 69 days, **six** are
-   `cargo`-ecosystem PRs that plausibly predate the current grouping config
-   and don't match any of its group patterns; the seventh, #1891, is a
-   `github-actions` PR that's individual **by design** (that ecosystem's
-   `dependabot.yml` stanza defines no groups at all) — a second Codex
-   comment caught an earlier draft folding it into the same "legacy
-   grouping leftover" bucket it doesn't belong in. Still not something this
-   pass acts on (closing or merging any of them is a human call, and #2615
-   is explicitly an "ask before" toolchain bump), but the scale of the
-   backlog is materially different from what either prior pass reported,
-   and is worth a maintainer pass of its own — reconciling or closing the
-   six orphaned `cargo` PRs, at minimum, and separately deciding whether
-   #1891/#2081 (both `github-actions`, both stuck) need anything beyond
-   ordinary review.
+   is 13 open, **10** of them 28–69 days old (an earlier draft said "~8",
+   undercounting — first Codex correction). Of the seven at 69 days, an
+   earlier draft called six of them "orphaned" leftovers of a
+   `dependabot.yml` grouping-config change, with #1891 wrongly lumped in as
+   a seventh — wrong on both counts, per two further Codex review comments:
+   #1891/#2081 are individual because the `github-actions` ecosystem
+   defines no groups at all, and the six `cargo` PRs (`tokio-tungstenite`,
+   `sha1`, `x509-parser`, `matchit`, `rand_chacha`, `rand`) are individual
+   because every one is a semver-major transition under Dependabot's own
+   pre-1.0 convention, and `rust-deps` only groups `minor`/`patch` — no
+   group in this file covers majors, so nothing was ever "orphaned" by a
+   config change; this is what the current config has always produced for
+   a major bump. See the corrected mechanism in the evidence section above.
+   The real, narrower finding: 8 individual PRs (2 actions, 6 cargo-major)
+   have simply sat unreviewed for 64–69 days, plus #2179 (42d) and #2302
+   (28d) — a review-backlog fact, not a configuration gap. Still not
+   something this pass acts on (closing or merging any of them is a human
+   call, and #2615 is explicitly an "ask before" toolchain bump), but the
+   scale of the backlog is materially different from what either prior pass
+   reported, and is worth a maintainer's attention: either review the eight
+   stuck major/actions PRs directly, or make the deliberate "ask before"
+   policy call to add a `major`-update-types group (accepting that group's
+   larger, batched diffs) if the backlog is the real problem to solve.
 7. The `fuzz/` (66 packages) and `island-flock/` (31 packages) scheduled
    batches remain uncovered by any process — `dependabot.yml` unchanged
    since the decision was raised. Same two options as last week: extend
@@ -370,8 +390,14 @@ grep -A1 '^name = "parking_lot"' Cargo.lock
    a human — or a future pass with GitHub Security-tab API access this
    session didn't have — to open `/security/dependabot` directly and join
    each of the 15 against this repo's existing waivers and its non-Rust
-   dependency files (`examples/island-flock/package.json`,
-   `benchmarks/runtime/django`'s Python deps) to determine how many are
+   dependency files. **Corrected by a Codex review comment on this PR**: an
+   earlier draft named `examples/island-flock/package.json` as one of those
+   files — it doesn't exist; `island-flock` has only Cargo manifests and
+   invokes `wasm-bindgen-cli` directly with no npm graph of its own. The
+   repo's actual tracked npm manifest is
+   `examples/react-graphql/frontend/package-lock.json` (plus
+   `package.json` beside it) — that's the file to check alongside
+   `benchmarks/runtime/django`'s Python deps to determine how many are
    already covered/waived, how many are non-Rust and outside `cargo-deny`'s
    scope entirely, and — most importantly — whether any of the 2 "high"
    alerts are a Cargo-ecosystem advisory that RustSec doesn't yet carry and
