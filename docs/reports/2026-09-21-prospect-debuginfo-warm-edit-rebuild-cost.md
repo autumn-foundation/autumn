@@ -193,9 +193,14 @@ the stub below and **📊 Assay**.)
   paired baseline numbers are reported separately from the main table's, not
   pooled with them, because they came roughly 40 minutes later in the
   session and read measurably lower (see **📊 Assay**) — a real reminder
-  that this sandbox's baseline itself drifts, which is exactly why each
-  reduced condition here is compared against a baseline measured in the same
-  narrow window, not a fixed constant.
+  that this sandbox's baseline itself drifts. **`debug=0` and `limited` are
+  each compared against a baseline measured in the same narrow window as
+  their own samples; `line-tables-only` is not (caught by Codex review on
+  PR #2882: an earlier draft of this sentence claimed this held for every
+  reduced condition, which conflicts with the unpaired-baseline correction
+  in **📊 Assay** for `line-tables-only` specifically — its valid samples
+  came from a rerun done later than, and not re-paired with, the baseline
+  row it's divided by).**
 
 ## 📊 Assay
 
