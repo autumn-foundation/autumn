@@ -3,11 +3,16 @@
 Third Ballast pass, one week after the second
 (`docs/reports/2026-09-14-ballast-dependency-ledger-audit.md`). That pass
 re-verified the harness, corrected two of its own earlier drafts on the
-"scheduled batch" methodology, and left eight follow-ups. This pass reruns
-the harness end to end (same methodology, same reproduce commands), re-checks
-every open follow-up, and surfaces one finding neither prior pass looked for:
-the actual state of the open Dependabot queue, rather than just its recent
-activity.
+"scheduled batch" methodology, and left **seven** open follow-ups (an eighth
+item was marked **Retracted** in that report, a git-history false alarm
+fully withdrawn, so it isn't an open item to carry forward — an earlier
+draft of this paragraph said "eight," miscounting it in, caught by a Codex
+review comment on this PR). This pass reruns the harness end to end (same
+methodology, same reproduce commands), re-checks every open follow-up, and
+surfaces two findings neither prior pass looked for: the actual state of
+the open Dependabot queue (not just its recent merge activity), and a
+discrepancy between this harness's clean result and GitHub's own native
+Dependabot alert count on the default branch (see the evidence section).
 
 ## 🎯 Class
 
@@ -98,8 +103,12 @@ below) are the obvious candidate mechanism, and `bitflags`/`parking_lot`/
 `parking_lot_core` specifically dropped out of this week's duplicate list
 after appearing in last week's. But a spot check found those exact crate
 names *still* have multiple versions in the raw `Cargo.lock` (`bitflags`
-1.3.2 + 2.13.1; `parking_lot` 0.8.6/0.9.12/0.11.2/0.12.5) — they're just not
-reachable within `deny.toml`'s scanned feature set via `cargo tree -i` on the
+1.3.2 + 2.13.1; `parking_lot` 0.11.2 + 0.12.5; `parking_lot_core` 0.8.6 +
+0.9.12 — **corrected, from a Codex review comment on this PR**: an earlier
+draft attributed all four version numbers to `parking_lot` alone; 0.8.6 and
+0.9.12 belong to `parking_lot_core` specifically, not `parking_lot`) —
+they're just not reachable within `deny.toml`'s scanned feature set via
+`cargo tree -i` on the
 default host target. So the honest statement is: within the graph this
 harness actually gates, duplicates and node count both fell; the raw lockfile
 still carries the old versions for other feature/target combinations outside
