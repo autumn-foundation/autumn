@@ -416,19 +416,116 @@ fn story_detail_response(
     }
 }
 
-/// Minimal gallery chrome layered on top of the framework widget stylesheet.
+/// Gallery chrome layered on top of the framework widget stylesheet
+/// (`WIDGETS_CSS_PATH`, linked before this `<style>` in `<head>`, so this
+/// block's declarations win the cascade at equal specificity).
+///
+/// Themed with the shared [`crate::ui::tokens`] custom properties
+/// (`var(--bg)`, `var(--primary)`, …) rather than hardcoded grays, so the
+/// gallery reads as a real Autumn surface instead of bare unstyled HTML —
+/// and so every `autumn-*` widget previewed inside a story re-themes too,
+/// since custom properties inherit down from `body`.
+///
+/// The `body { --bg: …; }` block below sets the gallery's own default
+/// ("Autumn": warm, not the framework's violet default) by overriding the
+/// tokens locally; it doesn't touch `tokens.css` itself, so apps embedding
+/// these widgets elsewhere are unaffected. [`theme_switch`] adds three more
+/// presets, swapped live by the same tokens — see its doc comment.
 const STORY_GALLERY_CSS: &str = r"
-body { margin: 0; font-family: system-ui, sans-serif; color: #1f2933; }
+body {
+    margin: 0;
+    font-family: var(--font-family);
+    color: var(--text);
+    background: var(--bg);
+    transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+
+    --bg: #fdf8f2;
+    --surface: #fffaf4;
+    --text: #2b1c10;
+    --text-muted: #7a6a58;
+    --border: #ecdcc8;
+    --primary: #c2540a;
+    --primary-hover: #a3470b;
+    --primary-light: #fbe4cd;
+    --radius: 0.6rem;
+    --shadow: 0 1px 3px rgba(43, 28, 16, 0.12), 0 4px 14px rgba(43, 28, 16, 0.08);
+}
+
+body:has(#story-theme-ocean:checked) {
+    --bg: #f0f7fb; --surface: #ffffff; --text: #0f2a3d; --text-muted: #52717f;
+    --border: #cfe4ec; --primary: #0e7490; --primary-hover: #0b5a70; --primary-light: #d7f0f5;
+    --shadow: 0 1px 3px rgba(15, 42, 61, 0.12), 0 4px 14px rgba(15, 42, 61, 0.08);
+}
+body:has(#story-theme-forest:checked) {
+    --bg: #f3f8f1; --surface: #ffffff; --text: #1b2e18; --text-muted: #5c7256;
+    --border: #d7e8d2; --primary: #2e7d32; --primary-hover: #25662a; --primary-light: #dcefdb;
+    --shadow: 0 1px 3px rgba(27, 46, 24, 0.12), 0 4px 14px rgba(27, 46, 24, 0.08);
+}
+body:has(#story-theme-midnight:checked) {
+    --bg: #14151c; --surface: #1d1f2b; --text: #e7e7ee; --text-muted: #9497ab;
+    --border: #2e3040; --primary: #8b7cf6; --primary-hover: #a190ff; --primary-light: #2b2650;
+    --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 4px 14px rgba(0, 0, 0, 0.3);
+}
+
+.story-theme-switch { display: flex; align-items: center; gap: 0.4rem; padding: 0.6rem 1.25rem; border-bottom: 1px solid var(--border); background: var(--surface); }
+.story-theme-switch legend { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-right: 0.25rem; padding: 0; }
+.story-theme-switch input[type='radio'] { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.story-theme-switch label { padding: 0.3rem 0.75rem; border-radius: 999px; border: 1px solid var(--border); font-size: 0.8rem; line-height: 1; cursor: pointer; color: var(--text-muted); }
+.story-theme-switch input[type='radio']:checked + label { background: var(--primary); border-color: var(--primary); color: #fff; }
+.story-theme-switch input[type='radio']:focus-visible + label { outline: 2px solid var(--primary); outline-offset: 2px; }
+
 .story-layout { display: flex; gap: 2rem; align-items: flex-start; }
-.story-sidebar { flex: 0 0 14rem; padding: 1rem 1.25rem; border-right: 1px solid #e0e0e0; min-height: 100vh; }
-.story-sidebar h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; color: #616e7c; margin: 1.25rem 0 0.25rem; }
+.story-sidebar { flex: 0 0 14rem; padding: 1.25rem; border-right: 1px solid var(--border); min-height: 100vh; background: var(--surface); }
+.story-sidebar h2 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin: 1.5rem 0 0.35rem; }
+.story-sidebar h2:first-child { margin-top: 0; }
 .story-sidebar ul { list-style: none; margin: 0; padding: 0; }
 .story-sidebar li { margin: 0.15rem 0; }
-.story-content { flex: 1 1 auto; padding: 1.5rem; max-width: 60rem; }
-.story-preview { padding: 1.5rem; border: 1px solid #e0e0e0; border-radius: 6px; margin-bottom: 1.5rem; }
-.story-content pre { background: #f5f7fa; border-radius: 6px; padding: 1rem; overflow-x: auto; }
-.story-empty { padding: 2rem; border: 1px dashed #cbd2d9; border-radius: 6px; }
+.story-sidebar a { color: var(--text); text-decoration: none; border-radius: 0.35rem; padding: 0.15rem 0.4rem; display: block; }
+.story-sidebar a:hover { background: var(--primary-light); color: var(--primary); }
+.story-content { flex: 1 1 auto; padding: 1.75rem 2rem 3rem; max-width: 60rem; }
+.story-content h1 { margin-top: 0; }
+.story-breadcrumb { color: var(--text-muted); font-size: 0.85rem; }
+.story-breadcrumb a { color: var(--primary); }
+.story-preview { padding: 1.75rem; border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 1.5rem; background: var(--surface); box-shadow: var(--shadow); }
+.story-content pre { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem; overflow-x: auto; }
+.story-empty { padding: 2rem; border: 1px dashed var(--border); border-radius: var(--radius); color: var(--text-muted); }
 ";
+
+/// The gallery's theme presets: `(radio value / id suffix, visible label)`.
+/// `"autumn"` is the default (checked server-side so the page never renders
+/// themeless before CSS applies).
+const STORY_THEMES: [(&str, &str); 4] = [
+    ("autumn", "Autumn"),
+    ("ocean", "Ocean"),
+    ("forest", "Forest"),
+    ("midnight", "Midnight"),
+];
+
+/// Live theme switcher: a `fieldset` of radio buttons that re-theme the
+/// whole page — including every `autumn-*` widget previewed in a story —
+/// with **no JavaScript**.
+///
+/// Each radio's `:checked` state is matched by a `body:has(#story-theme-…
+/// :checked)` rule in [`STORY_GALLERY_CSS`] that overrides the shared
+/// design tokens (`--bg`, `--primary`, …); because custom properties
+/// inherit, every rule referencing `var(--primary)` — in this stylesheet
+/// *and* in the linked `WIDGETS_CSS_PATH` bundle — re-resolves live the
+/// moment a different radio is checked. Same `:has()`-driven, script-free
+/// pattern as the alert widget's dismiss toggle and the tabs widget's
+/// `:target` deep-linking; safe under a strict `script-src 'self'` CSP with
+/// no `'unsafe-inline'` and no nonce, since nothing here executes.
+fn theme_switch() -> maud::Markup {
+    maud::html! {
+        fieldset class="story-theme-switch" {
+            legend { "Theme" }
+            @for (value, label) in STORY_THEMES {
+                input type="radio" name="story-theme" id=(format!("story-theme-{value}"))
+                    checked[value == "autumn"];
+                label for=(format!("story-theme-{value}")) { (label) }
+            }
+        }
+    }
+}
 
 /// Full HTML document shell: framework widget stylesheet + widget runtime
 /// script + gallery chrome.
@@ -470,7 +567,10 @@ fn story_page(
                     (maud::PreEscaped(STORY_GALLERY_CSS))
                 }
             }
-            body { (body) }
+            body {
+                (theme_switch())
+                (body)
+            }
         }
     }
 }
@@ -993,6 +1093,72 @@ mod tests {
         assert!(
             plain.contains("<style>") && !plain.contains("nonce="),
             "without the security layer no nonce attribute is emitted: {plain}"
+        );
+    }
+
+    // U11 (theming/interactivity follow-up): every story page renders a live
+    // theme switcher — one radio per `STORY_THEMES` entry, "autumn" checked
+    // by default — and each radio's `id` matches a `body:has(#story-theme-…
+    // :checked)` override in `STORY_GALLERY_CSS`, so picking a theme needs no
+    // JavaScript. This also guards the CSP: the switcher must never grow an
+    // inline `<script>`/`on*=` handler, only the pure-CSS `:has()` pattern.
+    #[test]
+    fn theme_switch_renders_radios_wired_to_css_overrides() {
+        let registry = StoryRegistry::new(vec![demo_story("Display", "Card")]);
+        let index = render_story_index(&registry, None).into_string();
+        let dom = crate::test_html::parse(&index);
+
+        let fieldset = crate::test_html::SelectorList::parse("fieldset.story-theme-switch")
+            .expect("selector parses");
+        assert!(
+            !fieldset.matches(&dom).is_empty(),
+            "index must render the theme switcher: {index}"
+        );
+
+        for (value, label) in STORY_THEMES {
+            let radio_id = format!("story-theme-{value}");
+            let radio_selector = crate::test_html::SelectorList::parse(&format!(
+                "input[type=\"radio\"][name=\"story-theme\"]#{radio_id}"
+            ))
+            .expect("selector parses");
+            assert!(
+                !radio_selector.matches(&dom).is_empty(),
+                "missing theme radio for {value:?}: {index}"
+            );
+
+            let label_selector =
+                crate::test_html::SelectorList::parse(&format!("label[for=\"{radio_id}\"]"))
+                    .expect("selector parses");
+            let label_matches = label_selector.matches(&dom);
+            assert!(
+                !label_matches.is_empty(),
+                "missing theme label for {value:?}: {index}"
+            );
+            assert!(
+                label_matches[0].text().contains(label),
+                "theme label for {value:?} should read {label:?}: {index}"
+            );
+
+            // "autumn" is the base `body {}` rule's own default — it needs no
+            // `:has()` override, only the other three presets do.
+            if value != "autumn" {
+                assert!(
+                    STORY_GALLERY_CSS.contains(&format!("#story-theme-{value}:checked")),
+                    "STORY_GALLERY_CSS must override tokens when #{radio_id} is checked"
+                );
+            }
+        }
+
+        assert!(
+            index.contains(r#"id="story-theme-autumn" checked"#),
+            "the default theme (autumn) must be checked server-side so the \
+             page never renders themeless before CSS applies: {index}"
+        );
+
+        assert!(
+            !index.contains("<script>") && !index.contains(" onclick=") && !index.contains(" onchange="),
+            "the theme switcher must stay pure-CSS (:has()), no inline script \
+             or event handler, to hold under a strict script-src CSP: {index}"
         );
     }
 }
