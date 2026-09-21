@@ -211,17 +211,33 @@ means (2 genuinely independent blocks each, interleaved
 baseline (2nd window) = [3.821s, 3.778s] — no overlap, a clean separation
 the same way the first window's baseline-vs-`debug=0` comparison was.
 
-**This is the report's most decision-relevant new number: on the exact
-setting Onramp's report measured, the warm-edit win (-26.45%) is roughly
-three times the cold-build win Onramp found for the same setting (-8.7%).**
-Onramp's report treated `debuginfo=1` as the safe-but-smaller-win option;
-this assay shows that framing undersold it on the axis that matters most for
-total developer time, because it only looked at the one-time cold build.
-Unlike the `line-tables-only`-vs-`debug=0` comparison earlier in this report
-(unmeasurable — see below), this `limited`-vs-its-own-baseline comparison
-and its cross-report comparison to Onramp's own `limited` number are both
-methodologically sound: two genuinely independent blocks each, and a valid
-apples-to-apples setting match confirmed via `rustc -C help`.
+**Correction (caught by Codex review on PR #2882, fifth round): the first
+draft of this paragraph called the -26.45% (warm) vs. -8.7% (cold) figures
+"roughly three times" as if that ratio were itself a measured, meaningful
+quantity. It isn't, and the claim is withdrawn.** Onramp's `-8.7%` number
+comes from just 2 samples, both from a single batched block, of a
+non-incremental full `autumn-web` crate build — unlike `baseline`/`debug=0`
+in that same report, `debuginfo=1` never got the interleaved-block check
+that would let anyone bound its own noise. And it's measuring a categorically
+different workload from this assay's incremental single-crate `hello`
+rebuild — different code being compiled, different compilation mode, no
+shared apparatus. Matching the rustc setting (per **🎯 Question**'s
+correction) makes the two numbers *comparable in kind*, not arithmetically
+combinable into a ratio.
+
+**What this assay's `limited` result does support, described honestly as
+two separate observations rather than one derived ratio:** on the *cold*
+build, Onramp measured `limited` giving a thin, weakly-replicated ~8.7%
+saving, well under its own 20% floor. On the *warm* edit, this assay
+measured `limited` giving a properly-replicated (2 independent blocks,
+6 samples, no overlap with its own paired baseline) ~26.45% saving, well
+over this assay's 10% materiality line. Both numbers stand on their own
+apparatus's own footing; neither multiplies into the other. What they
+jointly support is qualitative, not a multiplier: `limited` is not a
+option whose benefit is confined to the one-time cold build, the way
+Onramp's report's own framing (a real, if modest, cold-start win; an
+open question everywhere else) might suggest — it has a separately-verified,
+separately-large warm-edit win too.
 
 **Correction (caught by Codex review on PR #2882, three rounds on this one
 paragraph, about the original two-condition table only — the `limited` data
@@ -301,14 +317,17 @@ This changes the shape of the pending decision, not just its confidence:
    bigger than Onramp's report alone showed, because most of a
    development session's builds are warm edits, not cold starts.
 2. **`limited` (`debug = 1`, the actual level Onramp's report evaluated and
-   confirmed preserves backtrace file:line resolution) is not the
-   safe-but-smaller-win option on the warm-edit axis — it's a large win
-   there too, and proportionally larger than it was on the cold build.**
-   Onramp measured `limited` at ~8.7% on the cold build, well under its 20%
-   floor. This assay measured the same setting at ~26.45% on the warm edit —
-   over the 10% materiality line by a wide margin, and using genuinely
-   independent, interleaved blocks (see **📊 Assay**), so this comparison is
-   trustworthy in a way the one below isn't.
+   confirmed preserves backtrace file:line resolution) is not confined to
+   being a safe-but-marginal cold-start win — it has a separately-measured,
+   separately-large warm-edit win too.** Onramp measured `limited` at ~8.7%
+   on the cold build (from a thin, single-block sample of a different,
+   non-incremental workload — see the correction in **📊 Assay**, this is
+   not a number to build a ratio on). This assay measured the same setting
+   at ~26.45% on the warm edit, from a properly-replicated, genuinely
+   independent, interleaved design (see **📊 Assay**) — trustworthy on its
+   own terms, in a way the comparison in point 3 below isn't. The two
+   numbers aren't combinable into a multiplier, but together they say
+   `limited` is not a marginal, cold-build-only lever.
 3. **Whether `line-tables-only` (an even more minimal, distinct rustc level
    — see the terminology correction in **🎯 Question** — that this assay
    measured separately and by coincidence, not because it was the level
@@ -426,17 +445,25 @@ run_block() {
   done
 }
 
-# Full two-round, properly interleaved (round-robin) condition order,
-# covering all four conditions this report measures -- including `1`
-# (`limited`, the actual level Onramp's report evaluated; distinct from
-# `line-tables-only`, see the terminology correction in Question). NOT what
-# this assay's own `line-tables-only` data actually came from (caught by
-# Codex review on PR #2882: this assay's real rerun of that condition ran
-# two blocks back to back with no other condition in between, so its two
-# "blocks" were one continuously-held period, not two independent
-# re-entries -- see the stub in Apparatus and the correction in Assay).
-# Every condition's two occurrences are separated by the other three here,
-# so every block pays a genuine fresh re-entry:
+# IMPORTANT (caught by Codex review on PR #2882, sixth round): this
+# round-robin is a CORRECTED FOLLOW-UP DESIGN, not a literal replay of how
+# this report's own numbers were collected. The real sessions ran as two
+# separate sequences, neither of which is this loop:
+#   1. baseline -> debug=0 -> line-tables-only(buggy,discarded) ->
+#      line-tables-only(buggy,discarded) -> baseline -> debug=0
+#      (the buggy line-tables-only entries used unquoted TOML and never
+#      really measured anything; see the stub in Apparatus)
+#   2. A separate rerun, later: line-tables-only -> line-tables-only
+#      (fixed TOML quoting, but back to back -- see the pseudoreplication
+#      correction in Assay)
+#   3. A separate run, later still: limited -> baseline -> limited -> baseline
+# Running THIS script instead -- covering all four conditions in a genuine
+# round-robin, each pair separated by the other three -- does not
+# reproduce any of those three real sequences or their exact numbers; it is
+# the design a follow-up assay should use to get a result this report's own
+# apparatus couldn't validly produce for line-tables-only-vs-limited. Every
+# condition's two occurrences are separated by the other three here, so
+# every block pays a genuine fresh re-entry:
 for cond in "" 0 line-tables-only 1 "" 0 line-tables-only 1; do
   echo "== condition: '${cond:-baseline}' =="
   run_block "$cond"
