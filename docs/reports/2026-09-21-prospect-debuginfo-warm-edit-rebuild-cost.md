@@ -360,7 +360,21 @@ authority Onramp's report never actually had for this specific level.
 
 **Rather than downgrade the claim to "unverified" and move on, this gap was
 closed directly: the same throwaway-binary method Onramp's report used, run
-in this sandbox at `-C debuginfo=1`.**
+in this sandbox at `-C debuginfo=1`.** The two-function `main.rs` this
+tests (caught by Codex review on PR #2882: an earlier draft omitted this
+source, so the check couldn't actually be reproduced or verified against
+this exact frame layout):
+
+```rust
+fn inner() {
+    let bt = std::backtrace::Backtrace::force_capture();
+    println!("{bt}");
+}
+
+fn main() {
+    inner();
+}
+```
 
 ```
 $ rustc -C debuginfo=2 -o bt_default main.rs && RUST_BACKTRACE=full ./bt_default
@@ -630,6 +644,15 @@ report already scoped (`autumn-cli/src/templates/Cargo.toml.tmpl`,
 # origin/trunk-dev` or the base shown on
 # https://github.com/autumn-foundation/autumn/pull/2882 finds the same
 # commit.)
+
+# Pin the exact toolchain this assay measured with (caught by Codex review
+# on PR #2882: the repo ships no rust-toolchain.toml, so a bare `cargo`
+# resolves whatever "stable" means on the machine running this recipe --
+# not necessarily rustc/cargo 1.94.1, the version every number in this
+# report was measured on, and compiler codegen/incremental behavior can
+# shift between versions):
+rustup toolchain install 1.94.1
+rustup override set 1.94.1   # scoped to this worktree; every bare `cargo` below now resolves to it
 
 # Pre-warm deps + autumn-web once:
 cargo build -p hello
