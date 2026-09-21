@@ -462,8 +462,13 @@ body:has(#story-theme-forest:checked) {
     --shadow: 0 1px 3px rgba(27, 46, 24, 0.12), 0 4px 14px rgba(27, 46, 24, 0.08);
 }
 body:has(#story-theme-midnight:checked) {
+    /* Reuses tokens.css's own default violet (not a lighter #8b7cf6-family
+       shade) because white text sits directly on --primary throughout the
+       widget set (checked pills, buttons, …): #7c3aed keeps that pairing at
+       ~5.7:1 contrast, comfortably above WCAG AA's 4.5:1 for normal text —
+       a lighter violet dropped as low as 3.33:1 (review follow-up). */
     --bg: #14151c; --surface: #1d1f2b; --text: #e7e7ee; --text-muted: #9497ab;
-    --border: #2e3040; --primary: #8b7cf6; --primary-hover: #a190ff; --primary-light: #2b2650;
+    --border: #2e3040; --primary: #7c3aed; --primary-hover: #6d28d9; --primary-light: #2b2650;
     --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 4px 14px rgba(0, 0, 0, 0.3);
 }
 
@@ -1156,7 +1161,9 @@ mod tests {
         );
 
         assert!(
-            !index.contains("<script>") && !index.contains(" onclick=") && !index.contains(" onchange="),
+            !index.contains("<script>")
+                && !index.contains(" onclick=")
+                && !index.contains(" onchange="),
             "the theme switcher must stay pure-CSS (:has()), no inline script \
              or event handler, to hold under a strict script-src CSP: {index}"
         );
