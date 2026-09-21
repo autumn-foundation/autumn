@@ -36,17 +36,58 @@ use maud::{Markup, PreEscaped};
 
 use super::{Cache, get_cached, insert_cached};
 
-/// Cache a rendered Maud fragment keyed by `(identity, version)`.
+/// The ambient tenant folded into every fragment cache key (Warden
+/// 2026-09-21, `docs/security/2026-09-21-fragment-cache-tenant-key/`).
+///
+/// A fragment's `identity` is commonly a record's own primary key
+/// (`docs/guide/fragment-caching.md`'s own Quick Start:
+/// `format_args!("post_card:{}", post.id)`), and its `version` is commonly
+/// that record's `updated_at` or `#[lock_version]`
+/// (`docs/guide/conditional-get.md`). Neither is guaranteed unique *across*
+/// tenants once sharding is in play: `docs/guide/sharding.md`'s own resharding
+/// runbook calls out that a sharded table's primary key is a **shard-local**
+/// `BIGSERIAL` — every shard hands out its own `1, 2, 3, …` independently — so
+/// two different tenants' first row of the same model can land on
+/// `(id = 1, lock_version = 1)` deterministically, on different shards, the
+/// instant both exist.
+///
+/// Every *other* tenant-scoped Autumn primitive resolves the tenant from this
+/// same `CURRENT_TENANT` task-local ambiently, with no explicit parameter
+/// required — `tenant_scoped` repository finders, `save()`, preload,
+/// retention sweeps, and (after the 2026-09-05 fix) `#[cached]` itself
+/// (`autumn-macros/src/cached.rs`). Folding it in here, unconditionally,
+/// keeps `cache_fragment`/`cache_fragment_in` consistent with that idiom
+/// instead of being the one primitive where it silently doesn't apply.
+///
+/// `None` outside any tenancy-resolved request context (a single-tenant app,
+/// a non-request caller) — the key is unchanged there, exactly like
+/// `#[cached]`'s `Option<String>` component.
+fn tenant_key_component() -> String {
+    let tenant = crate::tenancy::CURRENT_TENANT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    // Length-prefixed for the same reason `identity` is below: without this,
+    // an absent tenant (empty string) could alias a tenant whose id happens
+    // to be a prefix of the next segment. Keeping the guarantee local to this
+    // module rather than relying on `TenancyConfig` rejecting an empty
+    // resolved tenant id elsewhere.
+    format!("{}:{tenant}", tenant.len())
+}
+
+/// Cache a rendered Maud fragment keyed by `(tenant, identity, version)`.
 ///
 /// - **Hit**: returns the cached `Markup` without running `render`.
 /// - **Miss**: calls `render()`, stores the result, and returns it.
 /// - **No cache** (`cache = None`): calls `render()` on every call — no panic.
 ///
-/// The cache key combines `identity` and `version` (the identity is
-/// length-prefixed so a `:` inside it can't alias two fragments). Storing the rendered
-/// `String` via [`insert_cached`] means the fragment works with both the
-/// moka in-process backend and the Redis shared backend (which serializes via
-/// serde JSON), and honours an optional TTL.
+/// The cache key folds in the ambient resolved tenant (see
+/// [`tenant_key_component`]) ahead of `identity` and `version` (each
+/// length-prefixed so a `:` inside either can't alias two fragments).
+/// Storing the rendered `String` via [`insert_cached`] means the fragment
+/// works with both the moka in-process backend and the Redis shared backend
+/// (which serializes via serde JSON), and honours an optional TTL.
 ///
 /// # Arguments
 ///
@@ -73,7 +114,8 @@ pub fn cache_fragment(
     // (identity="a:b", version="c") must not collide with (identity="a",
     // version="b:c"). The byte length pins where the identity ends.
     let identity = identity.to_string();
-    let key = format!("fragment:{}:{identity}:{version}", identity.len());
+    let tenant = tenant_key_component();
+    let key = format!("fragment:{tenant}:{}:{identity}:{version}", identity.len());
 
     if let Some(html) = get_cached::<String>(cache, &key) {
         // Hit: reconstruct Markup from the cached String without re-escaping.
@@ -175,10 +217,14 @@ pub fn cache_fragment_in(
     // Same length-prefixed identity as `cache_fragment`, behind the namespace
     // that `invalidate_namespace` scans for: `{namespace}:` is exactly the
     // prefix `MokaCache` matches on and `RedisCache` builds its `SCAN MATCH`
-    // from, so the declared id and the runtime key space finally agree.
+    // from, so the declared id and the runtime key space finally agree. The
+    // ambient tenant (see `tenant_key_component`) is folded in *after* that
+    // prefix so a namespace sweep is unaffected by which tenant wrote a given
+    // entry.
     let identity = identity.to_string();
+    let tenant = tenant_key_component();
     let key = format!(
-        "{namespace}:fragment:{}:{identity}:{version}",
+        "{namespace}:fragment:{tenant}:{}:{identity}:{version}",
         identity.len()
     );
 
