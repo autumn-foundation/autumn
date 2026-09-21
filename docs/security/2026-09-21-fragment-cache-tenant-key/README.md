@@ -149,30 +149,64 @@ namespace the handler's own tenant-correct query has no say over.
 
 ## 🩹 Fix
 
-`autumn/src/cache/fragment.rs`: a new `tenant_key_component()` reads
-`crate::tenancy::CURRENT_TENANT.try_with(Clone::clone)`, defaulting to an
-empty string outside any tenancy-resolved context, and both `cache_fragment`
-and `cache_fragment_in` fold it into their key — length-prefixed, the same
-technique already used for `identity`, so an absent tenant cannot alias a
-tenant whose id happens to be a prefix of the next segment:
+`autumn/src/cache/fragment.rs`: `tenant_key_component()` reads
+`crate::tenancy::CURRENT_TENANT.try_with(Clone::clone)` and returns
+`Option<String>` — preserving the task-local's own `None`/`Some`
+discriminant rather than collapsing it to a string. A new `fragment_key()`
+builds the key from that `Option`:
 
 ```rust
-let tenant = tenant_key_component();
-let key = format!("fragment:{tenant}:{}:{identity}:{version}", identity.len());
+fn fragment_key(prefix: &str, tenant: Option<&str>, identity: &str, version: impl Display) -> String {
+    match tenant {
+        Some(tenant) => format!(
+            "{prefix}tenant={}:{tenant}:{}:{identity}:{version}",
+            tenant.len(), identity.len()
+        ),
+        None => format!("{prefix}{}:{identity}:{version}", identity.len()),
+    }
+}
 ```
 
+Two review-round fixes are load-bearing here (Codex, PR #2884):
+
+- **`None` builds the exact pre-fix key**, with no tenant segment at all.
+  An earlier draft unconditionally inserted a tenant segment (even an empty
+  one) for every caller, which would have changed the key for *every*
+  existing single-tenant/non-request cache entry on upgrade — a silent,
+  total cold-cache for a permanent (`ttl = None`) Redis-backed installation,
+  with no way to reclaim the orphaned old keys. `None` now reaches the
+  `format!("{prefix}{}:{identity}:{version}", identity.len())` arm
+  unchanged.
+- **`Some(tenant)` — including an empty string — cannot alias `None`.** The
+  literal `tenant=` marker is non-numeric, so it can never collide with the
+  `None` key's leading decimal identity-length; and the tenant itself is
+  length-prefixed, so `Some("")` and `Some("x")` (and `None`) all land in
+  distinct key spaces. An earlier draft collapsed `CURRENT_TENANT`'s `Option`
+  to a plain string via `.flatten().unwrap_or_default()` before building the
+  key, which made a resolved-but-empty tenant id (reachable through the
+  public `with_tenant`) compute the *same* component as no tenant context at
+  all.
+
+`cache_fragment`/`cache_fragment_in` both call `fragment_key`;
 `cache_fragment_global`/`cache_fragment_global_in` are unchanged — they
 already call through to the fixed functions, so the fix covers all four
-public entry points. The tenant segment is inserted *after* the `{namespace}:`
-prefix in `cache_fragment_in`, so `invalidate_namespace`'s `SCAN
+public entry points. In `cache_fragment_in` the tenant segment sits *after*
+the `{namespace}:` prefix, so `invalidate_namespace`'s `SCAN
 MATCH "{namespace}:*"` (Redis) / prefix match (`MokaCache`) is unaffected —
 namespace-based invalidation still reaches every tenant's entries for that
 namespace.
 
 This mirrors the 2026-09-05 fix to `#[cached]` (`autumn-macros/src/cached.rs`):
-fold the ambient `CURRENT_TENANT` in unconditionally, at the primitive, so
-every caller gets tenant isolation for free rather than needing to remember
-to thread a tenant discriminator through `identity` by hand.
+fold the ambient `CURRENT_TENANT` in at the primitive, so every caller gets
+tenant isolation for free rather than needing to remember to thread a
+tenant discriminator through `identity` by hand — and, like that fix,
+preserve `Option`'s own discriminant rather than lossily stringifying it.
+
+Two unit tests pin both review-round properties directly:
+`no_tenant_context_reads_a_pre_fix_legacy_key` (hand-writes the exact
+pre-fix key and confirms a post-fix, no-tenant-context call still hits it)
+and `empty_string_tenant_does_not_alias_no_tenant_context` (an empty
+resolved tenant and no tenant context land in distinct cache entries).
 
 ## ✅ Verification
 
