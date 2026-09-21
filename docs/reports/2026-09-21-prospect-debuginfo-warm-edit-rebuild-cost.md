@@ -239,6 +239,49 @@ Onramp's report's own framing (a real, if modest, cold-start win; an
 open question everywhere else) might suggest — it has a separately-verified,
 separately-large warm-edit win too.
 
+**Correction (caught by Codex review on PR #2882, sixth round): this
+report's earlier drafts repeatedly said Onramp's report "verified" or
+"confirmed" that `limited` preserves backtrace file:line resolution. It
+never did.** Re-reading Onramp's own empirical check
+(`docs/reports/2026-09-17-onramp-devprofile-debuginfo-cold-start-findings.md:180-194`):
+its throwaway two-function binary only compares default debuginfo against
+`-C debuginfo=0`. The claim that `debuginfo=1` "keeps file:line resolution"
+(that report's line 123) is asserted in prose, alongside the same
+"line-tables-only" mislabeling this report's **🎯 Question** section already
+corrected — not measured. So this report's own claim was borrowing
+authority Onramp's report never actually had for this specific level.
+
+**Rather than downgrade the claim to "unverified" and move on, this gap was
+closed directly: the same throwaway-binary method Onramp's report used, run
+in this sandbox at `-C debuginfo=1`.**
+
+```
+$ rustc -C debuginfo=2 -o bt_default main.rs && RUST_BACKTRACE=full ./bt_default
+   0: main::inner
+             at ./main.rs:2:14
+   1: main::main
+             at ./main.rs:7:5
+   ...
+$ rustc -C debuginfo=1 -o bt_limited main.rs && RUST_BACKTRACE=full ./bt_limited
+   0: main::inner
+             at ./main.rs:2:14
+   1: main::main
+             at ./main.rs:7:5
+   ...
+$ rustc -C debuginfo=0 -o bt_none main.rs && RUST_BACKTRACE=full ./bt_none
+   0: main::inner
+   1: main::main
+   ...
+```
+
+`debuginfo=1`/`limited` reproduces file:line resolution for local frames
+identically to the full-debuginfo default (`at ./main.rs:2:14` in both);
+`debuginfo=0` drops it entirely, exactly reproducing the asymmetry Onramp's
+report found between default and `debuginfo=0` — just now with `limited`
+actually placed on the map instead of assumed onto it. This is now a
+genuinely confirmed result, by this assay, not a borrowed and mislabeled one
+from Onramp's report.
+
 **Correction (caught by Codex review on PR #2882, three rounds on this one
 paragraph, about the original two-condition table only — the `limited` data
 above came later and doesn't have this problem): draft 1 compared the
@@ -316,10 +359,13 @@ This changes the shape of the pending decision, not just its confidence:
    permanent backtrace-quality cost" — the compile-time side of the ledger is
    bigger than Onramp's report alone showed, because most of a
    development session's builds are warm edits, not cold starts.
-2. **`limited` (`debug = 1`, the actual level Onramp's report evaluated and
-   confirmed preserves backtrace file:line resolution) is not confined to
-   being a safe-but-marginal cold-start win — it has a separately-measured,
-   separately-large warm-edit win too.** Onramp measured `limited` at ~8.7%
+2. **`limited` (`debug = 1`, the actual level Onramp's report evaluated,
+   and which this assay independently confirmed preserves backtrace
+   file:line resolution — Onramp's own report only asserted this in prose
+   and never measured it for `limited` specifically; see the correction in
+   **📊 Assay**) is not confined to being a safe-but-marginal cold-start
+   win — it has a separately-measured, separately-large warm-edit win too.**
+   Onramp measured `limited` at ~8.7%
    on the cold build (from a thin, single-block sample of a different,
    non-incremental workload — see the correction in **📊 Assay**, this is
    not a number to build a ratio on). This assay measured the same setting
@@ -355,9 +401,11 @@ carries a large, validated recurring win, not just a marginal cold-start one.
 Not a new build — this assay feeds an existing decision (issue #2795) rather
 than proposing new code. If the maintainer picks `debug = 1` (`limited`) for
 the generated-project templates' `[profile.dev]` (the option with the
-strongest evidence behind it: Onramp's report already verified it preserves
-backtrace file:line resolution, and this assay adds a validated, large
-recurring warm-edit win — both measurements of the *same* rustc setting,
+strongest evidence behind it: this assay independently confirmed it
+preserves backtrace file:line resolution — Onramp's report only asserted
+this in prose and never measured it for `limited` specifically, see the
+correction in **📊 Assay** — and this assay adds a validated, large
+recurring warm-edit win; both are measurements of the *same* rustc setting,
 confirmed via `rustc -C help`): the change itself is the one line Onramp's
 report already scoped (`autumn-cli/src/templates/Cargo.toml.tmpl`,
 `Cargo.api.toml.tmpl`), plus the still-open items neither report has closed:
@@ -368,13 +416,15 @@ report already scoped (`autumn-cli/src/templates/Cargo.toml.tmpl`,
   default change.
 - Re-measure `debug=0`'s cold-build number above the noise floor / on a
   dedicated or CI-caliber box, per Onramp's report (only relevant if
-  `debug=0` rather than `limited` is the level under consideration — `debug=0`
-  does not preserve backtrace file:line resolution, per Onramp's report).
+  `debug=0` rather than `limited` is the level under consideration —
+  `debug=0` does not preserve backtrace file:line resolution, confirmed
+  empirically by both Onramp's report and this one).
 - New: a properly-blocked `line-tables-only`-vs-`limited` warm-edit
   comparison, only needed if the decider wants to consider `line-tables-only`
   specifically instead of `limited` — this assay's own attempt doesn't
   answer it (see the correction in **📊 Assay**), and `line-tables-only`'s
-  backtrace-quality property is itself unverified, unlike `limited`'s.
+  backtrace-quality property is itself unverified (by either report),
+  unlike `limited`'s.
 - Which build agents' gates: `cold-start-latency.yml` needs a green run
   against the new template default before it merges. **`dev-loop-latency.yml`
   does not yet give equivalent evidence for the warm-edit path — caught by
