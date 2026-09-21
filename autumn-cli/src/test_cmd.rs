@@ -278,6 +278,8 @@ mod tests {
             "my%20app",
             "already_test",
             "%6d%79_app",
+            "%5F_leading_underscore",
+            "MIXED%5fCase%2Fname",
             "trailing%2",
             "trailing%",
             "100%25done",
