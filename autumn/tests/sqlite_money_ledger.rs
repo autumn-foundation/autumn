@@ -1393,12 +1393,20 @@ async fn fund_wallet_and_race_withdrawals(
 /// `cache=shared`, where table-level `SQLITE_LOCKED` bypasses the busy
 /// handler entirely and a whole wave can lose (#2881) — there, only "at most
 /// one" is safe to assert.
+///
+/// Returns the observed `contention_errors` count. For `cache=shared`
+/// (`expect_exactly_one_winner == false`) this function does *not* itself
+/// assert that contention was observed — the caller retries with a freshly
+/// funded wallet until it is (see `concurrent_withdrawals_cannot_double_spend_a_disallow_negative_wallet`),
+/// since forcing overlap the same way file-backed WAL does (a preliminary
+/// read held open across the barrier) deadlocks `cache=shared` instead of
+/// racing it.
 async fn race_withdrawals_against_disallow_negative_wallet(
     pool: SqlitePool,
     racers: usize,
     pool_size: usize,
     expect_exactly_one_winner: bool,
-) {
+) -> i64 {
     // The two locking models this races against need the barrier in a
     // different place (see `fund_wallet_and_race_withdrawals`), which happens
     // to be the same condition as which outcome to expect, so one flag drives
@@ -1464,6 +1472,8 @@ async fn race_withdrawals_against_disallow_negative_wallet(
         "the ledger's own stored balance went negative: {balance}"
     );
     assert_books_balance(&mut conn).await;
+
+    contention_errors
 }
 
 /// The `cache=shared` + `mode=memory` path: table-level `SQLITE_LOCKED`
@@ -1471,10 +1481,37 @@ async fn race_withdrawals_against_disallow_negative_wallet(
 /// deliberately shareable-across-a-pool configuration
 /// (`sqlite_target_is_memory`'s doc in `autumn/src/db.rs`), not merely a test
 /// convenience.
+///
+/// Retries with a freshly funded wallet (a fresh pool, so there is no stale
+/// state to re-fund around) until real contention is observed, up to
+/// `MAX_ATTEMPTS`. Unlike file-backed WAL, `cache=shared` cannot be forced to
+/// overlap by holding a read open across the barrier — that deadlocks
+/// (filed as #2885) — so this settles for confirming contention actually
+/// happened rather than guaranteeing it on the first try.
 #[tokio::test]
 async fn concurrent_withdrawals_cannot_double_spend_a_disallow_negative_wallet() {
-    let pool = boot_pool_sized("mlg_double_spend", 8).await;
-    race_withdrawals_against_disallow_negative_wallet(pool, 96, 8, false).await;
+    const MAX_ATTEMPTS: usize = 5;
+
+    let mut contention_errors = 0;
+    for attempt in 0..MAX_ATTEMPTS {
+        let pool = boot_pool_sized(&format!("mlg_double_spend_{attempt}"), 8).await;
+        contention_errors =
+            race_withdrawals_against_disallow_negative_wallet(pool, 96, 8, false).await;
+        if contention_errors > 0 {
+            break;
+        }
+    }
+
+    // Proof this raced rather than serialized cleanly through the pool every
+    // attempt: `race_withdrawals_against_disallow_negative_wallet` already
+    // checks there was no double-spend on every attempt above: this is the
+    // one thing it does not check for the `cache=shared` path, since forcing
+    // it can deadlock instead of racing.
+    assert!(
+        contention_errors > 0,
+        "expected real SQLite contention on cache=shared after {MAX_ATTEMPTS} attempts, saw \
+         none — the racers may have serialized through the pool instead of actually racing"
+    );
 }
 
 /// The tempfile-backed path: a real file, so `journal_mode = WAL` actually
