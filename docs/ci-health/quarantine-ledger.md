@@ -1542,6 +1542,81 @@ without also filling in the intake form above.
   `.github/workflows/manual-job-tracking-rerun-check.yml` — see the dated
   update on the `job_tracking_stores_integration` entry below for why now,
   what it does, and why it isn't dispatchable yet.
+- **2026-09-21 update — 13th consecutive pass, harness still undispatched;
+  zero new hits on any of the three `live_upgrade` signatures.** Sampled
+  `ci.yml` `pull_request` runs from the 2026-09-20 report's own cutoff
+  (2026-09-20T07:33:19Z, exclusive) to 2026-09-21T09:55:07Z (~26.4h, one
+  `perPage=100`/`page=1` query whose own span, 2026-09-19T01:29:40Z–
+  2026-09-21T09:55:07Z, fully covers the window with margin on both ends, so
+  no second page was needed) — 75 runs in-window: 55 cancelled, 15 success,
+  5 failure. All 5 failures triaged at job level:
+  - Run 35540844428 (`claude/friendly-ritchie-d36hku`, PR #2842, a docs-only
+    change touching only `ci.yml`, `README.md`, `changelog.d/`, `docs/guide/`,
+    `scripts/check-docs-retrieval.sh`, and `skills/autumn-web/SKILL.md` — no
+    Rust source, confirmed by reading the PR's own file list) failed both
+    `Test (macos-latest)` and `SQLite runtime (feature=sqlite)`.
+    **Correction (post-review, via a Codex review comment on PR #2883): the
+    `Test (macos-latest)` failure was originally dismissed here as
+    "unrelated ... branch-owned," which is wrong — the PR's diff cannot own
+    a failure in code it never touches.** The failing test,
+    `autumn-macros-support`'s own unit test
+    `crate_path::tests::resolve_autumn_web_name_dashed_rename_is_sanitized`
+    (`left: "autumn_web", right: "autumn_web_05"`), is therefore an organic,
+    not-yet-diagnosed hit — logged below as its own new entry, same as the
+    SQLite finding. `SQLite runtime (feature=sqlite)` is the other new
+    signature logged below.
+  - Run 35523247491 (`claude/macro-split-decomposition-jalk90`, head
+    `30729276b2f8a50b76b70110c0aeb4ca9596c59a`, "Move the repository macro's
+    HTTP and retention slabs into their own modules," no open PR — the
+    branch ref no longer exists on origin) failed the same two jobs:
+    `SQLite runtime (feature=sqlite)` with the identical new signature, and
+    `Test (Docker)` with a repeat of the already-**closed**
+    `job_tracking_stores_integration::postgres_backend_persists_tracked_job_and_expires_it`
+    panic (`"record should be past its configured TTL"` at
+    `job_tracking_stores_integration.rs:264:5` — the pre-fix line number, not
+    the post-fix poll-based version). **Not a reopening.**
+    **Correction (post-review, via a Codex review comment on PR #2883): the
+    original version of this entry claimed this branch's pre-fix status was
+    "verified by git ancestry," but the `git merge-base --is-ancestor`
+    command actually run only checked PR #2870's (`claude/epic-meitner-eh6w1m`)
+    base commit, not this branch's — the two were conflated in prose.** This
+    branch's actual head commit, fetched via the GitHub API (the branch ref
+    itself is gone from origin, so a local `git merge-base` isn't possible
+    against it anymore), has `committer.date: 2026-09-20T16:34:05Z`, and the
+    CI run itself started `2026-09-20T16:36:30Z` — both well before the fix's
+    merge at `2026-09-20T19:35:35Z` UTC. Combined with the panic's exact
+    pre-fix line number and message text (which the post-fix version of the
+    test no longer contains at all, having been rewritten to a polling loop),
+    this is strong evidence of a pre-fix run, but by commit timestamp and
+    source-text matching, not literal ancestry — corrected to say so.
+  - Run 35530941996 (`claude/epic-meitner-eh6w1m`, PR #2870) failed
+    `Test (Docker)` with the **same** pre-fix `job_tracking_stores_integration`
+    signature (completed 2026-09-20T20:15:19Z, also before the 22:09:37Z UTC
+    fix/close) — same explanation, same non-reopening. **This is the one
+    branch actually checked by `git merge-base --is-ancestor`**: PR #2870's
+    base sha `9800221460975e7b3ee75a8490e392cb4b489f82` (confirmed via the
+    GitHub API against `head=claude/epic-meitner-eh6w1m`) is not a
+    descendant of the fix commit `0a0986b` (`git merge-base --is-ancestor
+    0a0986b 9800221...` exits 1) — the ancestry evidence in the original
+    version of this pass's report belongs to this branch alone, not to the
+    `macro-split-decomposition-jalk90` branch above, which is corrected
+    there.
+  - Run 35539828393 (`claude/intelligent-wright-ebjkn4`, closing the gap the
+    2026-09-20 report left open for this branch) failed `Test (Docker)` on
+    `examples/saas`'s own
+    `create_project_failure_redisplays_the_dashboard_with_name_preserved`
+    (`./tests/integration_test.rs:537`) — branch-owned WIP in an unrelated
+    example app, not matching any tracked signature.
+  - Run 35522888590 (`dependabot/github_actions/dtolnay/rust-toolchain-1.120.0`)
+    repeats its already-documented own action-pin-bump break (`SQLite runtime
+    (feature=sqlite)`, `MSRV (1.88.0)`) — that PR's own subject matter,
+    unmerged.
+
+  `manual-macos-contention-check.yml`: still `total_count: 0` against
+  `workflow_dispatch` runs, checked 2026-09-21T~10:0xZ — **13th** straight
+  pass since it became dispatchable 2026-09-08T15:07:44Z (now ~306.8 hours
+  idle, past 12.75 days). Still needs a human sign-off for new macOS CI
+  spend; not dispatched this pass for that reason.
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
   committed as `.github/workflows/manual-macos-contention-check.yml`, gated
@@ -1618,6 +1693,9 @@ without also filling in the intake form above.
 - **2026-09-18 update**: no repeat in the ~21.6h window sampled this pass
   (see the `live_upgrade` entry's 2026-09-18 dated update above for the
   window and method).
+- **2026-09-21 update**: no repeat in the ~26.4h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-21 dated update above for the
+  window and method).
 
 ### `sim_fault_plan::same_seed_replays_a_byte_identical_outcome_100_times`
 
@@ -1645,4 +1723,161 @@ without also filling in the intake form above.
 - **2026-09-18 update**: no repeat in the ~21.6h window sampled this pass
   (see the `live_upgrade` entry's 2026-09-18 dated update above for the
   window and method). Still n=1, still not campaigned.
+- **2026-09-21 update**: no repeat in the ~26.4h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-21 dated update above for the
+  window and method). Still n=1, still not campaigned.
+
+### `sqlite_jobs_scheduler_e2e::sqlite_job_backend_tracks_job_status_durably`
+
+- **New, 2026-09-21.** Two organic hits in the ~26.4h window sampled this
+  pass, both on the `SQLite runtime (feature=sqlite)` job, both the identical
+  panic:
+  ```
+  tracked enqueue: AutumnError { status: 500, inner: StringError("sqlite job
+  enqueue failed: ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
+  constraint"), ... }
+  ```
+  at `autumn/tests/sqlite_jobs_scheduler_e2e.rs:1301:6`.
+  - Run 106158118450 (run 35540844428, branch `claude/friendly-ritchie-d36hku`,
+    PR #2842 "Folio: make Autumn's log settings findable" — **docs-only**, "0
+    pages added" by its own title, merged as `4a448ab`), 2026-09-20T22:20:48Z.
+  - Run 106110875320 (run 35523247491, branch
+    `claude/macro-split-decomposition-jalk90`, an in-progress
+    autumn-macros crate-split/rename branch, no open PR),
+    2026-09-20T16:50:08Z.
+- **Not branch-owned**: PR #2842 is a pure docs change (confirmed by its own
+  title/scope) touching no job or SQLite code, yet hit the byte-identical
+  failure as an unrelated in-progress refactor branch. That rules out either
+  branch's own diff as the cause and points at a pre-existing race in
+  `trunk-dev` itself (in the product code, the test, or both) rather than WIP.
+- **Mechanism — confirmed source location, unconfirmed cause.** The panic
+  originates in `SqliteJobBackend`'s enqueue path
+  (`autumn/src/job/sqlite.rs:429-432`): the `INSERT ... ON CONFLICT (name,
+  unique_key) WHERE unique_key IS NOT NULL AND status IN ('enqueued',
+  'running') DO NOTHING` targets a **partial unique index** unconditionally,
+  for every job — including this test's `sqlite_tracked_job`, which declares
+  no `JobUniqueness` at all. SQLite requires an `ON CONFLICT` target to match
+  an existing index's column list AND partial-index predicate exactly; this
+  specific error text is what SQLite raises on a target/index *mismatch*, not
+  on a duplicate-value constraint violation — i.e. the index this clause
+  expects did not exist, in the expected shape, on this connection at
+  execution time.
+
+  **Correction (post-review, via a Codex review comment on PR #2883): the
+  original version of this entry's leading hypothesis — a readiness race
+  between the fresh per-test SQLite pool's migrations and
+  `start_runtime`/`enqueue_tracked` being able to submit work before that
+  migration completed — is wrong, and contradicted by the queue path itself,
+  not merely unconfirmed.** `enqueue_job_at` (`autumn/src/job/sqlite.rs:391`)
+  calls `let pool = queue_handle.ready().await?;` *before* obtaining a
+  connection or executing the insert. `SqliteJobQueue::ready`
+  (`autumn/src/job/sqlite.rs:253-258`) awaits
+  `self.schema.get_or_try_init(|| ensure_schema(&self.pool))` — a
+  `tokio::sync::OnceCell` — and `ensure_schema`
+  (`autumn/src/job/sqlite.rs:269-305`) is what creates
+  `idx_autumn_jobs_unique_inflight`, the exact partial unique index this
+  clause's `ON CONFLICT (name, unique_key) WHERE unique_key IS NOT NULL AND
+  status IN ('enqueued', 'running')` target names, via a synchronously
+  awaited `CREATE UNIQUE INDEX IF NOT EXISTS`. Read and confirmed directly
+  against `autumn/src/job/sqlite.rs` (not taken on the reviewer's word
+  alone): every enqueue through this queue handle awaits schema creation
+  first, so an enqueue cannot structurally overtake it. **This rules out
+  migration/readiness ordering as the mechanism, not just leaves it
+  unconfirmed.** The actual cause is open again — candidates not yet
+  investigated include a second insert code path that doesn't route through
+  `ready()`, a SQLite-version-specific quirk in how the partial-index
+  predicate is matched against the `ON CONFLICT` target, or a stale/reused
+  database file — but none of these has been checked against source or a
+  reproduction yet.
+
+  **Ruled out**: cross-test interference via the process-global
+  `GLOBAL_JOB_CLIENT` this test depends on
+  (`autumn_web::job_tracking::enqueue_tracked` routes through
+  `job::global_job_client()`, per `autumn/src/job_tracking.rs:1134`). Checked
+  every test in this same file (`sqlite_jobs_scheduler_e2e.rs`) that calls
+  `job::start_runtime`: all of them hold `global_job_runtime_test_lock()`
+  first. The tests that do *not* hold that lock
+  (`in_process_scheduler_coordinator_fires_a_task_on_sqlite`,
+  `distributed_lock_*_on_sqlite`, `sqlite_scheduler_lease_*`,
+  `sqlite_tracking_store_*`) build their own scoped coordinator/lock/store
+  instances against their own local `pool`, never `start_runtime` or the
+  global client — so they do not appear able to race this test's global-state
+  window. Not exhaustively verified across every other file that might
+  compile into the same `SQLite runtime (feature=sqlite)` job's test
+  binaries, but no interference path found within this file.
+- **Test-vs-product verdict: not yet rendered.** The readiness-gap framing
+  above is now ruled out (schema creation is synchronously awaited ahead of
+  every enqueue), so the open candidates — a second, unaudited enqueue path
+  that bypasses `ready()`; a SQLite-version-specific `ON CONFLICT`
+  partial-index matching quirk; a stale/reused database file — have not yet
+  been sorted into test-defect vs. product-defect. Undetermined.
+- **Not campaigned, no fix PR**: n=2, no Tier 1 rerun-rate baseline — this
+  role's hard gate does not permit a fix PR on this evidence alone, and the
+  mechanism itself is now back to unconfirmed after the correction above.
+  Next step: a same-commit rerun harness for this test against the
+  `SQLite runtime (feature=sqlite)` feature set (same pattern as
+  `.github/workflows/manual-job-tracking-rerun-check.yml`) to reproduce it
+  on demand, since source-reading alone has now ruled out one hypothesis
+  without surfacing a replacement.
+- **Does not appear to have blocked either PR**: #2842 merged
+  (`4a448ab`); whether that specific failing run was superseded by a later
+  green rerun on the same PR, or `SQLite runtime` wasn't a required check at
+  merge time, was not independently confirmed this pass — out of scope for
+  today's time-boxed triage.
+
+### `crate_path::tests::resolve_autumn_web_name_dashed_rename_is_sanitized`
+
+- **New, 2026-09-21 — opened after a correction, not at first triage.**
+  Originally dismissed in this pass's own organic-hit sampling as
+  "unrelated ... branch-owned," on the (wrong) assumption that a failure on
+  a branch implies the branch caused it. **Correction (post-review, via a
+  Codex review comment on PR #2883): PR #2842 is a pure docs change — its
+  full file list is `ci.yml`, `README.md`, a `changelog.d/` fragment, five
+  `docs/guide/*.md` pages, `scripts/check-docs-retrieval.sh` (new),
+  `scripts/docs-retrieval-questions.tsv` (new), and `skills/autumn-web/SKILL.md`
+  — no Rust source at all, let alone `autumn-macros-support`, so it cannot
+  own a failure in that crate's own unit test.** Reclassified as an organic,
+  undiagnosed hit.
+  - Run 106162503374 (part of run 35540844428, branch
+    `claude/friendly-ritchie-d36hku`, PR #2842), `Test (macos-latest)`,
+    2026-09-20T23:26:40Z: `assertion `left == right` failed`, `left:
+    "autumn_web"`, `right: "autumn_web_05"`, at
+    `autumn-macros-support/src/crate_path.rs:708:9`.
+- **n=1** — a single organic hit, macOS only (the same commit's
+  `Test (ubuntu-latest)`, `Test (windows-latest)`, and `Test (Docker)` all
+  passed the same test; not independently checked against every other job
+  in the matrix).
+- **Mechanism — source read, hypothesis not confirmed.** The failing test
+  (`autumn-macros-support/src/crate_path.rs:693-709`) writes a fixture
+  `Cargo.toml` declaring a dashed rename (`autumn-web-05 = { package =
+  "autumn-web", version = "0.5" }`) to a fresh temp directory, then calls
+  `resolve_autumn_web_name()` with `CARGO_MANIFEST_DIR` temporarily pointed
+  at that directory via `temp_env::with_var` (`with_fixture_manifest`,
+  lines 619-627 — its own doc comment already names the hazard: "restores
+  the previous value even if `f` panics" and (line 619) "concurrently by
+  default"). `resolve_autumn_web_name` (`crate_path.rs:94-105`) delegates to
+  `proc_macro_crate::crate_name("autumn-web")` and falls back to the
+  unrenamed `DEFAULT_NAME` ("autumn_web") on any `Err` or `FoundCrate::Itself`
+  — which is exactly the value observed, meaning `crate_name` did not see the
+  fixture manifest as a dependency declaring `autumn-web` under a rename.
+  `temp_env::with_var` is documented to serialize concurrent callers via an
+  internal process-wide lock specifically to make this pattern safe under
+  parallel test execution, so the leading (**unconfirmed**) hypothesis is
+  narrower than "a lock is missing": either `proc_macro_crate::crate_name`
+  reads or caches something outside that lock's coverage (its own internal
+  state, or a `cargo metadata` subprocess whose env capture doesn't align
+  with the lock's window), or a third, unaudited path also sets
+  `CARGO_MANIFEST_DIR` without going through `temp_env`. Not traced further
+  this pass — third-party crate internals (`proc-macro-crate`) were not
+  read.
+- **Test-vs-product verdict: not rendered.** This is `autumn-macros-support`
+  test-only code (a fixture-manifest helper and its assertion), not a
+  production request path, so a confirmed mechanism here would very likely
+  be a test-defect finding — but that's not yet confirmed, only likely.
+- **Not campaigned, no fix PR**: n=1, no baseline of any kind. Next step:
+  reproduce locally with repeated `cargo test -p autumn-macros-support
+  crate_path:: -- --test-threads=<N>` runs (note the `--` separator —
+  `--test-threads` is a libtest argument, not a cargo one; omitting it fails
+  before any test runs at all) to see whether increasing parallelism
+  reproduces it, before deciding whether a harness is warranted.
 
