@@ -57,7 +57,7 @@
 //! `cached_global_backend` are isolated (CLAUDE.md, "Integration Test Layout
 //! Guidelines" § Isolated tests, "Has process-wide side effects").
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 use autumn_web::cache::{MokaCache, clear_global_cache, set_global_cache};
 use autumn_web::config::AutumnConfig;
@@ -65,10 +65,11 @@ use autumn_web::prelude::{Markup, Tenant, cache_fragment_global, html};
 use autumn_web::test::TestApp;
 use autumn_web::{AutumnResult, get, public, routes};
 
-// The global cache is process-wide; hold this mutex for the whole test so a
-// concurrently running test in this binary cannot see a half-configured
-// backend or clear it out from under us (mirrors `tests/cached_global_backend.rs`).
-static GLOBAL_CACHE_LOCK: Mutex<()> = Mutex::new(());
+// No cross-test mutex around the process-global cache here (contrast
+// `tests/cached_global_backend.rs`, which has several tests sharing one
+// process): this file is its own isolated `[[test]]` binary — its own OS
+// process — with exactly one test function, so there is no other in-process
+// test to race with `GLOBAL_CACHE`.
 
 /// A synthetic "first post" row. Stands in for a real `#[repository(tenant_scoped,
 /// sharded)]` model row — see the module doc for why `id` and `lock_version`
@@ -79,7 +80,7 @@ struct FirstPost {
     sentinel_body: &'static str,
 }
 
-fn tenant_a_first_post() -> FirstPost {
+const fn tenant_a_first_post() -> FirstPost {
     FirstPost {
         id: 1,
         lock_version: 1,
@@ -87,7 +88,7 @@ fn tenant_a_first_post() -> FirstPost {
     }
 }
 
-fn tenant_b_first_post() -> FirstPost {
+const fn tenant_b_first_post() -> FirstPost {
     FirstPost {
         id: 1,
         lock_version: 1,
@@ -136,9 +137,6 @@ fn tenancy_config() -> AutumnConfig {
 /// component — and both tenants' first post is `id = 1, lock_version = 1`.
 #[tokio::test]
 async fn fragment_cache_leaks_across_tenants_on_first_row_collision() {
-    let _g = GLOBAL_CACHE_LOCK
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
     clear_global_cache();
     set_global_cache(Arc::new(MokaCache::new(100, None)));
 
