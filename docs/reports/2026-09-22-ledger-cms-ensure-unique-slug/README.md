@@ -312,3 +312,47 @@ after these fixes and are unchanged: 2 statements / 24 buffers for the
 case) or any equivalence assertion — `cargo test -p cms --test
 ensure_unique_slug_batch_profile -- --ignored --nocapture --test-threads=1`
 still reports "All equivalence checks passed."
+
+### Third round: does the batched fallback risk a sequential scan in production?
+
+A third review comment proposed going further still: instead of one batched
+`eq_any(&candidates[1..])` covering all remaining candidates, query in small
+incremental chunks, because the fixture's own `EXPLAIN` (361 rows) shows a
+sequential scan for the 198-item array, and "on a larger table it can
+instead mean roughly 198 index probes."
+
+This repo's own doctrine is explicit that a small fixture's plan doesn't
+predict a production one ("Plan shape — admissible when demonstrated at ≥3
+data sizes, because a plan change that only helps at your fixture's size is
+a coincidence"), so rather than reason about what the planner would
+probably do at scale, this was tested directly: the same 198-candidate
+`eq_any` query (with the same `competing_types` / bare-path scoping,
+exactly one real collision to search past — the "occasional duplicate
+title" case the comment was concerned about) against `posts`-shaped tables
+at three sizes, indexes and `ANALYZE`d the same way:
+
+| Table size | Plan | Buffers |
+|---:|---|---:|
+| 361 rows (this PR's fixture) | Seq Scan | 14 |
+| 50,000 rows | Bitmap Heap Scan → Bitmap Index Scan on `idx_posts_bare_path_slug` | 594 |
+| 2,000,000 rows | Index Scan on `idx_posts_bare_path_slug` | 597 |
+
+The sequential scan is specific to the tiny fixture — at both larger sizes
+the planner reaches for the index, and the buffer cost is **flat**
+(594→597, not growing with the table) because it scales with the size of
+the candidate array (bounded at 198 by the existing off-by-one boundary),
+not with the table. A production-sized table does not turn this into "a
+full-table scan or roughly 198 index probes" in the way that raised concern
+— it is bounded, index-backed, and its cost is independent of table size
+either way. Splitting the batched fallback into incremental chunks would
+add real complexity (multiple round trips again, more candidate-window
+bookkeeping to keep the exact ordering and 199-boundary correct, more
+surface to test) to defend against a regression this evidence doesn't
+support existing. Declined, with this evidence, in the PR thread; not
+implemented.
+
+(Reproduce: `CREATE TABLE`/indexes matching
+`examples/cms/migrations/20260908005714_create_content_schema/up.sql`'s
+`posts.slug` shape, populate with `generate_series` to the target row
+count plus one collision row, `ANALYZE`, then `EXPLAIN (ANALYZE, BUFFERS)`
+the same `slug = ANY(...)` shape `ensure_unique_slug`'s fallback issues.)
