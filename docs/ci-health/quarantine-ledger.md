@@ -2028,26 +2028,48 @@ without also filling in the intake form above.
   unconfirmed (a second, unaudited SQLite `INSERT ... ON CONFLICT` path, or a
   version-specific partial-index matching quirk, per the correction above),
   and there is no product-vs-test verdict to render. 0/100 with no fix
-  applied does not mean the bug is gone; it means same-commit, single-job
-  reruns of this one test in isolation have not reproduced it. **A concrete,
-  not-yet-investigated reason those two things could differ**: both organic
-  hits occurred inside an ordinary `ci.yml` PR run, where the `SQLite runtime
-  (feature=sqlite)` job runs concurrently alongside roughly a dozen sibling
-  jobs (`Lint`, `MSRV`, `Supply chain`, `Test (${{ matrix.os }})`, etc.) all
-  competing for the same runner pool and shared infra (registry cache,
-  network), whereas this harness's own iterations run one test, one at a
-  time, on one dedicated runner with no sibling jobs at all — the opposite of
-  organic conditions. If the actual mechanism involves cross-job resource
-  contention (disk I/O, CPU scheduling, or something else specific to a
-  runner under load from *other* concurrent CI jobs), this harness's own
-  isolation would structurally prevent it from ever reproducing, no matter
-  how many iterations run. This is a hypothesis, not yet checked against the
-  source (unlike the readiness-race hypothesis already ruled out above) —
-  next step for a future pass: either audit `SqliteJobBackend`'s enqueue path
-  for anything contention-sensitive that an isolated single-test run
-  wouldn't exercise, or design a harness that reruns the *whole*
-  `SQLite runtime (feature=sqlite)` job N times (not just this one test in
-  isolation) to preserve the organic concurrency shape.
+  applied does not mean the bug is gone; it means same-commit reruns of this
+  one test, run the way this harness runs it, have not reproduced it.
+
+  **Correction (post-review, via a Codex review comment on PR #2904): the
+  original version of this update named the wrong structural difference —
+  "sibling CI jobs competing for the same runner" is not how GitHub Actions
+  works, and this repo's own docs already say so.** `AGENTS.md`
+  (`AGENTS.md:83-86`) states plainly, of a sibling job in this same
+  workflow: "a runner whose disk it is the only claimant of" — each `ci.yml`
+  job (`Lint`, `MSRV`, `SQLite runtime`, etc.) gets its own dedicated,
+  isolated GitHub-hosted VM, not a shared host with other concurrently
+  running jobs. There is no cross-job disk/CPU contention for this harness's
+  isolation to structurally rule out; that framing was wrong, not merely
+  unconfirmed.
+
+  **The actual, verifiable structural difference is same-binary test
+  parallelism, not job isolation.** `ci.yml`'s own "Run the sqlite
+  integration suite" step (the real organic path both hits occurred on)
+  invokes `cargo test -p autumn-web --features "sqlite,test-support,storage"
+  --test sqlite_boot_serve --test sqlite_migrations ... --test
+  sqlite_jobs_scheduler_e2e --test confidential_repository_bidx ...` — no
+  `--test-threads` flag anywhere in that step, so libtest runs every test
+  *within* the `sqlite_jobs_scheduler_e2e` binary (27 tests total, per this
+  binary's own test count) at its default parallelism, one OS thread per
+  logical core. `manual-sqlite-jobs-rerun-check.yml`'s loop, by contrast,
+  filters to the single target test name **and** passes `--test-threads=1`
+  explicitly — eliminating same-binary concurrency entirely, not just
+  cross-job concurrency. If the real mechanism is a race between
+  `sqlite_job_backend_tracks_job_status_durably` and one of its 26 sibling
+  tests in the same file (shared process-global state, a shared on-disk
+  path, or contention on some other resource within the same test binary),
+  this harness's `--test-threads=1` filter would structurally prevent it
+  from ever reproducing, exactly the same shape of gap the withdrawn
+  sibling-job framing was reaching for, just at the correct layer (one test
+  binary's own internal parallelism, not GitHub Actions' job scheduling).
+  Not yet checked against `sqlite_jobs_scheduler_e2e.rs`'s own source for a
+  shared-state hazard between its tests (the kind of audit the
+  `job_tracking_stores_integration` entry above did for its own file, ruling
+  out `GLOBAL_JOB_CLIENT` interference) — that audit, plus a harness variant
+  that runs the *whole* `sqlite_jobs_scheduler_e2e` binary at default
+  parallelism (not `--test-threads=1`, not filtered to one test) N times, is
+  the concrete next step for a future pass.
 
 `crate_path::tests::resolve_autumn_web_name_dashed_rename_is_sanitized` was
 opened here 2026-09-21 (n=1, mechanism unconfirmed) and **closed the same
