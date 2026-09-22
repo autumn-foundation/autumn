@@ -43,6 +43,50 @@ use crate::probe;
 #[cfg(feature = "ws")]
 use tokio_util::sync::CancellationToken;
 
+/// A read-only view of one [`AppState`]'s extension map, for a caller that
+/// cannot hold the state itself.
+///
+/// Some extensions are published *after* the router is built: the
+/// custom-domain registry (#1635) appears at bind time, when the TLS listener
+/// creates it. A layer built before that cannot capture the value, and it must
+/// not capture an `AppState` either — `Route::call` deep-clones the service
+/// beneath it once per request (#2193), and the state is a wide struct. This
+/// handle is one `Arc`, so the clone costs one atomic increment, and the
+/// lookup happens only on the path that needs it.
+///
+/// Get one from [`AppState::late_extensions`].
+#[derive(Clone)]
+pub struct LateExtensions(Arc<std::sync::RwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>>);
+
+impl LateExtensions {
+    /// The extension of type `T`, if one is installed now.
+    ///
+    /// Same lookup as [`AppState::extension`], against the same map.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal extension map lock is poisoned.
+    #[must_use]
+    pub fn get<T>(&self) -> Option<Arc<T>>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        self.0
+            .read()
+            .expect("app state extension lock poisoned")
+            .get(&TypeId::of::<T>())
+            .cloned()
+            .and_then(|value| Arc::downcast::<T>(value).ok())
+    }
+}
+
+impl std::fmt::Debug for LateExtensions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The map holds `dyn Any` values, which cannot be printed.
+        f.write_str("LateExtensions")
+    }
+}
+
 /// Shared application state passed to all route handlers.
 ///
 /// Holds framework-managed resources such as the database connection pool.
@@ -303,6 +347,15 @@ impl AppState {
             .get(&TypeId::of::<T>())
             .cloned()
             .and_then(|value| Arc::downcast::<T>(value).ok())
+    }
+
+    /// A handle that reads this state's extensions later, from a place that
+    /// cannot hold an [`AppState`].
+    ///
+    /// See [`LateExtensions`] for when a layer needs one.
+    #[must_use]
+    pub(crate) fn late_extensions(&self) -> LateExtensions {
+        LateExtensions(Arc::clone(&self.extensions))
     }
 
     /// Borrow the app's designated live-state block, if one was registered

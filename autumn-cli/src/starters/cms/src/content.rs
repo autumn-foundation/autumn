@@ -1233,18 +1233,59 @@ pub async fn revisions_for(
 
 /// Rebuild the published-post counts of the given terms.
 ///
-/// The single fan-out: every path that recounts more than one term goes through
-/// here, so the `FOR UPDATE` each `recount_term` takes is always acquired in
-/// ascending id order. Four separate loops in id-of-arrival order is four
-/// chances for two transactions with overlapping term sets to hold the halves
-/// of each other's cycle and deadlock.
+/// The single fan-out: every path that recounts more than one term goes
+/// through here. A caller with N affected terms used to pay 3N round trips —
+/// `recount_term` called once per id, each call its own lock, its own count,
+/// its own update — when the actual identity space this call needs to
+/// resolve is bounded by N distinct term rows, not by looping N times. This
+/// locks every row up front in one batched, ascending-id-order `FOR UPDATE`
+/// (`.order(terms::id.asc())` ahead of `.for_update()`, the same guarantee
+/// `lock_terms` uses and for the same reason: every fan-out over terms locks
+/// ascending, so two transactions touching overlapping sets can never hold
+/// the halves of each other's cycle), computes every count in one grouped
+/// query, then writes every count back in one statement.
+///
+/// The lock has to be taken here, not left to a per-id `recount_term`,
+/// because `recount_terms_for_post` reaches this function directly, without
+/// `set_post_terms`'s prior `lock_terms` call.
 pub async fn recount_terms(conn: &mut AsyncPgConnection, term_ids: &[i64]) -> AutumnResult<()> {
     let mut ordered = term_ids.to_vec();
     ordered.sort_unstable();
     ordered.dedup();
-    for term_id in ordered {
-        recount_term(conn, term_id).await?;
+    if ordered.is_empty() {
+        return Ok(());
     }
+
+    // A term deleted underneath us has no row to lock and drops out here —
+    // `recount_term` used to reach the same conclusion per id, via `.optional()`.
+    let locked: Vec<i64> = terms::table
+        .filter(terms::id.eq_any(&ordered))
+        .select(terms::id)
+        .order(terms::id.asc())
+        .for_update()
+        .load(conn)
+        .await?;
+    if locked.is_empty() {
+        return Ok(());
+    }
+
+    let counts = term_post_counts(conn, &locked).await?;
+
+    use diesel::sql_types::{Array, BigInt};
+    let post_counts: Vec<i64> = locked
+        .iter()
+        .map(|id| counts.get(id).copied().unwrap_or(0))
+        .collect();
+    diesel::sql_query(
+        "UPDATE terms SET post_count = data.count \
+         FROM (SELECT * FROM UNNEST($1::bigint[], $2::bigint[]) AS t(id, count)) AS data \
+         WHERE terms.id = data.id",
+    )
+    .bind::<Array<BigInt>, _>(locked.clone())
+    .bind::<Array<BigInt>, _>(post_counts)
+    .execute(conn)
+    .await?;
+
     Ok(())
 }
 
@@ -1672,25 +1713,33 @@ pub async fn update_user(
         bio,
         website,
     } = edit;
-    // The same rule the registration path applies, for the same reason: this is
-    // a direct Diesel update, so the model's `#[validate(email)]` never runs.
-    // Fixing only the create path left an administrator able to store `user@`
-    // on an existing account.
     let email = email.trim().to_lowercase();
-    if !autumn_web::reexports::validator::ValidateEmail::validate_email(&email) {
-        return Err(AutumnError::unprocessable_msg(
-            "That email address is not valid",
-        ));
-    }
-    if email.len() > crate::hooks::MAX_EMAIL_BYTES {
-        return Err(AutumnError::unprocessable_msg(format!(
-            "Email must be at most {} characters",
-            crate::hooks::MAX_EMAIL_BYTES
-        )));
-    }
 
     with_administrator_guard(conn, actor_id, target_id, role, move |conn| {
         async move {
+            // The same rule the registration path applies, for the same
+            // reason: this is a direct Diesel update, so the model's
+            // `#[validate(email)]` never runs. Fixing only the create path
+            // left an administrator able to store `user@` on an existing
+            // account. Checked here, inside the guard's transaction and
+            // after it has re-confirmed the actor's own authorization —
+            // not before the guard runs, as this used to. An actor demoted
+            // or deleted while this request was in flight must be refused
+            // by the guard's own `FORBIDDEN` before an unrelated 422 from
+            // this validation can reach the caller and redisplay the Users
+            // screen using that stale, already-revoked `actor` (Codex
+            // review finding on PR #2906).
+            if !autumn_web::reexports::validator::ValidateEmail::validate_email(&email) {
+                return Err(AutumnError::unprocessable_msg(
+                    "That email address is not valid",
+                ));
+            }
+            if email.len() > crate::hooks::MAX_EMAIL_BYTES {
+                return Err(AutumnError::unprocessable_msg(format!(
+                    "Email must be at most {} characters",
+                    crate::hooks::MAX_EMAIL_BYTES
+                )));
+            }
             diesel::update(users::table.find(target_id))
                 .set((
                     users::role.eq(role.slug()),

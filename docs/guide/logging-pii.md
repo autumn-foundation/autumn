@@ -1,46 +1,374 @@
-# Logging & PII
+# Logging: log levels, format, and PII scrubbing
 
-Autumn includes a parameter scrubber for structured payloads. Today, it is wired
-into dev HTML error-badge request context rendering (headers/query) and helper APIs.
-It is **not yet globally applied to every tracing/log event payload**.
+This page is the one place Autumn's logging is configured. It answers four
+questions, in the order people usually arrive with them:
 
-## Built-in defaults
+- [how loud the logs are](#set-the-log-level) — `[log] level`
+- [what shape they come out in](#choose-the-log-format-pretty-or-json) —
+  `[log] format`, pretty or JSON
+- [how to turn up a log level in production without a
+  redeploy](#change-log-levels-at-runtime-without-a-restart) —
+  `PUT /actuator/loggers/{name}`
+- [what is kept out of them](#scrub-pii-from-logs) — the parameter scrubber
 
-By default, the scrubber filters keys such as:
+The [access log](#access-log) — one structured line per served request — is on
+by default and is configured here too.
 
-- `password`, `password_confirmation`
-- `token`, `access_token`, `refresh_token`
-- `secret`, `authorization`
-- `api_key`
-- `cookie`, `set-cookie`
-- `ssn`, `credit_card`, `card_number`, `cvv`
+## Set the log level
 
-Matched values are replaced with:
-
-```text
-[FILTERED]
-```
-
-## Configure in `autumn.toml`
+The global level lives in `[log] level`:
 
 ```toml
 [log]
 level = "info"
-format = "Json"
-
-# Add app-specific sensitive keys
-filter_parameters = ["pin", "private_note"]
-
-# Opt out of built-in defaults (use sparingly)
-unfilter_parameters = ["password"]
 ```
 
-### Important behavior
+**The effective default depends on the profile**, which is the usual answer to
+"why is dev so noisy and prod so quiet":
 
-- Matching is case-insensitive.
-- Matching is normalization-aware for separators/casing (`api_key`, `apiKey`,
-  `API-KEY`, `apikey` are treated equivalently).
-- Empty custom keys are ignored to avoid accidental “scrub everything”.
+| Profile | Default `level` |
+|---------|-----------------|
+| `dev`   | `debug`         |
+| `prod`  | `info`          |
+| any other profile (`staging`, `test`, a custom name) | `info` |
+
+`dev` and `prod` are the only profiles with smart defaults; anything else falls
+back to the struct default, `info`. Whatever you write in `autumn.toml` — or
+pass in the environment — overrides the profile's default, so the fence above
+pins `info` in dev too.
+
+The levels are `trace`, `debug`, `info`, `warn`, `error` and `off` — `off`
+silences the subscriber entirely. It is valid here, at startup, and only
+here: the [runtime endpoint](#change-log-levels-at-runtime-without-a-restart)
+takes the five named levels and rejects `off` with a `400`.
+
+For a deployment with no `autumn.toml` — a container, a platform that only
+hands you environment variables — the same field is `AUTUMN_LOG__LEVEL`:
+
+```bash
+AUTUMN_LOG__LEVEL=debug cargo run
+```
+
+Either spelling is read once, at startup. To change a level on a process that
+is already running, see [Change log levels at
+runtime](#change-log-levels-at-runtime-without-a-restart) below.
+
+### Turn on debug logging for one target
+
+The field takes the full [`tracing` filter
+syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html),
+not just a bare level, so one target can be turned up without raising the floor
+for everything else — which is usually what "turn on debug logging" should
+mean, since a global `debug` on a busy service buries the lines you came for:
+
+```toml
+[log]
+level = "info,autumn_web=debug,tower_http=trace"
+```
+
+The same syntax works in the environment variable:
+`AUTUMN_LOG__LEVEL="info,my_app::orders=debug"`.
+
+## Choose the log format (pretty or JSON)
+
+`[log] format` decides whether log lines are rendered for a human reading a
+terminal or for a collector parsing JSON:
+
+```toml
+[log]
+format = "Auto"
+```
+
+| Format   | Behavior                                                   |
+|----------|------------------------------------------------------------|
+| `Auto`   | Pretty unless the profile is `prod`/`production` (or the environment says production), then JSON |
+| `Pretty` | Always human-readable, colorized                           |
+| `Json`   | Always structured JSON                                     |
+
+As with the level, the profile picks the default: `dev` defaults to `Pretty`
+and `prod` to `Json`, both set outright, so the same binary reads well on a
+laptop and parses in production without the config changing. `Auto` is the
+struct default and is what any other profile gets — it reaches the same
+outcome by looking at the profile at startup. Set `Json` explicitly when
+something parses the output in development too: a local log shipper, a test
+that asserts on fields. The environment spelling is `AUTUMN_LOG__FORMAT=Json`.
+
+The format applies to every line the standard subscriber renders, the [access
+log](#access-log) included.
+
+## Change log levels at runtime, without a restart
+
+`[log] level` is read at startup, so raising verbosity to investigate
+something in production would normally mean a redeploy — by which time the
+thing you wanted to see has usually stopped happening. `PUT
+/actuator/loggers/{name}` changes the live `tracing` subscriber instead, and
+takes effect on the next event:
+
+```bash
+LOGGERS=http://localhost:3000/actuator/loggers
+
+# Do not assume the global level is `info`: it is whatever the profile or
+# config set, and once you have replaced it the response is the only place it
+# still exists.
+raise() {                         # raise <logger> <level>; prints `previous`
+  local out
+  out=$(curl -sX PUT "$LOGGERS/$1" \
+    -H 'content-type: application/json' -d "{\"level\":\"$2\"}")
+  # `applied` is what says the change reached the live subscriber. With no
+  # reload-capable one the endpoint still answers 200 — `"status":
+  # "recorded"`, `"applied": false` — having remembered the level and
+  # changed nothing. Read the logs after that and you are reading the old
+  # level while believing you raised it.
+  if [ "$(printf '%s' "$out" | jq -r .applied)" != true ]; then
+    printf 'NOT APPLIED: %s\n' "$(printf '%s' "$out" | jq -r .message)" >&2
+  fi
+  printf '%s' "$out" | jq -r .previous
+}
+
+# Raise the global level, KEEPING what it was, and check it took.
+ROOT_PREV=$(raise root debug)
+
+# Raise one target, leaving everything else where it is. Keep this response
+# too, in a variable of its own: it holds that TARGET's previous override,
+# which is a different thing from the global level and is not put back by
+# restoring `root`.
+ORDERS_PREV=$(raise my_app::orders trace)
+
+# … investigate …
+
+# Put each back to exactly what it was — but only to a level this endpoint
+# accepts. See below for when it is not one.
+restore() {                       # restore <logger> <level>
+  # `previous` comes back in the casing `[log] level` was written in, and
+  # `INFO` is as valid there as `info`. Fold it before matching — and send
+  # the folded form, which is what the endpoint does with it anyway.
+  local lvl
+  lvl=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
+  case "$lvl" in
+    trace|debug|info|warn|error)
+      curl -sX PUT "$LOGGERS/$1" \
+        -H 'content-type: application/json' -d "{\"level\":\"$lvl\"}" ;;
+    *) echo "cannot restore $1 to '$2' over HTTP — see below" ;;
+  esac
+}
+restore root "$ROOT_PREV"
+restore my_app::orders "$ORDERS_PREV"
+```
+
+(`jq` only to pull fields out; any JSON reader will do, and `GET $LOGGERS`
+shows `current_level` if you would rather read it by eye first.)
+
+**If `raise` prints `NOT APPLIED`, stop.** The level was recorded and the log
+stream did not change, so nothing you read next reflects the level you asked
+for — see [`applied` is the field to check](#change-log-levels-at-runtime-without-a-restart)
+below for when that happens. `previous` is still worth keeping: the override
+is in the process state either way, so it still wants restoring.
+
+Restoring the two separately is the part that is easy to drop, and dropping
+it is silent: put `root` back, walk away, and `my_app::orders` is still at
+`trace` with the level it used to have recorded nowhere but a response you
+no longer have.
+
+The `case` inside `restore` is not defensive padding either. **The endpoint
+accepts only the five named levels, and `previous` can hold something outside
+them** — so there are configurations this API cannot put back at all:
+
+| What `previous` holds | When | Restorable over HTTP? |
+|---|---|---|
+| `trace`/`debug`/`info`/`warn`/`error` | the usual case — in **whatever casing `[log] level` used** | yes, once folded to lower case |
+| `""` | `[log] level` names only targets (`"my_app=debug"`), so there is no global directive | **no** — and there is no way to set it back to "unset" either |
+| `off` | `[log] level = "off"` | **no** — `off` is valid at startup and rejected by this endpoint |
+| `null` | a target with no override of its own | **no** — there was no level to go back to; see below for what to send instead |
+
+`""` and `off` mean the same thing in practice: **restart to clear it.**
+`null` is the one row with a way forward, and it is below.
+Casing is why `restore` folds before it matches. `[log] level` accepts a
+level in any casing and stores it as written, so `level = "INFO"` makes
+`previous` come back as `INFO` — a perfectly restorable level that a
+case-sensitive test would send to the "cannot restore" branch, leaving the
+logger raised while the summary below says it was put back.
+
+Guarding on the accepted set rather than on "is it empty" is deliberate:
+`off` was the second value to turn up this way and `null` the third, and a
+membership test absorbed both without growing a branch for either.
+
+**`previous` is the whole point of that first response.** Every `PUT` returns
+the level that target had before the change, and it is the only record of what
+to restore:
+
+```json
+{ "status": "ok", "message": "Logger 'root' set to 'debug'",
+  "previous": "info", "applied": true }
+```
+
+For `root`, `previous` is the global level you just replaced. For a target,
+it is that target's previous override — or `null`, which is the case worth
+understanding before an incident rather than during one:
+
+- **A target that had an override** (one named in `[log] level` at startup,
+  like the `tower_http` in `level = "info,tower_http=warn"`) is what
+  `$ORDERS_PREV` holds — `warn` here, not the global level — and the
+  `restore my_app::orders "$ORDERS_PREV"` above is the call that puts it
+  back. Restoring only `root` leaves this target at `trace` *and* throws
+  away the one record of the level it is supposed to be at.
+- **A target that had none** — `"previous": null` — is the case `restore`
+  cannot close by itself, and the step it leaves you is not optional. You
+  raised the target from the global level to `trace`, so **it is still
+  emitting at `trace` until you lower it**. Send it the level you want it
+  at, normally whatever `root` is back to:
+
+  ```bash
+  restore my_app::orders "$ROOT_PREV"
+  ```
+
+  That stops the volume immediately. What it cannot do is remove the override:
+  there is no "remove" call, so the target stays *pinned* at that level and
+  will not follow later changes to `root`. Only a restart clears the pin,
+  since overrides live in the process.
+
+  `restore` guards this call too, and here for a sharper reason than on the
+  global one. Whenever the level you have to fall back on is itself outside
+  the five — `$ROOT_PREV` empty, or `off` — there is **no level you can send
+  that lowers this target**, so it stays at `trace` until the process
+  restarts, and the advice below hardens accordingly: **restart now, not when
+  convenient.**
+
+So the honest summary is two questions, and they are **independent**: the
+target and the global level come back separately, and one of them coming back
+says nothing about the other.
+
+**Did the target come back?**
+
+- **`$ORDERS_PREV` was a level** — yes. `restore` put it back exactly as it
+  was, and there is nothing further to do *to the target*.
+- **`$ORDERS_PREV` was `null` and `$ROOT_PREV` is a level** — **lower it now,
+  restart when convenient.** The fallback call stops a trace-level firehose,
+  potentially high-volume and on a busy target full of request detail, from
+  running on after the investigation is closed. The restart is only the
+  tidy-up that stops a later `root` change from silently missing that target.
+- **Neither was a level** — **restart now.** No `restore` fires, because
+  there is no level either call could send, so nothing has lowered the target
+  and it is still at `trace`. Here the restart is not tidy-up; it is the only
+  thing that stops the volume.
+
+**Did the global level come back?**
+
+- **`$ROOT_PREV` was a level** — yes, and you are done.
+- **`$ROOT_PREV` was `""` or `off`** — no, and no `PUT` can fix it: `root` is
+  sitting at the `debug` you raised it to, and this endpoint can set neither
+  "unset" nor `off`. **Restart to clear it**, whatever happened to the target.
+  `level = "my_app::orders=warn"` is exactly this shape — a directive naming
+  only targets leaves the global `previous` empty — so it is quite possible to
+  restore the target perfectly and still be leaking `debug` globally.
+
+`GET /actuator/loggers` lists everything currently overridden, and is the
+check worth running before you call the incident closed — not least because it
+is the only way to notice a target someone else raised.
+
+Those run as shown in development. **In production they need a CSRF token**,
+and the failure is a `403` that never reaches the handler — see [Getting a
+`PUT` past CSRF](#getting-a-put-past-csrf) below before you need this at 3am.
+
+`{name}` is either `root` (the global level) or a `tracing` target — a module
+path such as `my_app::orders`. `GET /actuator/loggers` reports what is in
+force:
+
+```json
+{
+  "current_level": "info",
+  "available_levels": ["trace", "debug", "info", "warn", "error"],
+  "loggers": { "my_app::orders": "trace" }
+}
+```
+
+Four things are worth knowing before you rely on this in an incident:
+
+- **Overrides are ephemeral.** They live in the running process. A restart,
+  a redeploy or a replacement replica is back at the configured `[log] level`.
+  Nothing here edits `autumn.toml`.
+- **`applied` is the field to check, not the status code.** A successful
+  change answers `"status": "ok"` with `"applied": true`. If the app was built
+  with a subscriber that cannot be reloaded, the change is remembered but
+  never reaches the log stream, and the response says so —
+  `"status": "recorded"`, `"applied": false` — rather than reporting a
+  false-positive `ok`. Both are `200`; only `applied` distinguishes them.
+- **A bad level or a bad target is a `400`.** Levels outside the five above
+  are rejected, and so are target names carrying `EnvFilter` metacharacters
+  (`=`, `,`, `[`, `]`, `{`, `}`, whitespace), so a malformed directive can
+  never reach the subscriber.
+- **The endpoint is mounted only in sensitive actuator mode.** It can change
+  what a production process logs, so it lives behind the same switch as
+  `/actuator/env` and `/actuator/configprops`:
+
+  ```toml
+  [actuator]
+  sensitive = true
+  ```
+
+  A `404` on `/actuator/loggers` usually means the profile has not enabled it
+  — but check the prefix before you go changing `sensitive`, since a wrong
+  path 404s identically. See
+  [Deployment](deployment.md) for what sensitive mode exposes and how to keep
+  it reachable only from inside your network.
+
+  ```toml
+  [actuator]
+  prefix = "/actuator"
+  ```
+
+  Every path on this page assumes that default. If your app sets
+  `[actuator] prefix = "/ops"`, the endpoint is `/ops/loggers` and
+  `/ops/loggers/{name}`, and the CSRF exemption below has to name `/ops/`
+  too — an `exempt_paths` entry still pointing at `/actuator/` matches
+  nothing and leaves the `PUT` returning `403`.
+
+### Getting a `PUT` past CSRF
+
+The `prod` profile turns CSRF on (`[security.csrf] enabled = true`, a smart
+default), `PUT` is not one of the safe methods, and the actuator carries no
+built-in exemption. So the bare `curl` above is a `403` in production: the
+CSRF layer wraps the whole router, the actuator endpoints included, so the
+request is rejected before `loggers_put` ever runs. In development, where CSRF is off by default, it works as
+written, which is exactly how this is discovered at the worst moment.
+
+Two ways through, and which one you want is a standing decision to make before
+an incident, not during one.
+
+**Exempt the actuator prefix.** `[security.csrf] exempt_paths` exists for
+management and API paths that authenticate with something other than a cookie:
+
+```toml
+[security.csrf]
+exempt_paths = ["/actuator/"]
+```
+
+(Or whatever `[actuator] prefix` is set to — the two have to agree.)
+
+CSRF defends against a browser being made to send a request with the user's
+ambient cookies. An actuator reached over an internal network, with no
+cookie-based session in play, is not that threat — which is why exempting it
+is a reasonable posture and not a hole. It is only reasonable if the actuator
+is *actually* unreachable from the public internet, so make this change
+together with the network restriction in
+[Deployment](deployment.md), never instead of it.
+
+**Or send the token.** CSRF here is double-submit: the cookie value and the
+`X-CSRF-Token` header must match. Any `GET` through the same origin mints the
+cookie, so pick one up and send it back:
+
+```bash
+# Mint the cookie (any GET will do) and keep it in a jar
+curl -c /tmp/jar -s -o /dev/null http://localhost:3000/actuator/health
+
+# Resend it as both cookie and header
+TOKEN=$(awk '/autumn-csrf/ {print $7}' /tmp/jar)
+curl -X PUT http://localhost:3000/actuator/loggers/root \
+  -b /tmp/jar -H "X-CSRF-Token: $TOKEN" \
+  -H 'content-type: application/json' -d '{"level":"debug"}'
+```
+
+`autumn-csrf` and `X-CSRF-Token` are the default cookie and header names
+(`[security.csrf] cookie_name` and `token_header` if you have changed them).
 
 ## Access log
 
@@ -53,7 +381,7 @@ subscriber, so `log.format` controls its shape, and it requires no telemetry
 feature or collector.
 
 The line never includes query strings, headers, or bodies, so it cannot leak
-the sensitive values this scrubber protects.
+the sensitive values the [parameter scrubber](#scrub-pii-from-logs) protects.
 
 Probe and asset noise is excluded by default; both knobs live in `[log]`:
 
@@ -71,12 +399,55 @@ Both knobs also honor environment overrides for TOML-less deployments:
 `AUTUMN_LOG__ACCESS_LOG=false` and
 `AUTUMN_LOG__ACCESS_LOG_EXCLUDE=/health,/internal` (comma-separated).
 
-## Startup warnings
+## Scrub PII from logs
+
+Autumn includes a parameter scrubber for structured payloads. Today, it is wired
+into dev HTML error-badge request context rendering (headers/query) and helper APIs.
+It is **not yet globally applied to every tracing/log event payload**.
+
+### Built-in defaults
+
+By default, the scrubber filters keys such as:
+
+- `password`, `password_confirmation`
+- `token`, `access_token`, `refresh_token`
+- `secret`, `authorization`
+- `api_key`
+- `cookie`, `set-cookie`
+- `ssn`, `credit_card`, `card_number`, `cvv`
+
+Matched values are replaced with:
+
+```text
+[FILTERED]
+```
+
+### Add or remove scrubbed keys
+
+Both lists live in `[log]`, beside the level and format above:
+
+```toml
+[log]
+# Add app-specific sensitive keys
+filter_parameters = ["pin", "private_note"]
+
+# Opt out of built-in defaults (use sparingly)
+unfilter_parameters = ["password"]
+```
+
+### Important behavior
+
+- Matching is case-insensitive.
+- Matching is normalization-aware for separators/casing (`api_key`, `apiKey`,
+  `API-KEY`, `apikey` are treated equivalently).
+- Empty custom keys are ignored to avoid accidental “scrub everything”.
+
+### Startup warnings
 
 If you opt out of built-in sensitive defaults via `unfilter_parameters`, Autumn
 emits a startup warning listing the opted-out keys.
 
-## Programmatic use
+### Programmatic use
 
 ```rust
 use autumn_web::log::filter::scrub;

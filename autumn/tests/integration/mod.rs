@@ -171,6 +171,7 @@ mod inline_broadcast_prefetch;
 mod inspector_integration;
 mod isr_coordination;
 mod job_recorder_integration;
+mod job_tenant_scope;
 mod job_tracking_route;
 mod job_tracking_stores_integration;
 #[cfg(all(feature = "ws", feature = "maud", feature = "htmx", feature = "db"))]
@@ -207,6 +208,8 @@ mod mcp_secured_guard;
 mod mcp_streaming;
 #[cfg(feature = "mcp")]
 mod mcp_structured_query;
+#[cfg(feature = "mcp")]
+mod mcp_throttle_guard;
 mod middleware_introspection;
 mod middleware_pipeline;
 mod middleware_stack_depth;
@@ -221,6 +224,8 @@ mod model_derivation;
 mod model_field_attrs;
 #[cfg(feature = "db")]
 mod model_votable;
+#[cfg(feature = "db")]
+mod money_ledger_postgres;
 #[cfg(feature = "maud")]
 mod negotiate;
 #[cfg(all(feature = "db", feature = "test-support"))]

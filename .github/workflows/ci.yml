@@ -196,6 +196,27 @@ jobs:
         # queueing behind ~20 minutes of workspace clippy in `lint` — and a
         # clippy failure can't stop it from running.
         run: ./scripts/check-migration-guides.sh
+      - name: Changelog fragment gate
+        # A release note used to go straight into CHANGELOG.md, at the top of
+        # the `## [Unreleased]` section — the same few lines every other open
+        # PR wrote to, so every PR conflicted with every other PR over text
+        # that was never the point of either. A note is now its own file under
+        # `changelog.d/`, and this step keeps it that way: it fails a PR that
+        # edits CHANGELOG.md, and fails a fragment the release tooling and the
+        # migration-guide gate above could not read.
+        #
+        # A release commit is exempt through the `release` label or a
+        # [changelog] token in the PR body. CI does not re-run on `labeled`,
+        # so the token is the reliable one: put it in the release PR body when
+        # you open it.
+        #
+        # Shares this docs-only job for the same reason as the gates around
+        # it: no toolchain, no cache, reports in seconds.
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          CHANGELOG_RELEASE_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'release') }}
+        run: ./scripts/check-changelog-fragments.sh --self-test && ./scripts/check-changelog-fragments.sh
       - name: Migration version gate
         # Framework, plugin and app migrations share one version space: diesel
         # keys `__diesel_schema_migrations` on the 14-digit version and
@@ -341,6 +362,35 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-orphans.sh --self-test && ./scripts/check-docs-orphans.sh
+      - name: Guide index completeness gate
+        # The reachability gate above asks "does any inbound link exist". This
+        # asks the question a reader actually has: "is this page somewhere I
+        # would look". They are different, and the gap between them is where
+        # this corpus was losing people — reachability passes when the only
+        # inbound link is a mid-page crosslink from another guide page, or a
+        # mention inside an agent SKILL.md, a surface written for a language
+        # model rather than for a person with a question.
+        #
+        # The step above says `docs/guide/` has no index of its own and that
+        # discovery therefore rests on README.md's hand-maintained list, which
+        # "someone has to remember to update. Nothing noticed when they
+        # forgot." Nothing noticed 92 times: the baseline run of this gate
+        # found 92 of the 147 guide pages in NO reader-facing index, among them
+        # middleware, testing, migrations, repositories, jobs, authorization,
+        # pagination, websockets, rate-limiting, i18n, events and oauth — the
+        # pages a reader needs in their first week. A cold retrieval test over
+        # README.md's list found the answering page absent for 11 of 15
+        # ordinary question classes, while every drift gate was green over
+        # those same pages. The answers were right and unreachable by search,
+        # which from the reader's seat is indistinguishable from absent.
+        #
+        # docs/guide/index.md is the fix, and this gate is what keeps it true:
+        # a page added without an index line fails in the commit that adds it,
+        # which is the only moment anyone has the context to write that line.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-guide-index.sh --self-test && ./scripts/check-docs-guide-index.sh
       - name: TOML config-key drift gate
         # The env-var gate above covers the config a reader SETS. This covers
         # the config they WRITE — a key in `autumn.toml` itself — which is the
@@ -610,6 +660,59 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-scope.sh --self-test && ./scripts/check-docs-scope.sh
+      - name: Docs retrieval gate
+        # Every gate above checks a page a reader HAS REACHED, and
+        # `check-docs-orphans.sh` checks that a path of links to it exists at
+        # all. Neither asks what a reader mid-task actually arrives with: not
+        # "which link do I click" but "what do I type". A page whose title and
+        # headings are spelled in project vocabulary instead of the reader's is
+        # invisible to that search while staying perfectly reachable,
+        # accurate and linked — every other gate green over it.
+        #
+        # The baseline found the log-configuration question class failing
+        # exactly that way. `docs/guide/logging-pii.md` carried `[log] level`,
+        # `log.format` and the access-log switches under the title
+        # "Logging & PII" — the name the README listed it by — so "log level",
+        # "debug logging" and "json logs" returned nothing, while `[log]`
+        # itself appeared in 9 fences across 7 pages. The runtime half,
+        # `PUT /actuator/loggers/{name}`, was on no reader-facing page at all.
+        #
+        # The fixture pins the ANSWERING page, not merely "some hit", so a
+        # retitle that re-aims a page at a different question fails here
+        # rather than passing quietly.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-retrieval.sh --self-test && ./scripts/check-docs-retrieval.sh
+      - name: CLI coverage gate
+        # The twelve docs gates above all run docs -> code: "is what we wrote
+        # still true?", which is DRIFT. This one runs code -> docs: "is what we
+        # shipped written down anywhere?", which is COVERAGE. Nothing asked
+        # that before, and the gap is invisible by construction — a gate that
+        # only reads the docs can never notice a command the docs never
+        # mention, so a command can ship, work, carry good `--help` text, be
+        # documented nowhere, and leave the whole tree green.
+        #
+        # That is how all four `autumn token` subcommands — `issue` since
+        # 0.5.x, `list` / `rotate` since 0.6.0 — reached 0.7 with "revoke api
+        # token" returning zero hits across all 160 guide pages. #2821 fixed
+        # the prose and deferred the gate, on the grounds that a correct one
+        # has to reuse `check-docs-cli.sh`'s `resolve()` rather than
+        # re-implement it. It does: surface, corpus, resolved invocations and
+        # the hidden-command set all come from that gate's `--list`,
+        # `--corpus`, `--resolved` and `--list-hidden` modes, so the two cannot
+        # disagree about what a line names. A private matcher gets the shallow
+        # cases right and the deep ones wrong — `autumn openapi export`
+        # satisfying the top-level `export` (a different command, an offline
+        # diagnostic snapshot) was caught in review on the first attempt.
+        #
+        # Not registered in `check-docs-scope.sh`'s SIBLINGS: it spells no
+        # corpus of its own, it asks `check-docs-cli.sh` for that gate's, so
+        # there is no second spelling for the scope gate to reconcile.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-cli-coverage.sh --self-test && ./scripts/check-docs-cli-coverage.sh
       - name: Plugin surface gate
         # The declared plugin API surface (issue #1601) has a compiled half —
         # the `plugin-contract` job below builds `autumn-plugin-reference`
@@ -661,6 +764,39 @@ jobs:
         # autumn-admin-plugin. The reference plugin proves the DECLARED surface;
         # the admin plugin proves a real, non-trivial consumer of it.
         run: cargo check -p autumn-admin-plugin --all-targets
+
+  migration-collisions:
+    name: Diesel migration version collisions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # `autumn migrate check-collisions` compares this branch's migration
+          # versions against every other pushed branch, which needs the
+          # remote-tracking refs a shallow (default) checkout doesn't fetch.
+          # Without this, the gate still runs — it degrades to a working-tree
+          # -only check with a loud warning rather than failing closed — but
+          # would silently lose the cross-branch half of the protection on
+          # every PR in this repo's own CI.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Migration version collision gate
+        # Diesel records applied migrations BY VERSION (the leading
+        # `YYYYMMDDHHMMSS` directory prefix). When two directories share one
+        # version, a fresh database runs exactly one of them and records the
+        # version as done -- the other is skipped forever, with no error
+        # anywhere. This is the enforcing half of `autumn migrate new`, which
+        # hands out a collision-free version at generation time; this gate
+        # catches a collision that generator could not see (a branch pushed
+        # after, a teammate's concurrent PR) before it reaches the default
+        # branch, on the push that introduced it rather than after both land.
+        #
+        # Framework-owned migrations live in `autumn/migrations`, not a
+        # repository-root `migrations/`, so this runs from within `autumn/` —
+        # exactly like a downstream app would run it from its own project
+        # root once `autumn migrate check-collisions` ships in a release.
+        run: (cd autumn && cargo run -p autumn-cli --bin autumn -- migrate check-collisions)
 
   supply-chain:
     name: Supply chain (cargo-deny)
@@ -2055,6 +2191,7 @@ jobs:
             --test sqlite_upsert_isolation \
             --test sqlite_votable \
             --test sqlite_derivation \
+            --test sqlite_money_ledger \
             --test sqlite_dependent_destroy \
             --test sqlite_tracked_sessions \
             --test sqlite_commit_hook_worker \

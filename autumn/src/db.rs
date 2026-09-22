@@ -6573,9 +6573,10 @@ pub(crate) fn establish_migration_connection(
 /// *immediately* with `SQLITE_BUSY`, and `auto_migrate_sqlite` exits the process.
 /// With the timeout, migration statements WAIT up to 5s for the lock to clear
 /// instead of aborting; diesel migrations are idempotent, so a migrator that
-/// waits and then finds migrations already applied is fine. Only `busy_timeout`
-/// is set here — NOT `foreign_keys`/`journal_mode`, because `foreign_keys = ON`
-/// can break table-recreating migrations.
+/// waits and then finds migrations already applied is fine.
+///
+/// Only `busy_timeout` is set here — NOT `foreign_keys`/`journal_mode`, because
+/// `foreign_keys = ON` can break table-recreating migrations.
 ///
 /// # Errors
 ///

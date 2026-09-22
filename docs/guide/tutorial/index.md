@@ -46,6 +46,11 @@ forward. Every chapter opens with a goal statement telling you what you will
 have by the end, and closes with a checkpoint showing the expected project
 state.
 
+Chapters 2, 3, 4, 5, 6, and 8, and part of Chapter 7, don't have their own
+narrative yet — each one links to the equivalent, already-working section of
+the [Getting Started guide](../getting-started.md) instead, so you can still
+go end to end without a dead stop.
+
 Code listings show only the new or changed code. When you need to see the
 full file at any point, check the corresponding checkpoint or refer to
 `examples/todo-app/`.
