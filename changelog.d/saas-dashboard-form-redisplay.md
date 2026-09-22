@@ -30,3 +30,8 @@
   field, and the pre-existing project list intact, with no project created
   by either rejected submission. `cargo clippy -p saas --all-targets -- -D
   warnings` and `cargo fmt --all -- --check`: clean.
+- **`examples/saas` and the `saas` starter: a new project shows its own
+  name, not the tenant id (issue #2854).** The `Project` fields were not in
+  the column order of the `projects` table. The generated repository reads
+  decode each row by position, so the dashboard showed the tenant id as the
+  name of every project. The fields now follow the table order.
