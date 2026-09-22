@@ -1655,25 +1655,33 @@ pub async fn update_user(
         bio,
         website,
     } = edit;
-    // The same rule the registration path applies, for the same reason: this is
-    // a direct Diesel update, so the model's `#[validate(email)]` never runs.
-    // Fixing only the create path left an administrator able to store `user@`
-    // on an existing account.
     let email = email.trim().to_lowercase();
-    if !autumn_web::reexports::validator::ValidateEmail::validate_email(&email) {
-        return Err(AutumnError::unprocessable_msg(
-            "That email address is not valid",
-        ));
-    }
-    if email.len() > crate::hooks::MAX_EMAIL_BYTES {
-        return Err(AutumnError::unprocessable_msg(format!(
-            "Email must be at most {} characters",
-            crate::hooks::MAX_EMAIL_BYTES
-        )));
-    }
 
     with_administrator_guard(conn, actor_id, target_id, role, move |conn| {
         async move {
+            // The same rule the registration path applies, for the same
+            // reason: this is a direct Diesel update, so the model's
+            // `#[validate(email)]` never runs. Fixing only the create path
+            // left an administrator able to store `user@` on an existing
+            // account. Checked here, inside the guard's transaction and
+            // after it has re-confirmed the actor's own authorization —
+            // not before the guard runs, as this used to. An actor demoted
+            // or deleted while this request was in flight must be refused
+            // by the guard's own `FORBIDDEN` before an unrelated 422 from
+            // this validation can reach the caller and redisplay the Users
+            // screen using that stale, already-revoked `actor` (Codex
+            // review finding on PR #2906).
+            if !autumn_web::reexports::validator::ValidateEmail::validate_email(&email) {
+                return Err(AutumnError::unprocessable_msg(
+                    "That email address is not valid",
+                ));
+            }
+            if email.len() > crate::hooks::MAX_EMAIL_BYTES {
+                return Err(AutumnError::unprocessable_msg(format!(
+                    "Email must be at most {} characters",
+                    crate::hooks::MAX_EMAIL_BYTES
+                )));
+            }
             diesel::update(users::table.find(target_id))
                 .set((
                     users::role.eq(role.slug()),
