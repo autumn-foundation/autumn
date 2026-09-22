@@ -8816,23 +8816,6 @@ fn main() {
     }
 
     #[test]
-    fn declares_package_recognizes_a_quoted_key() {
-        // TOML permits quoting any bare key; Cargo treats `"package" = "..."`
-        // identically to `package = "..."`. A caller who writes `cargo add
-        // --rename` output by hand has no reason to know the quoting is
-        // optional, so `declares_package` must accept both forms.
-        assert!(declares_package(
-            "\"package\" = \"autumn-web\"",
-            "autumn-web"
-        ));
-        assert!(declares_package("'package' = \"autumn-web\"", "autumn-web"));
-        assert!(declares_package(
-            "aw = { \"package\" = \"autumn-web\", version = \"0.6\" }",
-            "autumn-web"
-        ));
-    }
-
-    #[test]
     fn ensure_feature_package_alias_dep_autumn_web_alias_quoted_key() {
         // Same fixture as `ensure_feature_package_alias_dep_autumn_web_alias`,
         // but with the `package` key itself quoted -- a form Cargo accepts
