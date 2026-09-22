@@ -661,11 +661,13 @@ jobs:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-scope.sh --self-test && ./scripts/check-docs-scope.sh
       - name: Reader-vocabulary gate
-        # Every docs gate above asks whether a page is TRUE. None asks whether
-        # a reader FINDS it. The orphan gate is the near miss: it proves a page
-        # is reachable by CLICKING from an entry surface, which is not the same
-        # question — nobody clicks through a 159-page guide with no index, they
-        # type the word they already have.
+        # Most docs gates above ask whether a page is TRUE. The orphan gate is
+        # the near miss: it proves a page is reachable by CLICKING from an entry
+        # surface, which is not the same question — nobody reads down a 150-page
+        # guide index, they type the word they already have. The retrieval gate
+        # asks that typing question over a page's slug, H1 and headings; this
+        # one is its broader, weaker companion, asking whether the answering
+        # page carries the reader's word at all in rendered text.
         #
         # A findability defect is quieter than a wrong sentence, because a wrong
         # sentence is at least read. The reader who never lands on the page

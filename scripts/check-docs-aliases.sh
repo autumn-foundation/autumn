@@ -2,8 +2,8 @@
 # Reader-vocabulary gate: the page that documents a capability must carry the
 # word a reader searches for it by.
 #
-# WHY THIS EXISTS: the corpus has eight docs gates and they all answer the same
-# shape of question — is what this page says TRUE?
+# WHY THIS EXISTS: most of the corpus's docs gates answer the same shape of
+# question — is what this page says TRUE?
 # `scripts/check-docs-links.sh` gates its *links* (a 404),
 # `scripts/check-docs-cli.sh` its *commands* (`unrecognized subcommand`),
 # `scripts/check-docs-config.sh` the `AUTUMN_*` variables they SET (a silent
@@ -19,11 +19,21 @@
 # `check-docs-orphans.sh` is the closest thing to an exception, and it asks
 # whether a page is reachable by CLICKING — whether a link path exists from an
 # entry surface. That is not the same question as whether a reader FINDS it.
-# Nobody clicks their way through a 159-page guide with no index; they type the
-# word they already have into a search box.
+# Nobody reads their way down a 150-page guide index looking for the page that
+# answers them; they type the word they already have into a search box.
 #
-# So the corpus has eight gates for accuracy and none for findability, and a
-# findability defect is silent in a way even a wrong sentence is not. A wrong
+# `check-docs-retrieval.sh` asks that typing question too, and asks it more
+# strictly: it models a search over a page's slug, H1 and headings, so a page
+# passes only if it ANNOUNCES the reader's word, and its fixture pins one
+# question to one answering page. This gate is the broader, weaker companion.
+# It asks whether the answering page carries the reader's word AT ALL in
+# rendered text — anywhere on it, heading or prose or table cell — and pins a
+# capability to the vocabulary readers have for it rather than a question to a
+# page. A page can satisfy this one and still fail that one, which is a real
+# gap and not a redundancy: see the note above the table below.
+#
+# Either way a findability defect is silent in a way even a wrong sentence is
+# not. A wrong
 # sentence is at least READ. A page the reader never lands on produces no 404,
 # no exit code, no ignored override, and no support ticket — the reader
 # concludes the framework does not have the feature and goes and builds it
@@ -121,6 +131,21 @@ MODE = sys.argv[1] if len(sys.argv) > 1 else ''
 # The test is whether a reader would type one OR the other for the same idea;
 # "2FA" and "two-factor" are the same idea and both get typed, so they are two
 # required terms, not one alternation.
+#
+# KNOWN GAP, recorded rather than papered over. Satisfying a row here does NOT
+# imply the page ranks for that word under `check-docs-retrieval.sh`, which
+# searches only the slug, H1 and headings. The first row is the live example:
+# `docs/guide/authentication.md` carries "2FA" and "two-factor" in its intro,
+# its generator-flag table and its "where to go next" list — enough for this
+# gate — while having no heading for the capability at all, so
+#
+#     ./scripts/check-docs-retrieval.sh --list
+#
+# still reports MISS for "2fa" and "two factor authentication" against that
+# page if those rows are added to its fixture. Closing that needs a heading on
+# the page, which is a change to the guide's structure and its anchors, not a
+# change to this table. Until someone makes it, a row passing here means the
+# word is ON the page, not that a search will rank the page for it.
 READER_VOCABULARY = (
     ('two-factor authentication (2FA)', 'docs/guide/authentication.md',
      (r'\b2fa\b', r'\btwo[- ]factor\b')),
