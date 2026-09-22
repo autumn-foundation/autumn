@@ -171,6 +171,7 @@ mod inline_broadcast_prefetch;
 mod inspector_integration;
 mod isr_coordination;
 mod job_recorder_integration;
+mod job_tenant_scope;
 mod job_tracking_route;
 mod job_tracking_stores_integration;
 #[cfg(all(feature = "ws", feature = "maud", feature = "htmx", feature = "db"))]

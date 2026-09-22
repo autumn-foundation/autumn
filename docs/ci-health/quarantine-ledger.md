@@ -927,6 +927,103 @@ _None as of 2026-09-05._
   CI spend per this role's own rules; not dispatched this pass for that
   reason, flagged again rather than silently carried.
 
+### `crate_path::tests::resolve_autumn_web_name_dashed_rename_is_sanitized`
+
+- **2026-09-22 update — root cause confirmed by reading `proc_macro_crate`
+  3.5.0's own source (not left as a hypothesis), deterministic fix applied
+  and verified with a purpose-built stress harness, committed as a permanent
+  regression test.** This pass's organic-hit sampling (2026-09-21T09:55:07Z
+  exclusive to 2026-09-22T06:24:50Z, ~20.5h, one `perPage=100`/`page=1` query
+  whose own span, 2026-09-20T21:36:26Z–2026-09-22T06:24:50Z, fully covered
+  the window — 60 `pull_request`-triggered `ci.yml` runs: 42 cancelled/12
+  success/6 failure) found zero repeats of this signature, but with network
+  and a Rust toolchain available in this pass's own sandbox (unlike prior
+  passes), the 2026-09-21 entry's own recommended next step —
+  `cargo test -p autumn-macros-support crate_path:: -- --test-threads=<N>`
+  — was followed through on directly rather than deferred again.
+- **The prior entry's leading hypothesis (a `proc_macro_crate` caching or
+  locking gap) does not hold up against the crate's actual source.** Read
+  `proc-macro-crate-3.5.0/src/lib.rs` directly (fetched via `cargo check`,
+  vendored under `~/.cargo/registry/src/`): its internal cache is keyed by
+  the literal `CARGO_MANIFEST_DIR` string plus `Cargo.toml`'s own mtime, and
+  `crate_name`'s only external-process interaction
+  (`cargo locate-project --workspace --manifest-path=<fixture path>`) is
+  spawned with an explicit `--manifest-path`, not by reading the env var a
+  second time — so this crate's own cache is not the mechanism.
+- **The actual mechanism is in this repo's own test helper, not the
+  dependency.** `with_fixture_manifest` (`autumn-macros-support/src/crate_path.rs`,
+  then lines 621-627) calls `tempfile_dir()` and `std::fs::write`s the
+  fixture `Cargo.toml` to it **before** entering `temp_env::with_var`'s
+  serializing lock — so two of this module's four `with_fixture_manifest`
+  tests (which `cargo test` runs concurrently by default) racing to the same
+  directory name would race their `fs::write` calls unprotected, and
+  whichever test read second would see the *other* test's fixture content.
+  `tempfile_dir()`'s uniqueness came entirely from
+  `format!("...{}-{:?}", process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())`
+  — since every test in one `cargo test` binary shares one `pid`, all
+  uniqueness rested on the nanosecond timestamp being different across two
+  concurrent threads, which is not guaranteed at whatever resolution the
+  platform's clock actually offers under contention. The one organic hit
+  (2026-09-21, `Test (macos-latest)`, `left: "autumn_web", right:
+  "autumn_web_05"`) is exactly consistent with this: `"autumn_web"` is
+  `DEFAULT_NAME`, the fallback `resolve_autumn_web_name_falls_back_when_dependency_absent`'s
+  own fixture (which declares no `autumn-web` dependency at all) would
+  produce — i.e. the dashed-rename test very plausibly read a sibling test's
+  colliding fixture rather than its own.
+- **Measured, not assumed — a Tier 1 controlled-variable stress harness,
+  before and after.** A standalone Rust program mirroring `tempfile_dir()`'s
+  exact naming formula, run from 64 threads × 2,000 iterations each
+  (128,000 samples/run) on this sandbox's own (Linux) hardware, found a
+  real, repeatable collision rate in the pre-fix scheme: **158/768,000
+  (~0.021%) across 6 runs** (26, 32, 29, 38, 33, 27 collisions per run) —
+  non-zero on ordinary Linux hardware despite the one organic hit landing on
+  macOS, where clock resolution under contention is plausibly coarser
+  still. This is exactly the class of evidence this role's own bar calls
+  "Tier 1 — Controlled-variable runs": a fixed, reproducible protocol
+  isolating the one variable (clock-based vs. counter-based naming) that
+  changes the verdict.
+- **Test-vs-product verdict, rendered first, before touching the fix**:
+  test defect, not a product defect. `tempfile_dir()` is a private helper
+  inside `autumn-macros-support`'s own `#[cfg(test)]` module, used by
+  exactly the four tests in this file (confirmed by grep — no other module
+  calls it); no production macro-expansion path or downstream crate is
+  affected. `resolve_autumn_web_name`'s own real behavior — and the
+  `proc_macro_crate` dependency it calls — were never implicated.
+- **Fix, root-caused not tolerance-widened**: replaced the timestamp with a
+  process-wide monotonic `AtomicU64` counter (`unique_fixture_dir_name`,
+  same file) — a counter can never repeat within a process regardless of
+  clock resolution, eliminating the race by construction rather than
+  narrowing its window. No sleep, retry, or timeout was added anywhere.
+- **Verification — 0/N after, from the same harness, plus a real revert
+  check (not just the structural kind other entries have had to settle
+  for).** Because this mechanism is deterministic and local (no Docker, no
+  network flake to wait out), the fix could be verified far more directly
+  than most entries in this ledger:
+  - The 6-run, 128,000-sample-per-run stress harness above re-run against
+    the fixed (counter-based) scheme: **0/768,000 collisions**, all 6 runs.
+  - The same naming logic was committed as a permanent, fast (no filesystem
+    I/O), deterministic regression test —
+    `crate_path::tests::unique_fixture_dir_name_never_collides_under_concurrency`
+    (64 threads × 2,000 iterations, asserting no two generated names
+    collide) — added directly to `autumn-macros-support/src/crate_path.rs`
+    alongside the fix, so this failure mode is now guarded by ordinary
+    `cargo test`, not left to the Docker/macOS sweep's luck.
+  - **Revert check, run for real, not inferred structurally**: temporarily
+    restored the old timestamp-based `unique_fixture_dir_name()` (keeping
+    the new test) and ran
+    `cargo test -p autumn-macros-support --release crate_path::tests::unique_fixture_dir_name_never_collides_under_concurrency -- --exact`
+    15 times: **15/15 FAILED** (release mode's tighter loop makes the
+    collision far more probable than the ~0.02% debug-mode rate above — this
+    is expected, not a discrepancy, since tighter timing windows between
+    concurrent `SystemTime::now()` reads increase collision odds). Restored
+    the fix and re-ran the identical 15 invocations: **15/15 passed**. Both
+    `cargo fmt --check` and `cargo clippy -p autumn-macros-support
+    --all-targets -- -D warnings` are clean (the sole warning present,
+    `unknown lint: clippy::unused_async_trait_impl`, is the same pre-existing,
+    unrelated warning already documented elsewhere in this ledger).
+    `cargo test -p autumn-macros-support` (full package, 40 tests) passes.
+- **Closed**, 2026-09-22, #2895 (🚦 Semaphore).
+
 ## Under active investigation, not yet quarantined
 
 These are tracked here because they are the subject of an open rerun
@@ -1617,6 +1714,38 @@ without also filling in the intake form above.
   pass since it became dispatchable 2026-09-08T15:07:44Z (now ~306.8 hours
   idle, past 12.75 days). Still needs a human sign-off for new macOS CI
   spend; not dispatched this pass for that reason.
+- **2026-09-22 update — 14th consecutive pass, harness still undispatched;
+  zero new hits on any of the three `live_upgrade` signatures.** Sampled
+  `ci.yml` `pull_request` runs from the 2026-09-21 report's own cutoff
+  (2026-09-21T09:55:07Z, exclusive) to 2026-09-22T06:24:50Z (~20.5h, one
+  `perPage=100`/`page=1` query whose own span, 2026-09-20T21:36:26Z–
+  2026-09-22T06:24:50Z, fully covers the window with margin on both ends) —
+  60 runs in-window: 42 cancelled, 12 success, 6 failure. All 6 triaged at
+  job/log level: two `dependabot/cargo/*` branches (`validator-0.21.0`,
+  `infer-0.22.0`) repeating the already-documented `fuzz/Cargo.lock`
+  `--locked` staleness on `Supply chain (cargo-deny)`, plus
+  `validator-0.21.0` also failing `Test (Docker)` on its own subject
+  matter (the `validator` 0.21 bump makes `AlgorithmParameters`/`PostForm`
+  no longer satisfy `IntoChangeset`'s `Validate` bound in
+  `examples/reddit-clone`'s `posts.rs:539`, a genuine compile break from
+  that PR's own dependency bump, unmerged); `dependabot/cargo/jsonwebtoken-11.1.0`
+  failing `Lint`/`MSRV` from its own bump (jsonwebtoken 11.1's
+  `AlgorithmParameters` enum gained a non-exhaustive variant, breaking an
+  existing `match` in `autumn/src/auth.rs:1447` — again that PR's own
+  subject matter) plus the same `Supply chain` staleness; two runs on
+  `claude/bold-heisenberg-t5yxtw` (branch-owned WIP — a `cargo fmt` failure
+  on one run, a genuine `autumn-web` lib compile error near
+  `autumn/src/auth.rs:804` on the other, both this branch's own in-progress
+  diff); and `claude/intelligent-wright-vvhnue`'s `Windows Tier 1 journey`
+  job, whose logs 404'd (`get_job_logs` — likely log-retention/eviction,
+  not investigated further) — n=1, no matching signature, logged as a gap
+  rather than silently assumed branch-owned. None of the 6 match
+  `live_upgrade`, `cache_stampede`, `sim_fault_plan`,
+  `job_tracking_stores_integration`, or `sqlite_job_backend_tracks_job_status_durably`.
+  `manual-macos-contention-check.yml`: still `total_count: 0`, checked
+  2026-09-22T~10:1xZ — **14th** straight idle pass (now ~330.5 hours idle,
+  past 13.75 days). Still needs a human sign-off for new macOS CI spend;
+  not dispatched this pass for that reason.
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
   committed as `.github/workflows/manual-macos-contention-check.yml`, gated
@@ -1696,6 +1825,9 @@ without also filling in the intake form above.
 - **2026-09-21 update**: no repeat in the ~26.4h window sampled this pass
   (see the `live_upgrade` entry's 2026-09-21 dated update above for the
   window and method).
+- **2026-09-22 update**: no repeat in the ~20.5h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-22 dated update above for the
+  window and method).
 
 ### `sim_fault_plan::same_seed_replays_a_byte_identical_outcome_100_times`
 
@@ -1725,6 +1857,9 @@ without also filling in the intake form above.
   window and method). Still n=1, still not campaigned.
 - **2026-09-21 update**: no repeat in the ~26.4h window sampled this pass
   (see the `live_upgrade` entry's 2026-09-21 dated update above for the
+  window and method). Still n=1, still not campaigned.
+- **2026-09-22 update**: no repeat in the ~20.5h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-22 dated update above for the
   window and method). Still n=1, still not campaigned.
 
 ### `sqlite_jobs_scheduler_e2e::sqlite_job_backend_tracks_job_status_durably`
@@ -1824,60 +1959,152 @@ without also filling in the intake form above.
   green rerun on the same PR, or `SQLite runtime` wasn't a required check at
   merge time, was not independently confirmed this pass — out of scope for
   today's time-boxed triage.
+- **2026-09-22 update — no repeat in the ~20.5h window sampled this pass**
+  (see the `live_upgrade` entry's 2026-09-22 dated update above for the
+  window and method) — still n=2, still not campaigned via CI-native means.
+  This pass adds `.github/workflows/manual-sqlite-jobs-rerun-check.yml`, the
+  next step the 2026-09-21 entry called for: a `workflow_dispatch` harness
+  mirroring `manual-job-tracking-rerun-check.yml`'s shape (build once, loop
+  N times), building the standalone `sqlite_jobs_scheduler_e2e` `[[test]]`
+  target under the same `--features "sqlite,test-support,storage"` `ci.yml`'s
+  `SQLite runtime (feature=sqlite)` job uses (its "Run the sqlite integration
+  suite" step), then looping
+  `sqlite_job_backend_tracks_job_status_durably` alone against a fresh
+  on-disk SQLite file per iteration. Like the `job_tracking` harness before
+  it, this needs no runner class or CI spend a human must sign off on — it
+  is the same `ubuntu-latest`, no-Docker shape `ci.yml` already runs on
+  every PR, just isolated to one test and looped — so it is not gated the
+  way `manual-macos-contention-check.yml` is. **Built this pass, not
+  dispatchable via `workflow_dispatch` this pass**: that API only accepts a
+  workflow already present on the repository's default branch (`trunk-dev`),
+  the identical gotcha the `job_tracking` and `macos` harnesses both hit
+  before their own merges (see their entries above).
 
-### `crate_path::tests::resolve_autumn_web_name_dashed_rename_is_sanitized`
+  **This pass's own sandbox had a working Rust toolchain and network access
+  (unlike several prior passes), so the harness's exact protocol was run
+  locally rather than left waiting on a merge**: `cargo test -p autumn-web
+  --features "sqlite,test-support,storage" --test sqlite_jobs_scheduler_e2e
+  -- --test-threads=1 sqlite_job_backend_tracks_job_status_durably`, looped
+  50 times against a fresh on-disk SQLite file per iteration (the harness
+  workflow's own loop, run by hand). **Result: `0/50` failed, `50/50`
+  passed** — no repro in this sample. Confirmed via the root `Cargo.toml`
+  (`libsqlite3-sys = { version = "0.38", features = ["bundled"] }`): this
+  repo compiles its own vendored SQLite amalgamation rather than linking the
+  host's system library, so the SQLite binary itself should be equivalent
+  between this sandbox and GitHub's `ubuntu-latest` runners — the OS/kernel
+  scheduling environment around it is the remaining unconfirmed variable.
+  **This does not close the entry
+  and should not be read as evidence the mechanism is gone**: n=2 organic
+  in roughly a day of ambient PR traffic is a low enough rate that P(0
+  failures in 50 independent trials) stays uncomfortably high even if the
+  true rate is ~1-2% (≈0.6–0.9 under a naive binomial model) — a single
+  50-run miss is exactly what a low-rate flake looks like most of the time,
+  not evidence it was a one-off. Recorded as a data point, not a baseline:
+  the true Tier 1 baseline still needs either a CI-native dispatch once this
+  harness reaches `trunk-dev`, or a substantially larger local sample (e.g.
+  200+) to meaningfully narrow the "still present at low rate" vs. "was
+  never reproducible outside the original two CI runs" question.
+  **Next step, for whichever pass finds this PR merged**: dispatch
+  `manual-sqlite-jobs-rerun-check.yml` with `iterations: "50"` against
+  `trunk-dev`'s tip (CI-native, not local) — or, if a future pass again has
+  working local toolchain/network access and wants a higher-confidence
+  negative before that, extend the local sample well past 50 first.
+- **2026-09-22, later the same day — CI-native Tier 1 baseline obtained: 0/50
+  (0%), same day PR #2895 merged.** `manual-sqlite-jobs-rerun-check.yml` was
+  dispatched against `trunk-dev`'s new tip (`85ce096`, PR #2895's merge
+  commit) as soon as it became available (`workflow_dispatch` only accepts a
+  workflow already on the default branch). Run 35752555923 completed clean
+  end to end in under 4 minutes total (build 2m44s, then all 50 iterations in
+  22 seconds — this test needs no container startup, unlike the Postgres-backed
+  `job_tracking` harness, so it is far cheaper to run at high sample counts).
+  **`RESULT: 0/50 failed, 50/50 passed`** — the CI-native baseline the
+  2026-09-21 entry's own next step called for. Combined with this same day's
+  local 0/50 run above, that is **0/100 clean reruns total**, none of them
+  reproducing the "ON CONFLICT clause does not match" panic.
 
-- **New, 2026-09-21 — opened after a correction, not at first triage.**
-  Originally dismissed in this pass's own organic-hit sampling as
-  "unrelated ... branch-owned," on the (wrong) assumption that a failure on
-  a branch implies the branch caused it. **Correction (post-review, via a
-  Codex review comment on PR #2883): PR #2842 is a pure docs change — its
-  full file list is `ci.yml`, `README.md`, a `changelog.d/` fragment, five
-  `docs/guide/*.md` pages, `scripts/check-docs-retrieval.sh` (new),
-  `scripts/docs-retrieval-questions.tsv` (new), and `skills/autumn-web/SKILL.md`
-  — no Rust source at all, let alone `autumn-macros-support`, so it cannot
-  own a failure in that crate's own unit test.** Reclassified as an organic,
-  undiagnosed hit.
-  - Run 106162503374 (part of run 35540844428, branch
-    `claude/friendly-ritchie-d36hku`, PR #2842), `Test (macos-latest)`,
-    2026-09-20T23:26:40Z: `assertion `left == right` failed`, `left:
-    "autumn_web"`, `right: "autumn_web_05"`, at
-    `autumn-macros-support/src/crate_path.rs:708:9`.
-- **n=1** — a single organic hit, macOS only (the same commit's
-  `Test (ubuntu-latest)`, `Test (windows-latest)`, and `Test (Docker)` all
-  passed the same test; not independently checked against every other job
-  in the matrix).
-- **Mechanism — source read, hypothesis not confirmed.** The failing test
-  (`autumn-macros-support/src/crate_path.rs:693-709`) writes a fixture
-  `Cargo.toml` declaring a dashed rename (`autumn-web-05 = { package =
-  "autumn-web", version = "0.5" }`) to a fresh temp directory, then calls
-  `resolve_autumn_web_name()` with `CARGO_MANIFEST_DIR` temporarily pointed
-  at that directory via `temp_env::with_var` (`with_fixture_manifest`,
-  lines 619-627 — its own doc comment already names the hazard: "restores
-  the previous value even if `f` panics" and (line 619) "concurrently by
-  default"). `resolve_autumn_web_name` (`crate_path.rs:94-105`) delegates to
-  `proc_macro_crate::crate_name("autumn-web")` and falls back to the
-  unrenamed `DEFAULT_NAME` ("autumn_web") on any `Err` or `FoundCrate::Itself`
-  — which is exactly the value observed, meaning `crate_name` did not see the
-  fixture manifest as a dependency declaring `autumn-web` under a rename.
-  `temp_env::with_var` is documented to serialize concurrent callers via an
-  internal process-wide lock specifically to make this pattern safe under
-  parallel test execution, so the leading (**unconfirmed**) hypothesis is
-  narrower than "a lock is missing": either `proc_macro_crate::crate_name`
-  reads or caches something outside that lock's coverage (its own internal
-  state, or a `cargo metadata` subprocess whose env capture doesn't align
-  with the lock's window), or a third, unaudited path also sets
-  `CARGO_MANIFEST_DIR` without going through `temp_env`. Not traced further
-  this pass — third-party crate internals (`proc-macro-crate`) were not
-  read.
-- **Test-vs-product verdict: not rendered.** This is `autumn-macros-support`
-  test-only code (a fixture-manifest helper and its assertion), not a
-  production request path, so a confirmed mechanism here would very likely
-  be a test-defect finding — but that's not yet confirmed, only likely.
-- **Not campaigned, no fix PR**: n=1, no baseline of any kind. Next step:
-  reproduce locally with repeated `cargo test -p autumn-macros-support
-  crate_path:: -- --test-threads=<N>` runs (note the `--` separator —
-  `--test-threads` is a libtest argument, not a cargo one; omitting it fails
-  before any test runs at all) to see whether increasing parallelism
-  reproduces it, before deciding whether a harness is warranted.
+  **Still not closing this entry.** Per this role's own hard gate, a Tier 1
+  baseline this clean would ordinarily support closing a *diagnosed and
+  fixed* flake — but nothing has been fixed here: the mechanism is still
+  unconfirmed, and there is no product-vs-test verdict to render. **Correction
+  (post-review, via a third Codex review comment on PR #2904): drop "a
+  second, unaudited SQLite `INSERT ... ON CONFLICT` path" as a candidate —
+  it does not exist.** `grep -rn "sqlite job enqueue failed"` across the
+  whole repo finds exactly one call site
+  (`autumn/src/job/sqlite.rs:461`), immediately after the file's sole
+  `INSERT INTO autumn_jobs ... ON CONFLICT` (lines 428-458), and that
+  function unconditionally awaits `queue_handle.ready()` first
+  (`sqlite.rs:392`) — the same readiness-gate call already confirmed above
+  to create the partial index before any insert. There is no second path to
+  audit; the only remaining named candidate is the SQLite-version-specific
+  partial-index matching quirk. 0/100 with no fix
+  applied does not mean the bug is gone; it means same-commit reruns of this
+  one test, run the way this harness runs it, have not reproduced it.
+
+  **Correction (post-review, via a Codex review comment on PR #2904): the
+  original version of this update named the wrong structural difference —
+  "sibling CI jobs competing for the same runner" is not how GitHub Actions
+  works, and this repo's own docs already say so.** `AGENTS.md`
+  (`AGENTS.md:83-86`) states plainly, of a sibling job in this same
+  workflow: "a runner whose disk it is the only claimant of" — each `ci.yml`
+  job (`Lint`, `MSRV`, `SQLite runtime`, etc.) gets its own dedicated,
+  isolated GitHub-hosted VM, not a shared host with other concurrently
+  running jobs. There is no cross-job disk/CPU contention for this harness's
+  isolation to structurally rule out; that framing was wrong, not merely
+  unconfirmed.
+
+  **The actual, verifiable structural difference is same-binary test
+  parallelism, not job isolation.** `ci.yml`'s own "Run the sqlite
+  integration suite" step (the real organic path both hits occurred on)
+  invokes `cargo test -p autumn-web --features "sqlite,test-support,storage"
+  --test sqlite_boot_serve --test sqlite_migrations ... --test
+  sqlite_jobs_scheduler_e2e --test confidential_repository_bidx ...` — no
+  `--test-threads` flag anywhere in that step, so libtest runs every test
+  *within* the `sqlite_jobs_scheduler_e2e` binary (27 tests total, per this
+  binary's own test count) at its default parallelism, one OS thread per
+  logical core. `manual-sqlite-jobs-rerun-check.yml`'s loop, by contrast,
+  filters to the single target test name **and** passes `--test-threads=1`
+  explicitly — eliminating same-binary concurrency entirely, not just
+  cross-job concurrency. If the real mechanism is a race between
+  `sqlite_job_backend_tracks_job_status_durably` and one of its 26 sibling
+  tests in the same file (shared process-global state, a shared on-disk
+  path, or contention on some other resource within the same test binary),
+  this harness's `--test-threads=1` filter would structurally prevent it
+  from ever reproducing, exactly the same shape of gap the withdrawn
+  sibling-job framing was reaching for, just at the correct layer (one test
+  binary's own internal parallelism, not GitHub Actions' job scheduling).
+  **Correction (post-review, via a second Codex review comment on PR #2904):
+  the shared-state audit this paragraph called for already exists, for this
+  exact file, a few paragraphs up (lines 1928-1942 above) — restating it as
+  an open next step would have had a future pass redo completed work.**
+  That audit found every sibling test in `sqlite_jobs_scheduler_e2e.rs` that
+  calls `job::start_runtime` holds `global_job_runtime_test_lock()` first,
+  including this entry's own target test, which (per the source) holds that
+  lock for its **entire** runtime — so under default parallelism, any other
+  lock-holding sibling scheduled concurrently would simply block on the
+  mutex until the target test releases it, never truly interleaving with
+  it. That rules the process-global `GLOBAL_JOB_CLIENT` back *out* as the
+  same-binary mechanism too, not just as the original cross-process one —
+  the same conclusion, reached the same way, applies to both framings. If
+  same-binary parallelism is still the right layer (unconfirmed, not ruled
+  out — only this one specific shared resource is), the culprit would have
+  to be a *different*, still-unidentified resource shared outside that
+  lock's coverage — **not** a shared on-disk database path: **correction
+  (post-review, via a fourth Codex review comment on PR #2904)**, each test
+  builds its own `tempfile::TempDir` and `build_sqlite_pool` places
+  `jobs_scheduler.db` under that unique directory
+  (`autumn/tests/sqlite_jobs_scheduler_e2e.rs:78-80`), so sibling tests
+  cannot collide on a shared database file even under default parallelism —
+  that candidate is excluded by per-test isolation, not by the lock. What
+  remains open is a different process-global the lock doesn't cover, or
+  something not yet identified. Auditing for that
+  specific gap — not re-auditing `GLOBAL_JOB_CLIENT` or a shared database
+  file, both closed — plus a harness variant that runs the *whole*
+  `sqlite_jobs_scheduler_e2e` binary
+  at default parallelism (not `--test-threads=1`, not filtered to one test)
+  N times, is the concrete next step for a future pass.
+
+`crate_path::tests::resolve_autumn_web_name_dashed_rename_is_sanitized` was
+opened here 2026-09-21 (n=1, mechanism unconfirmed) and **closed the same
+week** — see its entry under "Closed entries" above for the full diagnosis,
+measured fix, and verification; not repeated here.
 
