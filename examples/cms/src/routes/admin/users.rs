@@ -189,7 +189,7 @@ async fn users_page(
                                 td class="px-4 py-3" {
                                     @if may_edit && row.id != user.id {
                                         form method="post"
-                                             action=(format!("/admin/users/{}", row.id))
+                                             action=(format!("/admin/users/{}?page={}", row.id, page))
                                              class="flex gap-2 items-center" {
                                                  (csrf.input())
                                             label for=(format!("role-{}", row.id))
@@ -221,7 +221,7 @@ async fn users_page(
                                     // not a recoverable mistake through the UI.
                                     @if may_edit && row.id != user.id {
                                         form method="post"
-                                             action=(format!("/admin/users/{}/delete", row.id)) {
+                                             action=(format!("/admin/users/{}/delete?page={}", row.id, page)) {
                                                  (csrf.input())
                                             button type="submit"
                                                    class="text-red-700 hover:underline text-xs" {
@@ -408,6 +408,7 @@ async fn redisplay_row_error(
     repos: &Repos,
     actor: &User,
     csrf: &Csrf,
+    filter: &UsersFilter,
     id: i64,
     role: Option<Role>,
     message: &str,
@@ -416,7 +417,7 @@ async fn redisplay_row_error(
         repos,
         actor,
         csrf,
-        &UsersFilter::default(),
+        filter,
         ("", "", Role::Subscriber),
         None,
         Some(&RowError { id, role, message }),
@@ -435,6 +436,7 @@ pub async fn update(
     session: Session,
     csrf: Csrf,
     Path(id): Path<i64>,
+    Query(filter): Query<UsersFilter>,
     Form(form): Form<UpdateUserForm>,
 ) -> AutumnResult<Response> {
     let actor = require_capability!(repos, session, csrf, Capability::EditUsers);
@@ -473,21 +475,24 @@ pub async fn update(
         })
         .await;
 
-    // The last-administrator guard and a stale-email rejection are both the
-    // administrator's to fix by resubmitting — same distinction `create`
-    // already draws between "fix the form" and "something else broke".
-    // Redisplay with the attempted role reselected rather than losing the
-    // edit to the generic error page; anything else (e.g. the target account
-    // no longer exists) propagates as the real error it is.
+    // Only the last-administrator guard is the administrator's to fix by
+    // resubmitting — same distinction `create` already draws between "fix
+    // the form" and "something else broke". A `FORBIDDEN` here is a
+    // *different* failure: `with_administrator_guard` returns it when the
+    // actor's own row lost `EditUsers` between `require_capability!` and
+    // this transaction's re-read (e.g. another administrator just demoted
+    // them). Redisplaying the Users screen in that case would render the
+    // account table, email addresses and editing controls for a viewer
+    // whose authorization was just revoked, using the stale pre-revocation
+    // `actor` — the opposite of enforcing the revocation. That propagates
+    // as the real error it is (Codex review finding on this PR), same as
+    // any other failure that is not the administrator's to correct here.
     if let Err(error) = updated {
-        let message = if error.status() == StatusCode::UNPROCESSABLE_ENTITY
-            || error.status() == StatusCode::FORBIDDEN
-        {
-            error.to_string()
-        } else {
+        if error.status() != StatusCode::UNPROCESSABLE_ENTITY {
             return Err(error);
-        };
-        return redisplay_row_error(&repos, &actor, &csrf, id, Some(role), &message).await;
+        }
+        let message = error.to_string();
+        return redisplay_row_error(&repos, &actor, &csrf, &filter, id, Some(role), &message).await;
     }
 
     Ok(Redirect::to("/admin/users").into_response())
@@ -499,6 +504,7 @@ pub async fn delete(
     session: Session,
     csrf: Csrf,
     Path(id): Path<i64>,
+    Query(filter): Query<UsersFilter>,
 ) -> AutumnResult<Response> {
     let actor = require_capability!(repos, session, csrf, Capability::EditUsers);
     if actor.id == id {
@@ -527,17 +533,17 @@ pub async fn delete(
 
     // Same guard `update` hits, reached from the delete button instead: the
     // target is the site's last administrator. Redisplay next to that row
-    // rather than bouncing to the generic error page — anything else
-    // propagates as the real error it is.
+    // rather than bouncing to the generic error page. A `FORBIDDEN` here
+    // means the *actor's own* authorization was revoked mid-request (see
+    // `update`'s matching comment) rather than anything about the target
+    // account, so it propagates as the real error it is instead of
+    // rendering the admin screen for a viewer who just lost access to it.
     if let Err(error) = deleted {
-        let message = if error.status() == StatusCode::UNPROCESSABLE_ENTITY
-            || error.status() == StatusCode::FORBIDDEN
-        {
-            error.to_string()
-        } else {
+        if error.status() != StatusCode::UNPROCESSABLE_ENTITY {
             return Err(error);
-        };
-        return redisplay_row_error(&repos, &actor, &csrf, id, None, &message).await;
+        }
+        let message = error.to_string();
+        return redisplay_row_error(&repos, &actor, &csrf, &filter, id, None, &message).await;
     }
 
     Ok(Redirect::to("/admin/users").into_response())
@@ -673,5 +679,18 @@ mod tests {
             message: "That email address is not valid",
         };
         assert_eq!(err.role, Some(Role::Editor));
+    }
+
+    /// `update`/`delete` redisplay only on `UNPROCESSABLE_ENTITY` (the
+    /// last-administrator/stale-email guard), never on `FORBIDDEN` — that
+    /// status means the *actor's own* `EditUsers` was revoked mid-request
+    /// (Codex review finding on this PR: redisplaying in that case would
+    /// render the account table for a viewer whose authorization was just
+    /// pulled, using the stale pre-revocation `actor`). This pins the
+    /// status-code boundary both handlers branch on.
+    #[test]
+    fn forbidden_is_not_the_redisplayable_status() {
+        let err = AutumnError::forbidden_msg("Your account can no longer manage users");
+        assert_ne!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }
