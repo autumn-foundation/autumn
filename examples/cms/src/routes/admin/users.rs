@@ -52,6 +52,23 @@ pub struct UpdateUserForm {
 /// `redisplay`, which never echoes a submitted password back into a form.
 type AddUserValues<'a> = (&'a str, &'a str, Role);
 
+/// A row-level failure to redisplay next to the account it happened to,
+/// instead of bouncing the administrator to the generic error page — the
+/// same failure `create`'s "Add user" card was already fixed for (see
+/// [`redisplay_add_user`]), now extended to `update` and `delete`, which
+/// share the same `content::with_administrator_guard` failure modes (the
+/// last-administrator guard, a stale-email rejection) but used to `?` them
+/// straight past this screen. `role` carries the change `update` attempted
+/// so the select re-shows what the administrator picked rather than
+/// reverting to the unchanged value; `delete` has no attempted value to
+/// restore, so it passes `None` and the select keeps showing the account's
+/// current role.
+struct RowError<'a> {
+    id: i64,
+    role: Option<Role>,
+    message: &'a str,
+}
+
 /// The "Add user" card. `error`, when present, renders adjacent to the fields
 /// it applies to and is announced via `role="alert"` — the same pattern
 /// `/register`'s `register_form_markup` already uses for this example.
@@ -99,6 +116,19 @@ fn add_user_form_markup(csrf: &Csrf, values: AddUserValues<'_>, error: Option<&s
     }
 }
 
+/// The row shown directly under an account whose `update` or `delete` just
+/// failed: persistent (not a toast that deletes itself) and adjacent to the
+/// row it explains, announced to assistive tech via `role="alert"`.
+fn row_error_row(err: &RowError<'_>) -> Markup {
+    html! {
+        tr class="border-t border-gray-100 bg-red-50" {
+            td colspan="4" class="px-4 py-2" {
+                p class="text-red-700 text-xs" role="alert" { (err.message) }
+            }
+        }
+    }
+}
+
 /// Renders the whole Users screen — the account table, its pagination, and
 /// the "Add user" card — parameterized by what the card should show. `list`
 /// calls this with a blank card; `create` calls it again, with the
@@ -113,6 +143,7 @@ async fn users_page(
     filter: &UsersFilter,
     add_user: AddUserValues<'_>,
     add_user_error: Option<&str>,
+    row_error: Option<&RowError<'_>>,
 ) -> AutumnResult<Markup> {
     let may_edit = user.role().can(Capability::EditUsers);
 
@@ -146,6 +177,7 @@ async fn users_page(
                     }
                     tbody {
                         @for row in &users {
+                            @let this_row_error = row_error.filter(|e| e.id == row.id);
                             tr class="border-t border-gray-100" {
                                 td class="px-4 py-3 font-medium" {
                                     (row.username)
@@ -164,7 +196,9 @@ async fn users_page(
                                                   class="sr-only" { "Role" }
                                             select #(format!("role-{}", row.id)) name="role"
                                                    class="border rounded px-2 py-1 text-xs" {
-                                                (role_options(row.role()))
+                                                (role_options(
+                                                    this_row_error.and_then(|e| e.role).unwrap_or(row.role())
+                                                ))
                                             }
                                             input type="hidden" name="display_name"
                                                   value=(row.display_name);
@@ -196,6 +230,9 @@ async fn users_page(
                                         }
                                     }
                                 }
+                            }
+                            @if let Some(err) = this_row_error {
+                                (row_error_row(err))
                             }
                         }
                     }
@@ -243,6 +280,7 @@ pub async fn list(
         &csrf,
         &filter,
         ("", "", Role::Subscriber),
+        None,
         None,
     )
     .await?;
@@ -352,6 +390,36 @@ async fn redisplay_add_user(
         &UsersFilter::default(),
         add_user,
         Some(message),
+        None,
+    )
+    .await?;
+    Ok((
+        StatusCode::UNPROCESSABLE_ENTITY,
+        layout(actor, csrf, "/admin/users", "Users", body),
+    )
+        .into_response())
+}
+
+/// Redisplays the Users screen at 422 with `id`'s row carrying `message`
+/// next to it, instead of bouncing the administrator to the framework's
+/// generic `application/problem+json` error page — the same failure
+/// [`redisplay_add_user`] already fixes for `create`. See [`RowError`].
+async fn redisplay_row_error(
+    repos: &Repos,
+    actor: &User,
+    csrf: &Csrf,
+    id: i64,
+    role: Option<Role>,
+    message: &str,
+) -> AutumnResult<Response> {
+    let body = users_page(
+        repos,
+        actor,
+        csrf,
+        &UsersFilter::default(),
+        ("", "", Role::Subscriber),
+        None,
+        Some(&RowError { id, role, message }),
     )
     .await?;
     Ok((
@@ -386,14 +454,15 @@ pub async fn update(
     // Credentials are deliberately not reachable from this screen: a role
     // change and a password change are different operations, and conflating
     // them is how an admin screen becomes an account-takeover primitive.
-    repos
+    let role = Role::parse(&form.role);
+    let updated = repos
         .with_conn(async |conn| {
             crate::content::update_user(
                 conn,
                 actor.id,
                 id,
                 crate::content::UserEdit {
-                    role: Role::parse(&form.role),
+                    role,
                     email: form.email.clone(),
                     display_name: form.display_name.trim().to_owned(),
                     bio: form.bio.clone(),
@@ -402,7 +471,24 @@ pub async fn update(
             )
             .await
         })
-        .await?;
+        .await;
+
+    // The last-administrator guard and a stale-email rejection are both the
+    // administrator's to fix by resubmitting — same distinction `create`
+    // already draws between "fix the form" and "something else broke".
+    // Redisplay with the attempted role reselected rather than losing the
+    // edit to the generic error page; anything else (e.g. the target account
+    // no longer exists) propagates as the real error it is.
+    if let Err(error) = updated {
+        let message = if error.status() == StatusCode::UNPROCESSABLE_ENTITY
+            || error.status() == StatusCode::FORBIDDEN
+        {
+            error.to_string()
+        } else {
+            return Err(error);
+        };
+        return redisplay_row_error(&repos, &actor, &csrf, id, Some(role), &message).await;
+    }
 
     Ok(Redirect::to("/admin/users").into_response())
 }
@@ -435,9 +521,24 @@ pub async fn delete(
     // means a transient failure leaves the account and its posts permanently
     // gone with the counts stale — and a retry finds no user to delete, so
     // nothing ever repairs them.
-    repos
+    let deleted = repos
         .with_conn(async |conn| crate::content::delete_user(conn, actor.id, id).await)
-        .await?;
+        .await;
+
+    // Same guard `update` hits, reached from the delete button instead: the
+    // target is the site's last administrator. Redisplay next to that row
+    // rather than bouncing to the generic error page — anything else
+    // propagates as the real error it is.
+    if let Err(error) = deleted {
+        let message = if error.status() == StatusCode::UNPROCESSABLE_ENTITY
+            || error.status() == StatusCode::FORBIDDEN
+        {
+            error.to_string()
+        } else {
+            return Err(error);
+        };
+        return redisplay_row_error(&repos, &actor, &csrf, id, None, &message).await;
+    }
 
     Ok(Redirect::to("/admin/users").into_response())
 }
@@ -524,5 +625,53 @@ mod tests {
             !markup.contains(r#"role="alert""#),
             "an alert rendered with no error to report: {markup}"
         );
+    }
+
+    /// Baseline (pre-fix) reproduction: `update` and `delete` `?`d
+    /// `content::with_administrator_guard`'s failures (e.g. "This is the
+    /// only administrator account; promote another user first") straight to
+    /// the framework's generic `application/problem+json` error page,
+    /// exactly like `create`'s pre-fix baseline above — same four booleans,
+    /// all failing. This module's fix replaces those `?`s with
+    /// `redisplay_row_error`, asserted by the tests below.
+    #[test]
+    fn baseline_last_administrator_guard_is_422_not_html() {
+        let err = AutumnError::unprocessable_msg(
+            "This is the only administrator account; promote another user first",
+        );
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// The row error is announced adjacent to the row it explains and
+    /// persists (a `<tr>` in the table, not a toast that deletes itself).
+    #[test]
+    fn row_error_row_announces_the_error() {
+        let markup = row_error_row(&RowError {
+            id: 7,
+            role: None,
+            message: "This is the only administrator account; promote another user first",
+        })
+        .into_string();
+
+        assert!(
+            markup.contains(r#"role="alert""#)
+                && markup.contains("This is the only administrator account"),
+            "the error is not announced next to the row: {markup}"
+        );
+    }
+
+    /// `update`'s failure carries the attempted role forward so the select
+    /// re-shows what the administrator picked instead of silently reverting
+    /// it — the same "don't discard what was already entered" rule
+    /// `add_user_form_preserves_submitted_values_on_failure` checks for the
+    /// "Add user" card.
+    #[test]
+    fn row_error_preserves_the_attempted_role() {
+        let err = RowError {
+            id: 7,
+            role: Some(Role::Editor),
+            message: "That email address is not valid",
+        };
+        assert_eq!(err.role, Some(Role::Editor));
     }
 }
