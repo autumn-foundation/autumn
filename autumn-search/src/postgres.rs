@@ -809,6 +809,20 @@ fn dedupe_by_id(documents: &[IndexedDocument], keep_first: bool) -> Vec<&Indexed
         .collect()
 }
 
+/// The `record_id` order `delete()` binds for its ledger `INSERT ...
+/// unnest($2)`.
+///
+/// The insert acquires its tombstone rows in array order, so the array must
+/// be ascending to match the unconditional batch's `ORDER BY record_id FOR
+/// UPDATE` tombstone clear — opposite orders on the two paths deadlock over
+/// the same tombstones (#2310). Kept as a pure helper so the ordering
+/// contract is unit-testable without a database.
+fn ascending_ids(ids: &[i64]) -> Vec<i64> {
+    let mut sorted = ids.to_vec();
+    sorted.sort_unstable();
+    sorted
+}
+
 /// One row's already-rendered column-value expression list, in the exact
 /// order `upsert_sql`'s INSERT column list declares (`index_name,
 /// record_id, tenant_id, language, fields, content, search_vector,
@@ -926,11 +940,26 @@ fn upsert_sql(
     // then delete" (document absent, tombstone present) and "delete, then upsert+clear"
     // (document present, no tombstone). Both are consistent; the inconsistent interleaving
     // cannot happen.
+    //
+    // `cleared` locks the ledger rows in ascending `record_id` order — via `ORDER BY`
+    // plus `FOR UPDATE` in a `SELECT`, the only thing that actually controls Postgres's
+    // row-lock acquisition order — matching `delete()`'s `INSERT ... unnest($2)` order.
+    // A bare `DELETE ... WHERE record_id = ANY($n)` locks whatever rows its scan visits,
+    // independent of the array's order, so racing an oppositely-ordered `delete()` over
+    // the same tombstones could deadlock: each statement holds one ledger row and waits
+    // for the other (#2310).
     format!(
         "WITH upserted AS ( \
            {upsert} \
+         ), \
+         cleared AS ( \
+           SELECT record_id FROM {DELETES_TABLE} \
+           WHERE index_name = $1 AND record_id = ANY(${ids_param}) \
+           ORDER BY record_id \
+           FOR UPDATE \
          ) \
-         DELETE FROM {DELETES_TABLE} WHERE index_name = $1 AND record_id = ANY(${ids_param})"
+         DELETE FROM {DELETES_TABLE} \
+         WHERE index_name = $1 AND record_id IN (SELECT record_id FROM cleared)"
     )
 }
 
@@ -1121,6 +1150,13 @@ impl SearchBackend for PostgresSearchStore {
             // scan visits them, independent of the array's order, so a bare `DELETE
             // ... WHERE record_id = ANY($2)` could lock out of order and deadlock
             // against a concurrent `write_documents` batch.
+            //
+            // The ledger half needs the same treatment in reverse: the `INSERT ...
+            // unnest($2)` below acquires its tombstone rows in array order, so the
+            // array is pre-sorted ascending to match the unconditional batch's
+            // `ORDER BY record_id FOR UPDATE` tombstone clear. Opposite orders on
+            // the two paths deadlock over the same tombstones (#2310).
+            let sorted_ids = ascending_ids(ids);
             bind_all(
                 diesel::sql_query(format!(
                     "WITH doomed AS ( \
@@ -1140,7 +1176,7 @@ impl SearchBackend for PostgresSearchStore {
                 .into_boxed::<autumn_web::RuntimeBackend>(),
                 [
                     Bound::Text(definition.name.to_owned()),
-                    Bound::Ids(ids.to_vec()),
+                    Bound::Ids(sorted_ids),
                 ],
             )
             .execute(&mut conn)
@@ -2119,6 +2155,19 @@ mod tests {
         );
         assert!(sql.contains("record_id = ANY($9)"), "{sql}");
 
+        // The tombstone clear must lock the ledger rows in ascending
+        // `record_id` order — ORDER BY + FOR UPDATE is the only thing that
+        // controls Postgres's lock acquisition order — matching `delete()`'s
+        // `INSERT ... unnest($2)` order. A bare DELETE ... ANY($n) locks in
+        // scan order and deadlocks against an oppositely-ordered delete
+        // racing over the same tombstones (#2310).
+        let lock_block = sql
+            .find(&format!("DELETE FROM {DELETES_TABLE}"))
+            .map(|at| &sql[..at])
+            .expect("the tombstone-clear DELETE exists");
+        assert!(lock_block.contains("ORDER BY record_id"), "{sql}");
+        assert!(lock_block.contains("FOR UPDATE"), "{sql}");
+
         // A watermarked (backfill) write leaves the ledger alone — its batch is
         // older than any tombstone by construction. Clearing it there would
         // undo the very delete the guard is protecting.
@@ -2146,6 +2195,18 @@ mod tests {
         assert_eq!(multi.matches("$3::timestamptz").count(), 3, "{multi}");
         assert!(multi.contains("record_id = $4"), "{multi}");
         assert!(multi.contains("record_id = $9"), "{multi}");
+    }
+
+    #[test]
+    fn delete_binds_its_ledger_ids_in_ascending_order() {
+        // `delete()`'s `INSERT ... unnest($2)` acquires tombstone rows in
+        // array order, so the bound array must be ascending to match the
+        // unconditional batch's `ORDER BY record_id FOR UPDATE` tombstone
+        // clear — opposite orders on the two paths deadlock (#2310).
+        assert_eq!(ascending_ids(&[3, 1, 2]), vec![1, 2, 3]);
+        assert_eq!(ascending_ids(&[1, 2, 3]), vec![1, 2, 3]);
+        assert_eq!(ascending_ids(&[5, 5, 1]), vec![1, 5, 5]);
+        assert_eq!(ascending_ids(&[]), Vec::<i64>::new());
     }
 
     #[test]
