@@ -23,7 +23,7 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::LitStr;
 
-use crate::model::{infer_table_name, pascal_to_snake};
+use autumn_macros_support::naming::{infer_table_name, pascal_to_snake};
 
 /// A resolved `#[commentable(...)]` declaration.
 ///

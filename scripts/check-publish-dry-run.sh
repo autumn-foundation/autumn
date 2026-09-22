@@ -32,7 +32,10 @@ die() {
 
 # Publishable crates in dependency order.
 CRATES=(
+  autumn-macros-support
   autumn-macros
+  autumn-macros-model
+  autumn-macros-repository
   autumn-schema-core
   autumn-edge
   autumn-web

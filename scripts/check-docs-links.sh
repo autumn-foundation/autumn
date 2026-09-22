@@ -465,7 +465,18 @@ for f in files:
             continue
         # A rendered link is a URL: `a%20b.md` addresses the file `a b.md`.
         path = urllib.parse.unquote(path)
-        resolved = os.path.normpath(os.path.join(os.path.dirname(os.path.join(root, f)), path))
+        # A `changelog.d/` fragment is text destined for `CHANGELOG.md` at the
+        # repository root: `scripts/update-changelog.sh` splices it in there,
+        # and `scripts/check-migration-guides.sh` reads it as if it already
+        # were. So its links must be written as CHANGELOG.md writes them, and
+        # they resolve from the root, not from `changelog.d/`. Resolving them
+        # here from the fragment's own directory made the two gates demand
+        # different text for one link. `README.md` is the directory's own
+        # prose, not a fragment, so it keeps ordinary relative resolution.
+        base = os.path.dirname(os.path.join(root, f))
+        if f.startswith("changelog.d/") and os.path.basename(f) != "README.md":
+            base = root
+        resolved = os.path.normpath(os.path.join(base, path))
         # A destination that climbs out of the checkout resolves against the
         # runner's filesystem, so `../../../../etc/passwd` "exists" and passes
         # while the rendered link reaches nothing. Existence off-tree is not

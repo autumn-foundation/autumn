@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A compensated first deploy now removes its stale proxy route (issue
+  #2270):** when a halted fleet rollout compensated a host's just-completed
+  FIRST deploy, the host was torn down but kamal-proxy kept a route pointing
+  at the now-stopped slot, so its public port answered `502` instead of
+  refusing the connection until the next deploy. `ProxyController` gained
+  `deregister_op` (`kamal-proxy remove`), probed the same way `deploy --help`
+  already is, so a drifted or renamed `remove` subcommand fails the deploy
+  closed before any cutover, never assumed present. The route is removed as
+  its own step, only after the app teardown fully succeeds, so a failure
+  there reports its own outcome (`CompensatedTeardownRouteFailed`) rather
+  than the misleading "still serving, roll it back" — a first deploy has no
+  previous release to roll back to.
+
 ### Added
 
 - **💵 Money as a framework primitive: typed `Money<C>` and an enforced
@@ -172,28 +187,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **🪞 Echo: `autumn generate auth --oauth`/`--webauthn` no longer mutate an
-  unrelated `autumn_web` dependency (#2753):** `ensure_autumn_web_oauth2_feature`
-  and `ensure_autumn_web_webauthn_feature` matched a `[dependencies.autumn_web]`
-  subtable as "this is `autumn-web`" purely by name, but Cargo does not
-  normalize `-`/`_` in a dependency table key — `[dependencies.autumn_web]`
-  names an unrelated package literally called `autumn_web` unless its body
-  renames it back with `package = "autumn-web"`. A project with such a
-  dependency (and `autumn-web` declared some other way) got the `oauth2`/
-  `webauthn` cargo feature silently added to the wrong dependency's features
-  list. `ensure_autumn_web_mail_feature` already carried the correct
-  `package`-rename check (#2752); the other two now call the same guard
-  before matching the underscore form, matching the fix Echo's findings
-  issue #2753 tracked as still outstanding. Two new regression tests
-  (`cargo_toml_oauth2_feature_ignores_unrenamed_underscore_subtable`,
-  `cargo_toml_webauthn_feature_ignores_unrenamed_underscore_subtable`) pin
-  the negative case; the existing underscore-subtable-form tests for both
-  functions still pass unchanged. The remaining clone-class work tracked by
-  #2753 (unifying all five `ensure_*_feature` helpers into one
-  `ensure_crate_features` and closing the multi-line `features = [...]`
-  array gap) is intentionally out of scope here — it is a ~700-line
-  refactor that needs its own characterization-tests-first PR, not folded
-  into a narrow security fix.
+- **🌐 Custom domains reach the app in production (issue #2657):** a tenant
+  hostname is never in `[security.trusted_hosts] hosts` — that is the point of
+  the feature — and `TrustedHostPolicy::from_config` read only that list. So a
+  request for `app.clientco.com`, registered, verified, `active` and holding
+  its own certificate, got `400 Invalid Host header` before tenancy resolution
+  ran. Every part below the trusted-host layer was correct; nothing reached it.
+  The only workaround was `hosts = ["*"]`, which turns host validation off for
+  the whole deployment — "custom domains **or** Host-header protection, pick
+  one". The policy now asks the custom-domain registry about a host its static
+  rules do not match, and admits it only while the domain is servable
+  (`active`), which is the rule SNI already applies at the handshake: a
+  `pending_dns` registration is not a way past host validation. The registry is
+  read per request, not captured, because the app publishes it at bind time —
+  after the router is built — so a domain connected or offboarded while the app
+  runs takes effect with no restart. A deployment with no registry pays one
+  extension lookup on the path that was about to answer `400` anyway.
+  The acceptance test for this behaviour called the tenancy extractor
+  directly, so the middleware that rejected the request was never in the path;
+  the new test drives a **mounted router** through the whole stack, and
+  publishes the registry after the build, as production does.
+  `AppState::late_extensions` is the small seam that makes the late read
+  possible. `docs/guide/tls.md` and `docs/guide/deployment.md` now state the
+  interaction.
+
 - **🛣️ Onramp: stop treating `local-dev-quickstart`'s permanent drift as a
   CI failure [no-plugin]:** nothing here is agent-facing — it's a
   CI-workflow-only change plus a test split, not new framework surface
@@ -1284,6 +1301,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The in-process TLS listener now advertises ALPN `[b"h2", b"http/1.1"]`
+  (#2321):** `build_server_config` never set `alpn_protocols`, so rustls
+  completed the handshake with no protocol selected and every browser —
+  every `[server.tls]` deployment, static-cert or ACME — silently fell back
+  to HTTP/1.1, losing multiplexing even though the serve path's
+  `hyper_util::server::conn::auto` already speaks h2 once a client sends the
+  preface. Both TLS modes funnel through `build_server_config_with_client_auth`,
+  which now sets the advertisement once, identically for the server-only and
+  client-auth arms. `h2` is listed first, then `http/1.1`, so ALPN-less and
+  http/1.1-only clients are unaffected. New regression tests pin the ALPN on
+  all three public entry points (`build_server_config`,
+  `build_server_config_with_resolver`, `build_server_config_with_client_auth`
+  with a real client verifier) so an accidental revert to no-ALPN fails the
+  suite. Not covered here: real-browser `wss://`/SSE/graceful-shutdown
+  behavior over h2 — the acceptance criteria ask for Chrome/Firefox
+  verification before the issue is closed, which needs a live listener, not
+  a unit test.
 - **🧭 Wayfinder: redisplay the "Add user" form on failure in `examples/cms`'s
   admin Users screen (error-path 0/5 → 5/5, entered values preserved) [no-plugin]:**
   an error-path inventory of `POST /admin/users` — the
@@ -1597,6 +1631,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   escape now strips one bracket from each side (`[[tag]]` → `[tag]`), matching
   the module's own "same syntax WordPress does" claim, and still suppresses
   expansion of the inner shortcode (#2678).
+- **`autumn db scrub`:** the runtime-config tables are now classified as
+  payload carriers (#2366, item 1). `autumn_runtime_config_values.raw_value`
+  holds the live operator-set override for each key — which can be a secret —
+  and `autumn_runtime_config_changes` is the append-only audit log
+  (`old_value` / `new_value` / `actor`). Both carry the `autumn_` prefix, so
+  introspection excluded them from the classified universe and a successful
+  scrub left them verbatim without even warning. A scrub now warns when they
+  are present and empties them when the app opts in with `[framework] purge`.
+  (Items 2 and 3 — materialized-view refresh order through indirect
+  dependencies, and partition-key columns rewritten through the parent — are
+  still open.)
 - **aws-ecs:** the generated ECS "migrate" task definition now carries the
   full app secret set (`AUTUMN_DATABASE__PRIMARY_URL`,
   `AUTUMN_SECURITY__SIGNING_SECRET`, and `AUTUMN_CACHE__REDIS__URL` when
@@ -2317,6 +2362,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   suite (29 tests, including diamond-cascade and hook/soft-delete cases)
   passes unchanged. See
   `docs/reports/2026-09-08-ledger-dependent-destroy-leaf-batch/`.
+
+- **🗃️ Ledger: batch `examples/cms`'s `recount_terms` per-term loop
+  (statements 3N→3):** `content::recount_terms` — called from
+  `set_post_terms`'s editor save path, the scheduled-publish sweep, and the
+  delete-user cascade whenever more than one term needs its published-post
+  count rebuilt — looped its ids one at a time and called `recount_term`
+  per id, which itself issued three round trips (a single-row `FOR UPDATE`
+  lock, a single-term scalar `COUNT(*)`, a single-row `UPDATE`). N affected
+  terms cost 3N round trips through this function alone. Now it locks every
+  row up front in one batched, ascending-id-order `FOR UPDATE` (the same
+  guarantee `lock_terms` uses, needed here too since `recount_terms_for_post`
+  reaches this function without a prior `lock_terms` call), computes every
+  count in one call to the already-batched `term_post_counts` helper
+  (previously used only by read-path screens), and writes every count back
+  in one bulk `UPDATE ... FROM UNNEST(...)` instead of N single-row updates.
+  Profiled through the real editor "Update" route against a 5,000-term/
+  2,000-post fixture at three tiers of affected-term count: statements
+  79→61 (N=7), 210→132 (N=27), 467→275 (N=65) — this function's own
+  contribution drops from 3N to 3 at every tier. `cargo test -p cms` (99
+  tests) and the full Docker-gated integration suite (211 tests) pass
+  unchanged. See `docs/reports/2026-09-18-ledger-cms-recount-terms-batch/`.
 
 - **⚡ Bolt: `feed::escape` ASCII fast path (instructions -38.4%):** a new
   `autumn/benches/feed_render.rs` profiling harness — rendering a realistic

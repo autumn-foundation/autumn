@@ -42,7 +42,7 @@ pub fn returns_mail(method: &ImplItemFn) -> bool {
     // `Ident::to_string()`, which spells a raw identifier `r#type` (not the
     // bare `type`) — compare against the same escaped form, not
     // `current_target()` directly (Codex review, #2552).
-    let crate_root = crate::crate_path::current_target_path_segment();
+    let crate_root = autumn_macros_support::crate_path::current_target_path_segment();
     match segments.as_slice() {
         [mail] => mail == "Mail",
         [root, mail] => *root == crate_root && mail == "Mail",

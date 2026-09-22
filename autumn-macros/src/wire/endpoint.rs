@@ -279,9 +279,11 @@ fn write_descriptor(
             krate,
             method: method.to_owned(),
             path: path.to_owned(),
-            request_type: request_ty
-                .map_or_else(|| "NoBody".to_owned(), crate::schema::type_name_str),
-            response_type: crate::schema::type_name_str(response_ty),
+            request_type: request_ty.map_or_else(
+                || "NoBody".to_owned(),
+                autumn_macros_support::schema::type_name_str,
+            ),
+            response_type: autumn_macros_support::schema::type_name_str(response_ty),
         },
     );
 }

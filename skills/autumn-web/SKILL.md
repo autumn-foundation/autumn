@@ -33,6 +33,12 @@ defaults into a convention-over-configuration stack with proc-macro ergonomics.
 This file is the quick operating guide. Load the adjacent reference files only
 when their details matter:
 
+- `docs/guide/index.md` - the complete guide catalog: every page under
+  `docs/guide/`, grouped by task, each entry naming the question that page
+  answers. Start here when the topic you need is not covered by this file or
+  the references below, rather than guessing a filename — the index is gated
+  by `scripts/check-docs-guide-index.sh`, so it lists every guide page that
+  exists and nothing that does not.
 - `references/api-reference.md` - release-line API map, proc macros,
   feature flags, AppBuilder methods, config env names, and dependency versions.
 - `references/examples.md` - official 0.7.0 example patterns for minimal apps,
@@ -2506,6 +2512,17 @@ Published 0.5.0 behavior:
   (prelude re-export).
 - `actuator.prometheus` exposes the Prometheus scrape endpoint independently
   of sensitive actuator mode.
+- Verbosity and shape are `[log] level` / `[log] format` (or
+  `AUTUMN_LOG__LEVEL` / `AUTUMN_LOG__FORMAT`). `level` takes the full
+  `tracing` filter syntax, so `"info,my_app::orders=debug"` raises one target
+  without raising the floor; `format` is `Auto` (pretty unless the profile is
+  production, then JSON), `Pretty` or `Json`. The profile sets both outright
+  before those defaults apply: `dev` is `debug`/`Pretty`, `prod` is
+  `info`/`Json`, any other profile falls back to `info`/`Auto`. Both are read
+  once, at
+  startup — see "Runtime log levels" below for changing one on a running
+  process. Every `[log]` knob, the access log and the PII scrubber included,
+  is documented on one page: `docs/guide/logging-pii.md`.
 
 ### Runtime log levels (0.6.0)
 
@@ -2527,8 +2544,13 @@ The response now carries `"applied": true` and `"status":"ok"` only when the
 change actually reached a reload-capable subscriber; otherwise it reports
 `"status":"recorded"` / `"applied": false` rather than a false-positive `ok`.
 Overrides stay ephemeral — a restart resets to the configured `log.level`.
-Invalid levels still return `400`. `GET /actuator/loggers` keeps reporting
-`current_level` + overrides, now matching real emission.
+Invalid levels still return `400` — as does a target name carrying an
+`EnvFilter` metacharacter (`=`, `,`, `[`, `]`, `{`, `}`, whitespace), so a
+malformed directive never reaches the subscriber. `GET /actuator/loggers`
+keeps reporting `current_level` + overrides, now matching real emission. The
+reader-facing version of this, with the full request/response shapes, is
+"Change log levels at runtime, without a restart" in
+`docs/guide/logging-pii.md` — point a user there rather than restating it.
 
 ### Build & git provenance on `/actuator/info` (0.6.0)
 
@@ -3050,6 +3072,8 @@ autumn release init --target azure-container-apps   # Terraform scaffold: main.t
 autumn release init --target aws-app-runner      # Fast/minimal AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ECR, App Runner behind a VPC connector, RDS Postgres, Secrets Manager). No CI workflow (#1279); see docs/guide/deployment.md.
 autumn release init --target aws-ecs             # Production AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (VPC, ALB+ACM DNS-validated HTTPS, ECS Fargate w/ circuit-breaker rollback, Application Auto Scaling, RDS, opt-in Redis) + .github/workflows/aws-deploy.yml (#1279); see docs/guide/deployment.md.
 autumn release init --target gcp-cloud-run       # GCP path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (Artifact Registry, Cloud Run, Cloud SQL Postgres behind a VPC connector, Secret Manager, opt-in Memorystore Redis) + .github/workflows/gcp-deploy.yml (#1280); see docs/guide/deployment.md.
+autumn migrate new add_widget_archived_at   # collision-free migration dir: prefer this (or `generate migration`) over hand-creating one — see "Migration version collisions" below
+autumn migrate check-collisions             # CI gate: fails if this branch's migration version collides with the default branch, another pushed branch, or the framework's own migrations
 autumn sbom                      # CycloneDX 1.5 SBOM for this source tree, to stdout (deterministic: no timestamp, content-derived serialNumber) (unreleased, issue #1615)
 autumn sbom --output sbom.cdx.json --locked        # write it; --locked fails when Cargo.lock disagrees with the manifests
 autumn sbom --verify sbom.cdx.json --expect-version 0.8.0   # regenerate + compare component-by-component, and pin the root version; exit 1 with a named diff on drift
@@ -3257,7 +3281,39 @@ legacy migrations applied before the checksum feature existed; use
 `autumn migrate baseline --force <version>` only when a deliberate edit
 is intended and the fork risk is accepted.
 
-### `autumn test` — isolated test DB (0.6.0, issue #1056)
+### Migration version collisions (unreleased — trunk-dev)
+
+Diesel records applied migrations **by version** (the leading
+`YYYYMMDDHHMMSS` directory prefix). If two differently-named migrations
+share a version, a fresh database silently applies only one of them and
+records the version as done — the other is skipped forever, with no error.
+This is the failure mode a hand-typed round timestamp (`...T00:00:00`, the
+top of an hour) invites: two authors reaching for midnight collide, while
+two authors reaching for the actual current second essentially never do.
+
+**Prefer `autumn migrate new <name>` (or `autumn generate migration
+<name>`) over hand-creating a migration directory** — never invent a
+`YYYYMMDDHHMMSS` stamp yourself. `autumn migrate new` picks a version
+guaranteed free across the working tree, every local/remote git branch this
+checkout has fetched, and the framework's own migrations, and creates
+`migrations/<version>_<name>/{up,down}.sql` (empty, with WHY/LOCKING
+guidance comments — same DDL-writing rules as any other migration). Run
+`autumn migrate check-collisions` before pushing (or rely on the CI gate) if
+a collision might have appeared on another branch since.
+
+If a user reports "my migration didn't run" and their app has more than one
+migration source (an installed plugin, a second `AppBuilder::migrations(…)`
+call), a version collision alone is not the cause: the framework
+auto-resolves it (`compute_migration_disambiguation` inside
+`autumn_web::migrate`) by giving the losing migration a deterministic
+substitute version, so both still apply — logged at `INFO`
+("Migration version collision resolved automatically"), not an error. Check
+that log line, or `autumn migrate check-collisions`, if you suspect a
+collision; only a narrow ambiguous-history case on `SQLite` (adopting a
+pre-fork database whose applied history can't be safely rewritten) is
+rejected as a hard error.
+
+### `autumn test` — isolated test DB (unreleased — trunk-dev, issue #1056)
 
 `autumn test` resolves the test DB URL with the same precedence as
 `autumn migrate` (`AUTUMN_DATABASE__PRIMARY_URL` → `AUTUMN_DATABASE__URL` →
@@ -3915,9 +3971,16 @@ tests live in consolidated binaries (`autumn` → `integration_tests`,
 a `mod` line in `tests/integration/mod.rs`, not new `[[test]]` targets.
 
 CI also runs a feature-combination compile gate (35 `autumn-web` feature
-combos via `cargo hack`), a generator-conformance gate, and a plugin
+combos via `cargo hack`), a generator-conformance gate, a plugin
 freshness gate (`scripts/check-plugin-freshness.sh` — user-facing changelog
-entries must ship matching Claude-plugin updates).
+entries must ship matching Claude-plugin updates), and a changelog fragment
+gate (`scripts/check-changelog-fragments.sh`).
+
+Do not edit `CHANGELOG.md` in a PR. A release note goes in its own file,
+`changelog.d/<slug>.md`, holding the markdown the `## [Unreleased]` section
+holds: a `### <Kind>` heading and its bullets. Every PR used to write to the
+top of that section, so every PR conflicted with every other PR. See
+`changelog.d/README.md`.
 
 For docs or generated-app changes, also run the docs smoke procedure in
 `docs/guide/docs-smoke.md`. For public API changes, run doctests for the
@@ -3941,6 +4004,7 @@ touched crate so examples compile from an external-consumer perspective.
 - `CHANGELOG.md`
 - `RELEASE_NOTES.md`
 - `STABILITY.md`
+- `changelog.d/README.md` (where an unreleased note is written)
 - `docs/migrations/README.md` (per-release upgrade guides; `next.md` is the
   rolling draft for unreleased breaking changes)
 - `docs/release-checklist.md`

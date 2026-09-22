@@ -68,7 +68,8 @@ constela = ["maud"]
 # constructed, used and dropped only on those threads, never inside the async
 # runtime.
 db = [
-    "autumn-macros/db",
+    "dep:autumn-macros-model",
+    "dep:autumn-macros-repository",
     "reqwest?/blocking",
     "dep:deadpool",
     "dep:diesel",
@@ -292,12 +293,17 @@ autumn-edge = { version = "0.7.0", path = "../autumn-edge", optional = true }
 # new crate to the workspace graph. MSRV 1.86 (below this workspace's 1.88
 # floor); licensed MIT OR Apache-2.0.
 wasmi = { version = "0.40", optional = true }
-# `default-features = false` drops the `#[model]` / `#[repository]` codegen from
-# the macro crate; the `db` feature above forwards it back on. A no-database app
-# could never reach either macro anyway (both re-exports are `#[cfg(feature =
-# "db")]` in `src/lib.rs`), and skipping them cuts the macro crate's own compile
-# time by ~90% on the no-DB onboarding path (issue #2309).
+# `default-features = false` drops the database-layer macros from the core
+# macro crate; the `db` feature above pulls them back in through the
+# `autumn-macros-model` / `autumn-macros-repository` crates. A no-database app
+# could never reach those macros anyway (their re-exports are `#[cfg(feature =
+# "db")]` in `src/lib.rs`), and skipping them cuts macro compile time by ~90%
+# on the no-DB onboarding path (issue #2309).
 autumn-macros = { version = "0.7.0", path = "../autumn-macros", default-features = false }
+# Database-layer proc macros, split out of `autumn-macros` so a no-database
+# build never compiles their codegen. Optional: enabled by the `db` feature.
+autumn-macros-model = { version = "0.7.0", path = "../autumn-macros-model", optional = true }
+autumn-macros-repository = { version = "0.7.0", path = "../autumn-macros-repository", optional = true }
 axum.workspace = true
 # 1.9 for `Bytes::from_owner`, which is what lets a response buffer own the
 # sandbox concurrency permit and release it exactly when the last handle drops.
@@ -326,7 +332,7 @@ tokio-postgres = { version = "0.7", optional = true }
 # setup callback. `ring` (not the aws-lc default) keeps cross-compilation
 # to mobile targets working; `webpki-roots` provides a deterministic root
 # store on platforms without an accessible native one.
-tokio-postgres-rustls = { version = "0.13", optional = true }
+tokio-postgres-rustls = { version = "0.14", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
 rustls-pki-types = { version = "1", features = ["std"], optional = true }
 webpki-roots = { version = "1", optional = true }
@@ -482,9 +488,20 @@ nix = { version = "0.31.2", features = ["fs"] }
 # link, so only binaries that actually reference it are affected.
 allocation-counter = "0.8.1"
 diesel = { version = "2", features = ["chrono", "postgres"] }
+# `rust_decimal`'s diesel impls (`AsExpression<Numeric>`, `ToSql`/`FromSql` on
+# the Pg backend) back the `#[model]` Postgres-`Decimal` integration test
+# (issue #2597): generated apps get `db-diesel2-postgres` from the model
+# generator's `MODEL_DEPS`, but the `autumn-web` lib itself only enables
+# `serde`, so the in-repo test target needs the feature here. Test-only — the
+# sqlite `cargo build` / `clippy --lib` lanes never build dev-dependencies.
+rust_decimal = { workspace = true, features = ["db-diesel2-postgres"] }
 filetime = "0.2"
 futures.workspace = true
 http.workspace = true
+# Compile-probe behind `serve_stack_speaks_http2` (see tls.rs): pins the
+# `axum/http2` feature the ALPN `h2` advertisement depends on. Deliberately
+# without `http2` — see the workspace dependency comment.
+hyper-util.workspace = true
 serde_json = "1"
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
@@ -618,6 +635,14 @@ harness = false
 [[bench]]
 name = "throttle_check"
 harness = false
+
+# Drives `money::ledger::post` (issue #1837) against an in-memory SQLite
+# database — no Docker needed, unlike `repository_crud`/`money_ledger_postgres`.
+# See the file header for the exact commands.
+[[bench]]
+name = "ledger_post"
+harness = false
+required-features = ["sqlite"]
 
 # W6 PR3 seed-sweep runner (issue #1797): CI-facing driver for
 # `sim::sweep::sweep_proptest`. `required-features` (not a `#![cfg(...)]` file
@@ -858,7 +883,7 @@ path = "tests/sqlite_json_field_conversion.rs"
 # tenant A's row untouched (no cross-tenant leak) and (Bug 2, lock) a stale
 # `lock_version` upsert surfaces a 409 — matching Postgres. Runs on an in-memory
 # SQLite pool with no Docker. Bug 1 (advisory-lock cfg-gate) is pinned by the
-# autumn-macros expansion test. Only meaningful under `--features sqlite`; the
+# autumn-macros-repository expansion test. Only meaningful under `--features sqlite`; the
 # file is `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to
 # an empty (passing) binary. Run explicitly:
 # `cargo test -p autumn-web --features sqlite --test sqlite_upsert_isolation`.
@@ -1269,6 +1294,15 @@ path = "tests/cache_global_integration.rs"
 [[test]]
 name = "cached_global_backend"
 path = "tests/cached_global_backend.rs"
+
+# Isolated: reads/writes the process-global cache backend via
+# `cache_fragment_global`, which `TestApp::build` clears unconditionally and
+# which a concurrently running consolidated-binary test could otherwise
+# stomp on — same reason as `cache_global_integration`/`cached_global_backend`
+# above (Warden 2026-09-21, docs/security/2026-09-21-fragment-cache-tenant-key/).
+[[test]]
+name = "cache_fragment_tenant_scope"
+path = "tests/cache_fragment_tenant_scope.rs"
 
 # Isolated: installs a process-global cache backend and depends on it surviving
 # across two requests, which any concurrent `TestApp::build` would clear.
