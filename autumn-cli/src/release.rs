@@ -2908,6 +2908,54 @@ previous_secrets = []
     }
 
     #[test]
+    fn azure_bootstrap_keeps_external_ingress_disabled_until_first_deploy() {
+        // Between `terraform apply` and the first real-image cutover, an
+        // inbound request to the public FQDN must not be able to start the
+        // bootstrap placeholder revision with production secret refs and the
+        // Key Vault-capable managed identity attached. `min_replicas = 0`
+        // only permits scale-to-zero; it does not stop the HTTP scale rule
+        // waking the placeholder on traffic — so external ingress itself
+        // stays disabled until the cutover opens it (#2312).
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let ingress_block = content
+            .split("ingress {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  }").next())
+            .expect("main.tf must declare the app ingress block");
+        assert!(
+            ingress_block.contains("external_enabled = false"),
+            "external ingress must stay disabled until the first real deploy: {ingress_block}"
+        );
+        assert!(
+            !ingress_block.contains("external_enabled = true"),
+            "external_enabled = true would let inbound traffic wake the bootstrap \
+             placeholder with production secrets: {ingress_block}"
+        );
+
+        // The cutover opens ingress once the real image is serving — after
+        // the image update, never before.
+        let workflow = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        let update_at = workflow
+            .find("az containerapp update")
+            .expect("workflow must cut over via az containerapp update");
+        let enable_at = workflow
+            .find("az containerapp ingress enable")
+            .expect("workflow must enable external ingress at cutover: {workflow}");
+        assert!(
+            enable_at > update_at,
+            "ingress must open AFTER the real image is deployed, not before: {workflow}"
+        );
+        assert!(
+            workflow.contains("--type external"),
+            "the cutover must open external (public) ingress: {workflow}"
+        );
+    }
+
+    #[test]
     fn variables_tf_marks_secret_inputs_sensitive_with_no_default() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");

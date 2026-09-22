@@ -388,8 +388,18 @@ resource "azurerm_container_app" "this" {
     }
   }
 
+  # External ingress stays DISABLED until the first real image is deployed
+  # (#2312). Between `terraform apply` and the cutover, any inbound request
+  # to the public FQDN would otherwise start the bootstrap placeholder
+  # revision — with the production secret refs and the Key Vault-capable
+  # managed identity attached. `min_replicas = 0` only permits
+  # scale-to-zero; it does not stop the HTTP scale rule below from waking
+  # the placeholder on traffic. The cutover (`az containerapp update
+  # --image`, in azure-deploy.yml and the deployment guide) enables
+  # external ingress via `az containerapp ingress enable` once the real
+  # image is serving.
   ingress {
-    external_enabled = true
+    external_enabled = false
     target_port      = 3000
     transport        = "http"
 

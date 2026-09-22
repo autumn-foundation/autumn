@@ -2025,7 +2025,13 @@ image (`bootstrap_image` — Container Apps must pull *some* image to create a
 first revision, and a brand-new ACR has none yet). The generated
 `min_replicas = 0` default is intentional: keep it at zero for the initial
 apply so the placeholder app container is not started with production secret
-refs or the app's Key Vault-capable managed identity. Build and push your
+refs or the app's Key Vault-capable managed identity. That alone is not the
+whole guarantee, though — `min_replicas = 0` permits scale-to-zero but does
+not stop the HTTP scale rule waking the placeholder on traffic, so the
+generated `main.tf` also keeps external ingress **disabled** until the first
+real image is deployed: between `terraform apply` and the cutover below,
+inbound requests to the public FQDN cannot start the placeholder with
+production secrets attached (#2312). Build and push your
 real image, run migrations, then cut the app over:
 
 ```bash
@@ -2100,6 +2106,17 @@ az containerapp update \
   --name "$APP_NAME" \
   --resource-group "$RG" \
   --image "$ACR/$APP_NAME:$TAG"
+
+# Open external ingress now that the real image is serving. Until this
+# point the app has been unreachable from the public FQDN by design
+# (#2312); the placeholder revision could never be woken by inbound
+# traffic with production secrets attached.
+az containerapp ingress enable \
+  --name "$APP_NAME" \
+  --resource-group "$RG" \
+  --type external \
+  --target-port 3000 \
+  --transport http
 ```
 
 Terraform is told to ignore both resources' image afterward
