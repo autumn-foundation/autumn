@@ -2009,6 +2009,45 @@ without also filling in the intake form above.
   `trunk-dev`'s tip (CI-native, not local) — or, if a future pass again has
   working local toolchain/network access and wants a higher-confidence
   negative before that, extend the local sample well past 50 first.
+- **2026-09-22, later the same day — CI-native Tier 1 baseline obtained: 0/50
+  (0%), same day PR #2895 merged.** `manual-sqlite-jobs-rerun-check.yml` was
+  dispatched against `trunk-dev`'s new tip (`85ce096`, PR #2895's merge
+  commit) as soon as it became available (`workflow_dispatch` only accepts a
+  workflow already on the default branch). Run 35752555923 completed clean
+  end to end in under 4 minutes total (build 2m44s, then all 50 iterations in
+  22 seconds — this test needs no container startup, unlike the Postgres-backed
+  `job_tracking` harness, so it is far cheaper to run at high sample counts).
+  **`RESULT: 0/50 failed, 50/50 passed`** — the CI-native baseline the
+  2026-09-21 entry's own next step called for. Combined with this same day's
+  local 0/50 run above, that is **0/100 clean reruns total**, none of them
+  reproducing the "ON CONFLICT clause does not match" panic.
+
+  **Still not closing this entry.** Per this role's own hard gate, a Tier 1
+  baseline this clean would ordinarily support closing a *diagnosed and
+  fixed* flake — but nothing has been fixed here: the mechanism is still
+  unconfirmed (a second, unaudited SQLite `INSERT ... ON CONFLICT` path, or a
+  version-specific partial-index matching quirk, per the correction above),
+  and there is no product-vs-test verdict to render. 0/100 with no fix
+  applied does not mean the bug is gone; it means same-commit, single-job
+  reruns of this one test in isolation have not reproduced it. **A concrete,
+  not-yet-investigated reason those two things could differ**: both organic
+  hits occurred inside an ordinary `ci.yml` PR run, where the `SQLite runtime
+  (feature=sqlite)` job runs concurrently alongside roughly a dozen sibling
+  jobs (`Lint`, `MSRV`, `Supply chain`, `Test (${{ matrix.os }})`, etc.) all
+  competing for the same runner pool and shared infra (registry cache,
+  network), whereas this harness's own iterations run one test, one at a
+  time, on one dedicated runner with no sibling jobs at all — the opposite of
+  organic conditions. If the actual mechanism involves cross-job resource
+  contention (disk I/O, CPU scheduling, or something else specific to a
+  runner under load from *other* concurrent CI jobs), this harness's own
+  isolation would structurally prevent it from ever reproducing, no matter
+  how many iterations run. This is a hypothesis, not yet checked against the
+  source (unlike the readiness-race hypothesis already ruled out above) —
+  next step for a future pass: either audit `SqliteJobBackend`'s enqueue path
+  for anything contention-sensitive that an isolated single-test run
+  wouldn't exercise, or design a harness that reruns the *whole*
+  `SQLite runtime (feature=sqlite)` job N times (not just this one test in
+  isolation) to preserve the organic concurrency shape.
 
 `crate_path::tests::resolve_autumn_web_name_dashed_rename_is_sanitized` was
 opened here 2026-09-21 (n=1, mechanism unconfirmed) and **closed the same
