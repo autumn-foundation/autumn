@@ -10509,6 +10509,8 @@ dependencies = [
  "scoped-futures",
  "serde",
  "serde_json",
+ "testcontainers",
+ "testcontainers-modules",
  "tokio",
  "tracing",
  "validator",
