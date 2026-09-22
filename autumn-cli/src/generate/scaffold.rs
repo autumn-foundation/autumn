@@ -11310,7 +11310,15 @@ fn render_csv_import_section(
             ),
             "\n        if !discarded_seen {\n            \
              discarded_seen = CSV_DISCARDED_COLUMNS.iter().any(|column| {\n                \
-             row.get(*column).is_some_and(|value| !value.trim().is_empty())\n            \
+             row.iter().any(|(key, value)| {\n                    \
+             // The row map is keyed by the header's RAW names, while the\n                    \
+             // header check and the decoder below both trim — a file headed\n                    \
+             // `title, tag` (the space RFC 4180 keeps) decodes fine but\n                    \
+             // `row.get(\"tag\")` would miss the `\" tag\"` entry and the\n                    \
+             // alert would never fire. Probe the trimmed keys so all three\n                    \
+             // consumers agree about what a column is called.\n                    \
+             key.trim() == *column && !value.trim().is_empty()\n                \
+             })\n            \
              });\n        }"
                 .to_owned(),
             [
