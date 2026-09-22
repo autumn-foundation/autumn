@@ -1216,18 +1216,59 @@ pub async fn revisions_for(
 
 /// Rebuild the published-post counts of the given terms.
 ///
-/// The single fan-out: every path that recounts more than one term goes through
-/// here, so the `FOR UPDATE` each `recount_term` takes is always acquired in
-/// ascending id order. Four separate loops in id-of-arrival order is four
-/// chances for two transactions with overlapping term sets to hold the halves
-/// of each other's cycle and deadlock.
+/// The single fan-out: every path that recounts more than one term goes
+/// through here. A caller with N affected terms used to pay 3N round trips —
+/// `recount_term` called once per id, each call its own lock, its own count,
+/// its own update — when the actual identity space this call needs to
+/// resolve is bounded by N distinct term rows, not by looping N times. This
+/// locks every row up front in one batched, ascending-id-order `FOR UPDATE`
+/// (`.order(terms::id.asc())` ahead of `.for_update()`, the same guarantee
+/// `lock_terms` uses and for the same reason: every fan-out over terms locks
+/// ascending, so two transactions touching overlapping sets can never hold
+/// the halves of each other's cycle), computes every count in one grouped
+/// query, then writes every count back in one statement.
+///
+/// The lock has to be taken here, not left to a per-id `recount_term`,
+/// because `recount_terms_for_post` reaches this function directly, without
+/// `set_post_terms`'s prior `lock_terms` call.
 pub async fn recount_terms(conn: &mut AsyncPgConnection, term_ids: &[i64]) -> AutumnResult<()> {
     let mut ordered = term_ids.to_vec();
     ordered.sort_unstable();
     ordered.dedup();
-    for term_id in ordered {
-        recount_term(conn, term_id).await?;
+    if ordered.is_empty() {
+        return Ok(());
     }
+
+    // A term deleted underneath us has no row to lock and drops out here —
+    // `recount_term` used to reach the same conclusion per id, via `.optional()`.
+    let locked: Vec<i64> = terms::table
+        .filter(terms::id.eq_any(&ordered))
+        .select(terms::id)
+        .order(terms::id.asc())
+        .for_update()
+        .load(conn)
+        .await?;
+    if locked.is_empty() {
+        return Ok(());
+    }
+
+    let counts = term_post_counts(conn, &locked).await?;
+
+    use diesel::sql_types::{Array, BigInt};
+    let post_counts: Vec<i64> = locked
+        .iter()
+        .map(|id| counts.get(id).copied().unwrap_or(0))
+        .collect();
+    diesel::sql_query(
+        "UPDATE terms SET post_count = data.count \
+         FROM (SELECT * FROM UNNEST($1::bigint[], $2::bigint[]) AS t(id, count)) AS data \
+         WHERE terms.id = data.id",
+    )
+    .bind::<Array<BigInt>, _>(locked.clone())
+    .bind::<Array<BigInt>, _>(post_counts)
+    .execute(conn)
+    .await?;
+
     Ok(())
 }
 
