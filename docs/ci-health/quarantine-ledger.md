@@ -2063,13 +2063,29 @@ without also filling in the intake form above.
   from ever reproducing, exactly the same shape of gap the withdrawn
   sibling-job framing was reaching for, just at the correct layer (one test
   binary's own internal parallelism, not GitHub Actions' job scheduling).
-  Not yet checked against `sqlite_jobs_scheduler_e2e.rs`'s own source for a
-  shared-state hazard between its tests (the kind of audit the
-  `job_tracking_stores_integration` entry above did for its own file, ruling
-  out `GLOBAL_JOB_CLIENT` interference) — that audit, plus a harness variant
-  that runs the *whole* `sqlite_jobs_scheduler_e2e` binary at default
-  parallelism (not `--test-threads=1`, not filtered to one test) N times, is
-  the concrete next step for a future pass.
+  **Correction (post-review, via a second Codex review comment on PR #2904):
+  the shared-state audit this paragraph called for already exists, for this
+  exact file, a few paragraphs up (lines 1928-1942 above) — restating it as
+  an open next step would have had a future pass redo completed work.**
+  That audit found every sibling test in `sqlite_jobs_scheduler_e2e.rs` that
+  calls `job::start_runtime` holds `global_job_runtime_test_lock()` first,
+  including this entry's own target test, which (per the source) holds that
+  lock for its **entire** runtime — so under default parallelism, any other
+  lock-holding sibling scheduled concurrently would simply block on the
+  mutex until the target test releases it, never truly interleaving with
+  it. That rules the process-global `GLOBAL_JOB_CLIENT` back *out* as the
+  same-binary mechanism too, not just as the original cross-process one —
+  the same conclusion, reached the same way, applies to both framings. If
+  same-binary parallelism is still the right layer (unconfirmed, not ruled
+  out — only this one specific shared resource is), the culprit would have
+  to be a *different*, still-unidentified resource shared outside that
+  lock's coverage (a shared on-disk path two tests' own `TempDir`-backed
+  pools don't actually isolate from each other, a different process-global
+  the lock doesn't cover, or something else entirely). Auditing for that
+  specific gap — not re-auditing `GLOBAL_JOB_CLIENT`, which is closed — plus
+  a harness variant that runs the *whole* `sqlite_jobs_scheduler_e2e` binary
+  at default parallelism (not `--test-threads=1`, not filtered to one test)
+  N times, is the concrete next step for a future pass.
 
 `crate_path::tests::resolve_autumn_web_name_dashed_rename_is_sanitized` was
 opened here 2026-09-21 (n=1, mechanism unconfirmed) and **closed the same
