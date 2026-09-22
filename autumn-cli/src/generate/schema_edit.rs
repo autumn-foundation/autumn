@@ -8816,6 +8816,19 @@ fn main() {
     }
 
     #[test]
+    fn ensure_feature_package_alias_dep_autumn_web_alias_quoted_key() {
+        // Same fixture as `ensure_feature_package_alias_dep_autumn_web_alias`,
+        // but with the `package` key itself quoted -- a form Cargo accepts
+        // identically to the unquoted one.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web = { \"package\" = \"autumn-web\", version = \"0.6\" }\n";
+        let updated = ensure_autumn_web_feature(cargo, "mail");
+        assert!(
+            updated.contains("\"mail\""),
+            "autumn_web alias with quoted package key must have feature added: {updated}"
+        );
+    }
+
+    #[test]
     fn ensure_feature_commented_dep_line_is_skipped() {
         // A commented-out dep like `# aw = { package = "autumn-web" }` must not
         // be treated as the actual dependency.  The real dep below must be updated.
