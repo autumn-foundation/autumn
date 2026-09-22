@@ -1022,7 +1022,7 @@ _None as of 2026-09-05._
     `unknown lint: clippy::unused_async_trait_impl`, is the same pre-existing,
     unrelated warning already documented elsewhere in this ledger).
     `cargo test -p autumn-macros-support` (full package, 40 tests) passes.
-- **Closed**, 2026-09-22, this pass's own PR (🚦 Semaphore).
+- **Closed**, 2026-09-22, #2895 (🚦 Semaphore).
 
 ## Under active investigation, not yet quarantined
 
