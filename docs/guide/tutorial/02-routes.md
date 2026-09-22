@@ -43,7 +43,23 @@ Expected project state with the new route structure.
 
 ---
 
-*Content coming in Sprint 12.*
+> **Not written yet.** This chapter's narrative doesn't exist yet. For the
+> actual routes this chapter's goal describes (the root-to-`/todos` redirect,
+> the `GET /todos` handler), see
+> [`examples/todo-app/src/routes/todos.rs`](../../../examples/todo-app/src/routes/todos.rs)
+> — that's the reference implementation this tutorial builds toward, and it's
+> covered by CI's example-fleet gate. Its handlers carry no `#[public]`,
+> `#[secured]`, or `#[authorize]` classification, unlike every example in the
+> Getting Started guide — add one when you copy a handler into your own
+> scaffolded project, or the generated `.github/workflows/ci.yml`'s
+> `autumn routes audit` step will fail your first push. For the general
+> concept of how route macros work, and why that classification is required
+> (see its "Why `#[public]` on every example" callout), the Getting Started
+> guide's
+> ["Routing essentials"](../getting-started.md#routing-essentials) section
+> explains it, though its examples (`/users/{id}`, `/items`) are generic, not
+> this app's routes. Continue to
+> [Chapter 3 — Database Setup](03-database.md) once you've wired up your own.
 
 ---
 

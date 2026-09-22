@@ -98,6 +98,9 @@ is_breaking_release_type() {
 # Publishable crates.
 CRATES=(
   autumn-macros
+  autumn-macros-support
+  autumn-macros-model
+  autumn-macros-repository
   autumn-web
   autumn-cli
   autumn-admin-plugin
@@ -315,6 +318,11 @@ for crate in "${CRATES[@]}"; do
       die "autumn-web is now v${autumn_web_current_version} but the SemVer feature allowlist is pinned to ${SEMVER_ALLOWLIST_TARGET_VERSION} (computed as the 0.6.0-baseline ∩ 0.7.0 feature set). cargo-semver-checks now compares against a newer baseline, which may already carry features this list still omits (currently sim-testing/pdf/edge/plugin-sandbox) — recompute both allowlists as (new-baseline ∩ current) features before releasing. See the comment above this block."
     fi
 
+    # `collab` is deliberately ABSENT: this list is the 0.6.0-baseline ∩ 0.7.0
+    # intersection and is passed to BOTH builds, so naming a feature the
+    # published baseline does not have fails that invocation outright ("does
+    # not have feature") and turns the gate into a tool error instead of a
+    # check. It joins the list when a baseline carries it (#1806).
     autumn_web_semver_features="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,reporting,presence,webauthn,inbound-mail,inbound-mailgun,inbound-ses,telemetry-otlp,offline-sync,embed-assets,tls,acme"
     # The SQLite backend surface: the SAME list plus `sqlite`.
     #

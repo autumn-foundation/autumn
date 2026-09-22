@@ -821,6 +821,8 @@ apply-time error.
   `autumn db restore`, the other half of the drill.
 - [Attribute encryption](attribute-encryption.md) — `#[encrypted]`, one of the
   two automatic classification sources.
-- [Logging & PII](logging-pii.md) — the log-side scrubber, which is a different
+- [Confidential fields](confidential-fields.md) — `#[confidential]`, whose
+  column names the log filter also folds in.
+- [Logging: levels, format & PII](logging-pii.md) — the log-side scrubber, which is a different
   thing entirely.
 - [Seeding](seeding.md) — synthetic data when you do not need production shapes.

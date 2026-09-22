@@ -56,11 +56,24 @@ mod chaos_state_loom;
 mod circuit_breaker_integration;
 mod clock_integration;
 mod cluster_two_node;
+#[cfg(all(feature = "db", feature = "collab"))]
+mod collab_model;
+#[cfg(all(feature = "collab", feature = "offline-sync"))]
+mod collab_offline_merge;
+#[cfg(all(feature = "collab", feature = "presence"))]
+mod collab_session;
 #[cfg(feature = "db")]
 mod commentable;
 mod commit_hook_drain;
 mod compile_fail;
 mod compression_middleware;
+#[cfg(feature = "db")]
+mod confidential_model;
+#[cfg(feature = "db")]
+mod confidential_red_team;
+mod confidential_sealing;
+#[cfg(feature = "db")]
+mod confidential_threat_model;
 mod config_deprecation;
 mod config_runtime_drift;
 #[cfg(feature = "constela")]
@@ -78,6 +91,7 @@ mod directory_shard_router;
 mod distributed_lock;
 mod download;
 mod duplicate_route_detection;
+mod edge_conformance_ci_coverage;
 // The origin-side half of the edge capsule (#1790). `cache-moka` supplies the
 // concrete `Cache` the `CacheEdgeKv` adapter is proven against; the wasm half
 // of the parity claim lives in the example crate's conformance suite, which
@@ -157,6 +171,7 @@ mod inline_broadcast_prefetch;
 mod inspector_integration;
 mod isr_coordination;
 mod job_recorder_integration;
+mod job_tenant_scope;
 mod job_tracking_route;
 mod job_tracking_stores_integration;
 #[cfg(all(feature = "ws", feature = "maud", feature = "htmx", feature = "db"))]
@@ -193,6 +208,8 @@ mod mcp_secured_guard;
 mod mcp_streaming;
 #[cfg(feature = "mcp")]
 mod mcp_structured_query;
+#[cfg(feature = "mcp")]
+mod mcp_throttle_guard;
 mod middleware_introspection;
 mod middleware_pipeline;
 mod middleware_stack_depth;
@@ -207,6 +224,8 @@ mod model_derivation;
 mod model_field_attrs;
 #[cfg(feature = "db")]
 mod model_votable;
+#[cfg(feature = "db")]
+mod money_ledger_postgres;
 #[cfg(feature = "maud")]
 mod negotiate;
 #[cfg(all(feature = "db", feature = "test-support"))]
@@ -281,6 +300,10 @@ mod read_your_writes_routing;
 // fails when one of them stops matching (#1186). No feature gate: it only reads
 // job.rs and ci.yml as text.
 mod redis_job_admin_ci_coverage;
+// ci.yml names the `--lib` Postgres relative-delay Docker tests by full test
+// path; this fails if either is renamed (#2111 follow-up). No feature gate:
+// it only reads job.rs and ci.yml as text.
+mod pg_relative_delay_ci_coverage;
 // Postgres tier of the bitemporal, tamper-evident record ledger (issue #1699).
 // The Docker-free golden test lives in `tests/sqlite_ledger.rs`; this proves the
 // Postgres fork (jsonb snapshot cast, Timestamptz binds, COALESCE unique index).
@@ -357,6 +380,8 @@ mod signed_webhooks;
 mod sim_advance_to;
 mod sim_chaos_clock_skew_monotonic;
 mod sim_clock_drain;
+#[cfg(feature = "collab")]
+mod sim_collab_convergence;
 mod sim_delayed_enqueue;
 mod sim_deterministic_ids;
 mod sim_fault_plan;

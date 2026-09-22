@@ -3677,3 +3677,66 @@ pub const RENDER_CLIENT: &str = r#"(module
     (call $emit (i32.const 128)))
 )
 "#;
+
+/// A render hook that makes a `kv-set` call before answering with its
+/// fragment.
+///
+/// Every other render guest in this corpus only ever exchanges one frame:
+/// the render request in, the fragment out. That leaves the capability
+/// channel — the `call`/reply loop `on_guest_line` services identically for
+/// both exchanges (`host.rs`) — completely unexercised from the render side.
+/// `SandboxedPlugin::render_slot` reads `CURRENT_TENANT` into
+/// `CapabilityServices` independently of `serve`'s own read
+/// (`plugin.rs:291-298` vs. `plugin.rs:579-587`), so a KV write made *during*
+/// a render hook is the only way to prove that capture, not just the
+/// request-path one, folds the tenant in before the key is derived.
+pub const RENDER_KV_WRITE: &str = r#"(module
+  (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 2 4)
+
+  (data (i32.const 128) "{\"op\":\"call\",\"call\":\"kv-set\",\"id\":1,\"key\":\"cart\",\"value\":\"one item\"}\0a\00")
+  (data (i32.const 384) "{\"op\":\"fragment\",\"nodes\":[{\"node\":\"element\",\"tag\":\"p\",\"children\":[{\"node\":\"text\",\"text\":\"ok\"}]}]}\0a\00")
+
+  (func $strlen (param $p i32) (result i32)
+    (local $n i32)
+    (block $done
+      (loop $l
+        (br_if $done (i32.eqz (i32.load8_u (i32.add (local.get $p) (local.get $n)))))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br $l)))
+    (local.get $n))
+
+  (func $emit (param $p i32)
+    (i32.store (i32.const 0) (local.get $p))
+    (i32.store (i32.const 4) (call $strlen (local.get $p)))
+    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 16))))
+
+  (func $read_line (result i32)
+    (local $n i32)
+    (block $done
+      (loop $l
+        (i32.store (i32.const 0) (i32.add (i32.const 65536) (local.get $n)))
+        (i32.store (i32.const 4) (i32.const 1))
+        (i32.store (i32.const 16) (i32.const 0))
+        (br_if $done (i32.ne (call $fd_read (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 16)) (i32.const 0)))
+        (br_if $done (i32.eqz (i32.load (i32.const 16))))
+        (br_if $done (i32.eq (i32.load8_u (i32.add (i32.const 65536) (local.get $n))) (i32.const 10)))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br_if $done (i32.ge_u (local.get $n) (i32.const 40000)))
+        (br $l)))
+    (local.get $n))
+
+  (func (export "_start")
+    ;; The render request frame. Its content does not matter: this guest
+    ;; makes the same call and answers the same fragment for every slot it
+    ;; is granted.
+    (drop (call $read_line))
+    (call $emit (i32.const 128))
+    ;; The host's reply to the `kv-set` call. Its content does not matter
+    ;; either — only that a reply comes back before the guest answers, the
+    ;; same protocol `CAPABILITY_CLIENT` follows on the request side.
+    (drop (call $read_line))
+    (call $emit (i32.const 384)))
+)
+"#;

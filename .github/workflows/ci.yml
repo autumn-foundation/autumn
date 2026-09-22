@@ -106,11 +106,18 @@ jobs:
         # whoever shapes the model's prompt can trigger on demand. Its nine modules
         # carry the panic gate and are configured out without this feature.
         #
+        # `collab` (#1806) is here because `collab/resolver.rs` is gated on
+        # `collab` AND `offline-sync`. The workspace lane above unifies
+        # `collab` in from examples/collab-notes but never `offline-sync`, and
+        # this lane had `offline-sync` without `collab` -- so the resolver, the
+        # piece that decides whether an offline edit merges or is discarded,
+        # was linted by no lane at all.
+        #
         # KEEP IN SYNC with the identical list in scripts/pre-push-check.sh --
         # check-panic-gate.sh verifies every gated module's feature is covered by an
         # enforcing CI clippy lane, so a feature dropped from here silently disarms
         # that module's deny block.
-        run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme" --all-targets -- -D warnings
+        run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,collab,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme" --all-targets -- -D warnings
       - name: Clippy (autumn-web, plugin-sandbox — panic gate)
         # `plugin-sandbox` (#1609) is not a default feature, so neither Clippy run
         # above compiles `plugin_sandbox`'s request-path modules and their
@@ -189,6 +196,27 @@ jobs:
         # queueing behind ~20 minutes of workspace clippy in `lint` — and a
         # clippy failure can't stop it from running.
         run: ./scripts/check-migration-guides.sh
+      - name: Changelog fragment gate
+        # A release note used to go straight into CHANGELOG.md, at the top of
+        # the `## [Unreleased]` section — the same few lines every other open
+        # PR wrote to, so every PR conflicted with every other PR over text
+        # that was never the point of either. A note is now its own file under
+        # `changelog.d/`, and this step keeps it that way: it fails a PR that
+        # edits CHANGELOG.md, and fails a fragment the release tooling and the
+        # migration-guide gate above could not read.
+        #
+        # A release commit is exempt through the `release` label or a
+        # [changelog] token in the PR body. CI does not re-run on `labeled`,
+        # so the token is the reliable one: put it in the release PR body when
+        # you open it.
+        #
+        # Shares this docs-only job for the same reason as the gates around
+        # it: no toolchain, no cache, reports in seconds.
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          CHANGELOG_RELEASE_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'release') }}
+        run: ./scripts/check-changelog-fragments.sh --self-test && ./scripts/check-changelog-fragments.sh
       - name: Migration version gate
         # Framework, plugin and app migrations share one version space: diesel
         # keys `__diesel_schema_migrations` on the 14-digit version and
@@ -334,6 +362,35 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-orphans.sh --self-test && ./scripts/check-docs-orphans.sh
+      - name: Guide index completeness gate
+        # The reachability gate above asks "does any inbound link exist". This
+        # asks the question a reader actually has: "is this page somewhere I
+        # would look". They are different, and the gap between them is where
+        # this corpus was losing people — reachability passes when the only
+        # inbound link is a mid-page crosslink from another guide page, or a
+        # mention inside an agent SKILL.md, a surface written for a language
+        # model rather than for a person with a question.
+        #
+        # The step above says `docs/guide/` has no index of its own and that
+        # discovery therefore rests on README.md's hand-maintained list, which
+        # "someone has to remember to update. Nothing noticed when they
+        # forgot." Nothing noticed 92 times: the baseline run of this gate
+        # found 92 of the 147 guide pages in NO reader-facing index, among them
+        # middleware, testing, migrations, repositories, jobs, authorization,
+        # pagination, websockets, rate-limiting, i18n, events and oauth — the
+        # pages a reader needs in their first week. A cold retrieval test over
+        # README.md's list found the answering page absent for 11 of 15
+        # ordinary question classes, while every drift gate was green over
+        # those same pages. The answers were right and unreachable by search,
+        # which from the reader's seat is indistinguishable from absent.
+        #
+        # docs/guide/index.md is the fix, and this gate is what keeps it true:
+        # a page added without an index line fails in the commit that adds it,
+        # which is the only moment anyone has the context to write that line.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-guide-index.sh --self-test && ./scripts/check-docs-guide-index.sh
       - name: TOML config-key drift gate
         # The env-var gate above covers the config a reader SETS. This covers
         # the config they WRITE — a key in `autumn.toml` itself — which is the
@@ -397,6 +454,24 @@ jobs:
         # `pub(crate)` modules is E0603 in the reader's crate however public the
         # item inside it is. Paths that leave the workspace are reported as
         # OPAQUE and counted rather than guessed at.
+        #
+        # Covers EVERY published crate, not just `autumn_web`. Adopting a plugin
+        # is a `use autumn_billing::…`/`use autumn_storage_s3::…` line in the
+        # reader's own file, and the corpus writes 67 such sibling-crate paths;
+        # until the gate scanned for them they were not passing checks, they
+        # were no checks at all. Resolution seeds with the crate the path NAMES,
+        # so a sibling path is never resolved against `autumn_web` — that would
+        # fail real items and pass names the reader cannot reach.
+        #
+        # It also rejects a path into a crate with NO library target, which no
+        # rename can fix: `autumn-cli` is `src/main.rs` alone, so `pub` inside
+        # it is visible only within the binary. That is the shape where every
+        # other signal lies — accessibility.md offered
+        # `use autumn_cli::check::{A11yCheckOptions, run_a11y_check, …}` naming
+        # a real module and real `pub` items, in a crate `cargo add` installs
+        # happily, with no library to import them from. The crate list is
+        # derived from the workspace, so a new published library crate that the
+        # gate does not model fails it rather than going unaudited.
         #
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
@@ -485,6 +560,81 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-macro-args.sh --self-test && ./scripts/check-docs-macro-args.sh
+      - name: Release-line pin gate
+        # The eighth thing a reader copies off a page, and the one every other
+        # gate is implicitly relative to: the dependency pin that decides WHICH
+        # autumn-web the rest of the page describes. A correct `autumn_web::…`
+        # path against the wrong release line is still a build error.
+        #
+        # It was gated in one place over eight pages —
+        # `repo_hygiene::first_run_docs_match_current_release_line` holds a
+        # hand-listed `FIRST_RUN_DOCS` array to the published pin — while the
+        # reader-facing corpus is 212 pages carrying 74 pins. That test is also
+        # existential rather than per-occurrence: it asks whether a page
+        # `contains` the right pin anywhere, so a page carrying both a correct
+        # and a stale pin passes. The CHANGELOG records the class being swept by
+        # hand twice already ("aligned the `autumn-cli` install pin to the
+        # workspace `0.6.0` across …", and a guide found "announcing the '0.4
+        # release line' while pinning 0.6 commands").
+        #
+        # The baseline run found one: `skills/autumn-patterns/SKILL.md` pinned
+        # `autumn-web = { version = "0.5", features = ["test-support"] }` in the
+        # `[dev-dependencies]` block of its testing section — the line a reader
+        # adds the first time they write a test, two release lines behind the
+        # `0.7` the same corpus pins in 47 other places. It entered the tree
+        # already stale, which is why a release-time sweep would not have caught
+        # it and a gate does.
+        #
+        # That pin does not fail as a version complaint. `autumn-web` pulls
+        # `libsqlite3-sys`, which carries `links = "sqlite3"`, and Cargo permits
+        # one package per `links` value in a graph — so two lines of autumn-web
+        # resolve to a NATIVE LIBRARY conflict naming neither autumn-web nor the
+        # page. Verified against crates.io in both directions: the 0.5 pin exits
+        # 101 at resolve time, the 0.7 pin resolves clean.
+        #
+        # Truth set is README.md's quickstart pin, the same single source
+        # `check-quickstart.sh` installs from, so a release bump moves this
+        # gate's expectation by editing one line and cannot disagree with the
+        # first-run test about what "current" means. Migration guides are held
+        # to their OWN version instead, since a before-block is the page's whole
+        # purpose.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-versions.sh --self-test && ./scripts/check-docs-versions.sh
+      - name: Feature-gate documentation gate
+        # Every gate above reads the corpus against a crate built with EVERY
+        # feature on, and `check-docs-symbols.sh` says so deliberately: gating
+        # symbol resolution on the default feature set "would report an item a
+        # reader can absolutely use as missing". That reasoning is right, and it
+        # leaves a hole the shape of its own premise. Proving
+        # `autumn_web::pdf::Pdf` EXISTS is not the reader's question — theirs is
+        # whether it exists in THEIR build, and autumn-web's default set is
+        # eight features out of fifty.
+        #
+        # So a page could open on `use autumn_web::pdf::Pdf;` with every path
+        # resolving, every macro argument valid and every link live, and the
+        # reader who pastes it into the project the quickstart just scaffolded
+        # gets `error[E0433]: could not find 'pdf' in 'autumn_web'` — a message
+        # about THEIR file, whose fix is a line the page never showed them.
+        #
+        # The baseline found nine such page/feature pairs across eight pages, of
+        # 78 gated uses. Three sat under a literal "**You write:**" heading, and
+        # `docs/guide/pdf-downloads.md` pointed AT the missing line: "requires
+        # the `maud` feature; enabled together with `pdf` in the quick start
+        # above", where the quick start above carried no Cargo.toml at all.
+        # `cloud-native.md`'s was the WebSocket drain contract — read by someone
+        # wiring a rolling deploy, the worst moment to find a feature missing.
+        #
+        # Truth set is parsed from `autumn/src/lib.rs`, `autumn/src/prelude.rs`
+        # and `autumn/Cargo.toml`'s transitively-closed default set, so moving
+        # an item behind a new feature moves the gate in the same commit.
+        # Registered in `check-docs-scope.sh`'s SIBLINGS, so its corpus cannot
+        # drift from the gates it sits beside.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-features.sh --self-test && ./scripts/check-docs-features.sh
       - name: Corpus scope agreement gate
         # The gates above each read "the reader-facing corpus", and each spells
         # that set itself. Three of them carry a comment promising the spellings
@@ -500,7 +650,7 @@ jobs:
         # and `AUTUMN_DATABASE__URL` were ungated while the same file already
         # carried `route-surface-allow` waivers for the gate that did read it.
         #
-        # This step compares the four declarations rather than the corpus, so it
+        # This step compares the gates' declarations rather than the corpus, so it
         # fails when a scope is edited rather than when the pages that scope
         # stopped covering finally rot. A difference between them is allowed but
         # must be written down, which is the rule that catches the case a
@@ -535,6 +685,59 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-aliases.sh --self-test && ./scripts/check-docs-aliases.sh
+      - name: Docs retrieval gate
+        # Every gate above checks a page a reader HAS REACHED, and
+        # `check-docs-orphans.sh` checks that a path of links to it exists at
+        # all. Neither asks what a reader mid-task actually arrives with: not
+        # "which link do I click" but "what do I type". A page whose title and
+        # headings are spelled in project vocabulary instead of the reader's is
+        # invisible to that search while staying perfectly reachable,
+        # accurate and linked — every other gate green over it.
+        #
+        # The baseline found the log-configuration question class failing
+        # exactly that way. `docs/guide/logging-pii.md` carried `[log] level`,
+        # `log.format` and the access-log switches under the title
+        # "Logging & PII" — the name the README listed it by — so "log level",
+        # "debug logging" and "json logs" returned nothing, while `[log]`
+        # itself appeared in 9 fences across 7 pages. The runtime half,
+        # `PUT /actuator/loggers/{name}`, was on no reader-facing page at all.
+        #
+        # The fixture pins the ANSWERING page, not merely "some hit", so a
+        # retitle that re-aims a page at a different question fails here
+        # rather than passing quietly.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-retrieval.sh --self-test && ./scripts/check-docs-retrieval.sh
+      - name: CLI coverage gate
+        # The twelve docs gates above all run docs -> code: "is what we wrote
+        # still true?", which is DRIFT. This one runs code -> docs: "is what we
+        # shipped written down anywhere?", which is COVERAGE. Nothing asked
+        # that before, and the gap is invisible by construction — a gate that
+        # only reads the docs can never notice a command the docs never
+        # mention, so a command can ship, work, carry good `--help` text, be
+        # documented nowhere, and leave the whole tree green.
+        #
+        # That is how all four `autumn token` subcommands — `issue` since
+        # 0.5.x, `list` / `rotate` since 0.6.0 — reached 0.7 with "revoke api
+        # token" returning zero hits across all 160 guide pages. #2821 fixed
+        # the prose and deferred the gate, on the grounds that a correct one
+        # has to reuse `check-docs-cli.sh`'s `resolve()` rather than
+        # re-implement it. It does: surface, corpus, resolved invocations and
+        # the hidden-command set all come from that gate's `--list`,
+        # `--corpus`, `--resolved` and `--list-hidden` modes, so the two cannot
+        # disagree about what a line names. A private matcher gets the shallow
+        # cases right and the deep ones wrong — `autumn openapi export`
+        # satisfying the top-level `export` (a different command, an offline
+        # diagnostic snapshot) was caught in review on the first attempt.
+        #
+        # Not registered in `check-docs-scope.sh`'s SIBLINGS: it spells no
+        # corpus of its own, it asks `check-docs-cli.sh` for that gate's, so
+        # there is no second spelling for the scope gate to reconcile.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-cli-coverage.sh --self-test && ./scripts/check-docs-cli-coverage.sh
       - name: Plugin surface gate
         # The declared plugin API surface (issue #1601) has a compiled half —
         # the `plugin-contract` job below builds `autumn-plugin-reference`
@@ -586,6 +789,39 @@ jobs:
         # autumn-admin-plugin. The reference plugin proves the DECLARED surface;
         # the admin plugin proves a real, non-trivial consumer of it.
         run: cargo check -p autumn-admin-plugin --all-targets
+
+  migration-collisions:
+    name: Diesel migration version collisions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # `autumn migrate check-collisions` compares this branch's migration
+          # versions against every other pushed branch, which needs the
+          # remote-tracking refs a shallow (default) checkout doesn't fetch.
+          # Without this, the gate still runs — it degrades to a working-tree
+          # -only check with a loud warning rather than failing closed — but
+          # would silently lose the cross-branch half of the protection on
+          # every PR in this repo's own CI.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Migration version collision gate
+        # Diesel records applied migrations BY VERSION (the leading
+        # `YYYYMMDDHHMMSS` directory prefix). When two directories share one
+        # version, a fresh database runs exactly one of them and records the
+        # version as done -- the other is skipped forever, with no error
+        # anywhere. This is the enforcing half of `autumn migrate new`, which
+        # hands out a collision-free version at generation time; this gate
+        # catches a collision that generator could not see (a branch pushed
+        # after, a teammate's concurrent PR) before it reaches the default
+        # branch, on the push that introduced it rather than after both land.
+        #
+        # Framework-owned migrations live in `autumn/migrations`, not a
+        # repository-root `migrations/`, so this runs from within `autumn/` —
+        # exactly like a downstream app would run it from its own project
+        # root once `autumn migrate check-collisions` ships in a release.
+        run: (cd autumn && cargo run -p autumn-cli --bin autumn -- migrate check-collisions)
 
   supply-chain:
     name: Supply chain (cargo-deny)
@@ -1245,6 +1481,15 @@ jobs:
         # budget, and these are typical single-Postgres-container tests
         # (seconds to low minutes each), so +30 min is a conservative margin.
         timeout-minutes: 75
+        env:
+          # `feature_flags_pg_integration` below builds with `managed-pg-bundled`,
+          # which compiles `postgresql_embedded`; its build script downloads
+          # Postgres binaries via the GitHub API and, unauthenticated, hits the
+          # 60 req/hr rate limit and fails the build with a 403 (2026-09-16, run
+          # 35126796648). Authenticate with the job's token to get the higher
+          # rate limit, as the `coverage` job and the Windows Tier 1 journey job
+          # already do.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
           cargo test -p autumn-web --test repository_shard_replica_routing -- --ignored
@@ -1255,7 +1500,7 @@ jobs:
           # (db.rs/managed_pg.rs/state.rs/job.rs/repository.rs/sharding.rs). This
           # list is every autumn-web feature EXCEPT `sqlite` (i.e. the Postgres
           # backend, which this pg-integration test requires). See #1614.
-          cargo test -p autumn-web --features "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme" --test feature_flags_pg_integration -- --ignored
+          cargo test -p autumn-web --features "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,collab,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme" --test feature_flags_pg_integration -- --ignored
           cargo test -p autumn-web --test scoped_tokens_db -- --ignored
           # The Redis job-admin dashboard suite lives in autumn-web's `--lib`
           # test module (it drives crate-private types: RedisJobAdminBackend,
@@ -1289,7 +1534,37 @@ jobs:
           )
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/redis-job-admin.log" \
             || { echo "::error::no redis job-admin dashboard tests ran — the ci.yml filters no longer match"; exit 1; }
+          # The Postgres relative-delay clock-skew regression (#2111 follow-up)
+          # also lives in the `--lib` module (it drives crate-private types:
+          # PgDueAt, pg_enqueue_job_at, pg_enqueue_on_conn_at), so it needs its
+          # own named filter for the same reason the redis job-admin suite
+          # above does. Named by full test path, not a shared `pg_` prefix:
+          # job.rs carries ~30 other ignored `pg_*` tests this filter must not
+          # revive. `pg_relative_delay_ci_coverage` (in the consolidated
+          # binary) is the other half of this guard. The admin-cancel
+          # classification test joins the same filter list: it is the same
+          # app-vs-database clock-skew concern applied to
+          # `pg_cancel_enqueued`'s ready/scheduled routing.
+          (
+            set -o pipefail
+            cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
+              --ignored --test-threads=1 \
+              job::tests::pg::pg_relative_delay_computes_run_at_on_the_database_clock \
+              job::tests::pg::pg_on_conn_relative_delay_ignores_how_long_the_transaction_was_already_open \
+              job::tests::pg::pg_cancel_classification_uses_the_database_clock_not_the_app_clock \
+              | tee "${RUNNER_TEMP}/pg-relative-delay.log"
+          )
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/pg-relative-delay.log" \
+            || { echo "::error::no pg relative-delay tests ran — the ci.yml filters no longer match"; exit 1; }
           cargo test -p autumn-admin-plugin --test token_admin_db -- --ignored
+          # Issue #2108: the same AdminModel cover as token_admin_db, for the
+          # two models that read a `timestamptz` column. Both assert the audit
+          # timestamp stays UTC after the Timestamptz -> Timestamp change.
+          cargo test -p autumn-admin-plugin --test experiment_admin_db -- --ignored
+          cargo test -p autumn-admin-plugin --test feature_flag_admin_db -- --ignored
+          # The Postgres half of the cross-backend proof. The SQLite half runs
+          # in the `sqlite-runtime` job, from the same test body.
+          cargo test -p autumn-admin-plugin --test custom_admin_model -- --ignored
           cargo test -p autumn-admin-plugin --test token_admin_bulk_delete_batch_profile -- --ignored
           cargo test -p autumn-admin-plugin --test feature_flag_admin_bulk_delete_batch_profile -- --ignored
           cargo test -p autumn-admin-plugin --test experiment_admin_bulk_delete_batch_profile -- --ignored
@@ -1313,6 +1588,8 @@ jobs:
           cargo test -p autumn-billing --test mirror_db -- --ignored
           # autumn-billing: close_dunning_for open-row-scan profile (Ledger).
           cargo test -p autumn-billing --test dunning_close_scan_profile -- --ignored
+          # autumn-billing: rearm_pending startup job-insert-loop findings profile (Ledger).
+          cargo test -p autumn-billing --test dunning_rearm_pending_profile -- --ignored
           # examples/react-graphql: the Postgres tier of its GraphQL suite
           # (rows, hooks, normalisation, validation, REST/GraphQL parity).
           # Testcontainer-managed; serial because the tests share one
@@ -1439,8 +1716,21 @@ jobs:
           # testcontainer) compiles into this binary and is swept. `i18n` is a
           # pure request-path/codegen feature — it pulls in no extra runner
           # service and cannot flip a backend.
-          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --test integration_tests offline_sync
-          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --test integration_tests -- \
+          #
+          # `collab` joined in #1806 for both halves of the same reason. The
+          # `#[collaborative]` round-trip suite (`collab_model`, Postgres
+          # testcontainer) is gated `db + collab` and would not compile into
+          # this binary otherwise — the exact hole #1384 closed for
+          # `translatable_model`. And `collab_offline_merge` is gated
+          # `collab + offline-sync`: `offline-sync` is enabled by no workspace
+          # member, so `cargo test --workspace` compiles it out, and this is
+          # the only job that builds that pair. It is a pure
+          # merge/codegen feature — no extra runner service, no backend flip.
+          # Its non-Docker tests are named below so they run here rather than
+          # nowhere.
+          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n,collab" --test integration_tests offline_sync
+          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n,collab" --test integration_tests collab_offline_merge
+          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n,collab" --test integration_tests -- \
             --ignored \
             --test-threads=1 \
             --skip per_request_overhead_is_under_50_microseconds_p99 \
@@ -1722,6 +2012,11 @@ jobs:
           # uncovered.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_jobs_scheduler_e2e
+          # Issue #2108: the admin plugin's `backend_select!` sqlite arms and
+          # the cross-backend model suite. Without this lane Codecov reads them
+          # as a new uncovered surface. No Docker, ~0.01s of runtime.
+          cargo llvm-cov --no-report -p autumn-admin-plugin --features autumn-web/sqlite \
+            --test custom_admin_model -- --ignored
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Generate coverage (Docker/testcontainer --ignored legs)
         if: matrix.lane == 'db-ignored'
@@ -1739,6 +2034,12 @@ jobs:
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_db -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \
+            --test experiment_admin_db -- --ignored
+          cargo llvm-cov --no-report -p autumn-admin-plugin \
+            --test feature_flag_admin_db -- --ignored
+          cargo llvm-cov --no-report -p autumn-admin-plugin \
+            --test custom_admin_model -- --ignored
+          cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_bulk_delete_batch_profile -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test feature_flag_admin_bulk_delete_batch_profile -- --ignored
@@ -1749,6 +2050,8 @@ jobs:
           cargo llvm-cov --no-report -p autumn-billing --test mirror_db -- --ignored
           cargo llvm-cov --no-report -p autumn-billing \
             --test dunning_close_scan_profile -- --ignored
+          cargo llvm-cov --no-report -p autumn-billing \
+            --test dunning_rearm_pending_profile -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test flags -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test config -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test experiments -- --ignored
@@ -1854,6 +2157,37 @@ jobs:
         # newly-added module rot the same way the pool tests did — silently,
         # because nothing runs it.
         run: cargo test -p autumn-web --features sqlite --lib
+      - name: Build autumn-admin-plugin under the sqlite backend
+        # Issue #2108. The plugin has no `sqlite` feature of its own — a
+        # manifest edge would flip the backend for the whole workspace, and
+        # `scripts/check-sqlite-unification.sh` rejects one — so the flip is an
+        # EXPLICIT `--features autumn-web/sqlite` here, and nowhere else.
+        #
+        # `--all-targets`, not `--lib`: every test binary of this crate also
+        # compiles under the flip, so the gate covers the dev surface too. Keep
+        # it that way. A test target that hardcodes `AsyncPgConnection` again
+        # fails here.
+        run: cargo clippy -p autumn-admin-plugin --features autumn-web/sqlite --all-targets -- -D warnings
+      - name: Run the admin-plugin model suite under sqlite
+        # The SAME test body the `Test (Docker)` job runs on Postgres: an
+        # application model driven through the whole `AdminModel` surface.
+        # Green here means a SQLite app can register its own admin models.
+        # No Docker: the fixture is an in-memory SQLite database.
+        #
+        # `scripts/pre-push-check.sh` skips this lane, so this step and the one
+        # above are the only gate on the plugin's SQLite build.
+        #
+        # The pass count is checked, because `-- --ignored` exits 0 when NO
+        # test matches. Drop the `#[ignore]` and this step would report green
+        # with nothing run — and it is the only place the SQLite arms execute.
+        run: |
+          set -o pipefail
+          cargo test -p autumn-admin-plugin --features autumn-web/sqlite \
+            --test custom_admin_model -- --ignored \
+            | tee "${RUNNER_TEMP}/admin-plugin-sqlite.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' \
+            "${RUNNER_TEMP}/admin-plugin-sqlite.log" \
+            || { echo "::error::no admin-plugin sqlite test ran — the #[ignore] or the target name changed"; exit 1; }
       - name: Run the sqlite integration suite
         # Named sqlite `[[test]]` targets only. `test-support` is required by the
         # TestApp/Db-extractor-based tests (sqlite_db_extractor, sqlite_read_only_tx,
@@ -1875,18 +2209,22 @@ jobs:
             --test sqlite_immediate_transaction \
             --test sqlite_statement_timeout_fail_closed \
             --test sqlite_crud_basic \
+            --test sqlite_unique_violation_field \
             --test sqlite_field_conversions \
             --test sqlite_uuid_decimal_conversions \
             --test sqlite_json_field_conversion \
             --test sqlite_upsert_isolation \
             --test sqlite_votable \
             --test sqlite_derivation \
+            --test sqlite_money_ledger \
             --test sqlite_dependent_destroy \
             --test sqlite_tracked_sessions \
             --test sqlite_commit_hook_worker \
+            --test sqlite_framework_migrations \
             --test sim_chaos \
             --test sim_fault_plan_db \
             --test sqlite_jobs_scheduler_e2e \
+            --test confidential_repository_bidx \
             --test sim_sqlite_substrate \
             --test sim_sqlite_integration \
             --test sim_chaos_crash
@@ -1988,6 +2326,13 @@ jobs:
       - name: Build the edge capsule
         # Ahead of the suite (which builds it too) so a wasm-only compile break
         # reports as a build failure rather than as a conformance failure.
+        # CARGO_TARGET_DIR matches examples/edge-greeting/tests/conformance.rs's
+        # own build_capsule(), which builds the same target into
+        # `<workspace target dir>/edge-conformance` — so this build and the
+        # suite's build land in one target-dir subtree. Cargo then finds its
+        # own build already fresh and does not compile the capsule twice.
+        env:
+          CARGO_TARGET_DIR: target/edge-conformance
         run: cargo build -p edge-greeting --target wasm32-wasip1 --release --bin edge-capsule
       - name: Nothing native may reach the capsule
         # `autumn-edge`'s manifest guard asserts this at the source level (one

@@ -224,18 +224,7 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // than re-executing the handler.
     let owns_replay = should_own_replay(&input_fn);
     let replay_check = if owns_replay {
-        quote! {
-            let __autumn_idempotency_replay = parts
-                .extensions
-                .get::<::autumn_web::idempotency::IdempotencyReplayResponse>()
-                .cloned()
-                .map(::autumn_web::reexports::axum::extract::Extension);
-            if let ::core::option::Option::Some(__autumn_response) =
-                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
-            {
-                return ::core::result::Result::Err(__autumn_response);
-            }
-        }
+        crate::idempotency_guard::owned_replay_check_tokens()
     } else {
         quote! {
             let __autumn_idempotency_replay = parts
@@ -611,6 +600,38 @@ mod tests {
         assert!(
             !generated.contains("__replay_response"),
             "must defer replay-ownership while #[authorize] is still pending:\n{generated}"
+        );
+    }
+
+    #[test]
+    fn owns_replay_when_unguarded() {
+        let generated = step_up_macro(
+            quote! {},
+            quote! {
+                async fn handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("__replay_response"),
+            "an otherwise-unguarded step-up handler's gate must own replay-serving:\n{generated}"
+        );
+    }
+
+    #[test]
+    fn defers_replay_to_an_earlier_gate_when_stacked() {
+        // Simulate `#[secured]` having already expanded and inserted its own
+        // gate parameter ahead of `#[step_up]`'s.
+        let generated = step_up_macro(
+            quote! {},
+            quote! {
+                async fn handler(_g: __AutumnSecuredGate_handler) -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("__replay_response"),
+            "must defer replay-ownership to the earlier-inserted gate:\n{generated}"
         );
     }
 

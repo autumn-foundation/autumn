@@ -15,18 +15,22 @@ categories = ["web-programming", "web-programming::http-server"]
 proc-macro = true
 
 [features]
-# `db` is on by default so a direct dependant (and `cargo test -p
-# autumn-macros`) keeps the full macro surface. `autumn-web` takes this crate
-# with `default-features = false` and forwards its own `db` feature, so a
-# no-database app never compiles the database codegen at all.
 default = ["db"]
-# Database-layer codegen: the `#[model]` and `#[repository]` attribute macros.
-# These two modules are ~40k of the crate's ~60k lines and dominate its compile
-# time, yet a no-database app can reach neither macro — `autumn-web` already
-# gates both re-exports on its own `db` feature (issue #2309).
+# A no-op kept so an existing `autumn-macros/db` dependant still RESOLVES.
+# It no longer switches anything on: the database-layer codegen (`#[model]`,
+# `#[commentable]`, `#[repository]`, `#[service]`) moved to the
+# `autumn-macros-model` and `autumn-macros-repository` crates, and rustc does
+# not let a proc-macro crate re-export another crate's proc macro, so this
+# crate cannot give those paths back. A direct dependant that names
+# `autumn_macros::model` must depend on the shard crate, or better, on
+# `autumn-web`, whose paths did not change. See
+# `docs/migrations/next.md`. `autumn-web` takes this crate with
+# `default-features = false` and pulls the shards in itself, so a no-database
+# app never compiles the database codegen at all.
 db = []
 
 [dependencies]
+autumn-macros-support = { version = "0.7.0", path = "../autumn-macros-support" }
 syn.workspace = true
 quote.workspace = true
 proc-macro2.workspace = true
@@ -39,8 +43,3 @@ serde_json = { workspace = true }
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-# Pinned to match the exact version every other crate in this workspace
-# already depends on (autumn, autumn-cli), so Cargo resolves one shared copy.
-temp-env = "0.3.6"

@@ -1,9 +1,10 @@
 # Migrating to the next Autumn release (rolling draft)
 
-> **Rolling draft.** This is the in-flight guide for the changes currently
-> under `## [Unreleased]` in [`CHANGELOG.md`](../../CHANGELOG.md). Every PR
-> that lands a breaking change appends a section here and links this file from
-> its changelog entry. At release time the file is renamed to
+> **Rolling draft.** This is the in-flight guide for the changes that are not
+> released yet. Every PR that lands a breaking change appends a section here
+> and links this file from its changelog note — which is a file under
+> [`changelog.d/`](../../changelog.d/README.md), not a line in
+> [`CHANGELOG.md`](../../CHANGELOG.md). At release time the file is renamed to
 > `docs/migrations/<version>.md`, its version placeholders are filled in, and
 > the index in [`README.md`](README.md) is updated — see
 > [`docs/release-checklist.md`](../release-checklist.md), *Migration Guide
@@ -118,6 +119,14 @@ before — but each also widens a Rust type that user code can name.
 
 Three types moved. You are affected only if your code constructs or matches one
 of them exhaustively; none of them changes meaning.
+
+**The `tls` feature does not exempt you from two of the three.** `TlsConfig`
+(`autumn_web::config`) and `SecurityDump` (`autumn_web::route_listing`) live in
+modules that are always compiled, and their new `client_auth` fields are
+unconditional — so an app that has never enabled `tls` and constructs either
+struct literally still gets `E0063: missing field client_auth` after
+upgrading. Only `TlsError` below is behind the non-default `tls` feature; that
+one snippet needs `features = ["tls"]` to compile at all.
 
 **Before (`{X.Y}`):**
 
@@ -243,7 +252,10 @@ the generated spec names that encoding instead of staying silent about it
 
 Only code that constructs a `Parameter` *by struct literal*, outside this
 crate, has to change. Every route macro and the OpenAPI generator itself
-already build one field at a time and are unaffected.
+already build one field at a time and are unaffected. `Parameter` is behind the
+non-default `openapi` feature, so an app that does not enable it is unaffected
+— the module `autumn_web::openapi` compiles either way, but the type does not
+exist without `features = ["openapi"]`.
 
 **Before (`{X.Y}`):**
 
@@ -624,6 +636,42 @@ nothing would let the reaper evict live participants.
 
 **Automation:** `manual` — the body depends on how the store holds its state.
 
+### admin-plugin: `ExperimentChange::changed_at` is now `NaiveDateTime`
+
+`autumn-admin-plugin` could not compile at all under the `autumn-web/sqlite`
+backend (#2108). One cause was the `Timestamptz` SQL type, which diesel
+implements for `Pg` only. `autumn_admin_plugin::experiments::ExperimentChange`
+is public, and the Rust field type decides which SQL type the generated DSL
+binds, so the field had to change:
+
+```diff
+ pub struct ExperimentChange {
+     …
+-    pub changed_at: chrono::DateTime<chrono::Utc>,
++    pub changed_at: chrono::NaiveDateTime,
+ }
+```
+
+Three things change for code that names the type:
+
+- **The field type.** Call `.and_utc()` on the field to get the old
+  `DateTime<Utc>` back. The value is the same instant.
+- **The `Serialize` output.** `changed_at` now serializes as
+  `"2024-01-15T12:34:56"`, with no `Z`. A consumer that parses strict RFC 3339
+  needs the offset added back, or a `serde` attribute of its own.
+- **The derived OpenAPI schema.** The property loses
+  `"format": "date-time"` and stays `"type": "string"`, so a generated client
+  gets a plain string where it had a timestamp.
+
+Nothing changes on the database. The `autumn_experiment_changes.changed_at`
+column stays `timestamptz`, and no migration is needed. Postgres sends
+`timestamp` and `timestamptz` in the same binary form — microseconds from
+2000-01-01 UTC — so the value read is identical, whatever the session time
+zone. `autumn-admin-plugin/tests/experiment_admin_db.rs` asserts that on a
+non-UTC session.
+
+**Automation:** `manual` — one call to `.and_utc()` at each use site.
+
 ### Capacity contracts: three metadata structs gain fields
 
 Deploys can now carry a proven capacity contract (`autumn calibrate` →
@@ -1003,6 +1051,66 @@ async fn beta_page() -> &'static str {
 `AppBuilder::static_gate` is a structural change no codemod can make safely
 (it needs the app's `AppBuilder` chain, not just the handler function).
 
+### repository: `owner = column` next to `api = "..."` now requires `policy`
+
+**Why:** Found during a Warden security review of `#[repository]`'s
+auto-generated CRUD API. `owner = <column>` only ever emitted opt-in
+`list_scoped(owner_id, ..)` / `search_page_scoped(owner_id, ..)` repository
+methods for a hand-written handler to call with an explicit owner id — the
+generated `api = "..."` HTTP handlers never called them. Declared on its own
+next to `api = "..."`, `owner` therefore compiled to a fully public REST API
+that read, at the declaration site, like a per-owner-scoped one: `GET <api>`
+returned every user's rows, and `GET`/`PUT`/`DELETE <api>/{id}` let any
+authenticated caller read, overwrite, or delete any other user's row by id.
+
+`scope = Type` does not close this on its own either: it only filters `GET
+<api>`'s SQL query (a performance optimization for the list endpoint), and
+has no effect on `_api_get`/`_api_update`/`_api_delete` — only `policy =
+Type` gates those (`can_show`/`can_update`/`can_delete`). An initial version
+of this fix accepted `scope` as an alternative to `policy`, which still left
+every single-record route unguarded; that gap was caught in review before
+merge, so the gate now requires `policy` unconditionally.
+
+**Before (`{X.Y}`):**
+
+```rust
+#[autumn_web::repository(Note, table = "notes", api = "/api/notes", owner = author_id)]
+pub trait NoteRepository {}
+```
+
+This compiled, and `GET /api/notes/{id}` (also `PUT`/`DELETE`) served or
+mutated *any* note by id, and `GET /api/notes` returned every user's notes —
+`owner = author_id` had no effect on any of the five generated routes. So
+did adding `scope = Type` alone: the list endpoint would then filter
+correctly, but `GET`/`PUT`/`DELETE /api/notes/{id}` stayed wide open.
+
+**After (`{X.Z}`):** add `policy = Type`, comparing `ctx.user_id_i64()`
+against the owner column in `can_show`/`can_update`/`can_delete`:
+
+```rust
+#[autumn_web::repository(
+    Note, table = "notes", api = "/api/notes",
+    owner = author_id, policy = NotePolicy,
+)]
+pub trait NoteRepository {}
+
+impl autumn_web::authorization::Policy<Note> for NotePolicy {
+    // can_show/can_update/can_delete compare ctx.user_id_i64() against
+    // note.author_id (or ctx.has_role("admin")); see
+    // autumn/tests/integration/repository_authorization.rs for a worked example.
+}
+```
+
+Keep `scope = Type` alongside `policy` if you also want the list endpoint's
+cheaper SQL-level filter instead of `policy`'s in-memory `can_show` sweep —
+`scope` is accepted as an addition to `policy`, never as a replacement for
+it. Or drop `api = "..."` entirely and call the generated
+`list_scoped`/`search_page_scoped` methods from your own hand-written,
+owner-checked routes.
+
+**Automation:** `manual` — what the policy actually checks is an application
+decision no codemod can make.
+
 ### Lifecycle: an unsound `#[lifecycle]` graph is now a compile error
 
 **Why:** `#[lifecycle]` proved its *endpoints* — every `initial`, `terminal` and
@@ -1108,6 +1216,58 @@ changes nothing and is always correct; on any other type it changes what serde
 accepts, so a codemod that added it everywhere would silently widen a request
 contract. `#[model]` is unaffected: its read schema describes a response only,
 so a conditionally-skipped column there stays sound without the attribute.
+
+### Macros: `autumn-macros` no longer holds the database macros (#2809)
+
+**Why:** `autumn-macros` was one 87k-line proc-macro dylib, and a full-crate
+check ran rustc out of memory on a modest machine. The database codegen —
+`#[model]`, `#[commentable]`, `#[repository]`, `#[service]` — now lives in two
+sibling crates, `autumn-macros-model` and `autumn-macros-repository`, so a
+no-database build never compiles it.
+
+**You are affected only if you depend on `autumn-macros` directly.** Nearly
+nobody does. Every `autumn_web::` path is unchanged, so an app that writes
+`use autumn_web::prelude::*` or `autumn_web::{model, repository, service}`
+needs no change at all.
+
+A direct dependant loses these three macro paths. `autumn-macros`'s `db`
+feature still resolves, but it is now an empty no-op: the macros it used to
+switch on are in other crates. Rust does not let a proc-macro crate re-export
+another crate's proc macro, so a compatibility facade in `autumn-macros` is
+not possible.
+
+**Before (`{X.Y}`):**
+
+```toml
+autumn-macros = { version = "{X.Y.Z}", features = ["db"] }
+```
+
+```rust
+#[autumn_macros::model]
+struct Post { id: i32 }
+```
+
+**After (`{(X+1).0}`):**
+
+```toml
+autumn-macros-model = "{X.Z.0}"
+autumn-macros-repository = "{X.Z.0}"
+```
+
+```rust
+#[autumn_macros_model::model]
+struct Post { id: i32 }
+```
+
+`#[repository]` comes from `autumn_macros_repository`; `#[model]`,
+`#[commentable]` and `#[service]` come from `autumn_macros_model`. Depending
+on `autumn-web` instead is the better fix, and the one we recommend: it pins
+both crates for you and keeps the paths you already write.
+
+**Automation:** `manual` — the rewrite needs a new dependency in `Cargo.toml`
+that no codemod may add on the reader's behalf, and the right answer for most
+readers is to depend on `autumn-web` instead, which is a design decision.
+
 
 ## Plugin authors
 

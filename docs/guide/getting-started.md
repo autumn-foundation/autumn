@@ -226,9 +226,9 @@ On a fresh project, before `autumn setup`, you will see something like:
 ✅ port_bindable — port 3000 is available
 ❌ tailwind_binary — target/autumn/tailwindcss not found
    hint: Run `autumn setup` to download the Tailwind CSS binary
-⚠️  signing_secret — using an ephemeral per-process signing secret (dev/test
-    only; sessions and signed URLs will not survive restarts or be shared
-    across replicas)
+⚠️  signing_secret — no signing secret configured (dev/test only): sessions and
+    CSRF tokens ride unsigned; local-storage signed URLs use an ephemeral
+    per-process key instead
    hint: Set AUTUMN_SECURITY__SIGNING_SECRET before deploying to production
 ⚠️  dotenv — `.env.example` is present but no `.env` exists
    hint: Copy `.env.example` to `.env` and fill in local values
@@ -1298,11 +1298,14 @@ so a `.env` file can never switch the active profile.
 
 ### Log format behavior
 
-| Format   | Behavior                                                 |
-|----------|----------------------------------------------------------|
-| `Auto`   | Pretty in development, JSON when the profile is production |
-| `Pretty` | Always human-readable, colorized                         |
-| `Json`   | Always structured JSON                                   |
+`Auto` renders pretty lines unless the profile is production, then JSON.
+`Pretty` and `Json` pin it either way. The profile usually decides this before
+`Auto` ever does: `dev` defaults to `Pretty` and `prod` to `Json` outright,
+which is why the same binary reads well on a laptop and parses in production
+without the config changing. The same goes for the level — `dev` defaults to
+`debug`, `prod` to `info`. [Logging](logging-pii.md#choose-the-log-format-pretty-or-json)
+is where the log settings are documented in full, including how to change a log
+level on a running process.
 
 ### Running without a database
 
@@ -1505,8 +1508,10 @@ See the [testing guide](testing.md) for `TestDb`, fixtures, and
 ## Before you deploy
 
 The generated app starts with local-safe defaults: in-memory sessions,
-in-process `#[scheduled]` tasks, an ephemeral signing secret, and a generic
-container Dockerfile. Before running multiple replicas you usually want to:
+in-process `#[scheduled]` tasks, no configured signing secret (see
+[signing secrets](signing-secrets.md) for what that does and does not sign),
+and a generic container Dockerfile. Before running multiple replicas you
+usually want to:
 
 1. Set `AUTUMN_ENV=prod`
 2. Set a durable `AUTUMN_SECURITY__SIGNING_SECRET` and a trusted-hosts list

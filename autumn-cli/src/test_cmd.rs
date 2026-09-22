@@ -215,6 +215,10 @@ fn derive_test_url(base_url: &str) -> Result<(String, String), String> {
 /// Minimal percent-decoding for a URL path segment (database name), matching
 /// `db::maintenance_target`'s handling so the derived name equals the name the
 /// `db`/`migrate` paths will operate on.
+///
+/// Duplicated byte-for-byte from `db::decode_percent` rather than shared,
+/// but pinned equal to it by `tests::decode_percent_matches_db_decode_percent`
+/// below — update both, or that test fails.
 fn decode_percent(segment: &str) -> String {
     let bytes = segment.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -259,6 +263,35 @@ mod tests {
     fn cargo_test_args_forwards_single_filter_after_separator() {
         let user = vec!["my_filter".to_owned()];
         assert_eq!(cargo_test_args(&user), vec!["test", "--", "my_filter"]);
+    }
+
+    #[test]
+    fn decode_percent_matches_db_decode_percent() {
+        // These two decoders are separate, hand-duplicated copies (see both
+        // functions' doc comments) rather than a shared one, because the
+        // `test` command and the `db`/`migrate` commands must derive the
+        // exact same database name from the exact same URL. This is the
+        // drift guard: if either copy changes without the other, one of
+        // these inputs should stop matching.
+        for segment in [
+            "my_app",
+            "my%20app",
+            "already_test",
+            "%6d%79_app",
+            "%5F_leading_underscore",
+            "MIXED%5fCase%2Fname",
+            "trailing%2",
+            "trailing%",
+            "100%25done",
+            "",
+            "%zz-not-hex",
+        ] {
+            assert_eq!(
+                decode_percent(segment),
+                crate::db::decode_percent(segment),
+                "decode_percent and db::decode_percent disagree on {segment:?}"
+            );
+        }
     }
 
     #[test]

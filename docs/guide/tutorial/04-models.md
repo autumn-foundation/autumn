@@ -49,7 +49,20 @@ Expected project state with models, queries, and database-backed routes.
 
 ---
 
-*Content coming in Sprint 12.*
+> **Not written yet.** This chapter's narrative doesn't exist yet. For the
+> actual `Todo`/`NewTodo` models and CRUD handlers this chapter's goal
+> describes, see
+> [`examples/todo-app/src/models.rs`](../../../examples/todo-app/src/models.rs)
+> and
+> [`examples/todo-app/src/routes/todos.rs`](../../../examples/todo-app/src/routes/todos.rs)
+> — that's the reference implementation this tutorial builds toward. The
+> Getting Started guide's
+> ["Define a model"](../getting-started.md#define-a-model) section defines
+> the same `Todo`/`NewTodo` structs, though its
+> ["Query the database"](../getting-started.md#query-the-database) section
+> returns JSON rather than the HTML `/todos` page this chapter's goal
+> describes. Continue to
+> [Chapter 5 — HTML Templates with Maud](05-templates.md) once yours compiles.
 
 ---
 

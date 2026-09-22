@@ -47,7 +47,7 @@ copy of the publish order.
 
 - `AppState`
 - `AutumnError`, `AutumnResult<T>`
-- `Db`
+- `Db`, `LazyDb` (defers the checkout past a body extractor, #2264)
 - `Page<T>`, `PageRequest`, `CursorPage<T>`, `CursorRequest`
 - `Valid<T>`, `Validated<T>`, `ValidateExt`
 - `Redirect`
@@ -259,6 +259,55 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   be declared `#[translatable]` with **no data migration**; keys are never gated
   on locale-tag shape, so every key an app can write round-trips through the
   column.
+- **(0.7.0)** `#[collaborative]` (issue #1806, needs the `collab` feature) — the column
+  stores a **text CRDT** instead of a plain string, so two people editing the
+  same field merge character by character rather than overwriting each other.
+  The field type becomes `autumn_web::collab::CollabText`, a Replicated
+  Growable Array persisted as JSON in the field's own `TEXT` column (portable
+  Postgres + `SQLite`, the same storage shape `#[translatable]` uses). Give the
+  column `DEFAULT '{"elems":[]}'` (`collab::EMPTY_DOCUMENT`); a bare `'{}'`
+  reads as prose, not as an empty document. Guarantees: replicas holding the
+  same operations render the same text **in any delivery order**; an operation
+  arriving before the character it refers to waits in a buffer rather than
+  being dropped; applying one twice is a no-op, so a reconnect is safe; and an
+  edit anchors to a neighbouring character rather than an index, so it lands
+  where the author meant even when the document changed in flight.
+  Generated: per-field `<f>_text()` / `<f>_insert(actor, index, text)` /
+  `<f>_remove(index, count)` / `<f>_set_text(actor, text)` /
+  `<f>_merge(&other)`, plus field-name-keyed `collaborative(field)` /
+  `collaborative_mut(field)` / `Model::collaborative_fields()`, and a
+  `collab::CollaborativeColumnDescriptor` inventory registration.
+  **Write semantics matter**: use `<f>_set_text` for a whole-field form post —
+  it emits the smallest edit, so a concurrent edit outside the changed span
+  survives. Assigning a fresh `CollabText::from(str)` throws the merge history
+  away. `Serialize` is lossless; `Deserialize` refuses a bare string, so
+  `PUT {"body": "hi"}` is a 422 rather than a silent wipe of everyone else's
+  characters. Refused in combination with `#[encrypted]`, `#[classified]`,
+  `#[searchable]`, `#[translatable]`, `#[normalize]`, `unique`/`indexed`,
+  `#[id]`, `#[lock_version]`, `#[position]`, `#[state_machine]`,
+  `#[serde(rename)]` and `#[diesel(column_name)]`. `Option<CollabText>` is a
+  compile error — an empty document already means "no text". A pre-existing
+  plain-text column can be declared `#[collaborative]` with **no data
+  migration** (it must be `NOT NULL`; back-fill `''` first).
+  **Live sessions** (needs `presence` too): `state.collab()` is a
+  `collab::CollabHub` holding one live document per field instance.
+  `hub.open_with(&doc_key("notes", id, "body"), || note.body.clone())?` seeds it
+  from the row once, and `collab::hub::serve_socket(&doc, actor, label, socket)`
+  is the whole client protocol from a `#[ws]` handler — operations fan out over
+  a `Channels` topic, membership comes from `Presence`, cursors ride a message
+  merged into the participant list. Authorize the **record** before opening the
+  document: the hub applies no ownership check. The last editor to leave evicts
+  the document; `hub.close(key)` hands back a `CollabClose` whose `text()` is
+  the final state to persist. The document stays discoverable until
+  `finalize()`, so a reconnect during the write joins it instead of seeding a
+  second authority from the stale row.
+  **Offline**: `collab::CollabResolver::for_table("notes")` replaces
+  last-write-wins for the marked columns of that collection in the
+  offline-sync engine (`sync::server::router`), leaving every other column and
+  every row-level delete to the wrapped resolver. Cost: the merge scans the
+  character list, so it suits note-sized and comment-sized fields. See
+  [collaboration](../../../docs/guide/collaboration.md) and
+  `examples/collab-notes`.
 - **(0.7.0)** `#[classified]` / `#[classified(personal_data)]` (issue #1654) — marks a
   non-null `String` column as **personal data** and carries that classification
   on the *type*, not in a name denylist. The generated field becomes
@@ -300,6 +349,40 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   `classify::manifest::ClassifiedFieldDescriptor` inventory registration, and
   `Model::__AUTUMN_CLASSIFIED_COLUMNS`. `autumn data-flow` emits the manifest.
   See `docs/guide/data-classification.md`.
+- **(0.7.0)** `#[confidential]` / `#[confidential(blind_index)]` (issue #1771) —
+  marks a column **operator-blind**: the value is sealed on the client under a
+  key the server never receives, so the server holds only ciphertext. Unlike
+  `#[encrypted]` (operator-held keys, `String` field, transparent plaintext in
+  Rust), the field is declared as `autumn_web::confidential::Sealed` — an opaque
+  envelope with no `Display`, no `Deref` and no accessor that yields plaintext.
+  Every generated struct (`NewX`/`UpdateX`/`Changeset`/`XFactory`/JSON view)
+  therefore carries ciphertext, and the database, `autumn db backup` output, the
+  access and error log, replay capsules, record version history, the admin UI and
+  its CSV export hold only that.
+  Client side: `RootKey::generate()` / `::from_hex` / `::from_bytes` (no
+  `Serialize`, no `Display`, no byte accessor, zeroizes on drop, never built from
+  config or the credentials store),
+  `FieldContext::for_record(table, column, owner, record)` (or `::new` without
+  the record, which leaves rows interchangeable), then
+  `key.seal(&ctx, plaintext)? -> Sealed` and `key.unseal(&ctx, &sealed)?`.
+  Equality: `#[confidential(blind_index)]` requires a companion
+  `<field>_bidx: autumn_web::confidential::BlindIndex` column; the client sends
+  `key.blind_index(&ctx, plaintext)` and the server compares the token
+  (constant-time `PartialEq`, fixed 32 hex characters, so no length leak).
+  Refused at **build time**: `#[encrypted]`, `#[classified]`, `#[searchable]`,
+  `#[unique]`, `#[indexed]`, `#[references]`, `#[normalize]`, `#[translatable]`,
+  `#[id]`, `#[lock_version]`, `#[position]`, `#[state_machine]`, `#[default]`, a
+  `tenant_id` column, `#[serde(rename)]` / `rename_all`,
+  `#[diesel(column_name)]`, the model's shard key, a non-`Sealed` field type —
+  and, through the `Model::__AUTUMN_CONFIDENTIAL_COLUMNS` list `#[model]`
+  publishes, a `#[repository]` `find_by_<field>` / `count_by_` / `delete_by_` /
+  `exists_by_`, `find_or_create_by_<field>`, `cursor_key = <field>` or grouped
+  aggregate. Query the `_bidx` companion instead. Generated: a type assertion
+  proving the field really is `Sealed`, a
+  `confidential::ConfidentialColumnDescriptor` inventory registration, and
+  `Model::__AUTUMN_CONFIDENTIAL_COLUMNS`. See
+  `docs/guide/confidential-fields.md` for the threat model, including what
+  sealing does not hide.
 - `#[normalize(trim, downcase, upcase, squish, strip_nul, with = path::to::fn)]` (issue
   #1379) — canonicalizes a `String` column, composing normalizers
   left-to-right. Built-ins live in `autumn_web::normalize`
@@ -563,6 +646,47 @@ delete actions remain last-write-wins.
   `.read_only()` / `.deferrable()` / `.max_attempts(n)` /
   `.initial_backoff(d)` / `.max_backoff(d)`; retrying constructors default
   to 5 attempts.
+
+## Money and the ledger (`autumn_web::money`, unreleased, #1837)
+
+Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
+
+- `Money<C>` — an amount in currency `C`, as an `i64` count of minor units.
+  No `f64`, and no `Add`/`Sub` impls (an operator cannot report an overflow).
+  `from_minor` / `from_major` / `minor` / `currency` / `to_decimal` /
+  `checked_add` / `checked_sub` / `checked_neg` / `checked_abs` /
+  `checked_mul` / `try_sum` / `is_zero` / `is_positive` / `is_negative` /
+  `to_any`; `ZERO`.
+- `Money::from_decimal(d, Rounding)` and `from_decimal_exact(d)` (refuses to
+  round). `Rounding` {`HalfUp`, `HalfEven`, `HalfDown`, `TowardZero`,
+  `AwayFromZero`, `Floor`, `Ceiling`} — no default, every call names one.
+- `Money::allocate(&[i64])` / `split(n)` — largest-remainder; the parts always
+  sum back to the whole. `split` is bounded by `money::MAX_PARTS`.
+- `Currency` (sealed) with markers `Usd`, `Eur`, `Gbp`, `Jpy`, … (34 ISO 4217
+  codes, exponents 0/2/3). `Usd::currency()` gives the runtime `CurrencyCode`;
+  `CurrencyCode::parse(code)` / `::known()`.
+- `AnyMoney` — runtime-tagged amount for a stored row: `new` / `zero` /
+  `minor` / `currency` / `to_decimal` / `checked_add` / `checked_sub` /
+  `checked_neg` / `try_sum` / `try_into_typed::<C>()`.
+- `MoneyError` {`Overflow`, `CurrencyMismatch`, `UnknownCurrency`, `Inexact`,
+  `InvalidWeights`} → 422, except `Overflow` → 500.
+- `money::ledger::{ensure_account, set_allow_negative, account, post, balance,
+  transaction_by_key, trial_balance}` — all take `&mut RuntimeConnection`, so
+  they nest inside `Db::tx`. `post` **requires** a transaction.
+- `Account::new(id, currency)` / `.disallow_negative()`; `Posting::debit(...)` /
+  `::credit(...)`; `Transaction::new(key, postings).memo(...)` /
+  `.validate()`; `IdempotencyKey::new(s)` / `::derive(namespace, &postings)`;
+  `PostOutcome::{Posted, Replayed}` with `is_posted` / `is_replayed` /
+  `transaction`; `PostedTransaction`, `CurrencyTotal`, `Side`.
+- `LedgerError` {`Money`, `Unbalanced`, `PostingCount`, `OneSided`,
+  `ZeroPosting`, `MixedCurrencies`, `NegativeAmount`, `UnknownAccount`,
+  `AccountCurrency`, `KeyReuse`, `InvalidText`, `NegativeBalance`,
+  `NotInTransaction`, `Conflict`, `EmptyTransaction`, `Database`} — 409 for
+  `KeyReuse` / `NegativeBalance` / `Conflict`, 500 for `NotInTransaction` /
+  `EmptyTransaction` / `Database`, 422 for the rest.
+- Tables `ACCOUNTS_TABLE` / `TRANSACTIONS_TABLE` / `POSTINGS_TABLE`
+  (`_autumn_money_*`), append-only by trigger on both backends, shipped in the
+  framework migration set.
 
 ## Form helpers (`autumn_web::form`)
 
@@ -1063,7 +1187,7 @@ double-submits and replays.
 - Rendering: `asset_url`, `Markup`, `PreEscaped`, `html!`.
 - Accessibility primitives (`maud` feature, 0.6.0):
   `Button`, `ButtonType`, `Img`, `Link`, `MenuItem`, `TextField`.
-- Extractors: `Db`, `Form`, `Json`, `Path`, `Query`, `State`, `Session`,
+- Extractors: `Db`, `LazyDb`, `Form`, `Json`, `Path`, `Query`, `State`, `Session`,
   `Auth`, `ApiToken`, `RequireApiToken`, `CsrfToken`, `CsrfFormField`,
   `PageRequest`, `Page`, `CursorRequest`, `CursorPage`, `Valid`,
   `ValidateExt`, `Validated`, `Flash`, `Multipart`, `HxRequest`,

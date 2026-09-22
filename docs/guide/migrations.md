@@ -28,6 +28,47 @@ The lock covers:
 
 ---
 
+## Version collisions
+
+Diesel records applied migrations **by version** — the leading
+`YYYYMMDDHHMMSS` prefix of a migration directory's name — in a single shared
+table, with no notion of which registered set (the framework, a plugin, the
+app's own `migrations/`) a version came from. When two differently-named
+migrations share one version, the framework detects it automatically at boot
+and gives the losing one a deterministic substitute version, so both still
+apply — logged at `INFO`
+("Migration version collision resolved automatically"), never a silently
+skipped migration. The one exception is a narrow, unrecoverable case on
+`SQLite`: adopting a pre-fork database whose already-applied history can't be
+safely rewritten fails loudly instead of guessing.
+
+Auto-resolution means a collision is never silently lost, but the substitute
+is still a generated, less-readable version stamp on an otherwise ordinary
+migration. Prefer to avoid the collision in the first place, most likely when
+two branches each add a migration around the same time and one picks a
+round, hand-typed timestamp (midnight, on the hour) instead of the actual
+current second — two people reaching for `00:00:00` on the same day collide;
+two people reaching for the real current second, to the second, essentially
+never do. Two tools help:
+
+* **`autumn migrate new <name>`** creates
+  `migrations/<version>_<name>/{up,down}.sql` with a version guaranteed free
+  across the working tree, every local and remote-tracking git branch this
+  checkout has fetched, and the framework's own compiled-in migrations. Use
+  this instead of hand-creating a migration directory.
+* **`autumn migrate check-collisions`** is the CI-time backstop for a
+  collision `migrate new` could not see — a branch pushed after, or a
+  teammate's concurrent PR. It fails when a version this checkout introduces
+  is already claimed by a different directory on the default branch, another
+  pushed branch, or the framework's own migrations, and is silent about a
+  collision between two *other* branches (that is their gate to fail on, not
+  this checkout's). It needs the full branch history
+  (`actions/checkout@v7` with `fetch-depth: 0`, or a local `git fetch
+  origin`); without it, it degrades to a working-tree-only check and prints a
+  loud warning rather than failing closed.
+
+---
+
 ## Lock key
 
 The advisory lock uses a single `bigint` key:
