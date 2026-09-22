@@ -44,7 +44,24 @@ Expected project state with both HTML and JSON routes.
 
 ---
 
-*Content coming in Sprint 12.*
+> **Not written yet.** This chapter's narrative doesn't exist yet. For the
+> actual JSON API this chapter's goal describes, see
+> [`examples/todo-app/src/routes/api.rs`](../../../examples/todo-app/src/routes/api.rs)
+> — that's the reference implementation this tutorial builds toward. Its
+> `list_json`/`create_json` handlers are declared as `#[get("/todos")]` /
+> `#[post("/todos")]` but mounted at `/api/todos` via `.scoped("/api", ...)`
+> in `main.rs` (see the `.scoped(...)` call there), matching this chapter's
+> goal — but that scope also requires a bearer token
+> (`POST /api/tokens` first) via a `RequireApiToken` Tower layer, and the
+> handlers themselves take an `ApiToken` extractor that depends on it, which
+> is more than this chapter's "testable with curl" goal implies. Don't just
+> drop the `RequireApiToken` layer — the handlers still take an `ApiToken`
+> extractor and would 401 with nothing populating it. For unauthenticated
+> `list`/`create` handlers instead, copy the Getting Started guide's
+> ["Query the database"](../getting-started.md#query-the-database) section,
+> which shows the same `Json<T>` request/response pattern without the token
+> layer. Continue to
+> [Chapter 9 — Error Handling](09-errors.md) once yours responds to curl.
 
 ---
 

@@ -362,6 +362,35 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-orphans.sh --self-test && ./scripts/check-docs-orphans.sh
+      - name: Guide index completeness gate
+        # The reachability gate above asks "does any inbound link exist". This
+        # asks the question a reader actually has: "is this page somewhere I
+        # would look". They are different, and the gap between them is where
+        # this corpus was losing people — reachability passes when the only
+        # inbound link is a mid-page crosslink from another guide page, or a
+        # mention inside an agent SKILL.md, a surface written for a language
+        # model rather than for a person with a question.
+        #
+        # The step above says `docs/guide/` has no index of its own and that
+        # discovery therefore rests on README.md's hand-maintained list, which
+        # "someone has to remember to update. Nothing noticed when they
+        # forgot." Nothing noticed 92 times: the baseline run of this gate
+        # found 92 of the 147 guide pages in NO reader-facing index, among them
+        # middleware, testing, migrations, repositories, jobs, authorization,
+        # pagination, websockets, rate-limiting, i18n, events and oauth — the
+        # pages a reader needs in their first week. A cold retrieval test over
+        # README.md's list found the answering page absent for 11 of 15
+        # ordinary question classes, while every drift gate was green over
+        # those same pages. The answers were right and unreachable by search,
+        # which from the reader's seat is indistinguishable from absent.
+        #
+        # docs/guide/index.md is the fix, and this gate is what keeps it true:
+        # a page added without an index line fails in the commit that adds it,
+        # which is the only moment anyone has the context to write that line.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-guide-index.sh --self-test && ./scripts/check-docs-guide-index.sh
       - name: TOML config-key drift gate
         # The env-var gate above covers the config a reader SETS. This covers
         # the config they WRITE — a key in `autumn.toml` itself — which is the
@@ -631,6 +660,30 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-scope.sh --self-test && ./scripts/check-docs-scope.sh
+      - name: Docs retrieval gate
+        # Every gate above checks a page a reader HAS REACHED, and
+        # `check-docs-orphans.sh` checks that a path of links to it exists at
+        # all. Neither asks what a reader mid-task actually arrives with: not
+        # "which link do I click" but "what do I type". A page whose title and
+        # headings are spelled in project vocabulary instead of the reader's is
+        # invisible to that search while staying perfectly reachable,
+        # accurate and linked — every other gate green over it.
+        #
+        # The baseline found the log-configuration question class failing
+        # exactly that way. `docs/guide/logging-pii.md` carried `[log] level`,
+        # `log.format` and the access-log switches under the title
+        # "Logging & PII" — the name the README listed it by — so "log level",
+        # "debug logging" and "json logs" returned nothing, while `[log]`
+        # itself appeared in 9 fences across 7 pages. The runtime half,
+        # `PUT /actuator/loggers/{name}`, was on no reader-facing page at all.
+        #
+        # The fixture pins the ANSWERING page, not merely "some hit", so a
+        # retitle that re-aims a page at a different question fails here
+        # rather than passing quietly.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-retrieval.sh --self-test && ./scripts/check-docs-retrieval.sh
       - name: CLI coverage gate
         # The twelve docs gates above all run docs -> code: "is what we wrote
         # still true?", which is DRIFT. This one runs code -> docs: "is what we

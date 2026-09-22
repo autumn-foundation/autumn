@@ -12,6 +12,7 @@ single command. Four subcommands cover the cases you actually hit:
 | `autumn generate channel`            | A real-time broadcast channel over the `Channels` API — an htmx SSE live view by default, or a raw `#[ws]` handler with `--ws` |
 | `autumn generate webhook`            | A signature-verified, replay-protected inbound provider webhook (Stripe/GitHub/Slack/generic) — handler, event dispatch, `autumn.toml` endpoint config, and tests |
 | `autumn generate scaffold`           | Everything `model` does plus `#[repository]`, HTML routes, smoke test, `routes![]` registration |
+| `autumn generate policy`             | A record-level `Policy`/`Scope` pair for a model that already exists, registered in `src/main.rs` |
 | `autumn generate wizard`             | A session-backed multi-step form wizard with per-step validation and a confirm/commit/cancel flow |
 | `autumn generate admin`              | An `AdminModel` adapter for an existing model, wired to `autumn-admin-plugin`   |
 | `autumn generate tauri`              | A complete `src-tauri/` sidecar project so the app ships as a native desktop installer (see [Tauri guide](tauri.md)) |
@@ -1997,6 +1998,72 @@ to install the OpenSSL libraries through `vcpkg` and set `VCPKG_ROOT` so
 The release SemVer gate checks `autumn-web` optional public feature APIs, so this
 native dependency must be present on machines that run `scripts/check-semver.sh`
 locally.
+
+## `autumn generate policy`
+
+Record-level authorization for a model that already exists — the same
+`Policy`/`Scope` pair a `scaffold` wires in for a *new* resource, for one you
+already have.
+
+```bash
+autumn generate policy Post
+```
+
+Produces:
+
+```
+src/policies/post.rs           # PostPolicy (Policy<Post>) + PostScope (Scope<Post>)
+src/policies/mod.rs            # pub mod post;  (created or appended)
+src/main.rs                    # mod policies; + .policy(...)/.scope(...) in the builder
+```
+
+The model has to exist first — the generated code names its type. Run
+`autumn generate model Post` (or `scaffold`) before this, or the generator stops
+with `no model 'Post' found` and writes nothing.
+
+### The owner column decides what you get
+
+The generator parses the model's `#[model]` struct looking for an owner column,
+and it accepts exactly three names: `user_id`, `author_id`, or `owner_id`. Those
+three only — a foreign key spelled anything else (`account_id`, `member_id`)
+reads as "no owner column" and takes the second branch below, quietly. (The
+`scaffold` generator has one extra heuristic, a column whose `references` target
+is the users table, but it needs the field DSL that only `scaffold` is given.)
+
+Either way `can_show` allows everyone (reads are public until you tighten them)
+and `can_create` allows any authenticated user. The other two methods, and the
+scope, depend on what it found.
+
+**With an owner column**, the rules are real ones:
+
+- `can_update`/`can_delete` allow the row's owner, or a user holding the `admin`
+  role.
+- `Scope::list` filters list queries to the current user's rows. A nullable
+  owner column — an `Option<i64>`, as `user:references?` leaves `user_id` — is
+  compared option-to-option instead of being wrapped, so it behaves the same.
+
+**Without one**, there is no ownership rule to emit, and the generator does not
+invent one:
+
+- `can_update`/`can_delete` check only that the caller is **signed in** — any
+  authenticated user may update or delete any row. Both carry a
+  `// SECURITY TODO` comment saying exactly that.
+- `Scope::list` denies: it returns no rows until you write the filter, under a
+  plain `// TODO`.
+
+The halves diverge on purpose. Denying the mutations too would make a freshly
+generated app 403 on its own edit form, so the generator emits the weakest check
+it can justify and marks it loudly; the scope has no such constraint, so it
+stays closed. **Neither is a finished policy.** Grep for `SECURITY TODO` before
+you deploy, and replace the authentication check with the real per-record rule.
+
+Once generated, the file is ordinary user code — edit it freely. The
+[Authorization guide](./authorization.md) covers the `Policy` trait,
+`PolicyContext`, and the ownership and role patterns the generated impl is a
+starting point for.
+
+`autumn destroy policy Post` reverses all of it, including the `src/main.rs`
+registrations — see [Undoing a generator](#undoing-a-generator-autumn-destroy).
 
 ## `autumn generate wizard`
 

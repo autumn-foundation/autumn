@@ -1295,6 +1295,15 @@ path = "tests/cache_global_integration.rs"
 name = "cached_global_backend"
 path = "tests/cached_global_backend.rs"
 
+# Isolated: reads/writes the process-global cache backend via
+# `cache_fragment_global`, which `TestApp::build` clears unconditionally and
+# which a concurrently running consolidated-binary test could otherwise
+# stomp on — same reason as `cache_global_integration`/`cached_global_backend`
+# above (Warden 2026-09-21, docs/security/2026-09-21-fragment-cache-tenant-key/).
+[[test]]
+name = "cache_fragment_tenant_scope"
+path = "tests/cache_fragment_tenant_scope.rs"
+
 # Isolated: installs a process-global cache backend and depends on it surviving
 # across two requests, which any concurrent `TestApp::build` would clear.
 [[test]]

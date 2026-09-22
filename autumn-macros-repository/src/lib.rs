@@ -7,7 +7,9 @@
 //! Users should not depend on this crate directly — use `autumn-web`
 //! instead, which re-exports everything behind its `db` feature.
 
+mod api;
 mod repository;
+mod retention;
 
 use proc_macro::TokenStream;
 

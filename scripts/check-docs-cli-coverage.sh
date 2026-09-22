@@ -189,12 +189,7 @@ BACKLOG = {
         'generators.md documents the generator family but omits this one; it '
         'also strands `destroy inbound-mail`, since the reversal rule covers '
         'a subcommand only once its `generate` half is documented.',
-    'generate policy':
-        'same shape as `generate inbound-mail`, and strands `destroy policy` '
-        'the same way. `authorization.md` documents the Policy trait at '
-        'length without naming the generator that writes one.',
     'destroy inbound-mail': 'stranded by `generate inbound-mail`; see above.',
-    'destroy policy': 'stranded by `generate policy`; see above.',
     'schema parse':
         '`autumn schema` is marked experimental in its own doc comment '
         '("Slices 2-3 ship `parse` and `snapshot`; `diff`/… arrive in later '
