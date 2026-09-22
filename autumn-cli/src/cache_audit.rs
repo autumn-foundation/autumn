@@ -53,6 +53,12 @@ pub struct CacheAuditOptions<'a> {
     /// or a repository behind a non-default feature is simply not compiled in,
     /// so it cannot appear in the manifest and cannot be found incoherent.
     pub features: routes::CargoFeatures,
+    /// Cargo profile the audited binary is built under.
+    ///
+    /// The manifest describes the binary that produced it. A `#[cached]` read
+    /// behind `#[cfg(not(debug_assertions))]` exists only in a release build,
+    /// so auditing the debug binary is a green gate on a build nobody ships.
+    pub profile: routes::CargoProfile,
 }
 
 /// Render the human report for a manifest.
@@ -178,13 +184,15 @@ pub fn write_manifest(manifest: &CoherenceManifest, path: &std::path::Path) -> s
 pub fn run(opts: &CacheAuditOptions<'_>) {
     eprintln!("\u{1F342} autumn cache audit\n");
     // Say which build is being audited whenever it is not the default one, so
-    // a manifest is never mistaken for a claim about a feature set it was not
-    // built under.
-    if !opts.features.is_default() {
-        eprintln!("Building with {}\n", opts.features.to_args().join(" "));
+    // a manifest is never mistaken for a claim about a feature set or profile
+    // it was not built under.
+    let mut build_flags = opts.features.to_args();
+    build_flags.extend(opts.profile.to_args());
+    if !build_flags.is_empty() {
+        eprintln!("Building with {}\n", build_flags.join(" "));
     }
-    routes::compile_binary_with(opts.package, opts.bin, &opts.features);
-    let binary = routes::find_binary(opts.package, opts.bin);
+    routes::compile_binary_with(opts.package, opts.bin, &opts.features, &opts.profile);
+    let binary = routes::find_binary_in_profile(opts.package, opts.bin, &opts.profile);
 
     let output = Command::new(&binary)
         .env("AUTUMN_DUMP_CACHE_COHERENCE", "1")

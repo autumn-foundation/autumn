@@ -405,8 +405,14 @@ pub fn run(opts: &GraphOptions<'_>) {
     if opts.release {
         eprintln!("Building the release profile\n");
     }
-    routes::compile_binary_with_profile(opts.package, opts.bin, &opts.features, opts.release);
-    let binary = routes::find_binary_in_profile(opts.package, opts.bin, opts.release);
+    routes::compile_binary_with(
+        opts.package,
+        opts.bin,
+        &opts.features,
+        &routes::CargoProfile::from_release(opts.release),
+    );
+    let binary =
+        routes::find_binary_in_profile(opts.package, opts.bin, &routes::CargoProfile::from_release(opts.release));
 
     let output = Command::new(&binary)
         .env(DUMP_ENV, "1")

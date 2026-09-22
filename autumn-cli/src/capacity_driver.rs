@@ -382,8 +382,13 @@ fn build_binary(opts: &CalibrateOptions<'_>, features: &crate::routes::CargoFeat
     // The deployed binary's feature selection is forwarded verbatim. Measuring
     // a default-feature build and then enforcing its limit on a production
     // binary that enables more is a contract about a program nobody runs.
-    crate::routes::compile_binary_with_profile(opts.package, opts.bin, features, true);
-    crate::routes::find_binary_in_profile(opts.package, opts.bin, true)
+    crate::routes::compile_binary_with(
+        opts.package,
+        opts.bin,
+        features,
+        &crate::routes::CargoProfile::from_release(true),
+    );
+    crate::routes::find_binary_in_profile(opts.package, opts.bin, &crate::routes::CargoProfile::from_release(true))
 }
 
 /// Directory the calibrated package's `autumn.toml` lives in.
