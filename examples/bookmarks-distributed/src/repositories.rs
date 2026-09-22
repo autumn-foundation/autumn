@@ -7,7 +7,7 @@ use diesel::OptionalExtension;
 use diesel::QueryableByName;
 use diesel::prelude::*;
 use diesel::result::{Error as DieselError, QueryResult};
-use diesel::sql_types::{BigInt, Text};
+use diesel::sql_types::{Array, BigInt, Text};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::deadpool::Pool;
@@ -234,24 +234,31 @@ impl BookmarkRepository {
         Ok(())
     }
 
-    /// Mark every id in `ids` that is still alive as dead, in one round trip.
+    /// Mark every `(id, url)` in `dead` dead, in one round trip -- but only
+    /// the rows whose *current* `url` still matches the URL that was probed.
     ///
-    /// Ids already dead -- replica lag, a concurrent probe, or a concurrent
-    /// delete can make a row disappear from `alive = true` after the task
-    /// observed it -- are silently skipped via the `alive = true` filter
-    /// rather than erroring; the caller gets back how many rows the batch
-    /// actually flipped.
-    pub async fn mark_dead_many(&self, ids: &[i64]) -> AutumnResult<usize> {
-        if ids.is_empty() {
+    /// A row is skipped, silently, when: it's already dead (replica lag, a
+    /// concurrent probe, or a concurrent delete can make a row disappear
+    /// from `alive = true` after the task observed it), or its `url` has
+    /// changed since the probe -- `PUT /api/bookmarks/{id}` can repair a
+    /// bookmark's URL mid-scan (it never touches `alive`, so the row is
+    /// still a candidate `alive = true` match by id alone), and a repaired
+    /// URL was never itself probed, so it must not be the one this batch
+    /// marks dead. The caller gets back how many rows it actually flipped.
+    pub async fn mark_dead_many(&self, dead: &[(i64, String)]) -> AutumnResult<usize> {
+        if dead.is_empty() {
             return Ok(0);
         }
         let mut conn = Self::conn(BookmarkOperation::MarkDead).await?;
-        diesel::update(
-            bookmarks::table
-                .filter(bookmarks::id.eq_any(ids))
-                .filter(bookmarks::alive.eq(true)),
+        let ids: Vec<i64> = dead.iter().map(|(id, _)| *id).collect();
+        let urls: Vec<&str> = dead.iter().map(|(_, url)| url.as_str()).collect();
+        diesel::sql_query(
+            "UPDATE bookmarks AS b SET alive = false \
+             FROM unnest($1::bigint[], $2::text[]) AS d(id, url) \
+             WHERE b.id = d.id AND b.url = d.url AND b.alive = true",
         )
-        .set(bookmarks::alive.eq(false))
+        .bind::<Array<BigInt>, _>(ids)
+        .bind::<Array<Text>, _>(urls)
         .execute(&mut conn)
         .await
         .map_err(AutumnError::from)

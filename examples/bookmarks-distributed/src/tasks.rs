@@ -70,26 +70,27 @@ async fn process_shard(
 
     tracing::info!(shard, count = shard_alive.len(), "link-checker owns shard");
 
-    let mut dead_ids = Vec::new();
+    let mut dead = Vec::new();
     for (id, url) in shard_alive {
         let reachable = probe_reachable(client, &url).await;
 
         if !reachable {
             tracing::warn!("link-checker: dead link id={id} url={url}");
-            dead_ids.push(id);
+            dead.push((id, url));
         }
     }
 
-    let dead_count = if dead_ids.is_empty() {
+    let dead_count = if dead.is_empty() {
         0
     } else {
-        let found = dead_ids.len();
-        let affected = repo.mark_dead_many(&dead_ids).await?;
+        let found = dead.len();
+        let affected = repo.mark_dead_many(&dead).await?;
         if affected < found {
             tracing::debug!(
                 shard,
                 stale = found - affected,
-                "link-checker skipped already-dead or concurrently-deleted rows"
+                "link-checker skipped rows already dead, deleted, or whose URL changed \
+                 since being probed"
             );
         }
         u32::try_from(affected).expect("shard dead-link count must fit in u32")
@@ -270,20 +271,32 @@ mod tests {
 /// `process_shard`, same fixture, same session)
 ///
 /// ```text
-/// calls=16     buffers=9535       UPDATE "bookmarks" SET "alive" = $1 WHERE (("bookmarks"."id" = ANY($2)) AND ("bookmarks"."alive" = $3))
+/// calls=16     buffers=9509       UPDATE bookmarks AS b SET alive = $3 FROM unnest($1::bigint[], $2::text[]) AS d(id, url) WHERE b.id = d.id AND b.url = d.url AND b.alive = $4
 /// calls=16     buffers=2323       SELECT id, url FROM bookmarks WHERE alive = $3 AND (id % $1) = $2 ORDER BY id
 /// ```
 ///
 /// **calls: 780 -> 16** (one `UPDATE` per shard that found a dead link this
 /// run, all 16 of them here, instead of one per dead link -- statement count
 /// no longer scales with how many links rotted). Buffers are essentially
-/// unchanged (9518 -> 9535): the batched form still reads/writes the same
+/// unchanged (9518 -> 9509): the batched form still reads/writes the same
 /// 780 rows, so buffer *count* was never the defect here -- eliminating the
 /// N+1 is the win, exactly as the impact floor's "statement count per unit
-/// of work" criterion describes. `EXPLAIN` on the batched shape (a 3-id
-/// sample) shows the same `Index Scan using bookmarks_pkey`, now with
-/// `Index Cond: (bookmarks.id = ANY (...))`, confirming the primary-key
-/// index still drives every row lookup -- no seq scan was introduced.
+/// of work" criterion describes.
+///
+/// The batch matches on `(id, url)`, not `id` alone (review round 2, #2839):
+/// `PUT /api/bookmarks/{id}` never touches `alive` (`models.rs`'s `#[default]`
+/// exclusion keeps it off `UpdateBookmark`), so a URL repaired concurrently,
+/// after its old URL was probed but before this shard's batch write runs,
+/// would otherwise still match `id = ANY($1) AND alive = true` and get
+/// marked dead on the strength of a URL that was never probed -- and since
+/// nothing in this app ever sets `alive` back to `true`, that mark would be
+/// permanent. Matching the *probed* URL too means a row whose URL changed
+/// since the probe silently falls out of the batch (same "not found is fine"
+/// tolerance `mark_dead` used to give a deleted row, now covering a changed
+/// one too). `EXPLAIN` on the batched shape (a 3-id sample) shows a `Nested
+/// Loop` over the `unnest(...)` set into `Index Scan using bookmarks_pkey`
+/// (`Index Cond: (b.id = d.id)`, `Filter: (b.alive AND (d.url = b.url))`) --
+/// the primary-key index still drives every row lookup, no seq scan.
 #[cfg(test)]
 mod link_checker_batch_profile {
     use crate::db::create_dual_pools;
@@ -652,12 +665,23 @@ mod link_checker_batch_profile {
             .map(i64::to_string)
             .collect::<Vec<_>>()
             .join(",");
+        // The demo rows' URLs are deterministic from the seed above
+        // (`'http://127.0.0.1/explain-demo/' || gs`, `gs` 1..=3, `ORDER BY id`
+        // matching insertion order for a fresh `BIGSERIAL` batch), so they
+        // can be reconstructed here without a second query.
+        let demo_urls_sql = (1..=demo_ids.len())
+            .map(|gs| format!("'http://127.0.0.1/explain-demo/{gs}'"))
+            .collect::<Vec<_>>()
+            .join(",");
         explain(
             &mut conn,
-            "mark_dead_many: batched UPDATE (this PR's shape, one per shard)",
+            "mark_dead_many: batched UPDATE (this PR's shape, one per shard, \
+             url-matched against a concurrent repair)",
             &format!(
-                "UPDATE bookmarks SET alive = false \
-                 WHERE (id = ANY(ARRAY[{demo_ids_sql}])) AND alive = true"
+                "UPDATE bookmarks AS b SET alive = false \
+                 FROM unnest(ARRAY[{demo_ids_sql}]::bigint[], ARRAY[{demo_urls_sql}]::text[]) \
+                   AS d(id, url) \
+                 WHERE b.id = d.id AND b.url = d.url AND b.alive = true"
             ),
         );
     }
