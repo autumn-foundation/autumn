@@ -1,4 +1,4 @@
-# 🗃️ Ledger: batch cms `ensure_unique_slug` collision probe (statements up to 199→1)
+# 🗃️ Ledger: batch cms `ensure_unique_slug` collision probe (statements up to 199→2, common case unchanged at 1)
 
 ## 🎯 Workload
 
@@ -34,10 +34,13 @@ on one page, plus 60 pre-existing collisions on the profiled slug itself
 (`some-title`, `some-title-2`, … `some-title-60`) — the shape a recurring
 title or a scripted import naturally produces. A follow-up `UPDATE` before
 `ANALYZE`, no `VACUUM`, gives the table real dead tuples, the same technique
-every other Ledger fixture in this repo uses. The profiled call is
-`ensure_unique_slug(conn, "post", "some-title", None, None)`, called
-directly (the real function, not a hand-rolled duplicate query) — no HTTP
-round trip is needed since the function takes a plain `AsyncPgConnection`.
+every other Ledger fixture in this repo uses. Two calls are profiled, both
+directly against the real function (not a hand-rolled duplicate query, no
+HTTP round trip needed since it takes a plain `AsyncPgConnection`):
+`ensure_unique_slug(conn, "post", "some-title", None, None)` (the 60-collision
+case) and `ensure_unique_slug(conn, "post", "brand-new-unused-title", None,
+None)` (zero collisions — the overwhelmingly common case in production,
+added after review — see "Revision" below).
 
 **Reproduce**:
 ```bash
@@ -55,8 +58,14 @@ per-row-loop finding in this repo's history (`ledger_dd_comments`,
 `collection_links` insert loop, …): the loop *is* the measured cost, and it
 is invisible in a buffer ranking because each individual `COUNT` is cheap.
 By `calls`, the unbatched `SELECT COUNT(*)` statement is 100% of the
-`posts`-touching statements this call issues before the fix (61 of 61) and
-0% after (0 of 1).
+`posts`-touching statements this call issues before the fix (61 of 61).
+
+The *call-frequency* profile matters as much as the buffer profile here: the
+61-collision case is the expensive tail, but the zero-collision case is the
+overwhelming majority of real calls (most titles are not reused). A fix
+graded only on the collision-heavy scenario can look free while actually
+taxing the common path — see "Revision" below, where exactly that was
+caught in review.
 
 ## 🧭 Plan (before/after `EXPLAIN`)
 
@@ -75,8 +84,14 @@ Execution Time: 0.114 ms
 ```
 This shape repeats **61 times** in sequence — one per candidate, from
 `some-title` through `some-title-61` — before the first free one is found.
+(After the fix, this exact shape still runs, but **only once** — as the
+fast-path probe of `candidates[0]`, shown as `buffers=10` above with the
+real fixture's row count, vs. `shared hit=8` in this smaller illustrative
+`EXPLAIN`.)
 
-**After** (batched shape, one call for the whole 61-candidate list):
+**After, fallback path** (batched shape, one call for the remaining
+60-candidate list, reached only because the fast-path probe above found
+`some-title` taken):
 ```
 SELECT slug FROM posts WHERE slug = ANY(ARRAY['some-title','some-title-2',...,'some-title-61']) AND post_type = ANY(ARRAY['post', 'page']) AND (post_type = 'post' OR parent_id IS NULL)
 Seq Scan on public.posts  (cost=0.15..21.35 rows=61 width=12) (actual time=0.096..0.130 rows=60 loops=1)
@@ -113,15 +128,27 @@ list.
 ordered candidate list the original loop would have enumerated — same
 starting point (`desired`, or `desired-2` when `shadowed_by_a_route`), same
 `2..=199` suffix bound, same off-by-one boundary (`desired-200` is never
-itself queried) — then issues **one** query:
-`posts::slug.eq_any(&candidates)` combined with the exact same scope filters
-that already existed (`competing_types`, nested-page/bare-path parent
-scoping, `exclude_id`), selecting just `posts::slug`. The returned rows
-collect into a `HashSet<String>` of taken candidates, and the first
-candidate in the original list *not* in that set wins — the same
-"first free wins" rule the loop applied one probe at a time. If every
-candidate is taken, the same `AutumnError::unprocessable_msg("Too many
-posts share this slug; choose a different one")` is returned.
+itself queried) — then resolves it in **at most two** queries instead of up
+to 199:
+
+1. **Fast-path probe**: the same single-value, index-backed
+   `SELECT COUNT(*) WHERE slug = $1` shape the original loop's very first
+   iteration used, checking only `candidates[0]`. If free (the common case),
+   return it immediately — one cheap statement, identical in shape and cost
+   to what the unfixed code already paid for this case.
+2. **Batched fallback**: only reached when the first candidate collides.
+   Issues **one** query — `posts::slug.eq_any(&candidates[1..])` combined
+   with the exact same scope filters that already existed
+   (`competing_types`, nested-page/bare-path parent scoping, `exclude_id`),
+   selecting just `posts::slug`. The returned rows collect into a
+   `HashSet<String>` of taken candidates, and the first remaining candidate
+   *not* in that set wins — the same "first free wins" rule the loop
+   applied one probe at a time. If every candidate is taken, the same
+   `AutumnError::unprocessable_msg("Too many posts share this slug; choose
+   a different one")` is returned.
+
+(See "Revision" below for why this is two queries rather than the one a
+first pass at this fix used.)
 
 One behavioral wrinkle is deliberately **not** reproduced: in the
 `shadowed_by_a_route` case, the original loop rechecks `desired-2` a second
@@ -139,16 +166,19 @@ indexed on every filter shape this query uses.
 
 | Scenario | Metric | Before | After | Tool |
 |---|---|---:|---:|---|
-| `ensure_unique_slug` (60 pre-existing collisions, "post") | `SELECT ... slug` statements | 61 | **1** | `pg_stat_statements.calls` |
-| same | buffers (hit+read) | 325 | 14 | `pg_stat_statements` |
+| `ensure_unique_slug` (60 pre-existing collisions, "post") | statements | 61 | **2** | `pg_stat_statements.calls` |
+| same | buffers (hit+read) | 325 | 24 (10 probe + 14 batch) | `pg_stat_statements` |
+| `ensure_unique_slug` (0 collisions — the common case) | statements | 1 | **1** (unchanged) | `pg_stat_statements.calls` |
+| same | buffers (hit+read) | 4 | 4 (unchanged) | `pg_stat_statements` |
 
-Buffers drop too here (325→14) — unlike the wiki `collection_links` INSERT
-finding, this is a **read** loop: 61 separate index probes (8 buffers each)
-cost more total I/O than one scan that touches the table once. That is a
-secondary benefit; the primary, gating criterion is the statement-count
-elimination itself: **"Elimination of an N+1 — statement count per request
-drops from O(n) to O(1)"**, which this clears independent of the buffer
-delta.
+The collision-heavy case goes from O(n) round trips to a constant 2 — still
+clears **"Elimination of an N+1 — statement count per request drops from
+O(n) to O(1)"** independent of the buffer delta. The common, zero-collision
+case — the overwhelming majority of real calls — is **unchanged**: same one
+statement, same buffer count, because the fast-path probe reproduces
+exactly the query shape the original loop's first iteration already paid
+for. That equality (not just "no regression") is what the added common-case
+profiled scenario asserts.
 
 ## ✅ Equivalence
 
@@ -208,3 +238,27 @@ cargo clippy -p cms --all-targets --all-features -- -D warnings
 cargo test -p cms
 cargo test -p cms --test integration_test -- --ignored --test-threads=1
 ```
+
+## 📝 Revision
+
+The PR's first commit batched the *entire* candidate list into one
+`eq_any(&candidates)` query unconditionally — every call, collision or not.
+Review (Codex, PR #2910) caught that this regresses the common,
+zero-collision path: on this fixture's 361-row table the planner resolves a
+~199-literal `ANY()` array via a **sequential scan** rather than the single
+indexed probe the original loop's first iteration used for the same case,
+because scanning 361 rows once is cheaper than the planner's cost model
+expects ~199 targeted index probes to be. A bigger production table would
+likely keep the index scan, but the underlying point holds regardless of
+plan shape: checking up to 199 candidates in one query is strictly more
+work than checking 1, and the zero-collision call — not the 60-collision
+one — is what nearly every real invocation of this function actually is.
+
+The fix above is the two-phase version: probe `candidates[0]` alone first
+(matches the original loop's first iteration exactly), and only reach for
+the batched query when that probe finds a collision. The added
+zero-collision profiled scenario in the Measurement table is what proves
+the common path is now byte-for-byte as cheap as before, not just
+"probably fine" — `any calls=0` in that scenario's `pg_stat_statements`
+snapshot means the batched query never runs at all when there is nothing to
+batch.

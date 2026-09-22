@@ -2405,12 +2405,71 @@ pub async fn ensure_unique_slug(
             .collect()
     };
 
-    let mut query = posts::table
-        .filter(posts::slug.eq_any(&candidates))
+    // The overwhelming common case is zero collisions: a title nobody has
+    // used before frees on the very first candidate. Probing that one alone
+    // — the same single-value, index-backed shape the original loop's first
+    // iteration used — keeps that path exactly as cheap as before. Batching
+    // the full ~199-candidate list into one `= ANY(...)` unconditionally
+    // would instead widen the WHERE clause enough that the planner can
+    // reach for a sequential scan even for a request that only needed to
+    // rule out one slug — trading an N+1 on the rare collision-heavy path
+    // for a regression on the common one. Only a collision on this first
+    // probe falls through to the batched query, for the remaining
+    // candidates, and it is *that* path — not the common one — that this
+    // fix is for.
+    let mut probe = posts::table
+        .filter(posts::slug.eq(&candidates[0]))
         .filter(posts::post_type.eq_any(&competing_types))
         .into_boxed();
-    // Siblings only, for a nested page — and for a top-level page or a
-    // post, the bare-path namespace, which nested pages are not in.
+    probe = apply_slug_scope(probe, post_type, parent_id, nested_page, exclude_id);
+    let first_taken: i64 = probe.count().get_result(conn).await?;
+    if first_taken == 0 {
+        return Ok(candidates
+            .into_iter()
+            .next()
+            .expect("candidates is non-empty"));
+    }
+
+    let remaining = &candidates[1..];
+    let mut query = posts::table
+        .filter(posts::slug.eq_any(remaining))
+        .filter(posts::post_type.eq_any(&competing_types))
+        .into_boxed();
+    query = apply_slug_scope(query, post_type, parent_id, nested_page, exclude_id);
+    // One round trip for the rest of the candidate list, instead of one per
+    // suffix: every existing row that holds ANY remaining candidate, in a
+    // single query, then the first candidate not among them wins in Rust —
+    // the same "first free wins" rule the original loop applied one probe
+    // at a time.
+    let taken: HashSet<String> = query
+        .select(posts::slug)
+        .load(conn)
+        .await?
+        .into_iter()
+        .collect();
+
+    remaining
+        .iter()
+        .find(|candidate| !taken.contains(*candidate))
+        .cloned()
+        // 199 collisions on one slug is not a naming accident. Refuse rather
+        // than loop further or silently overwrite.
+        .ok_or_else(|| {
+            AutumnError::unprocessable_msg("Too many posts share this slug; choose a different one")
+        })
+}
+
+/// Siblings only, for a nested page — and for a top-level page or a post,
+/// the bare-path namespace, which nested pages are not in. Shared between
+/// `ensure_unique_slug`'s fast-path single probe and its batched fallback so
+/// the two stay scoped identically.
+fn apply_slug_scope<'a>(
+    mut query: posts::BoxedQuery<'a, diesel::pg::Pg>,
+    post_type: &str,
+    parent_id: Option<i64>,
+    nested_page: bool,
+    exclude_id: Option<i64>,
+) -> posts::BoxedQuery<'a, diesel::pg::Pg> {
     query = match parent_id {
         Some(parent) if nested_page => query.filter(posts::parent_id.eq(parent)),
         _ if BARE_PATH_TYPES.contains(&post_type) => {
@@ -2421,26 +2480,7 @@ pub async fn ensure_unique_slug(
     if let Some(id) = exclude_id {
         query = query.filter(posts::id.ne(id));
     }
-    // One round trip for the whole candidate list, instead of one per
-    // suffix: every existing row that holds ANY candidate, in a single
-    // query, then the first candidate not among them wins in Rust — the
-    // same "first free wins" rule the original loop applied one probe at a
-    // time.
-    let taken: HashSet<String> = query
-        .select(posts::slug)
-        .load(conn)
-        .await?
-        .into_iter()
-        .collect();
-
-    candidates
-        .into_iter()
-        .find(|candidate| !taken.contains(candidate))
-        // 199 collisions on one slug is not a naming accident. Refuse rather
-        // than loop further or silently overwrite.
-        .ok_or_else(|| {
-            AutumnError::unprocessable_msg("Too many posts share this slug; choose a different one")
-        })
+    query
 }
 
 /// The deepest page hierarchy the site will address.

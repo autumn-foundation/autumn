@@ -297,6 +297,30 @@ async fn ensure_unique_slug_batch_profile() {
     drop(async_conn);
     let profile = print_profile(&mut conn, "60 pre-existing collisions -> some-title-61");
 
+    // === Profiled call: the overwhelming common case in production — a
+    // brand-new title with zero prior collisions. This is what the fast
+    // path (a single indexed probe of the first candidate alone) exists to
+    // keep cheap: it must cost the same one small statement the original
+    // per-suffix loop's first iteration cost, not the batched ~199-candidate
+    // query the collision path uses. ===
+    reset_stats(&mut conn);
+    let mut async_conn = pool.get().await.expect("async conn");
+    let allocated = ensure_unique_slug(
+        &mut async_conn,
+        "post",
+        "brand-new-unused-title",
+        None,
+        None,
+    )
+    .await
+    .expect("a free slug must be found immediately when there is no collision");
+    assert_eq!(allocated, "brand-new-unused-title");
+    drop(async_conn);
+    let common_case_profile = print_profile(
+        &mut conn,
+        "0 pre-existing collisions (the common case) -> brand-new-unused-title",
+    );
+
     println!("\n=== statement-count summary ===");
     println!(
         "{:<45} {:>12} {:>14} {:>10} {:>12}",
@@ -305,6 +329,19 @@ async fn ensure_unique_slug_batch_profile() {
     println!(
         "{:<45} {:>12} {:>14} {:>10} {:>12}",
         "ensure_unique_slug (60 collisions)", profile.0, profile.1, profile.2, profile.3
+    );
+    println!(
+        "{:<45} {:>12} {:>14} {:>10} {:>12}",
+        "ensure_unique_slug (0 collisions, common case)",
+        common_case_profile.0,
+        common_case_profile.1,
+        common_case_profile.2,
+        common_case_profile.3
+    );
+    assert_eq!(
+        common_case_profile.2, 0,
+        "the common zero-collision case must never reach the batched ANY() query \
+         -- the fast-path single probe must resolve it alone"
     );
 
     explain(
