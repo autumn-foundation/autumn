@@ -6,6 +6,8 @@
 //! post's terms *and* the affected terms' post counts. Handlers call these; they
 //! never open a transaction themselves.
 
+use std::collections::HashSet;
+
 use autumn_web::AutumnError;
 use autumn_web::AutumnResult;
 use diesel::prelude::*;
@@ -2381,39 +2383,64 @@ pub async fn ensure_unique_slug(
     let shadowed_by_a_route = !nested_page
         && BARE_PATH_TYPES.contains(&post_type)
         && segment_claim(desired, None).is_some();
-    let mut candidate = if shadowed_by_a_route {
-        format!("{desired}-2")
+
+    // The exact candidates the original suffix-at-a-time loop would have
+    // queried, in the same order and with the same off-by-one boundary:
+    // `desired-200` is never itself reached (the loop's `2..=200` range,
+    // combined with its check-then-advance structure, means the last
+    // candidate it ever queries is `desired-199`), so 199 taken candidates —
+    // not 200 — is what exhausts the search. A `shadowed_by_a_route` desired
+    // slug starts one suffix further in, at `desired-2`, because `desired`
+    // itself is reserved by a route rather than by another row; the original
+    // loop also rechecks `desired-2` a second time via its carried-over
+    // candidate, a redundant, idempotent recheck (the same string can't
+    // become "more taken" the second time) that is dropped here rather than
+    // reproduced.
+    let suffixed = (2..=199u32).map(|suffix| format!("{desired}-{suffix}"));
+    let candidates: Vec<String> = if shadowed_by_a_route {
+        suffixed.collect()
     } else {
-        desired.to_owned()
+        std::iter::once(desired.to_owned())
+            .chain(suffixed)
+            .collect()
     };
-    for suffix in 2..=200u32 {
-        let mut query = posts::table
-            .filter(posts::slug.eq(candidate.clone()))
-            .filter(posts::post_type.eq_any(&competing_types))
-            .into_boxed();
-        // Siblings only, for a nested page — and for a top-level page or a
-        // post, the bare-path namespace, which nested pages are not in.
-        query = match parent_id {
-            Some(parent) if nested_page => query.filter(posts::parent_id.eq(parent)),
-            _ if BARE_PATH_TYPES.contains(&post_type) => {
-                query.filter(posts::post_type.eq("post").or(posts::parent_id.is_null()))
-            }
-            _ => query,
-        };
-        if let Some(id) = exclude_id {
-            query = query.filter(posts::id.ne(id));
+
+    let mut query = posts::table
+        .filter(posts::slug.eq_any(&candidates))
+        .filter(posts::post_type.eq_any(&competing_types))
+        .into_boxed();
+    // Siblings only, for a nested page — and for a top-level page or a
+    // post, the bare-path namespace, which nested pages are not in.
+    query = match parent_id {
+        Some(parent) if nested_page => query.filter(posts::parent_id.eq(parent)),
+        _ if BARE_PATH_TYPES.contains(&post_type) => {
+            query.filter(posts::post_type.eq("post").or(posts::parent_id.is_null()))
         }
-        let taken: i64 = query.count().get_result(conn).await?;
-        if taken == 0 {
-            return Ok(candidate);
-        }
-        candidate = format!("{desired}-{suffix}");
+        _ => query,
+    };
+    if let Some(id) = exclude_id {
+        query = query.filter(posts::id.ne(id));
     }
-    // 200 collisions on one slug is not a naming accident. Refuse rather than
-    // loop or silently overwrite.
-    Err(AutumnError::unprocessable_msg(
-        "Too many posts share this slug; choose a different one",
-    ))
+    // One round trip for the whole candidate list, instead of one per
+    // suffix: every existing row that holds ANY candidate, in a single
+    // query, then the first candidate not among them wins in Rust — the
+    // same "first free wins" rule the original loop applied one probe at a
+    // time.
+    let taken: HashSet<String> = query
+        .select(posts::slug)
+        .load(conn)
+        .await?
+        .into_iter()
+        .collect();
+
+    candidates
+        .into_iter()
+        .find(|candidate| !taken.contains(candidate))
+        // 199 collisions on one slug is not a naming accident. Refuse rather
+        // than loop further or silently overwrite.
+        .ok_or_else(|| {
+            AutumnError::unprocessable_msg("Too many posts share this slug; choose a different one")
+        })
 }
 
 /// The deepest page hierarchy the site will address.
