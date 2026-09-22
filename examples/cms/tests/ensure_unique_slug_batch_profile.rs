@@ -350,13 +350,21 @@ async fn ensure_unique_slug_batch_profile() {
         "SELECT count(*) FROM posts WHERE slug = 'some-title-30' AND post_type = ANY(ARRAY['post', 'page']) \
          AND (post_type = 'post' OR parent_id IS NULL)",
     );
-    let any_list = std::iter::once("'some-title'".to_owned())
-        .chain((2..=61u32).map(|s| format!("'some-title-{s}'")))
+    // The real fallback always sends the FULL remaining candidate list
+    // (`some-title-2` through `some-title-199`, 198 literals) regardless of
+    // how many of them are actually taken -- it can't know that in advance,
+    // which is the whole point of asking in one round trip. Matching that
+    // exactly here (not truncating to the fixture's 60 collisions) matters:
+    // array cardinality affects the planner's index-vs-sequential-scan
+    // choice, so a truncated illustrative array would not be evidence about
+    // the query the fixed function actually executes.
+    let any_list = (2..=199u32)
+        .map(|s| format!("'some-title-{s}'"))
         .collect::<Vec<_>>()
         .join(",");
     explain(
         &mut conn,
-        "batched slug ANY() probe shape (the fix, one call for the whole candidate list)",
+        "batched slug ANY() probe shape (the fix's fallback, one call for the full remaining candidate list)",
         &format!(
             "SELECT slug FROM posts WHERE slug = ANY(ARRAY[{any_list}]) \
              AND post_type = ANY(ARRAY['post', 'page']) AND (post_type = 'post' OR parent_id IS NULL)"

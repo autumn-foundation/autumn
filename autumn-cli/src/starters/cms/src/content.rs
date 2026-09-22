@@ -2384,55 +2384,53 @@ pub async fn ensure_unique_slug(
         && BARE_PATH_TYPES.contains(&post_type)
         && segment_claim(desired, None).is_some();
 
-    // The exact candidates the original suffix-at-a-time loop would have
-    // queried, in the same order and with the same off-by-one boundary:
-    // `desired-200` is never itself reached (the loop's `2..=200` range,
-    // combined with its check-then-advance structure, means the last
-    // candidate it ever queries is `desired-199`), so 199 taken candidates —
-    // not 200 — is what exhausts the search. A `shadowed_by_a_route` desired
-    // slug starts one suffix further in, at `desired-2`, because `desired`
-    // itself is reserved by a route rather than by another row; the original
-    // loop also rechecks `desired-2` a second time via its carried-over
-    // candidate, a redundant, idempotent recheck (the same string can't
-    // become "more taken" the second time) that is dropped here rather than
-    // reproduced.
-    let suffixed = (2..=199u32).map(|suffix| format!("{desired}-{suffix}"));
-    let candidates: Vec<String> = if shadowed_by_a_route {
-        suffixed.collect()
+    // The first candidate the original suffix-at-a-time loop would have
+    // queried: `desired` itself, or `desired-2` when `shadowed_by_a_route`
+    // (that slug is reserved by a route rather than by another row, so the
+    // search starts one suffix further in).
+    let first_candidate = if shadowed_by_a_route {
+        format!("{desired}-2")
     } else {
-        std::iter::once(desired.to_owned())
-            .chain(suffixed)
-            .collect()
+        desired.to_owned()
     };
 
     // The overwhelming common case is zero collisions: a title nobody has
     // used before frees on the very first candidate. Probing that one alone
     // — the same single-value, index-backed shape the original loop's first
-    // iteration used — keeps that path exactly as cheap as before. Batching
-    // the full ~199-candidate list into one `= ANY(...)` unconditionally
-    // would instead widen the WHERE clause enough that the planner can
-    // reach for a sequential scan even for a request that only needed to
-    // rule out one slug — trading an N+1 on the rare collision-heavy path
-    // for a regression on the common one. Only a collision on this first
-    // probe falls through to the batched query, for the remaining
-    // candidates, and it is *that* path — not the common one — that this
-    // fix is for.
+    // iteration used, and the only string this path allocates — keeps that
+    // case exactly as cheap as before: no wider `= ANY(...)` query the
+    // planner might resolve with a sequential scan, and no wasted formatting
+    // of the ~198 suffixes that turn out not to be needed. Only a collision
+    // here falls through to building and batching the rest of the candidate
+    // list, and it is *that* path — not the common one — that this fix is
+    // for.
     let mut probe = posts::table
-        .filter(posts::slug.eq(&candidates[0]))
+        .filter(posts::slug.eq(&first_candidate))
         .filter(posts::post_type.eq_any(&competing_types))
         .into_boxed();
     probe = apply_slug_scope(probe, post_type, parent_id, nested_page, exclude_id);
     let first_taken: i64 = probe.count().get_result(conn).await?;
     if first_taken == 0 {
-        return Ok(candidates
-            .into_iter()
-            .next()
-            .expect("candidates is non-empty"));
+        return Ok(first_candidate);
     }
 
-    let remaining = &candidates[1..];
+    // Reached only on a collision. The rest of the candidates the original
+    // loop would have queried, in the same order and with the same
+    // off-by-one boundary: `desired-200` is never itself reached (the
+    // loop's `2..=200` range, combined with its check-then-advance
+    // structure, means the last candidate it ever queries is
+    // `desired-199`), so 199 taken candidates — not 200 — is what exhausts
+    // the search. The original loop also rechecks `desired-2` a second time
+    // via its carried-over candidate in the `shadowed_by_a_route` case, a
+    // redundant, idempotent recheck (the same string can't become "more
+    // taken" the second time) that is dropped here rather than reproduced.
+    let first_suffix = if shadowed_by_a_route { 3 } else { 2 };
+    let remaining: Vec<String> = (first_suffix..=199u32)
+        .map(|suffix| format!("{desired}-{suffix}"))
+        .collect();
+
     let mut query = posts::table
-        .filter(posts::slug.eq_any(remaining))
+        .filter(posts::slug.eq_any(&remaining))
         .filter(posts::post_type.eq_any(&competing_types))
         .into_boxed();
     query = apply_slug_scope(query, post_type, parent_id, nested_page, exclude_id);
@@ -2449,9 +2447,8 @@ pub async fn ensure_unique_slug(
         .collect();
 
     remaining
-        .iter()
-        .find(|candidate| !taken.contains(*candidate))
-        .cloned()
+        .into_iter()
+        .find(|candidate| !taken.contains(candidate))
         // 199 collisions on one slug is not a naming accident. Refuse rather
         // than loop further or silently overwrite.
         .ok_or_else(|| {

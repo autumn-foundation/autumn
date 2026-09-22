@@ -89,22 +89,31 @@ fast-path probe of `candidates[0]`, shown as `buffers=10` above with the
 real fixture's row count, vs. `shared hit=8` in this smaller illustrative
 `EXPLAIN`.)
 
-**After, fallback path** (batched shape, one call for the remaining
-60-candidate list, reached only because the fast-path probe above found
-`some-title` taken):
+**After, fallback path** (batched shape, one call for the **full remaining
+198-candidate list** — `some-title-2` through `some-title-199` — reached
+only because the fast-path probe above found `some-title` taken; the real
+function always sends the full remaining list here, not just enough to
+cover the fixture's 60 collisions, since it can't know the collision count
+in advance):
 ```
-SELECT slug FROM posts WHERE slug = ANY(ARRAY['some-title','some-title-2',...,'some-title-61']) AND post_type = ANY(ARRAY['post', 'page']) AND (post_type = 'post' OR parent_id IS NULL)
-Seq Scan on public.posts  (cost=0.15..21.35 rows=61 width=12) (actual time=0.096..0.130 rows=60 loops=1)
+SELECT slug FROM posts WHERE slug = ANY(ARRAY['some-title-2','some-title-3',...,'some-title-199']) AND post_type = ANY(ARRAY['post', 'page']) AND (post_type = 'post' OR parent_id IS NULL)
+Seq Scan on public.posts  (cost=0.49..21.70 rows=198 width=12) (actual time=0.101..0.132 rows=59 loops=1)
   Output: slug
   Filter: ((posts.post_type = ANY ('{post,page}'::text[])) AND ((posts.post_type = 'post'::text) OR (posts.parent_id IS NULL)) AND (posts.slug = ANY (...)))
-  Rows Removed by Filter: 300
+  Rows Removed by Filter: 301
   Buffers: shared hit=14
-Execution Time: 0.141 ms
+Execution Time: 0.154 ms
 ```
 The planner picks a sequential scan over the index here (361-row fixture,
-61-value `ANY()` list — cheaper than 61 index probes), which is a planner
-choice, not something the fix mandates; on a table with many more rows and
-a more selective type filter it may choose the index instead. Either way it
+198-value `ANY()` list — cheaper than up to 198 index probes), which is a
+planner choice, not something the fix mandates; on a table with many more
+rows and a more selective type filter it may choose the index instead.
+Buffers are unchanged from the 61-item illustration above (`shared hit=14`
+either way — a wider `ANY()` array over the same small fixture doesn't cost
+more once the planner has already committed to a sequential scan), and the
+`pg_stat_statements` snapshot in the Measurement table below is the real
+number either way, captured from the actual function call, not this
+illustrative query. Either way it
 is **one** round trip, carrying the whole candidate list instead of paying
 network/parse/plan overhead per candidate. Full output in
 `baseline/output.txt` and `after/output.txt`.
@@ -262,3 +271,44 @@ the common path is now byte-for-byte as cheap as before, not just
 "probably fine" — `any calls=0` in that scenario's `pg_stat_statements`
 snapshot means the batched query never runs at all when there is nothing to
 batch.
+
+### Second round
+
+A follow-up review caught two more real issues in that two-phase commit,
+both fixed here:
+
+1. **The fast-path probe still built all ~199 candidate strings before
+   checking any of them.** The two-phase version still collected the whole
+   ordered `candidates: Vec<String>` up front, `format!`-ing and
+   heap-allocating every suffix, then only *queried* the first one. A
+   zero-collision save — the common case — paid for ~198 unnecessary
+   allocations of strings it never used. Fixed by computing only
+   `first_candidate` up front (one allocation, matching what the original
+   loop's first iteration allocated) and building the rest of the ordered
+   list — now a plain `(first_suffix..=199u32).map(...).collect()` — only
+   after that probe reports a collision. No behavior change: the candidate
+   order, the `shadowed_by_a_route` starting point, and the 199-candidate
+   boundary are identical; this only moves *when* the strings after the
+   first are allocated.
+2. **The harness's illustrative fallback `EXPLAIN` didn't match what the
+   fixed function actually sends.** It hand-built an `ANY()` array sized to
+   the fixture's 60 collisions (`some-title` through `some-title-61`, 61
+   items) rather than the full remaining candidate space the real fallback
+   query always sends regardless of collision count (`some-title-2` through
+   `some-title-199`, 198 items, since `some-title` itself is now checked
+   separately by the fast-path probe). Array cardinality can change the
+   planner's index-vs-sequential-scan decision, so a truncated illustration
+   was not evidence about the query the function actually runs. Fixed by
+   building the illustrative array with the same bounds
+   (`first_suffix..=199`) the real fallback uses. The plan shape and buffer
+   count (`shared hit=14`) are unchanged with the corrected 198-item array —
+   this fixture is small enough that the wider array doesn't change the
+   planner's sequential-scan choice — but the illustration now actually
+   proves that instead of assuming it.
+
+Neither changes the Measurement table's numbers (both were re-captured
+after these fixes and are unchanged: 2 statements / 24 buffers for the
+60-collision case, 1 statement / 4 buffers, unchanged, for the 0-collision
+case) or any equivalence assertion — `cargo test -p cms --test
+ensure_unique_slug_batch_profile -- --ignored --nocapture --test-threads=1`
+still reports "All equivalence checks passed."
