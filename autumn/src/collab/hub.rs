@@ -303,9 +303,10 @@ pub enum CollabServerMessage {
         /// for one ([`CollabSession::snapshot`]).
         ///
         /// A client needs it to recognise its own operations coming back. It
-        /// sends an edit and waits for the echo before diffing again; without
-        /// a way to tell "my edit landed" from "somebody else typed", a second
-        /// keystroke inside one round trip would re-send the first.
+        /// holds a placeholder for each character it sent and drops the
+        /// placeholder when the echo names it; without a way to tell "my edit
+        /// landed" from "somebody else typed", a second keystroke inside one
+        /// round trip would re-send the first.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<String>,
     },
@@ -1541,20 +1542,51 @@ impl Drop for CollabSession {
 ///
 /// This is the whole client protocol: join, send the snapshot, then forward
 /// every broadcast to the socket and every socket message to the hub. An app
-/// wires collaboration in one line of its `#[ws]` handler.
+/// wires collaboration in one line of its `#[ws]` handler — **after**
+/// authorizing the record, as below.
 ///
 /// `actor` must be unique per connection — it is the id every character this
 /// editor types carries.
 ///
+/// # `doc` must come from an authorized load, never a raw client-supplied key
+///
+/// [`serve_socket`] and the [`CollabDoc`] it drives apply no ownership check
+/// of their own: anyone who reaches the socket can read and edit whatever
+/// document `doc` names. Resolve and authorize the record first — the same
+/// way any other handler would — and only then open the document:
+///
 /// ```rust,ignore
 /// #[ws("/notes/{id}/collab")]
-/// async fn collaborate(state: AppState, hub: CollabHub, id: Path<i64>) -> impl WsHandler {
-///     let doc = hub.document(&doc_key("notes", *id, "body"));
+/// async fn collaborate(
+///     state: AppState,
+///     hub: CollabHub,
+///     session: Session,
+///     id: Path<i64>,
+/// ) -> impl WsHandler {
+///     let note_id = *id;
+///     // Authorize the RECORD, then load it, then open the document. Never
+///     // open from a client-supplied key before that: the hub would
+///     // allocate a live (empty) document for every id a caller can type.
+///     let note = load_note_for(&session, note_id).await;
+///     let doc = note.and_then(|note| {
+///         hub.open_with(&doc_key("notes", note_id, "body"), || note.body.clone()).ok()
+///     });
 ///     // Through the injected entropy, never `Uuid::new_v4` (#1797).
 ///     let actor = state.entropy().uuid_v4().to_string();
-///     move |socket| async move { serve_socket(&doc, actor, "Guest", socket).await }
+///     move |socket| async move {
+///         // Not allowed, no such note, or the registry is full.
+///         let Some(doc) = doc else { return };
+///         serve_socket(&doc, actor, "Guest", socket).await;
+///     }
 /// }
 /// ```
+///
+/// See `docs/guide/collaboration.md` for the full walkthrough — including why
+/// [`CollabHub::open_with`], not [`CollabHub::document`], is what a handler
+/// should call: `document()` seeds a fresh *empty* document with no read of
+/// the row at all, so calling it from an unauthorized id would silently hand
+/// out a live, writable scratch document keyed by that id — never the row's
+/// real content, but a second, ungoverned document an attacker can join.
 ///
 /// The snapshot is sent after the subscription opens, so an operation that
 /// lands in between is delivered twice: once inside the snapshot and once as

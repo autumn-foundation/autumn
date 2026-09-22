@@ -1135,6 +1135,14 @@ pub struct SbomOptions {
     /// pulls in, and the documented sidecar-vs-binary cross-check would show
     /// spurious binary-only entries.
     pub features: Option<String>,
+    /// Resolve with the `default` feature disabled.
+    ///
+    /// An app built with `cargo build --no-default-features` links fewer
+    /// crates than the default set; without this, the document lists every
+    /// optional dependency the default set pulls in — crates that are not
+    /// in the shipped binary. Composes with `--features` for a slimmed
+    /// build with a few extras on top.
+    pub no_default_features: bool,
     /// Restrict resolution to one target triple.
     ///
     /// An SBOM generated inside the Linux production image otherwise lists
@@ -1158,6 +1166,9 @@ fn metadata_args(opts: &SbomOptions) -> Vec<String> {
     let mut args = vec!["metadata".into(), "--format-version".into(), "1".into()];
     if opts.all_features {
         args.push("--all-features".into());
+    }
+    if opts.no_default_features {
+        args.push("--no-default-features".into());
     }
     if let Some(features) = opts
         .features
@@ -1489,6 +1500,46 @@ mod tests {
         // so its SBOM must not be narrowed to whichever runner built it.
         let args = metadata_args(&SbomOptions::default());
         assert!(!args.iter().any(|a| a == "--filter-platform"), "{args:?}");
+    }
+
+    #[test]
+    fn no_default_features_reaches_cargo_metadata() {
+        // An app built with `cargo build --no-default-features` links fewer
+        // crates than the default set; without the flag the SBOM would
+        // describe crates that were never linked. Off by default, like every
+        // other resolution switch.
+        let args = metadata_args(&SbomOptions {
+            no_default_features: true,
+            ..SbomOptions::default()
+        });
+        assert!(
+            args.iter().any(|a| a == "--no-default-features"),
+            "{args:?}"
+        );
+        let default_args = metadata_args(&SbomOptions::default());
+        assert!(
+            !default_args.iter().any(|a| a == "--no-default-features"),
+            "{default_args:?}"
+        );
+    }
+
+    #[test]
+    fn no_default_features_composes_with_named_features() {
+        // A slimmed build with a few extras on top: cargo accepts both
+        // together, so both switches must reach `cargo metadata`.
+        let args = metadata_args(&SbomOptions {
+            no_default_features: true,
+            features: Some("embed-assets".into()),
+            ..SbomOptions::default()
+        });
+        assert!(
+            args.iter().any(|a| a == "--no-default-features"),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--features", "embed-assets"]),
+            "{args:?}"
+        );
     }
 
     #[test]

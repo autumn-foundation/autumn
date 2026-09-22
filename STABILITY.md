@@ -395,9 +395,11 @@ UPDATE_SCHEMA_SNAPSHOT=1 cargo test -p autumn-web schema_keys_snapshot_guard
 **Every release with a breaking change ships a migration guide** under
 [`docs/migrations/`](docs/migrations/) — pre-`1.0` that means most `0.x`
 releases, not just majors. This is enforced, not merely promised:
-`scripts/check-migration-guides.sh` fails CI when a `CHANGELOG.md` section
-declares a breaking change without a matching `docs/migrations/<version>.md`,
-or when a breaking entry does not link its guide (issue #1588). A release
+`scripts/check-migration-guides.sh` fails CI when a changelog section declares
+a breaking change without a matching `docs/migrations/<version>.md`, or when a
+breaking entry does not link its guide (issue #1588). It reads the unreleased
+notes from their own files under `changelog.d/`, so the gate fires on the PR
+that makes the break. A release
 without an upgrade path is treated as a broken build.
 
 The guide is written against the
@@ -417,7 +419,9 @@ Draft guides are opened alongside the *first* breaking change of a cycle, as
 subsequent breaking-change PR; the draft is renamed to `<version>.md` at
 release time, so the release ships with a complete guide on day one. See
 [`docs/migrations/README.md`](docs/migrations/README.md) for the process and
-the `**Breaking:**` changelog convention.
+the `**Breaking:**` changelog convention, and
+[`changelog.d/README.md`](changelog.d/README.md) for where an unreleased entry
+is written.
 
 ## CSV import/export (issue #808)
 

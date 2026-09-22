@@ -13,9 +13,9 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{Data, DeriveInput, Fields, FieldsNamed};
 
-use crate::schema;
 use crate::wire::ir::{TypeDescriptor, WireFieldDescriptor, WireTypeDescriptor};
 use crate::wire::store;
+use autumn_macros_support::schema;
 
 /// One field's shape in one direction, ready to emit or to serialize.
 struct Direction {

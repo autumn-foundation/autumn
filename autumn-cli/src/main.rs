@@ -1101,6 +1101,14 @@ enum Commands {
         /// production Dockerfile does this for `embed-assets` builds.
         #[arg(long, value_name = "FEATURES", conflicts_with = "binary")]
         features: Option<String>,
+        /// Resolve with the `default` feature disabled.
+        ///
+        /// An app built with `cargo build --no-default-features` links fewer
+        /// crates than the default set; without this the SBOM would list the
+        /// optional dependencies the default feature set pulls in. Composes
+        /// with `--features`.
+        #[arg(long, conflicts_with = "binary")]
+        no_default_features: bool,
         /// Restrict resolution to one target triple.
         ///
         /// Without it the document lists target-specific dependencies for
@@ -2925,6 +2933,50 @@ enum MigrateCommands {
         #[arg(long = "force", value_name = "VERSION")]
         force: Option<String>,
     },
+    /// Create `migrations/<version>_<name>/{up,down}.sql` with a version
+    /// that will not collide with any migration this checkout can see.
+    ///
+    /// Diesel records applied migrations BY VERSION (the leading
+    /// `YYYYMMDDHHMMSS` directory prefix). When two directories share one
+    /// version, a fresh database runs exactly one of them and records the
+    /// version as done — the other is skipped forever, with no error
+    /// anywhere. This picks a version free across the working tree, every
+    /// local and remote-tracking git branch, and this CLI's own compiled-in
+    /// framework migrations — never before the latest version already
+    /// claimed anywhere it can see.
+    ///
+    /// Does not touch the database. Prints the created directory's path.
+    ///
+    /// # Example
+    ///
+    ///   autumn migrate new add_widget_archived_at
+    #[command(verbatim_doc_comment)]
+    #[allow(clippy::doc_markdown)]
+    New {
+        /// `snake_case` name for the migration (no leading digit — the CLI
+        /// treats everything up to the first `_` as part of the version).
+        name: String,
+    },
+    /// Fail when a migration version this checkout introduces is already
+    /// claimed by a different directory elsewhere.
+    ///
+    /// The CI-time backstop for `autumn migrate new`: checks the working
+    /// tree's migration versions against the repository's default branch,
+    /// every other pushed branch, and this CLI's own compiled-in framework
+    /// migrations. Reports a collision only when this checkout's working
+    /// tree is one of the colliding directories — a collision between two
+    /// other branches is real but is that branch's own gate to fail on.
+    ///
+    /// Requires the full branch history (`git fetch --all` or
+    /// `actions/checkout` with `fetch-depth: 0`); degrades to a working-tree-
+    /// only check with a loud warning otherwise. Does not require a database
+    /// connection.
+    ///
+    /// # Example
+    ///
+    ///   autumn migrate check-collisions
+    #[command(verbatim_doc_comment, name = "check-collisions")]
+    CheckCollisions,
 }
 
 /// Subcommands for `autumn shard`.
@@ -3761,7 +3813,13 @@ enum GenerateCommands {
     /// When an owner column (`user_id`, `author_id`, or `owner_id`) is present,
     /// the generated `can_update`/`can_delete` allow the record owner or an
     /// `admin`, and the scope filters lists to the current user's rows.
-    /// Otherwise those default-deny with a `TODO` marker.
+    ///
+    /// When NO owner column is detected there is no ownership rule to emit, so
+    /// `can_update`/`can_delete` fall back to an authentication check under a
+    /// `SECURITY TODO` marker: any signed-in user may update or delete any row.
+    /// That is a placeholder, not a policy — replace it with a real per-record
+    /// rule before production. (The `Scope` does deny by default: it lists no
+    /// rows until its own `TODO` filter is written.)
     ///
     /// Requires the target model to already exist (`src/models/<snake>.rs`).
     /// Run `autumn generate model <Pascal>` (or `scaffold`) first.
@@ -4515,6 +4573,21 @@ fn run_command(command: Commands) {
             profile,
             wait,
         } => {
+            // `new` and `check-collisions` are pure filesystem/git operations
+            // with no database target — handle them before the DB-target
+            // resolution below, which every other `MigrateCommands` variant
+            // needs.
+            match &action {
+                Some(MigrateCommands::New { name }) => {
+                    migrate::versions::run_new(name);
+                    return;
+                }
+                Some(MigrateCommands::CheckCollisions) => {
+                    migrate::versions::run_check_collisions();
+                    return;
+                }
+                _ => {}
+            }
             let action = match action {
                 Some(MigrateCommands::Status) => migrate::MigrateAction::Status,
                 Some(MigrateCommands::Check) => migrate::MigrateAction::Check,
@@ -4531,6 +4604,9 @@ fn run_command(command: Commands) {
                     migrate::MigrateAction::Baseline(migrate::BaselineArgs {
                         force_version: force,
                     })
+                }
+                Some(MigrateCommands::New { .. } | MigrateCommands::CheckCollisions) => {
+                    unreachable!("handled above and returned")
                 }
                 None => migrate::MigrateAction::Run,
             };
@@ -4905,6 +4981,7 @@ fn run_command(command: Commands) {
             locked,
             all_features,
             features,
+            no_default_features,
             filter_platform,
             expect_version,
         } => sbom::run(&sbom::SbomOptions {
@@ -4915,6 +4992,7 @@ fn run_command(command: Commands) {
             locked,
             all_features,
             features,
+            no_default_features,
             filter_platform,
             expect_version,
         }),
@@ -6800,6 +6878,7 @@ mod tests {
             expect_version,
             all_features,
             features,
+            no_default_features,
             filter_platform,
         } = cli.command
         else {
@@ -6820,6 +6899,11 @@ mod tests {
              what the document describes by default"
         );
         assert!(features.is_none());
+        assert!(
+            !no_default_features,
+            "the default feature set is what a build actually links by default, \
+             so disabling it must be opt-in"
+        );
         assert!(
             filter_platform.is_none(),
             "a source release is consumed on every platform, so no filter by default"
@@ -6854,6 +6938,19 @@ mod tests {
             panic!("expected Sbom command");
         };
         assert_eq!(features.as_deref(), Some("embed-assets"));
+    }
+
+    #[test]
+    fn parse_sbom_no_default_features() {
+        let cli = Cli::try_parse_from(["autumn", "sbom", "--no-default-features"]).unwrap();
+        let Commands::Sbom {
+            no_default_features,
+            ..
+        } = cli.command
+        else {
+            panic!("expected Sbom command");
+        };
+        assert!(no_default_features);
     }
 
     #[test]
