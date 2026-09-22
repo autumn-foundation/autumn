@@ -2009,6 +2009,99 @@ without also filling in the intake form above.
   `trunk-dev`'s tip (CI-native, not local) — or, if a future pass again has
   working local toolchain/network access and wants a higher-confidence
   negative before that, extend the local sample well past 50 first.
+- **2026-09-22, later the same day — CI-native Tier 1 baseline obtained: 0/50
+  (0%), same day PR #2895 merged.** `manual-sqlite-jobs-rerun-check.yml` was
+  dispatched against `trunk-dev`'s new tip (`85ce096`, PR #2895's merge
+  commit) as soon as it became available (`workflow_dispatch` only accepts a
+  workflow already on the default branch). Run 35752555923 completed clean
+  end to end in under 4 minutes total (build 2m44s, then all 50 iterations in
+  22 seconds — this test needs no container startup, unlike the Postgres-backed
+  `job_tracking` harness, so it is far cheaper to run at high sample counts).
+  **`RESULT: 0/50 failed, 50/50 passed`** — the CI-native baseline the
+  2026-09-21 entry's own next step called for. Combined with this same day's
+  local 0/50 run above, that is **0/100 clean reruns total**, none of them
+  reproducing the "ON CONFLICT clause does not match" panic.
+
+  **Still not closing this entry.** Per this role's own hard gate, a Tier 1
+  baseline this clean would ordinarily support closing a *diagnosed and
+  fixed* flake — but nothing has been fixed here: the mechanism is still
+  unconfirmed, and there is no product-vs-test verdict to render. **Correction
+  (post-review, via a third Codex review comment on PR #2904): drop "a
+  second, unaudited SQLite `INSERT ... ON CONFLICT` path" as a candidate —
+  it does not exist.** `grep -rn "sqlite job enqueue failed"` across the
+  whole repo finds exactly one call site
+  (`autumn/src/job/sqlite.rs:461`), immediately after the file's sole
+  `INSERT INTO autumn_jobs ... ON CONFLICT` (lines 428-458), and that
+  function unconditionally awaits `queue_handle.ready()` first
+  (`sqlite.rs:392`) — the same readiness-gate call already confirmed above
+  to create the partial index before any insert. There is no second path to
+  audit; the only remaining named candidate is the SQLite-version-specific
+  partial-index matching quirk. 0/100 with no fix
+  applied does not mean the bug is gone; it means same-commit reruns of this
+  one test, run the way this harness runs it, have not reproduced it.
+
+  **Correction (post-review, via a Codex review comment on PR #2904): the
+  original version of this update named the wrong structural difference —
+  "sibling CI jobs competing for the same runner" is not how GitHub Actions
+  works, and this repo's own docs already say so.** `AGENTS.md`
+  (`AGENTS.md:83-86`) states plainly, of a sibling job in this same
+  workflow: "a runner whose disk it is the only claimant of" — each `ci.yml`
+  job (`Lint`, `MSRV`, `SQLite runtime`, etc.) gets its own dedicated,
+  isolated GitHub-hosted VM, not a shared host with other concurrently
+  running jobs. There is no cross-job disk/CPU contention for this harness's
+  isolation to structurally rule out; that framing was wrong, not merely
+  unconfirmed.
+
+  **The actual, verifiable structural difference is same-binary test
+  parallelism, not job isolation.** `ci.yml`'s own "Run the sqlite
+  integration suite" step (the real organic path both hits occurred on)
+  invokes `cargo test -p autumn-web --features "sqlite,test-support,storage"
+  --test sqlite_boot_serve --test sqlite_migrations ... --test
+  sqlite_jobs_scheduler_e2e --test confidential_repository_bidx ...` — no
+  `--test-threads` flag anywhere in that step, so libtest runs every test
+  *within* the `sqlite_jobs_scheduler_e2e` binary (27 tests total, per this
+  binary's own test count) at its default parallelism, one OS thread per
+  logical core. `manual-sqlite-jobs-rerun-check.yml`'s loop, by contrast,
+  filters to the single target test name **and** passes `--test-threads=1`
+  explicitly — eliminating same-binary concurrency entirely, not just
+  cross-job concurrency. If the real mechanism is a race between
+  `sqlite_job_backend_tracks_job_status_durably` and one of its 26 sibling
+  tests in the same file (shared process-global state, a shared on-disk
+  path, or contention on some other resource within the same test binary),
+  this harness's `--test-threads=1` filter would structurally prevent it
+  from ever reproducing, exactly the same shape of gap the withdrawn
+  sibling-job framing was reaching for, just at the correct layer (one test
+  binary's own internal parallelism, not GitHub Actions' job scheduling).
+  **Correction (post-review, via a second Codex review comment on PR #2904):
+  the shared-state audit this paragraph called for already exists, for this
+  exact file, a few paragraphs up (lines 1928-1942 above) — restating it as
+  an open next step would have had a future pass redo completed work.**
+  That audit found every sibling test in `sqlite_jobs_scheduler_e2e.rs` that
+  calls `job::start_runtime` holds `global_job_runtime_test_lock()` first,
+  including this entry's own target test, which (per the source) holds that
+  lock for its **entire** runtime — so under default parallelism, any other
+  lock-holding sibling scheduled concurrently would simply block on the
+  mutex until the target test releases it, never truly interleaving with
+  it. That rules the process-global `GLOBAL_JOB_CLIENT` back *out* as the
+  same-binary mechanism too, not just as the original cross-process one —
+  the same conclusion, reached the same way, applies to both framings. If
+  same-binary parallelism is still the right layer (unconfirmed, not ruled
+  out — only this one specific shared resource is), the culprit would have
+  to be a *different*, still-unidentified resource shared outside that
+  lock's coverage — **not** a shared on-disk database path: **correction
+  (post-review, via a fourth Codex review comment on PR #2904)**, each test
+  builds its own `tempfile::TempDir` and `build_sqlite_pool` places
+  `jobs_scheduler.db` under that unique directory
+  (`autumn/tests/sqlite_jobs_scheduler_e2e.rs:78-80`), so sibling tests
+  cannot collide on a shared database file even under default parallelism —
+  that candidate is excluded by per-test isolation, not by the lock. What
+  remains open is a different process-global the lock doesn't cover, or
+  something not yet identified. Auditing for that
+  specific gap — not re-auditing `GLOBAL_JOB_CLIENT` or a shared database
+  file, both closed — plus a harness variant that runs the *whole*
+  `sqlite_jobs_scheduler_e2e` binary
+  at default parallelism (not `--test-threads=1`, not filtered to one test)
+  N times, is the concrete next step for a future pass.
 
 `crate_path::tests::resolve_autumn_web_name_dashed_rename_is_sanitized` was
 opened here 2026-09-21 (n=1, mechanism unconfirmed) and **closed the same
