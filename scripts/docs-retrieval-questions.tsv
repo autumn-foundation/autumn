@@ -68,3 +68,26 @@ generate policy	docs/guide/generators.md
 # matcher rather than the reader. They are a findability question about
 # phrasing, a different class from the coverage defect this PR closes, and they
 # get their own change on their own evidence — same reasoning as "gzip" above.
+
+# --- Accepting a file upload ----------------------------------------------
+# `docs/guide/storage.md` IS the answer — its own opening sentence is "apps
+# that accept user-uploaded files", and it carries "Scaffolded uploads" and
+# "Direct uploads" — but its H1 was "File Storage in Autumn", so the reader's
+# own word for the task appeared in neither its slug nor its title.
+#
+# The question therefore did not land nowhere; it landed on the WRONG page.
+# The only place in all 164 guide pages announcing both words was
+# `cloud-native.md`'s "## File Uploads", a multi-replica caveat whose advice is
+# "enable the `storage` feature and pick the `S3` backend". A reader arriving
+# there from a search engine reads a deployment constraint as the answer to
+# "how do I accept an upload", and can reasonably conclude S3 is required to
+# accept one at all — the framework ships a working `Local` backend for exactly
+# that case, which is `storage.md`'s Quick start.
+#
+# Four pages already hand-route this question, which is what a recurring one
+# looks like when the page it belongs to does not announce itself:
+# `fleet-deploys.md`'s "Uploaded files" table row, `forms.md`'s "## Uploads"
+# ("see storage for where the bytes then go"), `cloud-native.md`'s own pointer,
+# and `index.md`, which describes the page as "uploading a file" — the index
+# author reached for the reader's word that the page itself never used.
+file uploads	docs/guide/storage.md
