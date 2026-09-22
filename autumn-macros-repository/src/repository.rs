@@ -6415,527 +6415,34 @@ fn emit_crud_bodies(
     }
 }
 
-/// The `hooks = ...` arm of [`emit_crud_bodies`].
-// The same grandfathered allows `repository_macro` carries: this body was
-// lifted out of it verbatim, so the lint surface moved with the code.
+struct HookedSave {
+    save_body: TokenStream,
+}
+
+/// What [`emit_hooked_save`] needs beyond [`RepoConfig`].
+struct HookedSaveInputs<'a> {
+    /// Counter-cache token: `serialize`.
+    cc_serialize: &'a TokenStream,
+    /// Counter-cache token: `after insert`.
+    cc_after_insert: &'a TokenStream,
+}
+
+/// The single-row save body of [`emit_crud_bodies_hooked`].
 #[allow(
     clippy::too_many_lines,
     clippy::option_if_let_else,
     clippy::large_stack_frames,
     clippy::cognitive_complexity
 )]
-fn emit_crud_bodies_hooked(
-    config: &RepoConfig,
-    inputs: &CrudBodiesInputs<'_>,
-    hooks_ident: &Ident,
-) -> Result<CrudBodies, TokenStream> {
-    let CrudBodiesInputs {
-        pg_name,
-        sd_filter,
-        read_route_init,
-        validate_item_result,
-        cascade,
+fn emit_hooked_save(config: &RepoConfig, inputs: &HookedSaveInputs<'_>) -> HookedSave {
+    let HookedSaveInputs {
         cc_serialize,
-        cc_capture,
-        cc_capture_many,
         cc_after_insert,
-        cc_after_insert_chunk,
-        cc_after_update,
-        cc_after_update_chunk,
-        cc_before_delete,
-        cc_before_delete_chunk,
-        tenant_struct_field,
-        tenant_clone_field,
-        tenant_init_field,
-        shards_struct_field,
-        shards_clone_field,
-        shards_none_field,
-        bcast_struct_field,
-        bcast_clone_field,
-        bcast_field_some_state,
-        ..
     } = *inputs;
-    let DependentCascade {
-        delete_many_compiletime_cascade,
-        delete_many_runtime_cascade,
-        delete_many_cascade_tx_bind,
-        delete_many_cascade_tx_ok,
-        delete_many_cascade_post_publish,
-        ..
-    } = cascade;
-
     let model_name = &config.model_name;
     let table_name = &config.table_name;
     let table_ident = format_ident!("{table_name}");
     let commit_hooks_enabled = config.hooks_type.is_some() && config.commit_hooks;
-    let tenant_extra = usize::from(config.tenant_scoped);
-
-    // ── Struct fields with hooks ───────────────────────
-    let idempotency_struct_field = if commit_hooks_enabled {
-        quote! {
-            idempotency: ::core::option::Option<::autumn_web::idempotency::IdempotencyContext>,
-        }
-    } else {
-        quote! {}
-    };
-    let idempotency_clone_field = if commit_hooks_enabled {
-        quote! {
-            idempotency: self.idempotency.clone(),
-        }
-    } else {
-        quote! {}
-    };
-
-    let struct_fields = quote! {
-        pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-            ::autumn_web::RuntimeConnection,
-        >,
-        hooks: #hooks_ident,
-        #idempotency_struct_field
-        #tenant_struct_field
-        #shards_struct_field
-        /// Read-routing snapshot for generated read-only methods (#971).
-        __autumn_read_route: ::autumn_web::repository::ReadRoute,
-        /// Statement timeout to apply on every connection checkout (ms). 0 = no limit.
-        __autumn_statement_timeout_ms: u64,
-        /// Slow-query logging threshold.
-        __autumn_slow_threshold: ::std::time::Duration,
-        /// Route path from `MatchedPath` for metrics labels.
-        __autumn_route: ::std::option::Option<::std::string::String>,
-        #bcast_struct_field
-    };
-
-    let clone_impl = quote! {
-        impl ::core::clone::Clone for #pg_name {
-            fn clone(&self) -> Self {
-                Self {
-                    pool: self.pool.clone(),
-                    hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksClone>::autumn_clone(&self.hooks),
-                    #idempotency_clone_field
-                    #tenant_clone_field
-                    #shards_clone_field
-                    __autumn_read_route: self.__autumn_read_route.clone(),
-                    __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
-                    __autumn_slow_threshold: self.__autumn_slow_threshold,
-                    __autumn_route: self.__autumn_route.clone(),
-                    #bcast_clone_field
-                }
-            }
-        }
-    };
-
-    let timeout_route_init = quote! {
-        use ::autumn_web::db::DbState as _;
-        // Postgres statement_timeout is a signed 32-bit integer (ms).
-        const __AUTUMN_PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
-        let __autumn_timeout_ms: u64 = _parts
-            .extensions
-            .get::<::autumn_web::db::StatementTimeout>()
-            .map(|t| ::std::convert::TryFrom::try_from(t.0.as_millis()).unwrap_or(u64::MAX))
-            .or_else(|| state.statement_timeout().map(|d| ::std::convert::TryFrom::try_from(d.as_millis()).unwrap_or(u64::MAX)))
-            .unwrap_or(0u64)
-            .min(__AUTUMN_PG_TIMEOUT_MAX_MS);
-        let __autumn_slow_threshold = state.slow_query_threshold();
-        let __autumn_route: ::std::option::Option<::std::string::String> = _parts
-            .extensions
-            .get::<::autumn_web::reexports::axum::extract::MatchedPath>()
-            .map(|p| p.as_str().to_owned());
-        #read_route_init
-    };
-
-    let extractor_init = if commit_hooks_enabled {
-        quote! {
-            #pg_name::__autumn_register_repository_commit_hooks();
-            #timeout_route_init
-            Ok(#pg_name {
-                pool,
-                hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
-                idempotency: _parts
-                    .extensions
-                    .get::<::autumn_web::idempotency::IdempotencyContext>()
-                    .cloned(),
-                #tenant_init_field
-                #shards_none_field
-                __autumn_read_route,
-                __autumn_statement_timeout_ms: __autumn_timeout_ms,
-                __autumn_slow_threshold,
-                __autumn_route,
-                #bcast_field_some_state
-            })
-        }
-    } else {
-        quote! {
-            #timeout_route_init
-            Ok(#pg_name {
-                pool,
-                hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
-                #tenant_init_field
-                #shards_none_field
-                __autumn_read_route,
-                __autumn_statement_timeout_ms: __autumn_timeout_ms,
-                __autumn_slow_threshold,
-                __autumn_route,
-                #bcast_field_some_state
-            })
-        }
-    };
-
-    let (broadcast_create, broadcast_update, broadcast_delete) = if config.broadcasts {
-        let base_topic_expr = match generate_topic_format(
-            config
-                .broadcast_topic
-                .as_deref()
-                .unwrap_or(&config.table_name),
-            &quote! { __record_ref },
-        ) {
-            Ok(expr) => expr,
-            Err(err) => {
-                let compile_err = err.to_compile_error();
-                return Err(quote! { #compile_err });
-            }
-        };
-
-        let topic_expr = if config.tenant_scoped {
-            quote! { ::std::format!("tenant:{}:{}", ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(&__record_ref.tenant_id), #base_topic_expr) }
-        } else {
-            base_topic_expr
-        };
-
-        let default_container = format!("{}-list", config.table_name);
-        let container_expr = config
-            .broadcast_container
-            .as_deref()
-            .unwrap_or(&default_container);
-        let model_prefix = to_snake_case(&config.model_name.to_string());
-
-        let (render_expr, create_swap_id, create_swap_strategy, update_id_expr, delete_id_expr) =
-            if let Some(ref render_path) = config.broadcast_render {
-                let extract_id = quote! {
-                    ::autumn_web::htmx::extract_html_id(&{#render_path(__record_ref)}.into_string())
-                        .unwrap_or_else(|| ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
-                };
-                (
-                    quote! { #render_path(__record_ref) },
-                    quote! { #container_expr.to_string() },
-                    quote! { ::autumn_web::htmx::OobSwap::BeforeEnd },
-                    extract_id.clone(),
-                    extract_id,
-                )
-            } else {
-                let dom_id = quote! { <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref) };
-                (
-                    quote! { <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(__record_ref) },
-                    quote! { #container_expr.to_string() },
-                    quote! { <#model_name as ::autumn_web::live::LiveFragment>::insert_swap() },
-                    dom_id.clone(),
-                    dom_id,
-                )
-            };
-
-        let create = quote! {
-            {
-                let __record_ref = &__record;
-                if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
-                    let __topic = #topic_expr;
-                    let __fragment = #render_expr;
-                    let __create_id = #create_swap_id;
-                    let __create_swap = #create_swap_strategy;
-                    if let ::core::result::Result::Err(__err) = __channels
-                        .broadcast()
-                        .publish_oob(&__topic, &__create_id, &__create_swap, &__fragment)
-                    {
-                        ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
-                    }
-                }
-            }
-        };
-
-        let update = quote! {
-            {
-                let __record_ref = &__record;
-                if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
-                    let __topic = #topic_expr;
-                    let __fragment = #render_expr;
-                    let __id = #update_id_expr;
-
-                    let __prev_id = __ctx_val
-                        .get("__autumn_previous_id")
-                        .and_then(|__v| __v.as_str());
-
-                    let __topic_changed = __ctx_val
-                        .get("__autumn_previous_topic")
-                        .and_then(|__v| __v.as_str())
-                        .map_or(false, |__prev_topic| __prev_topic != __topic);
-
-                    if __topic_changed {
-                        if let ::core::option::Option::Some(__prev_topic) = __ctx_val
-                            .get("__autumn_previous_topic")
-                            .and_then(|__v| __v.as_str())
-                        {
-                            let __delete_id = __prev_id.unwrap_or(&__id);
-                            let __delete_fragment = ::autumn_web::html! {};
-                            if let ::core::result::Result::Err(__err) = __channels
-                                .broadcast()
-                                .publish_oob(__prev_topic, __delete_id, &::autumn_web::htmx::OobSwap::Delete, &__delete_fragment)
-                            {
-                                ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast delete of old topic failed");
-                            }
-                        }
-                    }
-
-                    let (__target_id, __swap_strategy) = if __topic_changed {
-                        (#container_expr, <#model_name as ::autumn_web::live::LiveFragment>::insert_swap())
-                    } else {
-                        let __strategy = if let ::core::option::Option::Some(__prev_id_val) = __prev_id {
-                            if __prev_id_val != &__id {
-                                ::autumn_web::htmx::OobSwap::Target(
-                                    ::autumn_web::htmx::OobMethod::OuterHTML,
-                                    ::std::format!("#{}", __prev_id_val),
-                                )
-                            } else {
-                                ::autumn_web::htmx::OobSwap::OuterHTML
-                            }
-                        } else {
-                            ::autumn_web::htmx::OobSwap::OuterHTML
-                        };
-                        (__id.as_str(), __strategy)
-                    };
-
-                    if let ::core::result::Result::Err(__err) = __channels
-                        .broadcast()
-                        .publish_oob(&__topic, __target_id, &__swap_strategy, &__fragment)
-                    {
-                        ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
-                    }
-                }
-            }
-        };
-
-        let delete = quote! {
-            {
-                let __record_ref = &__record;
-                if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
-                    let __topic = #topic_expr;
-                    let __id = #delete_id_expr;
-                    let __fragment = ::autumn_web::html! {};
-                    if let ::core::result::Result::Err(__err) = __channels
-                        .broadcast()
-                        .publish_oob(&__topic, &__id, &::autumn_web::htmx::OobSwap::Delete, &__fragment)
-                    {
-                        ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
-                    }
-                }
-            }
-        };
-
-        (create, update, delete)
-    } else {
-        (quote! {}, quote! {}, quote! {})
-    };
-
-    let (enqueue_context_setup, enqueue_context_ref, finalize_context_setup, finalize_context_ref) =
-        if config.broadcasts {
-            let base_topic_expr = match generate_topic_format(
-                config
-                    .broadcast_topic
-                    .as_deref()
-                    .unwrap_or(&config.table_name),
-                &quote! { __record_ref },
-            ) {
-                Ok(expr) => expr,
-                Err(err) => {
-                    let compile_err = err.to_compile_error();
-                    return Err(quote! { #compile_err });
-                }
-            };
-
-            let topic_expr = if config.tenant_scoped {
-                quote! { ::std::format!("tenant:{}:{}", ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(&__record_ref.tenant_id), #base_topic_expr) }
-            } else {
-                base_topic_expr
-            };
-
-            let prev_id_expr = if let Some(ref render_path) = config.broadcast_render {
-                quote! { {
-                    let __prev_fragment = #render_path(__record_ref);
-                    ::autumn_web::htmx::extract_html_id(&__prev_fragment.into_string())
-                } }
-            } else {
-                quote! { ::core::option::Option::Some(<#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref)) }
-            };
-
-            (
-                quote! {
-                    let (__autumn_previous_topic, __autumn_previous_id) = if let ::core::option::Option::Some(__record_val) = &__vh_before {
-                        let __record_ref = __record_val;
-                        let __prev_topic = #topic_expr;
-                        let __prev_id = #prev_id_expr;
-                        (::core::option::Option::Some(__prev_topic), __prev_id)
-                    } else {
-                        (::core::option::Option::None, ::core::option::Option::None)
-                    };
-
-                    let mut __autumn_ctx_val = ::autumn_web::reexports::serde_json::to_value(&ctx)
-                        .map_err(|e| ::autumn_web::AutumnError::internal_server_error_msg(format!("serialize context: {e}")))?;
-
-                    if let ::core::option::Option::Some(ref __prev_topic) = __autumn_previous_topic {
-                        if let ::core::option::Option::Some(__map) = __autumn_ctx_val.as_object_mut() {
-                            __map.insert(
-                                "__autumn_previous_topic".to_string(),
-                                ::autumn_web::reexports::serde_json::Value::String(__prev_topic.clone()),
-                            );
-                        }
-                    }
-
-                    if let ::core::option::Option::Some(ref __prev_id_val) = __autumn_previous_id {
-                        if let ::core::option::Option::Some(__map) = __autumn_ctx_val.as_object_mut() {
-                            __map.insert(
-                                "__autumn_previous_id".to_string(),
-                                ::autumn_web::reexports::serde_json::Value::String(__prev_id_val.clone()),
-                            );
-                        }
-                    }
-                },
-                quote! { &__autumn_ctx_val },
-                quote! {
-                    let mut __autumn_finalized_ctx_val = ::autumn_web::reexports::serde_json::to_value(&ctx)
-                        .map_err(|e| ::autumn_web::AutumnError::internal_server_error_msg(format!("serialize finalized context: {e}")))?;
-                    if let ::core::option::Option::Some(ref __prev_topic) = __autumn_previous_topic {
-                        if let ::core::option::Option::Some(__map) = __autumn_finalized_ctx_val.as_object_mut() {
-                            __map.insert(
-                                "__autumn_previous_topic".to_string(),
-                                ::autumn_web::reexports::serde_json::Value::String(__prev_topic.clone()),
-                            );
-                        }
-                    }
-                    if let ::core::option::Option::Some(ref __prev_id) = __autumn_previous_id {
-                        if let ::core::option::Option::Some(__map) = __autumn_finalized_ctx_val.as_object_mut() {
-                            __map.insert(
-                                "__autumn_previous_id".to_string(),
-                                ::autumn_web::reexports::serde_json::Value::String(__prev_id.clone()),
-                            );
-                        }
-                    }
-                },
-                quote! { &__autumn_finalized_ctx_val },
-            )
-        } else {
-            (
-                quote! {
-                    let __autumn_previous_topic: ::core::option::Option<::std::string::String> = ::core::option::Option::None;
-                    let __autumn_previous_id: ::core::option::Option<::std::string::String> = ::core::option::Option::None;
-                },
-                quote! { &ctx },
-                quote! {},
-                quote! { &ctx },
-            )
-        };
-
-    let hook_support_methods = if commit_hooks_enabled {
-        quote! {
-        #[doc(hidden)]
-        fn __autumn_repository_commit_hook_key() -> &'static str {
-            ::core::concat!(
-                ::core::env!("CARGO_PKG_NAME"),
-                "::",
-                ::core::module_path!(),
-                "::",
-                ::core::stringify!(#table_ident),
-                "::",
-                ::core::stringify!(#model_name),
-                "::",
-                ::core::stringify!(#hooks_ident)
-            )
-        }
-
-        #[doc(hidden)]
-        fn __autumn_register_repository_commit_hooks() {
-            static __AUTUMN_REGISTERED: ::std::sync::OnceLock<()> = ::std::sync::OnceLock::new();
-            __AUTUMN_REGISTERED.get_or_init(|| {
-                ::autumn_web::__private::register_repository_commit_hook_runner(
-                    Self::__autumn_repository_commit_hook_key(),
-                    |__ctx, __record| async move {
-                        let mut __ctx: ::autumn_web::hooks::MutationContext =
-                            ::autumn_web::reexports::serde_json::from_value(__ctx)
-                                .map_err(|__error| {
-                                    ::autumn_web::AutumnError::internal_server_error_msg(
-                                        format!("deserialize repository create hook context: {__error}")
-                                    )
-                                })?;
-                        let __record: #model_name =
-                            #model_name::__autumn_commit_hook_from_value(__record)?;
-                        let __hooks =
-                            <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
-                        <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_create_commit(
-                            &__hooks,
-                            &mut __ctx,
-                            &__record,
-                        )
-                        .await?;
-                        #broadcast_create
-                        Ok(())
-                    },
-                    |__ctx_val, __record| async move {
-                        let mut __ctx: ::autumn_web::hooks::MutationContext =
-                            ::autumn_web::reexports::serde_json::from_value(__ctx_val.clone())
-                                .map_err(|__error| {
-                                    ::autumn_web::AutumnError::internal_server_error_msg(
-                                        format!("deserialize repository update hook context: {__error}")
-                                    )
-                                })?;
-                        let __record: #model_name =
-                            #model_name::__autumn_commit_hook_from_value(__record)?;
-                        let __hooks =
-                            <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
-                        <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_update_commit(
-                            &__hooks,
-                            &mut __ctx,
-                            &__record,
-                        )
-                        .await?;
-                        #broadcast_update
-                        Ok(())
-                    },
-                    |__ctx, __record| async move {
-                        let mut __ctx: ::autumn_web::hooks::MutationContext =
-                            ::autumn_web::reexports::serde_json::from_value(__ctx)
-                                .map_err(|__error| {
-                                    ::autumn_web::AutumnError::internal_server_error_msg(
-                                        format!("deserialize repository delete hook context: {__error}")
-                                    )
-                                })?;
-                        let __record: #model_name =
-                            #model_name::__autumn_commit_hook_from_value(__record)?;
-                        let __hooks =
-                            <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
-                        <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_delete_commit(
-                            &__hooks,
-                            &mut __ctx,
-                            &__record,
-                        )
-                        .await?;
-                        #broadcast_delete
-                        Ok(())
-                    },
-                );
-            });
-        }
-        }
-    } else {
-        quote! {}
-    };
-
-    let hook_inventory_registration = if commit_hooks_enabled {
-        quote! {
-            ::autumn_web::reexports::inventory::submit! {
-                ::autumn_web::__private::RepositoryCommitHookDescriptor {
-                    register: #pg_name::__autumn_register_repository_commit_hooks,
-                }
-            }
-        }
-    } else {
-        quote! {}
-    };
 
     // ── save (hooked) ─────────────────────────────────
     // ── save (hooked) ─────────────────────────────────
@@ -7355,6 +6862,50 @@ fn emit_crud_bodies_hooked(
             }
         }
     };
+
+    HookedSave { save_body }
+}
+
+struct HookedUpdate {
+    update_body: TokenStream,
+}
+
+/// What [`emit_hooked_update`] needs beyond [`RepoConfig`].
+struct HookedUpdateInputs<'a> {
+    /// Binds the commit-hook context the update path enqueues under.
+    enqueue_context_setup: &'a TokenStream,
+    /// Names that bound context at the enqueue call.
+    enqueue_context_ref: &'a TokenStream,
+    /// Binds the commit-hook context the update path finalizes under.
+    finalize_context_setup: &'a TokenStream,
+    /// Names that bound context at the finalize call.
+    finalize_context_ref: &'a TokenStream,
+    /// Counter-cache token: `capture`.
+    cc_capture: &'a TokenStream,
+    /// Counter-cache token: `after update`.
+    cc_after_update: &'a TokenStream,
+}
+
+/// The single-row update body of [`emit_crud_bodies_hooked`].
+#[allow(
+    clippy::too_many_lines,
+    clippy::option_if_let_else,
+    clippy::large_stack_frames,
+    clippy::cognitive_complexity
+)]
+fn emit_hooked_update(config: &RepoConfig, inputs: &HookedUpdateInputs<'_>) -> HookedUpdate {
+    let HookedUpdateInputs {
+        enqueue_context_setup,
+        enqueue_context_ref,
+        finalize_context_setup,
+        finalize_context_ref,
+        cc_capture,
+        cc_after_update,
+    } = *inputs;
+    let model_name = &config.model_name;
+    let table_name = &config.table_name;
+    let table_ident = format_ident!("{table_name}");
+    let commit_hooks_enabled = config.hooks_type.is_some() && config.commit_hooks;
 
     // ── update (hooked) ───────────────────────────────
     let draft_ext_trait = format_ident!("{}DraftExt", model_name);
@@ -8104,6 +7655,41 @@ fn emit_crud_bodies_hooked(
         }
     };
 
+    HookedUpdate { update_body }
+}
+
+struct HookedDelete {
+    delete_body: TokenStream,
+}
+
+/// What [`emit_hooked_delete`] needs beyond [`RepoConfig`].
+struct HookedDeleteInputs<'a> {
+    /// The soft-delete `WHERE deleted_at IS NULL` fragment, or nothing.
+    sd_filter: &'a TokenStream,
+    /// Counter-cache token: `serialize`.
+    cc_serialize: &'a TokenStream,
+    /// Counter-cache token: `before delete`.
+    cc_before_delete: &'a TokenStream,
+}
+
+/// The single-row delete body of [`emit_crud_bodies_hooked`].
+#[allow(
+    clippy::too_many_lines,
+    clippy::option_if_let_else,
+    clippy::large_stack_frames,
+    clippy::cognitive_complexity
+)]
+fn emit_hooked_delete(config: &RepoConfig, inputs: &HookedDeleteInputs<'_>) -> HookedDelete {
+    let HookedDeleteInputs {
+        sd_filter,
+        cc_serialize,
+        cc_before_delete,
+    } = *inputs;
+    let model_name = &config.model_name;
+    let table_name = &config.table_name;
+    let table_ident = format_ident!("{table_name}");
+    let commit_hooks_enabled = config.hooks_type.is_some() && config.commit_hooks;
+
     // ── delete (hooked) ───────────────────────────────
     //
     // The core mutation differs for soft-delete repositories:
@@ -8424,6 +8010,49 @@ fn emit_crud_bodies_hooked(
             Ok(())
         }
     };
+
+    HookedDelete { delete_body }
+}
+
+struct HookedInsertMany {
+    save_many_body: TokenStream,
+    save_many_skip_invalid_body: TokenStream,
+}
+
+/// What [`emit_hooked_insert_many`] needs beyond [`RepoConfig`].
+struct HookedInsertManyInputs<'a> {
+    /// Validation spliced ahead of one item of a bulk insert.
+    validate_item_result: &'a TokenStream,
+    /// Counter-cache token: `serialize`.
+    cc_serialize: &'a TokenStream,
+    /// Counter-cache token: `after insert`.
+    cc_after_insert: &'a TokenStream,
+    /// Counter-cache token: `after insert chunk`.
+    cc_after_insert_chunk: &'a TokenStream,
+}
+
+/// The bulk insert bodies of [`emit_crud_bodies_hooked`].
+#[allow(
+    clippy::too_many_lines,
+    clippy::option_if_let_else,
+    clippy::large_stack_frames,
+    clippy::cognitive_complexity
+)]
+fn emit_hooked_insert_many(
+    config: &RepoConfig,
+    inputs: &HookedInsertManyInputs<'_>,
+) -> HookedInsertMany {
+    let HookedInsertManyInputs {
+        validate_item_result,
+        cc_serialize,
+        cc_after_insert,
+        cc_after_insert_chunk,
+    } = *inputs;
+    let model_name = &config.model_name;
+    let table_name = &config.table_name;
+    let table_ident = format_ident!("{table_name}");
+    let tenant_extra = usize::from(config.tenant_scoped);
+    let commit_hooks_enabled = config.hooks_type.is_some() && config.commit_hooks;
 
     let save_many_body = {
         let tenant_id_setup = if config.tenant_scoped {
@@ -9409,6 +9038,67 @@ fn emit_crud_bodies_hooked(
         }
     };
 
+    HookedInsertMany {
+        save_many_body,
+        save_many_skip_invalid_body,
+    }
+}
+
+#[allow(clippy::struct_field_names)]
+struct HookedMutateMany {
+    update_many_body: TokenStream,
+    delete_many_body: TokenStream,
+    upsert_many_body: TokenStream,
+}
+
+/// What [`emit_hooked_mutate_many`] needs beyond [`RepoConfig`].
+struct HookedMutateManyInputs<'a> {
+    /// The `dependent(...)` cascade arms the delete-many body splices in.
+    cascade: &'a DependentCascade,
+    /// Counter-cache token: `serialize`.
+    cc_serialize: &'a TokenStream,
+    /// Counter-cache token: `capture many`.
+    cc_capture_many: &'a TokenStream,
+    /// Counter-cache token: `after update chunk`.
+    cc_after_update_chunk: &'a TokenStream,
+    /// Counter-cache token: `before delete chunk`.
+    cc_before_delete_chunk: &'a TokenStream,
+}
+
+/// The bulk update, delete and upsert bodies of [`emit_crud_bodies_hooked`].
+///
+/// `Err` carries the `compile_error!` a bad `broadcast_topic` produces on the
+/// delete-many cascade, which the caller returns as its whole expansion.
+#[allow(
+    clippy::too_many_lines,
+    clippy::option_if_let_else,
+    clippy::large_stack_frames,
+    clippy::cognitive_complexity
+)]
+fn emit_hooked_mutate_many(
+    config: &RepoConfig,
+    inputs: &HookedMutateManyInputs<'_>,
+) -> Result<HookedMutateMany, TokenStream> {
+    let HookedMutateManyInputs {
+        cascade,
+        cc_serialize,
+        cc_capture_many,
+        cc_after_update_chunk,
+        cc_before_delete_chunk,
+    } = *inputs;
+    let DependentCascade {
+        delete_many_compiletime_cascade,
+        delete_many_runtime_cascade,
+        delete_many_cascade_tx_bind,
+        delete_many_cascade_tx_ok,
+        delete_many_cascade_post_publish,
+        ..
+    } = cascade;
+    let model_name = &config.model_name;
+    let table_name = &config.table_name;
+    let table_ident = format_ident!("{table_name}");
+    let commit_hooks_enabled = config.hooks_type.is_some() && config.commit_hooks;
+
     let update_many_body = {
         let draft_ext_trait = format_ident!("{}DraftExt", model_name);
 
@@ -10269,27 +9959,14 @@ fn emit_crud_bodies_hooked(
         unreachable!("upsert_many is not available when hooks are configured")
     };
 
-    Ok(CrudBodies {
-        struct_fields,
-        clone_impl,
-        extractor_init,
-        save_body,
-        update_body,
-        delete_body,
-        hook_support_methods,
-        hook_inventory_registration,
-        save_many_body,
-        save_many_skip_invalid_body,
+    Ok(HookedMutateMany {
         update_many_body,
         delete_many_body,
         upsert_many_body,
     })
 }
 
-/// The no-hooks arm of [`emit_crud_bodies`]: the zero-cost path.
-///
-/// Unlike the hooked arm this one cannot fail: no `broadcast_topic` is parsed
-/// on this path, so there is no `compile_error!` to return.
+/// The `hooks = ...` arm of [`emit_crud_bodies`].
 // The same grandfathered allows `repository_macro` carries: this body was
 // lifted out of it verbatim, so the lint surface moved with the code.
 #[allow(
@@ -10298,13 +9975,17 @@ fn emit_crud_bodies_hooked(
     clippy::large_stack_frames,
     clippy::cognitive_complexity
 )]
-fn emit_crud_bodies_plain(config: &RepoConfig, inputs: &CrudBodiesInputs<'_>) -> CrudBodies {
+fn emit_crud_bodies_hooked(
+    config: &RepoConfig,
+    inputs: &CrudBodiesInputs<'_>,
+    hooks_ident: &Ident,
+) -> Result<CrudBodies, TokenStream> {
     let CrudBodiesInputs {
         pg_name,
+        sd_filter,
         read_route_init,
-        validate_row_result,
+        validate_item_result,
         cascade,
-        cc_has,
         cc_serialize,
         cc_capture,
         cc_capture_many,
@@ -10312,7 +9993,6 @@ fn emit_crud_bodies_plain(config: &RepoConfig, inputs: &CrudBodiesInputs<'_>) ->
         cc_after_insert_chunk,
         cc_after_update,
         cc_after_update_chunk,
-        cc_after_upsert_chunk,
         cc_before_delete,
         cc_before_delete_chunk,
         tenant_struct_field,
@@ -10326,29 +10006,34 @@ fn emit_crud_bodies_plain(config: &RepoConfig, inputs: &CrudBodiesInputs<'_>) ->
         bcast_field_some_state,
         ..
     } = *inputs;
-    let DependentCascade {
-        delete_many_compiletime_cascade,
-        delete_many_runtime_cascade,
-        delete_many_cascade_tx_bind,
-        delete_many_cascade_tx_ok,
-        delete_many_cascade_no_hooks_tail,
-        ..
-    } = cascade;
 
     let model_name = &config.model_name;
     let table_name = &config.table_name;
     let table_ident = format_ident!("{table_name}");
-    let new_name = format_ident!("New{model_name}");
-    let tenant_extra = usize::from(config.tenant_scoped);
-    let cc_tx_wrap =
-        |ret_ty: &TokenStream, body: &TokenStream| cc_transaction_wrap(cc_has, ret_ty, body);
+    let commit_hooks_enabled = config.hooks_type.is_some() && config.commit_hooks;
 
-    // ── No hooks: existing zero-cost path ─────────────
+    // ── Struct fields with hooks ───────────────────────
+    let idempotency_struct_field = if commit_hooks_enabled {
+        quote! {
+            idempotency: ::core::option::Option<::autumn_web::idempotency::IdempotencyContext>,
+        }
+    } else {
+        quote! {}
+    };
+    let idempotency_clone_field = if commit_hooks_enabled {
+        quote! {
+            idempotency: self.idempotency.clone(),
+        }
+    } else {
+        quote! {}
+    };
 
     let struct_fields = quote! {
         pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
             ::autumn_web::RuntimeConnection,
         >,
+        hooks: #hooks_ident,
+        #idempotency_struct_field
         #tenant_struct_field
         #shards_struct_field
         /// Read-routing snapshot for generated read-only methods (#971).
@@ -10367,6 +10052,8 @@ fn emit_crud_bodies_plain(config: &RepoConfig, inputs: &CrudBodiesInputs<'_>) ->
             fn clone(&self) -> Self {
                 Self {
                     pool: self.pool.clone(),
+                    hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksClone>::autumn_clone(&self.hooks),
+                    #idempotency_clone_field
                     #tenant_clone_field
                     #shards_clone_field
                     __autumn_read_route: self.__autumn_read_route.clone(),
@@ -10398,19 +10085,517 @@ fn emit_crud_bodies_plain(config: &RepoConfig, inputs: &CrudBodiesInputs<'_>) ->
         #read_route_init
     };
 
-    let extractor_init = quote! {
-        #timeout_route_init
-        Ok(#pg_name {
-            pool,
-            #tenant_init_field
-            #shards_none_field
-            __autumn_read_route,
-            __autumn_statement_timeout_ms: __autumn_timeout_ms,
-            __autumn_slow_threshold,
-            __autumn_route,
-            #bcast_field_some_state
-        })
+    let extractor_init = if commit_hooks_enabled {
+        quote! {
+            #pg_name::__autumn_register_repository_commit_hooks();
+            #timeout_route_init
+            Ok(#pg_name {
+                pool,
+                hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
+                idempotency: _parts
+                    .extensions
+                    .get::<::autumn_web::idempotency::IdempotencyContext>()
+                    .cloned(),
+                #tenant_init_field
+                #shards_none_field
+                __autumn_read_route,
+                __autumn_statement_timeout_ms: __autumn_timeout_ms,
+                __autumn_slow_threshold,
+                __autumn_route,
+                #bcast_field_some_state
+            })
+        }
+    } else {
+        quote! {
+            #timeout_route_init
+            Ok(#pg_name {
+                pool,
+                hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
+                #tenant_init_field
+                #shards_none_field
+                __autumn_read_route,
+                __autumn_statement_timeout_ms: __autumn_timeout_ms,
+                __autumn_slow_threshold,
+                __autumn_route,
+                #bcast_field_some_state
+            })
+        }
     };
+
+    let (broadcast_create, broadcast_update, broadcast_delete) = if config.broadcasts {
+        let base_topic_expr = match generate_topic_format(
+            config
+                .broadcast_topic
+                .as_deref()
+                .unwrap_or(&config.table_name),
+            &quote! { __record_ref },
+        ) {
+            Ok(expr) => expr,
+            Err(err) => {
+                let compile_err = err.to_compile_error();
+                return Err(quote! { #compile_err });
+            }
+        };
+
+        let topic_expr = if config.tenant_scoped {
+            quote! { ::std::format!("tenant:{}:{}", ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(&__record_ref.tenant_id), #base_topic_expr) }
+        } else {
+            base_topic_expr
+        };
+
+        let default_container = format!("{}-list", config.table_name);
+        let container_expr = config
+            .broadcast_container
+            .as_deref()
+            .unwrap_or(&default_container);
+        let model_prefix = to_snake_case(&config.model_name.to_string());
+
+        let (render_expr, create_swap_id, create_swap_strategy, update_id_expr, delete_id_expr) =
+            if let Some(ref render_path) = config.broadcast_render {
+                let extract_id = quote! {
+                    ::autumn_web::htmx::extract_html_id(&{#render_path(__record_ref)}.into_string())
+                        .unwrap_or_else(|| ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
+                };
+                (
+                    quote! { #render_path(__record_ref) },
+                    quote! { #container_expr.to_string() },
+                    quote! { ::autumn_web::htmx::OobSwap::BeforeEnd },
+                    extract_id.clone(),
+                    extract_id,
+                )
+            } else {
+                let dom_id = quote! { <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref) };
+                (
+                    quote! { <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(__record_ref) },
+                    quote! { #container_expr.to_string() },
+                    quote! { <#model_name as ::autumn_web::live::LiveFragment>::insert_swap() },
+                    dom_id.clone(),
+                    dom_id,
+                )
+            };
+
+        let create = quote! {
+            {
+                let __record_ref = &__record;
+                if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
+                    let __topic = #topic_expr;
+                    let __fragment = #render_expr;
+                    let __create_id = #create_swap_id;
+                    let __create_swap = #create_swap_strategy;
+                    if let ::core::result::Result::Err(__err) = __channels
+                        .broadcast()
+                        .publish_oob(&__topic, &__create_id, &__create_swap, &__fragment)
+                    {
+                        ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
+                    }
+                }
+            }
+        };
+
+        let update = quote! {
+            {
+                let __record_ref = &__record;
+                if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
+                    let __topic = #topic_expr;
+                    let __fragment = #render_expr;
+                    let __id = #update_id_expr;
+
+                    let __prev_id = __ctx_val
+                        .get("__autumn_previous_id")
+                        .and_then(|__v| __v.as_str());
+
+                    let __topic_changed = __ctx_val
+                        .get("__autumn_previous_topic")
+                        .and_then(|__v| __v.as_str())
+                        .map_or(false, |__prev_topic| __prev_topic != __topic);
+
+                    if __topic_changed {
+                        if let ::core::option::Option::Some(__prev_topic) = __ctx_val
+                            .get("__autumn_previous_topic")
+                            .and_then(|__v| __v.as_str())
+                        {
+                            let __delete_id = __prev_id.unwrap_or(&__id);
+                            let __delete_fragment = ::autumn_web::html! {};
+                            if let ::core::result::Result::Err(__err) = __channels
+                                .broadcast()
+                                .publish_oob(__prev_topic, __delete_id, &::autumn_web::htmx::OobSwap::Delete, &__delete_fragment)
+                            {
+                                ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast delete of old topic failed");
+                            }
+                        }
+                    }
+
+                    let (__target_id, __swap_strategy) = if __topic_changed {
+                        (#container_expr, <#model_name as ::autumn_web::live::LiveFragment>::insert_swap())
+                    } else {
+                        let __strategy = if let ::core::option::Option::Some(__prev_id_val) = __prev_id {
+                            if __prev_id_val != &__id {
+                                ::autumn_web::htmx::OobSwap::Target(
+                                    ::autumn_web::htmx::OobMethod::OuterHTML,
+                                    ::std::format!("#{}", __prev_id_val),
+                                )
+                            } else {
+                                ::autumn_web::htmx::OobSwap::OuterHTML
+                            }
+                        } else {
+                            ::autumn_web::htmx::OobSwap::OuterHTML
+                        };
+                        (__id.as_str(), __strategy)
+                    };
+
+                    if let ::core::result::Result::Err(__err) = __channels
+                        .broadcast()
+                        .publish_oob(&__topic, __target_id, &__swap_strategy, &__fragment)
+                    {
+                        ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
+                    }
+                }
+            }
+        };
+
+        let delete = quote! {
+            {
+                let __record_ref = &__record;
+                if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
+                    let __topic = #topic_expr;
+                    let __id = #delete_id_expr;
+                    let __fragment = ::autumn_web::html! {};
+                    if let ::core::result::Result::Err(__err) = __channels
+                        .broadcast()
+                        .publish_oob(&__topic, &__id, &::autumn_web::htmx::OobSwap::Delete, &__fragment)
+                    {
+                        ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
+                    }
+                }
+            }
+        };
+
+        (create, update, delete)
+    } else {
+        (quote! {}, quote! {}, quote! {})
+    };
+
+    let (enqueue_context_setup, enqueue_context_ref, finalize_context_setup, finalize_context_ref) =
+        if config.broadcasts {
+            let base_topic_expr = match generate_topic_format(
+                config
+                    .broadcast_topic
+                    .as_deref()
+                    .unwrap_or(&config.table_name),
+                &quote! { __record_ref },
+            ) {
+                Ok(expr) => expr,
+                Err(err) => {
+                    let compile_err = err.to_compile_error();
+                    return Err(quote! { #compile_err });
+                }
+            };
+
+            let topic_expr = if config.tenant_scoped {
+                quote! { ::std::format!("tenant:{}:{}", ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(&__record_ref.tenant_id), #base_topic_expr) }
+            } else {
+                base_topic_expr
+            };
+
+            let prev_id_expr = if let Some(ref render_path) = config.broadcast_render {
+                quote! { {
+                    let __prev_fragment = #render_path(__record_ref);
+                    ::autumn_web::htmx::extract_html_id(&__prev_fragment.into_string())
+                } }
+            } else {
+                quote! { ::core::option::Option::Some(<#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref)) }
+            };
+
+            (
+                quote! {
+                    let (__autumn_previous_topic, __autumn_previous_id) = if let ::core::option::Option::Some(__record_val) = &__vh_before {
+                        let __record_ref = __record_val;
+                        let __prev_topic = #topic_expr;
+                        let __prev_id = #prev_id_expr;
+                        (::core::option::Option::Some(__prev_topic), __prev_id)
+                    } else {
+                        (::core::option::Option::None, ::core::option::Option::None)
+                    };
+
+                    let mut __autumn_ctx_val = ::autumn_web::reexports::serde_json::to_value(&ctx)
+                        .map_err(|e| ::autumn_web::AutumnError::internal_server_error_msg(format!("serialize context: {e}")))?;
+
+                    if let ::core::option::Option::Some(ref __prev_topic) = __autumn_previous_topic {
+                        if let ::core::option::Option::Some(__map) = __autumn_ctx_val.as_object_mut() {
+                            __map.insert(
+                                "__autumn_previous_topic".to_string(),
+                                ::autumn_web::reexports::serde_json::Value::String(__prev_topic.clone()),
+                            );
+                        }
+                    }
+
+                    if let ::core::option::Option::Some(ref __prev_id_val) = __autumn_previous_id {
+                        if let ::core::option::Option::Some(__map) = __autumn_ctx_val.as_object_mut() {
+                            __map.insert(
+                                "__autumn_previous_id".to_string(),
+                                ::autumn_web::reexports::serde_json::Value::String(__prev_id_val.clone()),
+                            );
+                        }
+                    }
+                },
+                quote! { &__autumn_ctx_val },
+                quote! {
+                    let mut __autumn_finalized_ctx_val = ::autumn_web::reexports::serde_json::to_value(&ctx)
+                        .map_err(|e| ::autumn_web::AutumnError::internal_server_error_msg(format!("serialize finalized context: {e}")))?;
+                    if let ::core::option::Option::Some(ref __prev_topic) = __autumn_previous_topic {
+                        if let ::core::option::Option::Some(__map) = __autumn_finalized_ctx_val.as_object_mut() {
+                            __map.insert(
+                                "__autumn_previous_topic".to_string(),
+                                ::autumn_web::reexports::serde_json::Value::String(__prev_topic.clone()),
+                            );
+                        }
+                    }
+                    if let ::core::option::Option::Some(ref __prev_id) = __autumn_previous_id {
+                        if let ::core::option::Option::Some(__map) = __autumn_finalized_ctx_val.as_object_mut() {
+                            __map.insert(
+                                "__autumn_previous_id".to_string(),
+                                ::autumn_web::reexports::serde_json::Value::String(__prev_id.clone()),
+                            );
+                        }
+                    }
+                },
+                quote! { &__autumn_finalized_ctx_val },
+            )
+        } else {
+            (
+                quote! {
+                    let __autumn_previous_topic: ::core::option::Option<::std::string::String> = ::core::option::Option::None;
+                    let __autumn_previous_id: ::core::option::Option<::std::string::String> = ::core::option::Option::None;
+                },
+                quote! { &ctx },
+                quote! {},
+                quote! { &ctx },
+            )
+        };
+
+    let hook_support_methods = if commit_hooks_enabled {
+        quote! {
+        #[doc(hidden)]
+        fn __autumn_repository_commit_hook_key() -> &'static str {
+            ::core::concat!(
+                ::core::env!("CARGO_PKG_NAME"),
+                "::",
+                ::core::module_path!(),
+                "::",
+                ::core::stringify!(#table_ident),
+                "::",
+                ::core::stringify!(#model_name),
+                "::",
+                ::core::stringify!(#hooks_ident)
+            )
+        }
+
+        #[doc(hidden)]
+        fn __autumn_register_repository_commit_hooks() {
+            static __AUTUMN_REGISTERED: ::std::sync::OnceLock<()> = ::std::sync::OnceLock::new();
+            __AUTUMN_REGISTERED.get_or_init(|| {
+                ::autumn_web::__private::register_repository_commit_hook_runner(
+                    Self::__autumn_repository_commit_hook_key(),
+                    |__ctx, __record| async move {
+                        let mut __ctx: ::autumn_web::hooks::MutationContext =
+                            ::autumn_web::reexports::serde_json::from_value(__ctx)
+                                .map_err(|__error| {
+                                    ::autumn_web::AutumnError::internal_server_error_msg(
+                                        format!("deserialize repository create hook context: {__error}")
+                                    )
+                                })?;
+                        let __record: #model_name =
+                            #model_name::__autumn_commit_hook_from_value(__record)?;
+                        let __hooks =
+                            <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
+                        <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_create_commit(
+                            &__hooks,
+                            &mut __ctx,
+                            &__record,
+                        )
+                        .await?;
+                        #broadcast_create
+                        Ok(())
+                    },
+                    |__ctx_val, __record| async move {
+                        let mut __ctx: ::autumn_web::hooks::MutationContext =
+                            ::autumn_web::reexports::serde_json::from_value(__ctx_val.clone())
+                                .map_err(|__error| {
+                                    ::autumn_web::AutumnError::internal_server_error_msg(
+                                        format!("deserialize repository update hook context: {__error}")
+                                    )
+                                })?;
+                        let __record: #model_name =
+                            #model_name::__autumn_commit_hook_from_value(__record)?;
+                        let __hooks =
+                            <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
+                        <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_update_commit(
+                            &__hooks,
+                            &mut __ctx,
+                            &__record,
+                        )
+                        .await?;
+                        #broadcast_update
+                        Ok(())
+                    },
+                    |__ctx, __record| async move {
+                        let mut __ctx: ::autumn_web::hooks::MutationContext =
+                            ::autumn_web::reexports::serde_json::from_value(__ctx)
+                                .map_err(|__error| {
+                                    ::autumn_web::AutumnError::internal_server_error_msg(
+                                        format!("deserialize repository delete hook context: {__error}")
+                                    )
+                                })?;
+                        let __record: #model_name =
+                            #model_name::__autumn_commit_hook_from_value(__record)?;
+                        let __hooks =
+                            <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
+                        <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_delete_commit(
+                            &__hooks,
+                            &mut __ctx,
+                            &__record,
+                        )
+                        .await?;
+                        #broadcast_delete
+                        Ok(())
+                    },
+                );
+            });
+        }
+        }
+    } else {
+        quote! {}
+    };
+
+    let hook_inventory_registration = if commit_hooks_enabled {
+        quote! {
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::__private::RepositoryCommitHookDescriptor {
+                    register: #pg_name::__autumn_register_repository_commit_hooks,
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    let HookedSave { save_body } = emit_hooked_save(
+        config,
+        &HookedSaveInputs {
+            cc_serialize,
+            cc_after_insert,
+        },
+    );
+
+    let HookedUpdate { update_body } = emit_hooked_update(
+        config,
+        &HookedUpdateInputs {
+            enqueue_context_setup: &enqueue_context_setup,
+            enqueue_context_ref: &enqueue_context_ref,
+            finalize_context_setup: &finalize_context_setup,
+            finalize_context_ref: &finalize_context_ref,
+            cc_capture,
+            cc_after_update,
+        },
+    );
+
+    let HookedDelete { delete_body } = emit_hooked_delete(
+        config,
+        &HookedDeleteInputs {
+            sd_filter,
+            cc_serialize,
+            cc_before_delete,
+        },
+    );
+
+    let HookedInsertMany {
+        save_many_body,
+        save_many_skip_invalid_body,
+    } = emit_hooked_insert_many(
+        config,
+        &HookedInsertManyInputs {
+            validate_item_result,
+            cc_serialize,
+            cc_after_insert,
+            cc_after_insert_chunk,
+        },
+    );
+
+    let HookedMutateMany {
+        update_many_body,
+        delete_many_body,
+        upsert_many_body,
+    } = emit_hooked_mutate_many(
+        config,
+        &HookedMutateManyInputs {
+            cascade,
+            cc_serialize,
+            cc_capture_many,
+            cc_after_update_chunk,
+            cc_before_delete_chunk,
+        },
+    )?;
+
+    Ok(CrudBodies {
+        struct_fields,
+        clone_impl,
+        extractor_init,
+        save_body,
+        update_body,
+        delete_body,
+        hook_support_methods,
+        hook_inventory_registration,
+        save_many_body,
+        save_many_skip_invalid_body,
+        update_many_body,
+        delete_many_body,
+        upsert_many_body,
+    })
+}
+
+struct PlainSaveUpdate {
+    save_body: TokenStream,
+    update_body: TokenStream,
+}
+
+/// What [`emit_plain_save_update`] needs beyond [`RepoConfig`].
+#[allow(clippy::struct_field_names)]
+struct PlainSaveUpdateInputs<'a> {
+    /// Counter-cache token: `has`.
+    cc_has: &'a TokenStream,
+    /// Counter-cache token: `serialize`.
+    cc_serialize: &'a TokenStream,
+    /// Counter-cache token: `capture`.
+    cc_capture: &'a TokenStream,
+    /// Counter-cache token: `after insert`.
+    cc_after_insert: &'a TokenStream,
+    /// Counter-cache token: `after update`.
+    cc_after_update: &'a TokenStream,
+}
+
+/// The single-row save and update bodies of [`emit_crud_bodies_plain`].
+#[allow(
+    clippy::too_many_lines,
+    clippy::option_if_let_else,
+    clippy::large_stack_frames,
+    clippy::cognitive_complexity
+)]
+fn emit_plain_save_update(
+    config: &RepoConfig,
+    inputs: &PlainSaveUpdateInputs<'_>,
+) -> PlainSaveUpdate {
+    let PlainSaveUpdateInputs {
+        cc_has,
+        cc_serialize,
+        cc_capture,
+        cc_after_insert,
+        cc_after_update,
+    } = *inputs;
+    let cc_tx_wrap =
+        |ret_ty: &TokenStream, body: &TokenStream| cc_transaction_wrap(cc_has, ret_ty, body);
+    let model_name = &config.model_name;
+    let table_name = &config.table_name;
+    let table_ident = format_ident!("{table_name}");
 
     // #1325: transactional variants for the two transaction-free `save`
     // arms. Emitted behind the `const HAS_COUNTER_CACHES` guard, so they are
@@ -10982,6 +11167,42 @@ fn emit_crud_bodies_plain(config: &RepoConfig, inputs: &CrudBodiesInputs<'_>) ->
         }
     };
 
+    PlainSaveUpdate {
+        save_body,
+        update_body,
+    }
+}
+
+struct PlainDelete {
+    delete_body: TokenStream,
+}
+
+/// What [`emit_plain_delete`] needs beyond [`RepoConfig`].
+struct PlainDeleteInputs<'a> {
+    /// Counter-cache token: `has`.
+    cc_has: &'a TokenStream,
+    /// Counter-cache token: `before delete`.
+    cc_before_delete: &'a TokenStream,
+}
+
+/// The single-row delete body of [`emit_crud_bodies_plain`].
+#[allow(
+    clippy::too_many_lines,
+    clippy::option_if_let_else,
+    clippy::large_stack_frames,
+    clippy::cognitive_complexity
+)]
+fn emit_plain_delete(config: &RepoConfig, inputs: &PlainDeleteInputs<'_>) -> PlainDelete {
+    let PlainDeleteInputs {
+        cc_has,
+        cc_before_delete,
+    } = *inputs;
+    let cc_tx_wrap =
+        |ret_ty: &TokenStream, body: &TokenStream| cc_transaction_wrap(cc_has, ret_ty, body);
+    let model_name = &config.model_name;
+    let table_name = &config.table_name;
+    let table_ident = format_ident!("{table_name}");
+
     // #1325: transactional twins of the four transaction-free
     // `delete_by_id` arms (tenant/plain x soft/hard). Each decrements the
     // counter-cached parents *before* its own delete statement, so the two
@@ -11316,6 +11537,49 @@ fn emit_crud_bodies_plain(config: &RepoConfig, inputs: &CrudBodiesInputs<'_>) ->
             #cc_delete_hard_wrap
         }
     };
+
+    PlainDelete { delete_body }
+}
+
+struct PlainInsertMany {
+    save_many_body: TokenStream,
+    save_many_skip_invalid_body: TokenStream,
+}
+
+/// What [`emit_plain_insert_many`] needs beyond [`RepoConfig`].
+struct PlainInsertManyInputs<'a> {
+    /// Validation spliced ahead of one loaded insert row.
+    validate_row_result: &'a TokenStream,
+    /// Counter-cache token: `serialize`.
+    cc_serialize: &'a TokenStream,
+    /// Counter-cache token: `after insert`.
+    cc_after_insert: &'a TokenStream,
+    /// Counter-cache token: `after insert chunk`.
+    cc_after_insert_chunk: &'a TokenStream,
+}
+
+/// The bulk insert bodies of [`emit_crud_bodies_plain`].
+#[allow(
+    clippy::too_many_lines,
+    clippy::option_if_let_else,
+    clippy::large_stack_frames,
+    clippy::cognitive_complexity
+)]
+fn emit_plain_insert_many(
+    config: &RepoConfig,
+    inputs: &PlainInsertManyInputs<'_>,
+) -> PlainInsertMany {
+    let PlainInsertManyInputs {
+        validate_row_result,
+        cc_serialize,
+        cc_after_insert,
+        cc_after_insert_chunk,
+    } = *inputs;
+    let model_name = &config.model_name;
+    let table_name = &config.table_name;
+    let table_ident = format_ident!("{table_name}");
+    let new_name = format_ident!("New{model_name}");
+    let tenant_extra = usize::from(config.tenant_scoped);
 
     let save_many_body = if config.tenant_scoped && config.versioned {
         let vh_r = vh_insert_ts(
@@ -11910,6 +12174,67 @@ fn emit_crud_bodies_plain(config: &RepoConfig, inputs: &CrudBodiesInputs<'_>) ->
             Ok((successes, failures))
         }
     };
+
+    PlainInsertMany {
+        save_many_body,
+        save_many_skip_invalid_body,
+    }
+}
+
+#[allow(clippy::struct_field_names)]
+struct PlainMutateMany {
+    update_many_body: TokenStream,
+    delete_many_body: TokenStream,
+    upsert_many_body: TokenStream,
+}
+
+/// What [`emit_plain_mutate_many`] needs beyond [`RepoConfig`].
+struct PlainMutateManyInputs<'a> {
+    /// The `dependent(...)` cascade arms the delete-many body splices in.
+    cascade: &'a DependentCascade,
+    /// Counter-cache token: `serialize`.
+    cc_serialize: &'a TokenStream,
+    /// Counter-cache token: `capture many`.
+    cc_capture_many: &'a TokenStream,
+    /// Counter-cache token: `after update chunk`.
+    cc_after_update_chunk: &'a TokenStream,
+    /// Counter-cache token: `after upsert chunk`.
+    cc_after_upsert_chunk: &'a TokenStream,
+    /// Counter-cache token: `before delete chunk`.
+    cc_before_delete_chunk: &'a TokenStream,
+}
+
+/// The bulk update, delete and upsert bodies of [`emit_crud_bodies_plain`].
+#[allow(
+    clippy::too_many_lines,
+    clippy::option_if_let_else,
+    clippy::large_stack_frames,
+    clippy::cognitive_complexity
+)]
+fn emit_plain_mutate_many(
+    config: &RepoConfig,
+    inputs: &PlainMutateManyInputs<'_>,
+) -> PlainMutateMany {
+    let PlainMutateManyInputs {
+        cascade,
+        cc_serialize,
+        cc_capture_many,
+        cc_after_update_chunk,
+        cc_after_upsert_chunk,
+        cc_before_delete_chunk,
+    } = *inputs;
+    let DependentCascade {
+        delete_many_compiletime_cascade,
+        delete_many_runtime_cascade,
+        delete_many_cascade_tx_bind,
+        delete_many_cascade_tx_ok,
+        delete_many_cascade_no_hooks_tail,
+        ..
+    } = cascade;
+    let model_name = &config.model_name;
+    let table_name = &config.table_name;
+    let table_ident = format_ident!("{table_name}");
+    let tenant_extra = usize::from(config.tenant_scoped);
 
     let update_many_body = {
         // Unlike the hooks-enabled `update_many`, which updates one row per
@@ -12782,6 +13107,174 @@ fn emit_crud_bodies_plain(config: &RepoConfig, inputs: &CrudBodiesInputs<'_>) ->
             .await
         }
     };
+
+    PlainMutateMany {
+        update_many_body,
+        delete_many_body,
+        upsert_many_body,
+    }
+}
+
+/// The no-hooks arm of [`emit_crud_bodies`]: the zero-cost path.
+///
+/// Unlike the hooked arm this one cannot fail: no `broadcast_topic` is parsed
+/// on this path, so there is no `compile_error!` to return.
+// The same grandfathered allows `repository_macro` carries: this body was
+// lifted out of it verbatim, so the lint surface moved with the code.
+#[allow(
+    clippy::too_many_lines,
+    clippy::option_if_let_else,
+    clippy::large_stack_frames,
+    clippy::cognitive_complexity
+)]
+fn emit_crud_bodies_plain(config: &RepoConfig, inputs: &CrudBodiesInputs<'_>) -> CrudBodies {
+    let CrudBodiesInputs {
+        pg_name,
+        read_route_init,
+        validate_row_result,
+        cascade,
+        cc_has,
+        cc_serialize,
+        cc_capture,
+        cc_capture_many,
+        cc_after_insert,
+        cc_after_insert_chunk,
+        cc_after_update,
+        cc_after_update_chunk,
+        cc_after_upsert_chunk,
+        cc_before_delete,
+        cc_before_delete_chunk,
+        tenant_struct_field,
+        tenant_clone_field,
+        tenant_init_field,
+        shards_struct_field,
+        shards_clone_field,
+        shards_none_field,
+        bcast_struct_field,
+        bcast_clone_field,
+        bcast_field_some_state,
+        ..
+    } = *inputs;
+
+    // ── No hooks: existing zero-cost path ─────────────
+
+    let struct_fields = quote! {
+        pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+            ::autumn_web::RuntimeConnection,
+        >,
+        #tenant_struct_field
+        #shards_struct_field
+        /// Read-routing snapshot for generated read-only methods (#971).
+        __autumn_read_route: ::autumn_web::repository::ReadRoute,
+        /// Statement timeout to apply on every connection checkout (ms). 0 = no limit.
+        __autumn_statement_timeout_ms: u64,
+        /// Slow-query logging threshold.
+        __autumn_slow_threshold: ::std::time::Duration,
+        /// Route path from `MatchedPath` for metrics labels.
+        __autumn_route: ::std::option::Option<::std::string::String>,
+        #bcast_struct_field
+    };
+
+    let clone_impl = quote! {
+        impl ::core::clone::Clone for #pg_name {
+            fn clone(&self) -> Self {
+                Self {
+                    pool: self.pool.clone(),
+                    #tenant_clone_field
+                    #shards_clone_field
+                    __autumn_read_route: self.__autumn_read_route.clone(),
+                    __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
+                    __autumn_slow_threshold: self.__autumn_slow_threshold,
+                    __autumn_route: self.__autumn_route.clone(),
+                    #bcast_clone_field
+                }
+            }
+        }
+    };
+
+    let timeout_route_init = quote! {
+        use ::autumn_web::db::DbState as _;
+        // Postgres statement_timeout is a signed 32-bit integer (ms).
+        const __AUTUMN_PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
+        let __autumn_timeout_ms: u64 = _parts
+            .extensions
+            .get::<::autumn_web::db::StatementTimeout>()
+            .map(|t| ::std::convert::TryFrom::try_from(t.0.as_millis()).unwrap_or(u64::MAX))
+            .or_else(|| state.statement_timeout().map(|d| ::std::convert::TryFrom::try_from(d.as_millis()).unwrap_or(u64::MAX)))
+            .unwrap_or(0u64)
+            .min(__AUTUMN_PG_TIMEOUT_MAX_MS);
+        let __autumn_slow_threshold = state.slow_query_threshold();
+        let __autumn_route: ::std::option::Option<::std::string::String> = _parts
+            .extensions
+            .get::<::autumn_web::reexports::axum::extract::MatchedPath>()
+            .map(|p| p.as_str().to_owned());
+        #read_route_init
+    };
+
+    let extractor_init = quote! {
+        #timeout_route_init
+        Ok(#pg_name {
+            pool,
+            #tenant_init_field
+            #shards_none_field
+            __autumn_read_route,
+            __autumn_statement_timeout_ms: __autumn_timeout_ms,
+            __autumn_slow_threshold,
+            __autumn_route,
+            #bcast_field_some_state
+        })
+    };
+
+    let PlainSaveUpdate {
+        save_body,
+        update_body,
+    } = emit_plain_save_update(
+        config,
+        &PlainSaveUpdateInputs {
+            cc_has,
+            cc_serialize,
+            cc_capture,
+            cc_after_insert,
+            cc_after_update,
+        },
+    );
+
+    let PlainDelete { delete_body } = emit_plain_delete(
+        config,
+        &PlainDeleteInputs {
+            cc_has,
+            cc_before_delete,
+        },
+    );
+
+    let PlainInsertMany {
+        save_many_body,
+        save_many_skip_invalid_body,
+    } = emit_plain_insert_many(
+        config,
+        &PlainInsertManyInputs {
+            validate_row_result,
+            cc_serialize,
+            cc_after_insert,
+            cc_after_insert_chunk,
+        },
+    );
+
+    let PlainMutateMany {
+        update_many_body,
+        delete_many_body,
+        upsert_many_body,
+    } = emit_plain_mutate_many(
+        config,
+        &PlainMutateManyInputs {
+            cascade,
+            cc_serialize,
+            cc_capture_many,
+            cc_after_update_chunk,
+            cc_after_upsert_chunk,
+            cc_before_delete_chunk,
+        },
+    );
 
     CrudBodies {
         struct_fields,
