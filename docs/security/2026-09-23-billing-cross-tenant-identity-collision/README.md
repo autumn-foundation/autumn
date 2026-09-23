@@ -168,6 +168,20 @@ ground for a change confined to one leaf crate: `cargo check -p autumn-billing
 --all-targets` (the cross-package compile-break class `pre-push-check.sh`
 exists for) and the full `autumn-billing` test/clippy/fmt suite, both clean.
 
+**CI caught a real gap in this fix**, not a flake: the "Migration guide
+coverage" check's `check-docs-symbols.sh` gate failed on the migration
+guide's own suggested diff for a custom `recipient_for` override, because it
+referenced `autumn_billing::gate::TENANT_IDENTITY_SEPARATOR` — a
+`pub(crate)` constant a downstream app cannot actually name. The migration
+guide's advice would not have compiled for the exact reader it was written
+for. Fixed by adding a public `autumn_billing::gate::strip_tenant_scope`
+helper (used by the default `recipient_for` implementation too, replacing
+its own inline `rsplit`) and pointing the migration guide's diff at that
+instead of the raw separator, which also avoids exposing the separator
+character as public API. Verified: `./scripts/check-docs-symbols.sh` now
+reports 0 defects, and the full `autumn-billing` test/fmt/clippy suite
+above stayed green after the change.
+
 Re-attack attempts after the fix: reran both reproduction tests with the
 tenant scope removed entirely (single-tenant mode) to confirm the identity
 is byte-identical to pre-fix (no behavior change for non-tenant apps); reran
@@ -207,13 +221,15 @@ an app combining `BillingPlugin` with tenancy.
   strips the tenant prefix before parsing, so `user_id.parse::<i64>()`
   succeeds exactly as before.
 - A custom `BillingHooks::recipient_for` override that assumed the bare
-  session id needs the same one-line change (split on
-  `autumn_billing::gate::TENANT_IDENTITY_SEPARATOR` and take the last part)
-  — but only if the app runs `BillingPlugin` under tenancy, which
+  session id needs the same one-line change: call the new
+  `autumn_billing::gate::strip_tenant_scope(user_id)` before parsing — but
+  only if the app runs `BillingPlugin` under tenancy, which
   `docs/guide/billing.md` never documented as supported in the first place.
 - No config default changed, no route status code or response shape
-  changed, no public function signature changed. `TENANT_IDENTITY_SEPARATOR`
-  is a new `pub(crate)` constant, not part of the public API.
+  changed, no existing public function signature changed. The only new
+  public API is `autumn_billing::gate::strip_tenant_scope`, the recovery
+  half of the identity scoping — the separator itself
+  (`TENANT_IDENTITY_SEPARATOR`) stays `pub(crate)`.
 - Non-tenant apps (tenancy disabled, the overwhelming majority of
   `autumn-billing` users per the docs) see byte-identical behavior.
 - `CHANGELOG.md`: fragment added at `changelog.d/billing-tenant-scoped-identity.md`.

@@ -21,16 +21,11 @@ pub trait BillingHooks: Send + Sync + 'static {
     /// sessions can otherwise stringify to the identical id (a sharded
     /// deployment's shard-local `BIGSERIAL`, `docs/guide/sharding.md`), and
     /// this is the same identity every billing lookup is keyed on. The
-    /// default strips that prefix (splitting on the last `SEP`) before
-    /// parsing, so it keeps working unchanged; an app overriding this hook
-    /// and expecting the bare id under tenancy should do the same.
+    /// default recovers the raw id via [`crate::gate::strip_tenant_scope`]; an app
+    /// overriding this hook and expecting the bare id under tenancy should
+    /// call that same function rather than parsing `SEP` itself.
     fn recipient_for(&self, user_id: &str) -> Option<i64> {
-        user_id
-            .rsplit(crate::gate::TENANT_IDENTITY_SEPARATOR)
-            .next()
-            .unwrap_or(user_id)
-            .parse()
-            .ok()
+        crate::gate::strip_tenant_scope(user_id).parse().ok()
     }
 
     /// A subscription row was created or changed.

@@ -378,6 +378,23 @@ async fn user_id_in(session: &Session, state: &AppState) -> Result<String, Billi
     Ok(scope_identity_to_tenant(user_id))
 }
 
+/// Recover the raw session user id from a billing identity
+/// [`scope_identity_to_tenant`] may have tenant-scoped.
+///
+/// A no-op when tenancy is disabled, or for an identity written before this
+/// existed (no separator present) — so it is safe to call unconditionally,
+/// as [`BillingHooks::recipient_for`](crate::hooks::BillingHooks::recipient_for)'s
+/// default implementation does. `TENANT_IDENTITY_SEPARATOR` itself stays
+/// `pub(crate)`: this function, not the raw separator, is the stable surface
+/// a custom `recipient_for` override recovers the bare id through.
+#[must_use]
+pub fn strip_tenant_scope(user_id: &str) -> &str {
+    user_id
+        .rsplit(TENANT_IDENTITY_SEPARATOR)
+        .next()
+        .unwrap_or(user_id)
+}
+
 /// Fold the request's ambient `CURRENT_TENANT` into a billing identity.
 fn scope_identity_to_tenant(user_id: String) -> String {
     let tenant = autumn_web::tenancy::CURRENT_TENANT

@@ -1290,19 +1290,15 @@ For an affected app, `Customer.user_id` — and therefore whatever
 is now `{tenant}\u{1}{user_id}` rather than the bare session id (`\u{1}` is a
 control byte that can never appear in a resolved tenant id or an ordinary
 application user id, so the two components can never be misattributed). The
-**default** `recipient_for` implementation already strips the tenant prefix
-before parsing, so it needs no change. A custom override that assumed the
-bare session id under tenancy needs the same one-line change:
+**default** `recipient_for` implementation already recovers the raw id via
+[`autumn_billing::gate::strip_tenant_scope`](../../autumn-billing/src/gate.rs),
+so it needs no change. A custom override that assumed the bare session id
+under tenancy needs the same one-line change:
 
 ```diff
  fn recipient_for(&self, user_id: &str) -> Option<i64> {
 -    user_id.parse().ok()
-+    user_id
-+        .rsplit(autumn_billing::gate::TENANT_IDENTITY_SEPARATOR)
-+        .next()
-+        .unwrap_or(user_id)
-+        .parse()
-+        .ok()
++    autumn_billing::gate::strip_tenant_scope(user_id).parse().ok()
  }
 ```
 
