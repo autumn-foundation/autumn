@@ -149,8 +149,24 @@ cargo test -p autumn-billing --test dunning_close_scan_profile
 cargo test -p autumn-billing --test dunning_rearm_pending_profile
 cargo fmt -p autumn-billing -- --check
 cargo clippy -p autumn-billing --all-targets -- -D warnings
-./scripts/pre-push-check.sh
+cargo check -p autumn-billing --all-targets
+./scripts/check-panic-gate.sh          # 83 request-path modules gated
+./scripts/check-determinism-gate.sh    # 20 modules gated
+./scripts/check-plugin-surface.sh      # plugin API contract unchanged
+./scripts/check-changelog-fragments.sh # 34 fragments parse; CHANGELOG.md untouched
+./scripts/check-migration-guides.sh    # breaking entry links its guide
 ```
+
+`./scripts/pre-push-check.sh`'s full-workspace `cargo test --workspace --no-run`
+step hit this sandbox's disk allowance mid-build (compiling every example,
+benchmark and plugin from a cold cache): the linker crashed with `Bus error`
+on an unrelated example's test binary (`reddit-clone`'s
+`commentable_pg_integration`) after the filesystem read 0 bytes free — an
+environment resource limit, not a compile error in this change (`reddit-clone`
+does not depend on `autumn-billing`). The narrower gates above cover the same
+ground for a change confined to one leaf crate: `cargo check -p autumn-billing
+--all-targets` (the cross-package compile-break class `pre-push-check.sh`
+exists for) and the full `autumn-billing` test/clippy/fmt suite, both clean.
 
 Re-attack attempts after the fix: reran both reproduction tests with the
 tenant scope removed entirely (single-tenant mode) to confirm the identity
