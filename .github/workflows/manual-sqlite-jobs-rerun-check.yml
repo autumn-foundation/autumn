@@ -17,21 +17,30 @@ name: Manual sqlite_jobs_scheduler_e2e rerun check (Semaphore rerun harness)
 # than folded into ci.yml: it exists to generate a same-commit rerun-rate
 # baseline on demand, not to run on every push.
 #
-# Two jobs, two different shapes on purpose. `rerun` filters to the one
+# Three jobs, three different shapes on purpose. `rerun` filters to the one
 # target test with `--test-threads=1`, matching this ledger's earlier
-# hypothesis-elimination work. `rerun_default_parallelism` runs the *whole*
-# `sqlite_jobs_scheduler_e2e` binary (all 27 tests) at libtest's default
-# parallelism, with no filter and no `--test-threads` override — the exact
-# shape every organic hit has actually occurred under (`ci.yml`'s own
-# "Run the sqlite integration suite" step and its coverage-lane sibling
-# both invoke this binary with no `--test-threads` flag). A 2026-09-23
-# local run of exactly this shape (100 iterations, this repo's own
-# toolchain) reproduced the panic at 3/100 (3%), while a same-day 0/20
-# fully-serial (`--test-threads=1`, unfiltered) control run and this
-# harness's own isolated-single-test mode (0/100 local + 0/50 CI-native,
-# 2026-09-22) both stayed clean — see the ledger entry for the full
-# writeup. That result is what `rerun_default_parallelism` exists to
-# reproduce on demand in CI, not just locally.
+# hypothesis-elimination work; this harness's own isolated-single-test mode
+# stayed clean at 0/100 local + 0/50 CI-native (2026-09-22). The whole
+# binary (all 27 tests, no filter) is the shape every organic hit has
+# actually occurred under (`ci.yml`'s own "Run the sqlite integration
+# suite" step and its coverage-lane sibling both invoke it with no
+# `--test-threads` flag), run two ways: `rerun_default_parallelism` at
+# libtest's default parallelism, and `rerun_serial_whole_binary` fully
+# serial (`--test-threads=1`, still unfiltered — no other test function
+# runs concurrently with the target). A 2026-09-23 local run of the
+# default-parallelism shape (100 iterations) reproduced the panic at 3/100
+# (3%). An initial same-day serial control at n=20 showed 0/20 and was
+# reported as "requires concurrency" — a Codex review comment on PR #2922
+# correctly flagged that n=20 has only a ~46% chance of catching a true 3%
+# rate. Rerun at a properly-powered n=100, the serial shape **also**
+# failed, 1/100, the identical signature — the "requires concurrency"
+# framing was wrong. See the ledger entry for the full writeup, including
+# why `--test-threads=1` alone was never a true no-concurrency condition
+# (it serializes test *functions*, not the async tasks within one test's
+# own tokio runtime). `rerun_serial_whole_binary` exists to reproduce the
+# 1/100 figure on demand in CI, alongside `rerun_default_parallelism` for
+# the 3/100 one — neither figure is confirmed as statistically different
+# from the other at this sample size.
 on:
   workflow_dispatch:
     inputs:
@@ -256,4 +265,120 @@ jobs:
         with:
           name: sqlite-jobs-rerun-whole-binary-logs
           path: whole-binary-iteration-*.log
+          retention-days: 14
+
+  # Same whole-binary shape as rerun_default_parallelism, but fully serial
+  # (--test-threads=1) — added the same pass this ledger's "requires
+  # concurrency" framing was falsified by a properly-powered n=100 run of
+  # exactly this shape (1/100 failed, locally). Still unfiltered: no
+  # --test-threads override on `rerun` means only one test function is
+  # ever running at a time here, unlike the default-parallelism job above.
+  rerun_serial_whole_binary:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+      - name: Build the sqlite_jobs_scheduler_e2e test binary once
+        run: |
+          cargo test -p autumn-web --features "sqlite,test-support,storage" \
+            --test sqlite_jobs_scheduler_e2e --no-run
+      - name: Rerun the whole binary fully serially against a fresh on-disk SQLite file per test
+        env:
+          ITERATIONS: ${{ inputs.iterations }}
+        # workflow_dispatch's `type: choice` only constrains the manual UI
+        # dropdown - the API/CLI (`gh workflow run -f iterations=...`) can
+        # pass any string, so it's re-validated here rather than trusted.
+        run: |
+          case "$ITERATIONS" in
+            20|50) ;;
+            *) echo "::error::iterations must be 20 or 50 (got: $ITERATIONS)"; exit 1 ;;
+          esac
+          # Same independent target/sibling/joint classification as
+          # rerun_default_parallelism, applied to the serial shape.
+          target_fail=0
+          sibling_fail=0
+          joint_fail=0
+          target_missing=0
+          pass=0
+          for i in $(seq 1 "$ITERATIONS"); do
+            echo "=== iteration $i/$ITERATIONS ==="
+            cargo test -p autumn-web --features "sqlite,test-support,storage" \
+              --test sqlite_jobs_scheduler_e2e -- --test-threads=1 \
+              2>&1 | tee "serial-whole-binary-iteration-$i.log"
+            rc="${PIPESTATUS[0]}"
+            failed_names=$(grep -oE '^test [a-zA-Z0-9_]+ \.\.\. FAILED' \
+              "serial-whole-binary-iteration-$i.log" | awk '{print $2}')
+            target_hit=0
+            sibling_hit=0
+            while IFS= read -r name; do
+              [ -z "$name" ] && continue
+              if [ "$name" = "sqlite_job_backend_tracks_job_status_durably" ]; then
+                target_hit=1
+              else
+                sibling_hit=1
+              fi
+            done <<< "$failed_names"
+            target_ran=0
+            if [ "$target_hit" -eq 1 ] || grep -qE '^test sqlite_job_backend_tracks_job_status_durably \.\.\. ok' \
+                 "serial-whole-binary-iteration-$i.log"; then
+              target_ran=1
+            fi
+            if [ "$rc" -eq 0 ] && [ "$target_ran" -eq 1 ]; then
+              echo "iteration $i: PASS"
+              pass=$((pass + 1))
+            elif [ "$target_ran" -eq 0 ]; then
+              echo "iteration $i: TARGET NOT FOUND IN LOG (rc=$rc) - not counted toward target_fail/pass, logged for manual inspection (bad SHA/build, or the target was renamed)"
+              target_missing=$((target_missing + 1))
+            else
+              if [ "$target_hit" -eq 1 ]; then
+                target_fail=$((target_fail + 1))
+              fi
+              if [ "$sibling_hit" -eq 1 ]; then
+                sibling_fail=$((sibling_fail + 1))
+              fi
+              if [ "$target_hit" -eq 1 ] && [ "$sibling_hit" -eq 1 ]; then
+                joint_fail=$((joint_fail + 1))
+                echo "iteration $i: TARGET+SIBLING FAIL together (rc=$rc)"
+              elif [ "$target_hit" -eq 1 ]; then
+                echo "iteration $i: TARGET FAIL (rc=$rc)"
+              elif [ "$sibling_hit" -eq 1 ]; then
+                echo "iteration $i: SIBLING FAIL, target test unaffected (rc=$rc)"
+              else
+                echo "iteration $i: FAIL, no per-test FAILED line matched (rc=$rc) - treating as neither, logged for manual inspection"
+              fi
+            fi
+          done
+          target_ran_count=$((ITERATIONS - target_missing))
+          {
+            echo "## sqlite_jobs_scheduler_e2e whole-binary (serial, --test-threads=1) rerun result"
+            echo ""
+            if [ "$target_ran_count" -gt 0 ]; then
+              echo "Target (\`sqlite_job_backend_tracks_job_status_durably\`): \`$target_fail\`/\`$target_ran_count\` failed (denominator excludes iterations where the target could not be found)."
+            else
+              echo "Target (\`sqlite_job_backend_tracks_job_status_durably\`): rate undefined — the target was not found in any of the \`$ITERATIONS\` iteration logs."
+            fi
+            echo ""
+            echo "Sibling-test failures (any other test in the binary): \`$sibling_fail\`/\`$target_ran_count\`."
+            echo ""
+            echo "Of those, target and a sibling failed **together** in the same iteration: \`$joint_fail\`/\`$target_ran_count\` — only possible here via same-process state, since no two test functions run concurrently under --test-threads=1."
+            echo ""
+            if [ "$target_missing" -ne 0 ]; then
+              echo "⚠️ Target not found in \`$target_missing\`/\`$ITERATIONS\` iteration logs (bad SHA/build, or the target was renamed) — excluded from the target/sibling/pass counts above; inspect those logs manually."
+              echo ""
+            fi
+            echo "\`$pass\`/\`$ITERATIONS\` iterations passed outright (denominator is the full iteration count here, since a pass requires the target to have run)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "RESULT: target $target_fail/$target_ran_count failed, sibling $sibling_fail/$target_ran_count failed (of which $joint_fail/$target_ran_count joint with the target), $target_missing/$ITERATIONS target-missing, $pass/$ITERATIONS passed"
+      - name: Upload every iteration's full log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sqlite-jobs-rerun-serial-whole-binary-logs
+          path: serial-whole-binary-iteration-*.log
           retention-days: 14

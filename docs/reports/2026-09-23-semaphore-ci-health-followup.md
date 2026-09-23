@@ -1,4 +1,4 @@
-# 🚦 Semaphore: CI health follow-up — `sqlite_jobs_scheduler_e2e` flake reproduced outside CI for the first time (3/100 at default parallelism, 0/20 serial control)
+# 🚦 Semaphore: CI health follow-up — `sqlite_jobs_scheduler_e2e` flake reproduced outside CI for the first time; the "concurrency required" framing was wrong
 
 Follow-up to `docs/reports/2026-09-22-semaphore-ci-health-followup.md` and the
 running investigation in `docs/ci-health/quarantine-ledger.md`. This pass had
@@ -6,29 +6,46 @@ working network and toolchain access in its own sandbox (as the 2026-09-22
 pass did), and used it to follow through on that pass's own next step for
 `sqlite_jobs_scheduler_e2e::sqlite_job_backend_tracks_job_status_durably`: run
 the whole test binary at default parallelism, not filtered to one test. That
-reproduced the flake — **3/100** — for the first time outside CI, against a
-same-day **0/20** fully-serial control on the identical binary. A third
+reproduced the flake — **3/100** — for the first time outside CI. A third
 organic hit also turned up this pass's own sampling window, in a job shape
 (`Coverage (sandbox-sqlite)`) not previously checked for this signature,
-raising the organic count from n=2 to n=3. No fix opens this pass: only the
-correlation with whole-binary default-parallelism execution is confirmed —
-not, as an earlier draft of this report claimed and a Codex review comment
-on PR #2922 caught, a root-cause category naming inter-test shared state
-specifically. This report went through three more corrections diagnosing
-the intra-test candidate, in order: misidentifying the concurrent actor as
+raising the organic count from n=2 to n=3.
+
+This report's diagnosis went through six review corrections in total, the
+last of which overturns its own headline claim rather than just refining
+it. A same-day **0/20** fully-serial control looked clean and was reported
+as "this test never fails serially" — a Codex review comment on PR #2922
+correctly pointed out that n=20 has only a 46% chance of catching a true
+3% rate (54% chance of a clean run even if the bug is present as
+frequently as the concurrent sample suggested), so that control was never
+powered to support the claim. Rerun at a properly powered **n=100**: the
+serial control **also failed, 1/100, the identical signature** — the
+"fails only under concurrency" boundary this report and the ledger both
+asserted is false. Combined with a further realization this pass missed
+initially — `--test-threads=1` only prevents different *test functions*
+from running concurrently; it does not stop async tasks *within* one
+test's own tokio runtime (this target's own `queue_depth_survey_loop`
+included) from interleaving with that test's main body — the working
+hypothesis shifts from "requires concurrent sibling test functions" to
+"requires whole-binary execution context" (whether serial or concurrent),
+with the specific mechanism still unidentified. No fix opens this pass.
+No named mechanism survives review; this role's own hard gate requires
+one, plus a correct category, before a fix PR. No new hits on any other
+tracked signature.
+
+This report also went through five earlier corrections diagnosing the
+intra-test candidate, in order: overstating "concurrency confirmed" as a
+category rather than a correlation; misidentifying the concurrent actor as
 a `worker_loop` racing the enqueue (this test passes `run_workers: false`,
 so none is ever spawned — the real actor is `queue_depth_survey_loop`);
-then dismissing that actor as "read-only, so weaker" (its `wait_ready()`
-call can still win the race to run the schema-creating DDL, which is a
-write); then proposing that DDL race explains the panic via WAL-snapshot
-staleness on the enqueue's connection — ruled out on the fourth pass by
-`enqueue_job_at`'s own source order (it awaits schema-readiness *before*
-acquiring its connection, so that connection cannot predate the DDL). No
-named mechanism survives review this pass; both an inter-test shared
-resource and some intra-test interaction remain open, with nothing
-specific pointing at either. This role's own hard gate requires a specific
-defect, and a correct category besides, before a fix PR. No new hits on
-any other tracked signature.
+dismissing that actor as "read-only, so weaker" (its `wait_ready()` call
+can still win the race to run the schema-creating DDL, which is a write);
+proposing that DDL race explains the panic via WAL-snapshot staleness on
+the enqueue's connection — ruled out by `enqueue_job_at`'s own source
+order (it awaits schema-readiness *before* acquiring its connection, so
+that connection cannot predate the DDL); and finally the serial-control
+power issue above. Kept here for the record, since the fix history itself
+is part of what the next pass needs to not repeat.
 
 ## 🎯 Verdict path
 
@@ -79,9 +96,9 @@ None of the 7 match `live_upgrade`, `cache_stampede`, `sim_fault_plan`, or
 ## 🔍 Diagnosis
 
 **`sqlite_job_backend_tracks_job_status_durably` — a controlled local
-reproduction confirms sensitivity to whole-binary default-parallelism
-execution; neither the root-cause category nor the specific resource is
-confirmed.**
+reproduction confirms sensitivity to whole-binary *execution context*;
+neither concurrency specifically, the root-cause category, nor the
+specific resource is confirmed.**
 
 The third organic hit matters beyond the raw count: `Coverage
 (sandbox-sqlite)`'s coverage-generation step invokes the same
@@ -104,12 +121,38 @@ same-toolchain samples:
 - **Whole binary, fully serial (`--test-threads=1`, no filter)** — 20
   iterations, as a same-day control: **0/20 failed.**
 
+**Sixth review correction: that 20-run control was never powered to
+support the conclusion drawn from it, and the properly-powered rerun
+overturns it.** A Codex review comment on PR #2922 pointed out that at a
+true 3% rate, `n=20` has a 54% chance of showing zero failures by chance
+alone — so "0/20" was consistent with the bug still being present at the
+same rate as the concurrent sample, not evidence it requires concurrency.
+Verified the math (`(1-0.03)^20 ≈ 0.544`) and reran the same control at
+`n=100` — enough for only a ~5% chance of a clean run at a true 3% rate.
+**Result: 1/100 failed, iteration 88, the identical signature and line.**
+The "fails only under concurrency" claim is false.
+
+This also surfaced a mechanical point about what `--test-threads=1`
+actually controls: it serializes different *test functions* against each
+other, but does nothing to the tokio runtime *within* one test — this
+target's own `queue_depth_survey_loop` still runs as a separately
+scheduled async task alongside the test's main body regardless of the
+`--test-threads` value. So neither the 20-run nor the 100-run "serial"
+control was ever a true no-concurrency condition at the level the panic
+could plausibly originate from; they only removed concurrency *between
+test functions*, which this new evidence suggests was never the necessary
+condition anyway.
+
 Combined with the existing isolated-single-test results from 2026-09-22
-(0/100 local + 0/50 CI-native, both `--test-threads=1` and filtered to just
-this test), four independent samples now agree on one boundary: this test
-fails only when it runs *concurrently* with its own siblings in the same
-binary — never alone, and never when the whole binary runs one test at a
-time.
+(0/100 local + 0/50 CI-native, both `--test-threads=1` and filtered to
+just this test), the pattern across five samples is: **isolated single-test
+execution stays clean (0/150); whole-binary execution fails at a low rate
+whether or not different test functions run concurrently (1/100 serial,
+3/100 concurrent, not statistically distinguishable from each other at
+this N).** The working hypothesis is now "requires whole-binary execution
+context" — something about running alongside 26 sibling tests, not
+specifically about libtest-level thread concurrency between them — with
+the specific mechanism still unidentified.
 
 **Test-vs-product verdict: not rendered, and not leaning either way — after
 two review corrections, not one.** This report originally leaned
@@ -191,35 +234,49 @@ running after `shutdown.cancel()`/guard-drop, in a window a different test
 is active, remains a distinct, not-yet-checked question on its own terms.
 Other tests in this file that call `start_runtime` with
 `run_workers: true` would spawn a real `worker_loop` too, a separate,
-not-yet-checked instance of the same class of gap. Both audits — correctly
-scoped this time — are the named next step.
+not-yet-checked instance of the same class of gap. Both audits remain
+worth doing, but the n=100 serial-control result above (1/100, identical
+signature) means neither can be *the whole* explanation on its own: both
+were framed around a *different*, concurrently-running test interfering —
+a condition serial execution doesn't provide. Whatever explains the
+serial-mode failure has to work with only one test function running at a
+time; a next pass should start there (what, within a single test's own
+execution plus ambient process state left by 18-26 prior serial tests,
+could make this test's own intra-process behavior nondeterministic) before
+returning to the inter-test angles as a possible *additional* contributor
+to the higher concurrent rate.
 
 ## 🔧 Treatment
 
 No fix this pass. Per this role's hard gate, a fix PR needs the root-cause
-category *and* the specific defect; only a parallelism-sensitivity
-correlation is confirmed, and two candidate categories (inter-test shared
-state vs. a purely intra-test race merely widened by sibling load) remain
-open. Distinguishing between them, then naming the specific defect, is next
-pass's work, not this one's.
+category *and* the specific defect; this pass ends with *less* certainty
+about the category than its own earlier drafts claimed, not more — the
+properly-powered serial control shows concurrency between test functions
+is not the necessary condition, so "inter-test shared resource vs.
+intra-test race widened by sibling load" was itself the wrong framing.
+Working out what "whole-binary execution context" actually means
+mechanically, then naming the specific defect, is next pass's work.
 
 Added `rerun_default_parallelism` to
 `.github/workflows/manual-sqlite-jobs-rerun-check.yml`: a second job,
 alongside the existing filtered/serial `rerun` job, that builds the same
 binary once and runs it *whole* (no filter, no `--test-threads` override) N
 times, uploading each iteration's full log — the CI-native form of the local
-repro above, so a future pass (or CI itself) can confirm the 3/100 figure
-without needing a local sandbox with outbound network access. Not
-dispatchable this pass: `workflow_dispatch` only accepts a workflow already
-on the repository's default branch (`trunk-dev`), the same gotcha every
-harness in this ledger has hit on its own introduction pass.
+repro above, so a future pass (or CI itself) can confirm these figures
+without needing a local sandbox with outbound network access. It should be
+extended with a `--test-threads=1` serial variant too, given this pass's
+own finding that serial execution is not actually clean. Not dispatchable
+this pass: `workflow_dispatch` only accepts a workflow already on the
+repository's default branch (`trunk-dev`), the same gotcha every harness in
+this ledger has hit on its own introduction pass.
 
 ## 📊 Measurement
 
 | Protocol | Result |
 |---|---|
 | Whole binary, default parallelism, 100 same-commit reruns (this pass, local) | **3/100 failed** (3%) — iterations 43, 78, 95, identical signature/line each time |
-| Whole binary, fully serial (`--test-threads=1`), 20 same-commit reruns, same day (control) | **0/20 failed** |
+| Whole binary, fully serial (`--test-threads=1`), 20 same-commit reruns, same day (control) | 0/20 failed — **underpowered, see the n=100 rerun below** |
+| Whole binary, fully serial (`--test-threads=1`), 100 same-commit reruns, same day (properly-powered control) | **1/100 failed** (iteration 88), identical signature/line |
 | Isolated single test, `--test-threads=1`, 100 local reruns (2026-09-22) | 0/100 failed |
 | Isolated single test, `--test-threads=1`, 50 CI-native reruns (2026-09-22) | 0/50 failed |
 
@@ -227,7 +284,7 @@ No revert check applies — no fix was proposed this pass to revert.
 
 | Item | Before this pass | This pass | After |
 |---|---|---|---|
-| `sqlite_job_backend_tracks_job_status_durably` | n=2 organic, isolated-shape 0/100+0/50, category unconfirmed | n=3 organic (3rd hit in `Coverage (sandbox-sqlite)`); whole-binary Tier 1 baseline 3/100 vs. 0/20 serial control confirms parallelism-sensitivity only; root-cause category still open between two candidates (inter-test shared state vs. intra-test race widened by sibling load); test-vs-product verdict also open (not leaning test-side); CI-native whole-binary harness added | Under active investigation, escalated |
+| `sqlite_job_backend_tracks_job_status_durably` | n=2 organic, isolated-shape 0/100+0/50, category unconfirmed | n=3 organic (3rd hit in `Coverage (sandbox-sqlite)`); whole-binary Tier 1 baselines 3/100 (default parallelism) and 1/100 (properly-powered serial) both fail, isolated single-test stays clean at 0/150 — "requires concurrency" is falsified, "requires whole-binary execution context" is the new working hypothesis; root-cause category and specific defect both unidentified; test-vs-product verdict open; CI-native whole-binary harness added | Under active investigation, escalated |
 | `live_upgrade` (3 signatures) | Uncampaigned, 14 idle passes | No new organic hits | Unchanged |
 | `cache_stampede` | Uncampaigned | No new organic hits | Unchanged |
 | `sim_fault_plan` | n=1, uncampaigned | No new organic hits | Unchanged |
@@ -258,11 +315,14 @@ done
 # -> 3/100 FAILED, all sqlite_job_backend_tracks_job_status_durably at
 #    sqlite_jobs_scheduler_e2e.rs:1301:6
 
-for i in $(seq 1 20); do
+for i in $(seq 1 100); do
   cargo test -p autumn-web --features "sqlite,test-support,storage" \
     --test sqlite_jobs_scheduler_e2e -- --test-threads=1 > "ctrl-$i.log" 2>&1
 done
-# -> 0/20 FAILED
+# -> 1/100 FAILED (iteration 88), identical signature — an earlier n=20 run
+#    of this same control showed 0/20, which a Codex review comment on
+#    PR #2922 correctly flagged as underpowered ((1-0.03)^20 ≈ 54% chance
+#    of a clean run at a true 3% rate); rerun at n=100 for ~5% miss chance.
 ```
 
 Confirm the seven triaged failures in this pass's window:

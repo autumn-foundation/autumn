@@ -2130,9 +2130,11 @@ without also filling in the intake form above.
   at default parallelism (not `--test-threads=1`, not filtered to one test)
   N times, is the concrete next step for a future pass.
 - **2026-09-23 update — n=2→n=3 organic (a third hit, in a job shape not
-  previously checked); the concrete next step from the prior update is done,
-  and it reproduces: 3/100 (3%) at default parallelism vs. a clean 0/20
-  serial control run the same day.** Sampled `ci.yml` `pull_request` runs
+  previously checked); the concrete next step from the prior update is done
+  and it reproduces (3/100 at default parallelism); a same-day underpowered
+  serial control (0/20) was corrected mid-review to a properly-powered one
+  (1/100), which falsifies this entry's own "requires concurrency" framing
+  — see the correction below.** Sampled `ci.yml` `pull_request` runs
   from the 2026-09-22 report's own cutoff (2026-09-22T06:24:50Z, exclusive)
   to 2026-09-23T07:37:08Z (~25.2h; one no-filter `status=completed` query,
   `perPage=100`/page 1, whose own span — 2026-09-21T18:16:27Z–
@@ -2208,16 +2210,40 @@ without also filling in the intake form above.
 
   **Control run, same day, same toolchain**: the whole binary, run fully
   *serially* (`--test-threads=1`, no test-name filter — all 27 tests, one
-  at a time) 20 times. **Result: 0/20 failed.** This isolates the variable
-  cleanly: the difference between the two conditions is concurrent
-  execution within the same binary, not "running many tests in one
-  process" in general (the serial control does that too and stayed clean)
-  and not the specific single-test filter the existing harness uses
-  (already shown clean at much higher N on 2026-09-22). Combined with the
-  existing 0/100 (local) + 0/50 (CI-native) isolated-filtered results, four
-  independent samples now agree: this test fails only when it runs
-  *concurrently* with its own siblings in the same process, never when run
-  alone or when the whole binary runs one test at a time.
+  at a time) 20 times. **Result: 0/20 failed.**
+
+  **Correction (post-review, via a Codex review comment on PR #2922): this
+  control was never powered to support the "isolates the variable cleanly"
+  claim that followed it, and the claim itself is wrong.** At a true 3%
+  rate, `n=20` has `(1-0.03)^20 ≈ 54%` chance of showing zero failures by
+  chance alone — so 0/20 was consistent with the bug being present at the
+  same rate as the concurrent sample, not evidence that concurrency is
+  required. Rerun at `n=100` (≈5% chance of a clean run at a true 3% rate)
+  against the identical binary, same day: **1/100 failed, iteration 88,
+  the identical signature and line.** The "fails only under concurrency"
+  claim is false.
+
+  This also surfaces a mechanical point the original framing missed:
+  `--test-threads=1` serializes different *test functions* against each
+  other, but does not stop async tasks *within* one test's own tokio
+  runtime from interleaving with that test's main body — this target's own
+  `queue_depth_survey_loop` (see further corrections below) still runs as
+  a separately scheduled task regardless of the `--test-threads` value. So
+  neither the 20-run nor the 100-run "serial" control was ever a true
+  no-concurrency condition at the level the panic could plausibly
+  originate from; both only removed concurrency *between test functions*,
+  which this evidence now suggests was never the necessary condition.
+
+  Combined with the existing 0/100 (local) + 0/50 (CI-native)
+  isolated-filtered results, the pattern across five samples is:
+  **isolated single-test execution stays clean (0/150); whole-binary
+  execution fails at a low rate whether or not different test functions
+  run concurrently (1/100 serial, 3/100 concurrent — not statistically
+  distinguishable from each other at this N).** The working hypothesis is
+  "requires whole-binary execution context" (something about running
+  alongside 26 sibling tests, not specifically libtest-level concurrency
+  between them), not "requires concurrency" as earlier drafts of this
+  entry claimed.
   **Test-vs-product verdict: not rendered, and not leaning either way.**
   **Correction (post-review, via a Codex review comment on PR #2922): an
   earlier draft of this update leaned "presumptively test-side" on the
@@ -2286,26 +2312,34 @@ without also filling in the intake form above.
   mechanism survives review this pass.** Both directions — an inter-test
   shared resource, and some intra-test interaction not yet identified —
   stay open, with no live specific candidate for either as of this entry.
-  **Mechanism: only the parallelism-sensitivity correlation is confirmed;
-  the root-cause *category* is not.** **Correction (post-review, via a
-  second Codex review comment on PR #2922, same pass as the one above):**
-  an earlier draft of this update claimed the category itself — "resource
-  contention / shared state between concurrently-scheduled tests" — was
-  confirmed, naming sibling interference specifically. That overstates what
-  the 3/100-vs-0/20 comparison actually shows. What is confirmed: this test
-  fails only when the whole binary runs under libtest's default parallelism,
-  never when it runs alone or serially. What is *not* confirmed: that the
-  mechanism requires a resource shared *between* tests at all — an
-  intra-test race needs no sibling test to exist; concurrent siblings could
-  simply add enough CPU/scheduler contention to widen an already-latent
-  intra-test race's window, with no inter-test shared state involved. (The
-  specific intra-test candidate named in the correction just above, a
-  `worker_loop` racing the enqueue, was itself factually wrong and is
-  retracted there — this paragraph's point about the *shape* of an
-  intra-test explanation stands independent of that retraction.) Two
-  candidate categories remain open, not one confirmed: an inter-test shared resource (scoped to the binary),
-  and a purely intra-test timing-sensitive race (widened, not caused, by
-  sibling load). Neither has a named specific defect, so per this role's
+  **Mechanism: even the parallelism-sensitivity correlation, as originally
+  stated, is now known to overstate the evidence.** **Correction
+  (post-review, via a second Codex review comment on PR #2922, same pass as
+  the one above):** an earlier draft of this update claimed the category
+  itself — "resource contention / shared state between
+  concurrently-scheduled tests" — was confirmed, naming sibling
+  interference specifically. That overstated what the 3/100-vs-0/20
+  comparison seemed to show at the time — and the n=100 serial-control
+  correction further up this entry has since shown the underlying "never
+  when it runs alone or serially" premise was itself false (1/100 serial).
+  What survives: this test fails at a broadly similar low rate under
+  whole-binary execution, whether or not different test functions run
+  concurrently, and stays clean when isolated to just itself. What is
+  *not* confirmed: that the mechanism requires a resource shared
+  *between* tests at all, or that concurrency between test functions
+  plays any necessary role — an intra-test race, or some form of
+  process-state accumulation across 26 prior tests, needs no sibling
+  *concurrency* to exist. (The specific intra-test candidate named in the
+  correction just above, a `worker_loop` racing the enqueue, was itself
+  factually wrong and is retracted there — this paragraph's point about
+  the *shape* of an intra-test explanation stands independent of that
+  retraction.) Two candidate categories remain open, not one confirmed: an
+  inter-test shared resource (scoped to the binary, requiring no true
+  concurrency — order/state leakage from an earlier test would qualify),
+  and a purely intra-test timing-sensitive race whose window is shaped by
+  ambient process state built up over the binary's run (not necessarily
+  "widened by sibling load" in the concurrency sense originally proposed).
+  Neither has a named specific defect, so per this role's
   own hard gate (a category without the specific defect is not enough to
   fix, and a *wrong* category is worse) this remains uncampaigned for a fix
   PR either way.
@@ -2354,32 +2388,45 @@ without also filling in the intake form above.
   question (can `queue_depth_survey_loop` still be running after
   `shutdown.cancel()`/guard-drop, in a window a different test is active)
   remains a distinct, not-yet-checked angle worth auditing on its own
-  terms, separate from the now-dead schema-DDL-race idea. Other tests in
-  this same file that *do* call `start_runtime` with `run_workers: true`
-  (not yet enumerated) would spawn a real `worker_loop` too, a separate,
-  not-yet-checked instance of the same class of gap. Both audits — scoped
-  correctly this time — are the concrete next step, along
+  terms, separate from the now-dead schema-DDL-race idea, **but the n=100
+  serial-control correction further up this entry (1/100 failed with only
+  one test function ever running) means it cannot be the sole
+  explanation: whatever fires in serial mode does not need a second,
+  concurrently-running test to be active.** A next pass should first
+  audit what, within a single test's own execution plus ambient process
+  state left by 18-26 prior *serial* tests, could make this test's own
+  behavior nondeterministic, before returning to the inter-test/outliving-task
+  angle as a possible additional contributor to the higher concurrent rate
+  (3/100 vs. 1/100 — itself not statistically distinguishable at this N).
+  Other tests in this same file that *do* call `start_runtime` with
+  `run_workers: true` (not yet enumerated) would spawn a real `worker_loop`
+  too, a separate, not-yet-checked instance of the same class of gap. All
+  of the above remain the concrete next step, along
   with dispatching the harness variant this pass adds (below) against
   `trunk-dev` once merged, to get a CI-native (not just local-sandbox)
-  confirmation of the 3/100 figure above.
+  confirmation of both figures above.
 
   **This pass adds `rerun_default_parallelism` to
   `.github/workflows/manual-sqlite-jobs-rerun-check.yml`**: a second job,
   alongside the existing filtered/serial `rerun` job, that builds the same
   binary once and then runs it whole (no filter, no `--test-threads`
   override) N times, uploading each iteration's full log — the CI-native
-  form of the local repro above, so a future pass (or CI itself) can
-  confirm the 3/100 figure without needing a local sandbox with network
-  access. Not dispatchable this pass for the same reason every prior
-  harness in this ledger wasn't on its own introduction pass:
+  form of the local default-parallelism repro above, so a future pass (or
+  CI itself) can confirm the 3/100 figure without needing a local sandbox
+  with network access. It does not yet have a serial (`--test-threads=1`,
+  unfiltered) variant to confirm the 1/100 figure — that gap is itself a
+  next step, given this entry's own finding that serial execution is not
+  actually clean. Not dispatchable this pass for the same reason every
+  prior harness in this ledger wasn't on its own introduction pass:
   `workflow_dispatch` only accepts a workflow already present on the
   repository's default branch (`trunk-dev`). **Next step, for whichever
   pass finds this PR merged**: dispatch `rerun_default_parallelism` with
   `iterations: "50"` against `trunk-dev`'s tip for the CI-native
-  confirmation, and audit the `start_runtime`/`shutdown.cancel()`/guard-drop
-  ordering described above before proposing any fix — per this role's own
-  process, the product/test verdict must be rendered and the specific
-  defect named before a fix PR, and neither is done yet.
+  confirmation of the concurrent figure, add and dispatch a serial variant
+  for the 1/100 figure, and audit the intra-test/serial-mode mechanism
+  described above before proposing any fix — per this role's own process,
+  the product/test verdict must be rendered and the specific defect named
+  before a fix PR, and neither is done yet.
 
 `crate_path::tests::resolve_autumn_web_name_dashed_rename_is_sanitized` was
 opened here 2026-09-21 (n=1, mechanism unconfirmed) and **closed the same
