@@ -848,3 +848,37 @@ async fn portal_does_not_hand_a_hosted_session_to_another_tenants_customer() {
     })
     .await;
 }
+
+/// A custom `BillingProvider` (Stripe or otherwise) receives the raw session
+/// user id, never the tenant-scoped store key — the provider is outside
+/// Autumn's own tenant boundary and has no stake in the collision that
+/// scoping exists to prevent, and a custom provider's own metadata-based
+/// lookups should not silently break on a framework upgrade.
+#[tokio::test]
+async fn provider_create_customer_receives_the_raw_user_id_not_the_tenant_scoped_one() {
+    let harness = support::harness(MemoryBillingStore::shared(), FakeProvider::new(), pinned);
+    harness.client.acting_as("7").await;
+    with_tenant("acme".to_owned(), async {
+        harness
+            .client
+            .post("/billing/checkout")
+            .form("plan=pro")
+            .send()
+            .await
+            .assert_status(303);
+    })
+    .await;
+
+    let calls = harness.provider.calls();
+    let create_customer = calls
+        .iter()
+        .find_map(|call| match call {
+            FakeCall::CreateCustomer(request) => Some(request),
+            _ => None,
+        })
+        .expect("checkout creates a provider customer");
+    assert_eq!(
+        create_customer.user_id, "7",
+        "the provider must see the raw session id, not \"acme\\u{{1}}...\"-scoped one"
+    );
+}

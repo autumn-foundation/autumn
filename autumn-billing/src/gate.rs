@@ -157,6 +157,16 @@ impl Billing {
     /// The logged-in user id in `session`, read with the configured auth
     /// session key.
     ///
+    /// Under Autumn's tenancy feature, this is the same opaque, tenant-scoped
+    /// identity every billing store lookup is keyed on — not the bare
+    /// session value — since two different tenants' sessions can otherwise
+    /// stringify to the identical id (see `docs/guide/sharding.md`). Recover
+    /// the raw id with [`crate::gate::strip_tenant_scope`] if a caller needs
+    /// it. `CustomerRequest.user_id` (what a [`BillingProvider`](crate::provider::BillingProvider)
+    /// receives) is unaffected: `customer_for` recovers the raw id before
+    /// building that request, so a custom provider sees the same value as
+    /// before tenancy folded anything in here.
+    ///
     /// # Errors
     ///
     /// Returns [`BillingError::Unauthenticated`] when no user is logged in.
@@ -329,7 +339,7 @@ pub async fn session_user_id(
 }
 
 /// Marker byte opening a tenant-scoped billing identity
-/// ([`scope_identity_to_tenant`]).
+/// (`scope_identity_to_tenant`).
 ///
 /// A C0 control character rather than a printable one (`:`, `/`, …): an
 /// ordinary application user id written before tenancy existed can spell any
@@ -343,7 +353,7 @@ pub async fn session_user_id(
 /// (as an earlier version of this fix did) is then not injective: tenant `a`
 /// with user id `b{MARKER}c` and tenant `a{MARKER}b` with user id `c` fold
 /// to the identical string, reopening the exact cross-tenant collision this
-/// scoping exists to close. [`scope_identity_to_tenant`] instead
+/// scoping exists to close. `scope_identity_to_tenant` instead
 /// length-prefixes the tenant — the same reasoning `idempotency.rs`'s
 /// length-prefixed key components exist for, kept unhashed here so
 /// [`BillingHooks::recipient_for`](crate::hooks::BillingHooks::recipient_for)'s
@@ -412,7 +422,7 @@ fn encode_tenant_scope(tenant: &str, user_id: &str) -> String {
 }
 
 /// Recover the raw session user id from a billing identity
-/// [`scope_identity_to_tenant`] may have tenant-scoped.
+/// `scope_identity_to_tenant` may have tenant-scoped.
 ///
 /// A no-op when tenancy is disabled, or for an identity written before this
 /// existed, or for anything else that does not parse as this crate's own

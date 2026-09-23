@@ -241,10 +241,39 @@ separator-based fix (commit `0d450a7`), reviewed and fixed here:
    now gives the concrete relink recipe using the new
    `gate::scope_identity` + `store().relink_customer(...)` pair.
 
-Re-verified after both fixes: full `autumn-billing` lib tests (81, up from
-76, the 5 new `gate::tenant_scope_tests`), `--test integration` (167, up
-from 164), `--test mirror_db` (27, up from 24), `cargo fmt`/
-`clippy -D warnings` clean, `cargo check --all-targets` clean, and
+**A third, real gap** surfaced on the follow-up review round (commit
+`bf088b20`), marked P2: `Billing::current_user`/`session_user_id` return the
+tenant-scoped identity under tenancy, which `routes.rs`'s `customer_for` then
+forwarded unchanged into `CustomerRequest.user_id` — the field
+`BillingProvider::create_customer` receives, documented as "the application
+user id" with no parse contract but still a real behavior change for any
+custom `BillingProvider` that keys off it (a metadata-based lookup, a
+welcome-email trigger keyed by the raw id, …). Unlike `recipient_for`, this
+consumer is outside Autumn's own tenant boundary — Stripe (or a custom
+provider) has no stake in the collision this fix exists to prevent — so
+scoping it bought no security benefit while still being a compatibility
+break. Fixed in `routes.rs`'s `customer_for` by calling
+`gate::strip_tenant_scope` on `user_id` before building `CustomerRequest`,
+so the provider sees exactly what it always has, tenancy on or off. New
+test: `provider_create_customer_receives_the_raw_user_id_not_the_tenant_scoped_one`,
+asserting the `FakeProvider`'s recorded `CreateCustomer` call carries `"7"`,
+not the scoped form, under an active tenant scope.
+
+This round also fixed a real CI failure the first fix round introduced:
+`./scripts/check-docs.sh`'s `-D rustdoc::private_intra_doc_links` failed on
+`strip_tenant_scope`'s (and two other `pub` items') doc comments linking to
+the private `scope_identity_to_tenant` via `[`scope_identity_to_tenant`]`
+intra-doc-link syntax — a public item's docs cannot link to a
+non-`pub` one, since the target has no public doc page to link to. Changed
+those three references to plain inline code text (no brackets); verified
+with the exact CI command,
+`RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" cargo doc -p autumn-billing --no-deps`.
+
+Re-verified after all three fixes: full `autumn-billing` lib tests (81, up
+from 76, the 5 new `gate::tenant_scope_tests`), `--test integration` (168,
+up from 164), `--test mirror_db` (27, up from 24), `cargo fmt`/
+`clippy -D warnings` clean, `cargo check --all-targets` clean, the
+documentation-build command above clean, and
 `./scripts/check-docs-symbols.sh` / `check-migration-guides.sh` /
 `check-changelog-fragments.sh` all still green.
 
