@@ -365,9 +365,41 @@ demonstrating both the pitfall (bare id misses) and the fix (scoped id, via
 the new `gate::scope_identity`, finds it) concretely rather than leaving the
 contract only in prose.
 
-Re-verified after all eight findings: full `autumn-billing` lib tests (82),
-`--test integration` (171, up from 164), `--test mirror_db` (29), `cargo
-fmt`/`clippy -D warnings` clean, `cargo check --all-targets` clean, the
+A ninth and tenth finding landed in the same review round (commit `09b74d31`,
+both P2):
+
+9. **A concurrent webhook could undo a `relink_customer` migration.**
+   `DbBillingStore::upsert_customer` read the row (`current`), mutated a
+   few fields on that in-memory snapshot, and wrote the **whole row** back
+   with `.set(&current)`. Every billing webhook reaches this upsert, even
+   one with nothing of its own to change (email absent, already linked). If
+   an operator's `relink_customer` call committed the new tenant-scoped
+   `user_id` in the window between this upsert's read and its write, the
+   whole-row write silently overwrote it back to the stale, pre-relink bare
+   id — reverting the operator's own remediation, mid-migration, with no
+   error raised anywhere. Fixed by replacing the single whole-row `.set(&current)`
+   with two column-scoped `UPDATE`s: linking `user_id` only under a
+   `WHERE user_id IS NULL` guard (evaluated by the database against the
+   row's live state at write time, not this snapshot — the same
+   compare-and-set pattern already used elsewhere in this file, e.g.
+   `claim_dunning_attempt`), and a separate update touching only
+   `email`/`updated_at` that never references `user_id` at all, so it can
+   never be the write that reverts a relink. The final row is re-read after
+   both writes rather than returned from the stale snapshot. Not
+   independently regression-tested against a live race: reproducing the
+   exact interleaving deterministically would need a test-only pause hook
+   inside `DbBillingStore`'s own transaction, which is out of proportion for
+   this fix. Confidence instead comes from the fix matching an established,
+   already-relied-upon pattern in this same file, and from the full
+   `store_contract.rs` non-racing suite (customer upsert/link/lookup
+   properties) staying green against the refactored code.
+10. **This ledger's own Compatibility section** had the same "enabling
+    tenancy after" scoping bug the migration guide had in finding 7 — fixed
+    identically, in the same commit.
+
+Re-verified after all ten findings: full `autumn-billing` lib tests (82),
+`--test integration` (171), `--test mirror_db` (29), `cargo fmt`/
+`clippy -D warnings` clean, `cargo check --all-targets` clean, the
 documentation-build command above clean, and
 `./scripts/check-docs-symbols.sh` / `check-migration-guides.sh` /
 `check-plugin-surface.sh` / `check-changelog-fragments.sh` all still green.
@@ -418,17 +450,20 @@ an app combining `BillingPlugin` with tenancy.
   stay `pub(crate)`.
 - No config default changed, no route status code or response shape
   changed, no existing public function or trait method signature changed —
-  `relink_customer` is additive to the `BillingStore` trait, so any external
-  implementor of that trait needs to add it (the crate ships
-  `MemoryBillingStore` and `DbBillingStore`; no other implementor is known).
+  `relink_customer` is additive to the `BillingStore` trait with a default
+  implementation (`BillingError::Unsupported`), so an external implementor of
+  that trait keeps compiling unchanged and needs to override it only if it
+  wants to support the relink recipe (see finding 6, below).
 - Non-tenant apps (tenancy disabled, the overwhelming majority of
   `autumn-billing` users per the docs) see byte-identical behavior.
-- **An app enabling tenancy after `BillingPlugin` already had paying
-  customers** must relink each pre-existing `billing_customers` row via the
-  new `relink_customer` — see the migration guide. This was NOT true of the
+- **Every pre-existing `billing_customers` row of every tenancy-enabled app
+  running `BillingPlugin`** — whether tenancy was just turned on or has run
+  alongside billing all along — must be relinked via the new
+  `relink_customer`; see the migration guide. This was NOT true of the
   original fix's characterization ("indistinguishable in practice"); Codex's
-  review caught that the impact is immediate and the row does not
-  self-heal.
+  review caught first that the impact is immediate and the row does not
+  self-heal, and again (finding 7, below) that the guidance itself was scoped
+  too narrowly, describing only the "just turned tenancy on" case.
 - `CHANGELOG.md`: fragment added at `changelog.d/billing-tenant-scoped-identity.md`.
 
 ## 🗂 Ledger
