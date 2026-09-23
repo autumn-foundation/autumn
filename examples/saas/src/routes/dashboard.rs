@@ -10,6 +10,7 @@
 
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::response::Response;
+use autumn_web::security::SubmitToken;
 
 use crate::models::{NewProject, NewProjectForm, Project};
 use crate::repositories::{PgProjectRepository, ProjectRepository, cached_project_count};
@@ -18,6 +19,14 @@ use super::layout::layout;
 
 /// Render the dashboard: the project list plus the create-project form.
 ///
+/// `submit_token` is a fresh one-time token embedded as a hidden
+/// `_submit_token` field. The framework's `SubmitTokenLayer` consumes it on the
+/// POST so a double-clicked or browser-retried create-project submission runs
+/// exactly once and cannot create a duplicate project — no client-side
+/// JavaScript involved. A new token is minted on every render (including the
+/// error re-render below), so the corrected resubmit carries a fresh token
+/// rather than a spent one.
+///
 /// `name` re-populates the input and `error`, when present, is shown adjacent
 /// to the form on a rejected submission (Wayfinder: error-path inventory) —
 /// `create_project` below used to bounce a validation failure straight to the
@@ -25,6 +34,7 @@ use super::layout::layout;
 /// and dropping them off the project list entirely.
 fn dashboard_page(
     tenant_id: &str,
+    submit_token: &str,
     total: i64,
     projects: &[Project],
     name: &str,
@@ -47,6 +57,7 @@ fn dashboard_page(
 
             form action="/dashboard/projects" method="post"
                  class="flex gap-2 mb-6 bg-white rounded-lg shadow p-4" {
+                input type="hidden" name="_submit_token" value=(submit_token);
                 input name="name" value=(name) required placeholder="New project name" aria-label="New project name"
                       aria-invalid=[error.is_some().then(|| "true")]
                       class="flex-1 border rounded px-3 py-2";
@@ -74,6 +85,9 @@ fn dashboard_page(
 #[get("/dashboard")]
 pub async fn dashboard(
     Tenant(tenant_id): Tenant,
+    // A fresh token for the create-project form below; mirrors the signup
+    // form's wiring (issue #2921).
+    submit_token: SubmitToken,
     repo: PgProjectRepository,
 ) -> AutumnResult<Response> {
     // The tenant context is already established by the tenancy middleware, so the
@@ -85,7 +99,7 @@ pub async fn dashboard(
     // that — and `create_project` below is what makes it true at runtime.
     let total = cached_project_count(tenant_id.clone(), &repo).await?;
 
-    let page = dashboard_page(&tenant_id, total, &projects, "", None);
+    let page = dashboard_page(&tenant_id, submit_token.token(), total, &projects, "", None);
     Ok(page.into_response())
 }
 
@@ -93,6 +107,10 @@ pub async fn dashboard(
 pub async fn create_project(
     Tenant(tenant_id): Tenant,
     repo: PgProjectRepository,
+    // A fresh token for the error re-render below; the token that guarded THIS
+    // request has already been consumed by `SubmitTokenLayer` before the handler
+    // ran, so the re-rendered form must carry a new one.
+    submit_token: SubmitToken,
     Form(form): Form<NewProjectForm>,
 ) -> AutumnResult<Response> {
     let trimmed = form.name.trim();
@@ -108,6 +126,7 @@ pub async fn create_project(
         let total = cached_project_count(tenant_id.clone(), &repo).await?;
         let page = dashboard_page(
             &tenant_id,
+            submit_token.token(),
             total,
             &projects,
             &form.name,
