@@ -1756,9 +1756,11 @@ without also filling in the intake form above.
   failure. All 7 triaged (full detail in the `sqlite_jobs_scheduler_e2e`
   entry's own 2026-09-23 update below, not repeated here): one
   `dependabot/github_actions/dtolnay/rust-toolchain-1.120.0` repeat of its
-  already-documented action-pin break; four ordinary branch-owned `Lint`/
-  `MSRV`/`Diesel migration version collisions` WIP failures across three
-  `vesper/bugbash-23{12,63,19,31}-*` branches; and one genuine new organic
+  already-documented action-pin break; five ordinary branch-owned `Lint`/
+  `MSRV`/`Diesel migration version collisions` WIP failures across five
+  `vesper/bugbash-*` branches (2312, 2363, 2419, 2331, 2311 — see the
+  `sqlite_jobs_scheduler_e2e` entry's own update for the corrected
+  per-branch breakdown); and one genuine new organic
   hit — but on `sqlite_jobs_scheduler_e2e`, not on any `live_upgrade`,
   `cache_stampede`, or `sim_fault_plan` signature. None of the 7 match this
   entry. `manual-macos-contention-check.yml`: still `total_count: 0`,
@@ -2136,15 +2138,21 @@ without also filling in the intake form above.
   `perPage=100`/page 1, whose own span — 2026-09-21T18:16:27Z–
   2026-09-23T07:37:08Z — fully covers the window with margin on both ends)
   — 58 `pull_request` runs in-window: 27 success, 24 cancelled, 7 failure.
-  All 7 triaged at job/log level: the `dependabot/github_actions/
-  dtolnay/rust-toolchain-1.120.0` branch repeats its already-documented own
-  action-pin-bump break (`MSRV`, all three `Test (${{ matrix.os }})` legs);
-  three `vesper/bugbash-23{63,19,31}-*` branches each fail `Lint`
-  (`Clippy` or `cargo fmt`) on their own in-progress diff, one of those three
-  (`vesper/bugbash-2363-cache-audit-profile`) also failing `MSRV` and the
-  `Diesel migration version collisions` gate on the same WIP; one
-  (`vesper/bugbash-2419-doctor-strict-manifest`) also failing `MSRV` and
-  `Diesel migration version collisions`; ordinary branch-owned WIP in all
+  All 7 triaged at job/log level (this paragraph originally under-enumerated
+  them — `vesper/bugbash-2419-doctor-strict-manifest` doesn't match a
+  `23{63,19,31}` glob, and `vesper/bugbash-2311-validate-before-dedup` was
+  missing outright; corrected post-review via a Codex review comment on PR
+  #2922, cross-checked against this same update's own job-level data
+  gathered this pass): the `dependabot/github_actions/dtolnay/rust-toolchain-1.120.0`
+  branch repeats its already-documented own action-pin-bump break (`MSRV`,
+  all three `Test (${{ matrix.os }})` legs); four `vesper/bugbash-*`
+  branches each fail `Lint` (`Clippy` or `cargo fmt`) on their own
+  in-progress diff — `vesper/bugbash-2331-csv-required-columns` and
+  `vesper/bugbash-2311-validate-before-dedup` fail `Lint` only;
+  `vesper/bugbash-2363-cache-audit-profile` also fails `MSRV` and the
+  `Diesel migration version collisions` gate on the same WIP;
+  `vesper/bugbash-2419-doctor-strict-manifest` also fails `MSRV` and
+  `Diesel migration version collisions` — ordinary branch-owned WIP in all
   four cases, not re-triaged further. The remaining two:
   - `vesper/bugbash-2312-bootstrap-ingress` (run 35754864260) fails `Lint`
     only (`Clippy`, its own in-progress diff) — branch-owned.
@@ -2232,12 +2240,26 @@ without also filling in the intake form above.
   scoped to the test binary, not yet named). Both directions stay open
   until the specific resource is identified; this entry no longer states a
   presumption for either.
-  **Mechanism: root-cause *category* now confirmed (resource contention /
-  shared state between concurrently-scheduled tests in the same binary);
-  the *specific* defect — which resource, touched by which sibling test(s)
-  — is still not identified**, so per this role's own hard gate (a category
-  without the specific defect is not enough to fix) this remains
-  uncampaigned for a fix PR.
+  **Mechanism: only the parallelism-sensitivity correlation is confirmed;
+  the root-cause *category* is not.** **Correction (post-review, via a
+  second Codex review comment on PR #2922, same pass as the one above):**
+  an earlier draft of this update claimed the category itself — "resource
+  contention / shared state between concurrently-scheduled tests" — was
+  confirmed, naming sibling interference specifically. That overstates what
+  the 3/100-vs-0/20 comparison actually shows. What is confirmed: this test
+  fails only when the whole binary runs under libtest's default parallelism,
+  never when it runs alone or serially. What is *not* confirmed: that the
+  mechanism requires a resource shared *between* tests at all. The
+  intra-pool worker-loop/enqueue race described above needs no sibling
+  test to exist — concurrent siblings could simply add enough CPU/scheduler
+  contention to widen an already-latent intra-test race's window, with no
+  inter-test shared state involved. Two candidate categories remain open,
+  not one confirmed: an inter-test shared resource (scoped to the binary),
+  and a purely intra-test timing-sensitive race (widened, not caused, by
+  sibling load). Neither has a named specific defect, so per this role's
+  own hard gate (a category without the specific defect is not enough to
+  fix, and a *wrong* category is worse) this remains uncampaigned for a fix
+  PR either way.
 
   **Correction (post-review, via a Codex review comment on PR #2922): the
   multi-connection hypothesis was wrongly ruled out — `build_sqlite_pool`

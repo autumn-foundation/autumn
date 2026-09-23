@@ -10,11 +10,15 @@ reproduced the flake — **3/100** — for the first time outside CI, against a
 same-day **0/20** fully-serial control on the identical binary. A third
 organic hit also turned up this pass's own sampling window, in a job shape
 (`Coverage (sandbox-sqlite)`) not previously checked for this signature,
-raising the organic count from n=2 to n=3. No fix opens this pass: the
-root-cause *category* (concurrency/shared-state between tests in the same
-binary) is now confirmed, but the *specific* shared resource is not, and this
-role's own hard gate requires both before a fix PR. No new hits on any other
-tracked signature.
+raising the organic count from n=2 to n=3. No fix opens this pass: only the
+correlation with whole-binary default-parallelism execution is confirmed —
+not, as an earlier draft of this report claimed and a Codex review comment
+on PR #2922 caught, a root-cause category naming inter-test shared state
+specifically. A purely intra-test race (the target's own worker loop and
+enqueue call sharing one pool, with siblings only perturbing timing) remains
+equally live. This role's own hard gate requires a specific defect, and a
+wrong category besides, before a fix PR. No new hits on any other tracked
+signature.
 
 ## 🎯 Verdict path
 
@@ -64,9 +68,10 @@ None of the 7 match `live_upgrade`, `cache_stampede`, `sim_fault_plan`, or
 
 ## 🔍 Diagnosis
 
-**`sqlite_job_backend_tracks_job_status_durably` — root-cause *category* now
-confirmed by a controlled local reproduction; the specific shared resource is
-not yet identified.**
+**`sqlite_job_backend_tracks_job_status_durably` — a controlled local
+reproduction confirms sensitivity to whole-binary default-parallelism
+execution; neither the root-cause category nor the specific resource is
+confirmed.**
 
 The third organic hit matters beyond the raw count: `Coverage
 (sandbox-sqlite)`'s coverage-generation step invokes the same
@@ -142,9 +147,11 @@ the named next step.
 ## 🔧 Treatment
 
 No fix this pass. Per this role's hard gate, a fix PR needs the root-cause
-category *and* the specific defect; only the category (resource contention
-between concurrently-scheduled tests in the same binary) is confirmed. Naming
-the specific defect is next pass's work, not this one's.
+category *and* the specific defect; only a parallelism-sensitivity
+correlation is confirmed, and two candidate categories (inter-test shared
+state vs. a purely intra-test race merely widened by sibling load) remain
+open. Distinguishing between them, then naming the specific defect, is next
+pass's work, not this one's.
 
 Added `rerun_default_parallelism` to
 `.github/workflows/manual-sqlite-jobs-rerun-check.yml`: a second job,
@@ -170,7 +177,7 @@ No revert check applies — no fix was proposed this pass to revert.
 
 | Item | Before this pass | This pass | After |
 |---|---|---|---|
-| `sqlite_job_backend_tracks_job_status_durably` | n=2 organic, isolated-shape 0/100+0/50, category unconfirmed | n=3 organic (3rd hit in `Coverage (sandbox-sqlite)`); whole-binary Tier 1 baseline 3/100 vs. 0/20 serial control; category confirmed (concurrency-dependent), specific defect still open; CI-native whole-binary harness added | Under active investigation, escalated |
+| `sqlite_job_backend_tracks_job_status_durably` | n=2 organic, isolated-shape 0/100+0/50, category unconfirmed | n=3 organic (3rd hit in `Coverage (sandbox-sqlite)`); whole-binary Tier 1 baseline 3/100 vs. 0/20 serial control confirms parallelism-sensitivity only; root-cause category still open between two candidates (inter-test shared state vs. intra-test race widened by sibling load); test-vs-product verdict also open (not leaning test-side); CI-native whole-binary harness added | Under active investigation, escalated |
 | `live_upgrade` (3 signatures) | Uncampaigned, 14 idle passes | No new organic hits | Unchanged |
 | `cache_stampede` | Uncampaigned | No new organic hits | Unchanged |
 | `sim_fault_plan` | n=1, uncampaigned | No new organic hits | Unchanged |
