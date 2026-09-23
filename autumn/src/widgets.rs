@@ -500,7 +500,7 @@ pub fn active_search_empty_state(message: &str) -> maud::Markup {
         div
             role="status"
             aria-live="polite"
-            class="search-empty" {
+            class="autumn-search-empty" {
             (message)
         }
     }
@@ -645,7 +645,7 @@ pub fn autocomplete_empty_state(message: &str) -> maud::Markup {
         div
             role="status"
             aria-live="polite"
-            class="autocomplete-empty" {
+            class="autumn-autocomplete-empty" {
             (message)
         }
     }
@@ -2625,10 +2625,10 @@ pub enum NavLinkMatch {
 /// use autumn_web::widgets::nav_link;
 ///
 /// let html = nav_link("/posts", "/posts/new", "New Post").into_string();
-/// assert!(!html.contains("active"), "different path stays inactive: {html}");
+/// assert!(!html.contains("autumn-active"), "different path stays inactive: {html}");
 ///
 /// let html = nav_link("/posts", "/posts", "Posts").into_string();
-/// assert!(html.contains(r#"class="active""#));
+/// assert!(html.contains(r#"class="autumn-active""#));
 /// assert!(html.contains(r#"aria-current="page""#));
 /// ```
 #[cfg(feature = "maud")]
@@ -2639,7 +2639,7 @@ pub fn nav_link(current_path: &str, href: &str, label: &str) -> maud::Markup {
 
 /// Render a navigation anchor with an explicit [`NavLinkMatch`] mode.
 ///
-/// When active, the anchor carries `class="active"` and
+/// When active, the anchor carries `class="autumn-active"` and
 /// `aria-current="page"`; when inactive, neither attribute is emitted.
 ///
 /// # Example
@@ -2648,13 +2648,13 @@ pub fn nav_link(current_path: &str, href: &str, label: &str) -> maud::Markup {
 /// use autumn_web::widgets::{NavLinkMatch, nav_link, nav_link_matched};
 ///
 /// let html = nav_link("/posts", "/posts", "Posts").into_string();
-/// assert!(html.contains(r#"class="active""#));
+/// assert!(html.contains(r#"class="autumn-active""#));
 /// assert!(html.contains(r#"aria-current="page""#));
 ///
 /// // `/posts/3/edit` activates the `/posts` link only in Prefix mode.
 /// let html = nav_link_matched("/posts/3/edit", "/posts", "Posts", NavLinkMatch::Prefix)
 ///     .into_string();
-/// assert!(html.contains(r#"class="active""#));
+/// assert!(html.contains(r#"class="autumn-active""#));
 /// ```
 #[cfg(feature = "maud")]
 #[must_use]
@@ -2666,7 +2666,7 @@ pub fn nav_link_matched(
 ) -> maud::Markup {
     let active = nav_link_is_active(current_path, href, mode);
     maud::html! {
-        a href=(href) class=[active.then_some("active")] aria-current=[active.then_some("page")] {
+        a href=(href) class=[active.then_some("autumn-active")] aria-current=[active.then_some("page")] {
             (label)
         }
     }
@@ -3036,7 +3036,7 @@ impl NavBarConfig {
 /// right-aligned trailing item list.
 ///
 /// Every [`NavItem::Link`] built with [`NavItem::link`] / `link_matched`
-/// renders through [`nav_link_matched`], so it carries `class="active"` and
+/// renders through [`nav_link_matched`], so it carries `class="autumn-active"` and
 /// `aria-current="page"` when its `href` matches `current_path` — pair with
 /// the [`CurrentPath`](crate::extract::CurrentPath) extractor to get
 /// `current_path` from the incoming request. [`NavItem::plain_link`] never
@@ -3240,18 +3240,18 @@ pub enum HeadingLevel {
 #[cfg(feature = "maud")]
 #[derive(Debug, Clone, Default)]
 pub struct CardConfig<'a> {
-    /// Optional title text rendered in a `<hN class="card-title">` element.
+    /// Optional title text rendered in a `<hN class="autumn-card__title">` element.
     /// Set via [`CardConfig::title`] (HTML-escaped) or [`CardConfig::title_html`]
     /// (pre-built [`maud::Markup`] for rich content).
     title: Option<maud::Markup>,
     /// Heading level for the title element (default [`HeadingLevel::H2`]).
     level: HeadingLevel,
     /// Optional right-side header slot — e.g. action buttons.
-    /// Rendered inside `card-header` alongside the title.
+    /// Rendered inside `autumn-card__header` alongside the title.
     header_action: Option<maud::Markup>,
-    /// Optional footer content rendered in `<div class="card-footer">`.
+    /// Optional footer content rendered in `<div class="autumn-card__footer">`.
     footer: Option<maud::Markup>,
-    /// Extra CSS class(es) appended to the root `card` element.
+    /// Extra CSS class(es) appended to the root `autumn-card` element.
     class: Option<&'a str>,
 }
 
@@ -3302,14 +3302,14 @@ impl<'a> CardConfig<'a> {
         self
     }
 
-    /// Set the footer content rendered in `<div class="card-footer">`.
+    /// Set the footer content rendered in `<div class="autumn-card__footer">`.
     #[must_use]
     pub fn footer(mut self, footer: maud::Markup) -> Self {
         self.footer = Some(footer);
         self
     }
 
-    /// Add extra CSS class(es) to the root `card` element.
+    /// Add extra CSS class(es) to the root `autumn-card` element.
     #[must_use]
     pub const fn class(mut self, class: &'a str) -> Self {
         self.class = Some(class);
@@ -3354,27 +3354,30 @@ fn heading(
 
 /// Render a composable card container.
 ///
-/// Emits a `<div class="card">` with an optional header (title + action slot),
-/// a `<div class="card-body">` wrapping `body`, and an optional
-/// `<div class="card-footer">`.
+/// Emits a `<div class="autumn-card">` with an optional header (title + action slot),
+/// a `<div class="autumn-card__body">` wrapping `body`, and an optional
+/// `<div class="autumn-card__footer">`.
 ///
 /// The header is rendered only when a title or `header_action` is set.
 /// The title is wrapped in a heading element (`<h2>` by default, configurable
 /// via [`CardConfig::level`]) so screen readers can navigate card titles.
 ///
-/// All class names (`card`, `card-header`, `card-title`, `card-body`,
-/// `card-footer`) are stable so existing CSS and the admin plugin can adopt
-/// the widget with no restyling.
+/// All class names (`autumn-card`, `autumn-card__header`, `autumn-card__title`,
+/// `autumn-card__body`, `autumn-card__footer`) live in the framework's
+/// `autumn-*` namespace and are backed by rules in the widget stylesheet
+/// ([`crate::ui::WIDGETS_CSS`]), so the card renders styled out of the box.
+/// These names replaced the unprefixed `card`, `card-header`, … classes in
+/// 0.8.0 — see `changelog.d/2354-widget-class-namespace.md`.
 ///
 /// # CSS hooks
 ///
 /// | Selector | Element |
 /// |---|---|
-/// | `.card` | Root wrapper |
-/// | `.card-header` | Header row (title + action) |
-/// | `.card-title` | Title heading element |
-/// | `.card-body` | Body wrapper |
-/// | `.card-footer` | Footer wrapper |
+/// | `.autumn-card` | Root wrapper |
+/// | `.autumn-card__header` | Header row (title + action) |
+/// | `.autumn-card__title` | Title heading element |
+/// | `.autumn-card__body` | Body wrapper |
+/// | `.autumn-card__footer` | Footer wrapper |
 ///
 /// # Example
 ///
@@ -3401,32 +3404,32 @@ fn heading(
 /// let config = CardConfig::new().title("Posts").header_action(new_btn);
 ///
 /// let out = card(&html! { (summary) (table) }, &config).into_string();
-/// assert!(out.contains(r#"class="card-header""#));
-/// assert!(out.contains(r#"<h2 class="card-title">Posts</h2>"#));
-/// assert!(out.contains(r#"class="card-body""#));
+/// assert!(out.contains(r#"class="autumn-card__header""#));
+/// assert!(out.contains(r#"<h2 class="autumn-card__title">Posts</h2>"#));
+/// assert!(out.contains(r#"class="autumn-card__body""#));
 /// assert!(out.contains(r#"class="autumn-property-list""#));
 /// assert!(out.contains("<table"));
 /// ```
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn card(body: &maud::Markup, config: &CardConfig<'_>) -> maud::Markup {
-    let root_class = merge_class("card", config.class);
+    let root_class = merge_class("autumn-card", config.class);
     let has_header = config.title.is_some() || config.header_action.is_some();
     maud::html! {
         div class=(root_class) {
             @if has_header {
-                div class="card-header" {
+                div class="autumn-card__header" {
                     @if let Some(title) = &config.title {
-                        (heading(config.level, None, "card-title", title))
+                        (heading(config.level, None, "autumn-card__title", title))
                     }
                     @if let Some(action) = &config.header_action {
                         (action)
                     }
                 }
             }
-            div class="card-body" { (body) }
+            div class="autumn-card__body" { (body) }
             @if let Some(footer) = &config.footer {
-                div class="card-footer" { (footer) }
+                div class="autumn-card__footer" { (footer) }
             }
         }
     }
@@ -3434,19 +3437,24 @@ pub fn card(body: &maud::Markup, config: &CardConfig<'_>) -> maud::Markup {
 
 /// Render a metric stat-card tile: label, value, and an optional "view all" link.
 ///
-/// Emits a `<div class="stat-card">` matching the pattern used by the admin
-/// dashboard for model-count tiles. Both `label` and `value` are HTML-escaped.
+/// Emits a `<div class="autumn-stat-card">` matching the pattern used by the admin
+/// dashboard for model-count tiles, backed by the widget stylesheet
+/// ([`crate::ui::WIDGETS_CSS`]). Both `label` and `value` are HTML-escaped.
 ///
 /// `link` is `(href, link_text)`; omit with `None` to render without the link row.
+///
+/// All class names live in the framework's `autumn-*` namespace; the
+/// unprefixed `stat-card`, `stat-label`, … names were renamed in 0.8.0 —
+/// see `changelog.d/2354-widget-class-namespace.md`.
 ///
 /// # CSS hooks
 ///
 /// | Selector | Element |
 /// |---|---|
-/// | `.stat-card` | Root tile |
-/// | `.stat-label` | Metric label |
-/// | `.stat-value` | Metric number/value |
-/// | `.stat-link` | Link row (only present when `link` is `Some`) |
+/// | `.autumn-stat-card` | Root tile |
+/// | `.autumn-stat-card__label` | Metric label |
+/// | `.autumn-stat-card__value` | Metric number/value |
+/// | `.autumn-stat-card__link` | Link row (only present when `link` is `Some`) |
 ///
 /// # Example
 ///
@@ -3454,7 +3462,7 @@ pub fn card(body: &maud::Markup, config: &CardConfig<'_>) -> maud::Markup {
 /// use autumn_web::widgets::stat_card;
 ///
 /// let html = stat_card("Users", "1 024", Some(("/users", "View all →"))).into_string();
-/// assert!(html.contains(r#"class="stat-card""#));
+/// assert!(html.contains(r#"class="autumn-stat-card""#));
 /// assert!(html.contains("1 024"));
 /// assert!(html.contains(r#"href="/users""#));
 /// ```
@@ -3462,11 +3470,11 @@ pub fn card(body: &maud::Markup, config: &CardConfig<'_>) -> maud::Markup {
 #[must_use]
 pub fn stat_card(label: &str, value: &str, link: Option<(&str, &str)>) -> maud::Markup {
     maud::html! {
-        div class="stat-card" {
-            div class="stat-label" { (label) }
-            div class="stat-value" { (value) }
+        div class="autumn-stat-card" {
+            div class="autumn-stat-card__label" { (label) }
+            div class="autumn-stat-card__value" { (value) }
             @if let Some((href, text)) = link {
-                div class="stat-link" {
+                div class="autumn-stat-card__link" {
                     a href=(href) { (text) }
                 }
             }
@@ -4799,7 +4807,7 @@ impl AlertVariant {
             Self::Error => "×",
         };
         maud::html! {
-            svg class="alert__icon-svg" viewBox="0 0 20 20" width="20" height="20"
+            svg class="autumn-alert__icon-svg" viewBox="0 0 20 20" width="20" height="20"
                 aria-hidden="true" focusable="false" {
                 circle cx="10" cy="10" r="10" fill="currentColor" {}
                 text x="10" y="15" text-anchor="middle" font-size="13"
@@ -7449,7 +7457,7 @@ mod tests {
     #[test]
     fn nav_link_exact_match_is_active() {
         let html = nav_link("/admin/posts", "/admin/posts", "Posts").into_string();
-        assert!(html.contains(r#"class="active""#), "{html}");
+        assert!(html.contains(r#"class="autumn-active""#), "{html}");
         assert!(html.contains(r#"aria-current="page""#), "{html}");
     }
 
@@ -7476,7 +7484,7 @@ mod tests {
             NavLinkMatch::Prefix,
         )
         .into_string();
-        assert!(html.contains(r#"class="active""#), "{html}");
+        assert!(html.contains(r#"class="autumn-active""#), "{html}");
         assert!(html.contains(r#"aria-current="page""#), "{html}");
     }
 
@@ -7503,7 +7511,7 @@ mod tests {
             NavLinkMatch::Prefix,
         )
         .into_string();
-        assert!(html.contains(r#"class="active""#), "{html}");
+        assert!(html.contains(r#"class="autumn-active""#), "{html}");
     }
 
     #[test]
@@ -7516,7 +7524,7 @@ mod tests {
             NavLinkMatch::Prefix,
         )
         .into_string();
-        assert!(html.contains(r#"class="active""#), "{html}");
+        assert!(html.contains(r#"class="autumn-active""#), "{html}");
     }
 
     #[test]
@@ -7537,7 +7545,7 @@ mod tests {
         assert!(!html.contains("active"), "{html}");
 
         let html = nav_link_matched("/", "/", "Home", NavLinkMatch::Prefix).into_string();
-        assert!(html.contains(r#"class="active""#), "{html}");
+        assert!(html.contains(r#"class="autumn-active""#), "{html}");
     }
 
     #[test]
@@ -7649,7 +7657,7 @@ mod tests {
         let config = NavBarConfig::new().item(NavItem::link("/posts", "Posts"));
         let html = nav_bar("/posts", &config).into_string();
         assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
-        assert!(html.contains(r#"class="active""#), "{html}");
+        assert!(html.contains(r#"class="autumn-active""#), "{html}");
     }
 
     #[test]
@@ -7668,7 +7676,7 @@ mod tests {
         let config = NavBarConfig::new().item(NavItem::plain_link("/actuator/ui", "Actuator"));
         let html = nav_bar("/actuator/ui", &config).into_string();
         assert!(!html.contains("aria-current"), "{html}");
-        assert!(!html.contains(r#"class="active""#), "{html}");
+        assert!(!html.contains(r#"class="autumn-active""#), "{html}");
         assert!(html.contains(r#"href="/actuator/ui""#), "{html}");
     }
 
@@ -8249,10 +8257,10 @@ mod tests {
 
     #[test]
     fn card_config_defaults() {
-        // no title/action → no card-header rendered
+        // no title/action → no autumn-card__header rendered
         let html = card(&maud::html! {}, &CardConfig::new()).into_string();
-        assert!(!html.contains("card-header"), "{html}");
-        assert!(!html.contains("card-footer"), "{html}");
+        assert!(!html.contains("autumn-card__header"), "{html}");
+        assert!(!html.contains("autumn-card__footer"), "{html}");
         // default heading level is H2: setting a title renders <h2
         let html2 = card(&maud::html! {}, &CardConfig::new().title("X")).into_string();
         assert!(html2.contains("<h2"), "{html2}");
@@ -8268,7 +8276,7 @@ mod tests {
                 .class("wide"),
         )
         .into_string();
-        assert!(html.contains(r#"class="card wide""#), "{html}");
+        assert!(html.contains(r#"class="autumn-card wide""#), "{html}");
         assert!(html.contains("<h3"), "{html}");
         assert!(html.contains('T'), "{html}");
     }
@@ -8279,11 +8287,11 @@ mod tests {
     fn card_has_root_and_body_classes() {
         let body = maud::html! { p { "hello" } };
         let html = card(&body, &CardConfig::new()).into_string();
-        assert!(html.contains(r#"class="card""#), "{html}");
-        assert!(html.contains(r#"class="card-body""#), "{html}");
+        assert!(html.contains(r#"class="autumn-card""#), "{html}");
+        assert!(html.contains(r#"class="autumn-card__body""#), "{html}");
         assert!(html.contains("hello"), "{html}");
-        assert!(!html.contains("card-header"), "{html}");
-        assert!(!html.contains("card-footer"), "{html}");
+        assert!(!html.contains("autumn-card__header"), "{html}");
+        assert!(!html.contains("autumn-card__footer"), "{html}");
     }
 
     #[test]
@@ -8291,17 +8299,20 @@ mod tests {
         let body = maud::html! {};
         let html = card(&body, &CardConfig::new().title("Posts")).into_string();
         assert!(
-            html.contains(r#"<h2 class="card-title">Posts</h2>"#),
+            html.contains(r#"<h2 class="autumn-card__title">Posts</h2>"#),
             "{html}"
         );
-        assert!(html.contains(r#"class="card-header""#), "{html}");
+        assert!(html.contains(r#"class="autumn-card__header""#), "{html}");
     }
 
     #[test]
     fn card_title_respects_heading_level() {
         let body = maud::html! {};
         let html = card(&body, &CardConfig::new().title("X").level(HeadingLevel::H3)).into_string();
-        assert!(html.contains(r#"<h3 class="card-title">"#), "{html}");
+        assert!(
+            html.contains(r#"<h3 class="autumn-card__title">"#),
+            "{html}"
+        );
         assert!(!html.contains("<h2"), "{html}");
     }
 
@@ -8309,7 +8320,7 @@ mod tests {
     fn card_omits_header_when_empty() {
         let body = maud::html! {};
         let html = card(&body, &CardConfig::new()).into_string();
-        assert!(!html.contains("card-header"), "{html}");
+        assert!(!html.contains("autumn-card__header"), "{html}");
     }
 
     #[test]
@@ -8317,7 +8328,7 @@ mod tests {
         let action = maud::html! { a class="btn" href="/new" { "New" } };
         let body = maud::html! {};
         let html = card(&body, &CardConfig::new().header_action(action)).into_string();
-        assert!(html.contains(r#"class="card-header""#), "{html}");
+        assert!(html.contains(r#"class="autumn-card__header""#), "{html}");
         assert!(html.contains(r#"class="btn""#), "{html}");
         assert!(html.contains(r#"href="/new""#), "{html}");
     }
@@ -8327,8 +8338,8 @@ mod tests {
         let action = maud::html! { button { "Click" } };
         let body = maud::html! {};
         let html = card(&body, &CardConfig::new().header_action(action)).into_string();
-        assert!(html.contains("card-header"), "{html}");
-        assert!(!html.contains("card-title"), "{html}");
+        assert!(html.contains("autumn-card__header"), "{html}");
+        assert!(!html.contains("autumn-card__title"), "{html}");
         assert!(!html.contains("<h2"), "{html}");
     }
 
@@ -8337,7 +8348,7 @@ mod tests {
         let footer = maud::html! { span { "Save" } };
         let body = maud::html! {};
         let html = card(&body, &CardConfig::new().footer(footer)).into_string();
-        assert!(html.contains(r#"class="card-footer""#), "{html}");
+        assert!(html.contains(r#"class="autumn-card__footer""#), "{html}");
         assert!(html.contains("Save"), "{html}");
     }
 
@@ -8345,14 +8356,14 @@ mod tests {
     fn card_omits_footer_when_none() {
         let body = maud::html! {};
         let html = card(&body, &CardConfig::new()).into_string();
-        assert!(!html.contains("card-footer"), "{html}");
+        assert!(!html.contains("autumn-card__footer"), "{html}");
     }
 
     #[test]
     fn card_extra_class_escape_hatch() {
         let body = maud::html! {};
         let html = card(&body, &CardConfig::new().class("dashboard")).into_string();
-        assert!(html.contains(r#"class="card dashboard""#), "{html}");
+        assert!(html.contains(r#"class="autumn-card dashboard""#), "{html}");
     }
 
     #[test]
@@ -8380,7 +8391,7 @@ mod tests {
         let rows = vec![("Name", maud::html! { "Alice" })];
         let body = property_list(&rows);
         let html = card(&body, &CardConfig::new().title("Detail")).into_string();
-        assert!(html.contains(r#"class="card-body""#), "{html}");
+        assert!(html.contains(r#"class="autumn-card__body""#), "{html}");
         assert!(html.contains(r#"class="autumn-property-list""#), "{html}");
     }
 
@@ -8389,18 +8400,24 @@ mod tests {
     #[test]
     fn stat_card_renders_label_value() {
         let html = stat_card("Users", "42", None).into_string();
-        assert!(html.contains(r#"class="stat-card""#), "{html}");
-        assert!(html.contains(r#"class="stat-label""#), "{html}");
-        assert!(html.contains(r#"class="stat-value""#), "{html}");
+        assert!(html.contains(r#"class="autumn-stat-card""#), "{html}");
+        assert!(
+            html.contains(r#"class="autumn-stat-card__label""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"class="autumn-stat-card__value""#),
+            "{html}"
+        );
         assert!(html.contains("Users"), "{html}");
         assert!(html.contains("42"), "{html}");
-        assert!(!html.contains("stat-link"), "{html}");
+        assert!(!html.contains("autumn-stat-card__link"), "{html}");
     }
 
     #[test]
     fn stat_card_renders_optional_link() {
         let html = stat_card("Users", "42", Some(("/users", "View all →"))).into_string();
-        assert!(html.contains(r#"class="stat-link""#), "{html}");
+        assert!(html.contains(r#"class="autumn-stat-card__link""#), "{html}");
         assert!(html.contains(r#"href="/users""#), "{html}");
         assert!(html.contains("View all"), "{html}");
     }
@@ -8410,6 +8427,90 @@ mod tests {
         let html = stat_card("L", "<b>x</b>", None).into_string();
         assert!(html.contains("&lt;b&gt;"), "{html}");
         assert!(!html.contains("<b>x</b>"), "{html}");
+    }
+
+    // ── widget class namespace (#2354) ──────────────────────────────────
+
+    /// Every semantic class the renamed widgets emit must live in the
+    /// `autumn-*` namespace, and the old unprefixed hooks must be gone:
+    /// the standalone widget stylesheet only styles namespaced classes.
+    #[test]
+    fn renamed_widgets_emit_namespaced_classes_only() {
+        let body = maud::html! { p { "hello" } };
+        let html = card(
+            &body,
+            &CardConfig::new()
+                .title("Posts")
+                .header_action(maud::html! { a href="/new" { "New" } })
+                .footer(maud::html! { span { "Save" } }),
+        )
+        .into_string();
+        for class in [
+            "autumn-card",
+            "autumn-card__header",
+            "autumn-card__title",
+            "autumn-card__body",
+            "autumn-card__footer",
+        ] {
+            assert!(html.contains(class), "missing {class}: {html}");
+        }
+        for stale in [
+            r#"class="card""#,
+            "card-header",
+            "card-title",
+            "card-body",
+            "card-footer",
+        ] {
+            assert!(
+                !html.contains(stale),
+                "stale unprefixed hook {stale}: {html}"
+            );
+        }
+
+        let html = stat_card("Users", "42", Some(("/users", "View all"))).into_string();
+        for class in [
+            "autumn-stat-card",
+            "autumn-stat-card__label",
+            "autumn-stat-card__value",
+            "autumn-stat-card__link",
+        ] {
+            assert!(html.contains(class), "missing {class}: {html}");
+        }
+        for stale in [
+            r#"class="stat-card""#,
+            "stat-label",
+            "stat-value",
+            "stat-link",
+        ] {
+            assert!(
+                !html.contains(stale),
+                "stale unprefixed hook {stale}: {html}"
+            );
+        }
+
+        let html = nav_link("/posts", "/posts", "Posts").into_string();
+        assert!(html.contains(r#"class="autumn-active""#), "{html}");
+        assert!(!html.contains(r#"class="active""#), "{html}");
+
+        let html = active_search_empty_state("No results").into_string();
+        assert!(html.contains(r#"class="autumn-search-empty""#), "{html}");
+        assert!(!html.contains(r#"class="search-empty""#), "{html}");
+
+        let html = autocomplete_empty_state("No matches").into_string();
+        assert!(
+            html.contains(r#"class="autumn-autocomplete-empty""#),
+            "{html}"
+        );
+        assert!(!html.contains(r#"class="autocomplete-empty""#), "{html}");
+
+        let html = alert_with(
+            AlertVariant::Info,
+            maud::html! { "hi" },
+            &AlertConfig::new().icon(true),
+        )
+        .into_string();
+        assert!(html.contains(r#"class="autumn-alert__icon-svg""#), "{html}");
+        assert!(!html.contains(r#"class="alert__icon-svg""#), "{html}");
     }
 
     // ── hero ─────────────────────────────────────────────────────────────
