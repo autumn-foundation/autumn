@@ -474,21 +474,14 @@ use std::time::Duration;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 
-#[derive(diesel::QueryableByName)]
-struct TxCountRow {
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
-    n: i64,
-}
-
 async fn count_counters(conn: &mut RuntimeConnection) -> i64 {
-    diesel::sql_query("SELECT COUNT(*) AS n FROM counters")
-        .load::<TxCountRow>(conn)
+    // `count_star` over the table DSL: no named-field struct, so no
+    // `redundant_field_names` span artifact from a derive expansion.
+    counters::table
+        .select(diesel::dsl::count_star())
+        .first::<i64>(conn)
         .await
         .expect("count counters")
-        .into_iter()
-        .next()
-        .map(|r| r.n)
-        .unwrap_or(0)
 }
 
 async fn boot_tx_pool(db_path: &std::path::Path) -> SqlitePool {
