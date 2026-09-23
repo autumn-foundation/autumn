@@ -257,18 +257,20 @@ intra-test race widened by sibling load" was itself the wrong framing.
 Working out what "whole-binary execution context" actually means
 mechanically, then naming the specific defect, is next pass's work.
 
-Added `rerun_default_parallelism` to
-`.github/workflows/manual-sqlite-jobs-rerun-check.yml`: a second job,
-alongside the existing filtered/serial `rerun` job, that builds the same
-binary once and runs it *whole* (no filter, no `--test-threads` override) N
-times, uploading each iteration's full log — the CI-native form of the local
-repro above, so a future pass (or CI itself) can confirm these figures
-without needing a local sandbox with outbound network access. It should be
-extended with a `--test-threads=1` serial variant too, given this pass's
-own finding that serial execution is not actually clean. Not dispatchable
-this pass: `workflow_dispatch` only accepts a workflow already on the
-repository's default branch (`trunk-dev`), the same gotcha every harness in
-this ledger has hit on its own introduction pass.
+Added two jobs to `.github/workflows/manual-sqlite-jobs-rerun-check.yml`,
+alongside the existing filtered/serial `rerun` job: `rerun_default_parallelism`
+builds the binary once and runs it *whole* (no filter, no `--test-threads`
+override) N times — the CI-native form of the local default-parallelism
+repro (3/100). `rerun_serial_whole_binary`, added the same pass once the
+0/20-was-underpowered finding landed, mirrors it with `--test-threads=1` —
+the CI-native form of the properly-powered serial repro (1/100). Both
+upload each iteration's full log, so a future pass (or CI itself) can
+confirm both figures without needing a local sandbox with outbound network
+access. Neither is dispatchable this pass: `workflow_dispatch` only accepts
+a workflow already on the repository's default branch (`trunk-dev`), the
+same gotcha every harness in this ledger has hit on its own introduction
+pass. Once merged, the next step is to dispatch both — they already exist,
+not something to reimplement.
 
 ## 📊 Measurement
 

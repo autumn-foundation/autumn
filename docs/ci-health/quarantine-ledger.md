@@ -2406,24 +2406,23 @@ without also filling in the intake form above.
   `trunk-dev` once merged, to get a CI-native (not just local-sandbox)
   confirmation of both figures above.
 
-  **This pass adds `rerun_default_parallelism` to
-  `.github/workflows/manual-sqlite-jobs-rerun-check.yml`**: a second job,
-  alongside the existing filtered/serial `rerun` job, that builds the same
-  binary once and then runs it whole (no filter, no `--test-threads`
-  override) N times, uploading each iteration's full log — the CI-native
-  form of the local default-parallelism repro above, so a future pass (or
-  CI itself) can confirm the 3/100 figure without needing a local sandbox
-  with network access. It does not yet have a serial (`--test-threads=1`,
-  unfiltered) variant to confirm the 1/100 figure — that gap is itself a
-  next step, given this entry's own finding that serial execution is not
-  actually clean. Not dispatchable this pass for the same reason every
-  prior harness in this ledger wasn't on its own introduction pass:
-  `workflow_dispatch` only accepts a workflow already present on the
-  repository's default branch (`trunk-dev`). **Next step, for whichever
-  pass finds this PR merged**: dispatch `rerun_default_parallelism` with
-  `iterations: "50"` against `trunk-dev`'s tip for the CI-native
-  confirmation of the concurrent figure, add and dispatch a serial variant
-  for the 1/100 figure, and audit the intra-test/serial-mode mechanism
+  **This pass adds two jobs to
+  `.github/workflows/manual-sqlite-jobs-rerun-check.yml`**, alongside the
+  existing filtered/serial `rerun` job: `rerun_default_parallelism` builds
+  the binary once and runs it whole (no filter, no `--test-threads`
+  override) N times — the CI-native form of the local default-parallelism
+  repro above (3/100). `rerun_serial_whole_binary`, added the same pass
+  once the 0/20-was-underpowered finding landed, mirrors it with
+  `--test-threads=1` — the CI-native form of the properly-powered serial
+  repro (1/100). Both upload each iteration's full log. Neither is
+  dispatchable this pass for the same reason every prior harness in this
+  ledger wasn't on its own introduction pass: `workflow_dispatch` only
+  accepts a workflow already present on the repository's default branch
+  (`trunk-dev`). **Next step, for whichever pass finds this PR merged**:
+  dispatch both `rerun_default_parallelism` and `rerun_serial_whole_binary`
+  with `iterations: "50"` against `trunk-dev`'s tip for the CI-native
+  confirmation of both figures (the jobs already exist — dispatch them,
+  don't reimplement them), and audit the intra-test/serial-mode mechanism
   described above before proposing any fix — per this role's own process,
   the product/test verdict must be rendered and the specific defect named
   before a fix PR, and neither is done yet.
