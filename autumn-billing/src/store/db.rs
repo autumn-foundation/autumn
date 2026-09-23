@@ -700,16 +700,29 @@ impl BillingStore for DbBillingStore {
                         .first(conn)
                         .await
                         .optional()?;
-                    let Some(mut current) = existing else {
+                    let Some(current) = existing else {
                         return Ok(None);
                     };
-                    current.user_id = Some(user_id);
-                    current.updated_at = to_naive(now);
+                    // Column-scoped, symmetric to `upsert_customer`'s fix
+                    // above: a whole-row `.set(&current)` here would write
+                    // back this snapshot's `email` too, silently erasing a
+                    // concurrent webhook's `upsert_customer` email refresh
+                    // landing in the window between this read and this
+                    // write. Touch only the two columns this operation
+                    // actually intends to change.
                     diesel::update(billing_customers::table.find(&current.id))
-                        .set(&current)
+                        .set((
+                            billing_customers::user_id.eq(&user_id),
+                            billing_customers::updated_at.eq(to_naive(now)),
+                        ))
                         .execute(conn)
                         .await?;
-                    Ok(Some(current))
+                    let final_row: CustomerRow = billing_customers::table
+                        .find(&current.id)
+                        .select(CustomerRow::as_select())
+                        .first(conn)
+                        .await?;
+                    Ok(Some(final_row))
                 })
                 .await;
             match result {

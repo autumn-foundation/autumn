@@ -397,7 +397,20 @@ both P2):
     tenancy after" scoping bug the migration guide had in finding 7 — fixed
     identically, in the same commit.
 
-Re-verified after all ten findings: full `autumn-billing` lib tests (82),
+**An eleventh finding**, on the very next review round (commit `415080c4`,
+P2): finding 9's fix was one-directional. `DbBillingStore::relink_customer`
+had exactly the same whole-row `.set(&current)` shape, just mutating
+`user_id`/`updated_at` in memory while leaving `email` at whatever it read —
+so a webhook's `upsert_customer` committing a refreshed `email` in the
+window between `relink_customer`'s read and its write got silently erased
+by `relink_customer`'s own whole-row write, the identical bug pointed the
+other way. Fixed identically to finding 9: `relink_customer`'s write is now
+column-scoped to just `user_id`/`updated_at`, never touching `email`, with
+the final row re-read after the write rather than returned from the
+snapshot. Same reasoning as finding 9 on why this isn't independently
+race-tested against a live database.
+
+Re-verified after all eleven findings: full `autumn-billing` lib tests (82),
 `--test integration` (171), `--test mirror_db` (29), `cargo fmt`/
 `clippy -D warnings` clean, `cargo check --all-targets` clean, the
 documentation-build command above clean, and
