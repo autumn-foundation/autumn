@@ -1306,6 +1306,11 @@ static SQLITE_REPLICATION_ACTIVE: std::sync::atomic::AtomicBool =
 ///   auto-checkpoint rewrites the main database file, which would tear a base
 ///   snapshot mid-copy, and restarts the WAL under a new salt, which would force
 ///   an expensive fresh generation every 1000 pages.
+/// * The `busy_timeout` pragma is applied unconditionally, but it does **not**
+///   cover `cache=shared` table-lock conflicts: those return `SQLITE_LOCKED`
+///   without invoking the busy handler at all (the pool does not wire
+///   `sqlite3_unlock_notify`), so the pragma is inert for that one lock class —
+///   harmless, not harmful (issue #2881).
 #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
 const fn sqlite_connection_pragmas(read_only: bool, replicating: bool) -> &'static str {
     if read_only {
@@ -1475,13 +1480,32 @@ fn normalize_sqlite_target(url: &str) -> String {
 /// so it must NOT be forced single-slot and returns `false` here.
 #[cfg(feature = "sqlite")]
 fn sqlite_target_is_memory(target: &str) -> bool {
-    if target.contains("cache=shared") {
+    if sqlite_target_is_shared_cache(target) {
         return false;
     }
     target == ":memory:"
         || target == "file::memory:"
         || target.starts_with("file::memory:?")
         || target.contains("mode=memory")
+}
+
+/// Whether a normalized `SQLite` target asks for **shared-cache** mode
+/// (`cache=shared` in the query string) — the mode in which the pool's
+/// connections share one database (one in-memory database, or one shared
+/// view of a file) and contend on table locks rather than file locks.
+///
+/// Shared-cache table-lock conflicts return `SQLITE_LOCKED` /
+/// `SQLITE_LOCKED_SHAREDCACHE` **without invoking the busy handler at all**
+/// (documented `SQLite` behavior; this pool does not wire
+/// `sqlite3_unlock_notify`), so the unconditional `PRAGMA busy_timeout = 5000`
+/// from [`sqlite_connection_pragmas`] does **not** bound those waits (issue
+/// #2881): under real contention every contender can fail instantly, with no
+/// wait between them. Kept in sync with the `cache=shared` carve-out in
+/// [`sqlite_target_is_memory`], which exists precisely so shared-cache targets
+/// are never forced single-slot.
+#[cfg(feature = "sqlite")]
+fn sqlite_target_is_shared_cache(target: &str) -> bool {
+    target.contains("cache=shared")
 }
 
 /// Whether a `SQLite` database URL (any accepted spelling) resolves to **any**
@@ -1771,7 +1795,7 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
     };
 
     #[cfg(feature = "sqlite")]
-    reject_sqlite_statement_timeout(config.statement_timeout)?;
+    reject_sqlite_statement_timeout(config.statement_timeout, url)?;
 
     let pool = build_pool(
         url,
@@ -1801,8 +1825,16 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
 /// [`DatabasePoolProvider`](crate::db::DatabasePoolProvider) — whose
 /// `create_topology`/`create_shard_topology` need not route through those
 /// factories — cannot bypass the guard. No configured timeout can reach a live
-/// `SQLite` pool. `busy_timeout` still bounds lock waits; a real per-statement
-/// timeout is tracked by #1996/#1910.
+/// `SQLite` pool. `busy_timeout` bounds lock waits only for lock modes that
+/// consult the busy handler; it does **not** bound `cache=shared` table-lock
+/// waits, which return `SQLITE_LOCKED` without invoking the busy handler at
+/// all (issue #2881). A real per-statement timeout is tracked by
+/// #1996/#1910.
+///
+/// `target` is the pool's database target (the raw configured URL is fine —
+/// [`sqlite_target_is_shared_cache`] only inspects the query string) and is
+/// used solely to scope the lock-wait claim in the error message so it does
+/// not lie for `cache=shared` targets.
 ///
 /// # Errors
 ///
@@ -1811,16 +1843,30 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
 #[cfg(feature = "sqlite")]
 pub(crate) fn reject_sqlite_statement_timeout(
     statement_timeout: Option<Duration>,
+    target: &str,
 ) -> Result<(), PoolError> {
     let Some(timeout) = statement_timeout.filter(|t| !t.is_zero()) else {
         return Ok(());
+    };
+    // `busy_timeout` bounds lock waits only for lock modes that consult the
+    // busy handler. A `cache=shared` target's shared-cache table-lock
+    // conflicts return `SQLITE_LOCKED` without invoking the busy handler at
+    // all (this pool does not wire `sqlite3_unlock_notify`), so stating the
+    // unqualified claim for those targets would be false (issue #2881).
+    let wait_clause = if sqlite_target_is_shared_cache(target) {
+        "and note that `cache=shared` table-lock conflicts return SQLITE_LOCKED \
+         immediately, without consulting the busy handler (this pool does not \
+         wire sqlite3_unlock_notify), so `busy_timeout` does NOT bound those \
+         waits (issue #2881)"
+    } else {
+        "(`busy_timeout` already bounds lock waits)"
     };
     Err(PoolError::UnsupportedBackend(format!(
         "SQLite backend cannot enforce database.statement_timeout ({}ms): diesel's \
          SqliteConnection exposes no interrupt/progress-handler hook through the async \
          connection wrapper, so a runaway query cannot be aborted. Unset \
-         database.statement_timeout for the SQLite backend (busy_timeout already bounds \
-         lock waits), or run on Postgres. Tracking issue: #1996/#1910.",
+         database.statement_timeout for the SQLite backend {wait_clause}, or run on Postgres. \
+         Tracking issue: #1996/#1910.",
         timeout.as_millis()
     )))
 }
@@ -1870,7 +1916,7 @@ pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopolog
     };
 
     #[cfg(feature = "sqlite")]
-    reject_sqlite_statement_timeout(config.statement_timeout)?;
+    reject_sqlite_statement_timeout(config.statement_timeout, primary_url)?;
 
     let primary = build_pool(
         primary_url,
@@ -1914,7 +1960,7 @@ pub fn create_shard_topology(
     // Postgres-only), so the same fail-closed guard applies per shard. The shard
     // inherits the `[database]` `statement_timeout`.
     #[cfg(feature = "sqlite")]
-    reject_sqlite_statement_timeout(defaults.statement_timeout)?;
+    reject_sqlite_statement_timeout(defaults.statement_timeout, &shard.primary_url)?;
 
     let primary = build_pool(
         &shard.primary_url,
@@ -4905,6 +4951,79 @@ mod tests {
         ));
         // Plain file targets are not in-memory.
         assert!(!sqlite_target_is_memory("/var/lib/app.db"));
+    }
+
+    // `sqlite_target_is_shared_cache` is the predicate that scopes the
+    // `statement_timeout` rejection message (issue #2881): it must catch every
+    // `cache=shared` spelling, including a shared-cache file target, and must
+    // not fire for private in-memory or plain file targets.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_target_is_shared_cache_covers_query_spellings() {
+        // Shared-cache in-memory spellings.
+        assert!(sqlite_target_is_shared_cache("file::memory:?cache=shared"));
+        assert!(sqlite_target_is_shared_cache(
+            "file:app?mode=memory&cache=shared"
+        ));
+        // Shared-cache also applies to file-backed targets.
+        assert!(sqlite_target_is_shared_cache(
+            "file:/srv/ref.db?cache=shared&mode=ro"
+        ));
+        // Private in-memory targets are NOT shared-cache.
+        assert!(!sqlite_target_is_shared_cache(":memory:"));
+        assert!(!sqlite_target_is_shared_cache("file::memory:"));
+        assert!(!sqlite_target_is_shared_cache("file::memory:?foo=bar"));
+        assert!(!sqlite_target_is_shared_cache("file:app?mode=memory"));
+        // Plain file targets are NOT shared-cache.
+        assert!(!sqlite_target_is_shared_cache("file:/srv/ref.db"));
+        assert!(!sqlite_target_is_shared_cache("/var/lib/app.db"));
+    }
+
+    // The `statement_timeout` rejection must not claim `busy_timeout` bounds
+    // lock waits for `cache=shared` targets (issue #2881): shared-cache
+    // table-lock conflicts return `SQLITE_LOCKED` without invoking the busy
+    // handler at all, so the claim is false there and the message says so.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn reject_sqlite_statement_timeout_scopes_lock_wait_claim() {
+        let timeout = Some(std::time::Duration::from_millis(100));
+
+        let shared = reject_sqlite_statement_timeout(timeout, "file:app?mode=memory&cache=shared");
+        let message = match shared {
+            Err(PoolError::UnsupportedBackend(message)) => message,
+            other => panic!("expected UnsupportedBackend, got {other:?}"),
+        };
+        assert!(
+            message.contains("does NOT bound"),
+            "shared-cache message must disclaim the busy_timeout bound, got: {message}"
+        );
+        assert!(
+            message.contains("SQLITE_LOCKED"),
+            "shared-cache message must name the failure mode, got: {message}"
+        );
+        assert!(
+            message.contains("#2881"),
+            "shared-cache message must point at the issue, got: {message}"
+        );
+        assert!(
+            !message.contains("already bounds lock waits"),
+            "shared-cache message must not make the unqualified claim, got: {message}"
+        );
+
+        let plain = reject_sqlite_statement_timeout(timeout, "file:/srv/app.db");
+        let message = match plain {
+            Err(PoolError::UnsupportedBackend(message)) => message,
+            other => panic!("expected UnsupportedBackend, got {other:?}"),
+        };
+        assert!(
+            message.contains("(`busy_timeout` already bounds lock waits)"),
+            "non-shared-cache message keeps the original claim, got: {message}"
+        );
+
+        // No configured timeout asks for no guarantee and boots cleanly on
+        // either target shape.
+        assert!(reject_sqlite_statement_timeout(None, "file:app?mode=memory&cache=shared").is_ok());
+        assert!(reject_sqlite_statement_timeout(None, "file:/srv/app.db").is_ok());
     }
 
     // `sqlite_target_is_any_in_memory` is the broader predicate the
