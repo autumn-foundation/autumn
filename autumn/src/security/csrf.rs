@@ -435,15 +435,7 @@ where
         // satisfy an `/api/` exemption prefix while targeting another route.
         let clean = crate::security::path::clean_path(req.uri().path());
         let path = clean.as_str();
-        let is_exempt = self.settings.exempt_paths.iter().any(|prefix| {
-            if path == prefix {
-                true
-            } else if let Some(stripped) = path.strip_prefix(prefix) {
-                prefix.ends_with('/') || stripped.starts_with('/')
-            } else {
-                false
-            }
-        });
+        let is_exempt = crate::security::path::is_exempt_path(path, &self.settings.exempt_paths);
         let is_safe = is_exempt || self.settings.safe_methods.contains(req.method());
         let raw_cookie_token = extract_cookie_token(req.headers(), &self.settings.cookie_name);
 

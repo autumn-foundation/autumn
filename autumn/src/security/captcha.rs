@@ -696,13 +696,7 @@ where
         // `/inbound/mailgun/../other` cannot satisfy an exemption prefix
         // while targeting another route.
         let clean = crate::security::path::clean_path(req.uri().path());
-        if self.settings.exempt_paths.iter().any(|ep| {
-            let path = clean.as_str();
-            let e = ep.as_str();
-            path == e
-                || path.starts_with(e)
-                    && (e.ends_with('/') || path.as_bytes().get(e.len()) == Some(&b'/'))
-        }) {
+        if crate::security::path::is_exempt_path(clean.as_str(), &self.settings.exempt_paths) {
             let mut inner = self.inner.clone();
             std::mem::swap(&mut self.inner, &mut inner);
             return Box::pin(async move { inner.call(req).await });
