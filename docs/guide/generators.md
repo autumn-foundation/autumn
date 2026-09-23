@@ -11,7 +11,7 @@ single command. Four subcommands cover the cases you actually hit:
 | `autumn generate job`                | A `#[job]` background-job handler with args struct, `registered_jobs()` aggregator, and `.jobs(…)` wiring in `src/main.rs` |
 | `autumn generate channel`            | A real-time broadcast channel over the `Channels` API — an htmx SSE live view by default, or a raw `#[ws]` handler with `--ws` |
 | `autumn generate webhook`            | A signature-verified, replay-protected inbound provider webhook (Stripe/GitHub/Slack/generic) — handler, event dispatch, `autumn.toml` endpoint config, and tests |
-| `autumn generate inbound-mail`       | An `#[inbound_mail]` handler for email your app receives — Mailgun/SES/generic webhook endpoint, router wiring, and a signed-fixture integration test |
+| `autumn generate inbound-mail`       | An `#[inbound_mail]` handler for email your app receives — a **Mailgun** endpoint, router wiring, and a signed-fixture integration test (no provider flag; SES and generic are a hand edit) |
 | `autumn generate scaffold`           | Everything `model` does plus `#[repository]`, HTML routes, smoke test, `routes![]` registration |
 | `autumn generate policy`             | A record-level `Policy`/`Scope` pair for a model that already exists, registered in `src/main.rs` |
 | `autumn generate wizard`             | A session-backed multi-step form wizard with per-step validation and a confirm/commit/cancel flow |

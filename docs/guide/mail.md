@@ -619,6 +619,13 @@ there is no address it could safely suppress.
 smoke test and the `InboundMailRouter` registration in `src/main.rs` — see
 [Generators](generators.md#autumn-generate-inbound-mail).
 
+It scaffolds a **Mailgun** endpoint and nothing else: there is no provider flag,
+so the emitted `.endpoint(...)` is always
+`InboundMailEndpointConfig::mailgun("/inbound/mailgun", …)` and the generated
+test posts a Mailgun fixture. For SES or generic, generate it anyway and swap
+that one call for `::ses(path).with_topic_arn(…)` or `::generic(path)` — the
+handler, the routing and the wiring are provider-independent.
+
 ## Production Checklist
 
 - Enable the `mail` feature.
