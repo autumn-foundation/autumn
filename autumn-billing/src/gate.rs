@@ -328,11 +328,64 @@ pub async fn session_user_id(
     user_id_in(&session, state).await
 }
 
-/// The non-empty user id stored under the configured auth session key.
+/// Separator between the tenant and the raw session user id in a
+/// tenant-scoped billing identity ([`scope_identity_to_tenant`]).
+///
+/// A C0 control character rather than a printable one (`:`, `/`, …): a
+/// tenant id (resolved by Autumn's own `[tenancy]` config — a header
+/// allow-list, a subdomain map, a JWT claim) or an ordinary application user
+/// id can spell any printable character, so only a byte neither can contain
+/// makes `{tenant}{SEP}{user_id}` unambiguous to split back apart — the same
+/// reasoning `idempotency.rs`'s length-prefixed key components exist for.
+/// Kept as a plain separator rather than a hash so [`BillingHooks::recipient_for`](crate::hooks::BillingHooks::recipient_for)'s
+/// default implementation can still recover the raw id (see there).
+pub(crate) const TENANT_IDENTITY_SEPARATOR: char = '\u{1}';
+
+/// The non-empty user id stored under the configured auth session key,
+/// scoped to the ambient tenant when one is in scope.
+///
+/// A session's stored identity (whatever the app's login handler put under
+/// `auth.session_key`) is only guaranteed unique WITHIN its own tenant: a
+/// `#[repository(tenant_scoped)]` model's row id is a per-tenant sequence,
+/// and a sharded deployment's shard-local `BIGSERIAL` starts over on every
+/// shard (`docs/guide/sharding.md`: the destination's PK sequence is never
+/// copied between shards), so two different tenants' principals routinely
+/// stringify to the identical `user_id`. Every billing store lookup is keyed
+/// on this string alone (`customer_by_user`, `Entitled<R>`), and
+/// `BillingPlugin` always resolves the app's one primary connection pool —
+/// never a per-shard one — so without folding the tenant in here, two
+/// unrelated principals that happen to share a `user_id` would be treated as
+/// one and the same billing customer: reading, and through the hosted
+/// portal potentially managing, each other's subscription.
+///
+/// `None` (tenancy disabled, or a `[tenancy] public_paths` route the
+/// middleware exempts before it scopes anything) folds in nothing, so a
+/// non-tenant app's stored identity — and therefore its `billing_customers`
+/// rows — is byte-identical to what it was before this existed. Mirrors the
+/// tenant-folding already applied to `#[cached]`'s cache key and the
+/// idempotency/rate-limit storage keys.
+///
+/// **Compatibility:** under tenancy, this — and therefore `Customer.user_id`
+/// and whatever [`BillingHooks::recipient_for`](crate::hooks::BillingHooks::recipient_for)
+/// receives — is now `{tenant}{TENANT_IDENTITY_SEPARATOR}{user_id}`, not the
+/// bare session id. See that hook's doc for how to recover the raw id.
 async fn user_id_in(session: &Session, state: &AppState) -> Result<String, BillingError> {
-    session
+    let user_id = session
         .get(state.auth_session_key())
         .await
         .filter(|user_id| !user_id.is_empty())
-        .ok_or(BillingError::Unauthenticated)
+        .ok_or(BillingError::Unauthenticated)?;
+    Ok(scope_identity_to_tenant(user_id))
+}
+
+/// Fold the request's ambient `CURRENT_TENANT` into a billing identity.
+fn scope_identity_to_tenant(user_id: String) -> String {
+    let tenant = autumn_web::tenancy::CURRENT_TENANT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten();
+    match tenant {
+        Some(tenant) => format!("{tenant}{TENANT_IDENTITY_SEPARATOR}{user_id}"),
+        None => user_id,
+    }
 }

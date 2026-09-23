@@ -761,12 +761,31 @@ async fn store_resolution_falls_back_to_memory() {
 async fn subscription_does_not_leak_across_tenants_sharing_a_shard_local_user_id() {
     let store = MemoryBillingStore::shared();
 
-    // Tenant "acme": a paying Pro subscriber whose session stores the
-    // shard-local user id "7".
+    // Tenant "acme": its user "7" completes a real checkout and the
+    // provider's webhook confirms an active Pro subscription — the ordinary
+    // flow `docs/guide/billing.md` documents, run entirely through the real
+    // HTTP entry points (never a hand-built store row) so the customer this
+    // creates is keyed exactly the way production checkout keys it.
     let acme = support::harness(store.clone(), FakeProvider::new(), pinned);
-    let customer = seed_customer(&store, "7").await;
-    seed_subscription(&store, &customer, SubscriptionStatus::Active).await;
     acme.client.acting_as("7").await;
+    with_tenant("acme".to_owned(), async {
+        acme.client
+            .post("/billing/checkout")
+            .form("plan=pro")
+            .send()
+            .await
+            .assert_status(303);
+    })
+    .await;
+    let body = fixture_with("customer_subscription_created", |json| {
+        json["data"]["object"]["customer"] = Value::from("cus_fake_1");
+    });
+    // The provider webhook is tenant-agnostic (Stripe has no notion of
+    // Autumn tenants): it links by `provider_customer_id`, not by session,
+    // so it needs no tenant scope of its own.
+    let resp = support::post_webhook(&acme.client, &body).await;
+    resp.assert_status(200);
+    assert_eq!(resp.json::<Value>()["outcome"], "applied");
     with_tenant("acme".to_owned(), async {
         let resp = acme.client.get("/billing/subscription").send().await;
         resp.assert_status(200);

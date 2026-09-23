@@ -198,7 +198,9 @@ impl InvoiceStatus {
 pub struct Customer {
     /// Local id (UUID string).
     pub id: String,
-    /// Application user id from the session, when linked.
+    /// Application user id from the session, when linked. Under Autumn's
+    /// tenancy feature this is the tenant-scoped identity, not the bare
+    /// session id — see [`crate::hooks::BillingHooks::recipient_for`].
     pub user_id: Option<String>,
     /// Provider name (`stripe`).
     pub provider: String,
