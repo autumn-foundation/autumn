@@ -10859,6 +10859,7 @@ fn emit_plain_save_update(
             let update_target = #table_ident::table.find(id);
             let record = ::autumn_web::reexports::diesel::update(update_target)
                 .set(diesel_changeset)
+                .returning(#model_name::as_select())
                 .get_result::<#model_name>(conn)
                 .await
                 .map_err(::autumn_web::AutumnError::from)?;
@@ -11098,6 +11099,7 @@ fn emit_plain_save_update(
                     let update_target = #table_ident::table.find(id);
                     let record = ::autumn_web::reexports::diesel::update(update_target)
                         .set(diesel_changeset)
+                        .returning(#model_name::as_select())
                         .get_result::<#model_name>(conn)
                         .await
                         .map_err(::autumn_web::AutumnError::from)?;
@@ -11152,6 +11154,7 @@ fn emit_plain_save_update(
                         let update_target = #table_ident::table.find(id);
                         let record = ::autumn_web::reexports::diesel::update(update_target)
                             .set(diesel_changeset)
+                            .returning(#model_name::as_select())
                             .get_result::<#model_name>(conn)
                             .await
                             .map_err(::autumn_web::AutumnError::from)?;
@@ -12352,6 +12355,7 @@ fn emit_plain_mutate_many(
                     }
                     ::autumn_web::reexports::diesel::update(#table_ident::table.filter(#table_ident::id.eq_any(chunk)).filter(#table_ident::tenant_id.eq(t)))
                         .set(diesel_changeset)
+                        .returning(#model_name::as_select())
                         .get_results::<#model_name>(conn)
                         .await
                 } else {
@@ -15599,6 +15603,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
                     let mut conn = self.__autumn_acquire_read_conn().await?;
                     let query = #table_ident::table;
                     query
+                        .select(#model_name::as_select())
                         .load::<#model_name>(&mut conn)
                         .await
                         .map_err(::autumn_web::AutumnError::from)
@@ -15610,6 +15615,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
                     let mut conn = self.__autumn_acquire_read_conn().await?;
                     let query = #table_ident::table.filter(#table_ident::deleted_at.is_not_null());
                     query
+                        .select(#model_name::as_select())
                         .load::<#model_name>(&mut conn)
                         .await
                         .map_err(::autumn_web::AutumnError::from)
@@ -16321,6 +16327,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
                 #second_stage_soft_delete_filter
                 #second_stage_tenant_filter
                 let records = records_query
+                    .select(#model_name::as_select())
                     .load::<#model_name>(&mut conn)
                     .await?;
 
@@ -16591,6 +16598,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
                 #second_stage_soft_delete_filter
                 #second_stage_tenant_filter
                 let records = records_query
+                    .select(#model_name::as_select())
                     .load::<#model_name>(&mut conn)
                     .await?;
 
@@ -16992,6 +17000,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
                 #second_stage_tenant_filter
                 #second_stage_owner_filter
                 let records = records_query
+                    .select(#model_name::as_select())
                     .load::<#model_name>(&mut conn)
                     .await?;
 
@@ -22212,7 +22221,7 @@ mod tests {
         // instead of a bare `.for_update()` chain. The lock must still be
         // applied to the load that precedes `before_delete`.
         let delete_lock = delete_generated
-            .find("maybe_for_update ! (load_query)")
+            .find("maybe_for_update ! (load_query . select (Post :: as_select ()))")
             .expect(
                 "delete path should lock the row (maybe_for_update! seam) before before_delete",
             );
@@ -23132,7 +23141,9 @@ mod tests {
         .to_string();
         let destroy_arm = dependent_destroy_arm(&generated);
         assert!(
-            destroy_arm.contains("maybe_for_update ! (comments :: table . find (__cid))"),
+            destroy_arm.contains(
+                "maybe_for_update ! (comments :: table . find (__cid) . select (Comment :: as_select ()))"
+            ),
             "the per-ID reload must load the selected id straight into the \
              maybe_for_update! lock wrapper, with no deleted_at filter that could \
              drop a pre-soft-deleted child: {destroy_arm}"
@@ -24310,6 +24321,41 @@ mod tests {
         );
     }
 
+    /// #2854: every generated read must project the model's own column list
+    /// (`Model::as_select()`) instead of decoding the table's physical column
+    /// order positionally. A model whose field order differs from its `table!`
+    /// column order would otherwise come back with fields swapped.
+    #[test]
+    fn repository_macro_reads_project_model_as_select() {
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+
+        for signature in ["async fn find_all", "async fn find_by_id"] {
+            let body = generated_fn(&generated, signature);
+            assert!(
+                body.contains("select (Post :: as_select ())"),
+                "{signature} must select Post::as_select(): {body}"
+            );
+        }
+    }
+
+    /// #2854: `INSERT`/`UPDATE ... RETURNING` must project the model's own
+    /// column list instead of decoding `RETURNING *` positionally into the
+    /// model — same hazard as the reads, on the write side.
+    #[test]
+    fn repository_macro_writes_return_model_as_select() {
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+
+        for signature in ["async fn save", "async fn update"] {
+            let body = generated_fn(&generated, signature);
+            assert!(
+                body.contains("returning (Post :: as_select ())"),
+                "{signature} must return Post::as_select(): {body}"
+            );
+        }
+    }
+
     /// The generated text for one `async fn`, from its signature to the start of
     /// the next one (or end of input).
     ///
@@ -25010,11 +25056,11 @@ mod tests {
         // `.for_update()` chain. That branch must still lock the row before the
         // history diff (`INSERT INTO _autumn_version_history`) is computed.
         let no_expected_branch = generated
-            .find("} else { :: autumn_web :: maybe_for_update ! (load_query)")
+            .find("} else { :: autumn_web :: maybe_for_update ! (load_query . select (Post :: as_select ()))")
             .expect("versioned update should have a no-expected-version load branch");
         let section = &generated[no_expected_branch..];
         let lock_pos = section
-            .find("maybe_for_update ! (load_query)")
+            .find("maybe_for_update ! (load_query . select (Post :: as_select ()))")
             .expect("versioned update must lock the row (maybe_for_update! seam) before computing history diff");
         let first_pos = section
             .find(". first :: < Post >")

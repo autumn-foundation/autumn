@@ -16,6 +16,7 @@
 #![allow(clippy::must_use_candidate, clippy::missing_const_for_fn)]
 
 use autumn_web::Patch;
+use diesel::QueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
