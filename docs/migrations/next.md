@@ -1268,6 +1268,57 @@ both crates for you and keeps the paths you already write.
 that no codemod may add on the reader's behalf, and the right answer for most
 readers is to depend on `autumn-web` instead, which is a design decision.
 
+### autumn-billing: `Customer.user_id` is tenant-scoped under tenancy
+
+**Why:** `SessionUser`/`Entitled<R>` keyed every `autumn-billing` store lookup
+on the bare session user id, with no tenant component. That id is only
+guaranteed unique WITHIN one tenant — a sharded, `tenant_scoped` `User`
+model's row id is a **shard-local** `BIGSERIAL` (`docs/guide/sharding.md`),
+so two different tenants routinely produce the identical id — while
+`BillingPlugin` always resolves the app's one primary connection pool, never
+a per-shard one. An app combining `BillingPlugin` with tenancy could have one
+tenant's user read, and through the hosted Stripe portal potentially manage,
+another tenant's subscription the instant both users' ids collided. See
+`docs/security/2026-09-23-billing-cross-tenant-identity-collision/`.
+
+**You are affected only if your app enables Autumn's tenancy feature AND
+mounts `BillingPlugin`.** An app without tenancy enabled sees no change at
+all — `Customer.user_id` is computed exactly as before.
+
+For an affected app, `Customer.user_id` — and therefore whatever
+[`BillingHooks::recipient_for`](../../autumn-billing/src/hooks.rs) receives —
+is now `{tenant}\u{1}{user_id}` rather than the bare session id (`\u{1}` is a
+control byte that can never appear in a resolved tenant id or an ordinary
+application user id, so the two components can never be misattributed). The
+**default** `recipient_for` implementation already strips the tenant prefix
+before parsing, so it needs no change. A custom override that assumed the
+bare session id under tenancy needs the same one-line change:
+
+```diff
+ fn recipient_for(&self, user_id: &str) -> Option<i64> {
+-    user_id.parse().ok()
++    user_id
++        .rsplit(autumn_billing::gate::TENANT_IDENTITY_SEPARATOR)
++        .next()
++        .unwrap_or(user_id)
++        .parse()
++        .ok()
+ }
+```
+
+Existing `billing_customers` rows written before the upgrade keep their old,
+unscoped `user_id`. They are not retroactively migrated — doing so would
+need the very tenant context (which tenant each existing row belongs to)
+that this fix exists because the framework never recorded. A fresh checkout
+after the upgrade writes the new, tenant-scoped form; an existing linked
+customer's `user_id` continues to read as the old bare id until its next
+`.with_user()` write (typically indistinguishable in practice, since
+`reconcile.rs` never rewrites an already-linked `user_id`).
+
+**Automation:** `manual` — a custom `recipient_for` override, if one exists,
+needs the diff above; the default implementation and every other consumer of
+`Customer.user_id` need no change.
+
 
 ## Plugin authors
 
