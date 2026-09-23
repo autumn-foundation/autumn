@@ -626,6 +626,15 @@ test posts a Mailgun fixture. For SES or generic, generate it anyway and swap
 that one call for `::ses(path).with_topic_arn(…)` or `::generic(path)` — the
 handler, the routing and the wiring are provider-independent.
 
+Swapping the call is the whole job for `::generic`: the `inbound-mailgun` feature
+the generator adds implies `inbound-mail`, which carries the generic adapter.
+**SES needs `inbound-ses` in that feature list too** — added alongside
+`inbound-mailgun` or in place of it. Without it the SNS verifier is not compiled
+in and the endpoint answers `503` to every request, as
+[SES endpoints need a topic ARN](#ses-endpoints-need-a-topic-arn) describes. The
+generated integration test posts a Mailgun fixture, so it needs rewriting for
+either other provider.
+
 ## Production Checklist
 
 - Enable the `mail` feature.
