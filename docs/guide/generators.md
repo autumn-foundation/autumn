@@ -11,6 +11,7 @@ single command. Four subcommands cover the cases you actually hit:
 | `autumn generate job`                | A `#[job]` background-job handler with args struct, `registered_jobs()` aggregator, and `.jobs(…)` wiring in `src/main.rs` |
 | `autumn generate channel`            | A real-time broadcast channel over the `Channels` API — an htmx SSE live view by default, or a raw `#[ws]` handler with `--ws` |
 | `autumn generate webhook`            | A signature-verified, replay-protected inbound provider webhook (Stripe/GitHub/Slack/generic) — handler, event dispatch, `autumn.toml` endpoint config, and tests |
+| `autumn generate inbound-mail`       | An `#[inbound_mail]` handler for email your app receives — a **Mailgun** endpoint, router wiring, and a signed-fixture integration test (no provider flag; SES and generic are a hand edit) |
 | `autumn generate scaffold`           | Everything `model` does plus `#[repository]`, HTML routes, smoke test, `routes![]` registration |
 | `autumn generate policy`             | A record-level `Policy`/`Scope` pair for a model that already exists, registered in `src/main.rs` |
 | `autumn generate wizard`             | A session-backed multi-step form wizard with per-step validation and a confirm/commit/cancel flow |
@@ -1060,6 +1061,74 @@ cargo test -p autumn-cli --test generate generated_webhook_tests_pass -- --ignor
 These scaffold a fresh project, generate all four presets, and assert `cargo
 check --tests` passes with no hand-editing — plus one gate that actually runs
 the generated tests to confirm they pass on first run.
+
+## `autumn generate inbound-mail`
+
+The receiving half of `generate webhook`: a handler for mail your app is *sent*,
+rather than callbacks a SaaS provider posts. See
+[Receiving Mail](mail.md#receiving-mail-inbound-email) for the subsystem itself.
+
+```bash
+autumn generate inbound-mail Support
+```
+
+Produces:
+
+```
+src/inbound_mailers/support.rs   # SupportMailHandler + #[inbound_mail] handler and unit test
+src/inbound_mailers/mod.rs       # pub mod support;  (created or appended)
+tests/support_inbound_mail.rs    # posts a signed Mailgun fixture through the real route
+src/main.rs                      # mod inbound_mailers; + .inbound_mail_router(...) in the builder
+Cargo.toml                       # "inbound-mailgun" added to autumn-web's feature list
+```
+
+The router it wires in serves Mailgun at `/inbound/mailgun` and reads the signing
+key from `MAILGUN_SIGNING_KEY`:
+
+```rust,ignore
+.inbound_mail_router(
+    InboundMailRouter::new()
+        .endpoint(InboundMailEndpointConfig::mailgun(
+            "/inbound/mailgun",
+            std::env::var("MAILGUN_SIGNING_KEY").unwrap_or_default(),
+        ))
+        .handler(inbound_mailers::support::support_handler_info()),
+)
+```
+
+**Set that variable before you point Mailgun at the route.** The fallback is an
+empty key, and an endpoint with an empty signing key rejects every request with
+`500` rather than accept unsigned mail — the scaffold is inert, not open, until
+the key is there.
+
+### Generating a second handler
+
+Run it again with a **different** name and the new handler is chained onto the
+router already in `src/main.rs`, rather than a second router being inserted.
+
+Re-running with the **same** name is not a no-op. The handler and integration-test
+files are emitted as creations every time, so without `--force` the run stops on
+a collision and writes nothing; with `--force` it overwrites them, your edits
+included. Only the `src/main.rs` registration is skipped when that handler is
+already wired in, so a `--force` re-run does not register it twice.
+
+There is a catch the second run makes visible: the emitted handler starts at
+`#[inbound_mail(to = "*", processing = "background")]`, and `to = "*"` matches
+**every** message. Handlers are tried in registration order and the first match
+wins, so a second generated handler is unreachable until you narrow the first
+one's `to` to the address it is really for — an exact address, a `ticket*`
+local-part prefix, or a `replies+{token}@…` plus-address. The
+[recipient pattern table](mail.md#routing-a-message-to-a-handler) has the
+spellings.
+
+`processing = "background"` is also the default the scaffold ships, which means
+the webhook answers `200` before your handler runs and a handler error is logged
+and dropped. Switch it to `"sync"` and the error becomes a `500` instead, which
+leaves redelivery up to your provider rather than discarding the message.
+
+`autumn destroy inbound-mail Support` reverses all of it, including the
+`src/main.rs` registration — see
+[Undoing a generator](#undoing-a-generator-autumn-destroy).
 
 ## `autumn generate scaffold`
 

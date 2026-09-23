@@ -4049,7 +4049,7 @@ enum GenerateCommands {
     ///   - `src/inbound_mailers/mod.rs`      — created/updated with `pub mod`
     ///   - `tests/<snake>_inbound_mail.rs`   — integration smoke test
     ///   - `src/main.rs`                    — wired into `InboundMailRouter`
-    ///   - `Cargo.toml`                     — `inbound-mail` feature added
+    ///   - `Cargo.toml`                     — `inbound-mailgun` feature added
     ///
     /// Example:
     ///
