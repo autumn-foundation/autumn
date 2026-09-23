@@ -1965,6 +1965,27 @@ impl ShardedDb {
         self.db.tx(f).await
     }
 
+    /// Run an async closure inside a `BEGIN IMMEDIATE` transaction **on this
+    /// shard**. Same semantics as [`Db::tx_immediate`](crate::db::Db::tx_immediate);
+    /// the transaction never spans shards.
+    ///
+    /// # Errors
+    ///
+    /// See [`Db::tx_immediate`](crate::db::Db::tx_immediate).
+    pub async fn tx_immediate<'a, T, E, F>(&'a mut self, f: F) -> Result<T, AutumnError>
+    where
+        T: Send + 'a,
+        E: From<diesel::result::Error> + Send + Sync + 'a,
+        AutumnError: From<E>,
+        F: for<'r> FnOnce(
+                &'r mut crate::db::RuntimeConnection,
+            ) -> scoped_futures::ScopedBoxFuture<'a, 'r, Result<T, E>>
+            + Send
+            + 'a,
+    {
+        self.db.tx_immediate(f).await
+    }
+
     /// Run an async closure inside a transaction **on this shard** with explicit
     /// [`TxOptions`](crate::db::TxOptions) (isolation level + retry). Same
     /// semantics as [`Db::tx_with`](crate::db::Db::tx_with); the transaction

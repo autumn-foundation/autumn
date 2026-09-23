@@ -26,6 +26,16 @@
 //!    yielding a clean, reusable connection — the failed-commit connection is
 //!    never handed back mid-transaction (issue #1996 Finding 3).
 //!
+//! 7. `Db::tx_immediate` (issue #2885): the explicit user-facing immediate
+//!    transaction — commits a write, rolls back on `Err`, rolls back on panic
+//!    (and the pool stays usable), supports a nested savepoint (the
+//!    `BEGIN IMMEDIATE` goes through the transaction manager), takes the
+//!    write lock up front (a second connection's write fails fast while the
+//!    immediate transaction is open), while `Db::tx` stays deferred (a second
+//!    connection's write succeeds while a statement-less deferred transaction
+//!    is open), and building a pool over a `cache=shared` target logs the
+//!    loud shared-cache boot warning.
+//!
 //! Only meaningful under `--features sqlite`; the file is
 //! `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an
 //! empty (passing) binary. Run explicitly:
@@ -450,5 +460,352 @@ async fn commit_failure_leaves_pool_yielding_reusable_connection() {
     assert_eq!(
         reused.expect("the pool's connection is reusable after the COMMIT failure"),
         1
+    );
+}
+
+// ── `Db::tx_immediate` (issue #2885) ─────────────────────────────────────────
+// The explicit user-facing immediate transaction: same `Db::tx` shape (guards,
+// after-commit registry), but the transaction begins IMMEDIATE through the
+// transaction manager, and the closure receives `&mut RuntimeConnection`
+// (like the generated immediate-transaction paths).
+
+use autumn_web::db::Db;
+use std::time::Duration;
+use tracing_subscriber::Layer as _;
+use tracing_subscriber::layer::SubscriberExt as _;
+
+#[derive(diesel::QueryableByName)]
+struct TxCountRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    n: i64,
+}
+
+async fn count_counters(conn: &mut RuntimeConnection) -> i64 {
+    diesel::sql_query("SELECT COUNT(*) AS n FROM counters")
+        .load::<TxCountRow>(conn)
+        .await
+        .expect("count counters")
+        .into_iter()
+        .next()
+        .map(|r| r.n)
+        .unwrap_or(0)
+}
+
+async fn boot_tx_pool(db_path: &std::path::Path) -> SqlitePool {
+    let pool = boot_pool(db_path).await;
+    {
+        let mut conn = pool.get().await.expect("checkout a sqlite connection");
+        diesel::sql_query(
+            "CREATE TABLE IF NOT EXISTS counters (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 value BIGINT NOT NULL DEFAULT 0, \
+                 lock_version BIGINT NOT NULL DEFAULT 1\
+             )",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("create counters table");
+    }
+    pool
+}
+
+#[tokio::test]
+async fn tx_immediate_commits_write_and_nests_savepoint() {
+    use autumn_web::savepoint;
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = boot_tx_pool(&tmp.path().join("tx_imm.db")).await;
+    let mut db = Db::connect_for_test(&pool).await.expect("db checkout");
+
+    // A write plus a nested savepoint inside `tx_immediate`: the savepoint must
+    // succeed (BEGIN IMMEDIATE went through the transaction manager, so the
+    // nested op emits SAVEPOINT, not a raw BEGIN) and both writes commit.
+    db.tx_immediate(|conn| {
+        async move {
+            diesel::sql_query("INSERT INTO counters (value) VALUES (7)")
+                .execute(conn)
+                .await
+                .map_err(autumn_web::AutumnError::from)?;
+            savepoint(conn, |sp_conn| {
+                async move {
+                    diesel::sql_query("INSERT INTO counters (value) VALUES (8)")
+                        .execute(sp_conn)
+                        .await
+                        .map_err(autumn_web::AutumnError::from)?;
+                    Ok::<(), autumn_web::AutumnError>(())
+                }
+                .scope_boxed()
+            })
+            .await?;
+            Ok::<(), autumn_web::AutumnError>(())
+        }
+        .scope_boxed()
+    })
+    .await
+    .expect("tx_immediate commits");
+
+    let mut conn = pool.get().await.expect("checkout");
+    assert_eq!(
+        count_counters(&mut conn).await,
+        2,
+        "the outer write and the nested-savepoint write both committed"
+    );
+}
+
+#[tokio::test]
+async fn tx_immediate_rolls_back_on_error() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = boot_tx_pool(&tmp.path().join("tx_imm_rb.db")).await;
+    let mut db = Db::connect_for_test(&pool).await.expect("db checkout");
+
+    let outcome: autumn_web::AutumnResult<()> = db
+        .tx_immediate(|conn| {
+            async move {
+                diesel::sql_query("INSERT INTO counters (value) VALUES (9)")
+                    .execute(conn)
+                    .await
+                    .map_err(autumn_web::AutumnError::from)?;
+                Err(autumn_web::AutumnError::internal_server_error_msg(
+                    "intentional rollback",
+                ))
+            }
+            .scope_boxed()
+        })
+        .await;
+    assert!(outcome.is_err(), "the closure returned Err");
+
+    let mut conn = pool.get().await.expect("checkout");
+    assert_eq!(
+        count_counters(&mut conn).await,
+        0,
+        "the write was rolled back"
+    );
+}
+
+#[tokio::test]
+async fn tx_immediate_panic_rolls_back_and_pool_stays_usable() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = boot_tx_pool(&tmp.path().join("tx_imm_panic.db")).await;
+
+    // Run the panicking transaction on a spawned task: `tx_immediate` must roll
+    // the transaction back (through the transaction manager) before the unwind
+    // resumes, so the pooled connection is never recycled mid-transaction.
+    let task_pool = pool.clone();
+    let handle = tokio::spawn(async move {
+        let mut db = Db::connect_for_test(&task_pool).await.expect("db checkout");
+        let _: autumn_web::AutumnResult<()> = db
+            .tx_immediate(|conn| {
+                async move {
+                    diesel::sql_query("INSERT INTO counters (value) VALUES (42)")
+                        .execute(conn)
+                        .await
+                        .map_err(autumn_web::AutumnError::from)?;
+                    panic!("intentional panic inside tx_immediate");
+                    #[allow(unreachable_code)]
+                    Ok::<(), autumn_web::AutumnError>(())
+                }
+                .scope_boxed()
+            })
+            .await;
+    });
+    let join = handle.await;
+    assert!(
+        join.is_err() && join.unwrap_err().is_panic(),
+        "the panic propagates out of tx_immediate"
+    );
+
+    // The panic path rolled back: no partial row.
+    let mut conn = pool.get().await.expect("checkout");
+    assert_eq!(
+        count_counters(&mut conn).await,
+        0,
+        "the panicking transaction was rolled back"
+    );
+
+    // And the pool hands out a clean, reusable connection afterwards.
+    let mut db = Db::connect_for_test(&pool).await.expect("db checkout");
+    db.tx_immediate(|conn| {
+        async move {
+            diesel::sql_query("INSERT INTO counters (value) VALUES (1)")
+                .execute(conn)
+                .await
+                .map_err(autumn_web::AutumnError::from)?;
+            Ok::<(), autumn_web::AutumnError>(())
+        }
+        .scope_boxed()
+    })
+    .await
+    .expect("the pool's connection is reusable after the panic");
+    let mut conn = pool.get().await.expect("checkout");
+    assert_eq!(count_counters(&mut conn).await, 1);
+}
+
+// The begin-mode proof, through the public `Db` API: an open `tx_immediate`
+// holds the SQLite write lock from `BEGIN` (before the closure runs a single
+// statement), so a second connection's write fails fast; an open, still
+// statement-less deferred `tx` holds no lock, so the same write succeeds.
+// Together they prove `tx_immediate` really begins IMMEDIATE and `tx` really
+// stays deferred (issue #2885's contract).
+
+async fn write_probe_fails_while_lock_held(pool: &SqlitePool) {
+    let mut probe = pool.get().await.expect("checkout probe connection");
+    // Fail fast instead of waiting out the pool's 5s busy_timeout: the point is
+    // *that* the write lock is held, not how long the queue would be.
+    diesel::sql_query("PRAGMA busy_timeout = 120")
+        .execute(&mut *probe)
+        .await
+        .expect("set probe busy timeout");
+    let err = diesel::sql_query("INSERT INTO counters (value) VALUES (1)")
+        .execute(&mut *probe)
+        .await
+        .expect_err("the write must fail while the immediate lock is held");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("database is locked"),
+        "expected SQLITE_BUSY ('database is locked'), got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn tx_immediate_takes_write_lock_up_front() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = boot_tx_pool(&tmp.path().join("tx_imm_lock.db")).await;
+
+    let (opened_tx, opened_rx) = tokio::sync::oneshot::channel::<()>();
+    let holder_pool = pool.clone();
+    let holder = tokio::spawn(async move {
+        let mut db = Db::connect_for_test(&holder_pool)
+            .await
+            .expect("db checkout");
+        // No statements: the BEGIN IMMEDIATE alone must hold the write lock.
+        db.tx_immediate(|_conn| {
+            async move {
+                let _ = opened_tx.send(());
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                Ok::<(), autumn_web::AutumnError>(())
+            }
+            .scope_boxed()
+        })
+        .await
+        .expect("holder commits");
+    });
+    opened_rx.await.expect("holder entered tx_immediate");
+
+    write_probe_fails_while_lock_held(&pool).await;
+    holder.await.expect("holder task");
+}
+
+#[tokio::test]
+async fn tx_stays_deferred_without_write_lock_up_front() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = boot_tx_pool(&tmp.path().join("tx_def_lock.db")).await;
+
+    let (opened_tx, opened_rx) = tokio::sync::oneshot::channel::<()>();
+    let holder_pool = pool.clone();
+    let holder = tokio::spawn(async move {
+        let mut db = Db::connect_for_test(&holder_pool)
+            .await
+            .expect("db checkout");
+        // No statements: a deferred transaction holds no locks yet.
+        db.tx(|_conn| {
+            async move {
+                let _ = opened_tx.send(());
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                Ok::<(), autumn_web::AutumnError>(())
+            }
+            .scope_boxed()
+        })
+        .await
+        .expect("holder commits");
+    });
+    opened_rx.await.expect("holder entered tx");
+
+    // The same write that failed under `tx_immediate` succeeds under a
+    // statement-less deferred `tx`: no write lock was taken up front.
+    let mut probe = pool.get().await.expect("checkout probe connection");
+    diesel::sql_query("INSERT INTO counters (value) VALUES (1)")
+        .execute(&mut *probe)
+        .await
+        .expect("write succeeds: deferred tx holds no write lock");
+    holder.await.expect("holder task");
+}
+
+// ── Shared-cache boot warning (issue #2885) ─────────────────────────────────
+
+#[derive(Clone, Default)]
+struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log lock").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn install_log_capture() -> (LogBuffer, tracing::subscriber::DefaultGuard) {
+    let buffer = LogBuffer::default();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(buffer.clone())
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    (buffer, tracing::subscriber::set_default(subscriber))
+}
+
+fn captured_text(buffer: &LogBuffer) -> String {
+    String::from_utf8_lossy(&buffer.0.lock().expect("log lock")).into_owned()
+}
+
+#[tokio::test]
+async fn shared_cache_pool_construction_logs_loud_warning() {
+    // A shared-cache target must log the loud boot warning at pool
+    // construction (deadpool is lazy — no connection is opened).
+    let (buffer, _guard) = install_log_capture();
+    let config = DatabaseConfig {
+        url: Some("sqlite:file:warntest?mode=memory&cache=shared".to_string()),
+        ..Default::default()
+    };
+    let _pool = create_pool(&config)
+        .expect("pool builds")
+        .expect("a url is configured");
+    let logs = captured_text(&buffer);
+    assert!(
+        logs.contains("shared-cache"),
+        "expected the shared-cache boot warning, got: {logs}"
+    );
+    assert!(
+        logs.contains("2885"),
+        "the warning should name issue #2885, got: {logs}"
+    );
+    assert!(
+        logs.contains("tx_immediate"),
+        "the warning should point at Db::tx_immediate, got: {logs}"
+    );
+
+    // A non-shared-cache target stays silent: the warning is scoped to
+    // `cache=shared`, not to in-memory targets in general.
+    let (buffer2, _guard2) = install_log_capture();
+    let config2 = DatabaseConfig {
+        url: Some("sqlite:file:nowarn?mode=memory".to_string()),
+        ..Default::default()
+    };
+    let _pool2 = create_pool(&config2)
+        .expect("pool builds")
+        .expect("a url is configured");
+    let logs2 = captured_text(&buffer2);
+    assert!(
+        !logs2.contains("shared-cache"),
+        "no shared-cache warning expected for a non-shared-cache target, got: {logs2}"
     );
 }
