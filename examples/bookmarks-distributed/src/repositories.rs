@@ -7,7 +7,7 @@ use diesel::OptionalExtension;
 use diesel::QueryableByName;
 use diesel::prelude::*;
 use diesel::result::{Error as DieselError, QueryResult};
-use diesel::sql_types::{BigInt, Text};
+use diesel::sql_types::{Array, BigInt, Text};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::deadpool::Pool;
@@ -163,20 +163,6 @@ impl BookmarkRepository {
         })
     }
 
-    fn finish_mark_dead_result(affected: usize, id: i64) -> AutumnResult<bool> {
-        if affected == 0 {
-            // Replica lag or a concurrent delete can make this row disappear after the
-            // task observed it alive. Treat that as a benign no-op so one stale row does
-            // not abort the whole task run.
-            tracing::debug!(
-                bookmark_id = id,
-                "link-checker skipped stale dead-link update"
-            );
-            return Ok(false);
-        }
-        Ok(true)
-    }
-
     pub async fn find_all(&self) -> AutumnResult<Vec<Bookmark>> {
         let mut conn = Self::conn(BookmarkOperation::FindAll).await?;
         bookmarks::table
@@ -248,14 +234,34 @@ impl BookmarkRepository {
         Ok(())
     }
 
-    pub async fn mark_dead(&self, id: i64) -> AutumnResult<bool> {
+    /// Mark every `(id, url)` in `dead` dead, in one round trip -- but only
+    /// the rows whose *current* `url` still matches the URL that was probed.
+    ///
+    /// A row is skipped, silently, when: it's already dead (replica lag, a
+    /// concurrent probe, or a concurrent delete can make a row disappear
+    /// from `alive = true` after the task observed it), or its `url` has
+    /// changed since the probe -- `PUT /api/bookmarks/{id}` can repair a
+    /// bookmark's URL mid-scan (it never touches `alive`, so the row is
+    /// still a candidate `alive = true` match by id alone), and a repaired
+    /// URL was never itself probed, so it must not be the one this batch
+    /// marks dead. The caller gets back how many rows it actually flipped.
+    pub async fn mark_dead_many(&self, dead: &[(i64, String)]) -> AutumnResult<usize> {
+        if dead.is_empty() {
+            return Ok(0);
+        }
         let mut conn = Self::conn(BookmarkOperation::MarkDead).await?;
-        let affected = diesel::update(bookmarks::table.find(id))
-            .set(bookmarks::alive.eq(false))
-            .execute(&mut conn)
-            .await
-            .map_err(AutumnError::from)?;
-        Self::finish_mark_dead_result(affected, id)
+        let ids: Vec<i64> = dead.iter().map(|(id, _)| *id).collect();
+        let urls: Vec<&str> = dead.iter().map(|(_, url)| url.as_str()).collect();
+        diesel::sql_query(
+            "UPDATE bookmarks AS b SET alive = false \
+             FROM unnest($1::bigint[], $2::text[]) AS d(id, url) \
+             WHERE b.id = d.id AND b.url = d.url AND b.alive = true",
+        )
+        .bind::<Array<BigInt>, _>(ids)
+        .bind::<Array<Text>, _>(urls)
+        .execute(&mut conn)
+        .await
+        .map_err(AutumnError::from)
     }
 
     pub async fn count_all(&self) -> AutumnResult<i64> {
@@ -554,20 +560,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mark_dead_missing_rows_are_tolerated() {
-        let updated = BookmarkRepository::finish_mark_dead_result(0, 99)
-            .expect("replica lag and concurrent deletes should not abort the task");
+    #[tokio::test]
+    async fn mark_dead_many_short_circuits_on_empty_ids_without_touching_the_pool() {
+        // No `DistributedState::global()` is installed in this test, so a
+        // real attempt to acquire a connection would panic with "distributed
+        // state is not installed". Reaching `Ok(0)` instead proves the empty
+        // case returns before `Self::conn(...)` is ever called.
+        let updated = BookmarkRepository
+            .mark_dead_many(&[])
+            .await
+            .expect("an empty batch must not error");
 
-        assert!(!updated);
-    }
-
-    #[test]
-    fn mark_dead_reports_success_when_a_row_was_updated() {
-        let updated = BookmarkRepository::finish_mark_dead_result(1, 99)
-            .expect("affected rows should be reported as an applied update");
-
-        assert!(updated);
+        assert_eq!(updated, 0);
     }
 
     #[test]
