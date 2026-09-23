@@ -2206,7 +2206,7 @@ without also filling in the intake form above.
   flake outside CI**, and the first time this entry has a same-commit
   rerun-rate baseline for the shape that actually produces every organic
   hit, as opposed to the isolated-single-test shape that stayed clean at
-  0/100 local + 0/50 CI-native on 2026-09-22.
+  0/50 local + 0/50 CI-native on 2026-09-22.
 
   **Control run, same day, same toolchain**: the whole binary, run fully
   *serially* (`--test-threads=1`, no test-name filter — all 27 tests, one
@@ -2234,21 +2234,25 @@ without also filling in the intake form above.
   originate from; both only removed concurrency *between test functions*,
   which this evidence now suggests was never the necessary condition.
 
-  Combined with the existing 0/100 (local) + 0/50 (CI-native)
+  Combined with the existing 0/50 (local) + 0/50 (CI-native)
   isolated-filtered results, the pattern across five samples is:
-  **isolated single-test execution stays clean (0/150); whole-binary
+  **isolated single-test execution stays clean (0/100); whole-binary
   execution fails at a low rate whether or not different test functions
   run concurrently (1/100 serial, 3/100 concurrent — not statistically
   distinguishable from each other at this N).**
 
   **Seventh correction, same pass (via a further Codex review comment on
   PR #2922): this pattern is suggestive, not statistically confirmed —
-  an earlier draft of this update overstated it as established.** At a
-  true 1% rate, `0/150` still has a ~22% chance by pure chance
-  (`0.99^150 ≈ 0.221`); a one-sided exact (Fisher) test of 3/100 against
-  0/150 gives `p ≈ 0.063` — suggestive but short of conventional
-  significance, and 1/100-vs-0/150 is weaker still. Both figures
-  independently verified. So the working hypothesis is
+  an earlier draft of this update overstated it as established, and
+  additionally miscounted the isolated total as 150 rather than the
+  ledger's own recorded 100 (0/50 local + 0/50 CI-native, both from the
+  2026-09-22 entry above — not 0/100 local as this update first
+  claimed).** At a true 1% rate, `0/100` still has a ~37% chance by pure
+  chance (`0.99^100 ≈ 0.366`); a one-sided exact (Fisher) test of 3/100
+  against the corrected 0/100 gives `p ≈ 0.123` — not statistically
+  significant by any conventional threshold, weaker than this update
+  originally reported. 1/100-vs-0/100 is weaker still. Recomputed
+  directly from the corrected counts. So the working hypothesis is
   "requires whole-binary execution context" (something about running
   alongside 26 sibling tests, not specifically libtest-level concurrency
   between them) — genuinely the best-supported reading of the data, and

@@ -145,25 +145,31 @@ test functions*, which this new evidence suggests was never the necessary
 condition anyway.
 
 Combined with the existing isolated-single-test results from 2026-09-22
-(0/100 local + 0/50 CI-native, both `--test-threads=1` and filtered to
-just this test), the pattern across five samples is: **isolated single-test
-execution stays clean (0/150); whole-binary execution fails at a low rate
-whether or not different test functions run concurrently (1/100 serial,
-3/100 concurrent, not statistically distinguishable from each other at
-this N).**
+(0/50 local + 0/50 CI-native, both `--test-threads=1` and filtered to
+just this test — corrected below, an earlier draft of this section
+miscounted the local run as 100), the pattern across five samples is:
+**isolated single-test execution stays clean (0/100); whole-binary
+execution fails at a low rate whether or not different test functions run
+concurrently (1/100 serial, 3/100 concurrent, not statistically
+distinguishable from each other at this N).**
 
 **Seventh review correction, same pass: this pattern is suggestive, not
 statistically confirmed, and an earlier version of this section overstated
-it as such.** A Codex review comment on PR #2922 checked the isolated-vs-
-whole-binary comparison the same way it checked the earlier serial
-control: at a true 1% rate, `0/150` still has a ~22% chance of occurring
-by chance (`0.99^150 ≈ 0.221`); a one-sided exact (Fisher) test of 3/100
-against 0/150 gives `p ≈ 0.063` — suggestive but short of conventional
-significance, and the weaker 1/100-vs-0/150 comparison is less significant
-still. Verified both figures independently. So "requires whole-binary
-execution context" is the working hypothesis this pass leaves behind, not
-an established finding — something about running alongside 26 sibling
-tests, not specifically about libtest-level thread concurrency between
+it as such — compounded by a second error, miscounting the isolated total
+as 150 rather than the ledger's own recorded 100.** A Codex review comment
+on PR #2922 caught both: the isolated-vs-whole-binary comparison checked
+the same way as the earlier serial control, and the count itself against
+`docs/ci-health/quarantine-ledger.md`'s own 2026-09-22 entry (0/50 local +
+0/50 CI-native, not 0/100 local). At a true 1% rate, the corrected `0/100`
+still has a ~37% chance of occurring by chance (`0.99^100 ≈ 0.366`); a
+one-sided exact (Fisher) test of 3/100 against the corrected 0/100 gives
+`p ≈ 0.123` — not significant by any conventional threshold, weaker than
+this section originally reported. The weaker 1/100-vs-0/100 comparison is
+weaker still. Recomputed directly from the corrected counts. So "requires
+whole-binary execution context" is the working hypothesis this pass leaves
+behind, not an established finding — something about running alongside 26
+sibling tests, not specifically about libtest-level thread concurrency
+between
 them, remains the best-supported reading of the data so far, but a larger
 matched-sample campaign (a next step in its own right) would be needed to
 actually confirm it statistically.
@@ -299,14 +305,14 @@ something to reimplement.
 | Whole binary, default parallelism, 100 same-commit reruns (this pass, local) | **3/100 failed** (3%) — iterations 43, 78, 95, identical signature/line each time |
 | Whole binary, fully serial (`--test-threads=1`), 20 same-commit reruns, same day (control) | 0/20 failed — **underpowered, see the n=100 rerun below** |
 | Whole binary, fully serial (`--test-threads=1`), 100 same-commit reruns, same day (properly-powered control) | **1/100 failed** (iteration 88), identical signature/line |
-| Isolated single test, `--test-threads=1`, 100 local reruns (2026-09-22) | 0/100 failed |
+| Isolated single test, `--test-threads=1`, 50 local reruns (2026-09-22) | 0/50 failed |
 | Isolated single test, `--test-threads=1`, 50 CI-native reruns (2026-09-22) | 0/50 failed |
 
 No revert check applies — no fix was proposed this pass to revert.
 
 | Item | Before this pass | This pass | After |
 |---|---|---|---|
-| `sqlite_job_backend_tracks_job_status_durably` | n=2 organic, isolated-shape 0/100+0/50, category unconfirmed | n=3 organic (3rd hit in `Coverage (sandbox-sqlite)`); whole-binary Tier 1 baselines 3/100 (default parallelism) and 1/100 (properly-powered serial) both fail, isolated single-test stays clean at 0/150 — "requires concurrency" is falsified; "requires whole-binary execution context" is the working hypothesis but not statistically confirmed (3/100-vs-0/150 one-sided exact p≈0.063); root-cause category and specific defect both unidentified; test-vs-product verdict open; CI-native whole-binary harness (both concurrent and serial) added | Under active investigation, escalated |
+| `sqlite_job_backend_tracks_job_status_durably` | n=2 organic, isolated-shape 0/50+0/50, category unconfirmed | n=3 organic (3rd hit in `Coverage (sandbox-sqlite)`); whole-binary Tier 1 baselines 3/100 (default parallelism) and 1/100 (properly-powered serial) both fail, isolated single-test stays clean at 0/100 — "requires concurrency" is falsified; "requires whole-binary execution context" is the working hypothesis but not statistically confirmed (3/100-vs-0/100 one-sided exact p≈0.123, corrected from an earlier miscounted p≈0.063); root-cause category and specific defect both unidentified; test-vs-product verdict open; CI-native whole-binary harness (both concurrent and serial) added | Under active investigation, escalated |
 | `live_upgrade` (3 signatures) | Uncampaigned, 14 idle passes | No new organic hits | Unchanged |
 | `cache_stampede` | Uncampaigned | No new organic hits | Unchanged |
 | `sim_fault_plan` | n=1, uncampaigned | No new organic hits | Unchanged |

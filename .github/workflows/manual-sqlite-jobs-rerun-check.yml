@@ -20,7 +20,7 @@ name: Manual sqlite_jobs_scheduler_e2e rerun check (Semaphore rerun harness)
 # Three jobs, three different shapes on purpose. `rerun` filters to the one
 # target test with `--test-threads=1`, matching this ledger's earlier
 # hypothesis-elimination work; this harness's own isolated-single-test mode
-# stayed clean at 0/100 local + 0/50 CI-native (2026-09-22). The whole
+# stayed clean at 0/50 local + 0/50 CI-native (2026-09-22). The whole
 # binary (all 27 tests, no filter) is the shape every organic hit has
 # actually occurred under (`ci.yml`'s own "Run the sqlite integration
 # suite" step and its coverage-lane sibling both invoke it with no
