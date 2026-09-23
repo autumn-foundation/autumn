@@ -3759,11 +3759,15 @@ fn render_routes_file(
     } else {
         ""
     };
-    // `serde_json::to_string` is only referenced below by the i18n
-    // `delete_confirm_js` JS-escaping `@let` (see the comment at its
-    // definition) — importing it unconditionally left every non-i18n scaffold
+    // Referenced two ways: the i18n `delete_confirm_js` JS-escaping `@let`
+    // (see the comment at its definition) uses `serde_json::to_string`, and
+    // `into_new`'s JSON-field arms (see `FieldKind::Json` below) parse into
+    // bare `serde_json::Value` — the base project template has no direct
+    // `serde_json` dependency, only autumn-web's re-export. Importing it
+    // unconditionally left every scaffold with neither i18n nor a JSON field
     // (the documented, default case) with an unused import.
-    let serde_json_import = if labels.enabled() {
+    let has_json_field = fields.iter().any(|f| f.kind == FieldKind::Json);
+    let serde_json_import = if labels.enabled() || has_json_field {
         "use autumn_web::reexports::serde_json;\n"
     } else {
         ""
