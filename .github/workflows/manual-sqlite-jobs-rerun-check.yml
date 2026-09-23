@@ -3,9 +3,10 @@ name: Manual sqlite_jobs_scheduler_e2e rerun check (Semaphore rerun harness)
 # Manual dispatch only. Same-commit rerun-rate harness for
 # sqlite_jobs_scheduler_e2e::sqlite_job_backend_tracks_job_status_durably
 # (docs/ci-health/quarantine-ledger.md, "under active investigation" section):
-# n=2 organic hits (2026-09-21, two independent branches, one docs-only),
-# panic "sqlite job enqueue failed: ON CONFLICT clause does not match any
-# PRIMARY KEY or UNIQUE constraint" at
+# n=3 organic hits (2026-09-21 x2, one docs-only; 2026-09-22 in
+# `Coverage (sandbox-sqlite)`'s llvm-cov-instrumented run of the same
+# binary), panic "sqlite job enqueue failed: ON CONFLICT clause does not
+# match any PRIMARY KEY or UNIQUE constraint" at
 # autumn/tests/sqlite_jobs_scheduler_e2e.rs:1301. Same rationale as
 # manual-job-tracking-rerun-check.yml: this test needs no new runner class or
 # CI spend to rerun — it's the ordinary ubuntu-latest + SQLite (no Docker,
@@ -15,6 +16,22 @@ name: Manual sqlite_jobs_scheduler_e2e rerun check (Semaphore rerun harness)
 # manual-macos-contention-check.yml does. Gated on workflow_dispatch rather
 # than folded into ci.yml: it exists to generate a same-commit rerun-rate
 # baseline on demand, not to run on every push.
+#
+# Two jobs, two different shapes on purpose. `rerun` filters to the one
+# target test with `--test-threads=1`, matching this ledger's earlier
+# hypothesis-elimination work. `rerun_default_parallelism` runs the *whole*
+# `sqlite_jobs_scheduler_e2e` binary (all 27 tests) at libtest's default
+# parallelism, with no filter and no `--test-threads` override — the exact
+# shape every organic hit has actually occurred under (`ci.yml`'s own
+# "Run the sqlite integration suite" step and its coverage-lane sibling
+# both invoke this binary with no `--test-threads` flag). A 2026-09-23
+# local run of exactly this shape (100 iterations, this repo's own
+# toolchain) reproduced the panic at 3/100 (3%), while a same-day 0/20
+# fully-serial (`--test-threads=1`, unfiltered) control run and this
+# harness's own isolated-single-test mode (0/100 local + 0/50 CI-native,
+# 2026-09-22) both stayed clean — see the ledger entry for the full
+# writeup. That result is what `rerun_default_parallelism` exists to
+# reproduce on demand in CI, not just locally.
 on:
   workflow_dispatch:
     inputs:
@@ -103,4 +120,63 @@ jobs:
         with:
           name: sqlite-jobs-rerun-logs
           path: iteration-*.log
+          retention-days: 14
+
+  # Runs the whole binary at default parallelism instead of filtering to one
+  # test under `--test-threads=1` — see the header comment above for why
+  # this second shape exists and what it already reproduced locally.
+  rerun_default_parallelism:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+      - name: Build the sqlite_jobs_scheduler_e2e test binary once
+        run: |
+          cargo test -p autumn-web --features "sqlite,test-support,storage" \
+            --test sqlite_jobs_scheduler_e2e --no-run
+      - name: Rerun the whole binary at default parallelism against a fresh on-disk SQLite file per test
+        env:
+          ITERATIONS: ${{ inputs.iterations }}
+        # workflow_dispatch's `type: choice` only constrains the manual UI
+        # dropdown - the API/CLI (`gh workflow run -f iterations=...`) can
+        # pass any string, so it's re-validated here rather than trusted.
+        run: |
+          case "$ITERATIONS" in
+            20|50) ;;
+            *) echo "::error::iterations must be 20 or 50 (got: $ITERATIONS)"; exit 1 ;;
+          esac
+          fail=0
+          pass=0
+          for i in $(seq 1 "$ITERATIONS"); do
+            echo "=== iteration $i/$ITERATIONS ==="
+            cargo test -p autumn-web --features "sqlite,test-support,storage" \
+              --test sqlite_jobs_scheduler_e2e \
+              2>&1 | tee "whole-binary-iteration-$i.log"
+            rc="${PIPESTATUS[0]}"
+            if [ "$rc" -eq 0 ]; then
+              echo "iteration $i: PASS"
+              pass=$((pass + 1))
+            else
+              echo "iteration $i: FAIL (rc=$rc)"
+              fail=$((fail + 1))
+            fi
+          done
+          {
+            echo "## sqlite_jobs_scheduler_e2e whole-binary (default parallelism) rerun result"
+            echo ""
+            echo "\`$fail\`/\`$ITERATIONS\` failed, \`$pass\`/\`$ITERATIONS\` passed."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "RESULT: $fail/$ITERATIONS failed, $pass/$ITERATIONS passed"
+      - name: Upload every iteration's full log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sqlite-jobs-rerun-whole-binary-logs
+          path: whole-binary-iteration-*.log
           retention-days: 14

@@ -1746,6 +1746,25 @@ without also filling in the intake form above.
   2026-09-22T~10:1xZ — **14th** straight idle pass (now ~330.5 hours idle,
   past 13.75 days). Still needs a human sign-off for new macOS CI spend;
   not dispatched this pass for that reason.
+- **2026-09-23 update — 15th consecutive pass, harness still undispatched;
+  zero new hits on any of the three `live_upgrade` signatures.** Sampled
+  `ci.yml` `pull_request` runs from the 2026-09-22 report's own cutoff
+  (2026-09-22T06:24:50Z, exclusive) to 2026-09-23T07:37:08Z (~25.2h, one
+  no-filter `status=completed` query, `perPage=100`/page 1, span
+  2026-09-21T18:16:27Z–2026-09-23T07:37:08Z, fully covering the window with
+  margin) — 58 `pull_request` runs in-window: 27 success, 24 cancelled, 7
+  failure. All 7 triaged (full detail in the `sqlite_jobs_scheduler_e2e`
+  entry's own 2026-09-23 update below, not repeated here): one
+  `dependabot/github_actions/dtolnay/rust-toolchain-1.120.0` repeat of its
+  already-documented action-pin break; four ordinary branch-owned `Lint`/
+  `MSRV`/`Diesel migration version collisions` WIP failures across three
+  `vesper/bugbash-23{12,63,19,31}-*` branches; and one genuine new organic
+  hit — but on `sqlite_jobs_scheduler_e2e`, not on any `live_upgrade`,
+  `cache_stampede`, or `sim_fault_plan` signature. None of the 7 match this
+  entry. `manual-macos-contention-check.yml`: still `total_count: 0`,
+  checked 2026-09-23T~07:5xZ — **15th** straight idle pass (now ~352.9
+  hours idle, past 14.7 days). Still needs a human sign-off for new macOS
+  CI spend; not dispatched this pass for that reason.
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
   committed as `.github/workflows/manual-macos-contention-check.yml`, gated
@@ -1828,6 +1847,9 @@ without also filling in the intake form above.
 - **2026-09-22 update**: no repeat in the ~20.5h window sampled this pass
   (see the `live_upgrade` entry's 2026-09-22 dated update above for the
   window and method).
+- **2026-09-23 update**: no repeat in the ~25.2h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-23 dated update above for the
+  window and method).
 
 ### `sim_fault_plan::same_seed_replays_a_byte_identical_outcome_100_times`
 
@@ -1860,6 +1882,9 @@ without also filling in the intake form above.
   window and method). Still n=1, still not campaigned.
 - **2026-09-22 update**: no repeat in the ~20.5h window sampled this pass
   (see the `live_upgrade` entry's 2026-09-22 dated update above for the
+  window and method). Still n=1, still not campaigned.
+- **2026-09-23 update**: no repeat in the ~25.2h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-23 dated update above for the
   window and method). Still n=1, still not campaigned.
 
 ### `sqlite_jobs_scheduler_e2e::sqlite_job_backend_tracks_job_status_durably`
@@ -2102,6 +2127,143 @@ without also filling in the intake form above.
   `sqlite_jobs_scheduler_e2e` binary
   at default parallelism (not `--test-threads=1`, not filtered to one test)
   N times, is the concrete next step for a future pass.
+- **2026-09-23 update — n=2→n=3 organic (a third hit, in a job shape not
+  previously checked); the concrete next step from the prior update is done,
+  and it reproduces: 3/100 (3%) at default parallelism vs. a clean 0/20
+  serial control run the same day.** Sampled `ci.yml` `pull_request` runs
+  from the 2026-09-22 report's own cutoff (2026-09-22T06:24:50Z, exclusive)
+  to 2026-09-23T07:37:08Z (~25.2h; one no-filter `status=completed` query,
+  `perPage=100`/page 1, whose own span — 2026-09-21T18:16:27Z–
+  2026-09-23T07:37:08Z — fully covers the window with margin on both ends)
+  — 58 `pull_request` runs in-window: 27 success, 24 cancelled, 7 failure.
+  All 7 triaged at job/log level: the `dependabot/github_actions/
+  dtolnay/rust-toolchain-1.120.0` branch repeats its already-documented own
+  action-pin-bump break (`MSRV`, all three `Test (${{ matrix.os }})` legs);
+  three `vesper/bugbash-23{63,19,31}-*` branches each fail `Lint`
+  (`Clippy` or `cargo fmt`) on their own in-progress diff, one of those three
+  (`vesper/bugbash-2363-cache-audit-profile`) also failing `MSRV` and the
+  `Diesel migration version collisions` gate on the same WIP; one
+  (`vesper/bugbash-2419-doctor-strict-manifest`) also failing `MSRV` and
+  `Diesel migration version collisions`; ordinary branch-owned WIP in all
+  four cases, not re-triaged further. The remaining two:
+  - `vesper/bugbash-2312-bootstrap-ingress` (run 35754864260) fails `Lint`
+    only (`Clippy`, its own in-progress diff) — branch-owned.
+  - `vesper/bugbash-2310-tombstone-lock-order` (run 35754806914, PR
+    "fix(search): lock tombstones in deterministic record_id order (fixes
+    #2310)" — a search/ledger-locking fix, touching no job or SQLite-queue
+    code) shows `conclusion: failure` at the run level while every job
+    `list_workflow_jobs` returns by default (`filter: latest`, 30 of 34
+    jobs) reports `success` — a discrepancy investigated rather than
+    written off as tooling noise: the missing 4 jobs are the `Coverage
+    (${{ matrix.lane }})` matrix, fetched on page 2. `Coverage
+    (sandbox-sqlite)` failed its "Generate coverage (plugin-sandbox +
+    sqlite)" step (2026-09-22T18:16:46Z), full log fetched via
+    `get_job_logs`: **the identical `sqlite_job_backend_tracks_job_status_durably`
+    panic**, same line, same message, same signature as the two 2026-09-21
+    organic hits — `test sqlite_job_backend_tracks_job_status_durably ...
+    FAILED` among the binary's 27 tests, `thread
+    'sqlite_job_backend_tracks_job_status_durably' panicked at
+    autumn/tests/sqlite_jobs_scheduler_e2e.rs:1301:6: tracked enqueue:
+    ... StringError("sqlite job enqueue failed: ON CONFLICT clause does not
+    match any PRIMARY KEY or UNIQUE constraint")`. A third organic hit, on a
+    branch whose diff cannot own it (same reasoning this ledger already
+    applied to the first two), and on a PR that otherwise touches search
+    code exclusively. **n=2→n=3.**
+
+  This job matters beyond the raw count: `cargo llvm-cov` instrumentation
+  aside, `Coverage (sandbox-sqlite)`'s coverage-generation step invokes
+  the same `sqlite_jobs_scheduler_e2e` binary with no `--test-threads` flag
+  — the same default-parallelism shape as `ci.yml`'s ordinary `SQLite
+  runtime (feature=sqlite)` job (already established in the 2026-09-22
+  update above), and *not* the shape `manual-sqlite-jobs-rerun-check.yml`'s
+  existing `rerun` job uses (filtered to the one test, `--test-threads=1`).
+  All three organic hits to date have now occurred under default
+  parallelism; none has ever occurred under the filtered/serial shape this
+  harness was actually dispatching.
+
+  **This pass had a working local toolchain and network access (as the
+  2026-09-22 pass did), so it ran the concrete next step from that update
+  directly rather than waiting on a merge to dispatch it in CI**: built
+  `sqlite_jobs_scheduler_e2e` once (`cargo test -p autumn-web --features
+  "sqlite,test-support,storage" --test sqlite_jobs_scheduler_e2e --no-run`),
+  then ran the *whole* binary (all 27 tests, no filter, no
+  `--test-threads` override — libtest's default parallelism, one OS thread
+  per logical core) 100 times against this sandbox's own toolchain
+  (`rustc 1.94.1`). **Result: 3/100 failed, 97/100 passed** — iterations 43,
+  78, 95, each the identical signature and line
+  (`sqlite_jobs_scheduler_e2e.rs:1301:6`, the same "ON CONFLICT clause does
+  not match" panic. This is the **first successful reproduction of this
+  flake outside CI**, and the first time this entry has a same-commit
+  rerun-rate baseline for the shape that actually produces every organic
+  hit, as opposed to the isolated-single-test shape that stayed clean at
+  0/100 local + 0/50 CI-native on 2026-09-22.
+
+  **Control run, same day, same toolchain**: the whole binary, run fully
+  *serially* (`--test-threads=1`, no test-name filter — all 27 tests, one
+  at a time) 20 times. **Result: 0/20 failed.** This isolates the variable
+  cleanly: the difference between the two conditions is concurrent
+  execution within the same binary, not "running many tests in one
+  process" in general (the serial control does that too and stayed clean)
+  and not the specific single-test filter the existing harness uses
+  (already shown clean at much higher N on 2026-09-22). Combined with the
+  existing 0/100 (local) + 0/50 (CI-native) isolated-filtered results, four
+  independent samples now agree: this test fails only when it runs
+  *concurrently* with its own siblings in the same process, never when run
+  alone or when the whole binary runs one test at a time.
+  **Test-vs-product verdict: still not rendered** — a concurrency-dependent
+  failure inside a test binary's own libtest scheduling is not, on its own,
+  evidence of a product race (real deployments do not run 27 unrelated
+  test functions in shared-memory concurrency against one one-off SQLite
+  file), so this is presumptively a test-shared-state defect rather than a
+  product defect, but that has not been confirmed by identifying the actual
+  shared resource, so the verdict per this role's own bar stays open.
+  **Mechanism: root-cause *category* now confirmed (resource contention /
+  shared state between concurrently-scheduled tests in the same binary);
+  the *specific* defect — which resource, touched by which sibling test(s)
+  — is still not identified**, so per this role's own hard gate (a category
+  without the specific defect is not enough to fix) this remains
+  uncampaigned for a fix PR. One candidate the source supports checking
+  next, not yet checked: `build_sqlite_pool` pins `max_size`/`pool_size:
+  1` for every test (`autumn/tests/sqlite_jobs_scheduler_e2e.rs:78-92`,
+  confirmed by direct read), so a stale prepared statement across two
+  physical connections *within this test's own pool* is structurally
+  impossible — ruling that specific variant out, not just leaving it
+  unconfirmed. The target test's own path (`start_runtime` then
+  `autumn_web::job_tracking::enqueue_tracked`, which the 2026-09-11
+  `job_tracking_stores_integration` entry already established routes
+  through the process-global `job::global_job_client()`) is the one
+  concrete shared resource this test provably touches that an arbitrary
+  concurrently-scheduled sibling could also touch; the existing "ruled out"
+  finding for `GLOBAL_JOB_CLIENT` (a few paragraphs up) only checked
+  whether *other lock-holding* siblings truly interleave with it — it
+  did not check whether a `start_runtime` call's spawned background tasks
+  (the worker loop) can still be executing after `shutdown.cancel()` and
+  after the owning test's `global_job_runtime_test_lock()` guard is
+  dropped, into a window where a *different*, non-lock-holding concurrently
+  running test (or the next lock-holder) is active. That gap — not a new
+  hypothesis invented this pass, but an unexamined corner of the existing
+  one — is the concrete next step, along with dispatching the harness
+  variant this pass adds (below) against `trunk-dev` once merged, to get a
+  CI-native (not just local-sandbox) confirmation of the 3/100 figure
+  above.
+
+  **This pass adds `rerun_default_parallelism` to
+  `.github/workflows/manual-sqlite-jobs-rerun-check.yml`**: a second job,
+  alongside the existing filtered/serial `rerun` job, that builds the same
+  binary once and then runs it whole (no filter, no `--test-threads`
+  override) N times, uploading each iteration's full log — the CI-native
+  form of the local repro above, so a future pass (or CI itself) can
+  confirm the 3/100 figure without needing a local sandbox with network
+  access. Not dispatchable this pass for the same reason every prior
+  harness in this ledger wasn't on its own introduction pass:
+  `workflow_dispatch` only accepts a workflow already present on the
+  repository's default branch (`trunk-dev`). **Next step, for whichever
+  pass finds this PR merged**: dispatch `rerun_default_parallelism` with
+  `iterations: "50"` against `trunk-dev`'s tip for the CI-native
+  confirmation, and audit the `start_runtime`/`shutdown.cancel()`/guard-drop
+  ordering described above before proposing any fix — per this role's own
+  process, the product/test verdict must be rendered and the specific
+  defect named before a fix PR, and neither is done yet.
 
 `crate_path::tests::resolve_autumn_web_name_dashed_rename_is_sanitized` was
 opened here 2026-09-21 (n=1, mechanism unconfirmed) and **closed the same
