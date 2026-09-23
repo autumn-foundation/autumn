@@ -423,7 +423,7 @@ constructor built it:
 
 | Constructor | Provider | What it checks before parsing |
 | --- | --- | --- |
-| `InboundMailEndpointConfig::mailgun(path, signing_key)` | Mailgun | HMAC-SHA256 over `timestamp \|\| token`, compared in constant time, inside a 5-minute replay window |
+| `InboundMailEndpointConfig::mailgun(path, signing_key)` | Mailgun | HMAC-SHA256 over `timestamp \|\| token`, compared in constant time, with the `timestamp` required to be within 5 minutes of now |
 | `InboundMailEndpointConfig::ses(path)` | AWS SES via SNS | SNS RSA signature against the certificate named by `SigningCertURL`, plus the `TopicArn` binding below |
 | `InboundMailEndpointConfig::generic(path)` | Postfix, a relay, anything posting raw RFC 5322 | `X-Inbound-Signature: HMAC-SHA256(key, body)` — **only if you set a key.** With none set it checks nothing |
 
@@ -432,6 +432,16 @@ endpoint whose signing key is empty answers `500` to every request rather than
 accept unsigned mail, a bad signature or a timestamp outside the window is
 `401`, and the SES cases are below.
 
+**Nothing here de-duplicates.** Mailgun's timestamp check is a freshness bound,
+not replay protection: it caps how long a captured request stays usable at five
+minutes, and within that window the same `timestamp`/`token`/`signature` triple
+is accepted every time it arrives, because no delivery identifier is retained.
+Providers also retry on their own. Make any handler with side effects
+idempotent — key it on `Message-Id` from `email.headers`, or on your own
+plus-address token. This is the one place inbound mail differs from
+[`autumn generate webhook`](generators.md#autumn-generate-webhook), whose
+`SignedWebhook` extractor does keep replay markers.
+
 > **The generic endpoint is unauthenticated by default.** `generic(path)`
 > leaves both `signing_key` and `signing_key_env` unset, and with no key the
 > signature check is skipped entirely — every body that arrives is parsed and
@@ -439,8 +449,11 @@ accept unsigned mail, a bad signature or a timestamp outside the window is
 > on a private network, and it is a forged-mail hole on anything an attacker
 > can POST to. Set a key before the route is internet-facing.
 
-Set one — for any provider — with `signing_key_env`, which is read at startup so
-the secret stays out of the source:
+Set one with `signing_key_env`, which is read at startup so the secret stays out
+of the source. This applies to **Mailgun and generic endpoints only** — an SES
+endpoint is authenticated by the SNS certificate signature and its topic ARN,
+and `build_routes` never hands its signing key to the route, so setting one
+there does nothing:
 
 ```rust
 use autumn_web::inbound_mail::{InboundMailEndpointConfig, InboundMailProvider};
@@ -613,9 +626,10 @@ smoke test and the `InboundMailRouter` registration in `src/main.rs` — see
 - Shipping newsletters, digests, or other bulk mail? See
   [Mail compliance: List-Unsubscribe](mail-compliance.md) to meet Gmail/Yahoo
   bulk-sender requirements with one attribute and one config key.
-- Receiving mail? Set a signing key on every endpoint — a `generic` one with no
-  key authenticates nothing, and an unresolved key is a `500` rather than an
-  open route. Give every SES endpoint a
-  [topic ARN](#ses-endpoints-need-a-topic-arn), and decide per handler whether
-  `background` losing a message on error is acceptable — see
-  [Receiving Mail](#receiving-mail-inbound-email).
+- Receiving mail? Set a signing key on every Mailgun and generic endpoint — a
+  `generic` one with no key authenticates nothing, and an unresolved key is a
+  `500` rather than an open route. Give every SES endpoint a
+  [topic ARN](#ses-endpoints-need-a-topic-arn) instead; it takes no signing key.
+  Make side-effecting handlers idempotent — no inbound endpoint de-duplicates —
+  and decide per handler whether `background` losing a message on error is
+  acceptable. See [Receiving Mail](#receiving-mail-inbound-email).
