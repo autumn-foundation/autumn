@@ -2239,11 +2239,24 @@ without also filling in the intake form above.
   **isolated single-test execution stays clean (0/150); whole-binary
   execution fails at a low rate whether or not different test functions
   run concurrently (1/100 serial, 3/100 concurrent — not statistically
-  distinguishable from each other at this N).** The working hypothesis is
+  distinguishable from each other at this N).**
+
+  **Seventh correction, same pass (via a further Codex review comment on
+  PR #2922): this pattern is suggestive, not statistically confirmed —
+  an earlier draft of this update overstated it as established.** At a
+  true 1% rate, `0/150` still has a ~22% chance by pure chance
+  (`0.99^150 ≈ 0.221`); a one-sided exact (Fisher) test of 3/100 against
+  0/150 gives `p ≈ 0.063` — suggestive but short of conventional
+  significance, and 1/100-vs-0/150 is weaker still. Both figures
+  independently verified. So the working hypothesis is
   "requires whole-binary execution context" (something about running
   alongside 26 sibling tests, not specifically libtest-level concurrency
-  between them), not "requires concurrency" as earlier drafts of this
-  entry claimed.
+  between them) — genuinely the best-supported reading of the data, and
+  "requires concurrency" (what earlier drafts of this entry claimed) is
+  still correctly falsified by the 1/100 serial result on its own — but
+  "whole-binary context" itself is not yet a statistically confirmed
+  boundary, only the leading hypothesis. A larger matched-sample campaign
+  is needed to actually confirm it, and is itself a next step.
   **Test-vs-product verdict: not rendered, and not leaning either way.**
   **Correction (post-review, via a Codex review comment on PR #2922): an
   earlier draft of this update leaned "presumptively test-side" on the

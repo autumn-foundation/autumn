@@ -96,9 +96,10 @@ None of the 7 match `live_upgrade`, `cache_stampede`, `sim_fault_plan`, or
 ## 🔍 Diagnosis
 
 **`sqlite_job_backend_tracks_job_status_durably` — a controlled local
-reproduction confirms sensitivity to whole-binary *execution context*;
-neither concurrency specifically, the root-cause category, nor the
-specific resource is confirmed.**
+reproduction is *suggestive of* sensitivity to whole-binary *execution
+context*, not statistically confirmed; concurrency specifically, the
+root-cause category, and the specific resource all remain unconfirmed
+too.**
 
 The third organic hit matters beyond the raw count: `Coverage
 (sandbox-sqlite)`'s coverage-generation step invokes the same
@@ -149,10 +150,23 @@ just this test), the pattern across five samples is: **isolated single-test
 execution stays clean (0/150); whole-binary execution fails at a low rate
 whether or not different test functions run concurrently (1/100 serial,
 3/100 concurrent, not statistically distinguishable from each other at
-this N).** The working hypothesis is now "requires whole-binary execution
-context" — something about running alongside 26 sibling tests, not
-specifically about libtest-level thread concurrency between them — with
-the specific mechanism still unidentified.
+this N).**
+
+**Seventh review correction, same pass: this pattern is suggestive, not
+statistically confirmed, and an earlier version of this section overstated
+it as such.** A Codex review comment on PR #2922 checked the isolated-vs-
+whole-binary comparison the same way it checked the earlier serial
+control: at a true 1% rate, `0/150` still has a ~22% chance of occurring
+by chance (`0.99^150 ≈ 0.221`); a one-sided exact (Fisher) test of 3/100
+against 0/150 gives `p ≈ 0.063` — suggestive but short of conventional
+significance, and the weaker 1/100-vs-0/150 comparison is less significant
+still. Verified both figures independently. So "requires whole-binary
+execution context" is the working hypothesis this pass leaves behind, not
+an established finding — something about running alongside 26 sibling
+tests, not specifically about libtest-level thread concurrency between
+them, remains the best-supported reading of the data so far, but a larger
+matched-sample campaign (a next step in its own right) would be needed to
+actually confirm it statistically.
 
 **Test-vs-product verdict: not rendered, and not leaning either way — after
 two review corrections, not one.** This report originally leaned
@@ -286,7 +300,7 @@ No revert check applies — no fix was proposed this pass to revert.
 
 | Item | Before this pass | This pass | After |
 |---|---|---|---|
-| `sqlite_job_backend_tracks_job_status_durably` | n=2 organic, isolated-shape 0/100+0/50, category unconfirmed | n=3 organic (3rd hit in `Coverage (sandbox-sqlite)`); whole-binary Tier 1 baselines 3/100 (default parallelism) and 1/100 (properly-powered serial) both fail, isolated single-test stays clean at 0/150 — "requires concurrency" is falsified, "requires whole-binary execution context" is the new working hypothesis; root-cause category and specific defect both unidentified; test-vs-product verdict open; CI-native whole-binary harness added | Under active investigation, escalated |
+| `sqlite_job_backend_tracks_job_status_durably` | n=2 organic, isolated-shape 0/100+0/50, category unconfirmed | n=3 organic (3rd hit in `Coverage (sandbox-sqlite)`); whole-binary Tier 1 baselines 3/100 (default parallelism) and 1/100 (properly-powered serial) both fail, isolated single-test stays clean at 0/150 — "requires concurrency" is falsified; "requires whole-binary execution context" is the working hypothesis but not statistically confirmed (3/100-vs-0/150 one-sided exact p≈0.063); root-cause category and specific defect both unidentified; test-vs-product verdict open; CI-native whole-binary harness (both concurrent and serial) added | Under active investigation, escalated |
 | `live_upgrade` (3 signatures) | Uncampaigned, 14 idle passes | No new organic hits | Unchanged |
 | `cache_stampede` | Uncampaigned | No new organic hits | Unchanged |
 | `sim_fault_plan` | n=1, uncampaigned | No new organic hits | Unchanged |

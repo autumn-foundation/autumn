@@ -250,7 +250,7 @@ jobs:
             echo ""
             echo "Sibling-test failures (any other test in the binary): \`$sibling_fail\`/\`$target_ran_count\`."
             echo ""
-            echo "Of those, target and a sibling failed **together** in the same iteration: \`$joint_fail\`/\`$target_ran_count\` — diagnostic evidence for the shared-state hypothesis if nonzero."
+            echo "Of those, target and a sibling failed **together** in the same iteration: \`$joint_fail\`/\`$target_ran_count\`. Suggestive of shared causation only if it exceeds what the individual target/sibling failure rates predict by chance coincidence — not on its own."
             echo ""
             if [ "$target_missing" -ne 0 ]; then
               echo "⚠️ Target not found in \`$target_missing\`/\`$ITERATIONS\` iteration logs (bad SHA/build, or the target was renamed) — excluded from the target/sibling/pass counts above; inspect those logs manually."
@@ -366,7 +366,7 @@ jobs:
             echo ""
             echo "Sibling-test failures (any other test in the binary): \`$sibling_fail\`/\`$target_ran_count\`."
             echo ""
-            echo "Of those, target and a sibling failed **together** in the same iteration: \`$joint_fail\`/\`$target_ran_count\` — only possible here via same-process state, since no two test functions run concurrently under --test-threads=1."
+            echo "Of those, target and a sibling failed **together** in the same iteration: \`$joint_fail\`/\`$target_ran_count\`. Two independently-rare failures can coincide in one serial run by chance alone; this count is evidence of shared causation only if it exceeds what the individual target/sibling failure rates predict by chance, not on its own (Codex review, PR #2922 — an earlier version of this line wrongly called that the only explanation)."
             echo ""
             if [ "$target_missing" -ne 0 ]; then
               echo "⚠️ Target not found in \`$target_missing\`/\`$ITERATIONS\` iteration logs (bad SHA/build, or the target was renamed) — excluded from the target/sibling/pass counts above; inspect those logs manually."
