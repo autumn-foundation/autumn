@@ -1103,9 +1103,14 @@ the key is there.
 
 ### Generating a second handler
 
-Run it again and the new handler is chained onto the router already in
-`src/main.rs`, rather than a second router being inserted. Generating the same
-handler twice is a no-op.
+Run it again with a **different** name and the new handler is chained onto the
+router already in `src/main.rs`, rather than a second router being inserted.
+
+Re-running with the **same** name is not a no-op. The handler and integration-test
+files are emitted as creations every time, so without `--force` the run stops on
+a collision and writes nothing; with `--force` it overwrites them, your edits
+included. Only the `src/main.rs` registration is skipped when that handler is
+already wired in, so a `--force` re-run does not register it twice.
 
 There is a catch the second run makes visible: the emitted handler starts at
 `#[inbound_mail(to = "*", processing = "background")]`, and `to = "*"` matches
