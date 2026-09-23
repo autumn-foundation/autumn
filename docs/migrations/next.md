@@ -1268,6 +1268,47 @@ both crates for you and keeps the paths you already write.
 that no codemod may add on the reader's behalf, and the right answer for most
 readers is to depend on `autumn-web` instead, which is a design decision.
 
+### Widgets: widget CSS classes are now `autumn-`-prefixed (#2354)
+
+**Why:** several widgets emitted unprefixed class hooks (`card`,
+`card-header`, `stat-card`, `active`, …) that the widget stylesheet
+(`/static/css/autumn-widgets.css`) never styled — so the `/_stories`
+previews and any app linking only the bundle rendered those widgets
+unstyled, and generic hooks like `active` collided with app CSS. Every
+widget-emitted class now lives in the `autumn-*` namespace and is backed by
+a rule in the widget stylesheet.
+
+**You are affected only if your own CSS or JS targets the old hooks.**
+Widget output is unchanged apart from the class names.
+
+**Before (`{X.Y}`):**
+
+```css
+.card { border: 1px solid #e5e7eb; }
+.card-header { font-weight: 600; }
+a.active { color: red; }
+```
+
+**After (`{(X+1).0}`):**
+
+```css
+.autumn-card { border: 1px solid #e5e7eb; }
+.autumn-card__header { font-weight: 600; }
+a.autumn-active { color: red; }
+```
+
+Full mapping: `card` → `autumn-card`, `card-header` →
+`autumn-card__header`, `card-title` → `autumn-card__title`, `card-body` →
+`autumn-card__body`, `card-footer` → `autumn-card__footer`, `stat-card` →
+`autumn-stat-card`, `stat-label` → `autumn-stat-card__label`, `stat-value` →
+`autumn-stat-card__value`, `stat-link` → `autumn-stat-card__link`,
+`search-empty` → `autumn-search-empty`, `autocomplete-empty` →
+`autumn-autocomplete-empty`, `alert__icon-svg` → `autumn-alert__icon-svg`,
+`active` → `autumn-active` (on `nav_link()` output only).
+
+**Automation:** `manual` — the selectors live in the reader's own
+stylesheets, which no codemod may rewrite on their behalf.
+
 
 ## Plugin authors
 

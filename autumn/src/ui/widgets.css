@@ -1771,3 +1771,93 @@
     border-radius: var(--radius);
     color: var(--danger, #b3261e);
 }
+
+/* ── Card (#2354) ──────────────────────────────────────────────────────────
+   The card()/stat_card() widgets emit these namespaced hooks. They were
+   unprefixed (card, card-header, stat-card, …) before 0.8.0 and had no
+   rules in this bundle. */
+
+.autumn-card {
+    background-color: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    margin-bottom: 1.5rem;
+}
+
+.autumn-card__header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    padding: 1rem 1.5rem 0.75rem;
+    border-bottom: 1px solid var(--border);
+}
+
+.autumn-card__title {
+    margin: 0;
+    font-size: 1.125rem;
+    font-weight: 600;
+    color: var(--text);
+}
+
+.autumn-card__body {
+    padding: 1.5rem;
+}
+
+.autumn-card__footer {
+    padding: 0.75rem 1.5rem;
+    border-top: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 0.875rem;
+}
+
+/* ── Stat card (#2354) ───────────────────────────────────────────────────── */
+
+.autumn-stat-card {
+    background-color: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 1.25rem;
+}
+
+.autumn-stat-card__label {
+    font-size: 0.8125rem;
+    font-weight: 500;
+    color: var(--text-muted);
+}
+
+.autumn-stat-card__value {
+    margin-top: 0.25rem;
+    font-size: 1.75rem;
+    font-weight: 700;
+    color: var(--text);
+}
+
+.autumn-stat-card__link {
+    margin-top: 0.375rem;
+    font-size: 0.8125rem;
+}
+
+/* ── Empty states (#2354) ────────────────────────────────────────────────── */
+
+.autumn-search-empty,
+.autumn-autocomplete-empty {
+    margin: 0;
+    padding: 0.75rem 1rem;
+    color: var(--text-muted);
+}
+
+/* ── Alert icon (#2354) ──────────────────────────────────────────────────── */
+
+.autumn-alert__icon-svg {
+    flex-shrink: 0;
+}
+
+/* ── Active nav link (#2354) ─────────────────────────────────────────────── */
+
+.autumn-active {
+    font-weight: 600;
+    color: var(--primary);
+}
