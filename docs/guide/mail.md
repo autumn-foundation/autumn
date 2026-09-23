@@ -436,7 +436,8 @@ accept unsigned mail, a bad signature or a timestamp outside the window is
 not replay protection: it caps how long a captured request stays usable at five
 minutes, and within that window the same `timestamp`/`token`/`signature` triple
 is accepted every time it arrives, because no delivery identifier is retained.
-Providers also retry on their own.
+Providers redeliver on their own schedule too, so a handler sees the same
+message more than once for reasons that have nothing to do with an attacker.
 
 So make any handler with side effects idempotent, keyed on something that
 identifies the **message** rather than the conversation.
@@ -585,8 +586,10 @@ sees:
 - `"background"` answers `200` immediately and runs the handler in a spawned
   task. A handler that then returns `Err` is logged at `ERROR` and the message
   is gone — the provider already got its `200` and will not retry.
-- `"sync"` awaits the handler first. `Err` becomes a `500`, which most providers
-  retry, so handlers that must not lose a message belong here.
+- `"sync"` awaits the handler first. `Err` becomes a `500`, so whether the
+  message gets another chance is down to your provider's retry policy rather
+  than being decided for you. Handlers that must not silently lose a message
+  belong here.
 
 Choose `"sync"` for anything you would be sorry to drop, and keep it fast enough
 for the provider's webhook timeout.
