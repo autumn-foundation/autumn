@@ -3759,6 +3759,19 @@ fn render_routes_file(
     } else {
         ""
     };
+    // Referenced two ways: the i18n `delete_confirm_js` JS-escaping `@let`
+    // (see the comment at its definition) uses `serde_json::to_string`, and
+    // `into_new`'s JSON-field arms (see `FieldKind::Json` below) parse into
+    // bare `serde_json::Value` — the base project template has no direct
+    // `serde_json` dependency, only autumn-web's re-export. Importing it
+    // unconditionally left every scaffold with neither i18n nor a JSON field
+    // (the documented, default case) with an unused import.
+    let has_json_field = fields.iter().any(|f| f.kind == FieldKind::Json);
+    let serde_json_import = if labels.enabled() || has_json_field {
+        "use autumn_web::reexports::serde_json;\n"
+    } else {
+        ""
+    };
     // Empty-state copy. `DataTableConfig::new` takes `&str`, and the config is a
     // temporary borrowed only for the `data_table(...)` call, so an inline
     // `&t!(…)` is fine here — no binding needed.
@@ -4002,6 +4015,22 @@ fn render_routes_file(
     let lock_version_ty: String = lock_version.map(Field::rust_type).unwrap_or_default();
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
+    // With no nullable (or synthetic constrained-required-numeric) fields,
+    // `render_nullable_field_match` renders a bare `false` that never reads
+    // its `name` argument — the overwhelmingly common case for a first
+    // scaffold, since every documented example field is required. Name the
+    // parameter `_name` in exactly that case so the generated helper compiles
+    // without an unused-variable warning; every other case still binds `name`,
+    // matching the `matches!(name, ...)` body `render_nullable_field_match`
+    // emits.
+    let nullable_form_field_param = if fields
+        .iter()
+        .any(|f| f.nullable || is_constrained_required_numeric(f))
+    {
+        "name"
+    } else {
+        "_name"
+    };
     let has_attachments = has_attachment_fields(fields);
     // Issue #1125/#1830: inline record-level authorization on the mutating HTML
     // handlers + owner-scoped index. The caller sets `authorize` whenever an
@@ -4398,6 +4427,17 @@ fn render_routes_file(
                 let _ = write!(out, ", {ty}");
                 out
             });
+    // `Update{pascal_name}` is only constructed below by `update_stmt`'s
+    // `--live` branch (`render_update_changeset_expr`) — the default,
+    // non-`--live` path writes the update through a raw `diesel::update(...)`
+    // column tuple (`render_update_columns`) and never names the type. Import
+    // it only when `--live` will actually reference it, or every non-`--live`
+    // scaffold (the documented default) carries an unused import.
+    let update_model_import: String = if live {
+        format!(", Update{pascal_name}")
+    } else {
+        String::new()
+    };
     // The destroy handler must honour the resource's delete semantics: when the
     // scaffold was generated with `--soft-delete`, mark `deleted_at` (matching
     // the soft-delete repository) instead of issuing a physical `DELETE`.
@@ -7856,14 +7896,13 @@ pub async fn search(
 use autumn_web::extract::Path;
 {i18n_imports}use autumn_web::pagination::{{Page, PageRequest}};
 {sort_imports}use autumn_web::reexports::axum::body::Bytes;
-use autumn_web::reexports::serde_json;
-use autumn_web::security::{{CsrfFormField, CsrfToken, SubmitFormField, SubmitToken}};
+{serde_json_import}use autumn_web::security::{{CsrfFormField, CsrfToken, SubmitFormField, SubmitToken}};
 use autumn_web::ui::pagination::{{PagerOptions, pagination_nav}};
 {db_import}
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
-use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}{enum_import_suffix}}};
+use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}{update_model_import}{enum_import_suffix}}};
 use crate::repositories::{snake_name}::{{{pascal_name}Repository, Pg{pascal_name}Repository}};
 use crate::schema::{schema_import};",
         attachment_note = if has_attachments {
@@ -8386,7 +8425,7 @@ pub async fn destroy(
     Ok(form)
 }}
 
-fn is_nullable_form_field(name: &str) -> bool {{
+fn is_nullable_form_field({nullable_form_field_param}: &str) -> bool {{
     {nullable_field_match}
 }}
 {lock_version_parser}"#
@@ -12133,6 +12172,21 @@ fn render_changeset_build(
     )
 }
 
+/// Whether `f`'s Rust type implements `Copy`, restricted to the primitive
+/// kinds this generator is certain are `Copy` regardless of nullability
+/// (`Option<T>` is `Copy` whenever `T` is). Used only to decide whether
+/// [`render_update_columns`] needs a `.clone()` to move a field out of a
+/// shared `&New{Model}` reference — deliberately conservative: every other
+/// `FieldKind` (`String`, `Uuid`, `Decimal`, …) keeps its `.clone()` even
+/// where the underlying type happens to also be `Copy`, since verifying that
+/// per-kind is not this helper's job.
+const fn is_copy_field_kind(f: &Field) -> bool {
+    matches!(
+        f.kind,
+        FieldKind::Bool | FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64
+    )
+}
+
 /// A required numeric carrying a `{min,max}` range (issue #1388) that is
 /// represented as `Option<T>` on the form struct (issue #1748). Extracted so
 /// both the struct/`into_new` emission in [`render_model_form`] and the
@@ -12215,6 +12269,13 @@ fn render_update_columns(plural: &str, fields: &[Field]) -> String {
                 name = f.name,
                 wrapper = encryption_wrapper_type(mode),
             ),
+            None if is_copy_field_kind(f) => {
+                // `clippy::clone_on_copy`: `new` is only ever a shared
+                // reference here, but a `Copy` field (`bool`, `i32`, …) can be
+                // read out of it directly — `.clone()` would just be a
+                // same-cost copy through a different name.
+                write!(out, "{plural}::{name}.eq(new.{name})", name = f.name)
+            }
             None => write!(
                 out,
                 "{plural}::{name}.eq(new.{name}.clone())",
@@ -15884,7 +15945,11 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        assert!(routes.contains("use crate::models::post::{Post, NewPost, UpdatePost};"));
+        // Non-`--live` scaffolds write updates through a raw diesel column
+        // tuple, never constructing `UpdatePost` — importing it unconditionally
+        // left every non-`--live` scaffold with an unused import (Onramp).
+        assert!(routes.contains("use crate::models::post::{Post, NewPost};"));
+        assert!(!routes.contains("UpdatePost"), "{routes}");
         assert!(routes.contains("#[get(\"/posts\")]"));
         assert!(routes.contains("#[get(\"/posts/{id}\")]"));
         assert!(
@@ -15922,6 +15987,58 @@ async fn main() {
         assert!(!routes.contains("#[delete("));
         // The HTML delete route must be present and use POST (not DELETE).
         assert!(routes.contains(r#"#[post("/posts/{id}/delete", name = "delete")]"#));
+    }
+
+    /// Companion to `execute_writes_a_routes_file_referencing_model`: a
+    /// `--live` scaffold's `update_stmt` DOES construct `Update{Model}`
+    /// (`render_update_changeset_expr`), so its import must stay — this is
+    /// the one branch `update_model_import` must render non-empty.
+    #[test]
+    fn live_scaffold_routes_file_imports_update_model() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains("use crate::models::post::{Post, NewPost, UpdatePost};"),
+            "{routes}"
+        );
+        assert!(routes.contains("UpdatePost {"), "{routes}");
+    }
+
+    /// A nullable field flips `is_nullable_form_field`'s body from a bare
+    /// `false` to a real `matches!` on its `name` argument — the parameter
+    /// must be named (not `_name`) in exactly this case, or the match arm
+    /// itself would not compile.
+    #[test]
+    fn scaffold_with_nullable_field_names_the_form_field_param() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "subtitle:Option<String>".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains("fn is_nullable_form_field(name: &str) -> bool {"),
+            "{routes}"
+        );
+        assert!(routes.contains("matches!(name, \"subtitle\")"), "{routes}");
     }
 
     // ── enum field: form widgets, boundary validation, imports (issue #1030) ─
@@ -16004,8 +16121,10 @@ async fn main() {
         plan_and_execute_post_scaffold_with_status_enum(&tmp);
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
+        // Non-`--live` (see `execute_writes_a_routes_file_referencing_model`):
+        // no `UpdatePost` import.
         assert!(
-            routes.contains("use crate::models::post::{Post, NewPost, UpdatePost, Status};"),
+            routes.contains("use crate::models::post::{Post, NewPost, Status};"),
             "got:\n{routes}"
         );
     }
