@@ -430,6 +430,39 @@ async fn require_returns_the_view_or_forbidden() {
     assert!(matches!(err, BillingError::Forbidden(_)), "{err}");
 }
 
+/// Documents the identity contract `current_subscription`/`is_entitled`/
+/// `require`'s doc comments state: under tenancy, `Customer.user_id` is the
+/// tenant-scoped identity, so a caller resolving "the current user" some way
+/// other than `SessionUser`/`Entitled<R>` (which already go through
+/// `session_user_id`) must pass that same scoped value here, not a bare
+/// application user id — even though nothing in these methods' own
+/// signatures enforces it (`user_id: &str` accepts either).
+#[tokio::test]
+async fn is_entitled_requires_the_tenant_scoped_id_directly_under_tenancy() {
+    let h = build();
+    let scoped_id = autumn_billing::gate::scope_identity("acme", "7");
+    seed(&h.store, &scoped_id, PRO_PRICE, SubscriptionStatus::Active).await;
+    let billing = Billing::from_state(h.client.state()).expect("plugin started");
+
+    assert!(
+        !billing
+            .is_entitled("7", &PlanRule::AnyActive)
+            .await
+            .unwrap(),
+        "the bare id was never what checkout stored under tenancy; passing \
+         it here misses the row and silently denies an otherwise-paying \
+         tenant user"
+    );
+    assert!(
+        billing
+            .is_entitled(&scoped_id, &PlanRule::AnyActive)
+            .await
+            .unwrap(),
+        "the tenant-scoped id — what Billing::current_user/session_user_id \
+         actually return under tenancy — finds it"
+    );
+}
+
 #[tokio::test]
 async fn current_subscription_prefers_a_live_row_over_a_newer_ended_one() {
     let h = build();

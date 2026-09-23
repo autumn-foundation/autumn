@@ -1,0 +1,10 @@
+    Blocking waiting for file lock on artifact directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 38s
+     Running tests/integration.rs (target/debug/deps/integration-390f63e2ad72d450)
+
+running 2 tests
+test cases::routes::subscription_does_not_leak_across_tenants_sharing_a_shard_local_user_id ... ok
+test cases::routes::portal_does_not_hand_a_hosted_session_to_another_tenants_customer ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 162 filtered out; finished in 0.30s
+

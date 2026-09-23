@@ -170,6 +170,12 @@ fn hosted_response(negotiate: &Negotiate, session: &HostedSession) -> Response {
 }
 
 /// The customer linked to `user_id`, created at the provider when missing.
+///
+/// `user_id` may be tenant-scoped (`gate::scope_identity_to_tenant`); the
+/// provider — a third party outside Autumn's own tenant boundary, with no
+/// stake in the collision that scoping exists to prevent — receives the raw
+/// id via [`crate::gate::strip_tenant_scope`] instead, unchanged from before
+/// tenancy folded anything into the store's own lookup key.
 async fn customer_for(
     state: &AppState,
     service: &BillingService,
@@ -181,8 +187,9 @@ async fn customer_for(
     }
     let provider = service.provider();
     let local_id = state.entropy().uuid_v4().to_string();
+    let raw_user_id = crate::gate::strip_tenant_scope(user_id);
     let provider_customer_id = provider
-        .create_customer(CustomerRequest::new(local_id.clone(), user_id))
+        .create_customer(CustomerRequest::new(local_id.clone(), raw_user_id))
         .await?;
     let now = state.clock().now();
     let customer = store
