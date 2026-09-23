@@ -269,9 +269,23 @@ those three references to plain inline code text (no brackets); verified
 with the exact CI command,
 `RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" cargo doc -p autumn-billing --no-deps`.
 
-Re-verified after all three fixes: full `autumn-billing` lib tests (81, up
-from 76, the 5 new `gate::tenant_scope_tests`), `--test integration` (168,
-up from 164), `--test mirror_db` (27, up from 24), `cargo fmt`/
+**A fourth finding**, on the next review round (commit `2b46eedb`, P2): the
+new `MemoryBillingStore::relink_customer` checked for a `user_id` conflict
+*before* checking whether `id` even exists, so a missing `id` whose target
+`user_id` happened to already be claimed by some other, unrelated customer
+returned `BillingError::Conflict` instead of the documented `Ok(None)` —
+`DbBillingStore`'s implementation already checked existence first (it reads
+`current` by `id` before attempting the update), so the two backends
+disagreed on this one edge case. A real cross-backend inconsistency an
+operator's migration script could hit (e.g. retrying a relink after the
+source customer was deleted). Fixed by checking `contains_key(id)` first in
+the memory backend, matching the DB backend's order. New property:
+`customer_relink_missing_customer_is_none_even_with_a_conflicting_target`,
+run against both backends per `store_contract.rs`'s usual pattern.
+
+Re-verified after all four fixes: full `autumn-billing` lib tests (81, up
+from 76, the 5 new `gate::tenant_scope_tests`), `--test integration` (169,
+up from 164), `--test mirror_db` (28, up from 24), `cargo fmt`/
 `clippy -D warnings` clean, `cargo check --all-targets` clean, the
 documentation-build command above clean, and
 `./scripts/check-docs-symbols.sh` / `check-migration-guides.sh` /

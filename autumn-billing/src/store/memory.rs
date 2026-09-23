@@ -217,6 +217,12 @@ impl BillingStore for MemoryBillingStore {
         now: DateTime<Utc>,
     ) -> StoreFuture<'a, Option<Customer>> {
         ready(self.lock().and_then(|mut inner| {
+            // Existence first, matching the DB backend: a missing `id` is
+            // `Ok(None)` even when `user_id` is already claimed elsewhere —
+            // relinking a customer that does not exist is not a conflict.
+            if !inner.customers.contains_key(id) {
+                return Ok(None);
+            }
             if let Some(conflict) = inner
                 .customers
                 .values()

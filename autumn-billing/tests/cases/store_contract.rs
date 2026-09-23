@@ -981,6 +981,31 @@ pub async fn customer_relink_missing_customer_is_none(store: &dyn BillingStore) 
     assert_eq!(result, None);
 }
 
+/// Existence is checked before the conflict scan: relinking a missing `id`
+/// is `Ok(None)` even when the target `user_id` is already claimed by a
+/// different, existing customer — a missing row is not a conflict.
+pub async fn customer_relink_missing_customer_is_none_even_with_a_conflicting_target(
+    store: &dyn BillingStore,
+) {
+    store
+        .upsert_customer(
+            CustomerUpsert::new("cust-relink-3a", "stripe", "cus_relink_3a", at(0))
+                .with_user("taken"),
+        )
+        .await
+        .unwrap();
+
+    let result = store
+        .relink_customer("cust-relink-missing-2", "taken".to_string(), at(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        result, None,
+        "a missing customer id is Ok(None), not a Conflict, regardless of \
+         whether some other existing customer already holds the target user_id"
+    );
+}
+
 /// Relinking onto a `user_id` another customer already holds is a conflict,
 /// not a silent double-link — the same partial-unique constraint
 /// `upsert_customer` observes (`customer_one_row_per_user`), now enforced on
@@ -1292,6 +1317,7 @@ pub async fn run_contract(store: &dyn BillingStore) {
     customer_one_row_per_user(store).await;
     customer_relink_overwrites_existing_link(store).await;
     customer_relink_missing_customer_is_none(store).await;
+    customer_relink_missing_customer_is_none_even_with_a_conflicting_target(store).await;
     customer_relink_conflicts_with_existing_target(store).await;
     subscription_unchanged_redelivery(store).await;
     subscription_missing_fields_keep_stored_values(store).await;
@@ -1335,6 +1361,7 @@ mod memory {
         customer_one_row_per_user,
         customer_relink_overwrites_existing_link,
         customer_relink_missing_customer_is_none,
+        customer_relink_missing_customer_is_none_even_with_a_conflicting_target,
         customer_relink_conflicts_with_existing_target,
         subscription_unchanged_redelivery,
         subscription_missing_fields_keep_stored_values,
