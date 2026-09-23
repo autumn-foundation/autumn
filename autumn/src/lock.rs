@@ -932,9 +932,21 @@ mod sqlite_impl {
         /// Returns [`LockError`] if a connection could not be obtained or the
         /// query failed.
         pub async fn try_lock(&self) -> Result<Option<LockGuard>, LockError> {
+            let conn = self.conn().await?;
+            self.try_lock_on(conn).await
+        }
+
+        /// Run one acquire attempt on an already-checked-out connection.
+        ///
+        /// Split out of [`Self::try_lock`] so [`Self::lock_timeout`] can bound
+        /// the pool checkout against the caller's deadline without wrapping
+        /// (and aborting) the acquire SQL itself.
+        async fn try_lock_on(
+            &self,
+            mut conn: diesel_async::pooled_connection::deadpool::Object<RuntimeConnection>,
+        ) -> Result<Option<LockGuard>, LockError> {
             use diesel_async::RunQueryDsl as _;
 
-            let mut conn = self.conn().await?;
             let now = self.now_ms();
             // Reap expired leases first, so the insert below is the whole
             // acquire: a live lock keeps its row and blocks it, while a lock
@@ -1000,6 +1012,14 @@ mod sqlite_impl {
         /// past `timeout`. The wait is bounded to the deadline plus at most one
         /// in-flight poll round-trip.
         ///
+        /// The pool checkout behind each poll is bounded by the remaining
+        /// budget too: under pool pressure deadpool's own wait could otherwise
+        /// block far past `timeout` (the pool's `connect_timeout`, in seconds),
+        /// surfacing [`LockError::PoolUnavailable`] instead of honoring the
+        /// requested budget. Checkout time is debited from the deadline, so a
+        /// small `lock_timeout` returns [`LockError::Timeout`] on time even
+        /// when the pool is exhausted.
+        ///
         /// # Errors
         ///
         /// Returns [`LockError::Timeout`] if the lock is not acquired within
@@ -1014,7 +1034,18 @@ mod sqlite_impl {
                         waited: elapsed,
                     });
                 }
-                if let Some(guard) = self.try_lock().await? {
+                let remaining = timeout.saturating_sub(elapsed);
+                // Bound the checkout by the remaining budget (see the doc
+                // comment above): an unbounded `pool.get()` here is what let
+                // pool pressure turn a bounded wait into a seconds-long
+                // `PoolUnavailable` (issue #2585).
+                let conn = tokio::time::timeout(remaining, self.conn())
+                    .await
+                    .map_err(|_| LockError::Timeout {
+                        name: self.name.clone(),
+                        waited: start.elapsed(),
+                    })??;
+                if let Some(guard) = self.try_lock_on(conn).await? {
                     return Ok(guard);
                 }
                 let remaining = timeout.saturating_sub(start.elapsed());
@@ -1276,6 +1307,47 @@ mod sqlite_impl {
                 lock_name = %self.name,
                 lock_key = self.key,
                 "distributed lock released on drop"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // Issue #2585 item 6: `lock_timeout`'s per-poll checkout ran
+        // unbounded, so under pool pressure deadpool's own wait (the pool's
+        // `connect_timeout`, in seconds) blew a small budget and surfaced
+        // `PoolUnavailable` instead of `Timeout`. The checkout is now bounded
+        // by the remaining deadline.
+        #[tokio::test]
+        async fn lock_timeout_bounds_the_pool_checkout_by_the_deadline() {
+            let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+                RuntimeConnection,
+            >::new(":memory:");
+            let pool: SqlitePool =
+                diesel_async::pooled_connection::deadpool::Pool::builder(manager)
+                    .max_size(1)
+                    .runtime(deadpool::Runtime::Tokio1)
+                    .build()
+                    .expect("test pool builds without connecting");
+            // Exhaust the single slot: no checkout in the test can succeed
+            // while this is held.
+            let _held = pool.get().await.expect("checkout the only connection");
+
+            let lock = Lock::new(pool, "checkout-bounded-by-deadline");
+            let start = tokio::time::Instant::now();
+            let err = lock
+                .lock_timeout(Duration::from_millis(50))
+                .await
+                .expect_err("an exhausted pool cannot grant the lock");
+            assert!(
+                matches!(err, LockError::Timeout { .. }),
+                "expected LockError::Timeout, got {err:?}"
+            );
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "lock_timeout must return near the 50ms budget, not after deadpool's own wait"
             );
         }
     }
