@@ -2542,6 +2542,37 @@ without also filling in the intake form above.
   `sqlite_jobs_scheduler_e2e.rs`. Not written in this pass — recorded here so
   the fix is a separate, reviewable change.
 
+- **2026-09-23 update — reconciling this pass's rates with the two entries
+  above.** PR #2913 and this ledger's own "reproduced (3/100)" update ran the
+  same experiment shape independently, on different sandboxes, the same day:
+  whole binary, no test filter, default parallelism, versus the same whole
+  binary run fully serially. The two concurrent samples don't match exactly
+  (3/100 here vs. 4/50 there — 3% vs. 8%) and neither do the two serial ones
+  (1/100 here vs. 0/50 there — 1% vs. 0%), which is what prompted a review
+  comment on PR #2922 to ask that the two be reconciled rather than one
+  silently overriding the other. Neither pair is far enough apart to reject
+  "same underlying rate, different small samples": a two-sided Fisher test of
+  3/100 vs. 4/50 gives p ≈ 0.22, and 1/100 vs. 0/50 gives p ≈ 1.0. Pooling
+  each shape across both independent samples instead of comparing them
+  head-to-head: **7/150 (~4.7%) concurrent, 1/150 (~0.67%) serial.** A
+  one-sided exact (Fisher/hypergeometric) test of the pooled concurrent count
+  against the pooled serial count gives **p ≈ 0.033** — every rerun either
+  pass has collected under either shape, combined, and the only comparison in
+  this entry's history that clears a conventional significance threshold.
+
+  Read as complementary rather than competing: this pass's own "no live named
+  mechanism survives review" conclusion (above) is superseded, not
+  contradicted — this pass ruled out two specific wrong mechanisms (WAL
+  staleness; a `worker_loop` that, per direct source read, is never spawned
+  by this test) without finding the real one, and #2913's instrumentation
+  then found it. This pass's own distinct, still-standing contributions —
+  the corrected isolated-baseline arithmetic (0/50 local + 0/50 CI-native,
+  not 0/100+0/50 as an early draft miscounted), the two ruled-out mechanisms,
+  and the `rerun_serial_whole_binary` / `iterations: "100"` harness
+  additions to `manual-sqlite-jobs-rerun-check.yml` — stay useful for
+  measuring the eventual fix once it lands, independent of who named the
+  mechanism first.
+
 `crate_path::tests::resolve_autumn_web_name_dashed_rename_is_sanitized` was
 opened here 2026-09-21 (n=1, mechanism unconfirmed) and **closed the same
 week** — see its entry under "Closed entries" above for the full diagnosis,

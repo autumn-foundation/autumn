@@ -47,6 +47,33 @@ that connection cannot predate the DDL); and finally the serial-control
 power issue above. Kept here for the record, since the fix history itself
 is part of what the next pass needs to not repeat.
 
+**Superseded, same day, by PR #2913 (merged `c0268c6` while this PR was in
+review): a named mechanism, confirmed by instrumentation.** #2913 ran the
+same whole-binary-vs-serial experiment independently and went one step
+further — it instrumented the failing connection and found a pooled
+connection whose cached SQLite schema predates the queue's
+`CREATE UNIQUE INDEX idx_autumn_jobs_unique_inflight`, because
+`enqueue_tracked` takes a connection for the tracking record before the
+queue's own `ensure_schema` necessarily runs on that connection; verdict:
+product defect in `SqliteJobQueue`'s schema readiness, fix left to its own
+PR. That resolves the "no live named mechanism survives review" conclusion
+this report reached below — this report's own contribution was ruling out
+two specific wrong mechanisms (WAL staleness; a `worker_loop` that, per
+direct source read, this test never spawns) and correcting the serial
+control's statistical power, not naming the real one.
+
+#2913's rates (4/50 concurrent, 0/50 serial) don't match this report's
+(3/100 concurrent, 1/100 serial) exactly, which a Codex review comment on
+this PR flagged as needing reconciliation rather than one figure silently
+overriding the other. Neither pair rejects "same rate, different small
+samples" on its own (two-sided Fisher: 3/100-vs-4/50 p≈0.22, 1/100-vs-0/50
+p≈1.0). Pooled across both independent samples — 7/150 (~4.7%) concurrent,
+1/150 (~0.67%) serial — a one-sided exact test gives **p≈0.033**, the only
+comparison across either report that clears a conventional significance
+threshold, using every rerun either pass collected. Recorded in
+`docs/ci-health/quarantine-ledger.md`'s own dated update reconciling the
+two entries, rather than edited into #2913's landed text.
+
 ## 🎯 Verdict path
 
 Unchanged: `trunk-dev` is green; the required gate is `Test suite`
