@@ -31,6 +31,11 @@ on:
       - "autumn-cli/tests/generate.rs"
       - "autumn-cli/tests/integration/console.rs"
       - "autumn-cli/tests/integration/scaffold_validation.rs"
+      # The `cli_tests` module registry (#2538): it decides which test
+      # files compile into the binary at all. A change that removes or
+      # renames a `mod` declaration here would otherwise never trigger
+      # this workflow.
+      - "autumn-cli/tests/integration/mod.rs"
       # The `autumn db scrub` boot gate (#1602) lives in this workflow because
       # it needs the diesel CLI and compiles a generated app. Without these
       # paths a scrub-only change would run the ci.yml round-trip and skip the
@@ -100,6 +105,11 @@ on:
       - "autumn-cli/tests/generate.rs"
       - "autumn-cli/tests/integration/console.rs"
       - "autumn-cli/tests/integration/scaffold_validation.rs"
+      # The `cli_tests` module registry (#2538): it decides which test
+      # files compile into the binary at all. A change that removes or
+      # renames a `mod` declaration here would otherwise never trigger
+      # this workflow.
+      - "autumn-cli/tests/integration/mod.rs"
       # The `autumn db scrub` boot gate (#1602) lives in this workflow because
       # it needs the diesel CLI and compiles a generated app. Without these
       # paths a scrub-only change would run the ci.yml round-trip and skip the
@@ -198,6 +208,12 @@ jobs:
   # autumn-web crate, and runs `cargo build` / `cargo check`. Failures include
   # the full compiler stdout+stderr so the breakage is diagnosable from the
   # CI summary without fetching build logs manually.
+  #
+  # Every per-test `run:` step pipes its `cargo test` through `tee` and then
+  # asserts the log shows at least one passing test (issue #2538): `cargo
+  # test` exits 0 when an `--exact` filter matches zero tests, so without the
+  # guard a renamed or removed test goes silently green. `set -o pipefail`
+  # keeps a failing test binary failing the step through the pipe.
   compile-and-serve:
     name: Compile-and-serve gates (${{ matrix.toolchain }})
     needs: meta
@@ -232,89 +248,187 @@ jobs:
 
       - name: generated_project_compiles_runs_and_serves
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test e2e \
-            generated_project_compiles_runs_and_serves -- --ignored --exact
+            generated_project_compiles_runs_and_serves -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-generated_project_compiles_runs_and_serves.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-generated_project_compiles_runs_and_serves.log" generated_project_compiles_runs_and_serves
       - name: generated_scaffold_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test generate \
-            generated_scaffold_cargo_checks -- --ignored --exact
+            generated_scaffold_cargo_checks -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-generated_scaffold_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-generated_scaffold_cargo_checks.log" generated_scaffold_cargo_checks
       # Issue #1924: the only machine proof that a SQLite-configured scaffold —
       # Uuid, decimal, enum, DateTime, Attachment and json fields — compiles.
       # `cargo check` (not --all-targets): the smoke test is still Postgres-only
       # until the SQLite TestDb lands with #1905.
       - name: generated_sqlite_scaffold_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test generate \
-            generated_sqlite_scaffold_cargo_checks -- --ignored --exact
+            generated_sqlite_scaffold_cargo_checks -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-generated_sqlite_scaffold_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-generated_sqlite_scaffold_cargo_checks.log" generated_sqlite_scaffold_cargo_checks
       - name: generated_policy_scaffold_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test generate \
-            generated_policy_scaffold_cargo_checks -- --ignored --exact
+            generated_policy_scaffold_cargo_checks -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-generated_policy_scaffold_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-generated_policy_scaffold_cargo_checks.log" generated_policy_scaffold_cargo_checks
       - name: generated_nested_scaffold_cargo_checks
         # Issue #1323: the only machine proof that a `--belongs-to` scaffold
         # type-checks — including the textual patch it makes to the PARENT
         # resource's already-generated `show` handler — and that its generated
         # cross-parent isolation test passes.
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test generate \
-            generated_nested_scaffold_cargo_checks -- --ignored --exact
+            generated_nested_scaffold_cargo_checks -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-generated_nested_scaffold_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-generated_nested_scaffold_cargo_checks.log" generated_nested_scaffold_cargo_checks
       - name: generated_counter_cache_scaffold_cargo_checks
         # Issue #2431: the only machine proof that `--belongs-to <Parent>
         # --counter-cache` produces a child model that actually compiles.
         # `#[belongs_to(...)]` was being emitted above `#[autumn_web::model]`
         # instead of below it, which `cargo check` alone catches.
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test generate \
-            generated_counter_cache_scaffold_cargo_checks -- --ignored --exact
+            generated_counter_cache_scaffold_cargo_checks -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-generated_counter_cache_scaffold_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-generated_counter_cache_scaffold_cargo_checks.log" generated_counter_cache_scaffold_cargo_checks
       - name: generated_scaffold_config_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test generate \
-            generated_scaffold_config_cargo_checks -- --ignored --exact
+            generated_scaffold_config_cargo_checks -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-generated_scaffold_config_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-generated_scaffold_config_cargo_checks.log" generated_scaffold_config_cargo_checks
       - name: generated_validated_scaffold_round_trip_test_passes
         # Compiles a fresh scaffold and RUNS its generated test suite (not just
         # `cargo check`): the changeset round-trip test plus the write-path CRUD
         # test (create/update/delete + validation re-render, issue #1127). Both
         # are DB-free, so they run to completion here without Postgres.
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test generate \
-            generated_validated_scaffold_round_trip_test_passes -- --ignored --exact
+            generated_validated_scaffold_round_trip_test_passes -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-generated_validated_scaffold_round_trip_test_passes.log"
+          assert_ran "$RUNNER_TEMP/conformance-generated_validated_scaffold_round_trip_test_passes.log" generated_validated_scaffold_round_trip_test_passes
       - name: controller_generates_compiles_and_lists_routes
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test generate \
-            controller_generates_compiles_and_lists_routes -- --ignored --exact
+            controller_generates_compiles_and_lists_routes -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-controller_generates_compiles_and_lists_routes.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-controller_generates_compiles_and_lists_routes.log" controller_generates_compiles_and_lists_routes
       - name: controller_api_generates_json
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test generate \
-            controller_api_generates_json -- --ignored --exact
+            controller_api_generates_json -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-controller_api_generates_json.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-controller_api_generates_json.log" controller_api_generates_json
       - name: generated_job_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test generate \
-            generated_job_cargo_checks -- --ignored --exact
+            generated_job_cargo_checks -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-generated_job_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-generated_job_cargo_checks.log" generated_job_cargo_checks
       - name: generated_channel_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test generate \
-            generated_channel_cargo_checks -- --ignored --exact
+            generated_channel_cargo_checks -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-generated_channel_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-generated_channel_cargo_checks.log" generated_channel_cargo_checks
       - name: generated_channel_ws_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test generate \
-            generated_channel_ws_cargo_checks -- --ignored --exact
+            generated_channel_ws_cargo_checks -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-generated_channel_ws_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-generated_channel_ws_cargo_checks.log" generated_channel_ws_cargo_checks
       - name: generated_channel_smoke_test_passes
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test generate \
-            generated_channel_smoke_test_passes -- --ignored --exact
+            generated_channel_smoke_test_passes -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-generated_channel_smoke_test_passes.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-generated_channel_smoke_test_passes.log" generated_channel_smoke_test_passes
       # ── `autumn generate webhook` (#1366) ───────────────────────────────
       #
       # These two are the ONLY machine proof of that generator's headline
@@ -324,14 +438,28 @@ jobs:
       # so they must be named here or they never execute anywhere.
       - name: generated_webhook_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test generate \
-            generated_webhook_cargo_checks -- --ignored --exact
+            generated_webhook_cargo_checks -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-generated_webhook_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-generated_webhook_cargo_checks.log" generated_webhook_cargo_checks
       - name: generated_webhook_tests_pass
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test generate \
-            generated_webhook_tests_pass -- --ignored --exact
+            generated_webhook_tests_pass -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-generated_webhook_tests_pass.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-generated_webhook_tests_pass.log" generated_webhook_tests_pass
       # ── `autumn console` (#1039) ────────────────────────────────────────
       #
       # These four are the ONLY machine proof of the console's central
@@ -342,28 +470,56 @@ jobs:
       # explicitly here or they never execute anywhere.
       - name: console_bare_playground_target_compiles_untouched
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::console::console_bare_playground_target_compiles_untouched \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-console_bare_playground_target_compiles_untouched.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-console_bare_playground_target_compiles_untouched.log" console_bare_playground_target_compiles_untouched
       - name: console_playground_target_compiles_with_a_repository_round_trip
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::console::console_playground_target_compiles_with_a_repository_round_trip \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-console_playground_target_compiles_with_a_repository_round_trip.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-console_playground_target_compiles_with_a_repository_round_trip.log" console_playground_target_compiles_with_a_repository_round_trip
       - name: console_run_exits_non_zero_when_the_database_is_unreachable
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::console::console_run_exits_non_zero_when_the_database_is_unreachable \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-console_run_exits_non_zero_when_the_database_is_unreachable.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-console_run_exits_non_zero_when_the_database_is_unreachable.log" console_run_exits_non_zero_when_the_database_is_unreachable
       - name: console_run_surfaces_a_compile_error_in_the_playground
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::console::console_run_surfaces_a_compile_error_in_the_playground \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-console_run_surfaces_a_compile_error_in_the_playground.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-console_run_surfaces_a_compile_error_in_the_playground.log" console_run_surfaces_a_compile_error_in_the_playground
       # ── zero-JS attachment uploads (#1236) ──────────────────────────────
       #
       # The machine proof that a scaffolded `Attachment` column actually
@@ -376,16 +532,30 @@ jobs:
       # execute anywhere.
       - name: generated_attachment_scaffold_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::scaffold_form_for::generated_attachment_scaffold_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-generated_attachment_scaffold_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-generated_attachment_scaffold_cargo_checks.log" generated_attachment_scaffold_cargo_checks
       - name: generated_attachment_scaffold_multipart_test_passes
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::scaffold_form_for::generated_attachment_scaffold_multipart_test_passes \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-generated_attachment_scaffold_multipart_test_passes.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-generated_attachment_scaffold_multipart_test_passes.log" generated_attachment_scaffold_multipart_test_passes
       # ── translatable scaffold views (#1349) ─────────────────────────────
       #
       # The ONLY machine proof that `--i18n` emits Rust that COMPILES. Every
@@ -398,28 +568,56 @@ jobs:
       # the blocks above — named explicitly or they never execute anywhere.
       - name: i18n_scaffold_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::scaffold_i18n::i18n_scaffold_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-i18n_scaffold_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-i18n_scaffold_cargo_checks.log" i18n_scaffold_cargo_checks
       - name: i18n_scaffold_with_trash_and_search_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::scaffold_i18n::i18n_scaffold_with_trash_and_search_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-i18n_scaffold_with_trash_and_search_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-i18n_scaffold_with_trash_and_search_cargo_checks.log" i18n_scaffold_with_trash_and_search_cargo_checks
       - name: i18n_scaffold_with_owner_scoped_search_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::scaffold_i18n::i18n_scaffold_with_owner_scoped_search_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-i18n_scaffold_with_owner_scoped_search_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-i18n_scaffold_with_owner_scoped_search_cargo_checks.log" i18n_scaffold_with_owner_scoped_search_cargo_checks
       - name: i18n_scaffold_with_state_machine_and_attachment_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::scaffold_i18n::i18n_scaffold_with_state_machine_and_attachment_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-i18n_scaffold_with_state_machine_and_attachment_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-i18n_scaffold_with_state_machine_and_attachment_cargo_checks.log" i18n_scaffold_with_state_machine_and_attachment_cargo_checks
       # ── `{encrypted}` field-DSL modifier (#1340) ────────────────────────
       #
       # The ONLY machine proof that the emitted `#[encrypted(...)]` attribute
@@ -434,34 +632,69 @@ jobs:
       # caveat as the blocks above — named explicitly or they never run.
       - name: encrypted_scaffold_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::scaffold_encrypted::encrypted_scaffold_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-encrypted_scaffold_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-encrypted_scaffold_cargo_checks.log" encrypted_scaffold_cargo_checks
       - name: encrypted_api_scaffold_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::scaffold_encrypted::encrypted_api_scaffold_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-encrypted_api_scaffold_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-encrypted_api_scaffold_cargo_checks.log" encrypted_api_scaffold_cargo_checks
       - name: encrypted_live_scaffold_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::scaffold_encrypted::encrypted_live_scaffold_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-encrypted_live_scaffold_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-encrypted_live_scaffold_cargo_checks.log" encrypted_live_scaffold_cargo_checks
       - name: encrypted_nested_scaffold_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::scaffold_encrypted::encrypted_nested_scaffold_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-encrypted_nested_scaffold_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-encrypted_nested_scaffold_cargo_checks.log" encrypted_nested_scaffold_cargo_checks
       - name: encrypted_admin_scaffold_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::scaffold_encrypted::encrypted_admin_scaffold_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-encrypted_admin_scaffold_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-encrypted_admin_scaffold_cargo_checks.log" encrypted_admin_scaffold_cargo_checks
       # ── DSL `{…}` validation constraints (#1388) ────────────────────────
       #
       # The only machine proof that a scaffold carrying the FULL constraint
@@ -473,10 +706,17 @@ jobs:
       # above — named explicitly here or it never runs anywhere.
       - name: constrained_scaffold_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::scaffold_validation::constrained_scaffold_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-constrained_scaffold_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-constrained_scaffold_cargo_checks.log" constrained_scaffold_cargo_checks
       # ── cli_tests per-test triage (#1945) ───────────────────────────────
       #
       # These `#[ignore]`d tests each scaffold a fresh project and cargo-check
@@ -489,94 +729,199 @@ jobs:
       # as the blocks above, or they never run.
       - name: api_scaffold_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::api_scaffold::api_scaffold_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-api_scaffold_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-api_scaffold_cargo_checks.log" api_scaffold_cargo_checks
       - name: scaffolded_app_passes_routes_audit_gate
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::cloud_native_scaffold::scaffolded_app_passes_routes_audit_gate \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-scaffolded_app_passes_routes_audit_gate.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-scaffolded_app_passes_routes_audit_gate.log" scaffolded_app_passes_routes_audit_gate
       - name: scaffolded_api_app_passes_routes_audit_gate
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::cloud_native_scaffold::scaffolded_api_app_passes_routes_audit_gate \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-scaffolded_api_app_passes_routes_audit_gate.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-scaffolded_api_app_passes_routes_audit_gate.log" scaffolded_api_app_passes_routes_audit_gate
       - name: unscoped_position_generated_project_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::generate_position_scaffold::unscoped_position_generated_project_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-unscoped_position_generated_project_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-unscoped_position_generated_project_cargo_checks.log" unscoped_position_generated_project_cargo_checks
       - name: scoped_position_generated_project_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::generate_position_scaffold::scoped_position_generated_project_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-scoped_position_generated_project_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-scoped_position_generated_project_cargo_checks.log" scoped_position_generated_project_cargo_checks
       - name: soft_delete_position_generated_project_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::generate_position_scaffold::soft_delete_position_generated_project_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-soft_delete_position_generated_project_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-soft_delete_position_generated_project_cargo_checks.log" soft_delete_position_generated_project_cargo_checks
       - name: belongs_to_scaffold_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::scaffold_belongs_to::belongs_to_scaffold_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-belongs_to_scaffold_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-belongs_to_scaffold_cargo_checks.log" belongs_to_scaffold_cargo_checks
       - name: bulk_delete_generated_project_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::scaffold_bulk_delete::bulk_delete_generated_project_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-bulk_delete_generated_project_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-bulk_delete_generated_project_cargo_checks.log" bulk_delete_generated_project_cargo_checks
       - name: richtext_scaffold_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::scaffold_rich_text::richtext_scaffold_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-richtext_scaffold_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-richtext_scaffold_cargo_checks.log" richtext_scaffold_cargo_checks
       - name: searchable_scaffold_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::scaffold_search::searchable_scaffold_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-searchable_scaffold_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-searchable_scaffold_cargo_checks.log" searchable_scaffold_cargo_checks
       - name: trash_generated_project_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::scaffold_trash::trash_generated_project_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-trash_generated_project_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-trash_generated_project_cargo_checks.log" trash_generated_project_cargo_checks
       - name: linked_seed_binary_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::seed_model_linking::linked_seed_binary_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-linked_seed_binary_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-linked_seed_binary_cargo_checks.log" linked_seed_binary_cargo_checks
       - name: serve_daemon_start_status_stop_over_unix_socket
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::serve::serve_daemon_start_status_stop_over_unix_socket \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-serve_daemon_start_status_stop_over_unix_socket.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-serve_daemon_start_status_stop_over_unix_socket.log" serve_daemon_start_status_stop_over_unix_socket
       - name: generated_form_for_scaffold_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::scaffold_form_for::generated_form_for_scaffold_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-generated_form_for_scaffold_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-generated_form_for_scaffold_cargo_checks.log" generated_form_for_scaffold_cargo_checks
       - name: generated_scaffold_with_missing_reference_target_cargo_checks
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::scaffold_form_for::generated_scaffold_with_missing_reference_target_cargo_checks \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-generated_scaffold_with_missing_reference_target_cargo_checks.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-generated_scaffold_with_missing_reference_target_cargo_checks.log" generated_scaffold_with_missing_reference_target_cargo_checks
   # ── Generated-app variant conformance matrix ────────────────────────────────
   #
   # One matrixed job that scaffolds a fresh project in a specific "variant"
@@ -596,6 +941,12 @@ jobs:
   #   attachment-owner -> generated_attachment_owner_scaffold_cargo_checks
   #   owner-searchable          -> generated_owner_searchable_scaffold_cargo_checks
   #   nullable-owner-searchable -> generated_nullable_owner_searchable_scaffold_cargo_checks
+  #
+  # Every per-test `run:` step pipes its `cargo test` through `tee` and then
+  # asserts the log shows at least one passing test (issue #2538): `cargo
+  # test` exits 0 when an `--exact` filter matches zero tests, so without the
+  # guard a renamed or removed test goes silently green. `set -o pipefail`
+  # keeps a failing test binary failing the step through the pipe.
   app-variant-conformance:
     name: App-variant conformance (${{ matrix.variant.name }}, ${{ matrix.toolchain }})
     needs: meta
@@ -669,9 +1020,16 @@ jobs:
 
       - name: ${{ matrix.variant.test }}
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test generate \
-            ${{ matrix.variant.test }} -- --ignored --exact
+            ${{ matrix.variant.test }} -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-${{ matrix.variant.name }}.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-${{ matrix.variant.name }}.log" ${{ matrix.variant.test }}
   # ── Postgres e2e gate ────────────────────────────────────────────────────────
   #
   # Runs:
@@ -684,6 +1042,12 @@ jobs:
   # (available on ubuntu-latest). `autumn migrate` shells out to the `diesel`
   # CLI, which must be installed before the test runs. Failure surfaces the
   # full `cargo build` stdout+stderr captured by the test assertions.
+  #
+  # Every per-test `run:` step pipes its `cargo test` through `tee` and then
+  # asserts the log shows at least one passing test (issue #2538): `cargo
+  # test` exits 0 when an `--exact` filter matches zero tests, so without the
+  # guard a renamed or removed test goes silently green. `set -o pipefail`
+  # keeps a failing test binary failing the step through the pipe.
   scaffold-postgres:
     name: Scaffold Postgres e2e gate (${{ matrix.toolchain }})
     needs: meta
@@ -729,9 +1093,16 @@ jobs:
 
       - name: generated_scaffold_serves_posts_index_and_json_api
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test generate \
-            generated_scaffold_serves_posts_index_and_json_api -- --ignored --exact
+            generated_scaffold_serves_posts_index_and_json_api -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-generated_scaffold_serves_posts_index_and_json_api.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-generated_scaffold_serves_posts_index_and_json_api.log" generated_scaffold_serves_posts_index_and_json_api
       # ── DSL `{…}` validation constraints (#1388) ────────────────────────
       #
       # The ONLY runtime proof of that feature's headline acceptance
@@ -745,9 +1116,16 @@ jobs:
       # submission still redirects and persists.
       - name: generated_constrained_scaffold_enforces_validation_end_to_end
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test generate \
-            generated_constrained_scaffold_enforces_validation_end_to_end -- --ignored --exact
+            generated_constrained_scaffold_enforces_validation_end_to_end -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-generated_constrained_scaffold_enforces_validation_end_to_end.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-generated_constrained_scaffold_enforces_validation_end_to_end.log" generated_constrained_scaffold_enforces_validation_end_to_end
       # ── `json`/`jsonb` scaffold field type (#1341) ──────────────────────
       #
       # The ONLY machine proof of AC6/the Success Metric: scaffolds a
@@ -760,10 +1138,17 @@ jobs:
       # tests are not auto-swept the way autumn-web's are).
       - name: scaffolded_json_field_generates_compiles_inserts_and_selects
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::generate_json_postgres::scaffolded_json_field_generates_compiles_inserts_and_selects \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-scaffolded_json_field_generates_compiles_inserts_and_selects.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-scaffolded_json_field_generates_compiles_inserts_and_selects.log" scaffolded_json_field_generates_compiles_inserts_and_selects
       # ── `autumn db scrub` boots the app it scrubbed (#1602) ──────────────
       #
       # The one AC the general Docker sweep cannot cover: after a scrub, the
@@ -774,10 +1159,17 @@ jobs:
       # above: named explicitly here or it never runs anywhere.
       - name: scrubbed_database_migrates_clean_and_boots_the_app
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test cli_tests \
             integration::db_scrub::scrubbed_database_migrates_clean_and_boots_the_app \
-            -- --ignored --exact
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-scrubbed_database_migrates_clean_and_boots_the_app.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-scrubbed_database_migrates_clean_and_boots_the_app.log" scrubbed_database_migrates_clean_and_boots_the_app
   # ── `autumn plugin add` install gate (#1606) ────────────────────────────────
   #
   # The Success Metric for issue #1606: installing every first-party plugin
@@ -798,6 +1190,12 @@ jobs:
   # in this workflow pulls in. Each step's five projects share one
   # CARGO_TARGET_DIR inside the test, so the framework is compiled once per
   # step and the second step reuses the first's warm cargo cache.
+  #
+  # Every per-test `run:` step pipes its `cargo test` through `tee` and then
+  # asserts the log shows at least one passing test (issue #2538): `cargo
+  # test` exits 0 when an `--exact` filter matches zero tests, so without the
+  # guard a renamed or removed test goes silently green. `set -o pipefail`
+  # keeps a failing test binary failing the step through the pipe.
   plugin-install:
     name: autumn plugin install/remove lifecycle gate
     needs: meta
@@ -821,9 +1219,16 @@ jobs:
 
       - name: plugin_add_first_party_scaffolds_cargo_check
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test generate \
-            plugin_add_first_party_scaffolds_cargo_check -- --ignored --exact
+            plugin_add_first_party_scaffolds_cargo_check -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-plugin_add_first_party_scaffolds_cargo_check.log"
 
+          assert_ran "$RUNNER_TEMP/conformance-plugin_add_first_party_scaffolds_cargo_check.log" plugin_add_first_party_scaffolds_cargo_check
       # Issue #1631's Success Metric, the other half of the same guarantee:
       # `autumn new --with <plugin>` compiles, `autumn plugin remove <plugin>`
       # returns the app to a state that compiles, and `autumn doctor` finds no
@@ -832,5 +1237,13 @@ jobs:
       # builds the same aws-sdk-s3 / redis / media dependency graphs.
       - name: plugin_new_with_then_remove_round_trips_cargo_check
         run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
           cargo test -p autumn-cli --test generate \
-            plugin_new_with_then_remove_round_trips_cargo_check -- --ignored --exact
+            plugin_new_with_then_remove_round_trips_cargo_check -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-plugin_new_with_then_remove_round_trips_cargo_check.log"
+
+          assert_ran "$RUNNER_TEMP/conformance-plugin_new_with_then_remove_round_trips_cargo_check.log" plugin_new_with_then_remove_round_trips_cargo_check
