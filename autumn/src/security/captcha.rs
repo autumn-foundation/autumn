@@ -42,8 +42,10 @@
 //!
 //! ## Dev-mode bypass
 //!
-//! Set `dev_bypass = true` (the default when no `secret_key` is configured)
-//! to skip verification in local development:
+//! Omitting `secret_key` does **not** bypass verification — the real provider
+//! is still constructed and every submission fails closed (rejected, with a
+//! warning logged), since an empty secret can never verify a token. Set
+//! `dev_bypass = true` explicitly to skip verification in local development:
 //!
 //! ```toml
 //! [bot_protection]
