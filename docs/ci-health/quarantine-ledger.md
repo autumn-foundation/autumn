@@ -2222,13 +2222,31 @@ without also filling in the intake form above.
   the *specific* defect — which resource, touched by which sibling test(s)
   — is still not identified**, so per this role's own hard gate (a category
   without the specific defect is not enough to fix) this remains
-  uncampaigned for a fix PR. One candidate the source supports checking
-  next, not yet checked: `build_sqlite_pool` pins `max_size`/`pool_size:
-  1` for every test (`autumn/tests/sqlite_jobs_scheduler_e2e.rs:78-92`,
-  confirmed by direct read), so a stale prepared statement across two
-  physical connections *within this test's own pool* is structurally
-  impossible — ruling that specific variant out, not just leaving it
-  unconfirmed. The target test's own path (`start_runtime` then
+  uncampaigned for a fix PR.
+
+  **Correction (post-review, via a Codex review comment on PR #2922): the
+  multi-connection hypothesis was wrongly ruled out — `build_sqlite_pool`
+  does not pin `pool_size: 1`.** The claim above conflated a *different*
+  test's explicit `pool_size: 1` config (elsewhere in this file) with
+  `build_sqlite_pool` itself. Read directly
+  (`autumn/tests/sqlite_jobs_scheduler_e2e.rs:78-88`):
+  `build_sqlite_pool` builds a `DatabaseConfig { url: Some(url),
+  ..Default::default() }` and passes it to the public `create_pool` entry
+  point — it does not set `pool_size` at all. `DatabaseConfig::default()`'s
+  `pool_size` comes from `default_pool_size()` (`autumn/src/config.rs`),
+  which returns **10**, and `create_pool`
+  (`autumn/src/db.rs:1768-1782`) passes `config.effective_primary_pool_size()`
+  straight through to `build_pool`'s `max_size` with no SQLite-specific
+  override in this path. So the target test's own pool can hold up to 10
+  physical connections to its file, not 1 — a stale prepared statement or
+  other connection-local schema state racing across two of that pool's
+  connections is **not** structurally impossible and remains an open
+  candidate, on top of (not instead of) the `GLOBAL_JOB_CLIENT` gap below.
+  Flagged here rather than silently fixed in place, since a wrong "ruled
+  out" in this ledger is worse than an open question: it actively steers
+  the next pass away from a viable mechanism.
+
+  The target test's own path (`start_runtime` then
   `autumn_web::job_tracking::enqueue_tracked`, which the 2026-09-11
   `job_tracking_stores_integration` entry already established routes
   through the process-global `job::global_job_client()`) is the one

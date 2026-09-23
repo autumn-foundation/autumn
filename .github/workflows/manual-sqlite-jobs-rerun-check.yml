@@ -151,7 +151,12 @@ jobs:
             20|50) ;;
             *) echo "::error::iterations must be 20 or 50 (got: $ITERATIONS)"; exit 1 ;;
           esac
-          fail=0
+          # Counted separately from a bare exit code: this job runs the whole
+          # 27-test binary, so a nonzero exit can come from any sibling test,
+          # not just the tracked flake. Conflating the two would corrupt the
+          # rerun-rate this job exists to measure (Codex review, PR #2922).
+          target_fail=0
+          sibling_fail=0
           pass=0
           for i in $(seq 1 "$ITERATIONS"); do
             echo "=== iteration $i/$ITERATIONS ==="
@@ -162,17 +167,25 @@ jobs:
             if [ "$rc" -eq 0 ]; then
               echo "iteration $i: PASS"
               pass=$((pass + 1))
+            elif grep -qE '^test sqlite_job_backend_tracks_job_status_durably \.\.\. FAILED' \
+                 "whole-binary-iteration-$i.log"; then
+              echo "iteration $i: TARGET FAIL (rc=$rc)"
+              target_fail=$((target_fail + 1))
             else
-              echo "iteration $i: FAIL (rc=$rc)"
-              fail=$((fail + 1))
+              echo "iteration $i: SIBLING FAIL, target test unaffected (rc=$rc)"
+              sibling_fail=$((sibling_fail + 1))
             fi
           done
           {
             echo "## sqlite_jobs_scheduler_e2e whole-binary (default parallelism) rerun result"
             echo ""
-            echo "\`$fail\`/\`$ITERATIONS\` failed, \`$pass\`/\`$ITERATIONS\` passed."
+            echo "Target (\`sqlite_job_backend_tracks_job_status_durably\`): \`$target_fail\`/\`$ITERATIONS\` failed."
+            echo ""
+            echo "Sibling-test failures (excluded from the target rate above): \`$sibling_fail\`/\`$ITERATIONS\`."
+            echo ""
+            echo "\`$pass\`/\`$ITERATIONS\` iterations passed outright."
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "RESULT: $fail/$ITERATIONS failed, $pass/$ITERATIONS passed"
+          echo "RESULT: target $target_fail/$ITERATIONS failed, sibling $sibling_fail/$ITERATIONS failed, $pass/$ITERATIONS passed"
       - name: Upload every iteration's full log
         if: always()
         uses: actions/upload-artifact@v7

@@ -104,12 +104,20 @@ presumptively belongs to the test's own shared state, not the store's
 production behavior, but that has not been confirmed by naming the actual
 shared resource, so per this role's own bar the verdict stays open.
 
-One candidate is now ruled out by direct source read, not just
-unconfirmed: `build_sqlite_pool` pins `pool_size: 1` for every test
-(`autumn/tests/sqlite_jobs_scheduler_e2e.rs:78-92`), so a stale prepared
-statement racing across two physical connections *within this test's own
-pool* is structurally impossible. The one resource this test provably shares
-with the rest of the process is `job::global_job_client()` — the same
+**Correction, added post-review (a Codex comment on PR #2922 caught this
+before merge):** this report originally claimed `build_sqlite_pool` pins
+`pool_size: 1`, ruling out a stale-prepared-statement race across
+connections in this test's own pool. That was wrong — it conflated a
+*different* test's explicit `pool_size: 1` with `build_sqlite_pool` itself.
+Read directly, `build_sqlite_pool` (`autumn/tests/sqlite_jobs_scheduler_e2e.rs:78-88`)
+builds a `DatabaseConfig` with no `pool_size` override, so it inherits
+`DatabaseConfig::default()`'s value — **10** — and `create_pool` passes that
+straight through as the pool's `max_size`. The target test's pool can hold
+up to 10 physical connections, so a connection-local stale statement or
+schema-visibility race is **not** ruled out and remains an open candidate.
+See the ledger entry's own correction for the full detail. The one resource
+this test provably shares with the rest of the process is
+`job::global_job_client()` — the same
 process-global the 2026-09-11 `job_tracking_stores_integration` entry already
 established `enqueue_tracked` routes through. The existing "ruled out"
 finding for `GLOBAL_JOB_CLIENT` in this entry only checked whether *other
