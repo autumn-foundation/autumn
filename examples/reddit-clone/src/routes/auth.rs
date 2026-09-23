@@ -156,22 +156,23 @@ pub async fn register(
     csrf: CsrfToken,
     form: Form<RegisterForm>,
 ) -> AutumnResult<Response> {
-    // Bound echoed values to their own field limits before any re-render can
-    // reflect them: several branches below are reachable by input bigger
-    // than what they reject, so echoing it verbatim would let an attacker
-    // turn a bounded error page into an up-to-32MiB response (the default
-    // request-body limit) — the same amplification guard `examples/saas`
-    // and `examples/teams` apply to their own signup forms.
-    let username: String = form
-        .0
-        .username
-        .trim()
-        .to_lowercase()
-        .chars()
-        .take(32)
-        .collect();
-    let email: String = form.0.email.trim().chars().take(254).collect();
+    let username = form.0.username.trim().to_lowercase();
+    let email = form.0.email.trim().to_owned();
     let password = form.0.password;
+
+    // Bounded copies for echoing back into the form on a rejected
+    // submission only. Validation, the DB lookup/insert, and the mailer
+    // below all use the full `username`/`email` above — truncating those
+    // (rather than just the echo) made the too-long checks below
+    // unreachable and would have created accounts under a different,
+    // silently-shortened username (Codex finding on this PR). The cap
+    // here exists only so an attacker can't turn a bounded error page
+    // into an up-to-32MiB response (the default request-body limit) by
+    // submitting an enormous value — the same amplification guard
+    // `examples/saas` and `examples/teams` apply to their own signup
+    // forms.
+    let echo_username: String = username.chars().take(32).collect();
+    let echo_email: String = email.chars().take(254).collect();
 
     let open = crate::config_svc()
         .get("registration_open")
@@ -180,8 +181,8 @@ pub async fn register(
         .unwrap_or(false);
     if !open {
         return Ok(register_page(
-            &username,
-            &email,
+            &echo_username,
+            &echo_email,
             &["Registrations are currently closed".to_owned()],
             csrf.token(),
         )
@@ -190,8 +191,8 @@ pub async fn register(
 
     if username.len() < 2 || username.len() > 32 {
         return Ok(register_page(
-            &username,
-            &email,
+            &echo_username,
+            &echo_email,
             &["Username must be 2-32 characters".to_owned()],
             csrf.token(),
         )
@@ -202,8 +203,8 @@ pub async fn register(
         .all(|c| c.is_ascii_alphanumeric() || c == '_')
     {
         return Ok(register_page(
-            &username,
-            &email,
+            &echo_username,
+            &echo_email,
             &["Username may only contain letters, numbers, and underscores".to_owned()],
             csrf.token(),
         )
@@ -211,8 +212,8 @@ pub async fn register(
     }
     if password.len() < 6 {
         return Ok(register_page(
-            &username,
-            &email,
+            &echo_username,
+            &echo_email,
             &["Password must be at least 6 characters".to_owned()],
             csrf.token(),
         )
@@ -220,8 +221,8 @@ pub async fn register(
     }
     if !email.contains('@') {
         return Ok(register_page(
-            &username,
-            &email,
+            &echo_username,
+            &echo_email,
             &["Email address is invalid".to_owned()],
             csrf.token(),
         )
@@ -237,8 +238,8 @@ pub async fn register(
 
     if existing > 0 {
         return Ok(register_page(
-            &username,
-            &email,
+            &echo_username,
+            &echo_email,
             &["Username already taken".to_owned()],
             csrf.token(),
         )
@@ -313,8 +314,8 @@ pub async fn register(
         // server error, unchanged from before.
         Err(err) if err.status() == StatusCode::CONFLICT => {
             return Ok(register_page(
-                &username,
-                &email,
+                &echo_username,
+                &echo_email,
                 &["Username already taken".to_owned()],
                 csrf.token(),
             )
@@ -558,18 +559,17 @@ pub async fn login(
     csrf: CsrfToken,
     form: Form<LoginForm>,
 ) -> AutumnResult<Response> {
-    // Bounded the same way `register` bounds its echoed values: the only
-    // path reachable by a username bigger than the field ever accepts, so
-    // echoing it verbatim would let an attacker turn a bounded error page
-    // into an up-to-32MiB response (the default request-body limit).
-    let username: String = form
-        .0
-        .username
-        .trim()
-        .to_lowercase()
-        .chars()
-        .take(32)
-        .collect();
+    let username = form.0.username.trim().to_lowercase();
+
+    // Bounded copy for echoing back on a rejected submission only (same
+    // amplification guard as `register`, above): the DB lookup below must
+    // use the full `username`, or an overlong submission whose first 32
+    // characters happen to match a real, shorter account would silently
+    // authenticate against that account instead of failing to match
+    // (Codex finding on this PR) — no stored username can be longer than
+    // 32 characters (`register` enforces that on the way in), so the full
+    // `username` either matches a real row or matches nothing.
+    let echo_username: String = username.chars().take(32).collect();
 
     let user: Option<User> = users::table
         .filter(users::username.eq(&username))
@@ -580,7 +580,7 @@ pub async fn login(
 
     let Some(user) = user else {
         return Ok(login_page(
-            &username,
+            &echo_username,
             csrf.token(),
             Some("Invalid username or password"),
         )
@@ -589,7 +589,7 @@ pub async fn login(
 
     if !verify_password(&form.0.password, &user.password_hash).await? {
         return Ok(login_page(
-            &username,
+            &echo_username,
             csrf.token(),
             Some("Invalid username or password"),
         )
