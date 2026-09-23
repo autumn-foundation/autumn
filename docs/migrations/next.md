@@ -1287,13 +1287,14 @@ all — `Customer.user_id` is computed exactly as before.
 
 For an affected app, `Customer.user_id` — and therefore whatever
 [`BillingHooks::recipient_for`](../../autumn-billing/src/hooks.rs) receives —
-is now `{tenant}\u{1}{user_id}` rather than the bare session id (`\u{1}` is a
-control byte that can never appear in a resolved tenant id or an ordinary
-application user id, so the two components can never be misattributed). The
-**default** `recipient_for` implementation already recovers the raw id via
-[`autumn_billing::gate::strip_tenant_scope`](../../autumn-billing/src/gate.rs),
-so it needs no change. A custom override that assumed the bare session id
-under tenancy needs the same one-line change:
+is now an opaque, tenant-scoped identity rather than the bare session id.
+Recover the raw id with
+[`autumn_billing::gate::strip_tenant_scope`](../../autumn-billing/src/gate.rs);
+the exact wire format is deliberately not documented here — it is not public
+API and is not guaranteed stable. The **default** `recipient_for`
+implementation already calls it, so it needs no change. A custom override
+that assumed the bare session id under tenancy needs the same one-line
+change:
 
 ```diff
  fn recipient_for(&self, user_id: &str) -> Option<i64> {
@@ -1302,17 +1303,41 @@ under tenancy needs the same one-line change:
  }
 ```
 
-Existing `billing_customers` rows written before the upgrade keep their old,
-unscoped `user_id`. They are not retroactively migrated — doing so would
-need the very tenant context (which tenant each existing row belongs to)
-that this fix exists because the framework never recorded. A fresh checkout
-after the upgrade writes the new, tenant-scoped form; an existing linked
-customer's `user_id` continues to read as the old bare id until its next
-`.with_user()` write (typically indistinguishable in practice, since
-`reconcile.rs` never rewrites an already-linked `user_id`).
+**Existing `billing_customers` rows written before you enable tenancy on an
+app that already had `BillingPlugin` mounted go dark, immediately, on
+upgrade** — not "eventually" or "indistinguishably": every lookup now keys on
+the tenant-scoped identity, so `customer_by_user` misses the row on the very
+next request, and `Entitled<R>` reports `entitled: false` for an
+already-paying user until it is relinked. Nothing relinks it automatically:
+`upsert_customer` deliberately never replaces an existing `user_id` link (see
+its doc), so even a fresh checkout does not repair the row — it creates a
+**second** provider customer instead, which can produce a duplicate Stripe
+subscription. Relink each pre-existing row explicitly before (or immediately
+after) enabling tenancy, with the tenant you already know it belongs to from
+your own records:
+
+```rust
+let service = autumn_billing::BillingService::require(&state)?;
+let scoped_id = autumn_billing::gate::scope_identity(tenant, &legacy_user_id);
+service
+    .store()
+    .relink_customer(&customer_id, scoped_id, Utc::now())
+    .await?;
+```
+
+`relink_customer` is the one store method allowed to overwrite an existing
+link — restricted to operator-driven migrations for exactly this reason (see
+its doc on [`BillingStore`](../../autumn-billing/src/store/mod.rs)); nothing
+in request-handling or webhook code calls it. It returns
+`BillingError::Conflict` if `scoped_id` already links a different customer
+(for example, a fresh checkout already created one under the new id before
+you relinked the old row) — resolve that by hand, since it means two
+provider customers now exist for the one legacy row.
 
 **Automation:** `manual` — a custom `recipient_for` override, if one exists,
-needs the diff above; the default implementation and every other consumer of
+needs the diff above; every pre-existing `billing_customers` row under an
+app newly enabling tenancy needs the `relink_customer` call above; the
+default `recipient_for` implementation and every other consumer of
 `Customer.user_id` need no change.
 
 

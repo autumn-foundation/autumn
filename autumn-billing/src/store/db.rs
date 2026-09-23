@@ -643,6 +643,44 @@ impl BillingStore for DbBillingStore {
         })
     }
 
+    fn relink_customer<'a>(
+        &'a self,
+        id: &'a str,
+        user_id: String,
+        now: DateTime<Utc>,
+    ) -> StoreFuture<'a, Option<Customer>> {
+        Box::pin(async move {
+            let mut conn = self.conn().await?;
+            let result: Result<Option<CustomerRow>, TxError> = conn
+                .transaction(async move |conn| -> Result<Option<CustomerRow>, TxError> {
+                    let existing: Option<CustomerRow> = billing_customers::table
+                        .find(id)
+                        .select(CustomerRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    let Some(mut current) = existing else {
+                        return Ok(None);
+                    };
+                    current.user_id = Some(user_id);
+                    current.updated_at = to_naive(now);
+                    diesel::update(billing_customers::table.find(&current.id))
+                        .set(&current)
+                        .execute(conn)
+                        .await?;
+                    Ok(Some(current))
+                })
+                .await;
+            match result {
+                Ok(row) => Ok(row.map(CustomerRow::into_model)),
+                Err(TxError::Db(err)) if is_unique_violation(&err) => {
+                    Err(BillingError::Conflict(format!("relink_customer: {err}")))
+                }
+                Err(err) => Err(err.into_billing("relink_customer")),
+            }
+        })
+    }
+
     fn upsert_subscription(
         &self,
         upsert: SubscriptionUpsert,

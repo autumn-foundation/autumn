@@ -943,6 +943,83 @@ pub async fn customer_one_row_per_user(store: &dyn BillingStore) {
     assert_eq!(store.customer_by_user("u-d").await.unwrap(), Some(first));
 }
 
+/// `relink_customer` overwrites an existing link — the one operation
+/// `upsert_customer` deliberately refuses (`customer_one_row_per_user`
+/// above).
+pub async fn customer_relink_overwrites_existing_link(store: &dyn BillingStore) {
+    let customer = store
+        .upsert_customer(
+            CustomerUpsert::new("cust-relink-1", "stripe", "cus_relink_1", at(0))
+                .with_user("legacy-7"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(customer.user_id.as_deref(), Some("legacy-7"));
+
+    let relinked = store
+        .relink_customer("cust-relink-1", "tenant-scoped-7".to_string(), at(1))
+        .await
+        .unwrap()
+        .expect("customer exists");
+    assert_eq!(relinked.user_id.as_deref(), Some("tenant-scoped-7"));
+    assert_eq!(relinked.updated_at, at(1));
+
+    // The store agrees: old id is gone, new id resolves.
+    assert_eq!(store.customer_by_user("legacy-7").await.unwrap(), None);
+    assert_eq!(
+        store.customer_by_user("tenant-scoped-7").await.unwrap(),
+        Some(relinked)
+    );
+}
+
+/// Relinking a customer that does not exist is `Ok(None)`, not an error.
+pub async fn customer_relink_missing_customer_is_none(store: &dyn BillingStore) {
+    let result = store
+        .relink_customer("cust-relink-missing", "someone".to_string(), at(0))
+        .await
+        .unwrap();
+    assert_eq!(result, None);
+}
+
+/// Relinking onto a `user_id` another customer already holds is a conflict,
+/// not a silent double-link — the same partial-unique constraint
+/// `upsert_customer` observes (`customer_one_row_per_user`), now enforced on
+/// the write path that is allowed to overwrite a link.
+pub async fn customer_relink_conflicts_with_existing_target(store: &dyn BillingStore) {
+    store
+        .upsert_customer(
+            CustomerUpsert::new("cust-relink-2a", "stripe", "cus_relink_2a", at(0))
+                .with_user("already-claimed"),
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_customer(CustomerUpsert::new(
+            "cust-relink-2b",
+            "stripe",
+            "cus_relink_2b",
+            at(1),
+        ))
+        .await
+        .unwrap();
+
+    let err = store
+        .relink_customer("cust-relink-2b", "already-claimed".to_string(), at(2))
+        .await
+        .expect_err("target user_id is already linked to a different customer");
+    assert!(
+        matches!(err, autumn_billing::BillingError::Conflict(_)),
+        "expected Conflict, got {err:?}"
+    );
+    // Nothing changed.
+    let unchanged = store
+        .customer_by_id("cust-relink-2b")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.user_id, None);
+}
+
 /// The same event again (same instant, same status) is `Unchanged`, also
 /// for a terminal row.
 pub async fn subscription_unchanged_redelivery(store: &dyn BillingStore) {
@@ -1213,6 +1290,9 @@ pub async fn run_contract(store: &dyn BillingStore) {
     open_dunning_ordered_and_filtered(store).await;
     open_dunning_for_subscription_is_scoped_and_filtered(store).await;
     customer_one_row_per_user(store).await;
+    customer_relink_overwrites_existing_link(store).await;
+    customer_relink_missing_customer_is_none(store).await;
+    customer_relink_conflicts_with_existing_target(store).await;
     subscription_unchanged_redelivery(store).await;
     subscription_missing_fields_keep_stored_values(store).await;
     invoice_unchanged_redelivery(store).await;
@@ -1253,6 +1333,9 @@ mod memory {
         open_dunning_ordered_and_filtered,
         open_dunning_for_subscription_is_scoped_and_filtered,
         customer_one_row_per_user,
+        customer_relink_overwrites_existing_link,
+        customer_relink_missing_customer_is_none,
+        customer_relink_conflicts_with_existing_target,
         subscription_unchanged_redelivery,
         subscription_missing_fields_keep_stored_values,
         invoice_unchanged_redelivery,

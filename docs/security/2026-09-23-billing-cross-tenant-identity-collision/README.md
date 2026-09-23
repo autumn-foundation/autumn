@@ -10,7 +10,8 @@ by `SessionUser` (`routes.rs`: `checkout`, `portal`, `subscription`) and
 `POST {prefix}/checkout`, and any app handler guarded by `Entitled<R>`
 **Affected:** `autumn-billing` every release through 0.7.0, for any app that
 combines `BillingPlugin` with Autumn's tenancy feature
-**Status:** fixed — `autumn-billing/src/gate.rs`, `hooks.rs`, `model.rs`
+**Status:** fixed — `autumn-billing/src/gate.rs`, `hooks.rs`, `model.rs`,
+`store/mod.rs`, `store/memory.rs`, `store/db.rs`
 
 ## 🎯 Surface
 
@@ -122,29 +123,37 @@ explicitly documents its own "same-tenant only" limitation with a real
 ## 🩹 Fix
 
 `gate.rs`'s `user_id_in` now folds `CURRENT_TENANT` into the identity via a
-new `scope_identity_to_tenant`: `{tenant}\u{1}{user_id}` when a tenant is in
-scope (a `\u{1}` control byte — never contained in a resolved tenant id or an
-ordinary application user id — so the two components can never be
-misattributed), unchanged (`user_id` verbatim) when tenancy is disabled or
-the route is tenancy-exempt. Every billing store read and write already
-funnels through this one function, so `checkout`, `portal`, `subscription`,
-and `Entitled<R>` are all fixed together, and a non-tenant app's stored
-identity — and its `billing_customers` rows — is byte-identical to before.
+new `scope_identity_to_tenant`, when a tenant is in scope, unchanged
+(`user_id` verbatim) when tenancy is disabled or the route is
+tenancy-exempt. Every billing store read and write already funnels through
+this one function, so `checkout`, `portal`, `subscription`, and
+`Entitled<R>` are all fixed together, and a non-tenant app's stored identity
+— and its `billing_customers` rows — is byte-identical to before.
 
-A plain separator rather than a hash (unlike `#[cached]`'s tenant-folding,
-which hashes) was deliberate: `Customer.user_id` is also handed to
+The identity is a length-prefixed encoding,
+`{MARKER}{tenant.len()}:{tenant}{user_id}` (`encode_tenant_scope`), not a
+bare `{tenant}{SEP}{user_id}` join — see Blast radius for why a plain
+separator was tried first and is not injective once the tenant string itself
+can contain the separator (`autumn_web::tenancy`'s `session`/`jwt` sources
+place no character-set restriction on it). Length-prefixing makes the split
+point unambiguous regardless of what either component contains, the same
+reasoning `idempotency.rs`'s length-prefixed key components exist for.
+
+Unhashed rather than hashed (unlike `#[cached]`'s tenant-folding, which
+hashes) was deliberate: `Customer.user_id` is also handed to
 `BillingHooks::recipient_for`, documented as "the application user id" and
 default-implemented as `user_id.parse::<i64>()`. Hashing would have made the
 original id unrecoverable and silently broken every tenancy-enabled app's
-notifications. The default `recipient_for` now strips the tenant prefix
-(splitting on the last separator) before parsing, so it is unchanged in
-behavior; see Compatibility for what a custom hook implementation needs.
+notifications. The default `recipient_for` now calls the new
+`gate::strip_tenant_scope` before parsing, so it is unchanged in behavior;
+see Compatibility for what a custom hook implementation needs.
 
 ## ✅ Verification
 
 ```
-cargo test -p autumn-billing --test integration          # 164 passed, 0 failed
-cargo test -p autumn-billing --test mirror_db             # 24 passed, 3 ignored (Docker)
+cargo test -p autumn-billing --lib                        # 81 passed (incl. gate::tenant_scope_tests)
+cargo test -p autumn-billing --test integration           # 167 passed, 0 failed
+cargo test -p autumn-billing --test mirror_db              # 27 passed, 3 ignored (Docker)
 cargo test -p autumn-billing --test dunning_close_scan_profile
 cargo test -p autumn-billing --test dunning_rearm_pending_profile
 cargo fmt -p autumn-billing -- --check
@@ -188,6 +197,57 @@ is byte-identical to pre-fix (no behavior change for non-tenant apps); reran
 with the two tenants swapped (widgets pays, acme is the unrelated user) to
 confirm the fix is symmetric, not an artifact of seeding order.
 
+**Codex's automated PR review caught two more real gaps**, both against the
+separator-based fix (commit `0d450a7`), reviewed and fixed here:
+
+1. **P1 — the separator itself was not injective.** `autumn_web::tenancy`'s
+   `session` and `jwt` sources place no character-set restriction on the
+   resolved tenant string (`autumn/src/tenancy.rs`: both reject only an
+   empty string after `trim()`), so a bare `{tenant}{SEP}{user_id}` join was
+   not unambiguous: tenant `"a"` with user id `"b{SEP}c"` and tenant
+   `"a{SEP}b"` with user id `"c"` folded to the identical string — the exact
+   cross-tenant collision this whole fix exists to close, reopened by the
+   fix's own separator. Fixed by length-prefixing the tenant instead
+   (`{MARKER}{tenant.len()}:{tenant}{user_id}`, `autumn-billing/src/gate.rs`'s
+   `encode_tenant_scope`/`strip_tenant_scope`), the same reasoning
+   `idempotency.rs`'s length-prefixed key components already use, kept
+   unhashed so the id stays recoverable. Verified with a new unit test,
+   `gate::tenant_scope_tests::injective_even_when_a_component_contains_the_marker`,
+   that reproduces exactly this collision and asserts the two encodings now
+   differ (plus round-trip, embedded-colon, legacy-bare-id, and
+   malformed-input-does-not-panic cases in the same module).
+2. **P1 — no path to relink a pre-existing customer after enabling
+   tenancy.** For an app that already had `BillingPlugin` mounted and
+   *then* turned on tenancy, every existing `billing_customers` row keeps
+   its old bare `user_id` — but the fix means every lookup now keys on the
+   tenant-scoped form, so the row goes dark immediately, not
+   "indistinguishably" as this ledger and the migration guide originally
+   (incorrectly) characterized it. Worse, `upsert_customer` deliberately
+   never replaces an existing link, so even a fresh checkout does not
+   repair it — it silently creates a **second** provider customer instead.
+   There was no existing store API that could fix this safely (an automatic
+   fallback to the bare key would just reopen the collision this PR closes).
+   Fixed by adding `BillingStore::relink_customer` — a new, explicit,
+   overwrite-capable store method restricted to operator-driven migrations
+   (never called from request-handling or webhook code), implemented for
+   both `MemoryBillingStore` and `DbBillingStore`, returning
+   `BillingError::Conflict` if the target id already links a different
+   customer. Covered by three new `store_contract.rs` properties
+   (`customer_relink_overwrites_existing_link`,
+   `customer_relink_missing_customer_is_none`,
+   `customer_relink_conflicts_with_existing_target`), which — per that
+   file's own contract-suite pattern — run against `MemoryBillingStore` here
+   and against `DbBillingStore` in `tests/mirror_db.rs`. The migration guide
+   now gives the concrete relink recipe using the new
+   `gate::scope_identity` + `store().relink_customer(...)` pair.
+
+Re-verified after both fixes: full `autumn-billing` lib tests (81, up from
+76, the 5 new `gate::tenant_scope_tests`), `--test integration` (167, up
+from 164), `--test mirror_db` (27, up from 24), `cargo fmt`/
+`clippy -D warnings` clean, `cargo check --all-targets` clean, and
+`./scripts/check-docs-symbols.sh` / `check-migration-guides.sh` /
+`check-changelog-fragments.sh` all still green.
+
 ## 📡 Blast radius
 
 Swept the same shape ("a framework or plugin identity/cache/rate-limit key
@@ -213,25 +273,38 @@ an app combining `BillingPlugin` with tenancy.
 ## 📜 Compatibility
 
 - **Behavior change, tenancy-enabled apps only:** `Customer.user_id`, and
-  therefore the string `BillingHooks::recipient_for` receives, is now
-  `{tenant}\u{1}{user_id}` rather than the bare session id. Both
-  `Customer.user_id`'s doc comment and `BillingHooks::recipient_for`'s are
-  updated to say so.
+  therefore the string `BillingHooks::recipient_for` receives, is now an
+  opaque, tenant-scoped identity rather than the bare session id. The exact
+  wire format (length-prefixed, see Fix) is deliberately not public API and
+  not documented as stable — only `strip_tenant_scope` and `scope_identity`
+  are. Both `Customer.user_id`'s doc comment and
+  `BillingHooks::recipient_for`'s are updated to say so.
 - The **default** `recipient_for` implementation is unaffected: it now
-  strips the tenant prefix before parsing, so `user_id.parse::<i64>()`
+  calls `strip_tenant_scope` before parsing, so `user_id.parse::<i64>()`
   succeeds exactly as before.
 - A custom `BillingHooks::recipient_for` override that assumed the bare
   session id needs the same one-line change: call the new
   `autumn_billing::gate::strip_tenant_scope(user_id)` before parsing — but
   only if the app runs `BillingPlugin` under tenancy, which
   `docs/guide/billing.md` never documented as supported in the first place.
+- **New public API:** `autumn_billing::gate::{scope_identity, strip_tenant_scope}`
+  (build/recover a tenant-scoped identity explicitly, for operator tooling)
+  and `BillingStore::relink_customer` (overwrite an existing customer's
+  `user_id` link — see Fix). `TENANT_IDENTITY_MARKER` and the wire format
+  stay `pub(crate)`.
 - No config default changed, no route status code or response shape
-  changed, no existing public function signature changed. The only new
-  public API is `autumn_billing::gate::strip_tenant_scope`, the recovery
-  half of the identity scoping — the separator itself
-  (`TENANT_IDENTITY_SEPARATOR`) stays `pub(crate)`.
+  changed, no existing public function or trait method signature changed —
+  `relink_customer` is additive to the `BillingStore` trait, so any external
+  implementor of that trait needs to add it (the crate ships
+  `MemoryBillingStore` and `DbBillingStore`; no other implementor is known).
 - Non-tenant apps (tenancy disabled, the overwhelming majority of
   `autumn-billing` users per the docs) see byte-identical behavior.
+- **An app enabling tenancy after `BillingPlugin` already had paying
+  customers** must relink each pre-existing `billing_customers` row via the
+  new `relink_customer` — see the migration guide. This was NOT true of the
+  original fix's characterization ("indistinguishable in practice"); Codex's
+  review caught that the impact is immediate and the row does not
+  self-heal.
 - `CHANGELOG.md`: fragment added at `changelog.d/billing-tenant-scoped-identity.md`.
 
 ## 🗂 Ledger

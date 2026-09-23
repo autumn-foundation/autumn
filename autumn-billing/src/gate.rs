@@ -328,18 +328,27 @@ pub async fn session_user_id(
     user_id_in(&session, state).await
 }
 
-/// Separator between the tenant and the raw session user id in a
-/// tenant-scoped billing identity ([`scope_identity_to_tenant`]).
+/// Marker byte opening a tenant-scoped billing identity
+/// ([`scope_identity_to_tenant`]).
 ///
-/// A C0 control character rather than a printable one (`:`, `/`, …): a
-/// tenant id (resolved by Autumn's own `[tenancy]` config — a header
-/// allow-list, a subdomain map, a JWT claim) or an ordinary application user
-/// id can spell any printable character, so only a byte neither can contain
-/// makes `{tenant}{SEP}{user_id}` unambiguous to split back apart — the same
-/// reasoning `idempotency.rs`'s length-prefixed key components exist for.
-/// Kept as a plain separator rather than a hash so [`BillingHooks::recipient_for`](crate::hooks::BillingHooks::recipient_for)'s
-/// default implementation can still recover the raw id (see there).
-pub(crate) const TENANT_IDENTITY_SEPARATOR: char = '\u{1}';
+/// A C0 control character rather than a printable one (`:`, `/`, …): an
+/// ordinary application user id written before tenancy existed can spell any
+/// printable character, so a byte it is vanishingly unlikely to already
+/// start with is what lets [`strip_tenant_scope`] tell a scoped identity
+/// apart from a pre-existing bare one. It is NOT what separates the tenant
+/// from the user id within a scoped identity — `autumn_web::tenancy`'s
+/// `session` and `jwt` sources hand back whatever string the app's own
+/// session value or JWT claim contains, with no character-set restriction,
+/// so a tenant string can itself contain this same byte. Splitting on it
+/// (as an earlier version of this fix did) is then not injective: tenant `a`
+/// with user id `b{MARKER}c` and tenant `a{MARKER}b` with user id `c` fold
+/// to the identical string, reopening the exact cross-tenant collision this
+/// scoping exists to close. [`scope_identity_to_tenant`] instead
+/// length-prefixes the tenant — the same reasoning `idempotency.rs`'s
+/// length-prefixed key components exist for, kept unhashed here so
+/// [`BillingHooks::recipient_for`](crate::hooks::BillingHooks::recipient_for)'s
+/// default implementation can still recover the raw id.
+pub(crate) const TENANT_IDENTITY_MARKER: char = '\u{1}';
 
 /// The non-empty user id stored under the configured auth session key,
 /// scoped to the ambient tenant when one is in scope.
@@ -367,8 +376,11 @@ pub(crate) const TENANT_IDENTITY_SEPARATOR: char = '\u{1}';
 ///
 /// **Compatibility:** under tenancy, this — and therefore `Customer.user_id`
 /// and whatever [`BillingHooks::recipient_for`](crate::hooks::BillingHooks::recipient_for)
-/// receives — is now `{tenant}{TENANT_IDENTITY_SEPARATOR}{user_id}`, not the
-/// bare session id. See that hook's doc for how to recover the raw id.
+/// receives — is now an opaque, tenant-scoped identity, not the bare session
+/// id. Recover the raw id with [`strip_tenant_scope`]; a pre-existing
+/// `billing_customers` row keyed by the old bare id needs
+/// [`BillingStore::relink_customer`](crate::store::BillingStore::relink_customer)
+/// to move it onto the new one (see the migration guide).
 async fn user_id_in(session: &Session, state: &AppState) -> Result<String, BillingError> {
     let user_id = session
         .get(state.auth_session_key())
@@ -378,21 +390,50 @@ async fn user_id_in(session: &Session, state: &AppState) -> Result<String, Billi
     Ok(scope_identity_to_tenant(user_id))
 }
 
+/// Build the tenant-scoped billing identity for `tenant`/`user_id` directly,
+/// without reading the ambient [`CURRENT_TENANT`](autumn_web::tenancy::CURRENT_TENANT).
+///
+/// For operator tooling only — an offline migration script has no request to
+/// resolve a tenant from. Request-handling code goes through
+/// [`session_user_id`], which resolves `tenant` from `CURRENT_TENANT` itself.
+#[must_use]
+pub fn scope_identity(tenant: &str, user_id: impl Into<String>) -> String {
+    encode_tenant_scope(tenant, &user_id.into())
+}
+
+/// Length-prefix `tenant` so the split point stays unambiguous no matter what
+/// bytes `tenant` or `user_id` themselves contain: `{MARKER}{tenant.len()}:{tenant}{user_id}`.
+/// [`strip_tenant_scope`] reads the decimal length up to the first `:` after
+/// the marker, then skips exactly that many bytes — never the marker or a
+/// `:` occurring anywhere inside `tenant` or `user_id`, since nothing before
+/// that first `:` can come from either of them.
+fn encode_tenant_scope(tenant: &str, user_id: &str) -> String {
+    format!("{TENANT_IDENTITY_MARKER}{}:{tenant}{user_id}", tenant.len())
+}
+
 /// Recover the raw session user id from a billing identity
 /// [`scope_identity_to_tenant`] may have tenant-scoped.
 ///
 /// A no-op when tenancy is disabled, or for an identity written before this
-/// existed (no separator present) — so it is safe to call unconditionally,
-/// as [`BillingHooks::recipient_for`](crate::hooks::BillingHooks::recipient_for)'s
-/// default implementation does. `TENANT_IDENTITY_SEPARATOR` itself stays
-/// `pub(crate)`: this function, not the raw separator, is the stable surface
-/// a custom `recipient_for` override recovers the bare id through.
+/// existed, or for anything else that does not parse as this crate's own
+/// encoding (no marker, no `:`-terminated length, or too short) — so it is
+/// safe to call unconditionally, as
+/// [`BillingHooks::recipient_for`](crate::hooks::BillingHooks::recipient_for)'s
+/// default implementation does. Neither `TENANT_IDENTITY_MARKER` nor the
+/// wire format is public API: this function is the stable surface a custom
+/// `recipient_for` override recovers the bare id through.
 #[must_use]
 pub fn strip_tenant_scope(user_id: &str) -> &str {
-    user_id
-        .rsplit(TENANT_IDENTITY_SEPARATOR)
-        .next()
-        .unwrap_or(user_id)
+    let Some(rest) = user_id.strip_prefix(TENANT_IDENTITY_MARKER) else {
+        return user_id;
+    };
+    let Some((len, rest)) = rest.split_once(':') else {
+        return user_id;
+    };
+    let Ok(tenant_len) = len.parse::<usize>() else {
+        return user_id;
+    };
+    rest.get(tenant_len..).unwrap_or(user_id)
 }
 
 /// Fold the request's ambient `CURRENT_TENANT` into a billing identity.
@@ -402,7 +443,60 @@ fn scope_identity_to_tenant(user_id: String) -> String {
         .ok()
         .flatten();
     match tenant {
-        Some(tenant) => format!("{tenant}{TENANT_IDENTITY_SEPARATOR}{user_id}"),
+        Some(tenant) => encode_tenant_scope(&tenant, &user_id),
         None => user_id,
+    }
+}
+
+#[cfg(test)]
+mod tenant_scope_tests {
+    use super::{scope_identity, strip_tenant_scope};
+
+    /// `strip_tenant_scope` recovers exactly what `scope_identity` encoded.
+    #[test]
+    fn round_trips() {
+        let scoped = scope_identity("acme", "7");
+        assert_eq!(strip_tenant_scope(&scoped), "7");
+    }
+
+    /// A separator-based encoding would fold tenant `"a"`/user `"b\u{1}c"`
+    /// and tenant `"a\u{1}b"`/user `"c"` to the identical string — Autumn's
+    /// `session`/`jwt` tenancy sources place no character-set restriction on
+    /// the resolved tenant, so this is not a hypothetical input. The
+    /// length-prefixed encoding must tell the two apart.
+    #[test]
+    fn injective_even_when_a_component_contains_the_marker() {
+        let a = scope_identity("a", "b\u{1}c");
+        let b = scope_identity("a\u{1}b", "c");
+        assert_ne!(a, b, "distinct (tenant, user_id) pairs must not collide");
+        assert_eq!(strip_tenant_scope(&a), "b\u{1}c");
+        assert_eq!(strip_tenant_scope(&b), "c");
+    }
+
+    /// A colon right after the length digits — inside the tenant, not as the
+    /// length/tenant delimiter — must not confuse the parse.
+    #[test]
+    fn tenant_containing_a_colon_still_round_trips() {
+        let scoped = scope_identity("ten:ant", "user:42");
+        assert_eq!(strip_tenant_scope(&scoped), "user:42");
+    }
+
+    /// A bare id written before tenancy existed (no marker) passes through
+    /// unchanged rather than being misparsed.
+    #[test]
+    fn legacy_bare_id_is_unaffected() {
+        assert_eq!(strip_tenant_scope("42"), "42");
+    }
+
+    /// Malformed input that merely starts with the marker (truncated,
+    /// non-numeric length, or a length longer than what follows) degrades to
+    /// returning the input unchanged rather than panicking on a bad slice
+    /// index.
+    #[test]
+    fn malformed_scoped_looking_input_does_not_panic() {
+        assert_eq!(strip_tenant_scope("\u{1}"), "\u{1}");
+        assert_eq!(strip_tenant_scope("\u{1}abc:x"), "\u{1}abc:x");
+        assert_eq!(strip_tenant_scope("\u{1}999:short"), "\u{1}999:short");
+        assert_eq!(strip_tenant_scope("\u{1}3:ab"), "\u{1}3:ab");
     }
 }

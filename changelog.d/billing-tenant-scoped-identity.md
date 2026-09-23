@@ -19,10 +19,13 @@
   session's own id. Apps without tenancy enabled compute the same identity as
   before — `CURRENT_TENANT` resolves to `None` in both cases.
   **Breaking:** for tenancy-enabled apps only, `Customer.user_id`, and
-  therefore whatever `BillingHooks::recipient_for` receives, is now
-  `{tenant}\u{1}{user_id}` rather than the bare session id. See the
-  [migration guide](docs/migrations/next.md#autumn-billing-customeruser_id-is-tenant-scoped-under-tenancy).
-  The default
-  `recipient_for` strips the tenant prefix before parsing, so it is
-  unaffected; a custom override needs the same one-line change. See
+  therefore whatever `BillingHooks::recipient_for` receives, is now an
+  opaque, tenant-scoped identity rather than the bare session id — recover
+  the raw id with the new `autumn_billing::gate::strip_tenant_scope`. See the
+  [migration guide](docs/migrations/next.md#autumn-billing-customeruser_id-is-tenant-scoped-under-tenancy),
+  which also covers relinking a pre-existing `billing_customers` row (via
+  the new `BillingStore::relink_customer`) for an app enabling tenancy after
+  it already had paying customers. The default `recipient_for` already
+  calls `strip_tenant_scope`, so it is unaffected; a custom override needs
+  the same one-line change. See
   `docs/security/2026-09-23-billing-cross-tenant-identity-collision/`.
