@@ -477,6 +477,22 @@ jobs:
             integration::scaffold_validation::constrained_scaffold_cargo_checks \
             -- --ignored --exact
 
+      # ── Onramp: the documented quickstart scaffold must build warning-free ──
+      #
+      # The literal `docs/guide/generators.md` example
+      # (`Post title:String body:Text published:bool`) used to leave three
+      # unused-import/unused-variable warnings in the generated routes.rs —
+      # not a `cargo build` failure, but a hard failure of the generated
+      # project's OWN `ci.yml.tmpl` (`cargo clippy --all-targets -- -D
+      # warnings`), i.e. red CI on a brand-new user's first push. Same
+      # `cli_tests` caveat as the blocks above — named explicitly here or it
+      # never runs anywhere.
+      - name: documented_scaffold_example_builds_without_warnings
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_validation::documented_scaffold_example_builds_without_warnings \
+            -- --ignored --exact
+
       # ── cli_tests per-test triage (#1945) ───────────────────────────────
       #
       # These `#[ignore]`d tests each scaffold a fresh project and cargo-check

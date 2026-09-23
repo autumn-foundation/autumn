@@ -1664,7 +1664,8 @@ jobs:
             --skip linked_seed_binary_cargo_checks \
             --skip serve_daemon_start_status_stop_over_unix_socket \
             --skip scaffolded_json_field_generates_compiles_inserts_and_selects \
-            --skip scrubbed_database_migrates_clean_and_boots_the_app
+            --skip scrubbed_database_migrates_clean_and_boots_the_app \
+            --skip documented_scaffold_example_builds_without_warnings
           # Consolidated `integration_tests` binary: discover-and-run ALL the
           # Docker/testcontainer `#[ignore]`d DB tests instead of a hand-curated
           # per-feature allowlist (#1923). Enabling `test-support` (testcontainers)

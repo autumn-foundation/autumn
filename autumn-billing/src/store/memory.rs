@@ -210,6 +210,38 @@ impl BillingStore for MemoryBillingStore {
         }))
     }
 
+    fn relink_customer<'a>(
+        &'a self,
+        id: &'a str,
+        user_id: String,
+        now: DateTime<Utc>,
+    ) -> StoreFuture<'a, Option<Customer>> {
+        ready(self.lock().and_then(|mut inner| {
+            // Existence first, matching the DB backend: a missing `id` is
+            // `Ok(None)` even when `user_id` is already claimed elsewhere —
+            // relinking a customer that does not exist is not a conflict.
+            if !inner.customers.contains_key(id) {
+                return Ok(None);
+            }
+            if let Some(conflict) = inner
+                .customers
+                .values()
+                .find(|c| c.id != id && c.user_id.as_deref() == Some(user_id.as_str()))
+            {
+                return Err(BillingError::Conflict(format!(
+                    "user_id {user_id} already links customer {}",
+                    conflict.id
+                )));
+            }
+            let Some(row) = inner.customers.get_mut(id) else {
+                return Ok(None);
+            };
+            row.user_id = Some(user_id);
+            row.updated_at = now;
+            Ok(Some(row.clone()))
+        }))
+    }
+
     fn upsert_subscription(
         &self,
         upsert: SubscriptionUpsert,

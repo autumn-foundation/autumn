@@ -651,13 +651,13 @@ async fn main() {
         assert!(main.contains("mod policies;"), "{main}");
         assert!(
             main.contains(
-                ".policy::<crate::models::post::Post, _>(crate::policies::post::PostPolicy::default())"
+                ".policy::<crate::models::post::Post, _>(crate::policies::post::PostPolicy)"
             ),
             "{main}"
         );
         assert!(
             main.contains(
-                ".scope::<crate::models::post::Post, _>(crate::policies::post::PostScope::default())"
+                ".scope::<crate::models::post::Post, _>(crate::policies::post::PostScope)"
             ),
             "{main}"
         );
@@ -686,15 +686,11 @@ async fn main() {
 
         let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
         assert!(
-            main.contains(
-                ".policy::<crate::models::Post, _>(crate::policies::post::PostPolicy::default())"
-            ),
+            main.contains(".policy::<crate::models::Post, _>(crate::policies::post::PostPolicy)"),
             "single-file layout policy registration must use crate::models::Post: {main}"
         );
         assert!(
-            main.contains(
-                ".scope::<crate::models::Post, _>(crate::policies::post::PostScope::default())"
-            ),
+            main.contains(".scope::<crate::models::Post, _>(crate::policies::post::PostScope)"),
             "single-file layout scope registration must use crate::models::Post: {main}"
         );
     }

@@ -91,3 +91,32 @@ generate policy	docs/guide/generators.md
 # and `index.md`, which describes the page as "uploading a file" — the index
 # author reached for the reader's word that the page itself never used.
 file uploads	docs/guide/storage.md
+
+# --- Receiving mail -------------------------------------------------------
+# All eight failed cold before this change. `docs/guide/mail.md` is the page a
+# reader lands on for "email" and it was send-only: mailers, templates,
+# previews, delivery, transports. Its own index entry said so ("mailers,
+# templates, previews, and delivery"). Receiving — `#[inbound_mail]`, the
+# `InboundMailRouter`, the Mailgun/SES/generic webhook endpoints — appeared on
+# NO reader-facing page, while `macro-transparency.md` pointed at mail.md twice
+# "for the subsystem itself".
+#
+# "inbound mail" was the one that did not land nowhere: it landed on
+# `macro-transparency.md`'s `#[inbound_mail(to = "...", processing = "...")]`
+# heading — a macro-EXPANSION reference. A reader searching for how to receive
+# email read generated-code internals as the answer.
+inbound email	docs/guide/mail.md
+inbound mail	docs/guide/mail.md
+receiving email	docs/guide/mail.md
+email webhook	docs/guide/mail.md
+reply by email	docs/guide/mail.md
+mailgun	docs/guide/mail.md
+ses	docs/guide/mail.md
+generate inbound mail	docs/guide/generators.md
+# "receive email", "incoming email" and "bounce handling" also miss cold and are
+# deliberately NOT admitted. Closing them means a heading written for the
+# matcher rather than the reader — "receiving" is the word the section actually
+# uses, "inbound" is the word the framework uses, and neither page has a reason
+# to say "incoming". Same reasoning as "gzip" and "policy generator" above: a
+# phrasing question is a different defect from the coverage one this change
+# closes, and it gets its own change on its own evidence.

@@ -185,11 +185,6 @@ BACKLOG = {
         'find nothing. Distinct from the documented `autumn openapi export` '
         'and `autumn data export`, which is why a text matcher reported it '
         'covered and `resolve()` does not.',
-    'generate inbound-mail':
-        'generators.md documents the generator family but omits this one; it '
-        'also strands `destroy inbound-mail`, since the reversal rule covers '
-        'a subcommand only once its `generate` half is documented.',
-    'destroy inbound-mail': 'stranded by `generate inbound-mail`; see above.',
     'schema parse':
         '`autumn schema` is marked experimental in its own doc comment '
         '("Slices 2-3 ship `parse` and `snapshot`; `diff`/… arrive in later '

@@ -139,7 +139,7 @@ Looking for the API reference instead? That is
 
 ## Mail
 
-- [Mail](mail.md) — mailers, templates, previews, and delivery
+- [Mail](mail.md) — mailers, templates, previews, delivery, and receiving inbound email
 - [Mail Compliance](mail-compliance.md) — `List-Unsubscribe` and the one-click unsubscribe route
 
 ## APIs, webhooks and integrations

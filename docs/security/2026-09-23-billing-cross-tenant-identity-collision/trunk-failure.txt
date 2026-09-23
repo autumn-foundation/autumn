@@ -1,0 +1,170 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.51s
+     Running tests/integration.rs (target/debug/deps/integration-390f63e2ad72d450)
+
+running 2 tests
+
+thread 'cases::routes::portal_does_not_hand_a_hosted_session_to_another_tenants_customer' (7052) panicked at autumn-billing/tests/cases/routes.rs:820:9:
+assertion `left != right` failed: tenant widgets must not be handed a hosted portal session for tenant acme's Stripe customer just because their shard-local user ids collide as "7" (got a redirect to Some("https://portal.fake/cus_seeded_7"))
+  left: 303
+ right: 303
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/panicking.rs:434:23
+   3: core::panicking::assert_failed
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/panicking.rs:394:5
+   4: {async_block#0}
+             at ./tests/cases/routes.rs:820:9
+   5: {closure#0}<core::option::Option<alloc::string::String>, integration::cases::routes::portal_does_not_hand_a_hosted_session_to_another_tenants_customer::{async_block#0}::{async_block_env#0}>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/task_local.rs:401:35
+   6: tokio::task::task_local::LocalKey<T>::scope_inner
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/task_local.rs:217:19
+   7: <tokio::task::task_local::TaskLocalFuture<T,F> as core::future::future::Future>::poll
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/task_local.rs:399:14
+   8: {async_fn#0}<integration::cases::routes::portal_does_not_hand_a_hosted_session_to_another_tenants_customer::{async_block#0}::{async_block_env#0}, ()>
+             at /home/user/autumn/autumn/src/tenancy.rs:59:51
+   9: {async_block#0}
+             at ./tests/cases/routes.rs:830:6
+  10: poll<&mut dyn core::future::future::Future<Output=()>>
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/future/future.rs:133:9
+  11: poll<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/future/future.rs:133:9
+  12: {closure#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:830:70
+  13: with_budget<core::task::poll::Poll<()>, tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure#0}::{closure#0}::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/coop/mod.rs:167:5
+  14: budget<core::task::poll::Poll<()>, tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure#0}::{closure#0}::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/coop/mod.rs:133:5
+  15: {closure#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:830:25
+  16: tokio::runtime::scheduler::current_thread::Context::enter
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:488:19
+  17: {closure#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:829:44
+  18: tokio::runtime::scheduler::current_thread::CoreGuard::enter::{{closure}}
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:906:68
+  19: tokio::runtime::context::scoped::Scoped<T>::set
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context/scoped.rs:40:9
+  20: tokio::runtime::context::set_scheduler::{{closure}}
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context.rs:187:38
+  21: try_with<tokio::runtime::context::Context, tokio::runtime::context::set_scheduler::{closure_env#0}<(alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<()>), tokio::runtime::scheduler::current_thread::{impl#9}::enter::{closure_env#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>, core::option::Option<()>>>, (alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<()>)>
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/thread/local.rs:513:12
+  22: std::thread::local::LocalKey<T>::with
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/thread/local.rs:477:20
+  23: tokio::runtime::context::set_scheduler
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context.rs:187:17
+  24: tokio::runtime::scheduler::current_thread::CoreGuard::enter
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:906:27
+  25: tokio::runtime::scheduler::current_thread::CoreGuard::block_on
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:817:24
+  26: {closure#0}<core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:218:33
+  27: tokio::runtime::context::runtime::enter_runtime
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context/runtime.rs:65:16
+  28: block_on<core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:206:9
+  29: tokio::runtime::runtime::Runtime::block_on_inner
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/runtime.rs:374:52
+  30: block_on<core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/runtime.rs:343:18
+  31: portal_does_not_hand_a_hosted_session_to_another_tenants_customer
+             at ./tests/cases/routes.rs:830:11
+  32: integration::cases::routes::portal_does_not_hand_a_hosted_session_to_another_tenants_customer::{{closure}}
+             at ./tests/cases/routes.rs:802:77
+  33: core::ops::function::FnOnce::call_once
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/ops/function.rs:250:5
+  34: core::ops::function::FnOnce::call_once
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'cases::routes::subscription_does_not_leak_across_tenants_sharing_a_shard_local_user_id' (7053) panicked at autumn-billing/tests/cases/routes.rs:791:9:
+assertion `left == right` failed: tenant widgets' own unrelated user must not inherit tenant acme's paid subscription just because their shard-local user ids happen to collide as "7": {"entitled":true,"plan":{"entitlements":["export"],"id":"pro","interval":"month","name":"Pro","price":{"currency":"USD","minor":1999},"provider_price_id":"price_pro_monthly"},"subscription":{"cancel_at_period_end":false,"created_at":"2026-09-10T12:00:00Z","current_period_end":"2026-10-10T12:00:00Z","customer_id":"cust-7","id":"sub-cust-7","last_event_at":"2026-09-10T12:00:00Z","plan_id":"pro","provider_price_id":"price_pro_monthly","provider_subscription_id":"sub_cust-7","quantity":1,"status":"active","updated_at":"2026-09-10T12:00:00Z"}}
+  left: Bool(true)
+ right: false
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/panicking.rs:434:23
+   3: core::panicking::assert_failed
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/panicking.rs:394:5
+   4: {async_block#1}
+             at ./tests/cases/routes.rs:791:9
+   5: {closure#0}<core::option::Option<alloc::string::String>, integration::cases::routes::subscription_does_not_leak_across_tenants_sharing_a_shard_local_user_id::{async_block#0}::{async_block_env#1}>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/task_local.rs:401:35
+   6: tokio::task::task_local::LocalKey<T>::scope_inner
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/task_local.rs:217:19
+   7: <tokio::task::task_local::TaskLocalFuture<T,F> as core::future::future::Future>::poll
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/task_local.rs:399:14
+   8: {async_fn#0}<integration::cases::routes::subscription_does_not_leak_across_tenants_sharing_a_shard_local_user_id::{async_block#0}::{async_block_env#1}, ()>
+             at /home/user/autumn/autumn/src/tenancy.rs:59:51
+   9: {async_block#0}
+             at ./tests/cases/routes.rs:798:6
+  10: poll<&mut dyn core::future::future::Future<Output=()>>
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/future/future.rs:133:9
+  11: poll<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/future/future.rs:133:9
+  12: {closure#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:830:70
+  13: with_budget<core::task::poll::Poll<()>, tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure#0}::{closure#0}::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/coop/mod.rs:167:5
+  14: budget<core::task::poll::Poll<()>, tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure#0}::{closure#0}::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/coop/mod.rs:133:5
+  15: {closure#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:830:25
+  16: tokio::runtime::scheduler::current_thread::Context::enter
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:488:19
+  17: {closure#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:829:44
+  18: tokio::runtime::scheduler::current_thread::CoreGuard::enter::{{closure}}
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:906:68
+  19: tokio::runtime::context::scoped::Scoped<T>::set
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context/scoped.rs:40:9
+  20: tokio::runtime::context::set_scheduler::{{closure}}
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context.rs:187:38
+  21: try_with<tokio::runtime::context::Context, tokio::runtime::context::set_scheduler::{closure_env#0}<(alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<()>), tokio::runtime::scheduler::current_thread::{impl#9}::enter::{closure_env#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>, core::option::Option<()>>>, (alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<()>)>
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/thread/local.rs:513:12
+  22: std::thread::local::LocalKey<T>::with
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/thread/local.rs:477:20
+  23: tokio::runtime::context::set_scheduler
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context.rs:187:17
+  24: tokio::runtime::scheduler::current_thread::CoreGuard::enter
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:906:27
+  25: tokio::runtime::scheduler::current_thread::CoreGuard::block_on
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:817:24
+  26: {closure#0}<core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:218:33
+  27: tokio::runtime::context::runtime::enter_runtime
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context/runtime.rs:65:16
+  28: block_on<core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:206:9
+  29: tokio::runtime::runtime::Runtime::block_on_inner
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/runtime.rs:374:52
+  30: block_on<core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/runtime.rs:343:18
+  31: subscription_does_not_leak_across_tenants_sharing_a_shard_local_user_id
+             at ./tests/cases/routes.rs:798:11
+  32: integration::cases::routes::subscription_does_not_leak_across_tenants_sharing_a_shard_local_user_id::{{closure}}
+             at ./tests/cases/routes.rs:761:83
+  33: core::ops::function::FnOnce::call_once
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/ops/function.rs:250:5
+  34: core::ops::function::FnOnce::call_once
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/ops/function.rs:250:5
+test cases::routes::portal_does_not_hand_a_hosted_session_to_another_tenants_customer ... FAILED
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test cases::routes::subscription_does_not_leak_across_tenants_sharing_a_shard_local_user_id ... FAILED
+
+failures:
+
+failures:
+    cases::routes::portal_does_not_hand_a_hosted_session_to_another_tenants_customer
+    cases::routes::subscription_does_not_leak_across_tenants_sharing_a_shard_local_user_id
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 162 filtered out; finished in 0.19s
+
+error: test failed, to rerun pass `-p autumn-billing --test integration`
