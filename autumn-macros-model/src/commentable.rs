@@ -378,47 +378,63 @@ pub fn parse_commentable_attr(
     };
     // `type_name` alone is free-form (it is a bound *value*, never spliced into
     // SQL), but an empty discriminator would make every commentable model's
-    // rows indistinguishable, so it still has to say something.
-    let type_name = match pairs.get("type_name") {
-        None => model_ident.to_string(),
-        Some(parsed) if parsed.value.trim().is_empty() => {
-            return Err(syn::Error::new(
-                parsed.span,
-                "`type_name` in `#[commentable]` must not be empty: it is the \
-                 discriminator stored in `commentable_type`, and an empty one \
-                 cannot tell two models' comments apart",
-            ));
-        }
-        Some(parsed) => {
-            // The discriminator does not only land in a database column: the
-            // generic router matches it as ONE path segment
-            // (`/comments/{commentable_type}/{parent_id}`) and the widget
-            // interpolates it into an `hx-target` id selector. A name carrying
-            // `/` could never match the route; one carrying a space, `:`, `.`
-            // or `#` produces a selector that means something else entirely, so
-            // the thread would render and then never swap. Restrict it here,
-            // where the message can name the offending character, rather than
-            // let it fail as a mysterious 404 or a dead reply button.
-            let bad = parsed
-                .value
-                .chars()
-                .find(|c| !c.is_ascii_alphanumeric() && !matches!(c, '_' | '-'));
-            if let Some(bad) = bad {
-                return Err(syn::Error::new(
-                    parsed.span,
-                    format!(
-                        "`type_name` in `#[commentable]` may only contain ASCII \
-                         letters, digits, `_` and `-`, but this one contains \
-                         {bad:?}: the value is matched as a single URL path \
-                         segment by the generic router and interpolated into an \
-                         htmx id selector by the widget, and {bad:?} is valid in \
-                         neither"
-                    ),
-                ));
-            }
-            parsed.value.clone()
-        }
-    };
+    // rows indistinguishable, so it still has to say something. The default is
+    // the model's own Rust type name — and for a raw identifier (`struct
+    // r#type`, legal Rust) that spells `r#type`, which the router would then
+    // match as a path segment and the widget would interpolate into an id
+    // selector. The default goes through the same route/selector validation as
+    // the override (issue #2272): a name that cannot be made safe fails here
+    // with a directed message rather than as a mysterious 404 or a dead reply
+    // button at request time.
+    let (raw_type_name, type_name_span, is_default) = pairs.get("type_name").map_or_else(
+        || (model_ident.to_string(), model_ident.span(), true),
+        |parsed| (parsed.value.clone(), parsed.span, false),
+    );
+    if raw_type_name.trim().is_empty() {
+        return Err(syn::Error::new(
+            type_name_span,
+            "`type_name` in `#[commentable]` must not be empty: it is the \
+             discriminator stored in `commentable_type`, and an empty one \
+             cannot tell two models' comments apart",
+        ));
+    }
+    // The discriminator does not only land in a database column: the
+    // generic router matches it as ONE path segment
+    // (`/comments/{commentable_type}/{parent_id}`) and the widget
+    // interpolates it into an `hx-target` id selector. A name carrying
+    // `/` could never match the route; one carrying a space, `:`, `.`
+    // or `#` produces a selector that means something else entirely, so
+    // the thread would render and then never swap. Restrict it here,
+    // where the message can name the offending character, rather than
+    // let it fail as a mysterious 404 or a dead reply button.
+    let bad = raw_type_name
+        .chars()
+        .find(|c| !c.is_ascii_alphanumeric() && !matches!(c, '_' | '-'));
+    if let Some(bad) = bad {
+        // The one default that can trip this is a raw-identifier model name:
+        // name the explicit pin that fixes it.
+        let hint = if is_default {
+            let raw = model_ident.to_string();
+            let unraw = raw.strip_prefix("r#").unwrap_or(raw.as_str());
+            format!(
+                " The model name is a raw identifier; pin the discriminator explicitly with `type_name = \"{unraw}\"."
+            )
+        } else {
+            String::new()
+        };
+        return Err(syn::Error::new(
+            type_name_span,
+            format!(
+                "`type_name` in `#[commentable]` may only contain ASCII \
+                 letters, digits, `_` and `-`, but this one contains \
+                 {bad:?}: the value is matched as a single URL path \
+                 segment by the generic router and interpolated into an \
+                 htmx id selector by the widget, and {bad:?} is valid in \
+                 neither.{hint}"
+            ),
+        ));
+    }
+    let type_name = raw_type_name;
 
     Ok(CommentableSpec {
         author_model,
@@ -1165,6 +1181,35 @@ mod tests {
         assert!(parse(&quote! { (by = User, type_name = "BlogPost") }).is_ok());
         assert!(parse(&quote! { (by = User, type_name = "blog_post") }).is_ok());
         assert!(parse(&quote! { (by = User, type_name = "blog-post-v2") }).is_ok());
+    }
+
+    /// A raw-identifier model name (`struct r#type`, legal Rust) must not leak
+    /// the `r#` prefix into the discriminator (issue #2272): the default goes
+    /// through the same route/selector validation as an explicit `type_name`,
+    /// failing at compile time with a directed message instead of rendering
+    /// `/comments/r#type/…` — which a browser reads as a fragment, posting
+    /// every form to the wrong path — at request time.
+    #[test]
+    fn a_raw_identifier_model_name_gets_the_type_name_validation() {
+        let model: syn::Ident = syn::parse_quote!(r#type);
+        let attr: syn::Attribute = syn::parse_quote!(#[commentable(by = User)]);
+        let message = parse_commentable_attr(&attr, &model)
+            .expect_err("`r#type` must not become a `commentable_type` discriminator")
+            .to_string();
+        assert!(
+            message.contains("may only contain ASCII letters") && message.contains("id selector"),
+            "{message}"
+        );
+        // The offending character is named…
+        assert!(message.contains("'#'"), "{message}");
+        // …and the message directs at the explicit pin that fixes it.
+        assert!(message.contains("raw identifier"), "{message}");
+        assert!(message.contains("type_name = \"type\""), "{message}");
+
+        // A normal model name still defaults untouched.
+        let normal: syn::Ident = syn::parse_quote!(Post);
+        let spec = parse_commentable_attr(&attr, &normal).expect("`Post` is a fine default");
+        assert_eq!(spec.type_name, "Post");
     }
 
     /// Nothing joins to a display name without a table to read it from.
