@@ -283,11 +283,33 @@ the memory backend, matching the DB backend's order. New property:
 `customer_relink_missing_customer_is_none_even_with_a_conflicting_target`,
 run against both backends per `store_contract.rs`'s usual pattern.
 
-Re-verified after all four fixes: full `autumn-billing` lib tests (81, up
-from 76, the 5 new `gate::tenant_scope_tests`), `--test integration` (169,
-up from 164), `--test mirror_db` (28, up from 24), `cargo fmt`/
-`clippy -D warnings` clean, `cargo check --all-targets` clean, the
-documentation-build command above clean, and
+**A fifth finding**, on the following review round (commit `f3c1b1a5`, P2):
+`strip_tenant_scope` detects scoping by content, not provenance — it cannot
+tell "genuinely produced by `scope_identity_to_tenant`" apart from "a bare
+session id that already happens to start with `{MARKER}{digits}:`", since
+the two are indistinguishable byte-for-byte (Codex's example:
+`"\u{1}1:a7"` misparses to `"7"`, and also happens to be exactly what
+`scope_identity("a", "7")` produces). This is judged a **known, accepted
+limitation rather than a further fix**: closing it completely needs either a
+typed identity carrying its own scoped/raw provenance (a breaking API
+redesign well beyond this PR's scope) or rejecting the marker byte from
+every session/tenant value at the source (which cannot apply retroactively
+to a `user_id` an app already stored under `auth.session_key` before ever
+adopting this crate — the same backward-compatibility constraint that ruled
+out a full backfill in finding 2, above). Accepted specifically because
+`TENANT_IDENTITY_MARKER` is a raw C0 control byte: every `user_id` shape
+Autumn's own examples and `docs/guide/billing.md` produce — an integer
+primary key, a UUID — structurally cannot contain one. Documented explicitly
+on `strip_tenant_scope` (previously it undersold this as a clean
+"safe to call unconditionally" no-op fallback) and covered by a named test,
+`gate::tenant_scope_tests::known_limitation_a_bare_id_shaped_like_the_encoding_is_misclassified`,
+so the gap is deliberate and tracked rather than a silent surprise.
+
+Re-verified after all five findings: full `autumn-billing` lib tests (82, up
+from 76 — 6 `gate::tenant_scope_tests`, one added for this finding),
+`--test integration` (169, up from 164), `--test mirror_db` (28, up from
+24), `cargo fmt`/`clippy -D warnings` clean, `cargo check --all-targets`
+clean, the documentation-build command above clean, and
 `./scripts/check-docs-symbols.sh` / `check-migration-guides.sh` /
 `check-changelog-fragments.sh` all still green.
 

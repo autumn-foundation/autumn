@@ -429,9 +429,27 @@ fn encode_tenant_scope(tenant: &str, user_id: &str) -> String {
 /// encoding (no marker, no `:`-terminated length, or too short) — so it is
 /// safe to call unconditionally, as
 /// [`BillingHooks::recipient_for`](crate::hooks::BillingHooks::recipient_for)'s
-/// default implementation does. Neither `TENANT_IDENTITY_MARKER` nor the
-/// wire format is public API: this function is the stable surface a custom
-/// `recipient_for` override recovers the bare id through.
+/// default implementation and `routes.rs`'s `customer_for` both do. Neither
+/// `TENANT_IDENTITY_MARKER` nor the wire format is public API: this function
+/// is the stable surface a custom `recipient_for` override recovers the bare
+/// id through.
+///
+/// **Known, accepted limitation:** detection is content-based, not
+/// provenance-based — this function cannot tell "genuinely produced by
+/// `scope_identity_to_tenant`" apart from "a bare session id that happens to
+/// already start with `{MARKER}{digits}:`", because both are indistinguishable
+/// byte-for-byte. Closing this completely would need either a typed identity
+/// (carrying its own scoped/raw provenance rather than being a bare
+/// `String`) or rejecting the marker byte from every session/tenant value at
+/// the source — the former is a breaking API redesign this fix does not make
+/// unilaterally, the latter cannot apply retroactively to a `user_id` a
+/// pre-existing app already stored under `auth.session_key` before it ever
+/// adopted this crate. Accepted because `TENANT_IDENTITY_MARKER` is a raw C0
+/// control byte (`\u{1}`): every `user_id` shape Autumn's own examples and
+/// `docs/guide/billing.md` produce — an integer primary key, a UUID — cannot
+/// contain one, and an app whose session-stored identity can contain
+/// arbitrary bytes (unusual) should not treat this string as opaque metadata
+/// only, the same caveat `CustomerRequest.user_id` already carries.
 #[must_use]
 pub fn strip_tenant_scope(user_id: &str) -> &str {
     let Some(rest) = user_id.strip_prefix(TENANT_IDENTITY_MARKER) else {
@@ -508,5 +526,18 @@ mod tenant_scope_tests {
         assert_eq!(strip_tenant_scope("\u{1}abc:x"), "\u{1}abc:x");
         assert_eq!(strip_tenant_scope("\u{1}999:short"), "\u{1}999:short");
         assert_eq!(strip_tenant_scope("\u{1}3:ab"), "\u{1}3:ab");
+    }
+
+    /// Known, accepted limitation (see `strip_tenant_scope`'s doc): a bare
+    /// id that happens to be well-formed-looking scoped syntax is
+    /// misclassified, because detection is content-based, not
+    /// provenance-based. Documented here rather than left an undocumented
+    /// surprise — this is exactly why `TENANT_IDENTITY_MARKER` is a raw C0
+    /// control byte no realistic `user_id` (an integer id, a UUID) contains.
+    #[test]
+    fn known_limitation_a_bare_id_shaped_like_the_encoding_is_misclassified() {
+        let coincidental_bare_id = "\u{1}1:a7";
+        assert_eq!(strip_tenant_scope(coincidental_bare_id), "7");
+        assert_eq!(scope_identity("a", "7"), coincidental_bare_id);
     }
 }
