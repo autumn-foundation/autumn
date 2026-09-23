@@ -2433,10 +2433,17 @@ without also filling in the intake form above.
   accepts a workflow already present on the repository's default branch
   (`trunk-dev`). **Next step, for whichever pass finds this PR merged**:
   dispatch both `rerun_default_parallelism` and `rerun_serial_whole_binary`
-  with `iterations: "50"` against `trunk-dev`'s tip for the CI-native
-  confirmation of both figures (the jobs already exist — dispatch them,
-  don't reimplement them), and audit the intra-test/serial-mode mechanism
-  described above before proposing any fix — per this role's own process,
+  with `iterations: "100"` against `trunk-dev`'s tip for the CI-native
+  confirmation of both figures — a Codex review comment on PR #2922
+  correctly flagged that `iterations: "50"` (the workflow's default, and
+  what this pass would otherwise have recommended) has `0.99^50 ≈ 60.5%`
+  chance of reporting zero failures by luck alone at the observed serial
+  1% rate, not enough to confirm or refute it CI-natively; `"100"` matches
+  the local sample size that produced both figures and is now a permitted
+  choice on the workflow's `iterations` input (the jobs already exist —
+  dispatch them, don't reimplement them), and audit the
+  intra-test/serial-mode mechanism described above before proposing any
+  fix — per this role's own process,
   the product/test verdict must be rendered and the specific defect named
   before a fix PR, and neither is done yet.
 

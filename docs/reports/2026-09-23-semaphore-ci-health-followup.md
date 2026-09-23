@@ -283,8 +283,14 @@ confirm both figures without needing a local sandbox with outbound network
 access. Neither is dispatchable this pass: `workflow_dispatch` only accepts
 a workflow already on the repository's default branch (`trunk-dev`), the
 same gotcha every harness in this ledger has hit on its own introduction
-pass. Once merged, the next step is to dispatch both — they already exist,
-not something to reimplement.
+pass. Once merged, the next step is to dispatch both with
+`iterations: "100"` — a Codex review comment on PR #2922 correctly
+flagged that the workflow's default of `"50"` has `0.99^50 ≈ 60.5%`
+chance of reporting zero failures by luck alone at the observed serial 1%
+rate, not enough to confirm or refute it CI-natively; `"100"` (now a
+permitted choice on the `iterations` input) matches the local sample size
+that produced both figures. The jobs already exist — dispatch them, not
+something to reimplement.
 
 ## 📊 Measurement
 

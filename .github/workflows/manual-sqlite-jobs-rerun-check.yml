@@ -52,7 +52,13 @@ on:
         required: false
         default: "50"
         type: choice
-        options: ["20", "50"]
+        # 100 matters for rerun_serial_whole_binary specifically: at a true
+        # 1% rate (this entry's own 1/100 serial figure), a 50-run dispatch
+        # still has ~61% chance of reporting zero failures by luck alone
+        # (0.99^50 ≈ 0.605) — not enough to confirm or refute that baseline
+        # CI-natively. 100 matches the local sample size that produced it
+        # (Codex review, PR #2922).
+        options: ["20", "50", "100"]
 
 env:
   # Same values as ci.yml.
@@ -93,8 +99,8 @@ jobs:
         # pass any string, so it's re-validated here rather than trusted.
         run: |
           case "$ITERATIONS" in
-            20|50) ;;
-            *) echo "::error::iterations must be 20 or 50 (got: $ITERATIONS)"; exit 1 ;;
+            20|50|100) ;;
+            *) echo "::error::iterations must be 20, 50, or 100 (got: $ITERATIONS)"; exit 1 ;;
           esac
           fail=0
           pass=0
@@ -157,8 +163,8 @@ jobs:
         # pass any string, so it's re-validated here rather than trusted.
         run: |
           case "$ITERATIONS" in
-            20|50) ;;
-            *) echo "::error::iterations must be 20 or 50 (got: $ITERATIONS)"; exit 1 ;;
+            20|50|100) ;;
+            *) echo "::error::iterations must be 20, 50, or 100 (got: $ITERATIONS)"; exit 1 ;;
           esac
           # Counted independently, not as mutually-exclusive buckets: this job
           # runs the whole 27-test binary, so a nonzero exit can come from the
@@ -296,8 +302,8 @@ jobs:
         # pass any string, so it's re-validated here rather than trusted.
         run: |
           case "$ITERATIONS" in
-            20|50) ;;
-            *) echo "::error::iterations must be 20 or 50 (got: $ITERATIONS)"; exit 1 ;;
+            20|50|100) ;;
+            *) echo "::error::iterations must be 20, 50, or 100 (got: $ITERATIONS)"; exit 1 ;;
           esac
           # Same independent target/sibling/joint classification as
           # rerun_default_parallelism, applied to the serial shape.
