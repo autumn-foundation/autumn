@@ -17,12 +17,17 @@ on PR #2922 caught, a root-cause category naming inter-test shared state
 specifically. This report also originally misidentified the intra-test
 concurrent actor as a `worker_loop` racing the enqueue; a second Codex
 comment caught that this test passes `run_workers: false`, so no worker
-loop is ever spawned — the real (and weaker, read-only) intra-test actor is
-`queue_depth_survey_loop`. Both an inter-test shared resource and some
-not-yet-identified intra-test interaction remain open candidates. This
-role's own hard gate requires a specific defect, and a correct category
-besides, before a fix PR. No new hits on any other tracked
-signature.
+loop is ever spawned — the real intra-test actor is
+`queue_depth_survey_loop`, whose own `wait_ready()` call can win the race to
+run the schema-creating DDL on a different pooled connection than the one
+the enqueue later uses, under WAL mode (confirmed: every pooled connection
+runs `PRAGMA journal_mode = WAL`) — a third correction, since a first draft
+of this fix wrongly called that candidate "read-only, so weaker" before
+realizing `wait_ready()` itself is a write path. Both an inter-test shared
+resource and this now-named intra-test WAL-visibility candidate remain open,
+neither confirmed. This role's own hard gate requires a specific defect,
+and a correct category besides, before a fix PR. No new hits on any other
+tracked signature.
 
 ## 🎯 Verdict path
 
@@ -122,16 +127,26 @@ loop behind an early return (`autumn/src/job/sqlite.rs:1469-1471`,
 the test's own comment ("Enqueue-only... the web half of a split"). No
 `worker_loop` exists in this test. The one task `start_runtime` spawns
 unconditionally for every role, including this one, is
-`queue_depth_survey_loop`, which shares the same pool and schema gate but
-only runs a single read-only `SELECT` in this test's short runtime
-(`autumn/src/job/sqlite.rs:923-934`, `MAX_MAINTENANCE_INTERVAL` = 5s) — a
-real intra-test concurrent actor, but with no obvious mechanism for an
-`INSERT ... ON CONFLICT` prepare-time mismatch, considerably weaker than
-the (wrong) worker/enqueue story it replaces. Net effect: the intra-test
-candidate isn't eliminated, but it has no named mechanism either, so it
-doesn't out-argue the inter-test candidate. Both directions — an inter-test
-shared resource, and some not-yet-identified intra-test interaction — stay
-open.
+`queue_depth_survey_loop`, which shares the same pool and schema gate.
+
+**A fourth Codex comment then caught a second mistake in that same
+paragraph**: calling the survey loop "read-only, so weaker" discarded a
+concrete mechanism rather than ruling it out. Its periodic `SELECT` is
+read-only, but its `wait_ready()` call races the enqueue's `ready()` on the
+same `OnceCell`, and *whichever caller wins runs `ensure_schema`* — a write
+that creates the partial unique index the failing `ON CONFLICT` targets —
+on *its own* pooled connection, while the enqueue later gets a *different*
+connection from the same pool. Confirmed via `autumn/src/db.rs`: every
+non-read-only pooled connection in this backend runs `PRAGMA journal_mode =
+WAL`, which gives a connection a snapshot that doesn't advance until its
+own transaction restarts — a real mechanism by which one connection's
+committed DDL could be invisible to a different connection's next prepare,
+entirely within this one test. This is now the strongest concrete
+candidate, but not confirmed: reconciling the `OnceCell`'s happens-before
+guarantee against WAL's snapshot semantics for a second connection is the
+next audit, not more speculation. Both directions — an inter-test shared
+resource, and this now-named intra-test WAL-visibility candidate — stay
+open until one is confirmed against a real repro.
 
 **Correction, added post-review (a Codex comment on PR #2922 caught this
 before merge):** this report originally claimed `build_sqlite_pool` pins
@@ -157,12 +172,14 @@ the lock is held for the whole test); it did not check whether a
 `global_job_runtime_test_lock()` guard is dropped, into a window where a
 different, non-lock-holding sibling (or the next lock-holder) is active. For
 this specific target test that spawned task is `queue_depth_survey_loop`
-(no `worker_loop` here, `run_workers` is `false`) — weaker as a candidate
-since it's read-only, but not eliminated. Other tests in this file that call
-`start_runtime` with `run_workers: true` would spawn a real `worker_loop`
-and are a separate, not-yet-checked instance of the same class of gap. That
-correctly-scoped audit — not a new hypothesis, an unexamined corner of the
-existing one — is the named next step.
+(no `worker_loop` here, `run_workers` is `false`), and it is a live
+candidate via the schema-`OnceCell`/WAL-visibility mechanism above —
+reconciling the `OnceCell`'s ordering guarantee against WAL's snapshot
+semantics for a second connection is the specific audit that would confirm
+or rule it out. Other tests in this file that call `start_runtime` with
+`run_workers: true` would spawn a real `worker_loop` too, a separate,
+not-yet-checked instance of the same class of gap. Both audits — correctly
+scoped this time — are the named next step.
 
 ## 🔧 Treatment
 

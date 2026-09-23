@@ -163,6 +163,7 @@ jobs:
           target_fail=0
           sibling_fail=0
           joint_fail=0
+          target_missing=0
           pass=0
           for i in $(seq 1 "$ITERATIONS"); do
             echo "=== iteration $i/$ITERATIONS ==="
@@ -188,9 +189,23 @@ jobs:
                 sibling_hit=1
               fi
             done <<< "$failed_names"
-            if [ "$rc" -eq 0 ]; then
+            # A bare exit-code-0 does not prove the target test ran: a bad SHA
+            # that omits or renames the target would still exit 0 on the
+            # remaining tests, silently inflating "pass" for a target that
+            # never executed. Require the target's own "... ok" line whenever
+            # target_hit is 0, mirroring the isolated `rerun` job's own
+            # expected-pass-line check (Codex review, PR #2922).
+            target_ran=0
+            if [ "$target_hit" -eq 1 ] || grep -qE '^test sqlite_job_backend_tracks_job_status_durably \.\.\. ok' \
+                 "whole-binary-iteration-$i.log"; then
+              target_ran=1
+            fi
+            if [ "$rc" -eq 0 ] && [ "$target_ran" -eq 1 ]; then
               echo "iteration $i: PASS"
               pass=$((pass + 1))
+            elif [ "$target_ran" -eq 0 ]; then
+              echo "iteration $i: TARGET NOT FOUND IN LOG (rc=$rc) - not counted toward target_fail/pass, logged for manual inspection (bad SHA/build, or the target was renamed)"
+              target_missing=$((target_missing + 1))
             else
               if [ "$target_hit" -eq 1 ]; then
                 target_fail=$((target_fail + 1))
@@ -219,9 +234,13 @@ jobs:
             echo ""
             echo "Of those, target and a sibling failed **together** in the same iteration: \`$joint_fail\`/\`$ITERATIONS\` — diagnostic evidence for the shared-state hypothesis if nonzero."
             echo ""
+            if [ "$target_missing" -ne 0 ]; then
+              echo "⚠️ Target not found in \`$target_missing\`/\`$ITERATIONS\` iteration logs (bad SHA/build, or the target was renamed) — excluded from the target/sibling/pass counts above; inspect those logs manually."
+              echo ""
+            fi
             echo "\`$pass\`/\`$ITERATIONS\` iterations passed outright."
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "RESULT: target $target_fail/$ITERATIONS failed, sibling $sibling_fail/$ITERATIONS failed (of which $joint_fail/$ITERATIONS joint with the target), $pass/$ITERATIONS passed"
+          echo "RESULT: target $target_fail/$ITERATIONS failed, sibling $sibling_fail/$ITERATIONS failed (of which $joint_fail/$ITERATIONS joint with the target), $target_missing/$ITERATIONS target-missing, $pass/$ITERATIONS passed"
       - name: Upload every iteration's full log
         if: always()
         uses: actions/upload-artifact@v7
