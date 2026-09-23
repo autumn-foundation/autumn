@@ -191,7 +191,20 @@ On Postgres the account rows are held with `SELECT ... FOR UPDATE`, so two
 concurrent posts against one account are serialized. SQLite has no row lock and
 `Db::tx` opens a deferred transaction, so two concurrent posts there can leave
 the second with "database is locked". A SQLite app that posts concurrently must
-retry the transaction.
+retry the transaction — with backoff, in a bounded loop, and only while the
+error is the lock one (`database is locked` / `database table is locked`);
+retrying a different error can double-post.
+
+On a `cache=shared` target the failure mode is harsher. Shared-cache
+table-lock conflicts return `SQLITE_LOCKED` **without consulting the busy
+handler at all** (this pool does not wire `sqlite3_unlock_notify`), so the
+pooled `PRAGMA busy_timeout = 5000` does not bound those waits: under real
+contention *all* contenders can fail instantly in the same round, with no wait
+between them (issue #2881). A bare "retry once" is not enough there — use an
+exponential-backoff retry loop, take the write lock up front with a
+transaction that begins `IMMEDIATE`, or prefer a WAL-mode file database for
+hot write tables. See `docs/guide/sqlite-in-production.md` for the production
+SQLite story.
 
 The locks are sorted within one call, not across a transaction. If one
 transaction posts more than once over overlapping accounts, use `Db::tx_with`,
