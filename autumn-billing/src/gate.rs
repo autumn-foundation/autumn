@@ -180,6 +180,17 @@ impl Billing {
     /// newest event within that group. An abandoned `incomplete` checkout
     /// never hides an active subscription.
     ///
+    /// `user_id` is looked up against `Customer.user_id` verbatim — under
+    /// Autumn's tenancy feature that is the tenant-scoped identity
+    /// [`current_user`](Self::current_user)/[`session_user_id`] returns, not
+    /// a bare application user id. A caller resolving the current user some
+    /// other way (outside `SessionUser`/`Entitled<R>`, which already go
+    /// through `session_user_id`) must pass that same scoped value here —
+    /// build it explicitly with [`crate::gate::scope_identity`] if it isn't
+    /// already at hand — or this always misses and denies entitlement for an
+    /// otherwise-paying tenant user. [`is_entitled`](Self::is_entitled) and
+    /// [`require`](Self::require) share this contract; both call this method.
+    ///
     /// # Errors
     ///
     /// Returns the store error.

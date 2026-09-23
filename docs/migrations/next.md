@@ -1347,12 +1347,27 @@ unchanged — this is source-compatible for every implementor, tenancy or not.
 A custom store that wants to support the relink recipe above needs to
 override it; `MemoryBillingStore` and `DbBillingStore` already do.
 
+**A caller of `Billing::current_subscription`, `is_entitled`, or `require`
+directly** — outside `SessionUser`/`Entitled<R>`, which already resolve the
+right value internally — must pass the same tenant-scoped identity these
+three methods key their store lookup on. If your own code resolves "the
+current user" some other way (your own auth extractor, a background job) and
+calls one of these three with that bare id under tenancy, it silently misses
+an otherwise-paying user's row and denies entitlement — nothing in these
+methods' `user_id: &str` signature stops you from passing the wrong one.
+Pass whatever `Billing::current_user`/`session_user_id` already returned for
+this request, or build the identity explicitly with
+`autumn_billing::gate::scope_identity(tenant, &raw_user_id)` when you don't
+have that value at hand.
+
 **Automation:** `manual` — a custom `recipient_for` override, if one exists,
 needs the diff above; every pre-existing `billing_customers` row of every
 tenancy-enabled app running `BillingPlugin` — whether tenancy was just
 turned on or has been running alongside billing all along — needs the
-`relink_customer` call above; the default `recipient_for` implementation
-and every other consumer of `Customer.user_id` need no change.
+`relink_customer` call above; a direct caller of `current_subscription`/
+`is_entitled`/`require` needs the scoped-identity fix above; the default
+`recipient_for` implementation, `SessionUser`/`Entitled<R>`, and every other
+consumer of `Customer.user_id` need no change.
 
 
 ## Plugin authors

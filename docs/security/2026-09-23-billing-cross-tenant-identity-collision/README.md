@@ -341,9 +341,33 @@ on" case. Documentation-only change; no code, so no new test — the
 underlying `relink_customer` behavior was already covered by finding 2's
 tests.
 
-Re-verified after all seven findings: full `autumn-billing` lib tests (82),
-`--test integration` (170), `--test mirror_db` (29), `cargo fmt`/
-`clippy -D warnings` clean, `cargo check --all-targets` clean, the
+**An eighth finding**, on the following review round (commit `83cca9f4`,
+P2): `Billing::current_subscription`, `is_entitled`, and `require` are
+public methods taking a bare `user_id: &str` — a direct, documented way to
+check entitlement outside the `SessionUser`/`Entitled<R>` extractor pattern
+(a background job, a GraphQL resolver, an app's own auth middleware). Under
+tenancy, `Customer.user_id` is now the tenant-scoped identity, but these
+three methods do no scoping of their own — they pass `user_id` straight to
+`customer_by_user`. A caller resolving "the current user" some way other
+than `SessionUser`/`Entitled<R>` (which already route through
+`session_user_id`) and passing that bare id here would silently miss an
+otherwise-paying tenant user's row and deny entitlement, and nothing in the
+migration guide said so. Considered making these methods auto-scope
+`user_id` internally, but rejected it: a caller that already has the value
+`current_user`/`session_user_id` returned (already scoped) would then get
+**double**-scoped, breaking the common case to fix the uncommon one — the
+same content-vs-provenance ambiguity as finding 5, just facing the opposite
+direction. Documentation is the correct fix here, not a heuristic. Added the
+contract explicitly to `current_subscription`'s doc comment (the method the
+other two delegate to) and to the migration guide, and a new test,
+`cases::gate::is_entitled_requires_the_tenant_scoped_id_directly_under_tenancy`,
+demonstrating both the pitfall (bare id misses) and the fix (scoped id, via
+the new `gate::scope_identity`, finds it) concretely rather than leaving the
+contract only in prose.
+
+Re-verified after all eight findings: full `autumn-billing` lib tests (82),
+`--test integration` (171, up from 164), `--test mirror_db` (29), `cargo
+fmt`/`clippy -D warnings` clean, `cargo check --all-targets` clean, the
 documentation-build command above clean, and
 `./scripts/check-docs-symbols.sh` / `check-migration-guides.sh` /
 `check-plugin-surface.sh` / `check-changelog-fragments.sh` all still green.
