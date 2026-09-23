@@ -43,8 +43,11 @@
 //! ## Dev-mode bypass
 //!
 //! Omitting `secret_key` does **not** bypass verification — the real provider
-//! is still constructed and every submission fails closed (rejected, with a
-//! warning logged), since an empty secret can never verify a token. Set
+//! is still constructed, and every *challenged* submission (non-exempt path,
+//! `application/x-www-form-urlencoded`) fails closed (rejected, with a
+//! warning logged), since an empty secret can never verify a token. Exempt
+//! paths and non-urlencoded requests (JSON, multipart) are unaffected — see
+//! [`BotProtectionLayer`]'s own docs for exactly what's challenged. Set
 //! `dev_bypass = true` explicitly to skip verification in local development:
 //!
 //! ```toml
