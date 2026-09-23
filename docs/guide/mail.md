@@ -417,20 +417,30 @@ verifier, without which an SES endpoint cannot work at all.
 
 ### Inbound email webhooks: Mailgun, SES, and generic
 
-Each `InboundMailEndpointConfig` you register becomes one `POST` route, with a
-50 MB body limit, that authenticates the provider before anything is parsed:
+Each `InboundMailEndpointConfig` you register becomes one `POST` route with a
+50 MB body limit. What that route checks before parsing depends on which
+constructor built it:
 
 | Constructor | Provider | What it checks before parsing |
 | --- | --- | --- |
 | `InboundMailEndpointConfig::mailgun(path, signing_key)` | Mailgun | HMAC-SHA256 over `timestamp \|\| token`, compared in constant time, inside a 5-minute replay window |
 | `InboundMailEndpointConfig::ses(path)` | AWS SES via SNS | SNS RSA signature against the certificate named by `SigningCertURL`, plus the `TopicArn` binding below |
-| `InboundMailEndpointConfig::generic(path)` | Postfix, a relay, anything posting raw RFC 5322 | `X-Inbound-Signature: HMAC-SHA256(key, body)` — only when you set a key |
+| `InboundMailEndpointConfig::generic(path)` | Postfix, a relay, anything posting raw RFC 5322 | `X-Inbound-Signature: HMAC-SHA256(key, body)` — **only if you set a key.** With none set it checks nothing |
 
-All three reject rather than guess. A Mailgun endpoint with an empty signing key
-answers `500` to every request instead of accepting unsigned mail; a bad
-signature or a timestamp outside the window is `401`.
+Mailgun and SES authenticate unconditionally, and both fail closed: a Mailgun
+endpoint whose signing key is empty answers `500` to every request rather than
+accept unsigned mail, a bad signature or a timestamp outside the window is
+`401`, and the SES cases are below.
 
-Keep the key out of the source with `signing_key_env`, which is read at startup:
+> **The generic endpoint is unauthenticated by default.** `generic(path)`
+> leaves both `signing_key` and `signing_key_env` unset, and with no key the
+> signature check is skipped entirely — every body that arrives is parsed and
+> dispatched to your handlers. That is fine for a Postfix relay reachable only
+> on a private network, and it is a forged-mail hole on anything an attacker
+> can POST to. Set a key before the route is internet-facing.
+
+Set one — for any provider — with `signing_key_env`, which is read at startup so
+the secret stays out of the source:
 
 ```rust
 use autumn_web::inbound_mail::{InboundMailEndpointConfig, InboundMailProvider};
@@ -603,8 +613,9 @@ smoke test and the `InboundMailRouter` registration in `src/main.rs` — see
 - Shipping newsletters, digests, or other bulk mail? See
   [Mail compliance: List-Unsubscribe](mail-compliance.md) to meet Gmail/Yahoo
   bulk-sender requirements with one attribute and one config key.
-- Receiving mail? Set the provider's signing key (an unresolved one is a `500`,
-  not an open endpoint), give every SES endpoint a
+- Receiving mail? Set a signing key on every endpoint — a `generic` one with no
+  key authenticates nothing, and an unresolved key is a `500` rather than an
+  open route. Give every SES endpoint a
   [topic ARN](#ses-endpoints-need-a-topic-arn), and decide per handler whether
   `background` losing a message on error is acceptable — see
   [Receiving Mail](#receiving-mail-inbound-email).

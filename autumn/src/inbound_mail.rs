@@ -593,6 +593,12 @@ impl InboundMailEndpointConfig {
     ///
     /// When `signing_key` / `signing_key_env` is set, the handler verifies
     /// `X-Inbound-Signature: HMAC-SHA256(key, body)` before parsing.
+    ///
+    /// This constructor sets **neither**, so by default the endpoint verifies
+    /// nothing: every body that arrives is parsed and dispatched to the
+    /// registered handlers. That suits a relay reachable only on a private
+    /// network; on anything an attacker can POST to it is a forged-mail hole.
+    /// Set `signing_key` or `signing_key_env` before exposing the route.
     #[must_use]
     pub fn generic(path: impl Into<String>) -> Self {
         Self {
