@@ -6,6 +6,7 @@ use autumn_billing::prelude::*;
 use autumn_billing::routes::route_infos;
 use autumn_billing::store::{CustomerUpsert, SubscriptionUpsert};
 use autumn_billing::{PortalRequest, ProviderId, SubscriptionStatus};
+use autumn_web::tenancy::with_tenant;
 use autumn_web::test::TestApp;
 use autumn_web::time::FixedClock;
 use chrono::{DateTime, TimeZone, Utc};
@@ -739,4 +740,92 @@ async fn store_resolution_falls_back_to_memory() {
     );
     let service = autumn_billing::BillingService::require(client.state()).expect("plugin started");
     assert_eq!(service.store().applied_event_count().await.unwrap(), 1);
+}
+
+// ── Warden 2026-09-23: cross-tenant identity collision ────────────────────
+//
+// `SessionUser`/`Entitled<R>` key every billing lookup on the bare session
+// `user_id` string (`autumn_billing::gate::session_user_id`), with no tenant
+// component. That string is only guaranteed unique WITHIN one tenant:
+// `docs/guide/sharding.md` documents that a sharded deployment's shard-local
+// `BIGSERIAL` id "is not copied" between shards and starts over on each one,
+// so a `#[repository(tenant_scoped)]` `User` model on two different tenants'
+// shards routinely hands out the identical numeric id. `BillingPlugin`'s
+// store always resolves `DbState::pool(state)` — the app's one primary/
+// control pool (`autumn_billing::lib::BillingPlugin::resolve_store`), never a
+// per-shard one — so every tenant's billing mirror lives in the same
+// `billing_customers` table regardless. Two unrelated tenants' users sharing
+// a `user_id` are therefore treated as one and the same billing customer.
+
+#[tokio::test]
+async fn subscription_does_not_leak_across_tenants_sharing_a_shard_local_user_id() {
+    let store = MemoryBillingStore::shared();
+
+    // Tenant "acme": a paying Pro subscriber whose session stores the
+    // shard-local user id "7".
+    let acme = support::harness(store.clone(), FakeProvider::new(), pinned);
+    let customer = seed_customer(&store, "7").await;
+    seed_subscription(&store, &customer, SubscriptionStatus::Active).await;
+    acme.client.acting_as("7").await;
+    with_tenant("acme".to_owned(), async {
+        let resp = acme.client.get("/billing/subscription").send().await;
+        resp.assert_status(200);
+        assert_eq!(
+            resp.json::<Value>()["entitled"],
+            true,
+            "acme's own paying user must see their own subscription"
+        );
+    })
+    .await;
+
+    // Tenant "widgets": an entirely separate app/tenant sharing the same
+    // control-plane billing store, whose own independent shard-local
+    // sequence separately handed out "7" to a brand-new user who has never
+    // paid for anything.
+    let widgets = support::harness(store.clone(), FakeProvider::new(), pinned);
+    widgets.client.acting_as("7").await;
+    with_tenant("widgets".to_owned(), async {
+        let resp = widgets.client.get("/billing/subscription").send().await;
+        resp.assert_status(200);
+        let body: Value = resp.json();
+        assert_eq!(
+            body["entitled"], false,
+            "tenant widgets' own unrelated user must not inherit tenant acme's paid \
+             subscription just because their shard-local user ids happen to collide as \
+             \"7\": {body}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn portal_does_not_hand_a_hosted_session_to_another_tenants_customer() {
+    let store = MemoryBillingStore::shared();
+
+    // Tenant "acme" links its "7" to a real Stripe customer.
+    let acme = support::harness(store.clone(), FakeProvider::new(), pinned);
+    seed_customer(&store, "7").await;
+    acme.client.acting_as("7").await;
+
+    // Tenant "widgets" never linked its own "7" to any customer — its user
+    // has never even started a checkout.
+    let widgets = support::harness(store.clone(), FakeProvider::new(), pinned);
+    widgets.client.acting_as("7").await;
+    with_tenant("widgets".to_owned(), async {
+        let resp = widgets.client.post("/billing/portal").send().await;
+        // Without tenant scoping this wrongly resolves acme's customer row
+        // and redirects tenant widgets' user into acme's Stripe billing
+        // portal (payment methods, invoices, and the ability to cancel
+        // acme's subscription).
+        assert_ne!(
+            resp.status.as_u16(),
+            303,
+            "tenant widgets must not be handed a hosted portal session for tenant acme's \
+             Stripe customer just because their shard-local user ids collide as \"7\" \
+             (got a redirect to {:?})",
+            resp.header("location")
+        );
+        resp.assert_status(404);
+    })
+    .await;
 }
