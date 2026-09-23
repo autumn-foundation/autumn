@@ -2210,13 +2210,28 @@ without also filling in the intake form above.
   independent samples now agree: this test fails only when it runs
   *concurrently* with its own siblings in the same process, never when run
   alone or when the whole binary runs one test at a time.
-  **Test-vs-product verdict: still not rendered** — a concurrency-dependent
-  failure inside a test binary's own libtest scheduling is not, on its own,
-  evidence of a product race (real deployments do not run 27 unrelated
-  test functions in shared-memory concurrency against one one-off SQLite
-  file), so this is presumptively a test-shared-state defect rather than a
-  product defect, but that has not been confirmed by identifying the actual
-  shared resource, so the verdict per this role's own bar stays open.
+  **Test-vs-product verdict: not rendered, and not leaning either way.**
+  **Correction (post-review, via a Codex review comment on PR #2922): an
+  earlier draft of this update leaned "presumptively test-side" on the
+  reasoning that real deployments do not run 27 concurrent test functions
+  against one file — that reasoning does not survive the pool-size
+  correction two paragraphs up.** The target test's own `worker_loop`
+  (spawned by `start_runtime`, confirmed by direct read of
+  `autumn/src/job/sqlite.rs`'s `worker_loop`/`claim_next_job`) and the
+  test's own `enqueue_tracked` call both draw connections from the *same*
+  `SqliteJobQueue`'s pool, concurrently, entirely within this one test —
+  independent of any sibling test. That is the same intra-pool
+  multi-connection shape a production deployment hits any time a worker
+  loop and a request-path enqueue run against one SQLite file at once,
+  which is the backend's normal operating mode, not a test artifact. Running
+  the whole binary at default parallelism may simply be perturbing
+  scheduling/timing enough to trigger a race that already lives in that
+  pool usage — in which case concurrent siblings are the trigger, not the
+  defect, and the defect would be product-reachable. Sibling-test
+  concurrency remains a live, different candidate too (a resource genuinely
+  scoped to the test binary, not yet named). Both directions stay open
+  until the specific resource is identified; this entry no longer states a
+  presumption for either.
   **Mechanism: root-cause *category* now confirmed (resource contention /
   shared state between concurrently-scheduled tests in the same binary);
   the *specific* defect — which resource, touched by which sibling test(s)

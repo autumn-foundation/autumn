@@ -96,13 +96,22 @@ fails only when it runs *concurrently* with its own siblings in the same
 binary — never alone, and never when the whole binary runs one test at a
 time.
 
-**Test-vs-product verdict: still not rendered.** A concurrency-dependent
-failure inside one test binary's own libtest scheduling is not, on its own,
-evidence of a product race — a real deployment does not run 27 unrelated test
-functions in shared-memory concurrency against one SQLite file — so this
-presumptively belongs to the test's own shared state, not the store's
-production behavior, but that has not been confirmed by naming the actual
-shared resource, so per this role's own bar the verdict stays open.
+**Test-vs-product verdict: not rendered, and — after a second review
+correction below — not leaning either way.** This report originally leaned
+"presumptively test-side," reasoning that a real deployment does not run 27
+concurrent test functions against one SQLite file. A second Codex comment on
+PR #2922 correctly pointed out that reasoning doesn't survive the pool-size
+correction just above: the target test's own `worker_loop` (spawned by
+`start_runtime`) and its own `enqueue_tracked` call draw connections from the
+*same* pool concurrently, entirely within this one test, independent of any
+sibling — the same intra-pool multi-connection shape a production deployment
+hits whenever a worker loop and a request-path enqueue run against one
+SQLite file at once, which is this backend's normal operating mode, not a
+test artifact. Concurrent siblings may simply be perturbing scheduling
+enough to trigger a race that already lives in that pool usage, in which
+case the defect would be product-reachable. Sibling-test concurrency remains
+a live, separate candidate too. Both directions stay open until the specific
+resource is identified.
 
 **Correction, added post-review (a Codex comment on PR #2922 caught this
 before merge):** this report originally claimed `build_sqlite_pool` pins
