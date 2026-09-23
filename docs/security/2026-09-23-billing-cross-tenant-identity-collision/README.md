@@ -305,13 +305,29 @@ on `strip_tenant_scope` (previously it undersold this as a clean
 `gate::tenant_scope_tests::known_limitation_a_bare_id_shaped_like_the_encoding_is_misclassified`,
 so the gap is deliberate and tracked rather than a silent surprise.
 
-Re-verified after all five findings: full `autumn-billing` lib tests (82, up
-from 76 — 6 `gate::tenant_scope_tests`, one added for this finding),
-`--test integration` (169, up from 164), `--test mirror_db` (28, up from
+**A sixth finding**, on the next review round (commit `556da2a2`, P1):
+`relink_customer` was added to `BillingStore` as a **required** (non-defaulted)
+method — a breaking source-compat change for any app supplying its own
+`Arc<dyn BillingStore>` via `BillingPlugin::store` (a documented extension
+point, not a hypothetical), whether or not that app uses tenancy at all. Only
+`MemoryBillingStore`, `DbBillingStore`, and the test-only `FailingStore`
+wrapper were updated; the Compatibility section's "no other implementor is
+known" was an assumption, not something this PR could actually guarantee.
+Fixed by giving `relink_customer` a default implementation that returns
+`BillingError::Unsupported`, so a pre-existing external `BillingStore` keeps
+compiling unchanged and gets a clear, documented error if something ever
+calls the method on it, rather than a compile failure. New test in
+`store_contract.rs`,
+`relink_customer_default_is_unsupported_for_a_store_that_predates_it`, with
+a bespoke `LegacyStoreWithoutRelink` implementing every other method — proof
+this is source-compatible, not just an assertion in a doc comment.
+
+Re-verified after all six findings: full `autumn-billing` lib tests (82),
+`--test integration` (170, up from 164), `--test mirror_db` (29, up from
 24), `cargo fmt`/`clippy -D warnings` clean, `cargo check --all-targets`
 clean, the documentation-build command above clean, and
 `./scripts/check-docs-symbols.sh` / `check-migration-guides.sh` /
-`check-changelog-fragments.sh` all still green.
+`check-plugin-surface.sh` / `check-changelog-fragments.sh` all still green.
 
 ## 📡 Blast radius
 

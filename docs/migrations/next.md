@@ -1334,6 +1334,14 @@ in request-handling or webhook code calls it. It returns
 you relinked the old row) — resolve that by hand, since it means two
 provider customers now exist for the one legacy row.
 
+`relink_customer` is a **new method on the `BillingStore` trait**, which an
+app can implement its own backend against (`BillingPlugin::store`). It has a
+default implementation returning `BillingError::Unsupported`, specifically
+so a `BillingStore` implemented before this method existed keeps compiling
+unchanged — this is source-compatible for every implementor, tenancy or not.
+A custom store that wants to support the relink recipe above needs to
+override it; `MemoryBillingStore` and `DbBillingStore` already do.
+
 **Automation:** `manual` — a custom `recipient_for` override, if one exists,
 needs the diff above; every pre-existing `billing_customers` row under an
 app newly enabling tenancy needs the `relink_customer` call above; the

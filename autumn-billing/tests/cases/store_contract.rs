@@ -1376,3 +1376,177 @@ mod memory {
         run_contract(&store).await;
     }
 }
+
+/// A `BillingStore` implementor from before `relink_customer` existed —
+/// every method except it, backed by `unimplemented!()` since the point is
+/// only to prove this compiles and what the un-overridden default does.
+/// Adding a required (non-defaulted) method to a `pub trait` is a breaking
+/// change for every external implementor of it; `relink_customer` has a
+/// default body specifically so this keeps compiling.
+struct LegacyStoreWithoutRelink;
+
+impl BillingStore for LegacyStoreWithoutRelink {
+    fn claim_event<'a>(
+        &'a self,
+        _event_id: &'a str,
+        _kind: &'a str,
+        _now: DateTime<Utc>,
+        _stale_after: Duration,
+    ) -> autumn_billing::store::StoreFuture<'a, EventClaim> {
+        unimplemented!()
+    }
+    fn finish_event<'a>(
+        &'a self,
+        _event_id: &'a str,
+        _now: DateTime<Utc>,
+    ) -> autumn_billing::store::StoreFuture<'a, ()> {
+        unimplemented!()
+    }
+    fn release_event<'a>(
+        &'a self,
+        _event_id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, ()> {
+        unimplemented!()
+    }
+    fn applied_event_count(&self) -> autumn_billing::store::StoreFuture<'_, u64> {
+        unimplemented!()
+    }
+    fn upsert_customer(
+        &self,
+        _upsert: CustomerUpsert,
+    ) -> autumn_billing::store::StoreFuture<'_, autumn_billing::Customer> {
+        unimplemented!()
+    }
+    fn customer_by_id<'a>(
+        &'a self,
+        _id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Customer>> {
+        unimplemented!()
+    }
+    fn customer_by_user<'a>(
+        &'a self,
+        _user_id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Customer>> {
+        unimplemented!()
+    }
+    fn customer_by_provider_id<'a>(
+        &'a self,
+        _provider_customer_id: &'a ProviderId,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Customer>> {
+        unimplemented!()
+    }
+    // relink_customer: deliberately not overridden.
+    fn upsert_subscription(
+        &self,
+        _upsert: SubscriptionUpsert,
+    ) -> autumn_billing::store::StoreFuture<
+        '_,
+        autumn_billing::store::Write<autumn_billing::Subscription>,
+    > {
+        unimplemented!()
+    }
+    fn subscription_by_id<'a>(
+        &'a self,
+        _id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Subscription>> {
+        unimplemented!()
+    }
+    fn subscription_by_provider_id<'a>(
+        &'a self,
+        _provider_subscription_id: &'a ProviderId,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Subscription>> {
+        unimplemented!()
+    }
+    fn subscriptions_for_customer<'a>(
+        &'a self,
+        _customer_id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, Vec<autumn_billing::Subscription>> {
+        unimplemented!()
+    }
+    fn set_subscription_status<'a>(
+        &'a self,
+        _id: &'a str,
+        _status: SubscriptionStatus,
+        _now: DateTime<Utc>,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Subscription>> {
+        unimplemented!()
+    }
+    fn upsert_invoice(
+        &self,
+        _upsert: InvoiceUpsert,
+    ) -> autumn_billing::store::StoreFuture<'_, autumn_billing::store::Write<autumn_billing::Invoice>>
+    {
+        unimplemented!()
+    }
+    fn invoice_by_id<'a>(
+        &'a self,
+        _id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Invoice>> {
+        unimplemented!()
+    }
+    fn invoice_by_provider_id<'a>(
+        &'a self,
+        _provider_invoice_id: &'a ProviderId,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Invoice>> {
+        unimplemented!()
+    }
+    fn upsert_dunning(
+        &self,
+        _attempt: DunningAttempt,
+    ) -> autumn_billing::store::StoreFuture<'_, ()> {
+        unimplemented!()
+    }
+    fn dunning_by_invoice<'a>(
+        &'a self,
+        _invoice_id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<DunningAttempt>> {
+        unimplemented!()
+    }
+    fn claim_dunning_attempt<'a>(
+        &'a self,
+        _invoice_id: &'a str,
+        _attempt: i64,
+        _now: DateTime<Utc>,
+    ) -> autumn_billing::store::StoreFuture<'a, bool> {
+        unimplemented!()
+    }
+    fn open_dunning(&self) -> autumn_billing::store::StoreFuture<'_, Vec<DunningAttempt>> {
+        unimplemented!()
+    }
+    fn open_dunning_for_subscription<'a>(
+        &'a self,
+        _subscription_id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, Vec<DunningAttempt>> {
+        unimplemented!()
+    }
+    fn settle_dunning<'a>(
+        &'a self,
+        _invoice_id: &'a str,
+        _expected_attempt: i64,
+        _from: &'a [DunningState],
+        _row: DunningAttempt,
+    ) -> autumn_billing::store::StoreFuture<'a, bool> {
+        unimplemented!()
+    }
+    fn prune_events(&self, _before: DateTime<Utc>) -> autumn_billing::store::StoreFuture<'_, u64> {
+        unimplemented!()
+    }
+}
+
+/// Adding `relink_customer` to `BillingStore` must not break a store
+/// implemented before it existed: `LegacyStoreWithoutRelink` compiles
+/// (proving the trait stayed source-compatible) and its un-overridden call
+/// returns the documented `BillingError::Unsupported`, not a compile error
+/// and not a silent no-op.
+#[tokio::test]
+async fn relink_customer_default_is_unsupported_for_a_store_that_predates_it() {
+    let store = LegacyStoreWithoutRelink;
+    let err = store
+        .relink_customer("any", "any".to_string(), at(0))
+        .await
+        .expect_err("the default implementation must not silently succeed");
+    assert!(
+        matches!(err, autumn_billing::BillingError::Unsupported(_)),
+        "expected Unsupported, got {err:?}"
+    );
+}

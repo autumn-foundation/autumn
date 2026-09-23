@@ -402,12 +402,25 @@ pub trait BillingStore: Send + Sync + 'static {
     /// Returns [`BillingError::Conflict`] when `user_id` already links a
     /// different customer (the same partial-unique constraint
     /// [`upsert_customer`](BillingStore::upsert_customer) observes).
+    ///
+    /// Defaulted to [`BillingError::Unsupported`] so a `BillingStore`
+    /// implemented outside this crate before this method existed keeps
+    /// compiling unchanged — adding a method to a `pub trait` without a
+    /// default is a breaking change for every external implementor,
+    /// tenancy or not. [`MemoryBillingStore`] and [`DbBillingStore`]
+    /// (`crate::store::db`, `feature = "db"`) both override it; a custom
+    /// store wanting operator-driven relinking should too.
     fn relink_customer<'a>(
         &'a self,
         id: &'a str,
         user_id: String,
         now: DateTime<Utc>,
-    ) -> StoreFuture<'a, Option<Customer>>;
+    ) -> StoreFuture<'a, Option<Customer>> {
+        let _ = (id, user_id, now);
+        Box::pin(std::future::ready(Err(BillingError::Unsupported(
+            "relink_customer (this BillingStore has not implemented it)",
+        ))))
+    }
 
     // ── Subscriptions ───────────────────────────────────────────────────
 
