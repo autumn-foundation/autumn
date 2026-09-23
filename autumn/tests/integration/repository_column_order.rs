@@ -3,7 +3,7 @@
 //!
 //! The fixture's struct field order deliberately differs from the physical
 //! column order of its `table!` — `name` comes before `tenant_id` in the
-//! struct, after it in the table — exactly the SaaS `Project` shape from the
+//! struct, after it in the table — exactly the `SaaS` `Project` shape from the
 //! issue. Before the fix, `save` decoded the `RETURNING *` row positionally,
 //! so the tenant ID came back in `name` (and the dashboard rendered
 //! `founder@acme.test` as the project name); the generated reads that decoded
