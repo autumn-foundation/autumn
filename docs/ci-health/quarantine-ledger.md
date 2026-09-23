@@ -2451,6 +2451,97 @@ without also filling in the intake form above.
   the product/test verdict must be rendered and the specific defect named
   before a fix PR, and neither is done yet.
 
+- **2026-09-23 — reproduced (4/50), the trigger is pinned, and the mechanism
+  is now confirmed by instrumentation.** The 2026-09-22 update above named its
+  own next step: "a harness variant that runs the *whole*
+  `sqlite_jobs_scheduler_e2e` binary at default parallelism (not
+  `--test-threads=1`, not filtered to one test) N times". That was run
+  locally, on `trunk-dev`:
+
+  ```
+  cargo test -p autumn-web --features "sqlite,test-support,storage" \
+    --test sqlite_jobs_scheduler_e2e -j1
+  ```
+
+  No test filter and no `--test-threads` flag — the shape `ci.yml`'s "Run the
+  sqlite integration suite" step uses. Looped 50 times. **Result: `4/50
+  failed`** (runs 7, 11, 12 and 49), each the byte-identical panic this entry
+  opened on, each `test result: FAILED. 26 passed; 1 failed`, and in every
+  case the failing test was `sqlite_job_backend_tracks_job_status_durably`
+  and only it.
+
+  **Serialized control, same commit, same machine, same whole binary:
+  `0/50`.** The identical loop with `-- --test-threads=1` added (still no test
+  filter) passed every iteration. The pair discriminates the two candidate
+  layers: **concurrency inside the one test binary is the trigger, not test
+  order and not the host.**
+
+  This also reads the earlier clean runs correctly. The local `0/50` and the
+  CI-native `0/50` above both passed `--test-threads=1` **and** filtered to
+  the single test — the one configuration that cannot reproduce this. Those
+  100 reruns measured a lane the defect does not live in, so they are not
+  evidence of a low true rate. Measured the way CI runs this binary, the rate
+  is about 8%, which fits n=2 organic hits in a day of ambient traffic.
+  `manual-sqlite-jobs-rerun-check.yml` cannot reproduce this flake by
+  construction, and its loop needs to run the whole binary at default
+  parallelism before it can give a baseline that means anything.
+
+- **2026-09-23 — root cause: a pooled connection whose cached schema predates
+  the queue index.** With a repro in hand, the enqueue error path in
+  `autumn/src/job/sqlite.rs` was instrumented (temporary, not merged) to dump
+  state at the moment of the failure. Five instrumented runs, each stopping at
+  the first failure, give this chain:
+
+  1. `sqlite_master` on the **failing connection**, read immediately after the
+     error, holds `CREATE UNIQUE INDEX idx_autumn_jobs_unique_inflight ON
+     autumn_jobs (name, unique_key) WHERE unique_key IS NOT NULL AND status IN
+     ('enqueued', 'running')` — the exact index the `ON CONFLICT` target names.
+     The index is not missing and its shape is not wrong.
+  2. `pragma_index_list('autumn_jobs')` on the same connection reports
+     `idx_autumn_jobs_unique_inflight/unique=1/partial=1`, and
+     `pragma_table_info` reports all 23 columns. `pragma_database_list` names
+     the test's own `TempDir` file, and `sqlite_temp_master` is empty — so it
+     is the right file and no temp table shadows the real one.
+  3. A minimal `INSERT ... ON CONFLICT (name, unique_key) WHERE ... DO NOTHING`
+     re-run on that same connection **fails again**, identically. The failure
+     is not transient on that connection.
+  4. The same minimal statement on a **fresh connection from the same pool
+     succeeds**. The defect is per-connection, not per-file.
+  5. `ON CONFLICT (id)` — the primary key — **succeeds** on the failing
+     connection. It resolves a conflict target on this table; it cannot
+     resolve this partial one.
+  6. Forcing that connection to re-parse the schema (`CREATE TABLE IF NOT
+     EXISTS diag_touch (x)` then `DROP TABLE`) and re-running the identical
+     statement **succeeds**.
+
+  Step 6 is the decisive one: the statement, the file and the index are all
+  unchanged, and only the connection's view of the schema changed. **The
+  failing connection holds a cached schema that predates
+  `ensure_schema`'s `CREATE UNIQUE INDEX`, and SQLite does not reload it, so
+  the upsert's partial-index target cannot be resolved at prepare time.**
+  (`PRAGMA schema_version` reads the file, so it reports the same value on
+  both connections and does not contradict this.)
+
+  **Why this test and why under parallelism.** `enqueue_tracked`
+  (`autumn/src/job_tracking.rs:1147`) calls `store.create(...)` **before**
+  `client.enqueue_with_outcome(...)`. The tracking store takes a pooled
+  connection and runs its own DDL on it first; the queue's `ensure_schema`
+  then runs on whichever connection the pool hands **it**. When those are two
+  different connections, the first one is left holding a schema from before
+  the queue index existed, and the insert fails whenever the pool gives that
+  connection back. Which connection the pool returns depends on timing, which
+  is why load inside the test binary flips it and `--test-threads=1` hides it.
+
+- **Test-vs-product verdict: product defect.** The race is in
+  `SqliteJobQueue`'s schema readiness, not in the test. `ready()` marks the
+  schema ready for the **queue**, while the DDL was applied to **one
+  connection**. Any Autumn app on SQLite whose pool holds a connection older
+  than the queue's first `ensure_schema` can fail its first enqueue the same
+  way; the test only makes it likely by opening a connection for the tracking
+  record first. A fix belongs in `autumn/src/job/sqlite.rs`, not in
+  `sqlite_jobs_scheduler_e2e.rs`. Not written in this pass — recorded here so
+  the fix is a separate, reviewable change.
+
 `crate_path::tests::resolve_autumn_web_name_dashed_rename_is_sanitized` was
 opened here 2026-09-21 (n=1, mechanism unconfirmed) and **closed the same
 week** — see its entry under "Closed entries" above for the full diagnosis,

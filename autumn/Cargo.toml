@@ -607,6 +607,17 @@ name = "pdf_render"
 harness = false
 required-features = ["pdf"]
 
+# User-submitted rich-text workload for profilers, driving
+# `markdown::render_user_content_html` through the real pulldown-cmark parse +
+# `SafeEvents` filter + `ammonia` allowlist-sanitizer pipeline (issue #1255) —
+# the comment/post/wiki-body render path no other committed bench touches.
+# `required-features` since `markdown` is an opt-in feature, unlike most of
+# the other benches in this crate.
+[[bench]]
+name = "markdown_render"
+harness = false
+required-features = ["markdown"]
+
 # Signed-CSRF-cookie workload for profilers: drives real POST traffic through
 # `security::CsrfLayer` with HMAC signing active so the verification cost is
 # attributable in a profiler. Asserts nothing — see the file header for the
