@@ -788,7 +788,7 @@ What the framework guarantees while impersonation is active:
 | Question | Answer |
 |---|---|
 | Who do `#[secured]`, `RequireAuth` and `PolicyContext` resolve? | the **impersonated** user |
-| Who do audit events and `#[repository(versioned)]` rows record? | the **real impersonator** |
+| Who do audit events and `#[repository(versioned)]` rows record? | the **real impersonator** — for versioned rows and the audit events the framework emits. An `AuditEvent` you build by hand records whatever `actor_id` you pass it, so pass `impersonation::audit_actor_id(&session, &user).await` or `Current::actor()` there |
 | Who does `impersonation::impersonator_id(&state, &session)` return? | the **real impersonator** |
 | Session id | rotated on begin *and* end |
 | Audit | one event on begin, one on end, each with `actor_id` = the impersonator and `target_resource_id` = the target |
@@ -843,9 +843,12 @@ And what it refuses:
   impersonating.
 
 - **No self-destructive configuration.** `auth.session_key` must not be one of
-  the keys the impersonation record reserves (`impersonator_id`,
-  `impersonated_id`, `impersonator_role`, `impersonator_last_strong_auth_at`,
-  `role`) — the swap would clobber its own record. Both directions refuse the
+  the keys impersonation reserves for its own bookkeeping (`impersonator_id`,
+  `impersonated_id`, `impersonation_session_id`, `impersonator_role`,
+  `impersonator_last_strong_auth_at`, `role`) — the swap would clobber its own
+  record — nor the live step-up claim `last_strong_auth_at`, which the swap
+  stashes aside; a collision there would let a numeric target id satisfy
+  step-up with no reauthentication. Both directions refuse the
   misconfiguration, and registering the gate logs it at startup. Check it
   yourself with `impersonation::is_reserved_session_key`.
 
