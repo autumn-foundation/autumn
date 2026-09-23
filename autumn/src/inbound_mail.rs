@@ -509,12 +509,18 @@ pub struct InboundMailEndpointConfig {
     /// honours each [`InboundMailHandlerInfo::processing`] value directly;
     /// the endpoint-level default is not yet applied automatically.
     pub processing: ProcessingMode,
-    /// Expected SNS `TopicArn` for SES endpoints (recommended).
+    /// Expected SNS `TopicArn` for SES endpoints. **Required** — an SES
+    /// endpoint without one rejects every request.
     ///
     /// When set, the SNS signature verifier rejects any notification whose
-    /// `TopicArn` field does not match this value.  This prevents a validly-
-    /// signed message from a *different* SNS topic (possibly owned by another
-    /// AWS account) from being accepted.  Leave `None` to skip the topic check.
+    /// `TopicArn` field does not match this value (401).  This prevents a
+    /// validly-signed message from a *different* SNS topic (possibly owned by
+    /// another AWS account) from being accepted.
+    ///
+    /// Leaving it `None` does **not** skip the topic check: without an
+    /// expected ARN there is nothing to bind to, so the endpoint fails closed
+    /// and answers 503 to every request, logging an error naming the path at
+    /// startup. Set it with [`with_topic_arn`](Self::with_topic_arn).
     pub topic_arn: Option<String>,
 }
 
@@ -548,11 +554,18 @@ impl InboundMailEndpointConfig {
     /// AWS SES via SNS endpoint.
     ///
     /// No signing key is configured here: SNS subscription confirmation is
-    /// handled automatically, and SNS message authenticity is verified via
-    /// the `X-Amz-Sns-Message-Type` header.
+    /// handled automatically, and SNS message authenticity is verified by
+    /// checking the notification's RSA `Signature` against the certificate at
+    /// its `SigningCertURL` (which must itself be an `sns.<region>.amazonaws.com`
+    /// URL). The message type is read from the body's `Type` field; request
+    /// headers are not consulted.
     ///
-    /// For production use, call [`.with_topic_arn`](Self::with_topic_arn) to
-    /// restrict accepted notifications to your application's SNS topic.
+    /// You must call [`.with_topic_arn`](Self::with_topic_arn) to restrict
+    /// accepted notifications to your application's SNS topic. This is not a
+    /// production-only hardening step: an SES endpoint with no expected ARN
+    /// answers 503 to every request, in every profile, because without one any
+    /// AWS account could subscribe this endpoint to a topic of their own and
+    /// deliver validly-signed payloads.
     #[must_use]
     pub fn ses(path: impl Into<String>) -> Self {
         Self {
