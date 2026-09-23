@@ -2830,12 +2830,12 @@ pub fn remove_jobs_registration_from_app(existing: &str) -> String {
 /// `crate::models::<Pascal>` (single-file `src/models.rs`). The `crate::policies`
 /// path is layout-independent (policies always live in `src/policies/<snake>.rs`).
 fn policy_registration_call(model_path: &str, pascal: &str, snake: &str) -> String {
-    format!(".policy::<{model_path}, _>(crate::policies::{snake}::{pascal}Policy::default())")
+    format!(".policy::<{model_path}, _>(crate::policies::{snake}::{pascal}Policy)")
 }
 
 /// The `.scope::<...>(...)` builder call registering `{pascal}`'s scope.
 fn scope_registration_call(model_path: &str, pascal: &str, snake: &str) -> String {
-    format!(".scope::<{model_path}, _>(crate::policies::{snake}::{pascal}Scope::default())")
+    format!(".scope::<{model_path}, _>(crate::policies::{snake}::{pascal}Scope)")
 }
 
 /// Whether `line` is the `.policy::<...>(...)` registration for `{pascal}`,
@@ -2846,9 +2846,7 @@ fn scope_registration_call(model_path: &str, pascal: &str, snake: &str) -> Strin
 fn is_policy_registration_line(line: &str, pascal: &str, snake: &str) -> bool {
     let trimmed = line.trim();
     trimmed.starts_with(".policy::<")
-        && trimmed.ends_with(&format!(
-            "(crate::policies::{snake}::{pascal}Policy::default())"
-        ))
+        && trimmed.ends_with(&format!("(crate::policies::{snake}::{pascal}Policy)"))
 }
 
 /// Whether `line` is the `.scope::<...>(...)` registration for `{pascal}` — see
@@ -2856,9 +2854,7 @@ fn is_policy_registration_line(line: &str, pascal: &str, snake: &str) -> bool {
 fn is_scope_registration_line(line: &str, pascal: &str, snake: &str) -> bool {
     let trimmed = line.trim();
     trimmed.starts_with(".scope::<")
-        && trimmed.ends_with(&format!(
-            "(crate::policies::{snake}::{pascal}Scope::default())"
-        ))
+        && trimmed.ends_with(&format!("(crate::policies::{snake}::{pascal}Scope)"))
 }
 
 /// Inject `.policy::<...>(...)` and `.scope::<...>(...)` for `{pascal}` into
