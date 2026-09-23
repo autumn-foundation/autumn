@@ -9,6 +9,13 @@
   webhook", "reply by email", "mailgun", "ses" among them — landed on no page at
   all before this, except "inbound mail", which landed on the macro-expansion
   reference.
+- **inbound-mail:** the new section also states two things no inbound-mail doc
+  said before: Mailgun's 5-minute timestamp check is a freshness bound, not
+  replay protection — nothing de-duplicates, so side-effecting handlers must be
+  idempotent (unlike `SignedWebhook`, which does keep replay markers) — and a
+  signing key applies only to Mailgun and generic endpoints, since `build_routes`
+  never passes one to an SES route. `autumn generate inbound-mail` scaffolds a
+  Mailgun endpoint only; there is no provider flag.
 
 ### Fixed
 
@@ -27,12 +34,3 @@
   unauthenticated default outright.
 - **cli:** `autumn generate inbound-mail --help` said it adds the `inbound-mail`
   Cargo feature; it adds `inbound-mailgun`.
-
-### Documentation
-
-- **inbound-mail:** the new guide section states two things no inbound-mail doc
-  said before: Mailgun's 5-minute timestamp check is a freshness bound, not
-  replay protection — nothing de-duplicates, so side-effecting handlers must be
-  idempotent (unlike `SignedWebhook`, which does keep replay markers) — and a
-  signing key applies only to Mailgun and generic endpoints, since `build_routes`
-  never passes one to an SES route.

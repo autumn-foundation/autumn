@@ -1123,7 +1123,8 @@ spellings.
 
 `processing = "background"` is also the default the scaffold ships, which means
 the webhook answers `200` before your handler runs and a handler error is logged
-and dropped. Switch it to `"sync"` for work the provider should retry.
+and dropped. Switch it to `"sync"` and the error becomes a `500` instead, which
+leaves redelivery up to your provider rather than discarding the message.
 
 `autumn destroy inbound-mail Support` reverses all of it, including the
 `src/main.rs` registration — see
