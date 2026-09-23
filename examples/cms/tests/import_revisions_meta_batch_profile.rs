@@ -403,18 +403,75 @@ async fn import_revisions_meta_batch_profile() {
         "every post's custom fields, plus the importer's own two marker rows per post, must be present"
     );
 
+    // Result equivalence, not just counts: the batched multi-row INSERT must
+    // write the exact same values, in the exact same order, as the sequential
+    // single-row loop it replaces. Spot-checked on one post (`post-0`) rather
+    // than all 300, since every post is built by the same code path from the
+    // same template — a scrambled batch would show up here identically to how
+    // it would show up on any other post.
+    #[derive(QueryableByName, Debug)]
+    struct RevisionRow {
+        #[diesel(sql_type = Text)]
+        title: String,
+        #[diesel(sql_type = Text)]
+        summary: String,
+    }
+    use diesel::RunQueryDsl;
+    let sample_revisions: Vec<RevisionRow> = diesel::sql_query(
+        "SELECT r.title AS title, r.summary AS summary FROM revisions r \
+         JOIN posts p ON p.id = r.post_id \
+         WHERE p.slug = 'post-0' ORDER BY r.created_at ASC, r.id ASC",
+    )
+    .load(&mut conn)
+    .expect("sample revisions for post-0");
+    assert_eq!(
+        sample_revisions.len(),
+        REVISIONS_PER_POST,
+        "post-0 must carry every one of its revisions"
+    );
+    for (index, row) in sample_revisions.iter().enumerate() {
+        assert_eq!(row.title, format!("Revision {index} of post 0"));
+        assert_eq!(row.summary, format!("edit {index}"));
+    }
+
+    #[derive(QueryableByName, Debug)]
+    struct MetaRow {
+        #[diesel(sql_type = Text)]
+        meta_key: String,
+        #[diesel(sql_type = Text)]
+        meta_value: String,
+    }
+    let sample_meta: Vec<MetaRow> = diesel::sql_query(
+        "SELECT meta_key, meta_value FROM post_meta m \
+         JOIN posts p ON p.id = m.post_id \
+         WHERE p.slug = 'post-0' AND meta_key LIKE 'seo_field_%'",
+    )
+    .load(&mut conn)
+    .expect("sample meta for post-0");
+    assert_eq!(
+        sample_meta.len(),
+        META_FIELDS_PER_POST,
+        "post-0 must carry every one of its custom fields (marker keys excluded)"
+    );
+    let by_key: std::collections::HashMap<String, String> = sample_meta
+        .into_iter()
+        .map(|row| (row.meta_key, row.meta_value))
+        .collect();
+    for field in 0..META_FIELDS_PER_POST {
+        let key = format!("seo_field_{field}");
+        assert_eq!(
+            by_key.get(&key).map(String::as_str),
+            Some(format!("value-0-{field}").as_str()),
+            "field {key} must round-trip its exact value"
+        );
+    }
+
     let profile = print_profile(&mut conn, "fresh restore (300 posts)");
 
     println!("\n=== statement-count summary ===");
     println!(
         "{:<28} {:>11} {:>13} {:>11} {:>13} {:>11} {:>13}",
-        "scenario",
-        "rev 1-row",
-        "rev 1-buf",
-        "rev N-row",
-        "rev N-buf",
-        "meta 1-row",
-        "meta 1-buf"
+        "scenario", "rev 1-row", "rev 1-buf", "rev N-row", "rev N-buf", "meta 1-row", "meta 1-buf"
     );
     println!(
         "{:<28} {:>11} {:>13} {:>11} {:>13} {:>11} {:>13}",
