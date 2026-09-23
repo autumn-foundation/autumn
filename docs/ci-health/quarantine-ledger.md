@@ -2223,23 +2223,39 @@ without also filling in the intake form above.
   earlier draft of this update leaned "presumptively test-side" on the
   reasoning that real deployments do not run 27 concurrent test functions
   against one file — that reasoning does not survive the pool-size
-  correction two paragraphs up.** The target test's own `worker_loop`
-  (spawned by `start_runtime`, confirmed by direct read of
-  `autumn/src/job/sqlite.rs`'s `worker_loop`/`claim_next_job`) and the
-  test's own `enqueue_tracked` call both draw connections from the *same*
-  `SqliteJobQueue`'s pool, concurrently, entirely within this one test —
-  independent of any sibling test. That is the same intra-pool
-  multi-connection shape a production deployment hits any time a worker
-  loop and a request-path enqueue run against one SQLite file at once,
-  which is the backend's normal operating mode, not a test artifact. Running
-  the whole binary at default parallelism may simply be perturbing
-  scheduling/timing enough to trigger a race that already lives in that
-  pool usage — in which case concurrent siblings are the trigger, not the
-  defect, and the defect would be product-reachable. Sibling-test
-  concurrency remains a live, different candidate too (a resource genuinely
-  scoped to the test binary, not yet named). Both directions stay open
-  until the specific resource is identified; this entry no longer states a
-  presumption for either.
+  correction two paragraphs up.**
+
+  **Second correction (post-review, via a further Codex review comment on
+  PR #2922): the *first* correction's own replacement mechanism — a
+  `worker_loop` racing `enqueue_tracked` within this test — is itself
+  factually wrong, not just imprecisely worded.** This target test calls
+  `job::start_runtime(..., false)` (`autumn/tests/sqlite_jobs_scheduler_e2e.rs:1285-1294`,
+  the trailing `false`), and `start_runtime`'s own `run_workers: bool`
+  parameter gates exactly that: `if !run_workers { return Ok(()); }`
+  (`autumn/src/job/sqlite.rs:1469-1471`) returns *before* the worker-spawning
+  loop at lines 1505-1527 ever runs — confirmed by direct read, matching the
+  test's own comment, "Enqueue-only, so the record is written by a process
+  that never runs the job — the web half of a split." No `worker_loop`
+  exists in this test at all. The one task `start_runtime` spawns
+  unconditionally, for every role including this enqueue-only one, is
+  `queue_depth_survey_loop` (`autumn/src/job/sqlite.rs:1455-1465`), which
+  itself awaits the same schema-ready gate the enqueue path does and then
+  runs `update_queue_depth_gauges` — a single read-only `SELECT ... GROUP
+  BY` (`autumn/src/job/sqlite.rs:923-934`), no write, on tokio's default
+  first-tick-immediate `interval` against a 5-second
+  (`MAX_MAINTENANCE_INTERVAL`) period, so it fires at most once in this
+  test's ~3s runtime. That is a real intra-test concurrent actor sharing
+  the same pool and the same schema `OnceCell`, but a read-only `SELECT`
+  gives no obvious mechanism for an `INSERT ... ON CONFLICT` prepare-time
+  mismatch — considerably weaker as a candidate than the (wrong)
+  worker/enqueue write-write story it replaces. **Net effect: the
+  intra-test candidate is not eliminated, but it no longer has a
+  plausible named mechanism either, so it does not out-argue the
+  inter-test candidate the way the first correction claimed.** Both
+  directions — an inter-test shared resource, and *some* intra-test
+  interaction not yet identified — stay genuinely open; this entry states
+  no presumption for either, and specifically retracts the worker-loop
+  claim rather than merely softening it.
   **Mechanism: only the parallelism-sensitivity correlation is confirmed;
   the root-cause *category* is not.** **Correction (post-review, via a
   second Codex review comment on PR #2922, same pass as the one above):**
@@ -2249,12 +2265,15 @@ without also filling in the intake form above.
   the 3/100-vs-0/20 comparison actually shows. What is confirmed: this test
   fails only when the whole binary runs under libtest's default parallelism,
   never when it runs alone or serially. What is *not* confirmed: that the
-  mechanism requires a resource shared *between* tests at all. The
-  intra-pool worker-loop/enqueue race described above needs no sibling
-  test to exist — concurrent siblings could simply add enough CPU/scheduler
-  contention to widen an already-latent intra-test race's window, with no
-  inter-test shared state involved. Two candidate categories remain open,
-  not one confirmed: an inter-test shared resource (scoped to the binary),
+  mechanism requires a resource shared *between* tests at all — an
+  intra-test race needs no sibling test to exist; concurrent siblings could
+  simply add enough CPU/scheduler contention to widen an already-latent
+  intra-test race's window, with no inter-test shared state involved. (The
+  specific intra-test candidate named in the correction just above, a
+  `worker_loop` racing the enqueue, was itself factually wrong and is
+  retracted there — this paragraph's point about the *shape* of an
+  intra-test explanation stands independent of that retraction.) Two
+  candidate categories remain open, not one confirmed: an inter-test shared resource (scoped to the binary),
   and a purely intra-test timing-sensitive race (widened, not caused, by
   sibling load). Neither has a named specific defect, so per this role's
   own hard gate (a category without the specific defect is not enough to
@@ -2291,16 +2310,23 @@ without also filling in the intake form above.
   concurrently-scheduled sibling could also touch; the existing "ruled out"
   finding for `GLOBAL_JOB_CLIENT` (a few paragraphs up) only checked
   whether *other lock-holding* siblings truly interleave with it — it
-  did not check whether a `start_runtime` call's spawned background tasks
-  (the worker loop) can still be executing after `shutdown.cancel()` and
-  after the owning test's `global_job_runtime_test_lock()` guard is
-  dropped, into a window where a *different*, non-lock-holding concurrently
-  running test (or the next lock-holder) is active. That gap — not a new
-  hypothesis invented this pass, but an unexamined corner of the existing
-  one — is the concrete next step, along with dispatching the harness
-  variant this pass adds (below) against `trunk-dev` once merged, to get a
-  CI-native (not just local-sandbox) confirmation of the 3/100 figure
-  above.
+  did not check whether a `start_runtime` call's spawned background task(s)
+  can still be executing after `shutdown.cancel()` and after the owning
+  test's `global_job_runtime_test_lock()` guard is dropped, into a window
+  where a *different*, non-lock-holding concurrently running test (or the
+  next lock-holder) is active. **For this specific target test, per the
+  second correction above, that spawned task is `queue_depth_survey_loop`
+  (a `worker_loop` is never spawned here, `run_workers` is `false`)** — a
+  weaker candidate than a worker loop would be, since it is read-only, but
+  not eliminated: an outliving `wait_ready` call or a stray connection
+  checkout on the `OnceCell` schema gate is still worth checking. Other
+  tests in this same file that *do* call `start_runtime` with
+  `run_workers: true` (not yet enumerated) would spawn a real `worker_loop`
+  and are a separate, not-yet-checked source of the same class of gap. That
+  audit — scoped correctly this time — is the concrete next step, along
+  with dispatching the harness variant this pass adds (below) against
+  `trunk-dev` once merged, to get a CI-native (not just local-sandbox)
+  confirmation of the 3/100 figure above.
 
   **This pass adds `rerun_default_parallelism` to
   `.github/workflows/manual-sqlite-jobs-rerun-check.yml`**: a second job,

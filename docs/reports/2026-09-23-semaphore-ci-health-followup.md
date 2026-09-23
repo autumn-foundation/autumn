@@ -14,10 +14,14 @@ raising the organic count from n=2 to n=3. No fix opens this pass: only the
 correlation with whole-binary default-parallelism execution is confirmed —
 not, as an earlier draft of this report claimed and a Codex review comment
 on PR #2922 caught, a root-cause category naming inter-test shared state
-specifically. A purely intra-test race (the target's own worker loop and
-enqueue call sharing one pool, with siblings only perturbing timing) remains
-equally live. This role's own hard gate requires a specific defect, and a
-wrong category besides, before a fix PR. No new hits on any other tracked
+specifically. This report also originally misidentified the intra-test
+concurrent actor as a `worker_loop` racing the enqueue; a second Codex
+comment caught that this test passes `run_workers: false`, so no worker
+loop is ever spawned — the real (and weaker, read-only) intra-test actor is
+`queue_depth_survey_loop`. Both an inter-test shared resource and some
+not-yet-identified intra-test interaction remain open candidates. This
+role's own hard gate requires a specific defect, and a correct category
+besides, before a fix PR. No new hits on any other tracked
 signature.
 
 ## 🎯 Verdict path
@@ -101,22 +105,33 @@ fails only when it runs *concurrently* with its own siblings in the same
 binary — never alone, and never when the whole binary runs one test at a
 time.
 
-**Test-vs-product verdict: not rendered, and — after a second review
-correction below — not leaning either way.** This report originally leaned
+**Test-vs-product verdict: not rendered, and not leaning either way — after
+two review corrections, not one.** This report originally leaned
 "presumptively test-side," reasoning that a real deployment does not run 27
 concurrent test functions against one SQLite file. A second Codex comment on
 PR #2922 correctly pointed out that reasoning doesn't survive the pool-size
-correction just above: the target test's own `worker_loop` (spawned by
-`start_runtime`) and its own `enqueue_tracked` call draw connections from the
-*same* pool concurrently, entirely within this one test, independent of any
-sibling — the same intra-pool multi-connection shape a production deployment
-hits whenever a worker loop and a request-path enqueue run against one
-SQLite file at once, which is this backend's normal operating mode, not a
-test artifact. Concurrent siblings may simply be perturbing scheduling
-enough to trigger a race that already lives in that pool usage, in which
-case the defect would be product-reachable. Sibling-test concurrency remains
-a live, separate candidate too. Both directions stay open until the specific
-resource is identified.
+correction just below.
+
+That correction's own replacement claim — a `worker_loop` racing
+`enqueue_tracked` within this one test — was itself wrong, caught by a
+*third* Codex comment: this target test calls `job::start_runtime(...,
+false)` (`autumn/tests/sqlite_jobs_scheduler_e2e.rs:1285-1294`), and
+`start_runtime`'s `run_workers: bool` parameter gates the worker-spawning
+loop behind an early return (`autumn/src/job/sqlite.rs:1469-1471`,
+`if !run_workers { return Ok(()); }`) — confirmed by direct read, matching
+the test's own comment ("Enqueue-only... the web half of a split"). No
+`worker_loop` exists in this test. The one task `start_runtime` spawns
+unconditionally for every role, including this one, is
+`queue_depth_survey_loop`, which shares the same pool and schema gate but
+only runs a single read-only `SELECT` in this test's short runtime
+(`autumn/src/job/sqlite.rs:923-934`, `MAX_MAINTENANCE_INTERVAL` = 5s) — a
+real intra-test concurrent actor, but with no obvious mechanism for an
+`INSERT ... ON CONFLICT` prepare-time mismatch, considerably weaker than
+the (wrong) worker/enqueue story it replaces. Net effect: the intra-test
+candidate isn't eliminated, but it has no named mechanism either, so it
+doesn't out-argue the inter-test candidate. Both directions — an inter-test
+shared resource, and some not-yet-identified intra-test interaction — stay
+open.
 
 **Correction, added post-review (a Codex comment on PR #2922 caught this
 before merge):** this report originally claimed `build_sqlite_pool` pins
@@ -137,12 +152,17 @@ established `enqueue_tracked` routes through. The existing "ruled out"
 finding for `GLOBAL_JOB_CLIENT` in this entry only checked whether *other
 lock-holding* siblings truly interleave with the target test (they cannot —
 the lock is held for the whole test); it did not check whether a
-`start_runtime` call's spawned worker-loop task can still be running after
+`start_runtime` call's spawned background task(s) can still be running after
 `shutdown.cancel()` and after the owning test's
 `global_job_runtime_test_lock()` guard is dropped, into a window where a
-different, non-lock-holding sibling (or the next lock-holder) is active. That
-gap — not a new hypothesis, an unexamined corner of the existing one — is
-the named next step.
+different, non-lock-holding sibling (or the next lock-holder) is active. For
+this specific target test that spawned task is `queue_depth_survey_loop`
+(no `worker_loop` here, `run_workers` is `false`) — weaker as a candidate
+since it's read-only, but not eliminated. Other tests in this file that call
+`start_runtime` with `run_workers: true` would spawn a real `worker_loop`
+and are a separate, not-yet-checked instance of the same class of gap. That
+correctly-scoped audit — not a new hypothesis, an unexamined corner of the
+existing one — is the named next step.
 
 ## 🔧 Treatment
 
