@@ -322,10 +322,29 @@ calls the method on it, rather than a compile failure. New test in
 a bespoke `LegacyStoreWithoutRelink` implementing every other method — proof
 this is source-compatible, not just an assertion in a doc comment.
 
-Re-verified after all six findings: full `autumn-billing` lib tests (82),
-`--test integration` (170, up from 164), `--test mirror_db` (29, up from
-24), `cargo fmt`/`clippy -D warnings` clean, `cargo check --all-targets`
-clean, the documentation-build command above clean, and
+**A seventh finding**, on the next review round (commit `1e91e8a4`, P1): the
+migration guide's relink guidance was scoped too narrowly. It read as if
+only an app *newly* enabling tenancy on top of existing billing data needed
+to relink pre-existing rows — but every `billing_customers` row of **any**
+tenancy-enabled app running `BillingPlugin` is a bare, unscoped id pre-fix,
+regardless of whether tenancy was turned on yesterday or has run alongside
+billing since day one (pre-fix, `Customer.user_id` was never tenant-scoped
+either way — that's the entire vulnerability). An app that already combined
+tenancy and billing before this release — the actively-exploitable
+configuration this whole fix targets — would have read the guide, seen
+"enabling tenancy" language that didn't describe its own situation, and
+skipped the relink step, leaving every paying customer's row dark after
+upgrading. Fixed by broadening the guide's wording (and the changelog
+fragment's) to state plainly: every pre-existing row of every tenancy +
+billing app needs relinking on upgrade, not only the "just turned tenancy
+on" case. Documentation-only change; no code, so no new test — the
+underlying `relink_customer` behavior was already covered by finding 2's
+tests.
+
+Re-verified after all seven findings: full `autumn-billing` lib tests (82),
+`--test integration` (170), `--test mirror_db` (29), `cargo fmt`/
+`clippy -D warnings` clean, `cargo check --all-targets` clean, the
+documentation-build command above clean, and
 `./scripts/check-docs-symbols.sh` / `check-migration-guides.sh` /
 `check-plugin-surface.sh` / `check-changelog-fragments.sh` all still green.
 

@@ -24,8 +24,9 @@
   the raw id with the new `autumn_billing::gate::strip_tenant_scope`. See the
   [migration guide](docs/migrations/next.md#autumn-billing-customeruser_id-is-tenant-scoped-under-tenancy),
   which also covers relinking a pre-existing `billing_customers` row (via
-  the new `BillingStore::relink_customer`) for an app enabling tenancy after
-  it already had paying customers. The default `recipient_for` already
-  calls `strip_tenant_scope`, so it is unaffected; a custom override needs
-  the same one-line change. See
+  the new `BillingStore::relink_customer`) — needed by every tenancy-enabled
+  app upgrading with existing rows, whether it just enabled tenancy or has
+  run tenancy and billing together all along. The default `recipient_for`
+  already calls `strip_tenant_scope`, so it is unaffected; a custom override
+  needs the same one-line change. See
   `docs/security/2026-09-23-billing-cross-tenant-identity-collision/`.

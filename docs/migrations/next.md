@@ -1303,18 +1303,23 @@ change:
  }
 ```
 
-**Existing `billing_customers` rows written before you enable tenancy on an
-app that already had `BillingPlugin` mounted go dark, immediately, on
-upgrade** — not "eventually" or "indistinguishably": every lookup now keys on
-the tenant-scoped identity, so `customer_by_user` misses the row on the very
-next request, and `Entitled<R>` reports `entitled: false` for an
-already-paying user until it is relinked. Nothing relinks it automatically:
+**Every pre-existing `billing_customers` row keyed by a bare, unscoped
+`user_id` goes dark, immediately, on upgrade** — not "eventually" or
+"indistinguishably": every lookup now keys on the tenant-scoped identity, so
+`customer_by_user` misses the row on the very next request, and `Entitled<R>`
+reports `entitled: false` for an already-paying user until it is relinked.
+This is not only the app newly enabling tenancy on top of existing billing
+data — **it is every tenancy-enabled app upgrading `autumn-billing` past
+this fix**, including one that already ran tenancy and `BillingPlugin`
+together before this release: pre-fix, `Customer.user_id` was never
+tenant-scoped regardless of when tenancy was turned on, so every row any
+such app has today is a bare id. Nothing relinks it automatically:
 `upsert_customer` deliberately never replaces an existing `user_id` link (see
 its doc), so even a fresh checkout does not repair the row — it creates a
 **second** provider customer instead, which can produce a duplicate Stripe
-subscription. Relink each pre-existing row explicitly before (or immediately
-after) enabling tenancy, with the tenant you already know it belongs to from
-your own records:
+subscription. Relink every pre-existing row explicitly — before upgrading if
+you can stage it, immediately after if you cannot — with the tenant you
+already know it belongs to from your own records:
 
 ```rust
 let service = autumn_billing::BillingService::require(&state)?;
@@ -1343,10 +1348,11 @@ A custom store that wants to support the relink recipe above needs to
 override it; `MemoryBillingStore` and `DbBillingStore` already do.
 
 **Automation:** `manual` — a custom `recipient_for` override, if one exists,
-needs the diff above; every pre-existing `billing_customers` row under an
-app newly enabling tenancy needs the `relink_customer` call above; the
-default `recipient_for` implementation and every other consumer of
-`Customer.user_id` need no change.
+needs the diff above; every pre-existing `billing_customers` row of every
+tenancy-enabled app running `BillingPlugin` — whether tenancy was just
+turned on or has been running alongside billing all along — needs the
+`relink_customer` call above; the default `recipient_for` implementation
+and every other consumer of `Customer.user_id` need no change.
 
 
 ## Plugin authors
