@@ -6,6 +6,8 @@
 //! post's terms *and* the affected terms' post counts. Handlers call these; they
 //! never open a transaction themselves.
 
+use std::collections::HashSet;
+
 use autumn_web::AutumnError;
 use autumn_web::AutumnResult;
 use diesel::prelude::*;
@@ -2447,39 +2449,101 @@ pub async fn ensure_unique_slug(
     let shadowed_by_a_route = !nested_page
         && BARE_PATH_TYPES.contains(&post_type)
         && segment_claim(desired, None).is_some();
-    let mut candidate = if shadowed_by_a_route {
+
+    // The first candidate the original suffix-at-a-time loop would have
+    // queried: `desired` itself, or `desired-2` when `shadowed_by_a_route`
+    // (that slug is reserved by a route rather than by another row, so the
+    // search starts one suffix further in).
+    let first_candidate = if shadowed_by_a_route {
         format!("{desired}-2")
     } else {
         desired.to_owned()
     };
-    for suffix in 2..=200u32 {
-        let mut query = posts::table
-            .filter(posts::slug.eq(candidate.clone()))
-            .filter(posts::post_type.eq_any(&competing_types))
-            .into_boxed();
-        // Siblings only, for a nested page — and for a top-level page or a
-        // post, the bare-path namespace, which nested pages are not in.
-        query = match parent_id {
-            Some(parent) if nested_page => query.filter(posts::parent_id.eq(parent)),
-            _ if BARE_PATH_TYPES.contains(&post_type) => {
-                query.filter(posts::post_type.eq("post").or(posts::parent_id.is_null()))
-            }
-            _ => query,
-        };
-        if let Some(id) = exclude_id {
-            query = query.filter(posts::id.ne(id));
-        }
-        let taken: i64 = query.count().get_result(conn).await?;
-        if taken == 0 {
-            return Ok(candidate);
-        }
-        candidate = format!("{desired}-{suffix}");
+
+    // The overwhelming common case is zero collisions: a title nobody has
+    // used before frees on the very first candidate. Probing that one alone
+    // — the same single-value, index-backed shape the original loop's first
+    // iteration used, and the only string this path allocates — keeps that
+    // case exactly as cheap as before: no wider `= ANY(...)` query the
+    // planner might resolve with a sequential scan, and no wasted formatting
+    // of the ~198 suffixes that turn out not to be needed. Only a collision
+    // here falls through to building and batching the rest of the candidate
+    // list, and it is *that* path — not the common one — that this fix is
+    // for.
+    let mut probe = posts::table
+        .filter(posts::slug.eq(&first_candidate))
+        .filter(posts::post_type.eq_any(&competing_types))
+        .into_boxed();
+    probe = apply_slug_scope(probe, post_type, parent_id, nested_page, exclude_id);
+    let first_taken: i64 = probe.count().get_result(conn).await?;
+    if first_taken == 0 {
+        return Ok(first_candidate);
     }
-    // 200 collisions on one slug is not a naming accident. Refuse rather than
-    // loop or silently overwrite.
-    Err(AutumnError::unprocessable_msg(
-        "Too many posts share this slug; choose a different one",
-    ))
+
+    // Reached only on a collision. The rest of the candidates the original
+    // loop would have queried, in the same order and with the same
+    // off-by-one boundary: `desired-200` is never itself reached (the
+    // loop's `2..=200` range, combined with its check-then-advance
+    // structure, means the last candidate it ever queries is
+    // `desired-199`), so 199 taken candidates — not 200 — is what exhausts
+    // the search. The original loop also rechecks `desired-2` a second time
+    // via its carried-over candidate in the `shadowed_by_a_route` case, a
+    // redundant, idempotent recheck (the same string can't become "more
+    // taken" the second time) that is dropped here rather than reproduced.
+    let first_suffix = if shadowed_by_a_route { 3 } else { 2 };
+    let remaining: Vec<String> = (first_suffix..=199u32)
+        .map(|suffix| format!("{desired}-{suffix}"))
+        .collect();
+
+    let mut query = posts::table
+        .filter(posts::slug.eq_any(&remaining))
+        .filter(posts::post_type.eq_any(&competing_types))
+        .into_boxed();
+    query = apply_slug_scope(query, post_type, parent_id, nested_page, exclude_id);
+    // One round trip for the rest of the candidate list, instead of one per
+    // suffix: every existing row that holds ANY remaining candidate, in a
+    // single query, then the first candidate not among them wins in Rust —
+    // the same "first free wins" rule the original loop applied one probe
+    // at a time.
+    let taken: HashSet<String> = query
+        .select(posts::slug)
+        .load(conn)
+        .await?
+        .into_iter()
+        .collect();
+
+    remaining
+        .into_iter()
+        .find(|candidate| !taken.contains(candidate))
+        // 199 collisions on one slug is not a naming accident. Refuse rather
+        // than loop further or silently overwrite.
+        .ok_or_else(|| {
+            AutumnError::unprocessable_msg("Too many posts share this slug; choose a different one")
+        })
+}
+
+/// Siblings only, for a nested page — and for a top-level page or a post,
+/// the bare-path namespace, which nested pages are not in. Shared between
+/// `ensure_unique_slug`'s fast-path single probe and its batched fallback so
+/// the two stay scoped identically.
+fn apply_slug_scope<'a>(
+    mut query: posts::BoxedQuery<'a, diesel::pg::Pg>,
+    post_type: &str,
+    parent_id: Option<i64>,
+    nested_page: bool,
+    exclude_id: Option<i64>,
+) -> posts::BoxedQuery<'a, diesel::pg::Pg> {
+    query = match parent_id {
+        Some(parent) if nested_page => query.filter(posts::parent_id.eq(parent)),
+        _ if BARE_PATH_TYPES.contains(&post_type) => {
+            query.filter(posts::post_type.eq("post").or(posts::parent_id.is_null()))
+        }
+        _ => query,
+    };
+    if let Some(id) = exclude_id {
+        query = query.filter(posts::id.ne(id));
+    }
+    query
 }
 
 /// The deepest page hierarchy the site will address.
