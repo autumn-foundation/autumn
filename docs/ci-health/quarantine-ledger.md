@@ -2259,23 +2259,33 @@ without also filling in the intake form above.
   *different* connection from the same pool for its `INSERT`. Confirmed by
   reading `autumn/src/db.rs`: every non-read-only pooled `SQLite` connection
   in this backend runs `PRAGMA journal_mode = WAL`
-  (`sqlite_connection_pragmas`, `autumn/src/db.rs:1310-1324`), and WAL mode
-  gives a connection a snapshot view that does not advance until its own
-  read/write transaction context restarts — a real, named mechanism by
-  which one connection's committed DDL can be invisible to a different
-  connection's next prepare, entirely within this one test, no sibling
-  test required. This is now the strongest concrete candidate this entry
-  has for a specific defect, **but is not yet confirmed**: it explains how
-  a connection-local staleness *could* occur under WAL, not that it *does*
-  in this exact interleaving — the `OnceCell`'s own happens-before
-  guarantee (no caller proceeds past `ready()` until `ensure_schema`'s
-  future has resolved) still needs to be reconciled with whichever
-  connection-pool/driver behavior would let a second connection begin its
-  own transaction before observing that commit. That reconciliation, not
-  further speculation, is the concrete next step. Both directions — an
-  inter-test shared resource, and this now-named intra-test WAL-visibility
-  candidate — stay open until one is confirmed against a real repro; this
-  entry states no presumption for either.
+  (`sqlite_connection_pragmas`, `autumn/src/db.rs:1310-1324`), which raised
+  a WAL-snapshot-staleness mechanism as live.
+
+  **Second correction, same review round (via a further Codex comment on PR
+  #2922): that specific WAL-staleness mechanism is ruled out, not merely
+  unconfirmed — the ordering it needed doesn't exist.** `enqueue_job_at`
+  calls `queue_handle.ready().await?` (which resolves only once
+  `ensure_schema`'s future has completed) *before* `pool.get().await` for
+  its own connection (`autumn/src/job/sqlite.rs:392-393`, confirmed by
+  direct read: `ready()` is line 392, `pool.get()` is line 393, in that
+  order). Rust drops `ensure_schema`'s own connection guard at the end of
+  its function body — before the async fn returns `Ok(())` — which is
+  strictly before the `OnceCell` reports ready, which is strictly before
+  `enqueue_job_at` even *requests* its own connection. There is no window
+  in which the enqueue's connection could hold an open transaction, let
+  alone a WAL read snapshot, predating the DDL: it doesn't exist as a
+  connection yet when the DDL commits, and an idle connection's next
+  statement begins its snapshot at issue time, not earlier. The specific
+  staleness story is dead. What survives from the first correction: the
+  survey loop's `wait_ready()` *can* still be the one to execute
+  `ensure_schema` (it is not merely read-only), which remains true and
+  worth keeping in mind for whatever the eventual mechanism turns out to
+  be — but it does not, on its own, explain this failure via the route
+  just proposed. **Net effect of both corrections together: no named
+  mechanism survives review this pass.** Both directions — an inter-test
+  shared resource, and some intra-test interaction not yet identified —
+  stay open, with no live specific candidate for either as of this entry.
   **Mechanism: only the parallelism-sensitivity correlation is confirmed;
   the root-cause *category* is not.** **Correction (post-review, via a
   second Codex review comment on PR #2922, same pass as the one above):**
@@ -2335,14 +2345,18 @@ without also filling in the intake form above.
   test's `global_job_runtime_test_lock()` guard is dropped, into a window
   where a *different*, non-lock-holding concurrently running test (or the
   next lock-holder) is active. **For this specific target test, per the
-  two corrections above, that spawned task is `queue_depth_survey_loop`
-  (a `worker_loop` is never spawned here, `run_workers` is `false`), and it
-  is a live candidate via the schema `OnceCell`/WAL-visibility mechanism
-  named there** — reconciling the `OnceCell`'s happens-before guarantee
-  against WAL's own snapshot semantics for a second connection is the
-  specific audit that would confirm or rule it out. Other tests in this
-  same file that *do* call `start_runtime` with `run_workers: true` (not
-  yet enumerated) would spawn a real `worker_loop` too, a separate,
+  corrections above, that spawned task is `queue_depth_survey_loop`
+  (a `worker_loop` is never spawned here, `run_workers` is `false`); its
+  `wait_ready()` call can still be the one to execute `ensure_schema`, but
+  the specific WAL-staleness route from that observation to the panic is
+  now ruled out (see the second correction above), so this candidate has
+  no live named mechanism as of this entry** — this outliving-background-task
+  question (can `queue_depth_survey_loop` still be running after
+  `shutdown.cancel()`/guard-drop, in a window a different test is active)
+  remains a distinct, not-yet-checked angle worth auditing on its own
+  terms, separate from the now-dead schema-DDL-race idea. Other tests in
+  this same file that *do* call `start_runtime` with `run_workers: true`
+  (not yet enumerated) would spawn a real `worker_loop` too, a separate,
   not-yet-checked instance of the same class of gap. Both audits — scoped
   correctly this time — are the concrete next step, along
   with dispatching the harness variant this pass adds (below) against

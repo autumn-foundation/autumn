@@ -225,22 +225,31 @@ jobs:
               fi
             fi
           done
+          # The rate is only meaningful over iterations where the target
+          # actually ran — dividing by $ITERATIONS when target_missing is
+          # nonzero would understate the true rate among iterations that
+          # count (Codex review, PR #2922).
+          target_ran_count=$((ITERATIONS - target_missing))
           {
             echo "## sqlite_jobs_scheduler_e2e whole-binary (default parallelism) rerun result"
             echo ""
-            echo "Target (\`sqlite_job_backend_tracks_job_status_durably\`): \`$target_fail\`/\`$ITERATIONS\` failed."
+            if [ "$target_ran_count" -gt 0 ]; then
+              echo "Target (\`sqlite_job_backend_tracks_job_status_durably\`): \`$target_fail\`/\`$target_ran_count\` failed (denominator excludes iterations where the target could not be found)."
+            else
+              echo "Target (\`sqlite_job_backend_tracks_job_status_durably\`): rate undefined — the target was not found in any of the \`$ITERATIONS\` iteration logs."
+            fi
             echo ""
-            echo "Sibling-test failures (any other test in the binary): \`$sibling_fail\`/\`$ITERATIONS\`."
+            echo "Sibling-test failures (any other test in the binary): \`$sibling_fail\`/\`$target_ran_count\`."
             echo ""
-            echo "Of those, target and a sibling failed **together** in the same iteration: \`$joint_fail\`/\`$ITERATIONS\` — diagnostic evidence for the shared-state hypothesis if nonzero."
+            echo "Of those, target and a sibling failed **together** in the same iteration: \`$joint_fail\`/\`$target_ran_count\` — diagnostic evidence for the shared-state hypothesis if nonzero."
             echo ""
             if [ "$target_missing" -ne 0 ]; then
               echo "⚠️ Target not found in \`$target_missing\`/\`$ITERATIONS\` iteration logs (bad SHA/build, or the target was renamed) — excluded from the target/sibling/pass counts above; inspect those logs manually."
               echo ""
             fi
-            echo "\`$pass\`/\`$ITERATIONS\` iterations passed outright."
+            echo "\`$pass\`/\`$ITERATIONS\` iterations passed outright (denominator is the full iteration count here, since a pass requires the target to have run)."
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "RESULT: target $target_fail/$ITERATIONS failed, sibling $sibling_fail/$ITERATIONS failed (of which $joint_fail/$ITERATIONS joint with the target), $target_missing/$ITERATIONS target-missing, $pass/$ITERATIONS passed"
+          echo "RESULT: target $target_fail/$target_ran_count failed, sibling $sibling_fail/$target_ran_count failed (of which $joint_fail/$target_ran_count joint with the target), $target_missing/$ITERATIONS target-missing, $pass/$ITERATIONS passed"
       - name: Upload every iteration's full log
         if: always()
         uses: actions/upload-artifact@v7
