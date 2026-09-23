@@ -437,8 +437,9 @@ not replay protection: it caps how long a captured request stays usable at five
 minutes, and within that window the same `timestamp`/`token`/`signature` triple
 is accepted every time it arrives, because no delivery identifier is retained.
 Providers also retry on their own. Make any handler with side effects
-idempotent — key it on `Message-Id` from `email.headers`, or on your own
-plus-address token. This is the one place inbound mail differs from
+idempotent — key it on `email.headers.get("message-id")`, or on your own
+plus-address token. `email.headers` is keyed by **lower-cased** header name on
+both the Mailgun and RFC 5322 paths, so `get("Message-Id")` returns `None`. This is the one place inbound mail differs from
 [`autumn generate webhook`](generators.md#autumn-generate-webhook), whose
 `SignedWebhook` extractor does keep replay markers.
 
