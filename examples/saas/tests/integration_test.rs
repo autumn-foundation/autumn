@@ -537,6 +537,82 @@ async fn create_project_failure_redisplays_the_dashboard_with_name_preserved() {
     );
 }
 
+/// Scrape the `_submit_token` hidden field out of a rendered form.
+fn extract_submit_token(html: &str) -> String {
+    let marker = r#"name="_submit_token" value=""#;
+    let start = html
+        .find(marker)
+        .expect("expected a `_submit_token` hidden field in the rendered form (issue #2921)");
+    let rest = &html[start + marker.len()..];
+    let end = rest
+        .find('"')
+        .expect("unterminated `_submit_token` value in the rendered form");
+    rest[..end].to_owned()
+}
+
+/// Issue #2921: the dashboard's "Create Project" form used to carry no
+/// `_submit_token` hidden field (unlike signup/login in the same app), so two
+/// back-to-back `POST /dashboard/projects` — a double-click or a browser's
+/// silent retry of a slow POST — each ran the handler and created duplicate
+/// rows. The form now embeds a one-time token exactly like the signup form, so
+/// the second submission replays the first response instead of inserting a
+/// second project.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn create_project_double_submit_creates_exactly_one_project() {
+    let client = db_client().await;
+    let cookie = signup(&client, "founder@acme.test").await;
+
+    // The rendered dashboard must embed a fresh one-time token in the
+    // create-project form.
+    let dashboard = client
+        .get("/dashboard")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    dashboard.assert_ok();
+    let token = extract_submit_token(dashboard.text());
+
+    let body = |token: &str| format!("name=DoubleClickTest&_submit_token={token}");
+    let first = client
+        .post("/dashboard/projects")
+        .header("cookie", &cookie)
+        .form(&body(&token))
+        .send()
+        .await;
+    first.assert_status(303);
+
+    // The identical retry carries the now-spent token: the handler must not
+    // run again, and the recorded response is replayed instead.
+    let second = client
+        .post("/dashboard/projects")
+        .header("cookie", &cookie)
+        .form(&body(&token))
+        .send()
+        .await;
+    second.assert_status(303);
+    assert_eq!(
+        second.header("x-submit-token-replayed"),
+        Some("true"),
+        "the double-clicked submission must be short-circuited as a replay, \
+         not re-run the handler"
+    );
+
+    // Exactly one project landed.
+    let dashboard = client
+        .get("/dashboard")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    dashboard.assert_ok();
+    assert!(
+        dashboard.text().contains("1 total"),
+        "a double-clicked create-project submission must create exactly one \
+         project, got: {}",
+        dashboard.text()
+    );
+}
+
 /// AC8 (issue #1397): the whole persistent remember-me lifecycle, under the
 /// grace-window rotation model —
 ///   1. `POST /login` with `remember=on` sets BOTH a session cookie and a
