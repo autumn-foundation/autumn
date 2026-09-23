@@ -436,10 +436,19 @@ accept unsigned mail, a bad signature or a timestamp outside the window is
 not replay protection: it caps how long a captured request stays usable at five
 minutes, and within that window the same `timestamp`/`token`/`signature` triple
 is accepted every time it arrives, because no delivery identifier is retained.
-Providers also retry on their own. Make any handler with side effects
-idempotent — key it on `email.headers.get("message-id")`, or on your own
-plus-address token. `email.headers` is keyed by **lower-cased** header name on
-both the Mailgun and RFC 5322 paths, so `get("Message-Id")` returns `None`. This is the one place inbound mail differs from
+Providers also retry on their own.
+
+So make any handler with side effects idempotent, keyed on something that
+identifies the **message** rather than the conversation.
+`email.headers.get("message-id")` is the usual choice — and note `email.headers`
+is keyed by **lower-cased** name on both the Mailgun and RFC 5322 paths, so
+`get("Message-Id")` returns `None`. Do **not** key on the plus-address token: in
+the reply scheme below it identifies the *thread*, so every reply in that thread
+carries the same value and you would drop all but the first. `Message-Id` comes
+from the sender, so scope the key to its endpoint and expire it rather than
+trusting it as a globally unique id.
+
+This is the one place inbound mail differs from
 [`autumn generate webhook`](generators.md#autumn-generate-webhook), whose
 `SignedWebhook` extractor does keep replay markers.
 
