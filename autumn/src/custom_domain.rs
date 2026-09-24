@@ -8,9 +8,10 @@
 //!   ([`CustomDomainStore`]),
 //! - the tenant-facing [DNS instructions](DnsInstructions) — CNAME for a
 //!   subdomain, A/AAAA for an apex, which cannot carry a CNAME,
-//! - the **verification gate** ([`grade_dns_verification`]): no ACME order is
-//!   created until the hostname is independently observed to point at this
-//!   deployment,
+//! - the **verification gate** ([`grade_dns_verification`] and
+//!   [`grade_ownership`]): no ACME order is created until the hostname is
+//!   independently observed to point at this deployment AND its
+//!   [`VERIFICATION_LABEL`] TXT record carries this registration's token,
 //! - the [issuance budget](IssuanceLimiter) — per-domain and global caps plus
 //!   exponential backoff — that keeps a misconfigured tenant from burning the
 //!   CA's rate limits.
@@ -161,10 +162,10 @@ impl ExpectedIngress {
     }
 }
 
-/// The DNS record a tenant must publish for one custom domain.
+/// The record that routes a custom domain to this deployment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum DnsInstructions {
+pub enum RoutingRecord {
     /// A subdomain: one CNAME at the operator's ingress hostname.
     Cname {
         /// The record name the tenant creates.
@@ -184,8 +185,9 @@ pub enum DnsInstructions {
     },
 }
 
-impl DnsInstructions {
-    /// Build the instructions for `hostname` against this deployment's ingress.
+impl RoutingRecord {
+    /// Build the routing record for `hostname` against this deployment's
+    /// ingress.
     ///
     /// # Errors
     ///
@@ -217,7 +219,7 @@ impl DnsInstructions {
         Ok(Self::Cname { name: host, value })
     }
 
-    /// The instructions as a line a tenant-facing screen can print verbatim.
+    /// The record as tab-separated lines a tenant-facing screen can print.
     #[must_use]
     pub fn render(&self) -> String {
         match self {
@@ -234,6 +236,83 @@ impl DnsInstructions {
             }
         }
     }
+}
+
+/// The TXT record that proves a tenant controls a custom domain (#2642).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationRecord {
+    /// The record name: [`VERIFICATION_LABEL`] under the hostname.
+    pub name: String,
+    /// The TXT value: this registration's token.
+    pub value: String,
+}
+
+/// Every DNS record a tenant must publish for one custom domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsInstructions {
+    /// The record that points the hostname at this deployment.
+    pub routing: RoutingRecord,
+    /// The TXT record that proves the tenant controls the hostname.
+    ///
+    /// `None` only for a grandfathered record (see
+    /// [`CustomDomain::verification_token`]), which needs no proof.
+    pub verification: Option<VerificationRecord>,
+}
+
+impl DnsInstructions {
+    /// Build the instructions for one registered domain.
+    ///
+    /// # Errors
+    ///
+    /// As [`RoutingRecord::for_hostname`].
+    pub fn for_domain(domain: &CustomDomain, ingress: &ExpectedIngress) -> Result<Self, String> {
+        Ok(Self {
+            routing: RoutingRecord::for_hostname(&domain.hostname, ingress)?,
+            verification: domain
+                .verification_token
+                .as_ref()
+                .map(|token| VerificationRecord {
+                    name: verification_record_name(&domain.hostname),
+                    value: token.clone(),
+                }),
+        })
+    }
+
+    /// The instructions as tab-separated lines a tenant-facing screen can
+    /// print verbatim: the routing record(s), then the TXT record.
+    #[must_use]
+    pub fn render(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = self.routing.render();
+        if let Some(record) = &self.verification {
+            let _ = write!(out, "\n{}\tTXT\t{}", record.name, record.value);
+        }
+        out
+    }
+}
+
+// ── Ownership token ──────────────────────────────────────────────────────
+
+/// The label under a custom domain that holds its ownership TXT record.
+pub const VERIFICATION_LABEL: &str = "_autumn-challenge";
+
+/// The TXT record name that proves ownership of `hostname`.
+#[must_use]
+pub fn verification_record_name(hostname: &str) -> String {
+    format!("{VERIFICATION_LABEL}.{hostname}")
+}
+
+/// A fresh ownership token: 128 random bits as 32 hex digits.
+fn mint_verification_token() -> io::Result<String> {
+    use std::fmt::Write as _;
+    let mut bytes = [0_u8; 16];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|e| io::Error::other(format!("the OS random source failed: {e}")))?;
+    let mut out = String::with_capacity(32);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    Ok(out)
 }
 
 // ── Verification ─────────────────────────────────────────────────────────
@@ -263,6 +342,15 @@ pub enum VerificationOutcome {
     /// The name does not resolve yet — the ordinary state right after a tenant
     /// is handed the instructions.
     Unresolved,
+    /// The name points here, but its TXT record does not carry this
+    /// registration's token. A hostname that points here proves nothing on its
+    /// own: another tenant's dangling record also points here (#2642).
+    OwnershipUnproven {
+        /// The TXT record name the token must be published at.
+        record: String,
+        /// What was seen, for the status surface.
+        detail: String,
+    },
 }
 
 impl VerificationOutcome {
@@ -285,7 +373,52 @@ impl VerificationOutcome {
                  the record's TTL."
                     .to_owned(),
             ),
+            Self::OwnershipUnproven { record, detail } => Some(format!(
+                "DNS points here, but the TXT record {record} does not carry this registration's \
+                 token yet: {detail}. Publish the TXT record above."
+            )),
         }
+    }
+}
+
+/// What a TXT lookup observed at a domain's [`verification_record_name`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObservedTxt {
+    /// The TXT values published at the name. Empty when there are none.
+    Values(Vec<String>),
+    /// No resolver answered, so nothing is known.
+    Unanswered(String),
+}
+
+/// Grade a TXT observation against `domain`'s ownership token (pure).
+///
+/// Passes only when one of the observed values is exactly this registration's
+/// token. Each registration mints a new token, so a record left by an earlier
+/// tenant proves nothing for the next one. A record without a token fails:
+/// only an `active` record is grandfathered, and that grant is applied by the
+/// caller, not here.
+#[must_use]
+pub fn grade_ownership(domain: &CustomDomain, observed: &ObservedTxt) -> VerificationOutcome {
+    let record = verification_record_name(&domain.hostname);
+    let unproven = |detail: String| VerificationOutcome::OwnershipUnproven {
+        record: record.clone(),
+        detail,
+    };
+    let Some(token) = domain.verification_token.as_deref() else {
+        return unproven("this registration has no token yet".to_owned());
+    };
+    match observed {
+        ObservedTxt::Values(values) if values.iter().any(|v| v.trim() == token) => {
+            VerificationOutcome::PointsHere
+        }
+        ObservedTxt::Values(values) if values.is_empty() => {
+            unproven("no TXT record is published".to_owned())
+        }
+        ObservedTxt::Values(values) => unproven(format!(
+            "it carries {} other value(s), possibly a token from an earlier registration",
+            values.len()
+        )),
+        ObservedTxt::Unanswered(error) => unproven(format!("the TXT lookup failed ({error})")),
     }
 }
 
@@ -348,31 +481,51 @@ fn ingress_contains(expected: &ExpectedIngress, addr: IpAddr) -> bool {
     }
 }
 
-/// Apply a verification result to `hostname`'s registry record.
+/// Apply a verification result to the registration `domain` was read from.
 ///
 /// Success promotes `PendingDns` → `Verified`, which is the only thing that
 /// makes a domain eligible for an ACME order. Failure records the reason and a
 /// backoff so a tenant who has not published the record yet is retried at a
 /// decaying rate rather than every tick.
 ///
+/// Both writes apply only while the stored record is still the SAME
+/// registration: same tenant, same token. A lookup awaits, and if the hostname
+/// was offboarded and registered again meanwhile, a result graded against the
+/// old token must not promote the new registration. Returns whether it
+/// applied.
+///
 /// # Errors
 ///
 /// Propagates the store's write error.
 pub async fn apply_verification(
     registry: &CustomDomainRegistry,
-    hostname: &str,
+    domain: &CustomDomain,
     outcome: &VerificationOutcome,
     now_unix: i64,
     backoff_secs: i64,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     if outcome.is_verified() {
-        registry.record_verified(hostname, now_unix).await
+        registry
+            .record_verified_for(
+                &domain.hostname,
+                &domain.tenant,
+                domain.verification_token.as_deref(),
+                now_unix,
+            )
+            .await
     } else {
         let reason = outcome
             .reason()
             .unwrap_or_else(|| "verification failed".to_owned());
+        let token = domain.verification_token.clone();
         registry
-            .record_failure(hostname, now_unix, reason, backoff_secs)
+            .fail(
+                &domain.hostname,
+                |d| d.tenant == domain.tenant && d.verification_token == token,
+                now_unix,
+                reason,
+                backoff_secs,
+            )
             .await
     }
 }
@@ -383,9 +536,10 @@ pub async fn apply_verification(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DomainStatus {
-    /// Registered; DNS has not been confirmed to point here.
+    /// Registered; DNS has not been confirmed to point here, or the ownership
+    /// TXT record has not been seen.
     PendingDns,
-    /// DNS confirmed; eligible for an ACME order.
+    /// DNS and ownership confirmed; eligible for an ACME order.
     Verified,
     /// An ACME order is in flight.
     Issuing,
@@ -435,12 +589,20 @@ pub struct CustomDomain {
     pub consecutive_failures: u32,
     /// Earliest time the orchestrator may retry this domain.
     pub next_attempt_unix: Option<i64>,
+    /// This registration's ownership token, which the tenant publishes as TXT
+    /// at [`verification_record_name`]. Each registration mints a new one.
+    ///
+    /// `None` only on a record stored before tokens existed. An `active` one is
+    /// grandfathered: it proved control under the old rule, so it keeps
+    /// serving and renewing. Any other one is given a token at the next load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_token: Option<String>,
 }
 
 impl CustomDomain {
     /// A freshly registered domain, awaiting DNS.
     #[must_use]
-    const fn new(hostname: String, tenant: String, now_unix: i64) -> Self {
+    const fn new(hostname: String, tenant: String, now_unix: i64, token: String) -> Self {
         Self {
             hostname,
             tenant,
@@ -452,7 +614,22 @@ impl CustomDomain {
             cert_not_after_unix: None,
             consecutive_failures: 0,
             next_attempt_unix: None,
+            verification_token: Some(token),
         }
+    }
+
+    /// The TXT record name that proves ownership of this domain.
+    #[must_use]
+    pub fn verification_record_name(&self) -> String {
+        verification_record_name(&self.hostname)
+    }
+
+    /// Is this a record from before ownership tokens that still needs one?
+    ///
+    /// An `active` record without a token is grandfathered and does not.
+    #[must_use]
+    pub fn needs_verification_token(&self) -> bool {
+        self.verification_token.is_none() && self.status != DomainStatus::Active
     }
 
     /// May this domain be worked on at `now_unix`, or is it still in backoff?
@@ -796,13 +973,11 @@ impl CustomDomainRegistry {
         self.hydrated.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Hydrate the index from the store. Returns how many records loaded.
+    /// Replace the index with `records`, skipping reserved names. Returns how
+    /// many loaded and which ones [need a token](CustomDomain::needs_verification_token).
     ///
-    /// # Errors
-    ///
-    /// Propagates the store's read error.
-    pub async fn load(&self) -> io::Result<usize> {
-        let records = self.store.load_all().await?;
+    /// Sync, so the index lock can never be held across an await.
+    fn hydrate_index(&self, records: Vec<CustomDomain>) -> (usize, Vec<String>) {
         let mut index = write_lock(&self.index);
         index.clear();
         for record in records {
@@ -831,9 +1006,71 @@ impl CustomDomainRegistry {
             }
             index.insert(record.hostname.clone(), record);
         }
+        let legacy: Vec<String> = index
+            .values()
+            .filter(|d| d.needs_verification_token())
+            .map(|d| d.hostname.clone())
+            .collect();
+        (index.len(), legacy)
+    }
+
+    /// Hydrate the index from the store. Returns how many records loaded.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's read error.
+    pub async fn load(&self) -> io::Result<usize> {
+        let records = self.store.load_all().await?;
+        let (loaded, legacy) = self.hydrate_index(records);
         self.hydrated
             .store(true, std::sync::atomic::Ordering::Release);
-        Ok(index.len())
+        // A record stored before ownership tokens, and not yet serving, has
+        // proved nothing that stops a dangling-DNS takeover. Give it a token
+        // now, so the tenant sees the TXT record from the first screen after
+        // the upgrade. A failure here is retried by the orchestrator.
+        let now = now_unix();
+        for hostname in legacy {
+            if let Err(e) = self.adopt_verification_token(&hostname, now).await {
+                tracing::warn!(
+                    hostname = %hostname,
+                    "could not give a stored custom domain its verification token: {e}"
+                );
+            }
+        }
+        Ok(loaded)
+    }
+
+    /// Give a record stored before ownership tokens a token, and send it back
+    /// to `PendingDns` to prove it. Returns whether it applied.
+    ///
+    /// Only for a record that [needs one](CustomDomain::needs_verification_token):
+    /// an `active` record is grandfathered, and a record with a token keeps it.
+    ///
+    /// `registered_at_unix` moves to `now_unix`. The retention sweep deletes a
+    /// `PendingDns` record by its age, and a record that was `verified` before
+    /// the upgrade must get the full window to publish its TXT record.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a random-source failure or the store's write error.
+    pub async fn adopt_verification_token(
+        &self,
+        hostname: &str,
+        now_unix: i64,
+    ) -> io::Result<bool> {
+        let token = mint_verification_token()?;
+        self.mutate_if(hostname, CustomDomain::needs_verification_token, move |d| {
+            d.verification_token = Some(token);
+            d.status = DomainStatus::PendingDns;
+            d.registered_at_unix = now_unix;
+            d.failure_reason = Some(format!(
+                "ownership proof is now required: publish the {VERIFICATION_LABEL} TXT record \
+                 shown in the DNS instructions"
+            ));
+            d.consecutive_failures = 0;
+            d.next_attempt_unix = None;
+        })
+        .await
     }
 
     /// Connect `hostname` to `tenant`, starting it at `PendingDns`.
@@ -861,6 +1098,12 @@ impl CustomDomainRegistry {
         }
         if let Some(pattern) = self.reserved_match(&host) {
             return Err(RegisterError::Reserved { pattern });
+        }
+        // The ownership record sits one label deeper, so it must fit too.
+        if verification_record_name(&host).len() > MAX_HOSTNAME_LEN {
+            return Err(RegisterError::Invalid(format!(
+                "{host} is too long to carry its {VERIFICATION_LABEL} TXT record"
+            )));
         }
         // An index that never hydrated knows nothing, and the store keys its
         // files by a hash of the hostname: registering here would report
@@ -914,7 +1157,10 @@ impl CustomDomainRegistry {
                     max: self.max_domains,
                 });
             }
-            let record = CustomDomain::new(host.clone(), tenant.to_owned(), now_unix);
+            let token = mint_verification_token().map_err(|e| {
+                RegisterError::Store(format!("could not mint a verification token: {e}"))
+            })?;
+            let record = CustomDomain::new(host.clone(), tenant.to_owned(), now_unix, token);
             index.insert(host.clone(), record.clone());
             record
         };
@@ -1023,8 +1269,12 @@ impl CustomDomainRegistry {
     /// would otherwise strand the domain forever.
     #[must_use]
     pub fn due_for_issuance(&self, now_unix: i64) -> Vec<CustomDomain> {
+        // A record with no token has not proved ownership. Its adoption may
+        // have failed to persist, so it is held back here as well.
         self.filter(|d| {
-            matches!(d.status, DomainStatus::Verified | DomainStatus::Issuing) && d.is_due(now_unix)
+            matches!(d.status, DomainStatus::Verified | DomainStatus::Issuing)
+                && d.verification_token.is_some()
+                && d.is_due(now_unix)
         })
     }
 
@@ -1051,6 +1301,10 @@ impl CustomDomainRegistry {
 
     /// Promote a domain to `Verified` and clear any failure.
     ///
+    /// Checks nothing. The orchestrator uses
+    /// [`record_verified_for`](Self::record_verified_for), which applies only
+    /// to the registration whose DNS and token were checked.
+    ///
     /// # Errors
     ///
     /// Propagates the store's write error.
@@ -1069,6 +1323,44 @@ impl CustomDomainRegistry {
             d.consecutive_failures = 0;
             d.next_attempt_unix = None;
         })
+        .await
+    }
+
+    /// [`record_verified`](Self::record_verified), but only while the stored
+    /// record is the registration that was checked: same `tenant`, same
+    /// `token`. Returns whether it applied.
+    ///
+    /// A token of `None` never applies: a record without one has proved
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's write error.
+    pub async fn record_verified_for(
+        &self,
+        hostname: &str,
+        tenant: &str,
+        token: Option<&str>,
+        now_unix: i64,
+    ) -> io::Result<bool> {
+        let Some(token) = token else {
+            return Ok(false);
+        };
+        self.mutate_if(
+            hostname,
+            |d| d.tenant == tenant && d.verification_token.as_deref() == Some(token),
+            |d| {
+                if d.status == DomainStatus::PendingDns {
+                    d.status = DomainStatus::Verified;
+                }
+                if d.verified_at_unix.is_none() {
+                    d.verified_at_unix = Some(now_unix);
+                }
+                d.failure_reason = None;
+                d.consecutive_failures = 0;
+                d.next_attempt_unix = None;
+            },
+        )
         .await
     }
 
@@ -1215,7 +1507,7 @@ impl CustomDomainRegistry {
         reason: impl Into<String>,
         backoff_secs: i64,
     ) -> io::Result<()> {
-        self.fail(hostname, None, now_unix, reason, backoff_secs)
+        self.fail(hostname, |_| true, now_unix, reason, backoff_secs)
             .await
             .map(|_| ())
     }
@@ -1240,34 +1532,36 @@ impl CustomDomainRegistry {
         reason: impl Into<String>,
         backoff_secs: i64,
     ) -> io::Result<bool> {
-        self.fail(hostname, Some(tenant), now_unix, reason, backoff_secs)
-            .await
+        self.fail(
+            hostname,
+            |d| d.tenant == tenant,
+            now_unix,
+            reason,
+            backoff_secs,
+        )
+        .await
     }
 
     async fn fail(
         &self,
         hostname: &str,
-        tenant: Option<&str>,
+        guard: impl FnOnce(&CustomDomain) -> bool,
         now_unix: i64,
         reason: impl Into<String>,
         backoff_secs: i64,
     ) -> io::Result<bool> {
         let reason = reason.into();
-        self.mutate_if(
-            hostname,
-            |d| tenant.is_none_or(|t| d.tenant == t),
-            move |d| {
-                if d.status == DomainStatus::Issuing {
-                    // An order that failed goes back to `Verified`, not to
-                    // `PendingDns`: DNS was already proven, and re-verifying
-                    // would add a needless round trip to every retry.
-                    d.status = DomainStatus::Verified;
-                }
-                d.failure_reason = Some(reason.clone());
-                d.consecutive_failures = d.consecutive_failures.saturating_add(1);
-                d.next_attempt_unix = Some(now_unix.saturating_add(backoff_secs));
-            },
-        )
+        self.mutate_if(hostname, guard, move |d| {
+            if d.status == DomainStatus::Issuing {
+                // An order that failed goes back to `Verified`, not to
+                // `PendingDns`: DNS was already proven, and re-verifying
+                // would add a needless round trip to every retry.
+                d.status = DomainStatus::Verified;
+            }
+            d.failure_reason = Some(reason.clone());
+            d.consecutive_failures = d.consecutive_failures.saturating_add(1);
+            d.next_attempt_unix = Some(now_unix.saturating_add(backoff_secs));
+        })
         .await
     }
 
@@ -1662,23 +1956,44 @@ pub trait DomainIssuer: Send + Sync {
     ) -> futures::future::BoxFuture<'a, Result<IssuedCertificate, String>>;
 }
 
-/// Looks up where a hostname currently points.
+/// Looks up where a hostname currently points, and what its ownership TXT
+/// record carries.
 ///
-/// Implemented by the runtime against the system resolver, and by tests
-/// against a fixed table.
+/// Implemented by the runtime against the system resolver and public DNS, and
+/// by tests against a fixed table.
 pub trait DomainVerifier: Send + Sync {
     /// Observe `hostname`'s current DNS target.
     fn observe<'a>(&'a self, hostname: &'a str) -> futures::future::BoxFuture<'a, ObservedTarget>;
+
+    /// Observe the TXT values published at `name`, a
+    /// [`verification_record_name`].
+    fn observe_txt<'a>(&'a self, name: &'a str) -> futures::future::BoxFuture<'a, ObservedTxt>;
 }
 
-/// A [`DomainVerifier`] backed by the system resolver.
+/// A [`DomainVerifier`] backed by the system resolver for addresses and by
+/// direct DNS queries for TXT.
 ///
-/// Resolves addresses only: `getaddrinfo` follows CNAMEs transparently and
+/// Addresses come from `getaddrinfo`, which follows CNAMEs transparently and
 /// does not report them, so a tenant who publishes the suggested CNAME is
 /// verified by the addresses it resolves to — which is the property that
 /// actually matters.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SystemDomainVerifier;
+///
+/// `getaddrinfo` cannot read TXT, so the ownership record is asked of the
+/// zone's authoritative nameservers, found through `txt_resolvers`, and then
+/// of `txt_resolvers` themselves. TXT lookups need the `acme` feature; without
+/// it every TXT lookup is unanswered and no domain verifies.
+#[derive(Debug, Default, Clone)]
+pub struct SystemDomainVerifier {
+    txt_resolvers: Vec<std::net::SocketAddr>,
+}
+
+impl SystemDomainVerifier {
+    /// A verifier that asks `txt_resolvers` (recursive resolvers) for TXT.
+    #[must_use]
+    pub const fn new(txt_resolvers: Vec<std::net::SocketAddr>) -> Self {
+        Self { txt_resolvers }
+    }
+}
 
 impl DomainVerifier for SystemDomainVerifier {
     fn observe<'a>(&'a self, hostname: &'a str) -> futures::future::BoxFuture<'a, ObservedTarget> {
@@ -1695,6 +2010,28 @@ impl DomainVerifier for SystemDomainVerifier {
             match resolved {
                 Ok(Ok(addrs)) if !addrs.is_empty() => ObservedTarget::Addresses(addrs),
                 _ => ObservedTarget::None,
+            }
+        })
+    }
+
+    fn observe_txt<'a>(&'a self, name: &'a str) -> futures::future::BoxFuture<'a, ObservedTxt> {
+        Box::pin(async move {
+            if self.txt_resolvers.is_empty() {
+                return ObservedTxt::Unanswered("no TXT resolvers are configured".to_owned());
+            }
+            #[cfg(feature = "acme")]
+            {
+                use crate::acme::dns::resolver::{UdpDnsLookup, txt_values};
+                let lookup = UdpDnsLookup::new(std::time::Duration::from_secs(3));
+                match txt_values(name, &self.txt_resolvers, &lookup).await {
+                    Ok(values) => ObservedTxt::Values(values),
+                    Err(e) => ObservedTxt::Unanswered(e),
+                }
+            }
+            #[cfg(not(feature = "acme"))]
+            {
+                let _ = name;
+                ObservedTxt::Unanswered("TXT lookups need the `acme` feature".to_owned())
             }
         })
     }
@@ -2174,7 +2511,12 @@ mod tests {
     async fn the_filesystem_store_round_trips_and_deletes() {
         let dir = tempfile::tempdir().unwrap();
         let store = FsCustomDomainStore::new(dir.path());
-        let domain = CustomDomain::new("app.clientco.com".to_owned(), "t1".to_owned(), 100);
+        let domain = CustomDomain::new(
+            "app.clientco.com".to_owned(),
+            "t1".to_owned(),
+            100,
+            "token".to_owned(),
+        );
         store.save(&domain).await.unwrap();
 
         let loaded = store.load_all().await.unwrap();

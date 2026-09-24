@@ -16,6 +16,7 @@ use autumn_web::acme::tenant_domains::CustomDomainTask;
 use autumn_web::custom_domain::{
     CustomDomainCertCache, CustomDomainRegistry, DomainIssuer, DomainStatus, DomainVerifier,
     ExpectedIngress, IssuanceLimiter, IssuedCertificate, MemoryCustomDomainStore, ObservedTarget,
+    ObservedTxt,
 };
 use futures::future::BoxFuture;
 
@@ -26,29 +27,91 @@ const NOW: i64 = 1_800_000_000;
 // ── Seams ────────────────────────────────────────────────────────────────
 
 /// A verifier answering from a fixed table; anything absent does not resolve.
+///
+/// TXT answers come from [`publish`](Self::publish), and a name nothing was
+/// published at answers empty.
 #[derive(Debug)]
-struct TableVerifier(HashMap<String, ObservedTarget>);
+struct TableVerifier {
+    targets: HashMap<String, ObservedTarget>,
+    txt: Mutex<HashMap<String, Vec<String>>>,
+}
 
 impl TableVerifier {
     fn new(entries: &[(&str, ObservedTarget)]) -> Arc<Self> {
-        Arc::new(Self(
-            entries
+        Arc::new(Self {
+            targets: entries
                 .iter()
                 .map(|(host, target)| ((*host).to_owned(), target.clone()))
                 .collect(),
-        ))
+            txt: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Publish `value` as the only TXT value at `hostname`'s ownership record.
+    fn publish(&self, hostname: &str, value: &str) {
+        self.txt.lock().unwrap().insert(
+            format!("_autumn-challenge.{hostname}"),
+            vec![value.to_owned()],
+        );
     }
 }
 
 impl DomainVerifier for TableVerifier {
     fn observe<'a>(&'a self, hostname: &'a str) -> BoxFuture<'a, ObservedTarget> {
         Box::pin(async move {
-            self.0
+            self.targets
                 .get(hostname)
                 .cloned()
                 .unwrap_or(ObservedTarget::None)
         })
     }
+
+    fn observe_txt<'a>(&'a self, name: &'a str) -> BoxFuture<'a, ObservedTxt> {
+        Box::pin(async move {
+            ObservedTxt::Values(
+                self.txt
+                    .lock()
+                    .unwrap()
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        })
+    }
+}
+
+/// Wraps a verifier so every registration's owner has published its current
+/// token. The tests that predate #2642 assert other policy, so this keeps the
+/// ownership gate open for them; the #2642 tests use a bare verifier.
+struct OwnerPublishes {
+    inner: Arc<dyn DomainVerifier>,
+    registry: Arc<CustomDomainRegistry>,
+}
+
+impl DomainVerifier for OwnerPublishes {
+    fn observe<'a>(&'a self, hostname: &'a str) -> BoxFuture<'a, ObservedTarget> {
+        self.inner.observe(hostname)
+    }
+
+    fn observe_txt<'a>(&'a self, name: &'a str) -> BoxFuture<'a, ObservedTxt> {
+        Box::pin(async move {
+            let token = name
+                .strip_prefix("_autumn-challenge.")
+                .and_then(|host| self.registry.get(host))
+                .and_then(|d| d.verification_token);
+            ObservedTxt::Values(token.into_iter().collect())
+        })
+    }
+}
+
+fn owner_publishes(
+    inner: Arc<dyn DomainVerifier>,
+    registry: &Arc<CustomDomainRegistry>,
+) -> Arc<dyn DomainVerifier> {
+    Arc::new(OwnerPublishes {
+        inner,
+        registry: Arc::clone(registry),
+    })
 }
 
 /// An issuer that records every hostname it was asked about and fails for the
@@ -129,6 +192,25 @@ fn harness_with_limiter(
     issuer: Arc<dyn DomainIssuer>,
     limiter: IssuanceLimiter,
 ) -> Harness {
+    build_harness(verifier, issuer, limiter, true)
+}
+
+/// A harness whose verifier answers TXT exactly as given, for the #2642 tests.
+fn strict_harness(verifier: Arc<dyn DomainVerifier>, issuer: Arc<dyn DomainIssuer>) -> Harness {
+    build_harness(
+        verifier,
+        issuer,
+        IssuanceLimiter::new(5, 50, 300, 86_400),
+        false,
+    )
+}
+
+fn build_harness(
+    verifier: Arc<dyn DomainVerifier>,
+    issuer: Arc<dyn DomainIssuer>,
+    limiter: IssuanceLimiter,
+    owners_publish: bool,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
     let store_out = Arc::clone(&store);
@@ -139,6 +221,11 @@ fn harness_with_limiter(
     // `load()` marks the registry hydrated, which the retention prune requires
     // before it will delete anything.
     futures::executor::block_on(registry.load()).unwrap();
+    let verifier = if owners_publish {
+        owner_publishes(verifier, &registry)
+    } else {
+        verifier
+    };
     let cache = Arc::new(CustomDomainCertCache::new(8));
     let alerts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&alerts);
@@ -190,11 +277,11 @@ fn task_over(
     issuer: Arc<dyn DomainIssuer>,
 ) -> CustomDomainTask {
     CustomDomainTask {
+        verifier: owner_publishes(verifier, &registry),
         registry,
         cache,
         certs: Arc::clone(&certs) as Arc<dyn autumn_web::acme::store::AcmeStore>,
         provider: autumn_web::tls::crypto_provider(),
-        verifier,
         issuer,
         limiter: Arc::new(IssuanceLimiter::new(5, 5000, 300, 86_400)),
         ingress: ExpectedIngress {
@@ -1149,8 +1236,10 @@ async fn a_stale_order_does_not_delete_the_successors_certificate() {
         cache: Arc::new(CustomDomainCertCache::new(8)),
         certs: Arc::clone(&certs) as Arc<dyn autumn_web::acme::store::AcmeStore>,
         provider: autumn_web::tls::crypto_provider(),
-        verifier: TableVerifier::new(&[("app.clientco.com", points_here())])
-            as Arc<dyn DomainVerifier>,
+        verifier: owner_publishes(
+            TableVerifier::new(&[("app.clientco.com", points_here())]),
+            &registry,
+        ),
         issuer: ScriptedIssuer::new(&[]) as Arc<dyn DomainIssuer>,
         limiter: Arc::new(IssuanceLimiter::new(5, 50, 300, 86_400)),
         ingress: ExpectedIngress {
@@ -1416,8 +1505,10 @@ async fn an_order_is_not_placed_when_the_issuing_state_cannot_be_persisted() {
         cache: Arc::new(CustomDomainCertCache::new(8)),
         certs: Arc::clone(&certs) as Arc<dyn autumn_web::acme::store::AcmeStore>,
         provider: autumn_web::tls::crypto_provider(),
-        verifier: TableVerifier::new(&[("app.clientco.com", points_here())])
-            as Arc<dyn DomainVerifier>,
+        verifier: owner_publishes(
+            TableVerifier::new(&[("app.clientco.com", points_here())]),
+            &registry,
+        ),
         issuer: Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
         limiter: Arc::new(IssuanceLimiter::new(5, 50, 300, 86_400)),
         ingress: ExpectedIngress {
@@ -1627,8 +1718,10 @@ async fn an_order_is_abandoned_when_the_hostname_stops_being_this_tenants() {
         cache: Arc::new(CustomDomainCertCache::new(8)),
         certs: Arc::clone(&certs) as Arc<dyn autumn_web::acme::store::AcmeStore>,
         provider: autumn_web::tls::crypto_provider(),
-        verifier: TableVerifier::new(&[("app.clientco.com", points_here())])
-            as Arc<dyn DomainVerifier>,
+        verifier: owner_publishes(
+            TableVerifier::new(&[("app.clientco.com", points_here())]),
+            &registry,
+        ),
         issuer: Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
         limiter: Arc::new(IssuanceLimiter::new(5, 50, 300, 86_400)),
         ingress: ExpectedIngress {
@@ -2370,4 +2463,205 @@ async fn a_failure_is_recorded_only_for_the_tenant_that_still_owns_the_hostname(
     let record = registry.get("app.clientco.com").unwrap();
     assert_eq!(record.failure_reason.as_deref(), Some("mine"));
     assert_eq!(record.next_attempt_unix, Some(NOW + 300));
+}
+
+// ── #2642: ownership proof by TXT token ──────────────────────────────────
+
+/// A hostname that already points here is not verified until the registering
+/// tenant publishes ITS token: pointing here is exactly what a dangling record
+/// left by someone else also does.
+#[tokio::test]
+async fn a_hostname_already_pointing_here_waits_for_the_tenants_txt_token() {
+    let issuer = ScriptedIssuer::new(&[]);
+    let verifier = TableVerifier::new(&[("app.clientco.com", points_here())]);
+    let h = strict_harness(
+        Arc::clone(&verifier) as Arc<dyn DomainVerifier>,
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    let domain = h
+        .registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+
+    h.task.tick(NOW).await;
+    let pending = h.registry.get("app.clientco.com").unwrap();
+    assert_eq!(pending.status, DomainStatus::PendingDns);
+    let reason = pending.failure_reason.unwrap();
+    assert!(
+        reason.contains("_autumn-challenge.app.clientco.com"),
+        "{reason}"
+    );
+    assert_eq!(issuer.count(), 0, "no order before ownership is proven");
+
+    verifier.publish(
+        "app.clientco.com",
+        domain.verification_token.as_deref().unwrap(),
+    );
+    h.task.tick(NOW + 100_000).await;
+    assert_eq!(
+        h.registry.get("app.clientco.com").unwrap().status,
+        DomainStatus::Active
+    );
+    assert_eq!(issuer.count(), 1);
+}
+
+/// The takeover from #2642, end to end: tenant A connects a domain and
+/// offboards, leaving its CNAME and TXT records behind. Tenant B registers the
+/// same hostname. DNS still points here and still carries A's token, and
+/// neither proves anything for B.
+#[tokio::test]
+async fn a_new_tenant_cannot_inherit_an_offboarded_tenants_verification() {
+    let issuer = ScriptedIssuer::new(&[]);
+    let verifier = TableVerifier::new(&[("app.clientco.com", points_here())]);
+    let h = strict_harness(
+        Arc::clone(&verifier) as Arc<dyn DomainVerifier>,
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+
+    let a = h
+        .registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    let token_a = a.verification_token.unwrap();
+    verifier.publish("app.clientco.com", &token_a);
+    h.task.tick(NOW).await;
+    assert_eq!(
+        h.registry.tenant_for_host("app.clientco.com").as_deref(),
+        Some("tenant-a")
+    );
+    assert_eq!(issuer.count(), 1);
+
+    // A leaves. Its DNS records do not.
+    h.task.offboard("app.clientco.com").await.unwrap();
+
+    let b = h
+        .registry
+        .register("app.clientco.com", "tenant-b", NOW + 10)
+        .await
+        .unwrap();
+    assert_ne!(b.verification_token.as_deref(), Some(token_a.as_str()));
+    for tick in 1..=5 {
+        h.task.tick(NOW + tick * 100_000).await;
+    }
+    let record = h.registry.get("app.clientco.com").unwrap();
+    assert_eq!(record.tenant, "tenant-b");
+    assert_eq!(record.status, DomainStatus::PendingDns);
+    assert!(h.registry.tenant_for_host("app.clientco.com").is_none());
+    assert_eq!(issuer.count(), 1, "zero orders for tenant B");
+
+    // Only B publishing B's own token lets it through.
+    verifier.publish("app.clientco.com", b.verification_token.as_deref().unwrap());
+    h.task.tick(NOW + 1_000_000).await;
+    assert_eq!(
+        h.registry.tenant_for_host("app.clientco.com").as_deref(),
+        Some("tenant-b")
+    );
+    assert_eq!(issuer.count(), 2);
+}
+
+/// An `active` domain from before tokens proved control under the old rule. It
+/// keeps serving and keeps renewing without one.
+#[tokio::test]
+async fn a_grandfathered_active_domain_renews_without_a_token() {
+    use autumn_web::custom_domain::{CustomDomainStore as _, FsCustomDomainStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FsCustomDomainStore::new(dir.path().join("domains")));
+    let writer = CustomDomainRegistry::new(store.clone(), 10);
+    writer.load().await.unwrap();
+    writer
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    // Inside the 30-day renew window.
+    writer
+        .record_active("app.clientco.com", NOW, NOW + 10 * 86_400)
+        .await
+        .unwrap();
+    let mut legacy = writer.get("app.clientco.com").unwrap();
+    legacy.verification_token = None;
+    store.save(&legacy).await.unwrap();
+
+    let registry = Arc::new(CustomDomainRegistry::new(store, 10));
+    registry.load().await.unwrap();
+    let certs = Arc::new(FsAcmeStore::new(dir.path().join("acme"), "staging"));
+    let issuer = ScriptedIssuer::new(&[]);
+    let task = CustomDomainTask {
+        // No TXT anywhere: a renewal must not ask for one.
+        verifier: TableVerifier::new(&[("app.clientco.com", points_here())]),
+        ..task_over(
+            Arc::clone(&registry),
+            Arc::new(CustomDomainCertCache::new(8)),
+            certs,
+            TableVerifier::new(&[]),
+            Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+        )
+    };
+
+    task.tick(NOW).await;
+    let record = registry.get("app.clientco.com").unwrap();
+    assert_eq!(record.status, DomainStatus::Active);
+    assert!(record.verification_token.is_none());
+    assert_eq!(
+        registry.tenant_for_host("app.clientco.com").as_deref(),
+        Some("tenant-a")
+    );
+    assert_eq!(
+        issuer.calls(),
+        vec!["app.clientco.com".to_owned()],
+        "renewed"
+    );
+}
+
+/// The TXT lookup awaits. If the hostname changes hands during it, the result
+/// was graded against the old registration's token and must not promote the
+/// new one.
+#[tokio::test]
+async fn a_txt_result_for_a_registration_that_changed_hands_is_discarded() {
+    /// Re-registers the hostname for tenant B mid-lookup, then answers with
+    /// tenant A's token.
+    struct HandoverVerifier {
+        registry: std::sync::OnceLock<Arc<CustomDomainRegistry>>,
+    }
+    impl DomainVerifier for HandoverVerifier {
+        fn observe<'a>(&'a self, _hostname: &'a str) -> BoxFuture<'a, ObservedTarget> {
+            Box::pin(async move { points_here() })
+        }
+        fn observe_txt<'a>(&'a self, name: &'a str) -> BoxFuture<'a, ObservedTxt> {
+            Box::pin(async move {
+                let registry = self.registry.get().unwrap();
+                let host = name.strip_prefix("_autumn-challenge.").unwrap();
+                let old = registry.get(host).unwrap();
+                registry.remove(host).await.unwrap();
+                registry.register(host, "tenant-b", NOW + 1).await.unwrap();
+                ObservedTxt::Values(old.verification_token.into_iter().collect())
+            })
+        }
+    }
+
+    let verifier = Arc::new(HandoverVerifier {
+        registry: std::sync::OnceLock::new(),
+    });
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = strict_harness(
+        Arc::clone(&verifier) as Arc<dyn DomainVerifier>,
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    verifier.registry.set(Arc::clone(&h.registry)).ok().unwrap();
+    h.registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+
+    h.task.tick(NOW).await;
+    let record = h.registry.get("app.clientco.com").unwrap();
+    assert_eq!(record.tenant, "tenant-b");
+    assert_eq!(record.status, DomainStatus::PendingDns);
+    assert!(
+        record.failure_reason.is_none(),
+        "A's result is not B's failure either"
+    );
+    assert_eq!(issuer.count(), 0);
 }

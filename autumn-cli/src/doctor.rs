@@ -2004,6 +2004,147 @@ pub fn check_custom_domain_dns_impl(probe: &CustomDomainProbe) -> CheckResult {
     }
 }
 
+/// What `autumn doctor` read at a pending domain's ownership TXT record
+/// (#2642).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustomDomainTxt {
+    /// A resolver saw this registration's token.
+    Present,
+    /// Resolvers answered, and no TXT value is published.
+    Missing,
+    /// Resolvers answered with TXT values, none of them this registration's
+    /// token.
+    Stale {
+        /// How many values were seen.
+        values: usize,
+    },
+    /// No resolver answered.
+    Unanswerable(String),
+}
+
+/// One pending domain's ownership record, for [`check_custom_domain_txt_impl`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomDomainOwnershipProbe {
+    /// The registered hostname.
+    pub hostname: String,
+    /// The tenant it belongs to.
+    pub tenant: String,
+    /// The registration's token.
+    pub token: String,
+    /// What the TXT lookup found.
+    pub txt: CustomDomainTxt,
+}
+
+/// Grade TXT answers from several resolvers against `token` (pure).
+///
+/// The runtime passes a domain when ANY server shows the token, so doctor
+/// does the same: one stale cache must not read as a missing record.
+#[must_use]
+pub fn grade_custom_domain_txt(
+    token: &str,
+    answers: &[Result<Vec<String>, String>],
+) -> CustomDomainTxt {
+    let mut last_error = "no resolvers are configured".to_owned();
+    let mut answered = false;
+    let mut values = 0;
+    for answer in answers {
+        match answer {
+            Ok(seen) if seen.iter().any(|v| v.trim() == token) => return CustomDomainTxt::Present,
+            Ok(seen) => {
+                answered = true;
+                values = values.max(seen.len());
+            }
+            Err(e) => last_error.clone_from(e),
+        }
+    }
+    match (answered, values) {
+        (false, _) => CustomDomainTxt::Unanswerable(last_error),
+        (true, 0) => CustomDomainTxt::Missing,
+        (true, values) => CustomDomainTxt::Stale { values },
+    }
+}
+
+/// Grade one pending domain's ownership TXT record (pure; injectable).
+///
+/// A separate check from `custom_domain_dns`, so an operator can tell "the
+/// address record is wrong" from "the address is right, the TXT token is
+/// missing or stale". Each is a Warn: a pending domain is expected to be
+/// incomplete for a while.
+#[must_use]
+pub fn check_custom_domain_txt_impl(probe: &CustomDomainOwnershipProbe) -> CheckResult {
+    let CustomDomainOwnershipProbe {
+        hostname,
+        tenant,
+        token,
+        txt,
+    } = probe;
+    let record = autumn_web::custom_domain::verification_record_name(hostname);
+    let publish = "Publish the TXT record from the domain's DNS instructions; the address record \
+                   alone does not verify a domain";
+    match txt {
+        CustomDomainTxt::Present => CheckResult {
+            name: "custom_domain_txt",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "{record} carries the ownership token for {hostname} (tenant {tenant})"
+            )),
+            hint: None,
+        },
+        CustomDomainTxt::Missing => CheckResult {
+            name: "custom_domain_txt",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "{hostname} (tenant {tenant}) is pending_dns: its ownership TXT record is not \
+                 published. Expected `{record}` TXT `{token}`"
+            )),
+            hint: Some(publish),
+        },
+        CustomDomainTxt::Stale { values } => CheckResult {
+            name: "custom_domain_txt",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "{hostname} (tenant {tenant}) is pending_dns: {record} carries {values} value(s), \
+                 none of them this registration's token `{token}`. A token from an earlier \
+                 registration proves nothing for this one"
+            )),
+            hint: Some(publish),
+        },
+        CustomDomainTxt::Unanswerable(reason) => CheckResult {
+            name: "custom_domain_txt",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "cannot read {record} for {hostname} (tenant {tenant}): {reason}"
+            )),
+            hint: Some(
+                "Check [server.tls.acme.custom_domains] resolvers and that outbound DNS (UDP/53) \
+                 is allowed",
+            ),
+        },
+    }
+}
+
+/// Ask each resolver for `hostname`'s ownership TXT record and grade the
+/// answers against `token`.
+#[cfg(feature = "tls")]
+#[must_use]
+pub fn resolve_custom_domain_txt(
+    hostname: &str,
+    token: &str,
+    resolvers: &[std::net::SocketAddr],
+) -> CustomDomainTxt {
+    use autumn_web::acme::dns::resolver::lookup_txt_blocking;
+
+    let record = autumn_web::custom_domain::verification_record_name(hostname);
+    let answers: Vec<Result<Vec<String>, String>> = resolvers
+        .iter()
+        .map(|resolver| {
+            lookup_txt_blocking(*resolver, &record, std::time::Duration::from_secs(3))
+                .map(|answer| answer.values)
+        })
+        .collect();
+    grade_custom_domain_txt(token, &answers)
+}
+
 /// Grade port 80 on one ingress target, for tenant custom domains.
 ///
 /// Deliberately independent of the deployment certificate's challenge mode.
@@ -2143,7 +2284,11 @@ pub fn resolve_custom_domain_dns(
     // that prose is reworded.
     let verdict = grade_dns_verification(&ObservedTarget::Addresses(observed.clone()), &expected);
     match verdict {
-        VerificationOutcome::PointsHere => CustomDomainDns::PointsHere,
+        // The address grader never returns `OwnershipUnproven`; the TXT token
+        // is graded by `custom_domain_txt`.
+        VerificationOutcome::PointsHere | VerificationOutcome::OwnershipUnproven { .. } => {
+            CustomDomainDns::PointsHere
+        }
         VerificationOutcome::Unresolved => CustomDomainDns::Unresolved,
         VerificationOutcome::PointsElsewhere { .. } => CustomDomainDns::PointsElsewhere {
             seen: observed
@@ -2178,7 +2323,7 @@ fn resolve_addresses(host: &str) -> Vec<std::net::IpAddr> {
 
 /// Read the custom-domain registry off disk, where the runtime store writes it.
 ///
-/// Returns `(hostname, tenant, status)` per record, sorted. A file that will
+/// Returns `(hostname, tenant, status, token)` per record, sorted. A file that will
 /// not parse is skipped — the same treatment the runtime store gives it — so
 /// one corrupt record does not blind the check to the rest.
 #[must_use]
@@ -2214,6 +2359,7 @@ pub fn read_custom_domain_registry(store_dir: &std::path::Path) -> CustomDomainR
                 domain.hostname,
                 domain.tenant,
                 domain.status.as_str().to_owned(),
+                domain.verification_token,
             )),
             // The runtime skips a record it cannot read and serves the rest, so
             // doctor counts it rather than failing the run over it.
@@ -2232,8 +2378,9 @@ pub fn read_custom_domain_registry(store_dir: &std::path::Path) -> CustomDomainR
 /// the runtime skips, serving the rest).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CustomDomainRegistryRead {
-    /// `(hostname, tenant, status)` per readable record, sorted.
-    pub domains: Vec<(String, String, String)>,
+    /// `(hostname, tenant, status, ownership token)` per readable record,
+    /// sorted. The token is `None` on a record stored before tokens existed.
+    pub domains: Vec<(String, String, String, Option<String>)>,
     /// Why the directory could not be enumerated, if it could not.
     pub unreadable: Option<String>,
     /// Records that could not be read or parsed, one message each.
@@ -9770,6 +9917,11 @@ pub fn run(opts: DoctorOptions) {
                     .chain(ing.ipv6.iter().map(ToString::to_string))
                     .collect()
             });
+            #[cfg(feature = "tls")]
+            let txt_resolvers = cd_cfg
+                .as_ref()
+                .and_then(|cd| cd.resolver_addrs().ok())
+                .unwrap_or_default();
             let registry_read = registered.clone();
             tasks.push(Box::new(move || {
                 check_custom_domains_config_impl(
@@ -9802,11 +9954,31 @@ pub fn run(opts: DoctorOptions) {
                 // The ingress every registered domain is graded against — the
                 // deployment's, not this CLI host's.
                 let probe_ingress = cd_ingress.unwrap_or_default();
-                for (index, (hostname, tenant, status)) in registered
+                for (index, (hostname, tenant, status, token)) in registered
                     .into_iter()
                     .take(MAX_CUSTOM_DOMAIN_PROBES)
                     .enumerate()
                 {
+                    // A pending domain also needs its ownership TXT token
+                    // (#2642). A settled one proved it already, and a record
+                    // with no token is either grandfathered or given one at
+                    // the next start.
+                    #[cfg(feature = "tls")]
+                    if let (Some(token), "pending_dns") = (token, status.as_str()) {
+                        let (hostname, tenant) = (hostname.clone(), tenant.clone());
+                        let resolvers = txt_resolvers.clone();
+                        tasks.push(Box::new(move || {
+                            let txt = resolve_custom_domain_txt(&hostname, &token, &resolvers);
+                            check_custom_domain_txt_impl(&CustomDomainOwnershipProbe {
+                                hostname,
+                                tenant,
+                                token,
+                                txt,
+                            })
+                        }));
+                    }
+                    #[cfg(not(feature = "tls"))]
+                    let _ = token;
                     let probe_ingress = probe_ingress.clone();
                     tasks.push(Box::new(move || {
                         let dns = resolve_custom_domain_dns(&hostname, &probe_ingress);
@@ -13839,6 +14011,7 @@ pub struct Vault {
                         format!("d{i}.clientco.com"),
                         "tenant-a".to_owned(),
                         "active".to_owned(),
+                        None,
                     )
                 })
                 .collect(),
@@ -14171,6 +14344,54 @@ pub struct Vault {
         );
     }
 
+    // #2642: a pending domain's TXT token is graded apart from its address.
+    #[test]
+    fn the_txt_grader_tells_missing_from_stale_from_present() {
+        let ok = |values: &[&str]| Ok(values.iter().map(|v| (*v).to_owned()).collect());
+        assert_eq!(
+            grade_custom_domain_txt("tok", &[Err("timeout".to_owned()), ok(&["tok"])]),
+            CustomDomainTxt::Present
+        );
+        assert_eq!(
+            grade_custom_domain_txt("tok", &[ok(&[])]),
+            CustomDomainTxt::Missing
+        );
+        assert_eq!(
+            grade_custom_domain_txt("tok", &[ok(&["old-token"]), ok(&[])]),
+            CustomDomainTxt::Stale { values: 1 }
+        );
+        assert_eq!(
+            grade_custom_domain_txt("tok", &[Err("REFUSED".to_owned())]),
+            CustomDomainTxt::Unanswerable("REFUSED".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_txt_check_names_the_record_and_the_token_to_publish() {
+        let probe = |txt| CustomDomainOwnershipProbe {
+            hostname: "app.clientco.com".to_owned(),
+            tenant: "tenant-b".to_owned(),
+            token: "tok".to_owned(),
+            txt,
+        };
+        let present = check_custom_domain_txt_impl(&probe(CustomDomainTxt::Present));
+        assert_eq!(present.name, "custom_domain_txt");
+        assert_eq!(present.status, CheckStatus::Pass);
+
+        let missing = check_custom_domain_txt_impl(&probe(CustomDomainTxt::Missing));
+        assert_eq!(missing.status, CheckStatus::Warn);
+        let detail = missing.detail.unwrap();
+        assert!(detail.contains("not published"), "{detail}");
+        assert!(
+            detail.contains("`_autumn-challenge.app.clientco.com` TXT `tok`"),
+            "{detail}"
+        );
+
+        let stale = check_custom_domain_txt_impl(&probe(CustomDomainTxt::Stale { values: 1 }));
+        assert_eq!(stale.status, CheckStatus::Warn);
+        assert!(stale.detail.unwrap().contains("earlier registration"));
+    }
+
     #[test]
     fn the_registry_reader_skips_unreadable_records_and_sorts() {
         let dir = tempfile::tempdir().unwrap();
@@ -14213,6 +14434,8 @@ pub struct Vault {
         );
         assert_eq!(records[0].0, "a.clientco.com");
         assert_eq!(records[1].0, "b.clientco.com");
+        // Records from before #2642 carry no token.
+        assert_eq!(records[0].3, None);
     }
 
     #[test]

@@ -231,6 +231,55 @@ pub async fn authoritative_resolvers(
     Vec::new()
 }
 
+/// Every TXT value published at `fqdn`, for a custom domain's ownership check
+/// (#2642).
+///
+/// Asks the zone's authoritative nameservers first, found through `recursive`,
+/// with recursion not desired: a recursive resolver asked before the tenant
+/// publishes caches the negative answer, which would delay verification for
+/// the zone's negative TTL. Then asks `recursive` too, which covers a failed
+/// discovery and a record behind a CNAME the authoritative servers do not
+/// follow. Values from every server that answered are merged.
+///
+/// # Errors
+///
+/// Returns the last error when no server answered at all.
+pub async fn txt_values(
+    fqdn: &str,
+    recursive: &[SocketAddr],
+    lookup: &dyn DnsLookup,
+) -> Result<Vec<String>, String> {
+    let authoritative = authoritative_resolvers(fqdn, recursive, lookup).await;
+    let servers = authoritative
+        .iter()
+        .map(|server| (*server, false))
+        .chain(recursive.iter().map(|server| (*server, true)));
+    let mut values: Vec<String> = Vec::new();
+    let mut answered = false;
+    let mut last_error = "no resolvers were configured".to_owned();
+    for (server, recursion_desired) in servers {
+        match lookup
+            .query(server, fqdn, QTYPE_TXT, recursion_desired)
+            .await
+        {
+            Ok(answer) => {
+                answered = true;
+                for value in answer.txt_values(fqdn) {
+                    if !values.contains(&value) {
+                        values.push(value);
+                    }
+                }
+            }
+            Err(e) => last_error = e,
+        }
+    }
+    if answered {
+        Ok(values)
+    } else {
+        Err(last_error)
+    }
+}
+
 /// Query one resolver for a name's TXT values, blocking.
 ///
 /// The same wire code as [`UdpDnsLookup`], for `autumn doctor`'s synchronous
@@ -1573,6 +1622,54 @@ mod tests {
 
     fn resolver(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    // #2642: the ownership lookup merges what every answering server saw, and
+    // one resolver failing does not hide another's answer.
+    #[tokio::test]
+    async fn txt_values_merge_every_answer_and_survive_one_failing_resolver() {
+        let lookup = ScriptedLookup::new(vec![
+            (resolver(53), Err("timed out".to_owned())),
+            (
+                resolver(5353),
+                Ok(TxtAnswer {
+                    values: vec!["token-b".to_owned(), "v=spf1 -all".to_owned()],
+                    rcode: 0,
+                }),
+            ),
+        ]);
+        let values = txt_values(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(53), resolver(5353)],
+            lookup.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(values, vec!["token-b".to_owned(), "v=spf1 -all".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn txt_values_fail_only_when_no_server_answers() {
+        let lookup = ScriptedLookup::new(vec![(resolver(53), Err("REFUSED".to_owned()))]);
+        let err = txt_values(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(53)],
+            lookup.as_ref(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("REFUSED"), "{err}");
+
+        // NXDOMAIN is an answer: nothing is published yet.
+        let lookup = ScriptedLookup::new(vec![]);
+        let values = txt_values(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(53)],
+            lookup.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert!(values.is_empty());
     }
 
     #[tokio::test]

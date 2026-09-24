@@ -716,7 +716,8 @@ on the first successful renewal.
 Wildcard certificates cover `tenant42.myapp.com`. A B2B customer who wants
 `app.clientco.com` needs a certificate of their own. Turn the feature on and
 autumn does the whole journey: it hands each tenant exact DNS instructions,
-independently confirms the hostname points here, orders one certificate per
+independently confirms the hostname points here and that the tenant controls
+it, orders one certificate per
 hostname, serves it by SNI, routes requests on that `Host` to the owning
 tenant, and renews it. There is no per-domain configuration — a thousand
 tenants use the same twenty lines.
@@ -740,11 +741,15 @@ ingress_ipv4     = ["203.0.113.10"]      # A records, for tenant APEX domains
 # failure_backoff_secs        = 300      # doubles per consecutive failure
 # max_failure_backoff_secs    = 86400
 # poll_interval_secs          = 60
+# resolvers = ["1.1.1.1:53", "8.8.8.8:53"]  # read ownership TXT records
 ```
 
 `ingress_hostname` is what tenants CNAME at. An **apex** domain
 (`clientco.com`) cannot carry a CNAME, so it needs `ingress_ipv4` /
 `ingress_ipv6` instead; set both kinds if you accept both.
+
+`resolvers` are the recursive resolvers autumn asks for each domain's
+ownership TXT record. The server must reach them on UDP/53.
 
 ### The tenant journey
 
@@ -772,8 +777,10 @@ let ingress = config.server.tls.as_ref()
 let domain = registry.register("app.clientco.com", &tenant_id, now_unix).await?;
 
 // 2. Show the tenant exactly what to publish. Fields are tab-separated.
-let instructions = DnsInstructions::for_hostname(&domain.hostname, &ingress)?;
-println!("{}", instructions.render());   // app.clientco.com\tCNAME\tingress.myapp.com
+let instructions = DnsInstructions::for_domain(&domain, &ingress)?;
+println!("{}", instructions.render());
+// app.clientco.com                     CNAME  ingress.myapp.com
+// _autumn-challenge.app.clientco.com   TXT    <this registration's token>
 
 // 3. Render status, including why it is stuck.
 for d in registry.list_for_tenant(&tenant_id) {
@@ -789,6 +796,31 @@ domains.offboard_tenant_domains(&tenant_id).await?;   // every domain the tenant
 `registry.remove` forgets the registration only — routing and serving stop, but
 the certificate stays in the ACME store. Offboard through `CustomDomainPruner`
 so the private key goes too.
+
+### Ownership proof: the TXT token
+
+A hostname that points here proves nothing on its own. A tenant who leaves
+does not delete their DNS records, so their hostname still points here, and
+without more proof the next tenant to register it would get a certificate for
+it. So each registration gets a random token, and the tenant publishes it as a
+TXT record at `_autumn-challenge.<hostname>`. A domain verifies only when its
+address record points here **and** that TXT record carries this registration's
+token. Each registration mints a new token, so a record a previous tenant left
+behind proves nothing.
+
+The TXT record is needed until the domain is `active`. Renewals check only the
+address record.
+
+Domains connected before this rule are handled at the first start after the
+upgrade:
+
+- An `active` domain is **grandfathered**. It proved control under the old
+  rule, so it keeps serving and renewing with no token.
+- Any other domain gets a token and goes back to `pending_dns`, with a
+  `failure_reason` that asks for the TXT record. Show the tenant the DNS
+  instructions again. Its `registered_at_unix` restarts, so the
+  `custom_domains` retention window does not delete it before the tenant can
+  publish.
 
 The states are `pending_dns` → `verified` → `issuing` → `active`. There is no
 separate failed state: a domain that fails carries a `failure_reason` and a
@@ -824,9 +856,11 @@ three gates stand between a hostname and Let's Encrypt:
    SNI hostname nobody registered is refused at the TLS handshake, and no code
    path from there reaches the ACME provider.
 2. **Verification.** No order is created until autumn independently resolves
-   the hostname and finds it pointing at this deployment. A domain whose DNS
-   points elsewhere sits at `pending_dns` with the observed address in its
-   `failure_reason` and costs the CA nothing.
+   the hostname and finds it pointing at this deployment, and finds this
+   registration's token in its `_autumn-challenge` TXT record. A domain whose
+   DNS points elsewhere, or whose TXT record is missing or stale, sits at
+   `pending_dns` with the reason in its `failure_reason` and costs the CA
+   nothing.
 3. **Budget.** At the defaults, at most **5 orders per domain per day** and
    **50 across the whole deployment per hour** — comfortably inside Let's
    Encrypt's 300-new-orders-per-account-per-3-hours limit. Failures back off
@@ -892,6 +926,7 @@ the store and restart.
 |---|---|
 | `custom_domains` | The section loads, has somewhere for tenants to point, and its cap is not already exceeded. **Fail** on anything the server would exit at boot on. |
 | `custom_domain_dns` | (`--online`) Each registered domain still points here. **Fail** for an `active` or `verified` domain whose DNS has moved away or vanished — it is serving a certificate nobody can reach and will fail its next renewal. **Warn** for one still `pending_dns`. Probes the first 25 domains and says so. |
+| `custom_domain_txt` | (`--online`) Each `pending_dns` domain's `_autumn-challenge` TXT record carries its token. **Warn** when the record is missing, or carries only other values (for example a token from an earlier registration). A separate check from `custom_domain_dns`, so a wrong address and a missing token read differently. |
 | `custom_domain_http01` | (`--online`) Port 80 is reachable on **every address** each configured ingress target resolves to — one member of a load-balancer record set that drops it fails HTTP-01 for whatever share of tenants lands there. **Fail** when any is unreachable — tenant certificates are always issued over HTTP-01, so a closed port 80 blocks every one of them **even under a DNS-01 deployment**, where `acme_ports` rightly calls it optional for the deployment's own certificate. |
 
 ### Failure surfaces through health and alerts
