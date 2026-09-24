@@ -562,8 +562,12 @@ prints the `AUTUMN_SIM_SEED=…` replay line), `sometimes!` for reachability. A
 single run does **not** fail on an unsatisfied `sometimes!` — if you want that,
 arrange the workload so every label is reachable at any seed and call
 `assert_all_sometimes_satisfied()` explicitly. `Sim::build` injects the clock
-but **not** entropy: pass `.with_entropy(SeededEntropy::new(sim.seed))` or a
-later `Rng` draw silently stops replaying from the seed.
+and an entropy source seeded from `sim.seed` (an explicit `.with_entropy(..)`
+wins), and starts the app's `#[scheduled]` tasks: register them with
+`TestApp::new().tasks(tasks![..])` (jobs with `.jobs(jobs![..])`) and a tick
+fires when `sim.advance(..)` crosses it. Set
+`AUTUMN_SIM_LIVENESS_BUDGET_SECS` (single-threaded runs only) to turn a
+deadlocked `#[sim_test]` into a panic with its replay line.
 
 **`FaultPlan`** (#1680) — when the scenario is "the 3rd checkout fails" rather
 than "5% of checkouts fail", author it instead of drawing it:

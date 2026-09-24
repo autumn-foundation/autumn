@@ -28,41 +28,36 @@
 //! AUTUMN_SIM_SEED=0x9f3a cargo test -p my-crate deterministic
 //! ```
 //!
-//! # Scope (Wave 1)
+//! # What a `Sim` gives you
 //!
-//! W1 ships the **deterministic executor, the seed / replay / injection
-//! plumbing, and the public [`Sim`] skeleton** only. The handles hung off
-//! [`Sim`] ([`SimRng`], [`SimClock`], [`Chaos`], [`SimApp`]) are frozen,
-//! stability-minded placeholders whose behavior lands in later waves:
-//!
-//! - **W2** wires virtual-clock advancing / draining onto [`SimClock`] against
-//!   [`crate::time::ClockSource`], and mounts an app on [`SimApp`].
-//! - **W3** exposes deterministic id / `Uuid` generation through [`SimRng`] and
-//!   the [`crate::entropy::Rng`] extractor / [`crate::entropy::Entropy`] seam,
-//!   and routes the framework's high-value id sites through it. Bridge a seeded
-//!   source into a mounted app with [`Sim::seeded_entropy`].
-//! - **W5** turns [`Chaos`] into a public, seed-driven fault-injection builder
-//!   ([`Sim::chaos`]), installed at [`Sim::build`] and recorded into the
-//!   schedule read by [`Sim::__chaos_events`].
-//! - **W6** adds the [`always!`](crate::always) / [`sometimes!`](crate::sometimes)
-//!   assertion macros ([`mod@assert`]) and, behind the `sim-testing` feature, a
-//!   property-based op-driver (`sim::op`) — `Sim::gen_ops`/`Sim::gen_ops_with` for
-//!   deterministic generation and `Sim::run_proptest` for shrink-capable runs —
-//!   plus a seed-sweep runner (`sim::sweep`): `sweep_proptest` runs
-//!   `Sim::run_proptest` sequentially across a batch of seeds, reporting the
-//!   first failing seed, driven in CI by the `sim-sweep` `[[bin]]`.
-//! - **#1680** adds [`FaultPlan`], the *authored* fault lane beside [`Chaos`]:
-//!   ordinal-targeted DB-checkout / job-execution faults driven from one seed,
-//!   attached with [`crate::test::TestApp::with_fault_plan`], producing a
-//!   serializable [`FaultOutcome`] a regression test can compare byte-for-byte.
+//! - **Virtual time.** [`Sim::build`] mounts a [`crate::test::TestApp`] with a
+//!   virtual clock. [`Sim::advance`] and [`Sim::advance_to`] step it together
+//!   with tokio's paused timer, so `#[job]` backoff and `#[scheduled]` ticks fire
+//!   in virtual time. [`Sim::run_to_idle`] drains jobs, due ticks and durable
+//!   commit hooks.
+//! - **Seeded identity.** [`Sim::rng`] ([`SimRng`]) draws deterministic values.
+//!   [`Sim::build`] seeds the app's [`crate::entropy::Entropy`] from the seed,
+//!   so framework-minted ids (jobs, request ids, idempotency keys, sessions)
+//!   replay too. [`Sim::seeded_entropy`] returns the same source.
+//! - **Faults.** [`Chaos`] ([`Sim::chaos`]) injects seed-sampled faults.
+//!   [`FaultPlan`] (#1680), attached with
+//!   [`crate::test::TestApp::with_fault_plan`], injects authored ones and
+//!   records a serializable [`FaultOutcome`]. [`Sim::kill`] and
+//!   [`Sim::restart`] model a process crash; `sim::llm` is a seeded LLM stub.
+//! - **Assertions and sweeps.** [`always!`](crate::always) and
+//!   [`sometimes!`](crate::sometimes) ([`mod@assert`]). Behind the
+//!   `sim-testing` feature, `sim::op` generates workloads (`Sim::gen_ops`,
+//!   `Sim::run_proptest` with shrinking) and `sim::sweep` runs one scenario
+//!   across many seeds (`sweep_proptest`, driven in CI by the `sim-sweep` bin).
+//! - **Deadlocks.** With `AUTUMN_SIM_LIVENESS_BUDGET_SECS` set, a `#[sim_test]`
+//!   whose tasks all park panics with its replay line instead of hanging. See
+//!   [`__with_liveness_budget`] for the limits.
 //!
 //! Everything here is designed to grow additively (builder-style) without
 //! breaking the frozen surface — hence the `#[non_exhaustive]` markers.
 
-// The placeholder handles are intentionally thin in W1; their methods and
-// docs fill in over later waves. These narrowly-scoped allows keep the
-// skeleton clean under the workspace's pedantic lint set without masking real
-// issues in the behavioral code that lands later.
+// Several thin accessors here could be `const fn`; they stay non-const so the
+// frozen public surface can grow a non-const body later without a break.
 #![allow(clippy::missing_const_for_fn)]
 
 use std::sync::Arc;
@@ -187,7 +182,7 @@ pub struct Sim {
     /// printed on panic does this for you).
     pub seed: u64,
 
-    /// Seeded deterministic RNG. Generation helpers land in W3.
+    /// Seeded deterministic RNG, reached through [`Sim::rng`].
     rng: SimRng,
 
     /// Virtual clock, started at the fixed sim epoch
@@ -229,8 +224,8 @@ impl Sim {
     ///
     /// Infallible and cheap: it seeds the RNG and starts the virtual clock but
     /// does **not** boot a database or an app, so an empty
-    /// [`#[sim_test]`](crate::sim_test) runs with zero setup. App mounting
-    /// arrives in W2 via [`SimApp`].
+    /// [`#[sim_test]`](crate::sim_test) runs with zero setup. Mount an app with
+    /// [`build`](Sim::build).
     #[must_use]
     pub fn from_seed(seed: u64) -> Self {
         // Each seed run starts with a clean reachability registry, so the sweep
@@ -294,6 +289,11 @@ impl Sim {
     /// ready to inject into a mounted app via
     /// [`crate::state::AppState::with_entropy`].
     ///
+    /// [`build`](Self::build) already installs this source in the app it
+    /// mounts, unless the test passed its own with
+    /// [`crate::test::TestApp::with_entropy`]. Use this to seed state you build
+    /// yourself.
+    ///
     /// This is the bridge W3 provides for W2's app mounting: the app the
     /// simulation drives resolves the [`crate::entropy::Rng`] extractor and
     /// every framework-minted identifier (job ids, request ids, idempotency
@@ -317,12 +317,19 @@ impl Sim {
     /// the fixed sim epoch (`2020-01-01T00:00:00Z`) and moving only when
     /// [`Sim::advance`] steps it. The built app also starts the in-process job
     /// runtime (the in-memory backend), so [`run_to_idle`](Sim::run_to_idle)
-    /// can drain enqueued jobs deterministically.
+    /// can drain enqueued jobs deterministically, and starts its `#[scheduled]`
+    /// tasks, whose ticks fire as virtual time crosses their deadlines.
     ///
-    /// Configure `app` fully before handing it over — routes, jobs, and (in a
-    /// later wave) a sim database are attached to the [`crate::test::TestApp`]
-    /// prior to this call. Do **not** call [`crate::test::TestApp::with_clock`]
-    /// yourself; `build` owns the clock so time stays in lockstep.
+    /// Unless `app` already has an entropy source from
+    /// [`crate::test::TestApp::with_entropy`], `build` installs one seeded from
+    /// [`seed`](Sim::seed), so framework-minted ids replay from the seed. A
+    /// later mount through [`restart`](Sim::restart) derives a new seed from it,
+    /// so a restarted process does not repeat the crashed one's ids.
+    ///
+    /// Configure `app` fully before handing it over: routes, jobs, tasks and a
+    /// sim database are attached to the [`crate::test::TestApp`] before this
+    /// call. Do **not** call [`crate::test::TestApp::with_clock`] yourself;
+    /// `build` owns the clock so time stays in lockstep.
     ///
     /// The returned borrow is convenient for an immediate request; to interleave
     /// requests with [`advance`](Sim::advance) / [`run_to_idle`](Sim::run_to_idle)
