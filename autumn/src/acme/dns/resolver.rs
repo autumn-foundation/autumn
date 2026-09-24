@@ -285,38 +285,56 @@ pub async fn txt_values(
     lookup: &dyn DnsLookup,
     deadline: Duration,
 ) -> Result<Vec<String>, String> {
+    // Each authoritative answer is kept as it arrives, so the deadline drops
+    // only the servers still silent, not answers already in.
+    let collected: std::sync::Mutex<Vec<(String, Result<DnsAnswer, String>)>> =
+        std::sync::Mutex::new(Vec::new());
+    let keep = |asked: &str, answer: Result<DnsAnswer, String>| {
+        collected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((asked.to_owned(), answer));
+    };
     let from_authoritative = async {
-        let mut results = Vec::new();
+        use futures::StreamExt as _;
+        let mut asked: Vec<String> = Vec::new();
         let mut name = normalize_name(fqdn);
         for _ in 0..=MAX_CNAME_HOPS {
+            asked.push(name.clone());
             let servers = authoritative_resolvers(&name, recursive, lookup).await;
-            let answers = ask_txt_of_all(&servers, &name, false, lookup).await;
-            let target = answers
+            let mut pending: futures::stream::FuturesUnordered<_> = servers
                 .iter()
-                .filter_map(|answer| answer.as_ref().ok())
-                .find_map(|answer| answer.unresolved_cname_target(&name));
-            results.extend(answers.into_iter().map(|answer| (name.clone(), answer)));
-            match target {
-                Some(target) if !results.iter().any(|(asked, _)| *asked == target) => {
-                    name = target;
+                .map(|server| lookup.query(*server, &name, QTYPE_TXT, false))
+                .collect();
+            let mut target = None;
+            while let Some(answer) = pending.next().await {
+                if target.is_none() {
+                    if let Ok(answer) = &answer {
+                        target = answer.unresolved_cname_target(&name);
+                    }
                 }
+                keep(&name, answer);
+            }
+            drop(pending);
+            match target {
+                Some(target) if !asked.contains(&target) => name = target,
                 _ => break,
             }
         }
-        results
     };
     let from_authoritative = async {
-        tokio::time::timeout(deadline, from_authoritative)
+        if tokio::time::timeout(deadline, from_authoritative)
             .await
-            .unwrap_or_else(|_| {
-                vec![(
-                    fqdn.to_owned(),
-                    Err(format!(
-                        "the authoritative TXT lookup for {fqdn} did not finish within {}s",
-                        deadline.as_secs()
-                    )),
-                )]
-            })
+            .is_err()
+        {
+            keep(
+                fqdn,
+                Err(format!(
+                    "the authoritative TXT lookup for {fqdn} did not finish within {}s",
+                    deadline.as_secs()
+                )),
+            );
+        }
     };
     let from_recursive = async {
         ask_txt_of_all(recursive, fqdn, true, lookup)
@@ -325,8 +343,10 @@ pub async fn txt_values(
             .map(|answer| (fqdn.to_owned(), answer))
             .collect::<Vec<_>>()
     };
-    let (authoritative, recursive) =
-        futures::future::join(from_authoritative, from_recursive).await;
+    let ((), recursive) = futures::future::join(from_authoritative, from_recursive).await;
+    let authoritative = collected
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut values: Vec<String> = Vec::new();
     let mut answered = false;
     let mut last_error = "no resolvers were configured".to_owned();
@@ -2084,6 +2104,77 @@ mod tests {
             "_autumn-challenge.app.clientco.com",
             &[resolver(1), resolver(2)],
             &PartlyDeadLookup,
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(values, vec!["token-b".to_owned()]);
+    }
+
+    /// Resolver 1 drops every packet, and so does the zone's second
+    /// nameserver. The first nameserver has the token at once; resolver 2
+    /// still caches NXDOMAIN.
+    struct SlowAuthoritativeLookup;
+
+    impl DnsLookup for SlowAuthoritativeLookup {
+        fn query<'a>(
+            &'a self,
+            server: SocketAddr,
+            name: &'a str,
+            qtype: u16,
+            recursion_desired: bool,
+        ) -> BoxFuture<'a, Result<DnsAnswer, String>> {
+            Box::pin(async move {
+                if server == resolver(1) {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    return Err(format!("resolver {server} did not answer"));
+                }
+                if server == SocketAddr::from(([192, 0, 2, 2], 53)) {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    return Err(format!("resolver {server} did not answer"));
+                }
+                let owner = normalize_name(name);
+                let record = |rtype: u16, rdata: Rdata| ResourceRecord {
+                    name: owner.clone(),
+                    rtype,
+                    rdata,
+                };
+                let records = match (qtype, recursion_desired, owner.as_str()) {
+                    (QTYPE_NS, _, "clientco.com") => vec![
+                        record(QTYPE_NS, Rdata::Name("ns1.test".to_owned())),
+                        record(QTYPE_NS, Rdata::Name("ns2.test".to_owned())),
+                    ],
+                    (QTYPE_A, _, "ns1.test") => {
+                        vec![record(
+                            QTYPE_A,
+                            Rdata::A(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+                        )]
+                    }
+                    (QTYPE_A, _, "ns2.test") => {
+                        vec![record(
+                            QTYPE_A,
+                            Rdata::A(std::net::Ipv4Addr::new(192, 0, 2, 2)),
+                        )]
+                    }
+                    (QTYPE_TXT, false, "_autumn-challenge.app.clientco.com") => {
+                        vec![record(QTYPE_TXT, Rdata::Txt("token-b".to_owned()))]
+                    }
+                    _ => Vec::new(),
+                };
+                let rcode = if records.is_empty() { 3 } else { 0 };
+                Ok(DnsAnswer { rcode, records })
+            })
+        }
+    }
+
+    // Codex review on #2936: an answer that arrived before the deadline counts,
+    // even when another authoritative server is still silent at the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn answers_in_before_the_deadline_survive_a_silent_nameserver() {
+        let values = txt_values(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(1), resolver(2)],
+            &SlowAuthoritativeLookup,
             DEADLINE,
         )
         .await
