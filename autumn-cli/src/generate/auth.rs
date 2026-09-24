@@ -53,11 +53,34 @@ const PASSKEY_EXTRA_DEPS: &[(&str, &str)] = &[
 ];
 
 /// The code portion of a Cargo.toml line, up to (not including) its first
-/// `#` — the start of a TOML comment. A raw substring/character search over
-/// a whole line risks matching text that isn't syntax at all: a feature
-/// name mentioned in a comment, or a stray `]`/`}` inside one.
+/// `#` outside any quoted string — the start of a TOML comment. A raw
+/// substring/character search over a whole line risks matching text that
+/// isn't syntax at all: a feature name mentioned in a comment, a stray
+/// `]`/`}` inside one, or (the reverse mistake) a `#` that is itself inside
+/// a quoted value rather than starting a comment — a git-fork path/URL
+/// fragment like `"../autumn#fork"` is valid TOML, not a comment marker.
 fn strip_line_comment(s: &str) -> &str {
-    s.split_once('#').map_or(s, |(before, _)| before)
+    #[derive(PartialEq)]
+    enum Quote {
+        None,
+        Double,
+        Single,
+    }
+    let mut quote = Quote::None;
+    let mut chars = s.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match (c, &quote) {
+            ('"', Quote::None) => quote = Quote::Double,
+            ('\'', Quote::None) => quote = Quote::Single,
+            ('"', Quote::Double) | ('\'', Quote::Single) => quote = Quote::None,
+            ('\\', Quote::Double) => {
+                chars.next(); // skip the escaped character
+            }
+            ('#', Quote::None) => return &s[..i],
+            _ => {}
+        }
+    }
+    s
 }
 
 /// Required features for the `webauthn-rs` dependency.
@@ -1743,7 +1766,7 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
                                 // A `#`-commented-out mention of the feature or
                                 // a stray `]` inside a comment is not TOML —
                                 // check only the code portion of the line.
-                                let code = tk.split_once('#').map_or(tk, |(before, _)| before);
+                                let code = strip_line_comment(tk);
                                 if code.contains(FEATURE) {
                                     already_present = true;
                                 }
@@ -1775,10 +1798,7 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
                                     } else {
                                         &lines[idx]
                                     };
-                                    let raw = raw
-                                        .split_once('#')
-                                        .map_or(raw, |(before, _)| before)
-                                        .trim();
+                                    let raw = strip_line_comment(raw).trim();
                                     (!raw.is_empty()).then(|| raw.to_owned())
                                 });
                                 let sep = if last_entry.is_some_and(|e| !e.ends_with(',')) {
@@ -1997,7 +2017,7 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
                                 // A `#`-commented-out mention of the feature or
                                 // a stray `]` inside a comment is not TOML —
                                 // check only the code portion of the line.
-                                let code = tk.split_once('#').map_or(tk, |(before, _)| before);
+                                let code = strip_line_comment(tk);
                                 if code.contains(FEATURE) {
                                     already_present = true;
                                 }
@@ -2029,10 +2049,7 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
                                     } else {
                                         &lines[idx]
                                     };
-                                    let raw = raw
-                                        .split_once('#')
-                                        .map_or(raw, |(before, _)| before)
-                                        .trim();
+                                    let raw = strip_line_comment(raw).trim();
                                     (!raw.is_empty()).then(|| raw.to_owned())
                                 });
                                 let sep = if last_entry.is_some_and(|e| !e.ends_with(',')) {
@@ -11336,7 +11353,7 @@ fn ensure_autumn_web_webauthn_feature(toml: &str) -> String {
                                 // A `#`-commented-out mention of the feature or
                                 // a stray `]` inside a comment is not TOML —
                                 // check only the code portion of the line.
-                                let code = tk.split_once('#').map_or(tk, |(before, _)| before);
+                                let code = strip_line_comment(tk);
                                 if code.contains(FEATURE) {
                                     already_present = true;
                                 }
@@ -11368,10 +11385,7 @@ fn ensure_autumn_web_webauthn_feature(toml: &str) -> String {
                                     } else {
                                         &lines[idx]
                                     };
-                                    let raw = raw
-                                        .split_once('#')
-                                        .map_or(raw, |(before, _)| before)
-                                        .trim();
+                                    let raw = strip_line_comment(raw).trim();
                                     (!raw.is_empty()).then(|| raw.to_owned())
                                 });
                                 let sep = if last_entry.is_some_and(|e| !e.ends_with(',')) {
@@ -16224,6 +16238,57 @@ mod tests {
         );
         toml::from_str::<toml::Value>(&out)
             .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_autumn_web_mail_feature_respects_hash_inside_quoted_path() {
+        // Codex review on 28a9cb82: `strip_line_comment` itself was the bug
+        // this time — its naive `split_once('#')` treated a `#` inside a
+        // quoted value (a git-fork path fragment, valid TOML) as a comment
+        // start, hiding the real `features = [...]` that follows it. That
+        // made an already-satisfied feature look absent, so the generator
+        // appended a duplicate on every re-run.
+        let toml = "autumn-web = { path = \"../autumn#fork\", features = [\"mail\"] }\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert!(
+            out.contains("\"../autumn#fork\""),
+            "the quoted path must survive untouched: {out}"
+        );
+        assert_eq!(
+            out.matches("\"mail\"").count(),
+            1,
+            "the already-present feature must not be duplicated: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_webauthn_feature_respects_hash_inside_quoted_path() {
+        let toml = "autumn-web = { path = \"../autumn#fork\", features = [\"webauthn\"] }\n";
+        let out = ensure_autumn_web_webauthn_feature(toml);
+        assert!(
+            out.contains("\"../autumn#fork\""),
+            "the quoted path must survive untouched: {out}"
+        );
+        assert_eq!(
+            out.matches("\"webauthn\"").count(),
+            1,
+            "the already-present feature must not be duplicated: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_oauth2_feature_respects_hash_inside_quoted_path() {
+        let toml = "autumn-web = { path = \"../autumn#fork\", features = [\"oauth2\"] }\n";
+        let out = ensure_autumn_web_oauth2_feature(toml);
+        assert!(
+            out.contains("\"../autumn#fork\""),
+            "the quoted path must survive untouched: {out}"
+        );
+        assert_eq!(
+            out.matches("\"oauth2\"").count(),
+            1,
+            "the already-present feature must not be duplicated: {out}"
+        );
     }
 
     #[test]
