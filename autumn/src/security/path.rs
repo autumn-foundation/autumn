@@ -96,7 +96,7 @@ fn decode_encoded_slashes(path: &str) -> std::borrow::Cow<'_, str> {
 /// Returns `Some(dot_count)` when `segment` consists solely of one or two
 /// dots, where each dot may be literal (`.`) or percent-encoded (`%2e` /
 /// `%2E`). Returns `None` for every other segment.
-pub(crate) const fn dot_segment_len(segment: &str) -> Option<usize> {
+pub const fn dot_segment_len(segment: &str) -> Option<usize> {
     let bytes = segment.as_bytes();
     let mut i = 0;
     let mut dots = 0usize;
@@ -128,7 +128,7 @@ pub(crate) const fn dot_segment_len(segment: &str) -> Option<usize> {
 /// One level only, as in [`dot_segment_len`]: `%252e` yields `%` once. A `%`
 /// without two hex digits after it is not an escape and yields nothing.
 #[cfg(any(feature = "plugin-sandbox", test))]
-pub(crate) fn percent_escapes(text: &str) -> impl Iterator<Item = (u8, bool)> + '_ {
+pub fn percent_escapes(text: &str) -> impl Iterator<Item = (u8, bool)> + '_ {
     text.as_bytes().windows(3).filter_map(|window| {
         let [b'%', high, low] = *window else {
             return None;
