@@ -2147,7 +2147,16 @@ without also filling in the intake form above.
   per-branch breakdown); and one genuine new organic
   hit — but on `sqlite_jobs_scheduler_e2e`, not on any `live_upgrade`,
   `cache_stampede`, or `sim_fault_plan` signature. None of the 7 match this
-  entry. `manual-macos-contention-check.yml`: still `total_count: 0`,
+  entry. **Coverage gap, flagged post-review (via a Codex review comment on
+  this update, after the next day's #2942 pass had already established the
+  same gap for its own sample): this "zero new hits" finding is scoped to
+  the 34 runs that resolved to `success`/`failure` and were actually
+  triaged, not a proven-exhaustive zero-hit finding across the full 58-run
+  window.** `ci.yml`'s `concurrency.cancel-in-progress: true` means a job
+  inside one of the 24 `cancelled`-overall runs could still have completed
+  with a failing test before the run itself was marked cancelled by a
+  superseding push; those runs' job-level logs were not inspected this
+  pass. `manual-macos-contention-check.yml`: still `total_count: 0`,
   checked 2026-09-23T~07:5xZ — **15th** straight idle pass (now ~352.9
   hours idle, past 14.7 days). Still needs a human sign-off for new macOS
   CI spend; not dispatched this pass for that reason.
