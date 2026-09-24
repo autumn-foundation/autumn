@@ -387,14 +387,17 @@ pub async fn txt_values(
                 .iter()
                 .map(|server| lookup.query(*server, &name, QTYPE_TXT, false))
                 .collect();
+            // The servers of one zone agree, so the first CNAME target is
+            // followed at once and the rest of this hop is not waited for.
             let mut target = None;
             while let Some(answer) = pending.next().await {
-                if target.is_none()
-                    && let Ok(answer) = &answer
-                {
+                if let Ok(answer) = &answer {
                     target = answer.unresolved_cname_target(&name);
                 }
                 keep(&name, answer);
+                if target.is_some() {
+                    break;
+                }
             }
             drop(pending);
             match target {
@@ -2177,6 +2180,70 @@ mod tests {
             "_autumn-challenge.app.clientco.com",
             &[resolver(1), resolver(2)],
             &DeadDelegatedLookup,
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(values, vec!["token-b".to_owned()]);
+    }
+
+    /// Resolver 1 and nameserver `ns2.test` drop every packet. `ns1.test`
+    /// answers the ownership record with a CNAME to `dns-host.net`, whose
+    /// nameserver has the token. Resolver 2 still caches NXDOMAIN. Each answer
+    /// takes 10ms.
+    struct SilentPeerLookup;
+
+    impl DnsLookup for SilentPeerLookup {
+        fn query<'a>(
+            &'a self,
+            server: SocketAddr,
+            name: &'a str,
+            qtype: u16,
+            recursion_desired: bool,
+        ) -> BoxFuture<'a, Result<DnsAnswer, String>> {
+            Box::pin(async move {
+                if server == resolver(1) || server == SocketAddr::from(([192, 0, 2, 2], 53)) {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    return Err(format!("{server} did not answer"));
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let owner = normalize_name(name);
+                let record = |rtype: u16, rdata: Rdata| ResourceRecord {
+                    name: owner.clone(),
+                    rtype,
+                    rdata,
+                };
+                let ns = |host: &str| record(QTYPE_NS, Rdata::Name(host.to_owned()));
+                let a =
+                    |last: u8| record(QTYPE_A, Rdata::A(std::net::Ipv4Addr::new(192, 0, 2, last)));
+                let records = match (qtype, recursion_desired, owner.as_str()) {
+                    (QTYPE_NS, _, "clientco.com") => vec![ns("ns1.test"), ns("ns2.test")],
+                    (QTYPE_NS, _, "dns-host.net") => vec![ns("ns3.test")],
+                    (QTYPE_A, _, "ns1.test") => vec![a(1)],
+                    (QTYPE_A, _, "ns2.test") => vec![a(2)],
+                    (QTYPE_A, _, "ns3.test") => vec![a(3)],
+                    (QTYPE_TXT, false, "_autumn-challenge.app.clientco.com") => vec![record(
+                        QTYPE_CNAME,
+                        Rdata::Name("verify.dns-host.net".to_owned()),
+                    )],
+                    (QTYPE_TXT, false, "verify.dns-host.net") => {
+                        vec![record(QTYPE_TXT, Rdata::Txt("token-b".to_owned()))]
+                    }
+                    _ => Vec::new(),
+                };
+                Ok(DnsAnswer { rcode: 0, records })
+            })
+        }
+    }
+
+    // Codex review on #2936: a CNAME target is asked at once, not after every
+    // nameserver of the current hop has answered.
+    #[tokio::test(start_paused = true)]
+    async fn a_cname_target_is_asked_without_waiting_for_a_silent_nameserver() {
+        let values = txt_values(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(1), resolver(2)],
+            &SilentPeerLookup,
             DEADLINE,
         )
         .await
