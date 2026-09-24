@@ -268,9 +268,9 @@ type Failed = std::sync::Mutex<Vec<SocketAddr>>;
 /// Ask every server in `servers` that has not failed yet for every type in
 /// `qtypes` at once, with recursion desired, and return what `pick` finds.
 ///
-/// For each type, the first answer with records counts. It returns once every
-/// type has an answer and one of them has records, so a server that drops
-/// packets delays only a query that no other server can answer. A server that
+/// For each type, the first answer with records counts. It returns once each
+/// type has records or has no query left, so a server that drops packets
+/// delays only a type that no other server has records for. A server that
 /// fails is added to `failed` and is not asked again.
 async fn first_found<T>(
     servers: &[SocketAddr],
@@ -301,11 +301,11 @@ async fn first_found<T>(
             })
         })
         .collect();
-    let mut answered = vec![false; qtypes.len()];
+    let mut outstanding = vec![live.len(); qtypes.len()];
     let mut found: Vec<Vec<T>> = qtypes.iter().map(|_| Vec::new()).collect();
     while let Some((server, slot, answer)) = pending.next().await {
+        outstanding[slot] -= 1;
         if let Ok(answer) = answer {
-            answered[slot] = true;
             if found[slot].is_empty() {
                 found[slot] = pick(&answer);
             }
@@ -317,7 +317,11 @@ async fn first_found<T>(
                 failed.push(server);
             }
         }
-        if answered.iter().all(|done| *done) && found.iter().any(|f| !f.is_empty()) {
+        if found
+            .iter()
+            .zip(&outstanding)
+            .all(|(found, left)| !found.is_empty() || *left == 0)
+        {
             break;
         }
     }
@@ -2504,6 +2508,68 @@ mod tests {
             "_autumn-challenge.app.clientco.com",
             &[resolver(53)],
             &lookup,
+        )
+        .await;
+        assert_eq!(
+            found,
+            vec![
+                SocketAddr::from(([192, 0, 2, 1], 53)),
+                "[2001:db8::1]:53".parse::<SocketAddr>().unwrap(),
+            ]
+        );
+    }
+
+    /// Resolver 1 knows only the nameserver's A record and answers AAAA with
+    /// nothing at once. Resolver 2 knows only its AAAA record and is slower.
+    struct SplitStackLookup;
+
+    impl DnsLookup for SplitStackLookup {
+        fn query<'a>(
+            &'a self,
+            server: SocketAddr,
+            name: &'a str,
+            qtype: u16,
+            _recursion_desired: bool,
+        ) -> BoxFuture<'a, Result<DnsAnswer, String>> {
+            Box::pin(async move {
+                let owner = normalize_name(name);
+                let record = |rtype: u16, rdata: Rdata| ResourceRecord {
+                    name: owner.clone(),
+                    rtype,
+                    rdata,
+                };
+                if server == resolver(2) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let records = match (qtype, server == resolver(1), owner.as_str()) {
+                    (QTYPE_NS, _, "clientco.com") => {
+                        vec![record(QTYPE_NS, Rdata::Name("ns.test".to_owned()))]
+                    }
+                    (QTYPE_A, true, "ns.test") => {
+                        vec![record(
+                            QTYPE_A,
+                            Rdata::A(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+                        )]
+                    }
+                    (QTYPE_AAAA, false, "ns.test") => vec![record(
+                        QTYPE_AAAA,
+                        Rdata::Aaaa("2001:db8::1".parse().unwrap()),
+                    )],
+                    _ => Vec::new(),
+                };
+                Ok(DnsAnswer { rcode: 0, records })
+            })
+        }
+    }
+
+    // Codex review on #2936: an empty AAAA answer from one resolver does not
+    // stop the wait for another resolver's AAAA records.
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_answer_does_not_cut_off_the_other_address_family() {
+        let found = authoritative_resolvers(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(1), resolver(2)],
+            &SplitStackLookup,
         )
         .await;
         assert_eq!(
