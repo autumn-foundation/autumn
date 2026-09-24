@@ -435,10 +435,20 @@ fn component_from_package(pkg: &serde_json::Value) -> Result<Component, SbomErro
 ///
 /// The top-level component is `resolve.root` when cargo resolved one (the
 /// common case for a scaffolded app, where the command runs inside the single
-/// member crate). A virtual workspace manifest has no root, so `fallback`
-/// supplies the identity — for autumn itself that is the repository name plus
-/// `[workspace.package].version`, which is exactly what the release tag
-/// encodes.
+/// member crate). When `--manifest-path` names a member of a virtual
+/// workspace — for which cargo reports `resolve.root: null` — the named
+/// member becomes the root instead, so the document describes that member
+/// rather than the whole workspace. A virtual workspace with no member
+/// named still has no root, so `fallback` supplies the identity — for autumn
+/// itself that is the repository name plus `[workspace.package].version`,
+/// which is exactly what the release tag encodes.
+///
+/// The component list is the resolve graph walked from the root, following
+/// only non-dev edges: `cargo metadata` resolves dev-dependencies but never
+/// links them into a shipped artifact, so listing them produces false
+/// vulnerability findings. When the metadata carries no resolve graph at all
+/// (`cargo metadata --no-deps`), there is nothing to walk and every package
+/// is listed, as before.
 ///
 /// # Errors
 ///
@@ -448,18 +458,16 @@ pub fn bom_from_cargo_metadata(
     metadata: &serde_json::Value,
     fallback: &RootFallback,
     tool_version: &str,
+    manifest_path: Option<&Path>,
 ) -> Result<Bom, SbomError> {
     let packages = metadata
         .get("packages")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| SbomError::Metadata("no `packages` array".into()))?;
 
-    let root_id = metadata
-        .get("resolve")
-        .and_then(|r| r.get("root"))
-        .and_then(serde_json::Value::as_str);
+    let root_id = resolve_root_id(metadata, manifest_path);
 
-    let root_pkg = root_id.and_then(|id| {
+    let root_pkg = root_id.as_deref().and_then(|id| {
         packages
             .iter()
             .find(|p| p.get("id").and_then(serde_json::Value::as_str) == Some(id))
@@ -490,13 +498,142 @@ pub fn bom_from_cargo_metadata(
         },
     };
 
-    let components = packages
-        .iter()
-        .filter(|p| root_id.is_none() || p.get("id").and_then(serde_json::Value::as_str) != root_id)
-        .map(component_from_package)
-        .collect::<Result<Vec<_>, _>>()?;
+    // Walk the resolve graph so dev-dependencies — resolved but never linked
+    // — stay out of the shipped document. With no resolve graph there is
+    // nothing to walk; fall back to listing every package, as before.
+    let seeds: Vec<String> = match root_id.as_deref() {
+        Some(id) => vec![id.to_owned()],
+        // No root (a virtual workspace without a named member): describe the
+        // whole workspace's non-dev closure — every member's, unioned.
+        None => packages
+            .iter()
+            .filter(|p| p.get("source").is_none_or(serde_json::Value::is_null))
+            .filter_map(|p| {
+                p.get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect(),
+    };
+    let root_id_str = root_id.as_deref();
+    let components = match non_dev_reachable(metadata, &seeds) {
+        Some(reachable) => packages
+            .iter()
+            .filter(|p| {
+                let id = p.get("id").and_then(serde_json::Value::as_str);
+                id.is_some_and(|id| reachable.contains(id)) && id != root_id_str
+            })
+            .map(component_from_package)
+            .collect::<Result<Vec<_>, _>>()?,
+        None => packages
+            .iter()
+            .filter(|p| {
+                root_id_str.is_none()
+                    || p.get("id").and_then(serde_json::Value::as_str) != root_id_str
+            })
+            .map(component_from_package)
+            .collect::<Result<Vec<_>, _>>()?,
+    };
 
     Ok(assemble(root, components, tool_version))
+}
+
+/// Pick the package id the SBOM's top-level component describes.
+///
+/// `resolve.root` when cargo resolved one. A virtual workspace manifest has
+/// no root even when `--manifest-path` names one of its members, so in that
+/// case the named member — matched by its manifest path — becomes the root.
+fn resolve_root_id(metadata: &serde_json::Value, manifest_path: Option<&Path>) -> Option<String> {
+    let resolved = metadata
+        .get("resolve")
+        .and_then(|r| r.get("root"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    if resolved.is_some() {
+        return resolved;
+    }
+    let requested = manifest_path?;
+    metadata
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|p| {
+            p.get("manifest_path")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|m| manifest_matches(m, requested))
+        })
+        .filter_map(|p| {
+            p.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .next()
+}
+
+/// Whether a package's `manifest_path` (absolute, as `cargo metadata`
+/// reports it) names the `--manifest-path` the user passed (possibly
+/// relative). Canonicalizes on both sides so `./x/Cargo.toml` and
+/// symlinked checkouts still match; if either side cannot be canonicalized,
+/// compares the absolute strings instead.
+fn manifest_matches(pkg_manifest: &str, requested: &Path) -> bool {
+    let requested_abs = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| requested.to_path_buf(), |cwd| cwd.join(requested))
+    };
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canonical(Path::new(pkg_manifest)) == canonical(&requested_abs)
+}
+
+/// The package ids reachable from `seeds` through the cargo resolve graph,
+/// following only edges that are not dev-dependency-only.
+///
+/// `cargo metadata` marks the edge kind on each dependency (`dep_kinds`):
+/// a normal dependency reports `"kind": null`, a dev-dependency `"kind":
+/// "dev"`. A dependency can carry several kinds (e.g. both normal and
+/// build), so an edge is excluded only when *every* kind is `"dev"` — a
+/// missing `dep_kinds` array is treated as a normal edge, not a dev one.
+///
+/// Returns `None` when the metadata carries no resolve graph
+/// (`cargo metadata --no-deps`), so the caller can fall back to listing
+/// every package.
+fn non_dev_reachable(metadata: &serde_json::Value, seeds: &[String]) -> Option<BTreeSet<String>> {
+    let nodes = metadata.get("resolve")?.get("nodes")?.as_array()?;
+    let by_id: BTreeMap<&str, &serde_json::Value> = nodes
+        .iter()
+        .filter_map(|n| {
+            n.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(|id| (id, n))
+        })
+        .collect();
+
+    let mut reachable = BTreeSet::new();
+    let mut stack: Vec<&str> = seeds.iter().map(String::as_str).collect();
+    while let Some(id) = stack.pop() {
+        if !reachable.insert(id.to_owned()) {
+            continue;
+        }
+        let Some(node) = by_id.get(id) else { continue };
+        let deps = node.get("deps").and_then(serde_json::Value::as_array);
+        for dep in deps.into_iter().flatten() {
+            let kinds = dep.get("dep_kinds").and_then(serde_json::Value::as_array);
+            let dev_only = kinds.is_some_and(|ks| {
+                !ks.is_empty()
+                    && ks
+                        .iter()
+                        .all(|k| k.get("kind").and_then(serde_json::Value::as_str) == Some("dev"))
+            });
+            if dev_only {
+                continue;
+            }
+            if let Some(pkg) = dep.get("pkg").and_then(serde_json::Value::as_str) {
+                stack.push(pkg);
+            }
+        }
+    }
+    Some(reachable)
 }
 
 /// Serialize `bom` deterministically: pretty-printed JSON with a trailing
@@ -1280,7 +1417,12 @@ fn generate(opts: &SbomOptions) -> Result<Bom, SbomError> {
     }
     let metadata = run_cargo_metadata(opts)?;
     let fallback = workspace_fallback(&metadata);
-    bom_from_cargo_metadata(&metadata, &fallback, tool_version)
+    bom_from_cargo_metadata(
+        &metadata,
+        &fallback,
+        tool_version,
+        opts.manifest_path.as_deref(),
+    )
 }
 
 fn execute(opts: &SbomOptions) -> Result<(), SbomError> {
@@ -1383,7 +1525,7 @@ mod tests {
     #[test]
     fn emits_a_cyclonedx_envelope() {
         let md = metadata_with(&json!([pkg("serde", "1.0.0")]), &json!(null));
-        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0", None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
 
         assert_eq!(v["bomFormat"], "CycloneDX");
@@ -1400,7 +1542,7 @@ mod tests {
     fn omits_nondeterministic_fields() {
         let md = metadata_with(&json!([pkg("serde", "1.0.0")]), &json!(null));
         let rendered =
-            render(&bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap()).unwrap();
+            render(&bom_from_cargo_metadata(&md, &fallback(), "0.7.0", None).unwrap()).unwrap();
         // A UUID serial number or a wall-clock timestamp would make the
         // publish gate's `--verify` comparison impossible.
         assert!(
@@ -1417,13 +1559,14 @@ mod tests {
             .expect("a CycloneDX serialNumber must be present")
             .to_owned();
         assert!(serial.starts_with("urn:uuid:"), "{serial}");
-        let again = render(&bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap()).unwrap();
+        let again =
+            render(&bom_from_cargo_metadata(&md, &fallback(), "0.7.0", None).unwrap()).unwrap();
         assert_eq!(rendered, again, "the serial number must be reproducible");
 
         // …and it tracks the inventory: one crate different, different serial.
         let other = metadata_with(&json!([pkg("serde", "1.0.1")]), &json!(null));
         let other_serial = serde_json::from_str::<serde_json::Value>(
-            &render(&bom_from_cargo_metadata(&other, &fallback(), "0.7.0").unwrap()).unwrap(),
+            &render(&bom_from_cargo_metadata(&other, &fallback(), "0.7.0", None).unwrap()).unwrap(),
         )
         .unwrap()["serialNumber"]
             .as_str()
@@ -1561,7 +1704,7 @@ mod tests {
     #[test]
     fn falls_back_to_the_workspace_identity_when_there_is_no_root_package() {
         let md = metadata_with(&json!([pkg("serde", "1.0.0")]), &json!(null));
-        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0", None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
 
         assert_eq!(v["metadata"]["component"]["name"], "autumn");
@@ -1585,7 +1728,7 @@ mod tests {
             ]),
             &json!(root_id),
         );
-        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0", None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
 
         assert_eq!(v["metadata"]["component"]["name"], "my-app");
@@ -1600,10 +1743,190 @@ mod tests {
         assert_eq!(names, vec!["serde"]);
     }
 
+    /// A `resolve.nodes` entry as `cargo metadata` really reports one: `deps`
+    /// are (name, pkg id, kinds) triples, where the kinds are the
+    /// `dep_kinds[].kind` values — `None` for a normal dependency, since cargo
+    /// reports `"kind": null` there.
+    fn node(id: &str, deps: &[(&str, &str, &[Option<&str>])]) -> serde_json::Value {
+        json!({
+            "id": id,
+            "deps": deps
+                .iter()
+                .map(|(name, pkg, kinds)| json!({
+                    "name": name,
+                    "pkg": pkg,
+                    "dep_kinds": kinds
+                        .iter()
+                        .map(|k| json!({ "kind": k, "target": serde_json::Value::Null }))
+                        .collect::<Vec<_>>(),
+                }))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    fn metadata_with_resolve(
+        packages: &serde_json::Value,
+        root: &serde_json::Value,
+        nodes: &serde_json::Value,
+    ) -> serde_json::Value {
+        json!({
+            "packages": packages,
+            "workspace_root": "/tmp/ws",
+            "resolve": { "root": root, "nodes": nodes },
+        })
+    }
+
+    fn component_names(bom: &Bom) -> Vec<String> {
+        let mut names: Vec<String> = bom.components.iter().map(|c| c.name.clone()).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn dev_only_dependencies_are_excluded_from_the_component_list() {
+        // Issue #2385, defect 1: `cargo metadata` resolves dev-dependencies
+        // but never links them into the shipped artifact, so the SBOM must
+        // not inventory them (false vulnerability findings otherwise).
+        let root_id = "path+file:///tmp/ws#my-app@1.2.3";
+        let serde_id = "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.228";
+        let memchr_id = "registry+https://github.com/rust-lang/crates.io-index#memchr@2.7.4";
+        let assert_cmd_id =
+            "registry+https://github.com/rust-lang/crates.io-index#assert_cmd@2.0.16";
+        let doc_comment_id =
+            "registry+https://github.com/rust-lang/crates.io-index#doc-comment@0.3.3";
+        let md = metadata_with_resolve(
+            &json!([
+                {
+                    "id": root_id,
+                    "name": "my-app",
+                    "version": "1.2.3",
+                    "license": "MIT",
+                    "repository": serde_json::Value::Null,
+                },
+                pkg("serde", "1.0.228"),
+                pkg("memchr", "2.7.4"),
+                pkg("assert_cmd", "2.0.16"),
+                pkg("doc-comment", "0.3.3"),
+            ]),
+            &json!(root_id),
+            &json!([
+                node(
+                    root_id,
+                    &[
+                        ("serde", serde_id, &[None]),
+                        ("assert_cmd", assert_cmd_id, &[Some("dev")]),
+                    ]
+                ),
+                node(serde_id, &[("memchr", memchr_id, &[None])]),
+                node(
+                    assert_cmd_id,
+                    &[("doc-comment", doc_comment_id, &[Some("dev")])]
+                ),
+                node(memchr_id, &[]),
+                node(doc_comment_id, &[]),
+            ]),
+        );
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0", None).unwrap();
+        let names = component_names(&bom);
+        assert!(names.contains(&"serde".to_owned()), "{names:?}");
+        assert!(names.contains(&"memchr".to_owned()), "{names:?}");
+        assert!(
+            !names
+                .iter()
+                .any(|n| n == "assert_cmd" || n == "doc-comment"),
+            "dev-only crates must not be inventoried: {names:?}"
+        );
+    }
+
+    #[test]
+    fn mixed_kind_edges_are_kept_when_not_dev_only() {
+        // A dependency that is both normal and build (or dev and build) is
+        // linked; only a *dev-only* edge is pruned.
+        let root_id = "path+file:///tmp/ws#my-app@1.2.3";
+        let cc_id = "registry+https://github.com/rust-lang/crates.io-index#cc@1.2.35";
+        let md = metadata_with_resolve(
+            &json!([
+                {
+                    "id": root_id,
+                    "name": "my-app",
+                    "version": "1.2.3",
+                    "license": "MIT",
+                    "repository": serde_json::Value::Null,
+                },
+                pkg("cc", "1.2.35"),
+            ]),
+            &json!(root_id),
+            &json!([node(root_id, &[("cc", cc_id, &[None, Some("build")])],),]),
+        );
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0", None).unwrap();
+        assert_eq!(component_names(&bom), ["cc".to_owned()]);
+    }
+
+    #[test]
+    fn manifest_path_selects_the_member_root_of_a_virtual_workspace() {
+        // Issue #2385, defect 2: `cargo metadata --manifest-path m1/Cargo.toml`
+        // on a virtual workspace reports `resolve.root: null`, but the SBOM
+        // must describe the named member, not the whole workspace.
+        let m1_id = "path+file:///tmp/ws/m1#m1@0.3.0";
+        let m2_id = "path+file:///tmp/ws/m2#m2@0.3.0";
+        let serde_id = "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.228";
+        let rand_id = "registry+https://github.com/rust-lang/crates.io-index#rand@0.9.2";
+        let m1 = json!({
+            "id": m1_id,
+            "name": "m1",
+            "version": "0.3.0",
+            "license": "MIT",
+            "repository": serde_json::Value::Null,
+            "source": serde_json::Value::Null,
+            "manifest_path": "/tmp/ws/m1/Cargo.toml",
+        });
+        let m2 = json!({
+            "id": m2_id,
+            "name": "m2",
+            "version": "0.3.0",
+            "license": "MIT",
+            "repository": serde_json::Value::Null,
+            "source": serde_json::Value::Null,
+            "manifest_path": "/tmp/ws/m2/Cargo.toml",
+        });
+        let md = metadata_with_resolve(
+            &json!([m1, m2, pkg("serde", "1.0.228"), pkg("rand", "0.9.2")]),
+            &json!(null),
+            &json!([
+                node(m1_id, &[("serde", serde_id, &[None])]),
+                node(m2_id, &[("rand", rand_id, &[None])]),
+                node(serde_id, &[]),
+                node(rand_id, &[]),
+            ]),
+        );
+        let bom = bom_from_cargo_metadata(
+            &md,
+            &fallback(),
+            "0.7.0",
+            Some(Path::new("/tmp/ws/m1/Cargo.toml")),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+        assert_eq!(v["metadata"]["component"]["name"], "m1");
+        assert_eq!(v["metadata"]["component"]["version"], "0.3.0");
+        assert_eq!(v["metadata"]["component"]["type"], "application");
+        let names: Vec<&str> = v["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["serde"],
+            "only the named member's closure: {names:?}"
+        );
+    }
+
     #[test]
     fn records_purl_license_and_vcs_for_each_component() {
         let md = metadata_with(&json!([pkg("serde", "1.0.0")]), &json!(null));
-        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0", None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
         let c = &v["components"][0];
 
@@ -1632,7 +1955,7 @@ mod tests {
             }]),
             &json!(null),
         );
-        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0", None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
         let c = &v["components"][0];
         assert!(c.get("purl").is_none(), "{c}");
@@ -1649,7 +1972,7 @@ mod tests {
             }]),
             &json!(null),
         );
-        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0", None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
         let purl = v["components"][0]["purl"].as_str().unwrap();
         assert!(
@@ -1661,7 +1984,7 @@ mod tests {
     #[test]
     fn a_crates_io_package_keeps_the_canonical_purl() {
         let md = metadata_with(&json!([pkg("serde", "1.0.0")]), &json!(null));
-        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0", None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
         assert_eq!(v["components"][0]["purl"], "pkg:cargo/serde@1.0.0");
     }
@@ -1698,7 +2021,7 @@ mod tests {
             &json!([{ "id": "x#anon@0.1.0", "name": "anon", "version": "0.1.0" }]),
             &json!(null),
         );
-        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0", None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
 
         assert!(v["components"][0].get("licenses").is_none());
@@ -1723,8 +2046,8 @@ mod tests {
             ]),
             &json!(null),
         );
-        let ra = render(&bom_from_cargo_metadata(&a, &fallback(), "0.7.0").unwrap()).unwrap();
-        let rb = render(&bom_from_cargo_metadata(&b, &fallback(), "0.7.0").unwrap()).unwrap();
+        let ra = render(&bom_from_cargo_metadata(&a, &fallback(), "0.7.0", None).unwrap()).unwrap();
+        let rb = render(&bom_from_cargo_metadata(&b, &fallback(), "0.7.0", None).unwrap()).unwrap();
         assert_eq!(ra, rb);
 
         let v: serde_json::Value = serde_json::from_str(&ra).unwrap();
@@ -1749,7 +2072,7 @@ mod tests {
             &json!([pkg("serde", "1.0.0"), pkg("serde", "1.0.0")]),
             &json!(null),
         );
-        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0", None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
         assert_eq!(v["components"].as_array().unwrap().len(), 1);
     }
@@ -1758,7 +2081,7 @@ mod tests {
     fn rejects_metadata_without_a_packages_array() {
         let md = json!({ "workspace_root": "/tmp/ws" });
         assert!(matches!(
-            bom_from_cargo_metadata(&md, &fallback(), "0.7.0"),
+            bom_from_cargo_metadata(&md, &fallback(), "0.7.0", None),
             Err(SbomError::Metadata(_))
         ));
     }
@@ -1773,6 +2096,7 @@ mod tests {
             &metadata_with(&serde_json::Value::Array(packages), &json!(null)),
             &fallback(),
             "0.7.0",
+            None,
         )
         .unwrap()
     }
@@ -2012,7 +2336,7 @@ mod tests {
         // crates.io crate: this workspace publishes `autumn-web`, and `autumn`
         // is somebody else's package.
         let md = metadata_with(&json!([pkg("serde", "1.0.0")]), &json!(null));
-        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0", None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
         assert_eq!(v["metadata"]["component"]["name"], "autumn");
         assert!(
@@ -2044,7 +2368,7 @@ mod tests {
             ]),
             &json!(null),
         );
-        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0", None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
         let refs: Vec<&str> = v["components"]
             .as_array()
@@ -2062,7 +2386,7 @@ mod tests {
             &json!([pkg("serde", "1.0.0"), pkg("serde", "1.0.0")]),
             &json!(null),
         );
-        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0", None).unwrap();
         assert_eq!(bom.components.len(), 1);
     }
 
