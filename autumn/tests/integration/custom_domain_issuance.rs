@@ -2665,3 +2665,42 @@ async fn a_txt_result_for_a_registration_that_changed_hands_is_discarded() {
     );
     assert_eq!(issuer.count(), 0);
 }
+
+/// Codex review on #2936: each verification can wait out a DNS timeout, so a
+/// pass over many pending domains must not add those waits up.
+#[tokio::test(start_paused = true)]
+async fn pending_domains_are_verified_at_the_same_time() {
+    struct SlowVerifier;
+    impl DomainVerifier for SlowVerifier {
+        fn observe<'a>(&'a self, _hostname: &'a str) -> BoxFuture<'a, ObservedTarget> {
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+                ObservedTarget::None
+            })
+        }
+        fn observe_txt<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, ObservedTxt> {
+            Box::pin(async move { ObservedTxt::Values(Vec::new()) })
+        }
+    }
+
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = strict_harness(Arc::new(SlowVerifier), issuer as Arc<dyn DomainIssuer>);
+    for i in 0..32 {
+        h.registry
+            .register(&format!("app{i}.clientco.com"), "tenant-a", NOW)
+            .await
+            .unwrap();
+    }
+
+    let started = tokio::time::Instant::now();
+    h.task.tick(NOW).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(32 * 6 / 4),
+        "one pass took {elapsed:?}"
+    );
+    for i in 0..32 {
+        let domain = h.registry.get(&format!("app{i}.clientco.com")).unwrap();
+        assert!(domain.failure_reason.is_some(), "app{i} was not verified");
+    }
+}

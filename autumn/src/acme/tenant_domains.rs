@@ -50,6 +50,9 @@ use rustls::crypto::CryptoProvider;
 /// The scheduled-task name custom-domain leases and alerts are keyed on.
 pub const CUSTOM_DOMAIN_TASK: &str = "custom_domain_certificates";
 
+/// How many pending domains one tick verifies at the same time.
+const VERIFY_CONCURRENCY: usize = 16;
+
 /// Callback that dispatches a custom-domain failure to the operator (#1610).
 pub type ReporterFn = Arc<dyn Fn(String) + Send + Sync>;
 
@@ -226,9 +229,15 @@ impl CustomDomainTask {
 
     /// One pass over every registered domain.
     pub async fn tick(&self, now_unix: i64) {
-        for domain in self.registry.pending_verification(now_unix) {
-            self.verify_one(&domain.hostname, now_unix).await;
-        }
+        // Each check can wait out a DNS timeout, so checks run
+        // `VERIFY_CONCURRENCY` at a time instead of adding up. Each write goes
+        // through the registry's per-hostname gate.
+        futures::StreamExt::for_each_concurrent(
+            futures::stream::iter(self.registry.pending_verification(now_unix)),
+            VERIFY_CONCURRENCY,
+            |domain| async move { self.verify_one(&domain.hostname, now_unix).await },
+        )
+        .await;
         for domain in self.registry.due_for_issuance(now_unix) {
             self.issue_one(&domain.hostname, &domain.tenant, now_unix)
                 .await;
