@@ -1258,9 +1258,15 @@ impl CustomDomainRegistry {
     }
 
     /// Domains still awaiting DNS confirmation and out of backoff.
+    ///
+    /// Also a record that still needs a verification token in any status: its
+    /// upgrade at `load` failed to persist, and the check adopts it again.
     #[must_use]
     pub fn pending_verification(&self, now_unix: i64) -> Vec<CustomDomain> {
-        self.filter(|d| d.status == DomainStatus::PendingDns && d.is_due(now_unix))
+        self.filter(|d| {
+            (d.status == DomainStatus::PendingDns || d.needs_verification_token())
+                && d.is_due(now_unix)
+        })
     }
 
     /// Verified domains with no certificate yet, out of backoff.

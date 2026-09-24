@@ -1571,3 +1571,42 @@ async fn a_mounted_router_serves_an_active_custom_domain() {
         .await
         .assert_status(400);
 }
+
+/// Codex review on #2936: a token upgrade that fails to persist at `load` is
+/// retried by the verification pass, so the domain is not stranded until the
+/// next restart.
+#[tokio::test]
+async fn a_token_upgrade_that_fails_to_persist_stays_in_the_verification_pass() {
+    let store = Arc::new(FailingSaveStore::default());
+    let writer = hydrate(CustomDomainRegistry::new(
+        Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        10,
+    ));
+    writer
+        .register("verified.clientco.com", "tenant-c", NOW)
+        .await
+        .unwrap();
+    writer
+        .record_verified("verified.clientco.com", NOW)
+        .await
+        .unwrap();
+    let mut record = writer.get("verified.clientco.com").unwrap();
+    record.verification_token = None;
+    store.inner.save(&record).await.unwrap();
+
+    store.fail_saves();
+    let upgraded = hydrate(CustomDomainRegistry::new(
+        Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        10,
+    ));
+    let stranded = upgraded.get("verified.clientco.com").unwrap();
+    assert_eq!(stranded.status, DomainStatus::Verified);
+    assert!(stranded.verification_token.is_none());
+    assert!(upgraded.due_for_issuance(NOW + 1).is_empty());
+    let hosts: Vec<String> = upgraded
+        .pending_verification(NOW + 1)
+        .into_iter()
+        .map(|d| d.hostname)
+        .collect();
+    assert_eq!(hosts, vec!["verified.clientco.com".to_owned()]);
+}
