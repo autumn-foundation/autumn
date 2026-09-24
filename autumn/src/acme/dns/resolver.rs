@@ -52,6 +52,8 @@ const QTYPE_NS: u16 = 2;
 const QTYPE_AAAA: u16 = 28;
 /// Most candidate zones NS discovery asks about at the same time.
 const MAX_ZONE_PROBES: usize = 8;
+/// Most nameserver names of one zone that discovery resolves.
+const MAX_NAMESERVERS: usize = 8;
 /// `CNAME` record type.
 const QTYPE_CNAME: u16 = 5;
 /// Most CNAME hops [`DnsAnswer::txt_values_via_cnames`] follows.
@@ -179,12 +181,10 @@ impl DnsLookup for UdpDnsLookup {
 
 /// Discover the addresses of the nameservers **authoritative** for `fqdn`.
 ///
-/// Asks `NS` for every label suffix of `fqdn` at once, through `recursive`
-/// (the configured resolvers), takes the most specific suffix that answers
-/// with nameserver names, and resolves those names to IPv4 and IPv6
-/// addresses. The
-/// `_acme-challenge` label is dropped first: it is a record name inside the
-/// zone, never a zone cut of its own.
+/// Asks `NS` for the label suffixes of `fqdn`, most specific first, through
+/// `recursive` (the configured resolvers), takes the most specific suffix
+/// that answers with nameserver names, and resolves those names to IPv4 and
+/// IPv6 addresses.
 ///
 /// Returns an empty vector when discovery fails at any step — the caller then
 /// falls back to probing the recursive resolvers, which is worse but not
@@ -194,6 +194,7 @@ pub async fn authoritative_resolvers(
     recursive: &[SocketAddr],
     lookup: &dyn DnsLookup,
 ) -> Vec<SocketAddr> {
+    use futures::{FutureExt as _, StreamExt as _};
     // The `_acme-challenge` label stays on: it can itself be a delegated zone
     // with its own NS records, which is a recommended way to give an ACME
     // client credentials that reach nothing else. Stripping it skipped that
@@ -205,33 +206,41 @@ pub async fn authoritative_resolvers(
     let zones: Vec<String> = (0..labels.len().saturating_sub(1))
         .map(|start| labels[start..].join("."))
         .collect();
-    // Candidate zones are asked `MAX_ZONE_PROBES` at a time, so a resolver
-    // that drops packets costs about one query timeout, not one per
-    // candidate, and a hostname with many labels cannot start a lookup for
-    // each at once (#2642).
-    let ns_answers: Vec<Vec<String>> = {
-        use futures::{FutureExt as _, StreamExt as _};
-        // Boxed first: a lazily mapped iterator here makes the future not
-        // `Send` for every lifetime, which the spawned tasks need.
-        let probes: Vec<BoxFuture<'_, Vec<String>>> = zones
-            .iter()
-            .map(|zone| {
-                first_found(recursive, zone, &[QTYPE_NS], lookup, DnsAnswer::ns_names).boxed()
-            })
-            .collect();
-        futures::stream::iter(probes)
-            .buffered(MAX_ZONE_PROBES)
-            .collect()
-            .await
-    };
-    for names in ns_answers {
+    // Candidate zones are asked `MAX_ZONE_PROBES` at a time, most specific
+    // first, so a hostname with many labels cannot start a lookup for each at
+    // once. A resolver that fails a query is not asked again, so one that
+    // drops packets costs one query timeout in total (#2642).
+    let failed = Failed::default();
+    // Boxed first: a lazily mapped iterator here makes the future not `Send`
+    // for every lifetime, which the spawned tasks need.
+    let probes: Vec<BoxFuture<'_, Vec<String>>> = zones
+        .iter()
+        .map(|zone| {
+            first_found(
+                recursive,
+                &failed,
+                zone,
+                &[QTYPE_NS],
+                lookup,
+                DnsAnswer::ns_names,
+            )
+            .boxed()
+        })
+        .collect();
+    let mut ns_answers = futures::stream::iter(probes).buffered(MAX_ZONE_PROBES);
+    while let Some(mut names) = ns_answers.next().await {
         if names.is_empty() {
             continue;
         }
-        // A and AAAA are asked together; either one is enough.
+        // A zone can list many names; only the first `MAX_NAMESERVERS` are
+        // resolved, so one tenant's zone cannot start a lookup for each.
+        names.sort();
+        names.dedup();
+        names.truncate(MAX_NAMESERVERS);
         let ip_answers = futures::future::join_all(names.iter().map(|name| {
             first_found(
                 recursive,
+                &failed,
                 name,
                 &[QTYPE_A, QTYPE_AAAA],
                 lookup,
@@ -253,37 +262,66 @@ pub async fn authoritative_resolvers(
     Vec::new()
 }
 
-/// Ask every server in `servers` for every type in `qtypes` at once, with
-/// recursion desired, and return what `pick` finds in the first answer that
-/// has anything.
+/// Servers that failed a query during one discovery.
+type Failed = std::sync::Mutex<Vec<SocketAddr>>;
+
+/// Ask every server in `servers` that has not failed yet for every type in
+/// `qtypes` at once, with recursion desired, and return what `pick` finds.
 ///
-/// It returns as soon as one answer has something, so a server that drops
-/// packets delays only a query that no server can answer.
+/// For each type, the first answer with records counts. It returns once every
+/// type has an answer and one of them has records, so a server that drops
+/// packets delays only a query that no other server can answer. A server that
+/// fails is added to `failed` and is not asked again.
 async fn first_found<T>(
     servers: &[SocketAddr],
+    failed: &Failed,
     name: &str,
     qtypes: &[u16],
     lookup: &dyn DnsLookup,
     pick: impl Fn(&DnsAnswer) -> Vec<T>,
 ) -> Vec<T> {
-    use futures::StreamExt as _;
-    let mut pending: futures::stream::FuturesUnordered<_> = servers
+    use futures::{FutureExt as _, StreamExt as _};
+    let live: Vec<SocketAddr> = {
+        let failed = failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        servers
+            .iter()
+            .copied()
+            .filter(|server| !failed.contains(server))
+            .collect()
+    };
+    let mut pending: futures::stream::FuturesUnordered<_> = live
         .iter()
-        .flat_map(|server| {
-            qtypes
-                .iter()
-                .map(|qtype| lookup.query(*server, name, *qtype, true))
+        .flat_map(|&server| {
+            qtypes.iter().enumerate().map(move |(slot, &qtype)| {
+                lookup
+                    .query(server, name, qtype, true)
+                    .map(move |answer| (server, slot, answer))
+            })
         })
         .collect();
-    while let Some(answer) = pending.next().await {
+    let mut answered = vec![false; qtypes.len()];
+    let mut found: Vec<Vec<T>> = qtypes.iter().map(|_| Vec::new()).collect();
+    while let Some((server, slot, answer)) = pending.next().await {
         if let Ok(answer) = answer {
-            let found = pick(&answer);
-            if !found.is_empty() {
-                return found;
+            answered[slot] = true;
+            if found[slot].is_empty() {
+                found[slot] = pick(&answer);
+            }
+        } else {
+            let mut failed = failed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !failed.contains(&server) {
+                failed.push(server);
             }
         }
+        if answered.iter().all(|done| *done) && found.iter().any(|f| !f.is_empty()) {
+            break;
+        }
     }
-    Vec::new()
+    found.into_iter().flatten().collect()
 }
 
 /// Every TXT value published at `fqdn`, for a custom domain's ownership check
@@ -2249,8 +2287,10 @@ mod tests {
         ns: Vec<(&'static str, &'static str)>,
         addrs: Vec<(&'static str, std::net::IpAddr)>,
         ns_delay: Duration,
+        aaaa_delay: Duration,
         in_flight: std::sync::atomic::AtomicUsize,
         peak: std::sync::atomic::AtomicUsize,
+        addr_queries: std::sync::atomic::AtomicUsize,
     }
 
     impl TableLookup {
@@ -2263,8 +2303,10 @@ mod tests {
                 ns,
                 addrs,
                 ns_delay,
+                aaaa_delay: Duration::ZERO,
                 in_flight: std::sync::atomic::AtomicUsize::new(0),
                 peak: std::sync::atomic::AtomicUsize::new(0),
+                addr_queries: std::sync::atomic::AtomicUsize::new(0),
             }
         }
     }
@@ -2297,20 +2339,25 @@ mod tests {
                             .map(|(_, ns)| record(QTYPE_NS, Rdata::Name((*ns).to_owned())))
                             .collect()
                     }
-                    QTYPE_A | QTYPE_AAAA => self
-                        .addrs
-                        .iter()
-                        .filter(|(host, _)| *host == owner)
-                        .filter_map(|(_, ip)| match (qtype, ip) {
-                            (QTYPE_A, std::net::IpAddr::V4(v4)) => {
-                                Some(record(QTYPE_A, Rdata::A(*v4)))
-                            }
-                            (QTYPE_AAAA, std::net::IpAddr::V6(v6)) => {
-                                Some(record(QTYPE_AAAA, Rdata::Aaaa(*v6)))
-                            }
-                            _ => None,
-                        })
-                        .collect(),
+                    QTYPE_A | QTYPE_AAAA => {
+                        self.addr_queries.fetch_add(1, SeqCst);
+                        if qtype == QTYPE_AAAA {
+                            tokio::time::sleep(self.aaaa_delay).await;
+                        }
+                        self.addrs
+                            .iter()
+                            .filter(|(host, _)| *host == owner)
+                            .filter_map(|(_, ip)| match (qtype, ip) {
+                                (QTYPE_A, std::net::IpAddr::V4(v4)) => {
+                                    Some(record(QTYPE_A, Rdata::A(*v4)))
+                                }
+                                (QTYPE_AAAA, std::net::IpAddr::V6(v6)) => {
+                                    Some(record(QTYPE_AAAA, Rdata::Aaaa(*v6)))
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    }
                     _ => Vec::new(),
                 };
                 Ok(DnsAnswer { rcode: 0, records })
@@ -2353,6 +2400,119 @@ mod tests {
         assert_eq!(found, vec![SocketAddr::from(([192, 0, 2, 1], 53))]);
         let peak = lookup.peak.load(std::sync::atomic::Ordering::SeqCst);
         assert!(peak <= MAX_ZONE_PROBES, "{peak} NS lookups at once");
+    }
+
+    // Codex review on #2936: a resolver that drops packets is not asked
+    // again, so a hostname with many labels still reaches its zone's
+    // nameserver after one query timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_resolver_costs_one_timeout_for_a_long_hostname() {
+        let started = tokio::time::Instant::now();
+        let host = format!("{}_autumn-challenge.app.clientco.com", "a.".repeat(24));
+        let found =
+            authoritative_resolvers(&host, &[resolver(1), resolver(2)], &PartlyDeadLookup).await;
+        assert_eq!(found, vec![SocketAddr::from(([192, 0, 2, 1], 53))]);
+        assert!(
+            started.elapsed() <= Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    // Codex review on #2936: a large NS set does not start an address lookup
+    // for every name.
+    #[tokio::test]
+    async fn discovery_caps_how_many_nameservers_it_resolves() {
+        const NAMES: [&str; 40] = [
+            "ns00.test",
+            "ns01.test",
+            "ns02.test",
+            "ns03.test",
+            "ns04.test",
+            "ns05.test",
+            "ns06.test",
+            "ns07.test",
+            "ns08.test",
+            "ns09.test",
+            "ns10.test",
+            "ns11.test",
+            "ns12.test",
+            "ns13.test",
+            "ns14.test",
+            "ns15.test",
+            "ns16.test",
+            "ns17.test",
+            "ns18.test",
+            "ns19.test",
+            "ns20.test",
+            "ns21.test",
+            "ns22.test",
+            "ns23.test",
+            "ns24.test",
+            "ns25.test",
+            "ns26.test",
+            "ns27.test",
+            "ns28.test",
+            "ns29.test",
+            "ns30.test",
+            "ns31.test",
+            "ns32.test",
+            "ns33.test",
+            "ns34.test",
+            "ns35.test",
+            "ns36.test",
+            "ns37.test",
+            "ns38.test",
+            "ns39.test",
+        ];
+        let lookup = TableLookup::new(
+            NAMES.iter().map(|name| ("clientco.com", *name)).collect(),
+            NAMES
+                .iter()
+                .zip(1_u8..)
+                .map(|(name, n)| (*name, std::net::IpAddr::from([192, 0, 2, n])))
+                .collect(),
+            Duration::ZERO,
+        );
+        let found = authoritative_resolvers(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(53)],
+            &lookup,
+        )
+        .await;
+        assert_eq!(found.len(), MAX_NAMESERVERS);
+        let asked = lookup
+            .addr_queries
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(asked <= 2 * MAX_NAMESERVERS, "{asked} address lookups");
+    }
+
+    // Codex review on #2936: a dual-stack nameserver keeps both addresses,
+    // even when the A answer comes first.
+    #[tokio::test(start_paused = true)]
+    async fn discovery_keeps_both_addresses_of_a_dual_stack_nameserver() {
+        let mut lookup = TableLookup::new(
+            vec![("clientco.com", "ns.test")],
+            vec![
+                ("ns.test", "192.0.2.1".parse().unwrap()),
+                ("ns.test", "2001:db8::1".parse().unwrap()),
+            ],
+            Duration::ZERO,
+        );
+        lookup.aaaa_delay = Duration::from_millis(100);
+        let found = authoritative_resolvers(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(53)],
+            &lookup,
+        )
+        .await;
+        assert_eq!(
+            found,
+            vec![
+                SocketAddr::from(([192, 0, 2, 1], 53)),
+                "[2001:db8::1]:53".parse::<SocketAddr>().unwrap(),
+            ]
+        );
     }
 
     #[tokio::test]
