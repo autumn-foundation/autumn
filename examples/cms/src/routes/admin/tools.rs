@@ -9,6 +9,7 @@
 use autumn_web::AutumnResult;
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::response::Response;
+use diesel_async::AsyncPgConnection;
 use serde::{Deserialize, Serialize};
 
 use crate::capabilities::Capability;
@@ -260,23 +261,57 @@ pub struct ExportTermRef {
 /// the destination does not have is skipped rather than created, because an
 /// import restores content and the taxonomy list is the site's own.
 ///
-/// A pure lookup against `term_ids`, which `content::resolve_term_refs`
-/// builds once for every post in the file before this runs per post — this
-/// used to be its own `find_by_slug` round trip per term reference, so a
-/// heavily-tagged import paid one single-row SELECT per (post, term) pair
-/// instead of a handful of batched queries for the whole file.
-fn resolve_import_terms(
-    term_ids: &std::collections::HashMap<(String, String), i64>,
+/// Looked up against `term_ids`, which `content::resolve_term_refs` builds
+/// once for every post in the file up front — this used to be its own
+/// `find_by_slug` round trip per term reference, so a heavily-tagged import
+/// paid one single-row SELECT per (post, term) pair instead of a handful of
+/// batched queries for the whole file.
+///
+/// A reference this post carries but the up-front map does not is not
+/// necessarily nonexistent, only unresolved *as of that snapshot* — an
+/// import is one HTTP request spanning real wall-clock time across
+/// potentially thousands of posts, and someone else's unrelated write
+/// (creating a term under the same `(taxonomy, slug)` a not-yet-processed
+/// post references) can land in between. So a miss here is re-checked
+/// against the live table and, if found, cached into `term_ids` for any
+/// later post that names the same reference — bounded by this post's own
+/// miss count, not the file's total reference count, so the common case
+/// (everything already resolved by the up-front pass) pays nothing extra.
+/// A term deleted and recreated under the same key in that window is not
+/// covered by this cache-then-trust-the-cache-forever strategy — closing
+/// that fully would mean re-checking every cache *hit* too, i.e. a query
+/// per reference regardless of outcome, which is the exact per-reference
+/// round trip this batching exists to remove. `set_post_terms` already
+/// drops a since-deleted id rather than failing its foreign key (see its
+/// own doc comment), so that residual case fails soft — the post ends up
+/// untagged for that one reference, the same outcome an outright missing
+/// term produces — rather than aborting the import.
+async fn resolve_import_terms(
+    conn: &mut AsyncPgConnection,
+    term_ids: &mut std::collections::HashMap<(String, String), i64>,
     post: &ExportPost,
-) -> Vec<i64> {
-    post.terms
+) -> AutumnResult<Vec<i64>> {
+    let misses: Vec<(&str, &str)> = post
+        .terms
+        .iter()
+        .filter(|reference| {
+            !term_ids.contains_key(&(reference.taxonomy.clone(), reference.slug.clone()))
+        })
+        .map(|reference| (reference.taxonomy.as_str(), reference.slug.as_str()))
+        .collect();
+    if !misses.is_empty() {
+        let refreshed = content::resolve_term_refs(conn, misses).await?;
+        term_ids.extend(refreshed);
+    }
+    Ok(post
+        .terms
         .iter()
         .filter_map(|reference| {
             term_ids
                 .get(&(reference.taxonomy.clone(), reference.slug.clone()))
                 .copied()
         })
-        .collect()
+        .collect())
 }
 
 /// `open`, matching the column default, for a file that predates the field.
@@ -1374,7 +1409,7 @@ pub async fn import(
     // declares, so this is a pure read: a reference naming no local term
     // (this site doesn't have that taxonomy or slug) is simply absent below,
     // the same outcome the old per-post `find_by_slug` lookup produced.
-    let term_ids_by_ref = repos
+    let mut term_ids_by_ref = repos
         .with_conn(async |conn| {
             content::resolve_term_refs(
                 conn,
@@ -1652,7 +1687,7 @@ pub async fn import(
             // it to the ancestry pass. The marker commits before that work, so
             // a failure in between leaves exactly this state, and a retry that
             // only skipped would never repair it.
-            let term_ids = resolve_import_terms(&term_ids_by_ref, post);
+            //
             // Same mapping the creation path uses: a retry of a backup whose
             // schedules have since elapsed must not be refused either.
             let wanted_status = import_status(&post.status, post.published_at).to_owned();
@@ -1661,6 +1696,7 @@ pub async fn import(
             let transitioned = repos
                 .with_conn(async |conn| {
                     use diesel_async::AsyncConnection as _;
+                    let term_ids = resolve_import_terms(conn, &mut term_ids_by_ref, post).await?;
                     conn.transaction(async move |conn| {
                         content::set_post_terms(conn, ours_id, term_ids).await?;
                         if wanted_status != current_status {
@@ -1772,7 +1808,6 @@ pub async fn import(
             published_at: post.published_at,
         };
 
-        let term_ids = resolve_import_terms(&term_ids_by_ref, post);
         // The terms and the transition commit together. They were separate
         // transactions after an already-committed insert, so a failure in
         // either left the post present but unfinished — and the dedupe above
@@ -1805,6 +1840,7 @@ pub async fn import(
         let outcome = repos
             .with_conn(async |conn| {
                 use diesel_async::AsyncConnection as _;
+                let term_ids = resolve_import_terms(conn, &mut term_ids_by_ref, post).await?;
                 conn.transaction(async move |conn| {
                     // The parent resolved above is only *used* if it is one the
                     // editor would accept — a live row of the same type, no
