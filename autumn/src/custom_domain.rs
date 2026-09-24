@@ -1979,7 +1979,7 @@ pub trait DomainVerifier: Send + Sync {
 /// actually matters.
 ///
 /// `getaddrinfo` cannot read TXT, so the ownership record is asked of the
-/// zone's authoritative nameservers, found through `txt_resolvers`, and then
+/// zone's authoritative nameservers, found through `txt_resolvers`, and
 /// of `txt_resolvers` themselves. TXT lookups need the `acme` feature; without
 /// it every TXT lookup is unanswered and no domain verifies.
 #[derive(Debug, Default, Clone)]
@@ -2023,7 +2023,8 @@ impl DomainVerifier for SystemDomainVerifier {
             {
                 use crate::acme::dns::resolver::{UdpDnsLookup, txt_values};
                 let lookup = UdpDnsLookup::new(std::time::Duration::from_secs(3));
-                match txt_values(name, &self.txt_resolvers, &lookup).await {
+                let deadline = std::time::Duration::from_secs(6);
+                match txt_values(name, &self.txt_resolvers, &lookup, deadline).await {
                     Ok(values) => ObservedTxt::Values(values),
                     Err(e) => ObservedTxt::Unanswered(e),
                 }

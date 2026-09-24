@@ -238,13 +238,16 @@ pub async fn authoritative_resolvers(
 /// Every TXT value published at `fqdn`, for a custom domain's ownership check
 /// (#2642).
 ///
-/// Asks the zone's authoritative nameservers first, found through `recursive`,
-/// with recursion not desired: a recursive resolver asked before the tenant
-/// publishes caches the negative answer, which would delay verification for
-/// the zone's negative TTL. Then asks `recursive` too, which covers a failed
-/// discovery and a record delegated by CNAME to another zone, which only a
-/// recursive resolver follows. Values from every server that answered are
-/// merged, following any CNAME chain in each answer.
+/// Asks the zone's authoritative nameservers, found through `recursive`, with
+/// recursion not desired: their answer is fresh even when a recursive resolver
+/// cached a negative answer from before the tenant published. Also asks
+/// `recursive`, which covers a failed discovery and a record delegated by CNAME
+/// to another zone, which only a recursive resolver follows. Values from every
+/// server that answered are merged, following any CNAME chain in each answer.
+///
+/// All servers are asked at the same time, so a server that drops packets
+/// costs one query timeout, not one per server. Discovery and the
+/// authoritative queries stop at `deadline`; the recursive answers still count.
 ///
 /// # Errors
 ///
@@ -253,20 +256,32 @@ pub async fn txt_values(
     fqdn: &str,
     recursive: &[SocketAddr],
     lookup: &dyn DnsLookup,
+    deadline: Duration,
 ) -> Result<Vec<String>, String> {
-    let authoritative = authoritative_resolvers(fqdn, recursive, lookup).await;
-    let servers = authoritative
-        .iter()
-        .map(|server| (*server, false))
-        .chain(recursive.iter().map(|server| (*server, true)));
+    let from_authoritative = async {
+        let servers = authoritative_resolvers(fqdn, recursive, lookup).await;
+        ask_txt_of_all(&servers, fqdn, false, lookup).await
+    };
+    let from_authoritative = async {
+        tokio::time::timeout(deadline, from_authoritative)
+            .await
+            .unwrap_or_else(|_| {
+                vec![Err(format!(
+                    "the authoritative TXT lookup for {fqdn} did not finish within {}s",
+                    deadline.as_secs()
+                ))]
+            })
+    };
+    let (authoritative, recursive) = futures::future::join(
+        from_authoritative,
+        ask_txt_of_all(recursive, fqdn, true, lookup),
+    )
+    .await;
     let mut values: Vec<String> = Vec::new();
     let mut answered = false;
     let mut last_error = "no resolvers were configured".to_owned();
-    for (server, recursion_desired) in servers {
-        match lookup
-            .query(server, fqdn, QTYPE_TXT, recursion_desired)
-            .await
-        {
+    for result in authoritative.into_iter().chain(recursive) {
+        match result {
             Ok(answer) => {
                 answered = true;
                 for value in answer.txt_values_via_cnames(fqdn) {
@@ -283,6 +298,21 @@ pub async fn txt_values(
     } else {
         Err(last_error)
     }
+}
+
+/// Ask every server in `servers` for `fqdn`'s TXT record at the same time.
+async fn ask_txt_of_all(
+    servers: &[SocketAddr],
+    fqdn: &str,
+    recursion_desired: bool,
+    lookup: &dyn DnsLookup,
+) -> Vec<Result<DnsAnswer, String>> {
+    futures::future::join_all(
+        servers
+            .iter()
+            .map(|server| lookup.query(*server, fqdn, QTYPE_TXT, recursion_desired)),
+    )
+    .await
 }
 
 /// Query one resolver for a name's TXT values, blocking.
@@ -1675,6 +1705,7 @@ mod tests {
             "_autumn-challenge.app.clientco.com",
             &[resolver(53), resolver(5353)],
             lookup.as_ref(),
+            DEADLINE,
         )
         .await
         .unwrap();
@@ -1745,6 +1776,7 @@ mod tests {
             "_autumn-challenge.app.clientco.com",
             &[resolver(53)],
             lookup.as_ref(),
+            DEADLINE,
         )
         .await
         .unwrap_err();
@@ -1756,10 +1788,99 @@ mod tests {
             "_autumn-challenge.app.clientco.com",
             &[resolver(53)],
             lookup.as_ref(),
+            DEADLINE,
         )
         .await
         .unwrap();
         assert!(values.is_empty());
+    }
+
+    const DEADLINE: Duration = Duration::from_secs(6);
+
+    /// Answers every TXT query after `txt_delay` with one value naming the
+    /// server, and every discovery query after `discovery_delay` with nothing.
+    struct SlowLookup {
+        txt_delay: Duration,
+        discovery_delay: Duration,
+    }
+
+    impl DnsLookup for SlowLookup {
+        fn query<'a>(
+            &'a self,
+            server: SocketAddr,
+            name: &'a str,
+            qtype: u16,
+            _recursion_desired: bool,
+        ) -> BoxFuture<'a, Result<DnsAnswer, String>> {
+            Box::pin(async move {
+                if qtype != QTYPE_TXT {
+                    tokio::time::sleep(self.discovery_delay).await;
+                    return Ok(DnsAnswer {
+                        rcode: 0,
+                        records: Vec::new(),
+                    });
+                }
+                tokio::time::sleep(self.txt_delay).await;
+                Ok(DnsAnswer {
+                    rcode: 0,
+                    records: vec![ResourceRecord {
+                        name: normalize_name(name),
+                        rtype: QTYPE_TXT,
+                        rdata: Rdata::Txt(format!("from-{}", server.port())),
+                    }],
+                })
+            })
+        }
+    }
+
+    // #2642: slow servers are asked at the same time, so one lookup costs one
+    // server timeout, not one per server.
+    #[tokio::test(start_paused = true)]
+    async fn txt_values_ask_every_server_at_once() {
+        let lookup = SlowLookup {
+            txt_delay: Duration::from_secs(3),
+            discovery_delay: Duration::ZERO,
+        };
+        let started = tokio::time::Instant::now();
+        let values = txt_values(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(53), resolver(54), resolver(55), resolver(56)],
+            &lookup,
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(values.len(), 4, "{values:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    // #2642: a discovery that stalls stops at the deadline, and the recursive
+    // resolvers' answers still count.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_discovery_stops_at_the_deadline_and_keeps_recursive_answers() {
+        let lookup = SlowLookup {
+            txt_delay: Duration::ZERO,
+            discovery_delay: Duration::from_secs(3600),
+        };
+        let started = tokio::time::Instant::now();
+        let values = txt_values(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(53)],
+            &lookup,
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(values, vec!["from-53".to_owned()]);
+        assert!(
+            started.elapsed() <= DEADLINE,
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
