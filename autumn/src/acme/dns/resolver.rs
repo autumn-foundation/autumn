@@ -244,6 +244,8 @@ pub async fn authoritative_resolvers(
 /// `recursive`, which covers a failed discovery and a record delegated by CNAME
 /// to another zone, which only a recursive resolver follows. Values from every
 /// server that answered are merged, following any CNAME chain in each answer.
+/// When an authoritative answer ends at a CNAME to another zone, the target
+/// is asked of its own authoritative servers, up to the CNAME hop bound.
 ///
 /// All servers are asked at the same time, so a server that drops packets
 /// costs one query timeout, not one per server. Discovery and the
@@ -259,32 +261,55 @@ pub async fn txt_values(
     deadline: Duration,
 ) -> Result<Vec<String>, String> {
     let from_authoritative = async {
-        let servers = authoritative_resolvers(fqdn, recursive, lookup).await;
-        ask_txt_of_all(&servers, fqdn, false, lookup).await
+        let mut results = Vec::new();
+        let mut name = normalize_name(fqdn);
+        for _ in 0..=MAX_CNAME_HOPS {
+            let servers = authoritative_resolvers(&name, recursive, lookup).await;
+            let answers = ask_txt_of_all(&servers, &name, false, lookup).await;
+            let target = answers
+                .iter()
+                .filter_map(|answer| answer.as_ref().ok())
+                .find_map(|answer| answer.unresolved_cname_target(&name));
+            results.extend(answers.into_iter().map(|answer| (name.clone(), answer)));
+            match target {
+                Some(target) if !results.iter().any(|(asked, _)| *asked == target) => {
+                    name = target;
+                }
+                _ => break,
+            }
+        }
+        results
     };
     let from_authoritative = async {
         tokio::time::timeout(deadline, from_authoritative)
             .await
             .unwrap_or_else(|_| {
-                vec![Err(format!(
-                    "the authoritative TXT lookup for {fqdn} did not finish within {}s",
-                    deadline.as_secs()
-                ))]
+                vec![(
+                    fqdn.to_owned(),
+                    Err(format!(
+                        "the authoritative TXT lookup for {fqdn} did not finish within {}s",
+                        deadline.as_secs()
+                    )),
+                )]
             })
     };
-    let (authoritative, recursive) = futures::future::join(
-        from_authoritative,
-        ask_txt_of_all(recursive, fqdn, true, lookup),
-    )
-    .await;
+    let from_recursive = async {
+        ask_txt_of_all(recursive, fqdn, true, lookup)
+            .await
+            .into_iter()
+            .map(|answer| (fqdn.to_owned(), answer))
+            .collect::<Vec<_>>()
+    };
+    let (authoritative, recursive) =
+        futures::future::join(from_authoritative, from_recursive).await;
     let mut values: Vec<String> = Vec::new();
     let mut answered = false;
     let mut last_error = "no resolvers were configured".to_owned();
-    for result in authoritative.into_iter().chain(recursive) {
+    for (asked, result) in authoritative.into_iter().chain(recursive) {
         match result {
             Ok(answer) => {
                 answered = true;
-                for value in answer.txt_values_via_cnames(fqdn) {
+                for value in answer.txt_values_via_cnames(&asked) {
                     if !values.contains(&value) {
                         values.push(value);
                     }
@@ -536,6 +561,33 @@ impl DnsAnswer {
             values.extend(self.txt_values(&owner));
         }
         values
+    }
+
+    /// The end of the CNAME chain that starts at `name`, when the chain has
+    /// at least one hop and the answer carries no TXT value along it.
+    ///
+    /// An authoritative server answers only for its own zone, so a CNAME to
+    /// another zone arrives without the target's records.
+    #[must_use]
+    pub fn unresolved_cname_target(&self, name: &str) -> Option<String> {
+        if !self.txt_values_via_cnames(name).is_empty() {
+            return None;
+        }
+        let start = normalize_name(name);
+        let mut owner = start.clone();
+        for _ in 0..MAX_CNAME_HOPS {
+            let next = self.records.iter().find_map(|r| match &r.rdata {
+                Rdata::Name(target) if r.rtype == QTYPE_CNAME && r.name == owner => {
+                    Some(normalize_name(target))
+                }
+                _ => None,
+            });
+            let Some(next) = next else {
+                break;
+            };
+            owner = next;
+        }
+        (owner != start).then_some(owner)
     }
 
     /// The `NS` names in the answer.
@@ -1881,6 +1933,62 @@ mod tests {
             "took {:?}",
             started.elapsed()
         );
+    }
+
+    /// A tenant delegated its ownership record by CNAME after a recursive
+    /// resolver cached NXDOMAIN. Authoritative servers answer each name only
+    /// with what they own; recursive servers still answer NXDOMAIN.
+    struct DelegatedLookup;
+
+    impl DnsLookup for DelegatedLookup {
+        fn query<'a>(
+            &'a self,
+            _server: SocketAddr,
+            name: &'a str,
+            qtype: u16,
+            recursion_desired: bool,
+        ) -> BoxFuture<'a, Result<DnsAnswer, String>> {
+            let owner = normalize_name(name);
+            let record = |rtype: u16, rdata: Rdata| ResourceRecord {
+                name: owner.clone(),
+                rtype,
+                rdata,
+            };
+            let records = match (qtype, recursion_desired, owner.as_str()) {
+                (QTYPE_NS, _, _) => vec![record(QTYPE_NS, Rdata::Name("ns.test".to_owned()))],
+                (QTYPE_A, _, "ns.test") => {
+                    vec![record(
+                        QTYPE_A,
+                        Rdata::A(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+                    )]
+                }
+                (QTYPE_TXT, false, "_autumn-challenge.app.clientco.com") => vec![record(
+                    QTYPE_CNAME,
+                    Rdata::Name("verify.dns-host.net".to_owned()),
+                )],
+                (QTYPE_TXT, false, "verify.dns-host.net") => {
+                    vec![record(QTYPE_TXT, Rdata::Txt("token-b".to_owned()))]
+                }
+                _ => Vec::new(),
+            };
+            let rcode = if records.is_empty() { 3 } else { 0 };
+            Box::pin(async move { Ok(DnsAnswer { rcode, records }) })
+        }
+    }
+
+    // #2642: a CNAME target missing from the authoritative answer is asked of
+    // its own zone's servers, so a stale recursive NXDOMAIN does not hide it.
+    #[tokio::test]
+    async fn txt_values_ask_a_cname_target_of_its_own_nameservers() {
+        let values = txt_values(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(53)],
+            &DelegatedLookup,
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(values, vec!["token-b".to_owned()]);
     }
 
     #[tokio::test]
