@@ -107,13 +107,17 @@ dropped-and-recreated tables built inside each trial, 16 racers, 2 pools,
 barrier-synced, 1-seat room), Postgres instead of SQLite:**
 
 1. Start a real Postgres container (testcontainers) once.
-2. **Inside each trial:** `DROP TABLE`+`CREATE TABLE` both tables, then
-   build two fresh `deadpool` pools over that same running database
-   (mirroring #2864's `run_trial()`, which gets both a fresh database file
-   and fresh pools every call — a fresh Postgres *container* per trial
-   would give the same table-freshness guarantee but is prohibitively
-   slow, so a fresh schema on the existing container is the practical
-   equivalent).
+2. **Inside each trial:** build two fresh `deadpool` pools (`pool_a`,
+   `pool_b`) over that same running database, then `DROP TABLE`+
+   `CREATE TABLE` both tables through `pool_a` (mirroring #2864's
+   `run_trial()` exactly, including which pool runs the DDL — a fresh
+   Postgres *container* per trial would give the same table-freshness
+   guarantee but is prohibitively slow, so a fresh schema on the existing
+   container is the practical equivalent of SQLite's fresh database file).
+   This leaves `pool_a` with one warm connection and `pool_b` fully cold
+   at trial start, the same asymmetry #2864's own SQLite baseline has —
+   not a new confound this report introduces, but one inherited
+   intentionally to keep the comparison apples-to-apples.
 3. Create a room capped at 1 seat.
 4. Spawn 16 concurrent joiners split 8/8 across the two pools, synchronized
    on a `tokio::sync::Barrier`.
@@ -231,14 +235,28 @@ the other three each pay a fresh connection-establishment cost first. In
 this specific harness that gap is apparently enough for the fast racer to
 complete its entire check-then-insert and commit before any of the other
 three even issue their `SELECT COUNT`, so they correctly see the now-full
-room and get rejected — every time. A real production pool under load
-keeps *several* idle connections ready (this harness's `max_size` is 20),
-so four simultaneous requests would typically all grab already-warm
-connections with no such asymmetric head start, closer to condition B1's
-prewarmed result (40/40) than to this artifact. The fresh-pool number is
-reported for completeness and because it's a real, reproducible
-measurement of *this specific harness*, not because it generalizes to
-"fresh connections prevent the bug."
+room and get rejected — every time.
+
+This does **not** mean a warm production pool is immune the way this
+harness's pathological single-warm-connection case is — it means the
+outcome depends on how much *idle capacity* is actually available at the
+moment of the burst relative to the burst's size, not simply on whether
+the pool object has been "warmed up" at some point. `max_size: 20` is a
+ceiling, not a guarantee of 20 idle connections: this report's own B1
+data brackets the two extremes directly — 1 idle connection available for
+4 racers (this fresh-pool case) produced 0/40 overshoots (only the
+connection-holder got in), while B1's prewarmed case, which explicitly
+holds and releases 4 connections (matching the burst size) before
+measuring, produced 40/40. A production pool that happens to have at
+least burst-sized idle capacity free at the moment of the burst would
+plausibly look like the prewarmed case; a pool that's mostly saturated
+with other work at that moment could look more like this one. This
+session did not test intermediate idle-capacity levels (e.g. 2 idle
+connections for 4 racers), so the claim below is scoped to "when
+burst-sized idle capacity is available," not to warm pools in general.
+The fresh-pool number here is reported for completeness and because it's
+a real, reproducible measurement of *this specific harness*, not because
+it generalizes to "fresh connections prevent the bug."
 
 **Sanity check performed:** before trusting any of the above, a probe
 confirmed the cap enforces correctly under *sequential* (non-concurrent)
@@ -295,15 +313,20 @@ claims to know SQLite's warm-pool rate — it wasn't measured:**
   SQLite for this race" — the honest conclusion is "comparable, both low,
   under matched cold-start conditions."**
 - Under conditions representative of an already-running production
-  deployment's *actually warm* connection pool, **for a room's last
-  remaining seat specifically** (condition A2 excluding its one
-  warm-up-contaminated trial, cap=1: 59/59; condition B1 properly
-  prewarmed, seeded to 2/3 before racing for the last of 3: 40/40), the
-  failure rate **given that a burst of simultaneous join requests occurs**
-  is **100% in both conditions** — not "85-100%" or "97.5-100%" as earlier
-  revisions of this report said before two measurement artifacts (an
-  incompletely-warmed pool contaminating trial 0 in both A2 and B1) were
-  found and corrected. A related but distinct scenario — an empty room's
+  deployment's connection pool that has **at least burst-sized idle
+  capacity available at the moment of the burst** (see condition B1's own
+  writeup for why that qualifier matters — this session's data shows the
+  rate depends on available idle connections relative to burst size, not
+  simply on whether the pool has been "warmed up" at some point), **for a
+  room's last remaining seat specifically** (condition A2 excluding its
+  one warm-up-contaminated trial, cap=1: 59/59; condition B1 properly
+  prewarmed with burst-sized idle capacity, seeded to 2/3 before racing
+  for the last of 3: 40/40), the failure rate **given that a burst of
+  simultaneous join requests occurs** is **100% in both conditions** — not
+  "85-100%" or "97.5-100%" as earlier revisions of this report said before
+  two measurement artifacts (an incompletely-warmed pool contaminating
+  trial 0 in both A2 and B1) were found and corrected. A related but
+  distinct scenario — an empty room's
   initial-fill burst rather than contention for its last seat specifically
   (condition B0) — shows a somewhat lower rate: 92.5% with a warm pool
   (94.9% excluding its own confirmed trial-0 warm-up artifact — see
