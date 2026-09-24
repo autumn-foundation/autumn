@@ -1,5 +1,6 @@
 use autumn_web::extract::Path;
 use autumn_web::prelude::*;
+use autumn_web::reexports::axum::response::Response;
 
 use crate::models::{Bookmark, NewBookmark};
 use crate::repositories::BookmarkRepository;
@@ -107,30 +108,23 @@ pub async fn by_tag(Path(tag): Path<String>) -> AutumnResult<Markup> {
     ))
 }
 
-#[get("/new")]
-pub async fn new_form() -> Markup {
+/// Shared new-bookmark form body — rendered by both the plain `GET /new`
+/// and `create`'s `422` re-render, from a `Changeset<NewBookmark>`, so a
+/// rejected submission shows the same form with every field preserved and
+/// an inline error next to the offending input. `NewBookmark` already
+/// derives `validator::Validate` from the `#[validate(url)]` /
+/// `#[validate(length(...))]` attributes on `Bookmark` in `models.rs` — the
+/// bug was that `create` never called it, so an empty title or a
+/// non-URL string in `url` was inserted straight into the table.
+fn new_bookmark_form(changeset: &Changeset<NewBookmark>) -> Markup {
     layout(
         "Add Bookmark",
         html! {
             h1 class="text-2xl font-bold mb-6" { "Add Bookmark" }
             form action=(paths::create()) method="post" class="space-y-4" {
-                div {
-                    label for="url" class="block text-sm font-medium" { "URL" }
-                    input type="url" id="url" name="url" required
-                          placeholder="https://example.com"
-                          class="w-full border rounded p-2 mt-1";
-                }
-                div {
-                    label for="title" class="block text-sm font-medium" { "Title" }
-                    input type="text" id="title" name="title" required
-                          placeholder="My favorite site"
-                          class="w-full border rounded p-2 mt-1";
-                }
-                div {
-                    label for="tag" class="block text-sm font-medium" { "Tag" }
-                    input type="text" id="tag" name="tag" value="general"
-                          class="w-full border rounded p-2 mt-1";
-                }
+                (autumn_web::form::text_input(changeset, "url", "URL"))
+                (autumn_web::form::text_input(changeset, "title", "Title"))
+                (autumn_web::form::text_input(changeset, "tag", "Tag"))
                 button type="submit"
                        class="bg-indigo-600 text-white px-6 py-2 rounded hover:bg-indigo-700" {
                     "Save"
@@ -140,26 +134,44 @@ pub async fn new_form() -> Markup {
     )
 }
 
+#[get("/new")]
+pub async fn new_form() -> Markup {
+    new_bookmark_form(&Changeset::new(NewBookmark {
+        url: String::new(),
+        title: String::new(),
+        tag: "general".to_owned(),
+    }))
+}
+
 #[post("/bookmarks")]
 pub async fn create(
     State(state): State<AppState>,
-    form: Form<NewBookmark>,
-) -> AutumnResult<Redirect> {
+    Form(form): Form<NewBookmark>,
+) -> AutumnResult<Response> {
+    let changeset = form.into_changeset();
+    if !changeset.is_valid() {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            new_bookmark_form(&changeset),
+        )
+            .into_response());
+    }
     let repo = BookmarkRepository;
-    repo.save(&form).await?;
+    repo.save(&changeset.into_inner()).await?;
     // Cluster-wide, coordination-service-free: this replica adds to its own
     // entry and the other replica sees the new total within a push interval.
     // See `src/routes/cluster.rs`.
     crate::routes::cluster::record_bookmark_created(&state);
-    Ok(Redirect::to(&paths::list()))
+    Ok(Redirect::to(&paths::list()).into_response())
 }
 
 autumn_web::paths![list, by_tag, new_form, create];
 
 #[cfg(test)]
 mod tests {
-    use super::bookmark_card;
-    use crate::models::Bookmark;
+    use super::{bookmark_card, new_bookmark_form};
+    use crate::models::{Bookmark, NewBookmark};
+    use autumn_web::form::{Changeset, IntoChangeset};
     use chrono::{DateTime, Utc};
 
     #[test]
@@ -178,5 +190,75 @@ mod tests {
 
         assert!(markup.contains("hx-delete=\"/api/bookmarks/42\""));
         assert!(markup.contains("hx-swap=\"delete\""));
+    }
+
+    // ── create's validation (baseline was: none at all) ────────────────
+
+    #[test]
+    fn non_url_string_is_rejected_by_the_url_validator() {
+        let cs = NewBookmark {
+            url: "not a url".to_owned(),
+            title: "Some title".to_owned(),
+            tag: "general".to_owned(),
+        }
+        .into_changeset();
+        assert!(!cs.is_valid(), "\"not a url\" must fail #[validate(url)]");
+        assert!(!cs.errors_for("url").is_empty());
+    }
+
+    #[test]
+    fn empty_title_is_rejected_by_the_length_validator() {
+        let cs = NewBookmark {
+            url: "https://example.com".to_owned(),
+            title: String::new(),
+            tag: "general".to_owned(),
+        }
+        .into_changeset();
+        assert!(!cs.is_valid(), "empty title must fail length(min = 1)");
+        assert!(!cs.errors_for("title").is_empty());
+    }
+
+    #[test]
+    fn valid_submission_produces_a_valid_changeset() {
+        let cs = NewBookmark {
+            url: "https://example.com".to_owned(),
+            title: "Example".to_owned(),
+            tag: "general".to_owned(),
+        }
+        .into_changeset();
+        assert!(cs.is_valid());
+        assert!(cs.errors_for("url").is_empty());
+        assert!(cs.errors_for("title").is_empty());
+    }
+
+    #[test]
+    fn rejected_form_preserves_every_submitted_field_and_flags_only_the_bad_one() {
+        let cs = NewBookmark {
+            url: "not a url".to_owned(),
+            title: "Kept title".to_owned(),
+            tag: "kept-tag".to_owned(),
+        }
+        .into_changeset();
+        let html = new_bookmark_form(&cs).into_string();
+
+        // The failing field is flagged and preserved.
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains(r#"value="not a url""#), "{html}");
+        // The valid fields the user also typed are not dropped on the floor.
+        assert!(html.contains(r#"value="Kept title""#), "{html}");
+        assert!(html.contains(r#"value="kept-tag""#), "{html}");
+    }
+
+    #[test]
+    fn clean_form_shows_no_errors() {
+        let cs = Changeset::new(NewBookmark {
+            url: String::new(),
+            title: String::new(),
+            tag: "general".to_owned(),
+        });
+        let html = new_bookmark_form(&cs).into_string();
+        assert!(!html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains(r#"aria-invalid="false""#), "{html}");
     }
 }
