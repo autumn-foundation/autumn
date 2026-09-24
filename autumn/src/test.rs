@@ -1144,6 +1144,7 @@ impl TestApp {
             probes: crate::probe::ProbeState::ready_for_test(),
             state,
             _job_runtime: None,
+            _task_scheduler: None,
             clock_as_any: None,
             #[cfg(feature = "mail")]
             mail_recorder: None,
@@ -2337,6 +2338,23 @@ impl TestApp {
             Some(TestJobRuntime { shutdown })
         };
 
+        // Start `#[scheduled]` tasks on the in-process scheduler. Their loops
+        // sleep on tokio timers and read the injected clock, so under a
+        // `#[sim_test]` they tick in virtual time.
+        let task_scheduler = if self.tasks.is_empty() {
+            None
+        } else {
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            crate::app::start_task_scheduler_with_config(
+                std::mem::take(&mut self.tasks),
+                &state,
+                &shutdown,
+                &self.config.scheduler,
+            )
+            .expect("Failed to start scheduled tasks in test");
+            Some(TestTaskScheduler { shutdown })
+        };
+
         // Retain the registered job metadata so `perform_enqueued_jobs` can look
         // up each captured job's handler by name and dispatch it directly.
         let jobs_for_client = self.jobs.clone();
@@ -2478,6 +2496,7 @@ impl TestApp {
             probes,
             state,
             _job_runtime: job_runtime,
+            _task_scheduler: task_scheduler,
             clock_as_any: self.clock_as_any,
             #[cfg(feature = "mail")]
             mail_recorder: Some(mail_recorder_for_client),
@@ -2540,6 +2559,8 @@ pub struct TestClient {
     probes: crate::probe::ProbeState,
     pub(crate) state: AppState,
     _job_runtime: Option<TestJobRuntime>,
+    /// Stops the `#[scheduled]` task loops [`TestApp::build`] started.
+    _task_scheduler: Option<TestTaskScheduler>,
     /// Retained so `advance_clock` can downcast to [`crate::time::TickingClock`].
     clock_as_any: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     /// `None` when built via [`TestApp::from_router`], which bypasses recorder
@@ -2609,6 +2630,17 @@ type CookieJar = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Strin
 
 struct TestJobRuntime {
     shutdown: tokio_util::sync::CancellationToken,
+}
+
+/// Cancels the scheduled-task loops of one [`TestClient`] when it drops.
+struct TestTaskScheduler {
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for TestTaskScheduler {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
 }
 
 impl Drop for TestJobRuntime {

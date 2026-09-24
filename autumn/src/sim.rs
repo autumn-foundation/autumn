@@ -590,6 +590,11 @@ impl Sim {
         // real elapsed against the budget before returning. `advance_to` routes
         // through here, so it inherits the guard for free.
         let guard_start = self.wall_clock_guard_start();
+        // Let every ready task take one step at the current instant before time
+        // moves. A task spawned since the last yield (a `#[scheduled]` loop that
+        // `build` started, a job worker) then registers its first timer at the
+        // instant it was started, not at the end of this advance.
+        tokio::task::yield_now().await;
         // Step the framework clock first so any task woken by the tokio timer
         // that reads the clock observes the already-advanced instant.
         self.clock.advance(duration);
