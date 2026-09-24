@@ -889,15 +889,16 @@ pub async fn __with_liveness_budget<F: std::future::Future>(
     let Some(budget) = budget else {
         return body.await;
     };
-    match tokio::time::timeout(budget, body).await {
-        Ok(output) => output,
-        Err(_) => panic!(
-            "sim liveness: the test body did not finish within {budget:?} of virtual time \
-             (seed=0x{seed:x}). Every task was parked with no timer to wake one, which is a \
-             deadlock, or the body waited past the budget. Raise \
-             AUTUMN_SIM_LIVENESS_BUDGET_SECS for a legitimately long run."
-        ),
-    }
+    tokio::time::timeout(budget, body)
+        .await
+        .unwrap_or_else(|_elapsed| {
+            panic!(
+                "sim liveness: the test body did not finish within {budget:?} of virtual time \
+                 (seed=0x{seed:x}). Every task was parked with no timer to wake one, which is \
+                 a deadlock, or the body waited past the budget. Raise \
+                 AUTUMN_SIM_LIVENESS_BUDGET_SECS for a legitimately long run."
+            )
+        })
 }
 
 /// Upper bound on cooperative yield rounds [`Sim::run_to_idle`] performs before
