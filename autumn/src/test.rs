@@ -773,6 +773,7 @@ pub struct TestApp {
     http_mock_registry: Option<std::sync::Arc<crate::http_client::MockRegistry>>,
     state_initializers: Vec<Box<dyn FnOnce(&AppState) + Send>>,
     jobs: Vec<crate::job::JobInfo>,
+    tasks: Vec<crate::task::TaskInfo>,
     listeners: Vec<crate::events::ListenerInfo>,
     exception_filters: Vec<std::sync::Arc<dyn crate::middleware::ExceptionFilter>>,
     #[cfg(feature = "mail")]
@@ -855,6 +856,7 @@ impl TestApp {
             http_mock_registry: None,
             state_initializers: Vec::new(),
             jobs: Vec::new(),
+            tasks: Vec::new(),
             listeners: Vec::new(),
             exception_filters: Vec::new(),
             #[cfg(feature = "mail")]
@@ -1298,6 +1300,7 @@ impl TestApp {
         self.static_gate_layers
             .extend(app_builder.static_gate_layers);
         self.jobs.extend(app_builder.jobs);
+        self.tasks.extend(app_builder.tasks);
         self.listeners.extend(app_builder.listeners);
         self.exception_filters.extend(app_builder.exception_filters);
         self.metrics_sources.extend(app_builder.metrics_sources);
@@ -1494,6 +1497,30 @@ impl TestApp {
     #[must_use]
     pub fn with_fault_plan(mut self, plan: crate::sim::fault::FaultPlan) -> Self {
         self.fault_plan = Some(plan);
+        self
+    }
+
+    /// Register background jobs with the test app.
+    ///
+    /// Collect them with `jobs![..]`, exactly as in `AppBuilder::jobs`. They
+    /// run under the in-process test job runtime that [`build`](Self::build)
+    /// starts.
+    #[must_use]
+    pub fn jobs(mut self, jobs: Vec<crate::job::JobInfo>) -> Self {
+        self.jobs.extend(jobs);
+        self
+    }
+
+    /// Register `#[scheduled]` tasks with the test app.
+    ///
+    /// Collect them with `tasks![..]`, exactly as in `AppBuilder::tasks`.
+    /// [`build`](Self::build) starts them on the in-process scheduler, and
+    /// dropping the [`TestClient`] stops them. Their timers are tokio timers
+    /// and they read the injected clock, so under a `#[sim_test]` a tick fires
+    /// when [`crate::sim::Sim::advance`] crosses its deadline.
+    #[must_use]
+    pub fn tasks(mut self, tasks: Vec<crate::task::TaskInfo>) -> Self {
+        self.tasks.extend(tasks);
         self
     }
 
