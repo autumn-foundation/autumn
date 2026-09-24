@@ -808,8 +808,8 @@ address record points here **and** that TXT record carries this registration's
 token. Each registration mints a new token, so a record a previous tenant left
 behind proves nothing.
 
-The TXT record is needed until the domain is `active`. Renewals check only the
-address record.
+The TXT record may also be a CNAME to a name that carries the token. It is
+needed until the domain is `active`. Renewals check only the address record.
 
 Domains connected before this rule are handled at the first start after the
 upgrade:

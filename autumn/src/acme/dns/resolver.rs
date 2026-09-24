@@ -48,6 +48,10 @@ use super::TxtRecord;
 const QTYPE_A: u16 = 1;
 /// `NS` query type.
 const QTYPE_NS: u16 = 2;
+/// `CNAME` record type.
+const QTYPE_CNAME: u16 = 5;
+/// Most CNAME hops [`DnsAnswer::txt_values_via_cnames`] follows.
+const MAX_CNAME_HOPS: usize = 8;
 /// `TXT` query type.
 const QTYPE_TXT: u16 = 16;
 /// `OPT` pseudo-record type (EDNS0, RFC 6891).
@@ -238,8 +242,9 @@ pub async fn authoritative_resolvers(
 /// with recursion not desired: a recursive resolver asked before the tenant
 /// publishes caches the negative answer, which would delay verification for
 /// the zone's negative TTL. Then asks `recursive` too, which covers a failed
-/// discovery and a record behind a CNAME the authoritative servers do not
-/// follow. Values from every server that answered are merged.
+/// discovery and a record delegated by CNAME to another zone, which only a
+/// recursive resolver follows. Values from every server that answered are
+/// merged, following any CNAME chain in each answer.
 ///
 /// # Errors
 ///
@@ -264,7 +269,7 @@ pub async fn txt_values(
         {
             Ok(answer) => {
                 answered = true;
-                for value in answer.txt_values(fqdn) {
+                for value in answer.txt_values_via_cnames(fqdn) {
                     if !values.contains(&value) {
                         values.push(value);
                     }
@@ -476,6 +481,33 @@ impl DnsAnswer {
             .collect()
     }
 
+    /// The `TXT` values at `name`, or at the end of the CNAME chain that
+    /// starts at `name`, as a recursive resolver returns it.
+    ///
+    /// A tenant can delegate its ownership record with a CNAME. The answer
+    /// then holds the CNAME at `name` and the TXT under the target, so
+    /// [`txt_values`](Self::txt_values) alone finds nothing. The chain is
+    /// bounded, so a CNAME loop cannot run forever.
+    #[must_use]
+    pub fn txt_values_via_cnames(&self, name: &str) -> Vec<String> {
+        let mut owner = normalize_name(name);
+        let mut values = self.txt_values(&owner);
+        for _ in 0..MAX_CNAME_HOPS {
+            let next = self.records.iter().find_map(|r| match &r.rdata {
+                Rdata::Name(target) if r.rtype == QTYPE_CNAME && r.name == owner => {
+                    Some(normalize_name(target))
+                }
+                _ => None,
+            });
+            let Some(next) = next else {
+                break;
+            };
+            owner = next;
+            values.extend(self.txt_values(&owner));
+        }
+        values
+    }
+
     /// The `NS` names in the answer.
     #[must_use]
     pub fn ns_names(&self) -> Vec<String> {
@@ -508,7 +540,8 @@ fn normalize_name(name: &str) -> String {
     name.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
-/// Parse a DNS response into the TXT values it carries for `name`.
+/// Parse a DNS response into the TXT values it carries for `name`, following
+/// a CNAME chain in the answer (see [`DnsAnswer::txt_values_via_cnames`]).
 ///
 /// # Errors
 ///
@@ -516,7 +549,7 @@ fn normalize_name(name: &str) -> String {
 pub fn parse_txt_response(id: u16, name: &str, msg: &[u8]) -> Result<TxtAnswer, String> {
     let answer = parse_response(id, name, msg)?;
     Ok(TxtAnswer {
-        values: answer.txt_values(name),
+        values: answer.txt_values_via_cnames(name),
         rcode: answer.rcode,
     })
 }
@@ -606,7 +639,7 @@ pub fn parse_response(id: u16, name: &str, msg: &[u8]) -> Result<DnsAnswer, Stri
             // An NS target is a domain name in the message, so it may be
             // compressed against an earlier one — decode it against the WHOLE
             // message rather than the RDATA slice.
-            QTYPE_NS => Rdata::Name(read_name(msg, header_end)?.0),
+            QTYPE_NS | QTYPE_CNAME => Rdata::Name(read_name(msg, header_end)?.0),
             QTYPE_A if rdlength == 4 => Rdata::A(std::net::Ipv4Addr::new(
                 msg[header_end],
                 msg[header_end + 1],
@@ -1646,6 +1679,63 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(values, vec!["token-b".to_owned(), "v=spf1 -all".to_owned()]);
+    }
+
+    // #2642: a TXT record delegated by CNAME is read at the chain's end.
+    #[test]
+    fn txt_values_follow_a_cname_chain_in_the_answer() {
+        let record = |name: &str, rtype: u16, rdata: Rdata| ResourceRecord {
+            name: name.to_owned(),
+            rtype,
+            rdata,
+        };
+        let answer = DnsAnswer {
+            rcode: 0,
+            records: vec![
+                record(
+                    "_autumn-challenge.app.clientco.com",
+                    QTYPE_CNAME,
+                    Rdata::Name("verify.dns-host.net".to_owned()),
+                ),
+                record(
+                    "verify.dns-host.net",
+                    QTYPE_TXT,
+                    Rdata::Txt("token-b".to_owned()),
+                ),
+                record(
+                    "unrelated.example",
+                    QTYPE_TXT,
+                    Rdata::Txt("other".to_owned()),
+                ),
+            ],
+        };
+        assert_eq!(
+            answer.txt_values_via_cnames("_autumn-challenge.app.clientco.com."),
+            vec!["token-b".to_owned()]
+        );
+
+        // A loop ends at the hop bound instead of spinning.
+        let looped = DnsAnswer {
+            rcode: 0,
+            records: vec![
+                record("a.test", QTYPE_CNAME, Rdata::Name("b.test".to_owned())),
+                record("b.test", QTYPE_CNAME, Rdata::Name("a.test".to_owned())),
+            ],
+        };
+        assert!(looped.txt_values_via_cnames("a.test").is_empty());
+    }
+
+    // The wire parser decodes a CNAME's target, so the chain can be walked.
+    #[test]
+    fn a_cname_answer_record_decodes_its_target() {
+        let name = "_autumn-challenge.app.clientco.com";
+        let mut msg = response_head(0x4242, name, 1, 0);
+        push_answer(&mut msg, QTYPE_CNAME, &encode_labels("verify.dns-host.net"));
+        let answer = parse_response(0x4242, name, &msg).unwrap();
+        assert_eq!(
+            answer.records[0].rdata,
+            Rdata::Name("verify.dns-host.net".to_owned())
+        );
     }
 
     #[tokio::test]
