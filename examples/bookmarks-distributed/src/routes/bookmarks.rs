@@ -108,6 +108,50 @@ pub async fn by_tag(Path(tag): Path<String>) -> AutumnResult<Markup> {
     ))
 }
 
+/// Like `autumn_web::form::text_input`, but keeps the native `type`,
+/// `required`, and `placeholder` attributes the hand-rolled markup this
+/// replaces used to carry — the shared helper only ever emits a plain
+/// optional `type="text"` input (Codex review on #2946), which would have
+/// dropped the mobile URL keyboard and the browser-native required-field
+/// check for `url`/`title` with no upside, since server-side validation
+/// alone still covers correctness.
+fn field_input(
+    changeset: &Changeset<NewBookmark>,
+    field: &str,
+    label: &str,
+    input_type: &str,
+    required: bool,
+    placeholder: Option<&str>,
+) -> Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let value = changeset.field_value(field).unwrap_or_default();
+    let error_id = format!("{field}-error");
+
+    html! {
+        div id=(format!("{field}-field")) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
+            input
+                type=(input_type)
+                id=(field)
+                name=(field)
+                required[required]
+                placeholder=[placeholder]
+                value=(value)
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                aria-invalid=(has_errors)
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+            @if has_errors {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Shared new-bookmark form body — rendered by both the plain `GET /new`
 /// and `create`'s `422` re-render, from a `Changeset<NewBookmark>`, so a
 /// rejected submission shows the same form with every field preserved and
@@ -122,9 +166,9 @@ fn new_bookmark_form(changeset: &Changeset<NewBookmark>) -> Markup {
         html! {
             h1 class="text-2xl font-bold mb-6" { "Add Bookmark" }
             form action=(paths::create()) method="post" class="space-y-4" {
-                (autumn_web::form::text_input(changeset, "url", "URL"))
-                (autumn_web::form::text_input(changeset, "title", "Title"))
-                (autumn_web::form::text_input(changeset, "tag", "Tag"))
+                (field_input(changeset, "url", "URL", "url", true, Some("https://example.com")))
+                (field_input(changeset, "title", "Title", "text", true, Some("My favorite site")))
+                (field_input(changeset, "tag", "Tag", "text", false, None))
                 button type="submit"
                        class="bg-indigo-600 text-white px-6 py-2 rounded hover:bg-indigo-700" {
                     "Save"
@@ -248,6 +292,30 @@ mod tests {
         // The valid fields the user also typed are not dropped on the floor.
         assert!(html.contains(r#"value="Kept title""#), "{html}");
         assert!(html.contains(r#"value="kept-tag""#), "{html}");
+    }
+
+    #[test]
+    fn form_keeps_native_input_semantics_alongside_the_changeset_errors() {
+        // Codex review on #2946: switching to a changeset-aware helper must
+        // not silently drop the mobile URL keyboard / browser-native
+        // required-field check the hand-rolled markup used to carry.
+        let cs = Changeset::new(NewBookmark {
+            url: String::new(),
+            title: String::new(),
+            tag: "general".to_owned(),
+        });
+        let html = new_bookmark_form(&cs).into_string();
+        assert!(html.contains(r#"type="url""#), "{html}");
+        assert!(html.contains(r#"id="url" name="url" required"#), "{html}");
+        assert!(
+            html.contains(r#"id="title" name="title" required"#),
+            "{html}"
+        );
+        assert!(!html.contains(r#"id="tag" name="tag" required"#), "{html}");
+        assert!(
+            html.contains(r#"placeholder="https://example.com""#),
+            "{html}"
+        );
     }
 
     #[test]

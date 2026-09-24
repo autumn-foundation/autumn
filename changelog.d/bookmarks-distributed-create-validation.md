@@ -14,7 +14,11 @@
   right there unused. Fix: `create` now calls `.into_changeset()` and, on
   an invalid submission, re-renders the same `Add Bookmark` form at HTTP
   422 with every submitted field preserved and an inline error next to the
-  offending input — the same `Changeset`/`text_input` idiom the sibling
-  `examples/bookmarks` already uses. New unit tests cover the rejected-url
-  case, the rejected-title case, that unrelated valid fields survive a
-  rejection, and the clean (no-error) render.
+  offending input — the same `Changeset`-driven idiom the sibling
+  `examples/bookmarks` already uses, rendered through a local `field_input`
+  helper rather than the framework's `text_input` so the native `type`,
+  `required`, and `placeholder` attributes the hand-rolled markup used to
+  carry are preserved alongside the new inline errors (per review). New
+  unit tests cover the rejected-url case, the rejected-title case, that
+  unrelated valid fields survive a rejection, the native-attribute
+  preservation, and the clean (no-error) render.
