@@ -45,6 +45,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::grants::{CapabilityGrants, CapabilityQuotas, ConsentDelta, added};
 use crate::route_listing::{RouteClassification, RouteInfo, RouteSource};
+use crate::security::path::{dot_segment_len, percent_escapes};
 
 /// The sandbox wire-protocol version this build speaks.
 ///
@@ -1411,8 +1412,18 @@ fn validate_route_path(path: &str) -> Result<(), ManifestError> {
         if segment.is_empty() {
             return refuse("a route path must not contain an empty path segment");
         }
-        if segment == "." || segment == ".." {
-            return refuse("a route path must not contain `.` or `..` segments");
+        // A route has one spelling, or the router's literal comparisons are
+        // wrong. A client removes `%2e` as it removes `.`, and a proxy may
+        // decode any ASCII escape or upper-case any hex, so the plugin could
+        // mount beside the application route it arrives at (#2463).
+        if dot_segment_len(segment).is_some() {
+            return refuse("a route path must not contain `.` or `..` segments in any spelling");
+        }
+        if percent_escapes(segment).any(|(byte, _)| byte.is_ascii()) {
+            return refuse("a route path must write an ASCII character as itself, not escaped");
+        }
+        if percent_escapes(segment).any(|(_, upper)| !upper) {
+            return refuse("a route path must write a percent-escape in upper-case hex");
         }
         if segment.chars().any(char::is_whitespace) {
             return refuse("a route path must not contain whitespace");
@@ -1743,6 +1754,50 @@ max_concurrency = 8
                 "route path {bad} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn a_route_path_with_a_second_spelling_is_refused() {
+        // #2463. Each of these names another route once a client or a proxy
+        // normalises it. The router compares literals, so it would mount the
+        // plugin beside the application route it arrives at.
+        for bad in [
+            "/hello/./transfer",
+            "/hello/../transfer",
+            "/hello/%2e/transfer",    // a single-dot segment, encoded
+            "/hello/%2E/transfer",    // in upper case
+            "/hello/%2e%2e/transfer", // a double-dot segment, encoded
+            "/hello/.%2E/transfer",   // half encoded
+            "/hello/%2e./transfer",   // the other half
+            "/hello/a%2fb",           // an encoded `/`
+            "/hello/a%2Fb",           // in upper case
+            "/hello/a%5cb",           // an encoded `\`
+            "/hello/%74ransfer",      // an encoded letter
+            "/hello/%7E",             // an encoded unreserved symbol
+            "/hello/a%20b",           // an encoded space
+            "/hello/a%3Fb",           // an encoded `?`
+            "/hello/%252e",           // an encoded `%`, one decode from `%2e`
+            "/hello/caf%c3%a9",       // lower-case hex, which a proxy may upper-case
+        ] {
+            let src = valid_toml()
+                .replace(r#"method = "GET""#, r#"method = "POST""#)
+                .replace(r#"path = "/hello/greet""#, &format!(r#"path = "{bad}""#));
+            assert!(
+                matches!(
+                    SandboxManifest::parse(&src),
+                    Err(ManifestError::InvalidRoutePath { .. })
+                ),
+                "route path {bad} must be refused"
+            );
+        }
+
+        // A non-ASCII character has no literal spelling in a URL, so its
+        // escape is the one spelling it has.
+        let src = valid_toml().replace(r#"path = "/hello/greet""#, r#"path = "/hello/caf%C3%A9""#);
+        assert!(
+            SandboxManifest::parse(&src).is_ok(),
+            "an escaped `é` is its one spelling"
+        );
     }
 
     #[test]
