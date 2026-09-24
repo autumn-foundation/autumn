@@ -1,4 +1,4 @@
-# 🪝 Snag: `DbRoomStore` seat-cap race confirmed on Postgres — rate is harness-dependent, escalates issue #2864 more modestly than first measured
+# 🪝 Snag: `DbRoomStore` seat-cap race confirmed on Postgres — near-deterministic on a warm production pool, indistinguishable from SQLite's rate once cold-start methodology is fully matched
 
 **Charter:** proposed charter 1 from
 [2026-09-20's session](2026-09-20-snag-db-room-store-seat-race.md) — "the
@@ -11,12 +11,12 @@ info` succeeds), so this closes that gap.
 
 ## 🐛 Repro
 
-**Title:** 🪝 Snag: `DbRoomStore::join_room` seat-cap race reproduces on
-Postgres under both a matched-methodology comparison to #2864's SQLite
-baseline (17/60) and a warm-connection-pool / no-barrier condition closer to
-steady-state production load, specifically for a room's last remaining
-seat (60/60 and 39/40) (data-correctness, oracle:
-docs/guide/media.md "Both backends enforce the absolute 6-seat mesh
+**Title:** 🪝 Snag: `DbRoomStore::join_room` seat-cap race is near-
+deterministic on a properly-warmed Postgres pool for a room's last seat
+(59/59 and 40/40 once two measurement artifacts are corrected); under a
+fully cold-start-matched comparison to #2864's SQLite baseline it is no
+longer clearly distinguishable from SQLite's own ~4/100 (data-correctness,
+oracle: docs/guide/media.md "Both backends enforce the absolute 6-seat mesh
 ceiling")
 
 This is **the same bug already filed as
@@ -55,55 +55,103 @@ recreated per request) — it's a different, useful experiment, not a
 replacement for the properly-matched baseline comparison, and conflating
 the two was the actual mistake.
 
-**Condition A1 — methodology matched to #2864 (fresh pools built inside
-each trial, 16 racers, 2 pools, barrier-synced, 1-seat room), Postgres
-instead of SQLite:**
+**Second correction, from a fourth review round:** two more measurement
+artifacts were found and fixed after the above was written — both real,
+both confirmed against the actual per-trial data before accepting them,
+and both change headline numbers again:
 
-1. Start a real Postgres container (testcontainers) once; create its tables
-   once.
-2. **Inside each trial:** build two fresh `deadpool` pools over that same
-   running database (mirroring #2864's `run_trial()` building two fresh
-   pools per call — the confound being controlled for is pool/connection
-   warmth, not database freshness, since spinning a fresh *container* per
-   trial is prohibitively slow).
+1. **A1 still wasn't a fair comparison to SQLite.** #2864's SQLite
+   `run_trial()` opens a **brand-new tempfile database** every trial, so
+   its tables are always empty. A1's fresh-*pools*-per-trial fix (above)
+   left the *tables* shared across all 60 trials on one Postgres database,
+   so row/index state accumulated as trials progressed (up to ~1000 rows by
+   trial 60) — a remaining unmatched variable. Rerunning with the tables
+   also dropped and recreated inside every trial (true schema isolation,
+   matching SQLite's per-trial freshness) **dropped the rate further, to
+   2/60 (3.3%) and 8/60 (13.3%) across two independent runs** — both far
+   below the original "matched" 17/60 (28%), and now in the same
+   neighborhood as SQLite's own ~4/100 rather than clearly above it. The
+   two runs disagree with each other by 4x (2/60 vs 8/60), which is itself
+   informative: at these low base rates, 60-trial samples carry enough
+   noise that neither this report nor #2864's own single 4/100 SQLite
+   measurement should be read as a precise rate — only as "low, but real
+   and nonzero on both backends." **The "~7x SQLite" comparative claim in
+   this report's second revision does not hold up under full methodology
+   matching and is retracted;** see condition A1 below for the corrected
+   numbers.
+2. **A2 and B1's "warm pool" trials weren't all actually warm.** Both
+   built their pool(s), ran one DDL setup query (which leaves exactly one
+   connection idle-but-returned), and immediately started the trial loop —
+   so trial 0 raced over a pool with only 1 of the N connections its
+   racers would need actually established, while every later trial raced
+   over a fully warm pool. Checked directly against the saved per-trial
+   logs: **A2's sole below-average outcome (`successes=3`, the minimum in
+   its histogram) was trial 0, and B1's sole non-overshoot trial
+   (`successes=1`) was also trial 0** — both exactly consistent with an
+   incomplete-warm-up artifact rather than a genuine race outcome, not
+   coincidence. Corrected below by excluding the contaminated trial 0 from
+   A2's existing data (explicitly sanctioned as an option by the review
+   comment that raised this) and by rerunning B1 with the pool properly
+   prewarmed (racers-worth of connections explicitly acquired and released
+   before the trial loop starts) rather than relying on incidental DDL
+   warm-up.
+
+**Condition A1 — methodology matched to #2864 (fresh pools AND fresh,
+dropped-and-recreated tables built inside each trial, 16 racers, 2 pools,
+barrier-synced, 1-seat room), Postgres instead of SQLite:**
+
+1. Start a real Postgres container (testcontainers) once.
+2. **Inside each trial:** `DROP TABLE`+`CREATE TABLE` both tables, then
+   build two fresh `deadpool` pools over that same running database
+   (mirroring #2864's `run_trial()`, which gets both a fresh database file
+   and fresh pools every call — a fresh Postgres *container* per trial
+   would give the same table-freshness guarantee but is prohibitively
+   slow, so a fresh schema on the existing container is the practical
+   equivalent).
 3. Create a room capped at 1 seat.
 4. Spawn 16 concurrent joiners split 8/8 across the two pools, synchronized
    on a `tokio::sync::Barrier`.
 5. Count successes and independently re-count `media_room_participants`.
-6. Repeat for 60 trials, fresh namespace per trial.
+6. Repeat for 60 trials.
 
-**Result: 17/60 trials overshot the 1-seat cap (28%).** Histogram of
-`successes` across all 60 trials:
-`{1: 43, 2: 7, 3: 5, 4: 3, 5: 2}` — the modal, and majority, outcome (43/60,
-72%) is the *correct* one (exactly one racer admitted); of the 17
-overshoots, 12/17 (71%) admitted only 1-2 extra racers (`successes` 2 or 3),
-not the near-total admission condition A2 (below) shows. Still ~7x #2864's
-SQLite rate
-(28% vs. ~4%), so Postgres does appear to race somewhat more readily than
-SQLite even under matched methodology — plausibly because SQLite's
-`busy_timeout`+WAL locking serializes writers to some degree that
-Postgres's default read-committed MVCC does not — but this is a modest,
-not order-of-magnitude, difference, and not the headline this report
-originally claimed.
+**Result: 2/60 (3.3%) and 8/60 (13.3%) overshot across two independent
+60-trial runs** (histograms `{1: 58, 2: 1, 3: 1}` and
+`{1: 52, 2: 3, 3: 4, 4: 1}` respectively) — combined, 10/120 (8.3%). This is
+no longer clearly distinguishable from #2864's own ~4/100 SQLite rate given
+the sample sizes and the 4x spread between the two Postgres runs
+themselves; the earlier "~7x SQLite, modest but real backend difference"
+claim was itself downstream of the unmatched table-freshness confound and
+does not survive fixing it. The honest conclusion from A1 is: **once
+methodology is fully matched (fresh pools, fresh schema, same
+barrier-synced 16-racer harness), this race's cold-start rate is low and
+roughly comparable between Postgres and SQLite — not dramatically worse on
+either backend.**
 
 **Condition A2 — warm, pre-established pools reused across all 60 trials**
 (this session's original condition A, kept and reframed rather than
-discarded): identical to A1 except the two pools are built **once**, before
-the trial loop, and reused warm for all 60 trials — representative of a
-real server's persistent connection pool under sustained concurrent load,
-rather than a fair single-variable comparison to #2864's SQLite numbers.
+discarded): identical to A1's harness except the tables and the two pools
+are **not** rebuilt per trial — tables persist and the two pools are built
+**once**, before the trial loop, and reused warm for all 60 trials —
+representative of a real server's persistent connection pool and
+long-lived tables under sustained concurrent load, not a fair
+single-variable comparison to #2864's SQLite numbers.
 
-**Result: 60/60 trials overshot**, with `successes=16` (every racer
-admitted into the 1-seat room) as the single most common value —
-27/60 (45%) — full histogram
-`{3: 1, 5: 1, 8: 1, 10: 2, 11: 1, 12: 3, 13: 5, 14: 5, 15: 14, 16: 27}`. A
-first run of this same condition (not separately logged) measured 59/60,
-consistent with a real high-but-not-necessarily-100% rate. This condition
-says: **once a Postgres-backed deployment's connection pools are warmed up
-under real traffic, a burst of simultaneous join requests for a room's last
-seat has close to zero chance of being correctly capped** — which is
-arguably the more operationally relevant number for an already-running
-production app, even though it isn't a fair backend-vs-backend comparison.
+**Result: 60/60 trials overshot**, full histogram
+`{3: 1, 5: 1, 8: 1, 10: 2, 11: 1, 12: 3, 13: 5, 14: 5, 15: 14, 16: 27}`
+— **but trial 0 (the sole `successes=3` outcome, the histogram's minimum)
+is the warm-up artifact described above**, not a genuine measurement:
+checked directly against the saved log, it's the very first trial, right
+after the single DDL-setup connection was the only warm one available.
+Excluding it: **59/59 trials overshot (100%)** among genuinely-warm trials,
+with `successes=16` (every racer admitted) the single most common
+individual outcome at 27/59 (45.8%). A separate first run of this same
+condition (not logged in full) measured 59/60, consistent with a real
+high rate with some run-to-run noise. This condition says: **once a
+Postgres-backed deployment's connection pools are actually warmed up under
+real traffic, a burst of simultaneous join requests for a room's last seat
+has essentially zero chance of being correctly capped** — the more
+operationally relevant number for an already-running production app, even
+though it isn't a fair backend-vs-backend comparison.
 
 **Condition B0 — empty-room initial-fill burst, no barrier, no two-process
 simulation:** 4 concurrent joiners (`tokio::spawn` fired back-to-back, no
@@ -141,28 +189,38 @@ across trials.
 
 **Result: 39/40 trials overshot (97.5%)**, and 36/40 (90%) let all 4 racers
 into the single remaining seat — histogram of racer successes:
-`{1: 1, 2: 1, 3: 2, 4: 36}`. Even more lopsided than B0.
+`{1: 1, 2: 1, 3: 2, 4: 36}`. **The sole non-overshoot trial (`successes=1`)
+is, again, trial 0** — checked directly against the saved log — the same
+incomplete-warm-up artifact identified in condition A2 above: only the one
+connection from DDL setup was actually warm at trial 0. **Rerunning with
+the pool explicitly prewarmed first** (acquiring and releasing 4
+connections — one per racer — before the trial loop starts, instead of
+relying on incidental DDL warm-up): **40/40 trials overshot (100%)**,
+histogram `{2: 2, 3: 2, 4: 36}` — genuinely deterministic once the pool is
+actually warm before measurement begins, not 39/40 with an artifact mixed
+in.
 
-**Rerun with a fresh pool built inside each trial: 0/40 overshot** — every
-single trial correctly admitted exactly 1 racer and rejected the other 3
-(confirmed reproducible across two independent 40-trial runs). This is
-**not** evidence the bug disappears under fresh connections, and citing it
-that way would be its own overclaim: the two *sequential* pre-seed joins
-that ran immediately before the race, on the same freshly-built pool, leave
-that pool with exactly one already-warm idle connection at the moment the
-4 racers spawn. One racer reuses it and reaches the count-then-insert
-window essentially instantly; the other three each pay a fresh
-connection-establishment cost first. In this specific harness that gap is
-apparently enough for the fast racer to complete its entire check-then-
-insert and commit before any of the other three even issue their `SELECT
-COUNT`, so they correctly see the now-full room and get rejected — every
-time. A real production pool under load keeps *several* idle connections
-ready (this harness's `max_size` is 20), so four simultaneous requests
-would typically all grab already-warm connections with no such asymmetric
-head start, closer to condition B1's warm-pool result (39/40) than to this
-artifact. The fresh-pool number is reported for completeness and because
-it's a real, reproducible measurement of *this specific harness*, not
-because it generalizes to "fresh connections prevent the bug."
+**Rerun (of the original, non-prewarmed version) with a fresh pool built
+inside each trial: 0/40 overshot** — every single trial correctly admitted
+exactly 1 racer and rejected the other 3 (confirmed reproducible across two
+independent 40-trial runs). This is **not** evidence the bug disappears
+under fresh connections, and citing it that way would be its own overclaim:
+the two *sequential* pre-seed joins that ran immediately before the race,
+on the same freshly-built pool, leave that pool with exactly one
+already-warm idle connection at the moment the 4 racers spawn. One racer
+reuses it and reaches the count-then-insert window essentially instantly;
+the other three each pay a fresh connection-establishment cost first. In
+this specific harness that gap is apparently enough for the fast racer to
+complete its entire check-then-insert and commit before any of the other
+three even issue their `SELECT COUNT`, so they correctly see the now-full
+room and get rejected — every time. A real production pool under load
+keeps *several* idle connections ready (this harness's `max_size` is 20),
+so four simultaneous requests would typically all grab already-warm
+connections with no such asymmetric head start, closer to condition B1's
+prewarmed result (40/40) than to this artifact. The fresh-pool number is
+reported for completeness and because it's a real, reproducible
+measurement of *this specific harness*, not because it generalizes to
+"fresh connections prevent the bug."
 
 **Sanity check performed:** before trusting any of the above, a probe
 confirmed the cap enforces correctly under *sequential* (non-concurrent)
@@ -195,51 +253,66 @@ unchanged since #2864 was filed.
 
 ## 💥 Impact
 
-**Confirms and moderately escalates #2864 on Postgres — the size of the
-escalation depends on which condition is cited, and both are reported
-rather than leading with the more dramatic one:**
+**Confirms #2864 on Postgres. The headline is not "Postgres races more
+readily than SQLite" — under full methodology matching that claim doesn't
+hold up — it's "under conditions representative of an actually-running
+deployment, this race is essentially deterministic, on both backends the
+data supports drawing a conclusion about":**
 
-- Under methodology matched to #2864's SQLite baseline (condition A1), the
-  rate is 17/60 (28%) vs. SQLite's ~4/100 (~4%) — roughly 7x higher, a real
-  but modest difference, plausibly attributable to Postgres's default
-  read-committed MVCC racing more readily than SQLite's WAL+`busy_timeout`
-  locking under an otherwise-identical check-then-insert. This is the
-  number to cite for "is Postgres worse than SQLite for this specific
-  race," and it does not support "order of magnitude" or "near-certain."
-- Under a warm-connection-pool condition representative of an
-  already-running production deployment's pool, **for a room's last
-  remaining seat specifically** (condition A2, cap=1: 60/60; condition B1,
-  seeded to 2/3 before racing for the last of 3: 39/40), the failure rate
-  **given that a burst of simultaneous join requests occurs** is 97.5-100%,
-  and both conditions show full admission (every racer let in) as the
-  single most common individual outcome (condition A2: 27/60, 45%;
-  condition B1: 36/40, 90%) — not a majority in A2's case, a majority in
-  B1's. A related but distinct scenario — an empty room's initial-fill
-  burst rather than its last seat specifically (condition B0) — shows a
-  similar 85-92.5% warm-pool rate. None of these probes measured real
-  arrival rates or workload patterns, only the outcome of a
-  deliberately-launched concurrent burst — so this is a statement about
-  what happens *if* such a burst occurs, not an estimate of how often one
-  does in a live deployment.
+- Under a fully cold-start-matched comparison to #2864's SQLite baseline
+  (condition A1: fresh pools *and* fresh schema every trial, matching
+  SQLite's fresh-tempfile-database-per-trial exactly), the rate is 2/60 and
+  8/60 across two independent runs (3.3%-13.3%, combined 8.3%) vs. SQLite's
+  ~4/100 (~4%). **This is no longer clearly distinguishable from SQLite's
+  rate** — both are low, both are real and nonzero, and the two Postgres
+  runs disagree with each other by 4x, which says more about how much noise
+  a 60-trial sample carries at this base rate than about a backend
+  difference. This report's earlier claims of "an order of magnitude
+  higher" (first revision) and then "~7x higher" (second revision) were
+  both artifacts of incompletely-matched methodology (pool warmth, then
+  table/schema freshness) and neither is supported once methodology is
+  fully matched. **Do not cite this report for "Postgres is worse than
+  SQLite for this race" — the honest conclusion is "comparable, both low,
+  under matched cold-start conditions."**
+- Under conditions representative of an already-running production
+  deployment's *actually warm* connection pool, **for a room's last
+  remaining seat specifically** (condition A2 excluding its one
+  warm-up-contaminated trial, cap=1: 59/59; condition B1 properly
+  prewarmed, seeded to 2/3 before racing for the last of 3: 40/40), the
+  failure rate **given that a burst of simultaneous join requests occurs**
+  is **100% in both conditions** — not "85-100%" or "97.5-100%" as earlier
+  revisions of this report said before two measurement artifacts (an
+  incompletely-warmed pool contaminating trial 0 in both A2 and B1) were
+  found and corrected. A related but distinct scenario — an empty room's
+  initial-fill burst rather than contention for its last seat specifically
+  (condition B0) — shows a somewhat lower rate: 92.5% with a warm pool,
+  85% with a fresh pool per trial (these are two different conditions, not
+  a single range — see condition B0 above for which number is which). None
+  of these probes measured real arrival rates or workload patterns, only
+  the outcome of a deliberately-launched concurrent burst — so this is a
+  statement about what happens *if* such a burst occurs, not an estimate of
+  how often one does in a live deployment.
 - Postgres is the backend the docs frame as "the correct backend for a
   horizontally-scaled or multi-process deployment," i.e. the one operators
   choose specifically because they expect concurrent load. When a burst of
-  simultaneous joins for a room's last seat(s) does occur, the claim is
-  falsest exactly where it's relied on most (production-representative
-  condition) to measurably-but-moderately false even under the more
-  conservative matched-methodology condition (17/60, 28%) — but how often
-  such a burst occurs in any given deployment is outside what this session
-  measured.
+  simultaneous joins for a room's last seat does occur against an
+  already-warm production pool, the claim is essentially always false. This
+  session found no evidence that Postgres is meaningfully worse than SQLite
+  at resisting the race itself under equivalent cold-start conditions — the
+  severity comes from how deterministic the failure is under ordinary warm
+  production load, on either backend, not from a Postgres-specific
+  weakness.
 - Still not crash/hang/data-loss — no error, no corruption, the room
   simply silently seats more participants than its documented ceiling,
   which for a WebRTC mesh (O(n²) peer connections) can push participant
   clients into far more simultaneous connections than the ceiling was
   chosen to bound. Severity classification stays "data-correctness /
   documented-claim violation," per the same reasoning #2864 already gives;
-  the *likelihood* component moves from "narrow window" (SQLite's
-  characterization) to somewhere between "roughly 7x more likely" and "the
-  common case," depending on deployment shape, rather than uniformly "the
-  common case" as an earlier revision of this report claimed.
+  the *likelihood* component is "the common case" under a warm production
+  pool contending for a room's last seat (both backends), and "low but
+  real, roughly comparable between backends" under a cold-start-matched
+  comparison — not the SQLite-vs-Postgres severity gradient earlier
+  revisions of this report claimed.
 
 ## Dedup search
 
@@ -278,16 +351,16 @@ The corrected reasoning for not committing: the natural permanent home for
 this reproduction — per 2026-09-20's report's own conclusion — is as a new
 `#[ignore]`d test *function added inside `room_store_db.rs`*, since that
 target **is** one of the two ci.yml already names and runs unconditionally.
-Adding it there, given a 92–100% observed failure rate across both
-conditions in this session, would make that Docker CI step fail on nearly
-every run, and this repo has no established "expected-fail/quarantined"
-marking convention the step would respect. That is the same practical
-outcome the first revision described (a committed version would break CI),
-reached by the correct mechanism (naming it into an always-run target, not
-tripping a sweep that doesn't exist for this crate) — worth being precise
-about, since a future contributor relying on the wrong mechanism could
-wrongly conclude a *different* new standalone file is safe to commit when
-it would in fact just never run.
+Adding it there, given how consistently conditions A2/B1 (properly warmed)
+fail, would make that Docker CI step fail on nearly every run, and this
+repo has no established "expected-fail/quarantined" marking convention the
+step would respect. That is the same practical outcome the first revision
+described (a committed version would break CI), reached by the correct
+mechanism (naming it into an always-run target, not tripping a sweep that
+doesn't exist for this crate) — worth being precise about, since a future
+contributor relying on the wrong mechanism could wrongly conclude a
+*different* new standalone file is safe to commit when it would in fact
+just never run.
 
 ```bash
 cd /home/user/autumn
@@ -295,20 +368,31 @@ cd /home/user/autumn
 # a normal CI/dev box with the Docker daemon already up can skip this):
 #   nohup dockerd >/tmp/dockerd.log 2>&1 & sleep 5 && docker info
 
-# Condition A1 — matched to #2864's SQLite methodology (fresh pools/trial):
-# add autumn-media-plugin/tests/snag_pg_seat_race_freshpool.rs (listing
-# below), then:
+# Condition A1, fresh pools only (an intermediate step, NOT the final fair
+# comparison — kept for its own sake since it's what exposed the
+# pool-warmth confound in the first place) — add
+# autumn-media-plugin/tests/snag_pg_seat_race_freshpool.rs (listing below):
 cargo test -p autumn-media-plugin --test snag_pg_seat_race_freshpool -- --ignored --nocapture
-# Expect a minority of 60 trials to overshoot the 1-seat cap (this session:
-# 17/60, histogram {1: 43, 2: 7, 3: 5, 4: 3, 5: 2}).
+# This session: 17/60 — see condition A1's writeup above for why this
+# number is superseded by the fresh-schema rerun below.
 rm autumn-media-plugin/tests/snag_pg_seat_race_freshpool.rs
 
-# Condition A2 — warm pools reused across trials (production-representative,
-# NOT a fair SQLite comparison): add
-# autumn-media-plugin/tests/snag_pg_seat_race_probe.rs (listing below), then:
+# Condition A1, fresh pools AND fresh (dropped+recreated) schema per trial
+# — the actual fair comparison to #2864's SQLite baseline — add
+# autumn-media-plugin/tests/snag_pg_seat_race_freshpool_freshschema.rs
+# (listing below):
+cargo test -p autumn-media-plugin --test snag_pg_seat_race_freshpool_freshschema -- --ignored --nocapture
+# Run it twice — this session: 2/60 then 8/60, i.e. low and noisy, roughly
+# comparable to SQLite's ~4/100, not clearly higher.
+rm autumn-media-plugin/tests/snag_pg_seat_race_freshpool_freshschema.rs
+
+# Condition A2 — warm pools AND persistent tables reused across trials
+# (production-representative, NOT a fair SQLite comparison) — add
+# autumn-media-plugin/tests/snag_pg_seat_race_probe.rs (listing below):
 cargo test -p autumn-media-plugin --test snag_pg_seat_race_probe -- --ignored --nocapture
-# Expect nearly all 60 trials to overshoot, most often to the full 16/16
-# racer count (this session: 60/60 overshot, mode successes=16 in 27/60).
+# Expect trial 0 to be an outlier (incomplete pool warm-up — see condition
+# A2's writeup above) and every trial after it to overshoot (this session:
+# 60/60 including trial 0, 59/59 excluding it, mode successes=16 at 27/59).
 rm autumn-media-plugin/tests/snag_pg_seat_race_probe.rs
 
 # Condition B0 (empty-room initial-fill burst, warm pool) — add
@@ -328,13 +412,21 @@ cargo test -p autumn-media-plugin --test snag_pg_seat_race_lowconc_freshpool -- 
 # ~4x collapse condition A showed).
 rm autumn-media-plugin/tests/snag_pg_seat_race_lowconc_freshpool.rs
 
-# Condition B1 (seeded last-seat contention, warm pool — the scenario B0
-# was meant to model) — add
+# Condition B1, warm pool but NOT explicitly prewarmed (shows the same
+# trial-0 artifact as condition A2 — kept to demonstrate it) — add
 # autumn-media-plugin/tests/snag_pg_lastseat_lowconc.rs (listing below):
 cargo test -p autumn-media-plugin --test snag_pg_lastseat_lowconc -- --ignored --nocapture
-# Expect the large majority of 40 trials to overshoot the 3-seat cap (this
-# session: 39/40 overshot, 36/40 at racer_successes=4).
+# This session: 39/40, with trial 0 as the sole non-overshoot — see
+# condition B1's writeup above.
 rm autumn-media-plugin/tests/snag_pg_lastseat_lowconc.rs
+
+# Condition B1, explicitly prewarmed (acquire-and-release RACERS
+# connections before the trial loop) — the corrected number — add
+# autumn-media-plugin/tests/snag_pg_lastseat_prewarmed.rs (listing below):
+cargo test -p autumn-media-plugin --test snag_pg_lastseat_prewarmed -- --ignored --nocapture
+# Expect all 40 trials to overshoot (this session: 40/40, histogram
+# {2: 2, 3: 2, 4: 36}).
+rm autumn-media-plugin/tests/snag_pg_lastseat_prewarmed.rs
 
 # Condition B1 (fresh pool/trial) — add
 # autumn-media-plugin/tests/snag_pg_lastseat_freshpool.rs (listing below).
@@ -349,7 +441,7 @@ rm autumn-media-plugin/tests/snag_pg_lastseat_freshpool.rs
 ```
 
 <details>
-<summary><code>snag_pg_seat_race_freshpool.rs</code> (16-racer / 2-pool / barrier-synced, fresh pools per trial, condition A1 — matched to #2864)</summary>
+<summary><code>snag_pg_seat_race_freshpool.rs</code> (16-racer / 2-pool / barrier-synced, fresh pools per trial only — intermediate step, superseded by the fresh-schema version below)</summary>
 
 ```rust
 use std::sync::Arc;
@@ -470,7 +562,133 @@ async fn pg_fresh_pools_per_trial_still_overshoots() {
 </details>
 
 <details>
-<summary><code>snag_pg_seat_race_probe.rs</code> (16-racer / 2-pool / barrier-synced, warm pools reused across trials, condition A2)</summary>
+<summary><code>snag_pg_seat_race_freshpool_freshschema.rs</code> (16-racer / 2-pool / barrier-synced, fresh pools AND fresh dropped+recreated tables per trial — the actual fair comparison to #2864, condition A1 final)</summary>
+
+```rust
+use std::sync::Arc;
+
+use autumn_media_plugin::rooms::RoomStore;
+use autumn_media_plugin::rooms_db::DbRoomStore;
+use chrono::Duration;
+use diesel::prelude::*;
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use diesel_async::pooled_connection::deadpool::Pool;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::postgres::Postgres;
+
+const DROP_TABLES_SQL: &str = "
+    DROP TABLE IF EXISTS media_room_participants;
+    DROP TABLE IF EXISTS media_rooms;
+";
+const CREATE_TABLES_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS media_rooms (
+        namespace TEXT NOT NULL, room_id TEXT NOT NULL,
+        max_participants INTEGER NOT NULL, created_at TIMESTAMP NOT NULL,
+        PRIMARY KEY (namespace, room_id));
+    CREATE TABLE IF NOT EXISTS media_room_participants (
+        namespace TEXT NOT NULL, room_id TEXT NOT NULL, participant_id TEXT NOT NULL,
+        display_name TEXT, token TEXT NOT NULL, joined_at TIMESTAMP NOT NULL,
+        token_expires_at TIMESTAMP NOT NULL, last_seen_at TIMESTAMP NOT NULL,
+        PRIMARY KEY (namespace, room_id, participant_id),
+        FOREIGN KEY (namespace, room_id) REFERENCES media_rooms (namespace, room_id) ON DELETE CASCADE);
+";
+
+#[derive(diesel::QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+}
+
+fn build_pool(url: &str) -> Pool<AsyncPgConnection> {
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+    Pool::builder(manager).max_size(20).build().expect("pool")
+}
+
+async fn run_ddl(pool: &Pool<AsyncPgConnection>, sql: &str) {
+    let mut conn = pool.get().await.expect("conn");
+    for stmt in sql.split(';') {
+        let stmt = stmt.trim();
+        if !stmt.is_empty() {
+            diesel::sql_query(stmt).execute(&mut conn).await.expect("ddl");
+        }
+    }
+}
+
+// Fresh pools AND fresh (dropped+recreated) tables inside every trial.
+async fn run_trial(url: &str, trial: usize) -> (usize, i64) {
+    let (pool_a, pool_b) = (build_pool(url), build_pool(url));
+    run_ddl(&pool_a, DROP_TABLES_SQL).await;
+    run_ddl(&pool_a, CREATE_TABLES_SQL).await;
+
+    let store_a: Arc<dyn RoomStore> = Arc::new(DbRoomStore::new(pool_a.clone(), 6));
+    let store_b: Arc<dyn RoomStore> = Arc::new(DbRoomStore::new(pool_b.clone(), 6));
+    let ns = format!("tenant-{trial}");
+    let room = store_a.create_room(&ns, 1).await.expect("create");
+
+    const RACERS: usize = 16;
+    let barrier = Arc::new(tokio::sync::Barrier::new(RACERS));
+    let mut handles = Vec::new();
+    for i in 0..RACERS {
+        let store = if i % 2 == 0 { store_a.clone() } else { store_b.clone() };
+        let (room_id, barrier, ns) = (room.id.clone(), barrier.clone(), ns.clone());
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            store
+                .join_room(&ns, &room_id, Some(format!("racer-{i}")), Duration::seconds(300))
+                .await
+        }));
+    }
+    let mut successes = 0;
+    for h in handles {
+        if h.await.expect("panic").is_ok() {
+            successes += 1;
+        }
+    }
+
+    let mut conn = pool_a.get().await.expect("conn");
+    let final_count: i64 = diesel::sql_query(
+        "SELECT COUNT(*) as count FROM media_room_participants WHERE namespace = $1 AND room_id = $2",
+    )
+    .bind::<diesel::sql_types::Text, _>(ns.clone())
+    .bind::<diesel::sql_types::Text, _>(room.id.clone())
+    .get_result::<CountRow>(&mut conn)
+    .await
+    .expect("count")
+    .count;
+    (successes, final_count)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker (testcontainers) - SCRATCH PROBE, not for CI"]
+async fn pg_fresh_pools_and_fresh_schema_per_trial() {
+    let container = Postgres::default().start().await.expect("start postgres");
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+    const TRIALS: usize = 60;
+    let mut overshoots = 0;
+    let mut histogram: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    for trial in 0..TRIALS {
+        let (successes, final_count) = run_trial(&url, trial).await;
+        println!("trial {trial}: successes={successes} final_seat_count={final_count} (cap=1)");
+        *histogram.entry(successes).or_insert(0) += 1;
+        if final_count > 1 || successes > 1 {
+            overshoots += 1;
+        }
+    }
+    println!("overshoots: {overshoots}/{TRIALS}");
+    println!("histogram of successes-per-trial: {histogram:?}");
+    assert_eq!(overshoots, 0, "cap exceeded in {overshoots}/{TRIALS} trials");
+}
+```
+
+</details>
+
+<details>
+<summary><code>snag_pg_seat_race_probe.rs</code> (16-racer / 2-pool / barrier-synced, warm pools AND persistent tables reused across trials, condition A2)</summary>
 
 ```rust
 use std::sync::Arc;
@@ -775,7 +993,7 @@ async fn pg_low_concurrency_fresh_pool_per_trial() {
 </details>
 
 <details>
-<summary><code>snag_pg_lastseat_lowconc.rs</code> (3-seat room seeded to 2/3 occupied, 4 racers for the last seat, warm pool, condition B1)</summary>
+<summary><code>snag_pg_lastseat_lowconc.rs</code> (3-seat room seeded to 2/3 occupied, 4 racers for the last seat, warm pool but not explicitly prewarmed — shows the trial-0 artifact, condition B1 intermediate)</summary>
 
 ```rust
 use std::sync::Arc;
@@ -835,6 +1053,120 @@ async fn pg_last_seat_contention_warm_pool() {
     const CAP: i64 = 3;
     const PRESEED: usize = 2; // occupy 2 of 3 seats before racing for the last one
     const RACERS: usize = 4;  // 4 requests race for the single remaining seat
+    let mut overshoots = 0;
+    let mut histogram: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    for trial in 0..TRIALS {
+        let ns = format!("tenant-{trial}");
+        let room = store.create_room(&ns, CAP as usize).await.expect("create");
+        for p in 0..PRESEED {
+            store
+                .join_room(&ns, &room.id, Some(format!("preseed-{p}")), Duration::seconds(300))
+                .await
+                .expect("preseed join");
+        }
+        let mut handles = Vec::new();
+        for i in 0..RACERS {
+            let (s, room_id, ns2) = (store.clone(), room.id.clone(), ns.clone());
+            handles.push(tokio::spawn(async move {
+                s.join_room(&ns2, &room_id, Some(format!("racer-{i}")), Duration::seconds(300)).await
+            }));
+        }
+        let mut successes = 0;
+        for h in handles { if h.await.expect("panic").is_ok() { successes += 1; } }
+        let mut conn = pool.get().await.expect("conn");
+        let final_count: i64 = diesel::sql_query(
+            "SELECT COUNT(*) as count FROM media_room_participants WHERE namespace = $1 AND room_id = $2",
+        )
+        .bind::<diesel::sql_types::Text, _>(ns.clone())
+        .bind::<diesel::sql_types::Text, _>(room.id.clone())
+        .get_result::<CountRow>(&mut conn)
+        .await
+        .expect("count")
+        .count;
+        println!("trial {trial}: racer_successes={successes} final_seat_count={final_count} (cap={CAP}, preseeded={PRESEED})");
+        *histogram.entry(successes).or_insert(0) += 1;
+        if final_count > CAP { overshoots += 1; }
+    }
+    println!("overshoots: {overshoots}/{TRIALS}");
+    println!("histogram of racer_successes-per-trial: {histogram:?}");
+    assert_eq!(overshoots, 0, "cap exceeded in {overshoots}/{TRIALS} trials");
+}
+```
+
+</details>
+
+<details>
+<summary><code>snag_pg_lastseat_prewarmed.rs</code> (same as above, but explicitly prewarms RACERS connections before the trial loop — the corrected number, condition B1 final)</summary>
+
+```rust
+use std::sync::Arc;
+use autumn_media_plugin::rooms::RoomStore;
+use autumn_media_plugin::rooms_db::DbRoomStore;
+use chrono::Duration;
+use diesel::prelude::*;
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use diesel_async::pooled_connection::deadpool::Pool;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::postgres::Postgres;
+
+const CREATE_TABLES_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS media_rooms (
+        namespace TEXT NOT NULL, room_id TEXT NOT NULL,
+        max_participants INTEGER NOT NULL, created_at TIMESTAMP NOT NULL,
+        PRIMARY KEY (namespace, room_id));
+    CREATE TABLE IF NOT EXISTS media_room_participants (
+        namespace TEXT NOT NULL, room_id TEXT NOT NULL, participant_id TEXT NOT NULL,
+        display_name TEXT, token TEXT NOT NULL, joined_at TIMESTAMP NOT NULL,
+        token_expires_at TIMESTAMP NOT NULL, last_seen_at TIMESTAMP NOT NULL,
+        PRIMARY KEY (namespace, room_id, participant_id),
+        FOREIGN KEY (namespace, room_id) REFERENCES media_rooms (namespace, room_id) ON DELETE CASCADE);
+";
+
+#[derive(diesel::QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+}
+
+fn build_pool(url: &str) -> Pool<AsyncPgConnection> {
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+    Pool::builder(manager).max_size(20).build().expect("pool")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker (testcontainers) - SCRATCH PROBE, not for CI"]
+async fn pg_last_seat_contention_warm_pool_explicitly_prewarmed() {
+    let container = Postgres::default().start().await.expect("start postgres");
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    {
+        let mut conn = build_pool(&url).get().await.expect("conn");
+        for stmt in CREATE_TABLES_SQL.split(';') {
+            let stmt = stmt.trim();
+            if !stmt.is_empty() { diesel::sql_query(stmt).execute(&mut conn).await.expect("ddl"); }
+        }
+    }
+    let pool = build_pool(&url);
+    let store: Arc<dyn RoomStore> = Arc::new(DbRoomStore::new(pool.clone(), 6));
+
+    const RACERS: usize = 4;
+    // Explicitly prewarm: acquire RACERS connections concurrently, then
+    // release them all, so the pool actually has RACERS warm connections
+    // ready before trial 0 (not just the 1 left over from DDL setup).
+    {
+        let mut conns = Vec::new();
+        for _ in 0..RACERS {
+            conns.push(pool.get().await.expect("prewarm conn"));
+        }
+        drop(conns);
+    }
+
+    const TRIALS: usize = 40;
+    const CAP: i64 = 3;
+    const PRESEED: usize = 2;
     let mut overshoots = 0;
     let mut histogram: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
     for trial in 0..TRIALS {
@@ -985,18 +1317,22 @@ async fn pg_last_seat_contention_fresh_pool_per_trial() {
 1. **Fix prioritization signal for whoever picks up #2864/#2407**: this
    session's data confirms the fix (row lock / `SELECT ... FOR UPDATE` /
    advisory lock, per #2407's own proposed remediation) applies to Postgres
-   too, at a rate that's modestly higher than SQLite's under matched
-   methodology (condition A1, ~7x) and much higher under a
-   production-representative warm-pool condition, specifically for a
-   room's last seat (condition A2/B1, 97.5-100%) — worth citing both
-   numbers on the issue rather than either alone, so priority isn't set
-   from just the more dramatic one.
+   too, and that the deciding factor for urgency is deployment shape, not
+   backend choice — under a fully cold-start-matched comparison Postgres
+   and SQLite are roughly comparable and both low (condition A1, 3.3-13.3%
+   vs. SQLite's ~4%), but under conditions representative of an
+   already-running deployment's warm connection pool, contention for a
+   room's last seat is essentially deterministic on *either* backend
+   (condition A2/B1, 100%) — worth citing the warm-pool number as the
+   operationally relevant one, since "Postgres is worse than SQLite" is
+   not what this session's fully-corrected data supports.
 2. **`create_room`'s registry-cap race, against Postgres** — carried over
    unattempted from 2026-09-20's charter 2, now that Docker access is
-   confirmed working in-session; worth probing with *both* the matched
-   (fresh-pool) and warm-pool methodologies from the start this time,
-   given how much the pool-warmth confound mattered for the barrier-synced
-   condition here.
+   confirmed working in-session; worth probing with *all three*
+   methodology axes from the start this time (pool freshness, schema
+   freshness, and explicit prewarming for the "warm" condition), given how
+   many rounds of review it took this session to find and control for each
+   one in `join_room`'s equivalent race.
 3. **`DbRoomStore` reaper convergence** — still carried over unattempted
    from 2026-09-13/14/20.
 4. **Whether the same non-atomicity pattern (`SELECT COUNT(*)` then
