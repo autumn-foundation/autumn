@@ -194,6 +194,17 @@ pub async fn authoritative_resolvers(
     recursive: &[SocketAddr],
     lookup: &dyn DnsLookup,
 ) -> Vec<SocketAddr> {
+    discover(fqdn, recursive, &Failed::default(), lookup).await
+}
+
+/// `authoritative_resolvers`, skipping the servers in `failed` and adding
+/// each server that fails to it.
+async fn discover(
+    fqdn: &str,
+    recursive: &[SocketAddr],
+    failed: &Failed,
+    lookup: &dyn DnsLookup,
+) -> Vec<SocketAddr> {
     use futures::{FutureExt as _, StreamExt as _};
     // The `_acme-challenge` label stays on: it can itself be a delegated zone
     // with its own NS records, which is a recommended way to give an ACME
@@ -210,7 +221,6 @@ pub async fn authoritative_resolvers(
     // first, so a hostname with many labels cannot start a lookup for each at
     // once. A resolver that fails a query is not asked again, so one that
     // drops packets costs one query timeout in total (#2642).
-    let failed = Failed::default();
     // Boxed first: a lazily mapped iterator here makes the future not `Send`
     // for every lifetime, which the spawned tasks need.
     let probes: Vec<BoxFuture<'_, Vec<String>>> = zones
@@ -218,7 +228,7 @@ pub async fn authoritative_resolvers(
         .map(|zone| {
             first_found(
                 recursive,
-                &failed,
+                failed,
                 zone,
                 &[QTYPE_NS],
                 lookup,
@@ -240,7 +250,7 @@ pub async fn authoritative_resolvers(
         let ip_answers = futures::future::join_all(names.iter().map(|name| {
             first_found(
                 recursive,
-                &failed,
+                failed,
                 name,
                 &[QTYPE_A, QTYPE_AAAA],
                 lookup,
@@ -262,7 +272,7 @@ pub async fn authoritative_resolvers(
     Vec::new()
 }
 
-/// Servers that failed a query during one discovery.
+/// Servers that failed a query during one lookup.
 type Failed = std::sync::Mutex<Vec<SocketAddr>>;
 
 /// Ask every server in `servers` that has not failed yet for every type in
@@ -367,9 +377,12 @@ pub async fn txt_values(
         use futures::StreamExt as _;
         let mut asked: Vec<String> = Vec::new();
         let mut name = normalize_name(fqdn);
+        // Shared by every hop, so a server that drops packets costs one
+        // timeout for the whole chain.
+        let failed = Failed::default();
         for _ in 0..=MAX_CNAME_HOPS {
             asked.push(name.clone());
-            let servers = authoritative_resolvers(&name, recursive, lookup).await;
+            let servers = discover(&name, recursive, &failed, lookup).await;
             let mut pending: futures::stream::FuturesUnordered<_> = servers
                 .iter()
                 .map(|server| lookup.query(*server, &name, QTYPE_TXT, false))
@@ -2117,6 +2130,53 @@ mod tests {
             "_autumn-challenge.app.clientco.com",
             &[resolver(53)],
             &DelegatedLookup,
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(values, vec!["token-b".to_owned()]);
+    }
+
+    /// `DelegatedLookup` with only `clientco.com` and `dns-host.net` as zones,
+    /// and resolver 1 dropping every packet. Each answer takes 10ms.
+    struct DeadDelegatedLookup;
+
+    impl DnsLookup for DeadDelegatedLookup {
+        fn query<'a>(
+            &'a self,
+            server: SocketAddr,
+            name: &'a str,
+            qtype: u16,
+            recursion_desired: bool,
+        ) -> BoxFuture<'a, Result<DnsAnswer, String>> {
+            Box::pin(async move {
+                if server == resolver(1) {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    return Err(format!("resolver {server} did not answer"));
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let owner = normalize_name(name);
+                if qtype == QTYPE_NS && owner != "clientco.com" && owner != "dns-host.net" {
+                    return Ok(DnsAnswer {
+                        rcode: 0,
+                        records: Vec::new(),
+                    });
+                }
+                DelegatedLookup
+                    .query(server, name, qtype, recursion_desired)
+                    .await
+            })
+        }
+    }
+
+    // Codex review on #2936: a resolver that drops packets costs one timeout
+    // for the whole CNAME chain, not one per hop.
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_resolver_costs_one_timeout_across_cname_hops() {
+        let values = txt_values(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(1), resolver(2)],
+            &DeadDelegatedLookup,
             DEADLINE,
         )
         .await
