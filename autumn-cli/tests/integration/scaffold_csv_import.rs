@@ -725,6 +725,40 @@ fn the_decoder_sees_the_same_column_names_the_header_check_accepted() {
     );
 }
 
+/// The discarded-column probe must agree with the decoder about what a column
+/// is CALLED. The probe used to look the row map up by raw name while the
+/// header check and the decoder both trim, so a file headed `title, blob` —
+/// the space RFC 4180 keeps — decoded its rows fine while the probe missed
+/// the `" blob"` entry and the "this import cannot set" alert never fired:
+/// the operator's edit vanished with no word anywhere. All three consumers
+/// must normalize.
+#[test]
+fn the_discarded_column_probe_sees_the_same_column_names_the_decoder_accepted() {
+    let (_tmp, project, _) = scaffold_project(
+        "import-discarded-padded",
+        &["title:String", "blob:Option<Bytea>"],
+        &["--import"],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains(r#"const CSV_DISCARDED_COLUMNS: &[&str] = &["blob"];"#),
+        "the Bytea column must be the discarded one the probe watches:\n{routes}"
+    );
+    let import = handler_slice(&routes, "import");
+    // The probe reads the row map, which is keyed by the header's RAW names —
+    // the one consumer that never trimmed. It must trim like the decoder.
+    assert!(
+        import.contains("key.trim() == *column"),
+        "the discarded-column probe must normalize keys like the decoder:\n{import}"
+    );
+    // ...and it must still skip blank cells, so an ordinary export round trip
+    // (every discarded column present but empty) does not cry wolf.
+    assert!(
+        import.contains("!value.trim().is_empty()"),
+        "the probe must still ignore blank discarded cells:\n{import}"
+    );
+}
+
 /// A `Bytea` column must not be importable, because the CSV cannot carry it
 /// back. The export renders it with `String::from_utf8_lossy`, so a byte that
 /// is not valid UTF-8 is ALREADY a U+FFFD replacement character in the file —
