@@ -2123,8 +2123,13 @@ pub fn check_custom_domain_txt_impl(probe: &CustomDomainOwnershipProbe) -> Check
     }
 }
 
-/// Ask each resolver for `hostname`'s ownership TXT record and grade the
-/// answers against `token`.
+/// Read `hostname`'s ownership TXT record the way the runtime does, and grade
+/// it against `token`.
+///
+/// Uses the runtime's lookup: the zone's authoritative servers too, not only
+/// `resolvers`. A recursive resolver can cache a negative answer from before
+/// the tenant published, and doctor must not warn about a record the runtime
+/// already sees.
 #[cfg(feature = "tls")]
 #[must_use]
 pub fn resolve_custom_domain_txt(
@@ -2132,17 +2137,23 @@ pub fn resolve_custom_domain_txt(
     token: &str,
     resolvers: &[std::net::SocketAddr],
 ) -> CustomDomainTxt {
-    use autumn_web::acme::dns::resolver::lookup_txt_blocking;
+    use autumn_web::acme::dns::resolver::{UdpDnsLookup, txt_values};
 
     let record = autumn_web::custom_domain::verification_record_name(hostname);
-    let answers: Vec<Result<Vec<String>, String>> = resolvers
-        .iter()
-        .map(|resolver| {
-            lookup_txt_blocking(*resolver, &record, std::time::Duration::from_secs(3))
-                .map(|answer| answer.values)
-        })
-        .collect();
-    grade_custom_domain_txt(token, &answers)
+    let lookup = UdpDnsLookup::new(std::time::Duration::from_secs(3));
+    let answer = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(txt_values(
+            &record,
+            resolvers,
+            &lookup,
+            std::time::Duration::from_secs(6),
+        )),
+        Err(e) => Err(format!("could not start a runtime for the TXT lookup: {e}")),
+    };
+    grade_custom_domain_txt(token, &[answer])
 }
 
 /// Grade port 80 on one ingress target, for tenant custom domains.
