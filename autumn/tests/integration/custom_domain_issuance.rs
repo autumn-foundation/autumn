@@ -644,6 +644,94 @@ async fn retention_prunes_abandoned_registrations_and_orphaned_certificates() {
     );
 }
 
+// ── AC7 on the extracted prune-only type (#2652) ─────────────────────────
+
+#[tokio::test]
+async fn the_prune_only_pruner_the_cli_installs_prunes_like_the_task() {
+    use autumn_web::acme::tenant_domains::PruneOnlyCustomDomainPruner;
+    use autumn_web::custom_domain::CustomDomainPruner as _;
+
+    // The harness task needs a verifier and an issuer, but the prune-only
+    // type the one-shot `autumn db retention` path installs is built from the
+    // same parts WITHOUT them: no order is placed and no CA is contacted on
+    // the CLI path.
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        TableVerifier::new(&[]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    let pruner = PruneOnlyCustomDomainPruner {
+        registry: Arc::clone(&h.registry),
+        cache: Arc::clone(&h.cache),
+        certs: Arc::clone(&h.store) as Arc<dyn autumn_web::acme::store::AcmeStore>,
+        limiter: Arc::new(IssuanceLimiter::new(5, 50, 300, 86_400)),
+        cert_store_paths: Some(Arc::clone(&h.store)),
+        retained_cert_ids: HashSet::from([CertId::from_domains(&["app.example.com".to_owned()])
+            .as_str()
+            .to_owned()]),
+        reporter: Arc::new({
+            let sink = Arc::clone(&h.alerts);
+            move |message: String| sink.lock().unwrap().push(message)
+        }),
+        recovery: None,
+    };
+
+    // Never published DNS.
+    h.registry
+        .register("abandoned.clientco.com", "tenant-b", NOW)
+        .await
+        .unwrap();
+    // A certificate whose registry record is already gone.
+    h.store
+        .save_cert(
+            &CertId::from_domains(&["orphan.clientco.com".to_owned()]),
+            &autumn_web::acme::store::StoredCert {
+                chain_pem: CERT_PEM.to_owned(),
+                key_pem: KEY_PEM.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    // The deployment's own certificate: same store, no registry record, but
+    // named in `retained_cert_ids` — the prune must not delete it.
+    h.store
+        .save_cert(
+            &CertId::from_domains(&["app.example.com".to_owned()]),
+            &autumn_web::acme::store::StoredCert {
+                chain_pem: CERT_PEM.to_owned(),
+                key_pem: KEY_PEM.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let cutoff = NOW + 86_400;
+    // A dry run reports without deleting.
+    assert_eq!(pruner.prune(cutoff, true).await.unwrap(), 2);
+    assert!(h.registry.get("abandoned.clientco.com").is_some());
+
+    assert_eq!(pruner.prune(cutoff, false).await.unwrap(), 2);
+    assert!(h.registry.get("abandoned.clientco.com").is_none());
+    assert!(
+        h.store
+            .load_cert(&CertId::from_domains(&["orphan.clientco.com".to_owned()]))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // The retained deployment certificate survives the prune.
+    assert!(
+        h.store
+            .load_cert(&CertId::from_domains(&["app.example.com".to_owned()]))
+            .await
+            .unwrap()
+            .is_some(),
+        "the prune must not delete the deployment's own certificate"
+    );
+    // And nothing ever asked the issuer for anything.
+    assert_eq!(issuer.count(), 0, "the prune path must not contact a CA");
+}
+
 // ── AC5: health names the domain and the tenant ──────────────────────────
 
 #[tokio::test]
