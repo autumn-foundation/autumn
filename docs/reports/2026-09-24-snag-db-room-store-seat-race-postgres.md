@@ -159,8 +159,11 @@ individual outcome at 27/59 (45.8%). A separate first run of this same
 condition (not logged in full) measured 59/60, consistent with a real
 high rate with some run-to-run noise. This condition says: **once a
 Postgres-backed deployment's connection pools are actually warmed up under
-real traffic, a burst of simultaneous join requests for a room's last seat
-has essentially zero chance of being correctly capped** — the more
+real traffic, and have at least burst-sized idle capacity available at the
+moment of the burst** (see condition B1 below for why that qualifier
+matters — a pool with fewer idle connections than the burst size behaves
+differently), **a burst of simultaneous join requests for a room's last
+seat has essentially zero chance of being correctly capped** — the more
 operationally relevant number for an already-running production app, even
 though it isn't a fair backend-vs-backend comparison.
 
