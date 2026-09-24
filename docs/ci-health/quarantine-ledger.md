@@ -1380,6 +1380,33 @@ _None as of 2026-09-05._
   Match the harness to how CI actually runs the binary before reading a clean
   result as evidence.
 
+- **2026-09-24 verification — fix holding, 0 new recurrences.** Sampled
+  `ci.yml` `pull_request` runs across the ~14.2h following PR #2925's merge
+  (2026-09-23T19:33:05Z through 2026-09-24T09:42:24Z — the tail end of the
+  broader ~37.85h window described in the `live_upgrade` entry's 2026-09-24
+  dated update below, most of which predates the merge). One hit of this
+  test's own failure signature was found in that broader window (run
+  35866381449, branch `claude/sleepy-brown-7ke3xk`, job completed
+  2026-09-23T13:36:52Z), but that completion time is ~6 hours **before** the
+  fix's merge, and outside the ~14.2h post-merge window this verification
+  actually covers — it is the same pre-fix occurrence this entry's own
+  reproduction campaign already accounts for, not a new recurrence. Zero
+  hits among the `success`/`failure`-concluded runs in the ~14.2h sampled
+  after the merge.
+  **Correction (post-review, via a Codex review comment on PR #2942): an
+  earlier version of this note and the corresponding `live_upgrade` update
+  below misstated the post-merge verification interval as "~38h," which was
+  the full sampling window's span, not the portion after the merge.**
+  **Second correction (post-review, via a further Codex review comment on PR
+  #2942): the "zero hits" claim was not scoped to what was actually
+  inspected.** `ci.yml`'s `concurrency.cancel-in-progress: true` (lines 9-11)
+  means a job inside a `cancelled`-overall run can still have completed with
+  a failing test before the run itself was marked cancelled by a superseding
+  push. The cancelled runs inside the post-merge window were not inspected
+  at job level this pass, so this verification covers only the
+  `success`/`failure`-concluded runs in that window, not an exhaustive sweep
+  of every job that ran.
+
 
 ## Under active investigation, not yet quarantined
 
@@ -2103,6 +2130,67 @@ without also filling in the intake form above.
   2026-09-22T~10:1xZ — **14th** straight idle pass (now ~330.5 hours idle,
   past 13.75 days). Still needs a human sign-off for new macOS CI spend;
   not dispatched this pass for that reason.
+- **2026-09-24 update — 15th consecutive pass, harness still undispatched;
+  zero new hits on any of the three `live_upgrade` signatures.** Sampled
+  `ci.yml` `pull_request` runs, page 1 of `list_workflow_runs`
+  (`event=pull_request`, `status=completed`, `perPage=100`): 100 runs
+  spanning 2026-09-22T19:51:14Z–2026-09-24T09:42:24Z (~37.85h) — 64
+  cancelled, 32 success, 4 failure. **Coverage gap, recorded rather than
+  hidden**: page 2 of the identical query returned runs from
+  2026-09-07–2026-09-09 instead of continuing backward from page 1's start,
+  and `total_count` itself differed between the two calls (9315 vs. 7616) —
+  the API's pagination did not behave as a stable continuation this pass, so
+  the ~13.4h gap between this window's start and the 2026-09-22 report's own
+  cutoff (2026-09-22T06:24:50Z–19:51:14Z) was not independently sampled.
+  **Second coverage gap (post-review, via a Codex review comment on PR
+  #2942): only the runs that resolved to `failure` were triaged.** `ci.yml`'s
+  `concurrency.cancel-in-progress: true` (lines 9-11) means a job inside one
+  of the 64 `cancelled`-overall runs could still have completed with a
+  failing test before the run itself was marked cancelled by a superseding
+  push. Those 64 runs' job-level logs were not inspected this pass, so the
+  "zero new hits" findings below are scoped to the 36 runs that resolved to
+  `success`/`failure` and were actually checked — not a proven-exhaustive
+  zero-hit finding across the full 100-run window (the same caveat this
+  ledger's 2026-09-15 update already established as this role's working
+  standard when cancelled-run job-level sampling isn't repeated).
+  All 4 in-window failures triaged at job/log level:
+  - Run 35909966810 (`vesper/bugbash-2881-busy-timeout-shared-cache`,
+    `SQLite runtime (feature=sqlite)`, 2026-09-23T19:32:07Z): `E0061`,
+    `reject_sqlite_statement_timeout` called with 1 argument instead of 2 at
+    `autumn/src/app.rs:11164` and `:11248` — that branch's own in-progress
+    statement-timeout work, unmerged, not a flake.
+  - Run 35894739084 (`vesper/bugbash-2921-create-project-submit-token`,
+    `Lint`/`Test suite`, 2026-09-23T17:18:51Z): `E0308`,
+    `extract_submit_token` expects `&str`, given `String`, at
+    `examples/saas/tests/integration_test.rs:574` — that branch's own
+    submit-token test helper, unmerged, not a flake.
+  - Run 35866381449 (`claude/sleepy-brown-7ke3xk`, `SQLite runtime
+    (feature=sqlite)`, 2026-09-23T13:20:28Z):
+    `sqlite_job_backend_tracks_job_status_durably` FAILED — the exact
+    signature closed above, but this job completed 2026-09-23T13:36:52Z, ~6
+    hours **before** PR #2925's merge (`ff406e0`, 2026-09-23T19:33:05Z). The
+    same pre-fix occurrence the closed entry's own campaign already
+    accounts for, not a new recurrence.
+  - Run 35806829348
+    (`dependabot/github_actions/dtolnay/rust-toolchain-1.120.0`,
+    `MSRV`/`Test (macos-latest)`/`Test (ubuntu-latest)`/
+    `Test (windows-latest)`/`Test suite`, 2026-09-23T01:34:17Z): `rustup`
+    failed installing toolchain `1.120.0` itself — that PR's own subject
+    matter (the pin bump), unmerged.
+
+  None of the 4 match `live_upgrade`, `cache_stampede`, `sim_fault_plan`, or
+  any other tracked signature. **`sqlite_job_backend_tracks_job_status_durably`'s
+  fix (PR #2925) is holding**: zero recurrences among the `success`/
+  `failure`-concluded runs in the ~14.2h of PR traffic sampled since its
+  2026-09-23T19:33:05Z merge, out of this pass's broader ~37.85h window (see
+  the closed entry's own 2026-09-24 verification note above, including its
+  cancelled-run caveat).
+
+  `manual-macos-contention-check.yml`: still `total_count: 0` against
+  `workflow_dispatch` runs, checked 2026-09-24T~09:5xZ — **15th** straight
+  idle pass since it became dispatchable 2026-09-08T15:07:44Z (now ~378.6
+  hours idle, past 15.77 days). Still needs a human sign-off for new macOS CI
+  spend; not dispatched this pass for that reason.
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
   committed as `.github/workflows/manual-macos-contention-check.yml`, gated
@@ -2185,6 +2273,9 @@ without also filling in the intake form above.
 - **2026-09-22 update**: no repeat in the ~20.5h window sampled this pass
   (see the `live_upgrade` entry's 2026-09-22 dated update above for the
   window and method).
+- **2026-09-24 update**: no repeat in the ~37.85h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-24 dated update above for the
+  window and method).
 
 ### `sim_fault_plan::same_seed_replays_a_byte_identical_outcome_100_times`
 
@@ -2217,6 +2308,9 @@ without also filling in the intake form above.
   window and method). Still n=1, still not campaigned.
 - **2026-09-22 update**: no repeat in the ~20.5h window sampled this pass
   (see the `live_upgrade` entry's 2026-09-22 dated update above for the
+  window and method). Still n=1, still not campaigned.
+- **2026-09-24 update**: no repeat in the ~37.85h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-24 dated update above for the
   window and method). Still n=1, still not campaigned.
 
 `sqlite_jobs_scheduler_e2e::sqlite_job_backend_tracks_job_status_durably` was
