@@ -641,7 +641,19 @@ pub async fn set_post_terms(
         // Ascending id order, and every fan-out over terms uses the same order,
         // so two transactions touching overlapping sets can never hold the
         // halves of each other's cycle.
-        lock_terms(conn, &affected).await?;
+        let locked = lock_terms(conn, &affected).await?;
+
+        // A caller's `term_ids` can be stale by the time this transaction
+        // runs -- the id was resolved earlier (an editor's form round trip,
+        // or an import's up-front batch resolution of every post's term
+        // references) and the term was deleted in between. `lock_terms`
+        // already tolerates that for locking/recounting purposes (see its
+        // own doc comment); filtering `wanted` down to what it actually
+        // found does the same for the insert below, so a deleted term is
+        // silently dropped from the post's assignment instead of the insert
+        // failing its foreign key.
+        let locked_ids: HashSet<i64> = locked.into_iter().collect();
+        wanted.retain(|id| locked_ids.contains(id));
 
         diesel::delete(post_terms::table.filter(post_terms::post_id.eq(post_id)))
             .execute(conn)
@@ -695,21 +707,21 @@ pub async fn set_post_terms(
 /// the loop's `.optional()`; `recount_term` reaches the same conclusion for
 /// the one lock it still takes per row (see its own doc comment for why that
 /// one stays unbatched).
-async fn lock_terms(conn: &mut AsyncPgConnection, term_ids: &[i64]) -> AutumnResult<()> {
+async fn lock_terms(conn: &mut AsyncPgConnection, term_ids: &[i64]) -> AutumnResult<Vec<i64>> {
     let mut ordered = term_ids.to_vec();
     ordered.sort_unstable();
     ordered.dedup();
     if ordered.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    let _locked: Vec<i64> = terms::table
+    let locked: Vec<i64> = terms::table
         .filter(terms::id.eq_any(&ordered))
         .select(terms::id)
         .order(terms::id.asc())
         .for_update()
         .load(conn)
         .await?;
-    Ok(())
+    Ok(locked)
 }
 
 /// Rebuild the counts of every term a post is filed under.
@@ -3927,6 +3939,56 @@ pub async fn mark_imports_complete(
         .execute(conn)
         .await?;
     Ok(())
+}
+
+/// Batch-resolve `(taxonomy, slug)` term references to the id of the local
+/// term they name -- one to a few chunked `slug = ANY(...)` queries total,
+/// grouped by taxonomy, rather than one single-row lookup per reference.
+///
+/// Mirrors `import_terms`'s own batching one call up: this call's terms
+/// pass has already created every term the file itself declares, so by the
+/// time the posts pass runs, every reference a post carries either already
+/// exists or names nothing this site has -- there is nothing left to insert
+/// here, only to look up. A reference naming no local term is simply absent
+/// from the result, matching what the old per-post `find_by_slug` lookup
+/// found (nothing, once filtered to the right taxonomy in application code).
+///
+/// Grouped by taxonomy so the round trips scale with the site's registered-
+/// taxonomy count (usually low single digits), not with how many term
+/// references the file's posts carry in total -- a heavily-tagged blog's
+/// backup can carry many more references than distinct taxonomies.
+pub async fn resolve_term_refs<'a, I>(
+    conn: &mut AsyncPgConnection,
+    wanted: I,
+) -> AutumnResult<std::collections::HashMap<(String, String), i64>>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    use std::collections::{HashMap, HashSet};
+
+    const CHUNK: usize = 1000;
+
+    let mut by_taxonomy: HashMap<&'a str, HashSet<&'a str>> = HashMap::new();
+    for (taxonomy, slug) in wanted {
+        by_taxonomy.entry(taxonomy).or_default().insert(slug);
+    }
+
+    let mut by_key: HashMap<(String, String), i64> = HashMap::new();
+    for (taxonomy, slugs) in by_taxonomy {
+        let slugs: Vec<&str> = slugs.into_iter().collect();
+        for chunk in slugs.chunks(CHUNK) {
+            let rows: Vec<(String, String, i64)> = terms::table
+                .filter(terms::taxonomy.eq(taxonomy))
+                .filter(terms::slug.eq_any(chunk.iter().copied()))
+                .select((terms::taxonomy, terms::slug, terms::id))
+                .load(conn)
+                .await?;
+            for (row_taxonomy, row_slug, row_id) in rows {
+                by_key.insert((row_taxonomy, row_slug), row_id);
+            }
+        }
+    }
+    Ok(by_key)
 }
 
 /// The imported rows a previous run finished.

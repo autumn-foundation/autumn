@@ -15358,6 +15358,83 @@ async fn a_post_is_locked_before_its_terms() {
     save.await.expect("the task").expect("the save succeeds");
 }
 
+/// A term id can go stale between when a caller resolved it and when
+/// `set_post_terms` actually runs — an editor's form round trip, or (the
+/// case that motivated this) an import that batch-resolves every post's
+/// term references up front and then assigns them one post at a time, so a
+/// term deleted midway through a long-running import is still in a later
+/// post's `wanted` list. `lock_terms` already tolerates a missing row for
+/// locking and recounting; `set_post_terms` must not then try to insert a
+/// `post_terms` row for it, which would violate the foreign key and abort
+/// the whole save (and, in the batched-import case, every post still to
+/// come) instead of just silently omitting that one stale reference —
+/// exactly what the old unbatched per-post lookup did by finding nothing.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_term_deleted_after_resolution_is_dropped_not_a_hard_failure() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Tagged", "Body.", "publish").await;
+
+    for slug in ["kept", "vanishes"] {
+        client
+            .post("/admin/terms/category")
+            .header("cookie", &cookie)
+            .form(&form(&[("name", slug), ("slug", slug)]))
+            .send()
+            .await
+            .assert_status(303);
+    }
+    let (kept_id, vanishing_id): (i64, i64) = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let kept = {{crate_name}}::schema::terms::table
+            .filter({{crate_name}}::schema::terms::slug.eq("kept"))
+            .select({{crate_name}}::schema::terms::id)
+            .first(&mut conn)
+            .await
+            .expect("the kept term");
+        let vanishing = {{crate_name}}::schema::terms::table
+            .filter({{crate_name}}::schema::terms::slug.eq("vanishes"))
+            .select({{crate_name}}::schema::terms::id)
+            .first(&mut conn)
+            .await
+            .expect("the vanishing term");
+        (kept, vanishing)
+    };
+
+    // Stands in for another admin deleting the term between when a caller
+    // resolved `vanishing_id` and when this save runs.
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        diesel::delete({{crate_name}}::schema::terms::table.filter({{crate_name}}::schema::terms::id.eq(vanishing_id)))
+            .execute(&mut conn)
+            .await
+            .expect("delete the term out from under the save");
+    }
+
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+    {{crate_name}}::content::set_post_terms(&mut conn, post_id, vec![kept_id, vanishing_id])
+        .await
+        .expect(
+            "the save succeeds despite the stale reference, instead of failing its foreign key",
+        );
+
+    let filed: Vec<i64> = {{crate_name}}::schema::post_terms::table
+        .filter({{crate_name}}::schema::post_terms::post_id.eq(post_id))
+        .select({{crate_name}}::schema::post_terms::term_id)
+        .load(&mut conn)
+        .await
+        .expect("the post's filed terms");
+    assert_eq!(
+        filed,
+        vec![kept_id],
+        "the deleted term must be silently dropped, and the still-live one still filed"
+    );
+}
+
 /// The export reads every table from one snapshot.
 ///
 /// The reads were separate repository calls, each on its own pooled connection
