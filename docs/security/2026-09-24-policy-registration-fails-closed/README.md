@@ -69,17 +69,32 @@ Test: `autumn/tests/integration/repository_authorization.rs`:
 - `get_via_repository_endpoint_fails_closed_when_policy_is_not_registered`
 - `list_via_repository_endpoint_fails_closed_when_policy_is_not_registered`
 
-Both build a `TestApp` mounting the file's existing `Note` model/routes
+The first builds a `TestApp` mounting the file's existing `Note` model/route
 (`#[repository(Note, api = "/api/notes", policy = NotePolicy, scope =
-NoteScope)]`) but deliberately omit the `.policy::<Note, _>(NotePolicy)`
+NoteScope)]`) but deliberately omits the `.policy::<Note, _>(NotePolicy)`
 builder call the file's other tests all make — reproducing, byte for byte,
 the state `validate_repository_policies_registered` exists to catch at
 boot and that a `dev`-profile boot would silently carry into serving real
-traffic. The first test seeds a real row (`"Nobody should ever see this
-title"`) and requests it *as the row's own owner* — a session that would
-pass `NotePolicy::can_show` if the policy ever ran — via
-`GET /api/notes/{id}`. The second seeds two other tenants' rows and
-requests the list via `GET /api/notes` as a third, unrelated session.
+traffic. It seeds a real row (`"Nobody should ever see this title"`) and
+requests it *as the row's own owner* — a session that would pass
+`NotePolicy::can_show` if the policy ever ran — via `GET /api/notes/{id}`.
+
+The second uses the file's existing policy-only `SecretNote` fixture
+(`policy = SecretNotePolicy`, no `scope`) instead of `Note`, and seeds two
+other tenants' rows before requesting the list via `GET /api/secret-notes`
+as a third, unrelated session. A first version of this test used `Note` —
+a Codex review round on this PR (`chatgpt-codex-connector[bot]`) caught
+that `Note` also declares `scope = NoteScope`, and `_api_list`'s generated
+body picks its scope-vs-policy branch from which attribute was declared on
+the macro, not from what is registered at runtime (`autumn-macros-repository/
+src/api.rs`'s `scope_list_body`: `if config.scope_type.is_some() { .. }
+else if has_policy { .. }`). Since that first version never registered
+`.scope::<Note, _>(...)` either, the request 500'd on "missing scope
+registration" *before* the list handler ever reached the policy branch —
+the test was green, but proved nothing about the policy path at all.
+Switching to `SecretNote`, which declares no `scope`, forces the generated
+handler onto the `has_policy` per-row `can_show` branch — the one this
+finding is actually about.
 
 ```
 cargo test -p autumn-web --test integration_tests --features db \
@@ -171,6 +186,16 @@ missing policy registration fall through to an unguarded response.
   *with* the policy registered, and the missing-registration state is
   verb-independent (the `.ok_or_else` resolution happens before any
   verb-specific logic runs).
+- One Codex review round (`chatgpt-codex-connector[bot]`) on the PR caught
+  a real gap in the *list* test's rigor (not in the framework): the first
+  version used `Note`, whose declared `scope = NoteScope` made the
+  generated list handler 500 on a missing *scope* registration before the
+  missing-*policy* path was ever reached (see "Reproduction" above) — the
+  test passed, but for the wrong reason, and would have stayed green even
+  if a real bypass existed. Fixed by switching to the file's existing
+  policy-only `SecretNote` fixture, which declares no `scope` and so
+  forces the `has_policy` branch. Re-ran after the fix — 13/13 still pass
+  (`after.txt`, which reflects the post-fix run).
 
 ## 📡 Blast radius
 

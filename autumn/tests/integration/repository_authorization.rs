@@ -673,12 +673,21 @@ fn build_app_without_policy_registration(
     // `prod`/`production` profiles. `TestApp` runs no such profile-gated
     // check, so this reproduces the exact live state a `dev`-profile boot
     // would silently reach.
+    //
+    // `Note` also declares `scope = NoteScope`, but that only matters for
+    // the *list* endpoint (`_api_list`'s generated body picks its scope vs.
+    // policy branch from whether `scope = ...` was declared on the macro,
+    // not from what is registered at runtime — see
+    // `list_via_repository_endpoint_fails_closed_when_policy_is_not_registered`,
+    // which deliberately uses the policy-only `SecretNote` fixture instead
+    // of `Note` so it actually exercises the missing-*policy* path rather
+    // than short-circuiting on a missing *scope* registration first). The
+    // single-record `_api_get` path below has no such branch — it always
+    // runs the policy check when `policy = ...` is declared — so `Note` is
+    // fine for it.
     TestApp::new()
         .with_db(pool)
-        .routes(vec![
-            __autumn_route_info_note_api_list(),
-            __autumn_route_info_note_api_get(),
-        ])
+        .routes(vec![__autumn_route_info_note_api_get()])
         .layer(SessionLayer::new(store, SessionConfig::default()))
         .build()
 }
@@ -717,19 +726,42 @@ async fn get_via_repository_endpoint_fails_closed_when_policy_is_not_registered(
     );
 }
 
+fn build_secret_app_without_policy_registration(
+    pool: Pool<AsyncPgConnection>,
+    store: MemoryStore,
+) -> autumn_web::test::TestClient {
+    // `SecretNote` declares `policy = SecretNotePolicy` and no `scope`, so
+    // its generated `_api_list` body takes the `has_policy` (per-row
+    // `can_show`) branch rather than a scope branch — the fixture this test
+    // needs to actually exercise the missing-*policy* path on `list`,
+    // unlike `Note` (see `build_app_without_policy_registration`'s doc
+    // comment: `Note` also declares `scope = ...`, and the generated list
+    // handler picks the scope branch over the policy branch whenever
+    // `scope = ...` was declared on the macro at all, regardless of
+    // whether anything is registered for it at runtime — a Codex review
+    // round on this PR caught that this test originally used `Note` and so
+    // was passing for the wrong reason, a missing *scope* registration
+    // short-circuiting before the missing-policy path was ever reached).
+    TestApp::new()
+        .with_db(pool)
+        .routes(vec![__autumn_route_info_secret_note_api_list()])
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .build()
+}
+
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn list_via_repository_endpoint_fails_closed_when_policy_is_not_registered() {
-    let (pool, _container) = setup_pool().await;
-    seed_note(&pool, "alice's private note", 1).await;
-    seed_note(&pool, "bob's private note", 2).await;
+    let (pool, _container) = setup_secret_notes_pool().await;
+    seed_secret(&pool, "alice's private secret", 1).await;
+    seed_secret(&pool, "bob's private secret", 2).await;
 
     let store = MemoryStore::new();
     seed_session(&store, "sess-stranger", "999", None).await;
-    let client = build_app_without_policy_registration(pool, store);
+    let client = build_secret_app_without_policy_registration(pool, store);
 
     let response = client
-        .get("/api/notes")
+        .get("/api/secret-notes")
         .header("Cookie", "autumn.sid=sess-stranger")
         .send()
         .await;
@@ -743,6 +775,6 @@ async fn list_via_repository_endpoint_fails_closed_when_policy_is_not_registered
         String::from_utf8_lossy(&response.body)
     );
     let body = String::from_utf8_lossy(&response.body);
-    assert!(!body.contains("alice's private note"));
-    assert!(!body.contains("bob's private note"));
+    assert!(!body.contains("alice's private secret"));
+    assert!(!body.contains("bob's private secret"));
 }
