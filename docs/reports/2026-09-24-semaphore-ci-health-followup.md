@@ -57,8 +57,10 @@ before the fix landed on `trunk-dev`.
 None needed. This pass is verification-only:
 
 - Confirmed `sqlite_job_backend_tracks_job_status_durably`'s fix (PR #2925)
-  is holding: zero recurrences in the ~38h of ordinary PR traffic sampled
-  since its merge.
+  is holding: zero recurrences in the ~14.2h of ordinary PR traffic sampled
+  since its merge (2026-09-23T19:33:05Z through this pass's window end,
+  2026-09-24T09:42:24Z — not the full ~37.85h sampling window, most of which
+  predates the merge and contains the one known pre-fix hit).
 - Added dated 2026-09-24 updates to the `live_upgrade`, `cache_stampede`, and
   `sim_fault_plan` entries in `docs/ci-health/quarantine-ledger.md` recording
   this pass's clean sampling window, and a verification addendum to the

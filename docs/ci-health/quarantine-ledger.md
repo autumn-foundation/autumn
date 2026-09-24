@@ -1381,14 +1381,21 @@ _None as of 2026-09-05._
   result as evidence.
 
 - **2026-09-24 verification — fix holding, 0 new recurrences.** Sampled
-  `ci.yml` `pull_request` runs across the ~38h following PR #2925's merge
-  (2026-09-23T19:33:05Z through 2026-09-24T09:42:24Z, the window described in
-  the `live_upgrade` entry's 2026-09-24 dated update below). One in-window hit
-  of this test's own failure signature was found (run 35866381449, branch
-  `claude/sleepy-brown-7ke3xk`, job completed 2026-09-23T13:36:52Z), but that
-  completion time is ~6 hours **before** the fix's merge — it is the same
-  pre-fix occurrence this entry's own reproduction campaign already accounts
-  for, not a new recurrence. Zero hits after the merge.
+  `ci.yml` `pull_request` runs across the ~14.2h following PR #2925's merge
+  (2026-09-23T19:33:05Z through 2026-09-24T09:42:24Z — the tail end of the
+  broader ~37.85h window described in the `live_upgrade` entry's 2026-09-24
+  dated update below, most of which predates the merge). One hit of this
+  test's own failure signature was found in that broader window (run
+  35866381449, branch `claude/sleepy-brown-7ke3xk`, job completed
+  2026-09-23T13:36:52Z), but that completion time is ~6 hours **before** the
+  fix's merge, and outside the ~14.2h post-merge window this verification
+  actually covers — it is the same pre-fix occurrence this entry's own
+  reproduction campaign already accounts for, not a new recurrence. Zero
+  hits in the ~14.2h sampled after the merge.
+  **Correction (post-review, via a Codex review comment on PR #2942): an
+  earlier version of this note and the corresponding `live_upgrade` update
+  below misstated the post-merge verification interval as "~38h," which was
+  the full sampling window's span, not the portion after the merge.**
 
 
 ## Under active investigation, not yet quarantined
@@ -2152,9 +2159,10 @@ without also filling in the intake form above.
 
   None of the 4 match `live_upgrade`, `cache_stampede`, `sim_fault_plan`, or
   any other tracked signature. **`sqlite_job_backend_tracks_job_status_durably`'s
-  fix (PR #2925) is holding**: zero recurrences in the ~38h of PR traffic
-  sampled since its 2026-09-23T19:33:05Z merge (see the closed entry's own
-  2026-09-24 verification note above).
+  fix (PR #2925) is holding**: zero recurrences in the ~14.2h of PR traffic
+  sampled since its 2026-09-23T19:33:05Z merge, out of this pass's broader
+  ~37.85h window (see the closed entry's own 2026-09-24 verification note
+  above).
 
   `manual-macos-contention-check.yml`: still `total_count: 0` against
   `workflow_dispatch` runs, checked 2026-09-24T~09:5xZ — **15th** straight
