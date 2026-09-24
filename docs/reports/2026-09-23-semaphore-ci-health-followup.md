@@ -1,5 +1,13 @@
 # 🚦 Semaphore: CI health follow-up — `sqlite_jobs_scheduler_e2e` flake reproduced outside CI for the first time; the "concurrency required" framing was wrong
 
+**Status as of 2026-09-24: fixed and closed.** PR #2925 landed the fix this
+pass's diagnosis was circling (merged `ff406e0`, verified 100/100 against
+the same repro that found 4/50 before it) and PR #2931 closed the ledger
+entry (merged `7e7b674`). See "Superseded again" under Diagnosis below for
+how this pass's own findings relate to the landed fix. The narrative below
+is kept as the historical record of this pass's own investigation, written
+before the fix existed.
+
 Follow-up to `docs/reports/2026-09-22-semaphore-ci-health-followup.md` and the
 running investigation in `docs/ci-health/quarantine-ledger.md`. This pass had
 working network and toolchain access in its own sandbox (as the 2026-09-22
@@ -70,9 +78,25 @@ samples" on its own (two-sided Fisher: 3/100-vs-4/50 p≈0.22, 1/100-vs-0/50
 p≈1.0). Pooled across both independent samples — 7/150 (~4.7%) concurrent,
 1/150 (~0.67%) serial — a one-sided exact test gives **p≈0.033**, the only
 comparison across either report that clears a conventional significance
-threshold, using every rerun either pass collected. Recorded in
-`docs/ci-health/quarantine-ledger.md`'s own dated update reconciling the
-two entries, rather than edited into #2913's landed text.
+threshold, using every rerun either pass collected. This pass recorded that
+reconciliation as a dated update appended to the ledger's still-open entry.
+
+**Superseded again, overnight, by the actual fix landing: PR #2925 (merged
+`ff406e0`) and PR #2931 (merged `7e7b674`).** #2925 made `ensure_schema`
+drop every idle pooled connection once it creates the schema, so the pool
+never serves a connection whose cached schema predates
+`idx_autumn_jobs_unique_inflight` — the defect #2913 named, fixed directly
+at its source. Verified the way this ledger's own rule requires: the
+identical loop that failed 4/50 before the change passed 100/100 after it,
+same machine, same command — not a clean rerun of the isolated lane that
+was never sensitive to this bug. #2931 then closed the ledger entry and
+moved it to "Closed entries," which is why the reconciliation paragraph
+above no longer has a live home in the ledger: merging `trunk-dev` into
+this PR replaced the whole open entry (including this pass's reconciliation
+update) with the closed entry's one-line pointer, matching the ledger's own
+convention for a resolved flake. This report keeps the reconciliation math
+as a record of what this pass measured before the fix existed; the ledger
+itself now points straight at the closed entry and the fix commit instead.
 
 ## 🎯 Verdict path
 
@@ -295,35 +319,31 @@ to the higher concurrent rate.
 
 ## 🔧 Treatment
 
-No fix this pass. Per this role's hard gate, a fix PR needs the root-cause
-category *and* the specific defect; this pass ends with *less* certainty
-about the category than its own earlier drafts claimed, not more — the
-properly-powered serial control shows concurrency between test functions
-is not the necessary condition, so "inter-test shared resource vs.
-intra-test race widened by sibling load" was itself the wrong framing.
-Working out what "whole-binary execution context" actually means
-mechanically, then naming the specific defect, is next pass's work.
+No fix in this pass's own diagnosis — per this role's hard gate, a fix PR
+needs the root-cause category *and* the specific defect, and this pass
+ended with *less* certainty about the category than its own earlier drafts
+claimed, not more. **Overtaken by events**: PR #2925 landed the actual fix
+overnight (`ensure_schema` drops idle pooled connections once it creates
+the schema, evicting the stale-cache connection this whole chain of
+corrections was circling), verified 100/100 against the same repro that
+found 4/50 before it, and PR #2931 closed the ledger entry. Nothing further
+to work out here.
 
 Added two jobs to `.github/workflows/manual-sqlite-jobs-rerun-check.yml`,
 alongside the existing filtered/serial `rerun` job: `rerun_default_parallelism`
 builds the binary once and runs it *whole* (no filter, no `--test-threads`
 override) N times — the CI-native form of the local default-parallelism
-repro (3/100). `rerun_serial_whole_binary`, added the same pass once the
-0/20-was-underpowered finding landed, mirrors it with `--test-threads=1` —
-the CI-native form of the properly-powered serial repro (1/100). Both
-upload each iteration's full log, so a future pass (or CI itself) can
-confirm both figures without needing a local sandbox with outbound network
-access. Neither is dispatchable this pass: `workflow_dispatch` only accepts
-a workflow already on the repository's default branch (`trunk-dev`), the
-same gotcha every harness in this ledger has hit on its own introduction
-pass. Once merged, the next step is to dispatch both with
-`iterations: "100"` — a Codex review comment on PR #2922 correctly
-flagged that the workflow's default of `"50"` has `0.99^50 ≈ 60.5%`
-chance of reporting zero failures by luck alone at the observed serial 1%
-rate, not enough to confirm or refute it CI-natively; `"100"` (now a
-permitted choice on the `iterations` input) matches the local sample size
-that produced both figures. The jobs already exist — dispatch them, not
-something to reimplement.
+repro (3/100 pre-fix). `rerun_serial_whole_binary`, added the same pass
+once the 0/20-was-underpowered finding landed, mirrors it with
+`--test-threads=1` — the CI-native form of the properly-powered serial
+repro (1/100 pre-fix). Both upload each iteration's full log. These are
+still this pass's live contribution post-fix: once this PR reaches
+`trunk-dev`, dispatching both with `iterations: "100"` against the fix
+commit is the CI-native confirmation of #2925's local 100/100 result — the
+harness the ledger's own "lesson for this ledger" note (in the now-closed
+entry) says any future rerun campaign for this test needs, since a lane
+that filters to one test and serializes it was never sensitive to this
+defect in the first place.
 
 ## 📊 Measurement
 
