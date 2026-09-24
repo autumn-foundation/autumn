@@ -1,0 +1,22 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.62s
+     Running tests/integration_tests.rs (target/debug/deps/integration_tests-c4eae556de182efc)
+
+running 13 tests
+test integration::repository_authorization::ac_9b_admin_can_update_via_repository_endpoint ... ok
+test integration::repository_authorization::ac_9c_unauthorized_response_is_404_by_default ... ok
+test integration::repository_authorization::ac_9a_non_owner_cannot_update_via_repository_endpoint ... ok
+test integration::repository_authorization::ac_9d_custom_forbidden_response_403_round_trips ... ok
+test integration::repository_authorization::admin_scope_returns_all_records ... ok
+test integration::repository_authorization::get_via_repository_endpoint_fails_closed_when_policy_is_not_registered ... ok
+test integration::repository_authorization::list_via_repository_endpoint_fails_closed_when_policy_is_not_registered ... ok
+test integration::repository_authorization::handwritten_list_handler_uses_scope_via_blanket_trait ... ok
+test integration::repository_authorization::owner_can_update_their_own_note_via_repository_endpoint ... ok
+test integration::repository_authorization::policy_without_scope_filters_index_via_can_show ... ok
+test integration::repository_authorization::policy_without_scope_returns_empty_when_no_records_pass_can_show ... ok
+test integration::repository_authorization::scope_filters_repository_index_endpoint_to_owners_records ... ok
+test integration::repository_authorization::update_via_api_rejects_invalid_title ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 2028 filtered out; finished in 6.51s
+
+
+[exited with code 0]
