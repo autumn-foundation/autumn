@@ -79,13 +79,19 @@ and both change headline numbers again:
    this report's second revision does not hold up under full methodology
    matching and is retracted;** see condition A1 below for the corrected
    numbers.
-2. **A2 and B1's "warm pool" trials weren't all actually warm.** Both
-   built their pool(s), ran one DDL setup query (which leaves exactly one
-   connection idle-but-returned), and immediately started the trial loop —
-   so trial 0 raced over a pool with only 1 of the N connections its
-   racers would need actually established, while every later trial raced
-   over a fully warm pool. Checked directly against the saved per-trial
-   logs: **A2's sole below-average outcome (`successes=3`, the minimum in
+2. **A2 and B1's "warm pool" trials weren't all actually warm, for two
+   different reasons.** A2 ran its one DDL setup query through `pool_a`
+   directly — the same pool object its racers later use — leaving exactly
+   one of its connections idle-but-returned before trial 0. B1 runs DDL
+   through a separate, temporary pool built and dropped just for that
+   query; its *measured* pool starts with zero warm connections, and the
+   one connection idle by the time trial 0's racers spawn comes from
+   `create_room` and the two sequential preseed `join_room` calls that
+   immediately precede them, reusing the same connection. Either way, the
+   result is the same shape: trial 0 raced over a pool with only 1 of the
+   N connections its racers would need actually established, while every
+   later trial raced over a fully warm pool. Checked directly against the
+   saved per-trial logs: **A2's sole below-average outcome (`successes=3`, the minimum in
    its histogram) was trial 0, and B1's sole non-overshoot trial
    (`successes=1`) was also trial 0** — both exactly consistent with an
    incomplete-warm-up artifact rather than a genuine race outcome, not
@@ -198,9 +204,14 @@ across trials.
 into the single remaining seat — histogram of racer successes:
 `{1: 1, 2: 1, 3: 2, 4: 36}`. **The sole non-overshoot trial (`successes=1`)
 is, again, trial 0** — checked directly against the saved log — the same
-incomplete-warm-up artifact identified in condition A2 above: only the one
-connection from DDL setup was actually warm at trial 0. **Rerunning with
-the pool explicitly prewarmed first** (acquiring and releasing 4
+incomplete-warm-up shape identified in condition A2 above, though from a
+different source here: this harness's DDL runs through a separate,
+temporary pool that's dropped right after, so the *measured* pool starts
+fully cold; the one connection that's idle-but-returned by the time trial
+0's racers spawn comes from `create_room` and the two sequential preseed
+`join_room` calls immediately before them (all three reuse the same
+connection in sequence), not from DDL. **Rerunning with the pool
+explicitly prewarmed first** (acquiring and releasing 4
 connections — one per racer — before the trial loop starts, instead of
 relying on incidental DDL warm-up): **40/40 trials overshot (100%)**,
 histogram `{2: 2, 3: 2, 4: 36}` — genuinely deterministic once the pool is
@@ -341,10 +352,14 @@ from #2864's own dedup note.
 
 ## 🔬 Reproduce
 
-Two scratch test files (one per condition, each its own `[[test]]`-shaped
-file under `autumn-media-plugin/tests/`) were added for this session, run
-against a live Docker/testcontainers Postgres, and then **removed** (not
-committed).
+Eight scratch test files, each its own `[[test]]`-shaped file under
+`autumn-media-plugin/tests/`, were added across this session's several
+rounds of correction — two for condition A1 (an intermediate fresh-pool-
+only version, then the final fresh-pool-and-fresh-schema version), one for
+A2, two for B0 (warm and fresh-pool), and three for B1 (warm-but-not-
+prewarmed, the final explicitly-prewarmed version, and a fresh-pool
+rerun) — run against a live Docker/testcontainers Postgres, and then
+**removed** (not committed) after each.
 
 **Correction from this report's first revision:** that revision claimed
 committing these as permanent tests would "turn the CI Docker sweep red on
@@ -1170,7 +1185,8 @@ async fn pg_last_seat_contention_warm_pool_explicitly_prewarmed() {
     const RACERS: usize = 4;
     // Explicitly prewarm: acquire RACERS connections concurrently, then
     // release them all, so the pool actually has RACERS warm connections
-    // ready before trial 0 (not just the 1 left over from DDL setup).
+    // ready before trial 0 (not just the 1 left warm by create_room and
+    // the sequential preseed joins below).
     {
         let mut conns = Vec::new();
         for _ in 0..RACERS {
