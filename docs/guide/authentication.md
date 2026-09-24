@@ -433,6 +433,94 @@ remember-me) and
 
 ---
 
+## Passwordless sign-in: magic link and passkey login
+
+Signing a user in without a password. Both mechanisms are flags on
+[`autumn generate auth`](#quick-start-autumn-generate-auth) rather than separate
+subsystems, and both **replace** the password rather than adding a factor on top
+of it — a different security property from two-factor authentication (2FA),
+which keeps the password and requires a second proof as well. Each composes with
+the others on the same model.
+
+| Flag | Mechanism | Routes it generates |
+|---|---|---|
+| `--magic-link` | A single-use sign-in link emailed to the address | `GET`/`POST` `/login/magic`, `GET`/`POST` `/login/magic/verify` |
+| `--passkeys` | WebAuthn — platform authenticators (Touch ID, Face ID, Windows Hello) and FIDO2 security keys | `/passkeys/register`, `/passkeys/login`, `/passkeys`, `/passkeys/revoke` |
+
+The generator writes the handlers, the migration and the templates, and
+describes what it wrote **into your project**: `--magic-link` appends a
+passwordless section to your project-local `docs/guide/authentication.md`, and
+`--passkeys` writes `docs/guide/passkeys.md`. Those describe *your* generated
+code. The settings below are the framework's: they are what the generated
+handlers read at runtime, so they apply whether you have run the generator yet
+or are still deciding whether the defaults suit you.
+
+### Magic link expiry (TTL) and per-email cooldown
+
+```toml
+[auth.magic_link]
+ttl_minutes         = 15   # one-time link lifetime, in minutes
+email_cooldown_secs = 60   # per-email re-mint window, in seconds
+```
+
+Both keys are optional; omitting the section applies these defaults. Each has an
+`AUTUMN_AUTH__MAGIC_LINK__*` environment override
+(`AUTUMN_AUTH__MAGIC_LINK__TTL_MINUTES`,
+`AUTUMN_AUTH__MAGIC_LINK__EMAIL_COOLDOWN_SECS`) — see
+[runtime config](./runtime-config.md).
+
+- `ttl_minutes` (default `15`) — a magic link is a bearer credential, so the
+  expiry window bounds the blast radius of one that leaks, via a forwarded mail
+  or a shared inbox. Keep it at `15` or less; raise it only against that
+  tradeoff. A negative value fails deserialization rather than minting
+  already-expired links.
+- `email_cooldown_secs` (default `60`) — `POST /login/magic` skips minting a
+  fresh token when an unexpired, unconsumed one was already issued for that
+  address inside the window, which throttles email-bombing a single address even
+  from rotating IPs. The per-IP limit is separate, enforced by
+  [`#[throttle]`](./rate-limiting.md) on the route.
+
+Sending the link needs a configured mailer — see [Mail](./mail.md).
+
+### Passkey (WebAuthn) relying-party settings: `rp_id` and `rp_origin`
+
+Passkeys need the `webauthn` Cargo feature and a **relying party** — the domain
+the credential is bound to. `rp_id` and `rp_origin` both default to the empty
+string, and the passkey routes return `500` with "WebAuthn is not configured"
+until you set them, so this is required configuration rather than tuning:
+
+```toml
+[auth.webauthn]
+rp_id     = "example.com"          # domain only — no scheme, no port
+rp_name   = "My App"               # shown in the authenticator's dialog
+rp_origin = "https://example.com"  # full origin, including the scheme
+```
+
+For local development, the origin carries the port and the scheme is `http`:
+
+```toml
+[auth.webauthn]
+rp_id     = "localhost"
+rp_name   = "My App (dev)"
+rp_origin = "http://localhost:3000"
+```
+
+- `rp_id` must be the registrable domain, or a parent of it — `example.com`
+  covers `app.example.com`, and the reverse does not hold.
+- `rp_origin` must parse as a URL and must be an origin that `rp_id` covers.
+  `WebauthnBuilder` rejects a mismatch, so a wrong pair surfaces as a `500` from
+  the passkey routes rather than as a ceremony that fails in the browser.
+- Changing `rp_id` invalidates every credential already registered under the old
+  value: a passkey is bound to the relying party it was created for. Treat it as
+  a migration, not a config edit.
+- `rp_name` (default `"My App"`) is display text only, and safe to change.
+
+Binding is the security property, not a detail: a credential registered against
+`example.com` cannot authenticate against an attacker's domain even if the
+credential bytes are stolen.
+
+---
+
 ## Protecting routes
 
 ### `#[secured]`
@@ -986,9 +1074,10 @@ indistinguishable, and that logout makes the old cookie unusable. See the
   for "may this user touch this record?".
 - Two-factor authentication (2FA / MFA) — `autumn generate auth User --totp`
   adds a TOTP second factor on top of the password.
-- Passwordless sign-in — `autumn generate auth User --passkeys` or
-  `--magic-link` replaces the password instead of adding a factor to it. Each
-  flag writes its flows and its own project-local docs.
+- [Passwordless sign-in](#passwordless-sign-in-magic-link-and-passkey-login) —
+  `autumn generate auth User --passkeys` or `--magic-link` replaces the password
+  instead of adding a factor to it, with its `[auth.webauthn]` and
+  `[auth.magic_link]` settings.
 - [Rate limiting](./rate-limiting.md) and [bot protection](./bot-protection.md)
   — the volumetric half of credential-stuffing defence.
 - [Submit tokens](./submit-tokens.md) — at-most-once signup and reset forms.
