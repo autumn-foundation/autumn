@@ -7318,6 +7318,20 @@ impl AppBuilder {
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
+        // Custom domains (#2652): the `custom_domains` retention dataset looks
+        // up the same pruner the server installs, but the TLS bind path that
+        // installs it never runs in a one-shot `run_framework_retention_mode`
+        // — without this the dataset always reported "custom domains are not
+        // enabled". The pruner carries no ACME issuer: pruning only touches
+        // the registry and the certificate store, so no order is placed and
+        // no CA is contacted.
+        #[cfg(feature = "acme")]
+        install_custom_domain_retention_pruner(
+            config.server.tls.as_ref().and_then(|tls| tls.acme.as_ref()),
+            config.tenancy.base_domain.as_deref(),
+            &state,
+        )
+        .await;
         // The app's own state initializers are what install the GDPR registry
         // a legal hold lives in. Skipping them would make `autumn db
         // retention` report a sweep the running app would actually refuse.
@@ -9686,22 +9700,7 @@ async fn build_acme_tls_listener(
     // so the deployment's certificate keeps serving its own names unchanged.
     let custom_domains = match acme_cfg.custom_domains.as_ref() {
         Some(cd_cfg) if cd_cfg.enabled => {
-            // Reserve everything this deployment already serves. Without it a
-            // tenant registers another tenant's subdomain — which the
-            // operator's own wildcard already points here, so it verifies and
-            // issues — and every request for that host then resolves to
-            // whoever registered it.
-            let mut reserved = acme_cfg.domains.clone();
-            reserved.extend(tenancy_base_domain.map(ToOwned::to_owned));
-            // The ingress hostname is the sharpest of the three. It ALREADY
-            // resolves to the ingress addresses, so a tenant who registers it
-            // needs no DNS change at all: verification passes on the first
-            // tick, HTTP-01 validates, and from then on every request to the
-            // deployment's own infrastructure hostname routes to that tenant.
-            // It is not necessarily covered by `domains` — an operator may run
-            // ingress under a separate infrastructure zone — so it is reserved
-            // explicitly rather than by assuming overlap.
-            reserved.extend(cd_cfg.ingress_hostname.clone());
+            let reserved = custom_domain_reserved_names(acme_cfg, tenancy_base_domain);
             let registry = std::sync::Arc::new(
                 crate::custom_domain::CustomDomainRegistry::new(
                     std::sync::Arc::new(crate::custom_domain::FsCustomDomainStore::new(
@@ -9992,6 +9991,117 @@ fn compose_acme_alert_reporter(
     })
 }
 
+/// The hostnames custom-domain registration must never claim: the
+/// deployment's own ACME domains, the tenancy base domain, and the ingress
+/// hostname.
+///
+/// Shared by the TLS bind path and the one-shot `autumn db retention` path so
+/// the two registries agree on what is reserved (#2652).
+#[cfg(feature = "acme")]
+fn custom_domain_reserved_names(
+    acme_cfg: &crate::config::AcmeConfig,
+    tenancy_base_domain: Option<&str>,
+) -> Vec<String> {
+    // Reserve everything this deployment already serves. Without it a
+    // tenant registers another tenant's subdomain — which the
+    // operator's own wildcard already points here, so it verifies and
+    // issues — and every request for that host then resolves to
+    // whoever registered it.
+    let mut reserved = acme_cfg.domains.clone();
+    reserved.extend(tenancy_base_domain.map(ToOwned::to_owned));
+    // The ingress hostname is the sharpest of the three. It ALREADY
+    // resolves to the ingress addresses, so a tenant who registers it
+    // needs no DNS change at all: verification passes on the first
+    // tick, HTTP-01 validates, and from then on every request to the
+    // deployment's own infrastructure hostname routes to that tenant.
+    // It is not necessarily covered by `domains` — an operator may run
+    // ingress under a separate infrastructure zone — so it is reserved
+    // explicitly rather than by assuming overlap.
+    if let Some(cd_cfg) = acme_cfg.custom_domains.as_ref() {
+        reserved.extend(cd_cfg.ingress_hostname.clone());
+    }
+    reserved
+}
+
+/// Install the custom-domain retention pruner for a one-shot
+/// `autumn db retention` run (#2652).
+///
+/// The `dyn CustomDomainPruner` extension is normally installed by
+/// [`spawn_custom_domain_task`] on the TLS bind path, which a one-shot run
+/// never takes — without this the `custom_domains` dataset always reported
+/// "custom domains are not enabled". The pruner carries no ACME issuer:
+/// pruning only touches the registry and the certificate store, so no order
+/// is placed and no CA is contacted.
+#[cfg(feature = "acme")]
+async fn install_custom_domain_retention_pruner(
+    acme: Option<&crate::config::AcmeConfig>,
+    tenancy_base_domain: Option<&str>,
+    state: &AppState,
+) {
+    let Some(acme_cfg) = acme else {
+        return;
+    };
+    let Some(cd_cfg) = acme_cfg.custom_domains.as_ref() else {
+        return;
+    };
+    if !cd_cfg.enabled {
+        return;
+    }
+    let registry = std::sync::Arc::new(
+        crate::custom_domain::CustomDomainRegistry::new(
+            std::sync::Arc::new(crate::custom_domain::FsCustomDomainStore::new(
+                cd_cfg.store_dir.clone(),
+            )),
+            cd_cfg.max_domains,
+        )
+        .with_reserved(custom_domain_reserved_names(acme_cfg, tenancy_base_domain)),
+    );
+    match registry.load().await {
+        Ok(count) => tracing::info!(count, "loaded tenant custom domains"),
+        // A registry that cannot be read is not fatal to the deployment: its
+        // own certificate still serves. It IS fatal to pruning, though — an
+        // index that hydrated nothing cannot tell whether a hostname is
+        // already owned, so `prune` refuses rather than deleting every stored
+        // key.
+        Err(e) => tracing::error!(
+            "failed to load the tenant custom-domain registry: {e}; the custom_domains \
+             retention dataset will refuse to prune until this is fixed"
+        ),
+    }
+    let store = std::sync::Arc::new(crate::acme::store::FsAcmeStore::new(
+        acme_cfg.cache_dir.clone(),
+        crate::acme::directory_label(&acme_cfg.directory),
+    ));
+    let pruner = crate::acme::tenant_domains::PruneOnlyCustomDomainPruner {
+        registry,
+        cache: std::sync::Arc::new(crate::custom_domain::CustomDomainCertCache::new(
+            cd_cfg.cert_cache_size,
+        )),
+        certs: std::sync::Arc::clone(&store) as std::sync::Arc<dyn crate::acme::store::AcmeStore>,
+        limiter: std::sync::Arc::new(crate::custom_domain::IssuanceLimiter::new(
+            cd_cfg.issuance_per_domain_per_day,
+            cd_cfg.issuance_global_per_hour,
+            cd_cfg.failure_backoff_secs,
+            cd_cfg.max_failure_backoff_secs,
+        )),
+        cert_store_paths: Some(store),
+        // The deployment's own certificate shares this store and has no
+        // registry record; naming it keeps the retention prune from deleting
+        // the certificate the listener is serving.
+        retained_cert_ids: std::iter::once(
+            crate::acme::store::CertId::from_domains(&acme_cfg.domains)
+                .as_str()
+                .to_owned(),
+        )
+        .collect(),
+        reporter: make_custom_domain_reporter(state),
+        recovery: Some(make_custom_domain_recovery(state)),
+    };
+    state
+        .insert_extension(std::sync::Arc::new(pruner)
+            as std::sync::Arc<dyn crate::custom_domain::CustomDomainPruner>);
+}
+
 /// Publish the custom-domain registry and spawn its orchestrator (#1635).
 ///
 /// The registry goes into `AppState` so tenancy resolution can route a
@@ -10065,7 +10175,9 @@ fn spawn_custom_domain_task(
         .collect(),
     });
 
-    state.insert_extension(std::sync::Arc::clone(&task)
+    // The pruner is the retention half of the task, not the task itself: the
+    // same small type the one-shot `autumn db retention` path installs (#2652).
+    state.insert_extension(std::sync::Arc::new(task.pruner())
         as std::sync::Arc<dyn crate::custom_domain::CustomDomainPruner>);
 
     let interval = std::time::Duration::from_secs(config.poll_interval_secs.max(1));
@@ -19896,5 +20008,63 @@ mod unix_socket_tests {
         let err = prepare_unix_socket_path(&path).expect_err("must refuse a non-socket file");
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         assert!(path.exists(), "regular file must not be removed");
+    }
+
+    /// Regression (#2652): the one-shot `autumn db retention` path must
+    /// install the same `dyn CustomDomainPruner` the server installs — the
+    /// TLS bind path that used to do it never runs in a one-shot, so the
+    /// `custom_domains` retention dataset always reported "custom domains
+    /// are not enabled".
+    #[cfg(feature = "acme")]
+    #[tokio::test]
+    async fn retention_mode_installs_the_custom_domain_pruner() {
+        fn acme_with_custom_domains(enabled: bool) -> crate::config::AcmeConfig {
+            let toml = format!(
+                "domains = [\"app.example.com\"]\ncontact_email = \"ops@example.com\"\n\
+                 [custom_domains]\nenabled = {enabled}\n"
+            );
+            toml::from_str(&toml).expect("test ACME config parses")
+        }
+
+        // Enabled custom domains: the pruner is installed. It carries no ACME
+        // issuer — pruning only touches the registry and the certificate
+        // store, so no order is placed and no CA is contacted.
+        let state = crate::state::AppState::for_test();
+        super::install_custom_domain_retention_pruner(
+            Some(&acme_with_custom_domains(true)),
+            None,
+            &state,
+        )
+        .await;
+        assert!(
+            state
+                .extension::<std::sync::Arc<dyn crate::custom_domain::CustomDomainPruner>>()
+                .is_some(),
+            "one-shot retention must install the custom-domain pruner"
+        );
+
+        // Custom domains disabled: nothing is installed, and the dataset keeps
+        // its honest "not enabled" report.
+        let state = crate::state::AppState::for_test();
+        super::install_custom_domain_retention_pruner(
+            Some(&acme_with_custom_domains(false)),
+            None,
+            &state,
+        )
+        .await;
+        assert!(
+            state
+                .extension::<std::sync::Arc<dyn crate::custom_domain::CustomDomainPruner>>()
+                .is_none()
+        );
+
+        // No ACME at all: nothing is installed.
+        let state = crate::state::AppState::for_test();
+        super::install_custom_domain_retention_pruner(None, None, &state).await;
+        assert!(
+            state
+                .extension::<std::sync::Arc<dyn crate::custom_domain::CustomDomainPruner>>()
+                .is_none()
+        );
     }
 }

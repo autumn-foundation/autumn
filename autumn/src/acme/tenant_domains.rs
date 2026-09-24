@@ -194,6 +194,324 @@ impl std::fmt::Debug for CustomDomainTask {
     }
 }
 
+// ── The prune-only half ────────────────────────────────────────────────────
+
+/// The retention-prune half of [`CustomDomainTask`]: everything the
+/// [`CustomDomainPruner`](crate::custom_domain::CustomDomainPruner) trait
+/// needs, and none of the issuance/renewal orchestration.
+///
+/// The server installs this — not the task — as the `dyn CustomDomainPruner`
+/// state extension, and the one-shot `autumn db retention` path installs the
+/// same type. Pruning only touches the registry and the certificate store, so
+/// the CLI never builds an ACME issuer: no order is placed and no CA is
+/// contacted (#2652).
+pub struct PruneOnlyCustomDomainPruner {
+    /// The hostname → tenant registry, and the lifecycle state it holds.
+    pub registry: Arc<CustomDomainRegistry>,
+    /// The bounded cache the SNI resolver reads; offboarding evicts from it.
+    pub cache: Arc<CustomDomainCertCache>,
+    /// Certificate persistence, for deleting an offboarded pair.
+    pub certs: Arc<dyn AcmeStore>,
+    /// Per-domain issuance budgets; offboarding forgets the hostname.
+    pub limiter: Arc<IssuanceLimiter>,
+    /// The certificate store as a filesystem store, when it is one, so the
+    /// retention prune can enumerate stored pairs. `None` disables orphan
+    /// pruning rather than guessing at another store's layout.
+    pub cert_store_paths: Option<Arc<crate::acme::store::FsAcmeStore>>,
+    /// Certificate ids the prune must never delete — the deployment's own
+    /// certificate, which shares this store but has no registry record.
+    pub retained_cert_ids: std::collections::HashSet<String>,
+    /// Where a failed certificate delete is reported (#1610's
+    /// failed-scheduled-operation alert).
+    pub reporter: ReporterFn,
+    /// Invoked once no domain carries a failure any more, so the operator
+    /// alert the reporter raised is cleared rather than left standing.
+    pub recovery: Option<RecoveryFn>,
+}
+
+impl PruneOnlyCustomDomainPruner {
+    /// Offboard `hostname`: stop routing, stop serving, halt renewal, and
+    /// delete the stored certificate so it is not orphaned (AC7, #1605).
+    ///
+    /// # Errors
+    ///
+    /// Propagates a registry-store error. A certificate that cannot be deleted
+    /// is logged rather than failing the offboarding: the domain is already
+    /// unroutable and unservable by then, so leaving it registered would be
+    /// worse.
+    pub async fn offboard(&self, hostname: &str) -> std::io::Result<bool> {
+        // Normalise once, up front: the registry normalises internally, but the
+        // cache key, the budget history and the certificate id all derive from
+        // the raw string, so `offboard("APP.ClientCo.com.")` would drop the
+        // record and leave the private key on disk.
+        let Ok(host) = crate::custom_domain::normalize_hostname(hostname) else {
+            return Ok(false);
+        };
+        self.offboard_guarded(&host, |_| true).await
+    }
+
+    /// Remove one hostname while `guard` holds for the stored record, then drop
+    /// what this process holds for it.
+    ///
+    /// Every offboarding path goes through here. The guard runs inside the
+    /// registry's per-hostname write gate, so a caller that chose this hostname
+    /// before an `.await` — a retention sweep, a tenant-wide teardown — re-
+    /// asserts that choice against the record as it is now rather than
+    /// disconnecting whoever holds the hostname by the time its turn comes.
+    async fn offboard_guarded(
+        &self,
+        host: &str,
+        guard: impl FnOnce(&crate::custom_domain::CustomDomain) -> bool,
+    ) -> std::io::Result<bool> {
+        let removed = self.registry.remove_if(host, guard).await?;
+        // Purge only while the hostname is still nobody's. A successor that
+        // registered in the gap owns whatever sits at this hostname's cache
+        // slot and certificate id now, and deleting those would leave THEIR
+        // domain recorded as active with nothing to serve.
+        let purged = if self.registry.get(host).is_none() {
+            self.purge_local(host).await
+        } else {
+            true
+        };
+        // A cleanup that failed has just raised its own alert, naming a private
+        // key still on disk. Retracting it here — because the registry is
+        // empty and therefore "healthy" — would leave that key with nothing
+        // pointing at it, and no retention sweep runs by default.
+        if removed && purged {
+            self.clear_alert_if_healthy(crate::custom_domain::now_unix());
+        }
+        Ok(removed)
+    }
+
+    /// Offboard `hostname` only while it is still the record `expected`
+    /// describes — same tenant, same status, same registration time.
+    ///
+    /// The retention sweep's candidates come from a snapshot taken before a
+    /// series of awaits; this re-asserts each one inside the registry's
+    /// per-hostname write gate, so a domain that finished setup in the
+    /// meantime is left alone. Nothing local is purged when the guard rejects:
+    /// the certificate belongs to a domain that is now live.
+    async fn offboard_if_unchanged(
+        &self,
+        expected: &crate::custom_domain::CustomDomain,
+    ) -> std::io::Result<bool> {
+        let Ok(host) = crate::custom_domain::normalize_hostname(&expected.hostname) else {
+            return Ok(false);
+        };
+        let removed = self
+            .offboard_guarded(&host, |current| {
+                current.tenant == expected.tenant
+                    && current.status == expected.status
+                    && current.registered_at_unix == expected.registered_at_unix
+            })
+            .await?;
+        if !removed {
+            tracing::debug!(
+                hostname = %host,
+                "skipping a retention offboard: the domain changed while the sweep was running"
+            );
+        }
+        Ok(removed)
+    }
+
+    /// Drop everything this process holds for an offboarded hostname.
+    ///
+    /// A certificate that cannot be deleted does not fail the offboarding: the
+    /// domain is already unroutable and unservable, and reporting failure would
+    /// suggest none of it happened. It is ALERTED instead — an offboarded
+    /// tenant's private key left on disk is an operator's problem, and nothing
+    /// else retries it: the orphan prune only runs when a `[retention]
+    /// custom_domains` window is configured, and it is unset by default.
+    /// Returns whether everything local actually went.
+    async fn purge_local(&self, host: &str) -> bool {
+        self.cache.remove(host);
+        self.limiter.forget(host);
+        if let Err(e) = self.certs.delete_cert(&cert_id_for(host)).await {
+            let message = format!(
+                "offboarded custom domain {host} but could not delete its certificate: {e}. The \
+                 certificate and private key are still on disk"
+            );
+            tracing::warn!("{message}");
+            (self.reporter)(message);
+            return false;
+        }
+        true
+    }
+
+    /// Retract the operator alert once NOTHING is failing any more.
+    ///
+    /// Offboarding the one domain that was failing removes the failure from the
+    /// registry but is not itself a success, so without this the
+    /// `scheduled_task_failure` alert it raised would stand for a domain that
+    /// no longer exists.
+    fn clear_alert_if_healthy(&self, now_unix: i64) {
+        if let Some(recovery) = &self.recovery
+            && self.registry.health_report(now_unix).is_empty()
+        {
+            recovery();
+        }
+    }
+
+    /// Offboard every domain a tenant owns. Returns how many were removed.
+    ///
+    /// The hostname list is a snapshot and each offboard awaits, so every
+    /// removal re-asserts the tenant: a hostname freed early in the sweep can
+    /// be re-registered by ANOTHER tenant before a later one runs, and removing
+    /// it unconditionally would disconnect a tenant who was never part of this
+    /// teardown.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the registry store's delete error.
+    pub async fn offboard_tenant(&self, tenant: &str) -> std::io::Result<usize> {
+        let hostnames: Vec<String> = self
+            .registry
+            .list_for_tenant(tenant)
+            .into_iter()
+            .map(|d| d.hostname)
+            .collect();
+        let mut removed = 0;
+        for hostname in hostnames {
+            let Ok(host) = crate::custom_domain::normalize_hostname(&hostname) else {
+                continue;
+            };
+            if self
+                .offboard_guarded(&host, |current| current.tenant == tenant)
+                .await?
+            {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Delete stored certificate pairs no registered hostname maps to.
+    ///
+    /// Only certificates whose [`CertId`] matches some *removed* custom domain
+    /// can be identified: an id is a hash, so the deployment's own certificate
+    /// (and any other) is left alone by construction — we delete only ids that
+    /// no longer appear in the registry AND are not the configured cert.
+    fn prune_orphan_certs(&self, dry_run: bool) -> Result<u64, String> {
+        let Some(fs) = self.cert_store_paths.as_ref() else {
+            // A non-filesystem store cannot be enumerated through this seam.
+            return Ok(0);
+        };
+        // Enumerate the store FIRST, then snapshot the registry. The reverse
+        // order deletes a certificate issued in between: its hostname was
+        // registered after the registry snapshot, so it is missing from `live`,
+        // while its freshly written pair is already in `stored`. Activation
+        // would then complete with its durable certificate gone, and the domain
+        // would fail the first handshake after a cache eviction or a restart.
+        // This way, a pair written after the enumeration is simply not a
+        // candidate, and one written before it has a record the later snapshot
+        // sees.
+        let stored = fs
+            .list_certs()
+            .map_err(|e| format!("failed to enumerate stored certificates: {e}"))?;
+        let live: std::collections::HashSet<String> = self
+            .registry
+            .list()
+            .into_iter()
+            .map(|d| cert_id_for(&d.hostname).as_str().to_owned())
+            .collect();
+        let mut removed = 0;
+        for (id, chain, key) in stored {
+            if live.contains(id.as_str()) || self.retained_cert_ids.contains(id.as_str()) {
+                continue;
+            }
+            if dry_run {
+                removed += 1;
+                continue;
+            }
+            let mut deleted = true;
+            // The KEY first. `list_certs` discovers candidates from their
+            // `.chain.pem`, so a crash after removing the chain would strand a
+            // private key no later sweep can ever find again. This order leaves
+            // at worst a public chain behind, which the next sweep re-lists.
+            for path in [&key, &chain] {
+                if let Err(e) = std::fs::remove_file(path) {
+                    tracing::warn!(path = %path.display(), "failed to remove an orphaned certificate: {e}");
+                    deleted = false;
+                }
+            }
+            // Count only what actually went: the retention report must not
+            // claim a deletion that failed.
+            if deleted {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+}
+
+impl crate::custom_domain::CustomDomainPruner for PruneOnlyCustomDomainPruner {
+    fn prune(
+        &self,
+        cutoff_unix: i64,
+        dry_run: bool,
+    ) -> futures::future::BoxFuture<'_, Result<u64, String>> {
+        Box::pin(async move {
+            // An index that failed to hydrate knows nothing, so EVERY tenant
+            // certificate would read as an orphan and be deleted. One transient
+            // read error at boot must not cost the deployment every private key
+            // it holds.
+            if !self.registry.is_hydrated() {
+                return Err(
+                    "refusing to prune: the custom-domain registry did not load at boot, so \
+                     every certificate would look orphaned"
+                        .to_owned(),
+                );
+            }
+            let mut removed = 0_u64;
+            // Abandoned connections: a tenant was handed DNS instructions and
+            // never published the record. Nothing else ever deletes these.
+            for domain in self.registry.list() {
+                if domain.status == crate::custom_domain::DomainStatus::PendingDns
+                    && domain.registered_at_unix < cutoff_unix
+                {
+                    if dry_run {
+                        removed += 1;
+                        continue;
+                    }
+                    // These candidates came from a `list()` snapshot and each
+                    // offboard below awaits, so by the time this one runs the
+                    // domain may have verified, issued and gone `Active` — the
+                    // orchestrator ticks concurrently. Deleting it then would
+                    // disconnect a tenant seconds after their domain came up,
+                    // and take the certificate with it, so the record is
+                    // re-asserted inside the registry's per-hostname gate.
+                    if self
+                        .offboard_if_unchanged(&domain)
+                        .await
+                        .map_err(|e| format!("failed to offboard {}: {e}", domain.hostname))?
+                    {
+                        removed += 1;
+                    }
+                }
+            }
+            // Orphaned certificates: a pair whose hostname is no longer
+            // registered at all. Pruned regardless of the cutoff — there is no
+            // record left to age.
+            removed += self.prune_orphan_certs(dry_run)?;
+            Ok(removed)
+        })
+    }
+
+    fn offboard_domain<'a>(
+        &'a self,
+        hostname: &'a str,
+    ) -> futures::future::BoxFuture<'a, std::io::Result<bool>> {
+        Box::pin(self.offboard(hostname))
+    }
+
+    fn offboard_tenant_domains<'a>(
+        &'a self,
+        tenant: &'a str,
+    ) -> futures::future::BoxFuture<'a, std::io::Result<usize>> {
+        Box::pin(self.offboard_tenant(tenant))
+    }
+}
+
 impl CustomDomainTask {
     /// Run until `shutdown`, ticking every `interval`.
     ///
@@ -702,159 +1020,48 @@ impl CustomDomainTask {
         }
     }
 
+    /// The prune-only half of this task: the
+    /// [`CustomDomainPruner`](crate::custom_domain::CustomDomainPruner)
+    /// implementation the server and `autumn db retention` both install.
+    pub(crate) fn pruner(&self) -> PruneOnlyCustomDomainPruner {
+        PruneOnlyCustomDomainPruner {
+            registry: Arc::clone(&self.registry),
+            cache: Arc::clone(&self.cache),
+            certs: Arc::clone(&self.certs),
+            limiter: Arc::clone(&self.limiter),
+            cert_store_paths: self.cert_store_paths.clone(),
+            retained_cert_ids: self.retained_cert_ids.clone(),
+            reporter: Arc::clone(&self.reporter),
+            recovery: self.recovery.clone(),
+        }
+    }
+
+    /// Retract the operator alert once NOTHING is failing any more.
+    ///
+    /// Shared with the prune half; see
+    /// [`PruneOnlyCustomDomainPruner::clear_alert_if_healthy`].
+    fn clear_alert_if_healthy(&self, now_unix: i64) {
+        self.pruner().clear_alert_if_healthy(now_unix);
+    }
+
     /// Offboard `hostname`: stop routing, stop serving, halt renewal, and
     /// delete the stored certificate so it is not orphaned (AC7, #1605).
     ///
     /// # Errors
     ///
-    /// Propagates a registry-store error. A certificate that cannot be deleted
-    /// is logged rather than failing the offboarding: the domain is already
-    /// unroutable and unservable by then, so leaving it registered would be
-    /// worse.
+    /// Propagates a registry-store error; see
+    /// [`PruneOnlyCustomDomainPruner::offboard`].
     pub async fn offboard(&self, hostname: &str) -> std::io::Result<bool> {
-        // Normalise once, up front: the registry normalises internally, but the
-        // cache key, the budget history and the certificate id all derive from
-        // the raw string, so `offboard("APP.ClientCo.com.")` would drop the
-        // record and leave the private key on disk.
-        let Ok(host) = crate::custom_domain::normalize_hostname(hostname) else {
-            return Ok(false);
-        };
-        self.offboard_guarded(&host, |_| true).await
-    }
-
-    /// Remove one hostname while `guard` holds for the stored record, then drop
-    /// what this process holds for it.
-    ///
-    /// Every offboarding path goes through here. The guard runs inside the
-    /// registry's per-hostname write gate, so a caller that chose this hostname
-    /// before an `.await` — a retention sweep, a tenant-wide teardown — re-
-    /// asserts that choice against the record as it is now rather than
-    /// disconnecting whoever holds the hostname by the time its turn comes.
-    async fn offboard_guarded(
-        &self,
-        host: &str,
-        guard: impl FnOnce(&crate::custom_domain::CustomDomain) -> bool,
-    ) -> std::io::Result<bool> {
-        let removed = self.registry.remove_if(host, guard).await?;
-        // Purge only while the hostname is still nobody's. A successor that
-        // registered in the gap owns whatever sits at this hostname's cache
-        // slot and certificate id now, and deleting those would leave THEIR
-        // domain recorded as active with nothing to serve.
-        let purged = if self.registry.get(host).is_none() {
-            self.purge_local(host).await
-        } else {
-            true
-        };
-        // A cleanup that failed has just raised its own alert, naming a private
-        // key still on disk. Retracting it here — because the registry is
-        // empty and therefore "healthy" — would leave that key with nothing
-        // pointing at it, and no retention sweep runs by default.
-        if removed && purged {
-            self.clear_alert_if_healthy(crate::custom_domain::now_unix());
-        }
-        Ok(removed)
-    }
-
-    /// Offboard `hostname` only while it is still the record `expected`
-    /// describes — same tenant, same status, same registration time.
-    ///
-    /// The retention sweep's candidates come from a snapshot taken before a
-    /// series of awaits; this re-asserts each one inside the registry's
-    /// per-hostname write gate, so a domain that finished setup in the
-    /// meantime is left alone. Nothing local is purged when the guard rejects:
-    /// the certificate belongs to a domain that is now live.
-    async fn offboard_if_unchanged(
-        &self,
-        expected: &crate::custom_domain::CustomDomain,
-    ) -> std::io::Result<bool> {
-        let Ok(host) = crate::custom_domain::normalize_hostname(&expected.hostname) else {
-            return Ok(false);
-        };
-        let removed = self
-            .offboard_guarded(&host, |current| {
-                current.tenant == expected.tenant
-                    && current.status == expected.status
-                    && current.registered_at_unix == expected.registered_at_unix
-            })
-            .await?;
-        if !removed {
-            tracing::debug!(
-                hostname = %host,
-                "skipping a retention offboard: the domain changed while the sweep was running"
-            );
-        }
-        Ok(removed)
-    }
-
-    /// Drop everything this process holds for an offboarded hostname.
-    ///
-    /// A certificate that cannot be deleted does not fail the offboarding: the
-    /// domain is already unroutable and unservable, and reporting failure would
-    /// suggest none of it happened. It is ALERTED instead — an offboarded
-    /// tenant's private key left on disk is an operator's problem, and nothing
-    /// else retries it: the orphan prune only runs when a `[retention]
-    /// custom_domains` window is configured, and it is unset by default.
-    /// Returns whether everything local actually went.
-    async fn purge_local(&self, host: &str) -> bool {
-        self.cache.remove(host);
-        self.limiter.forget(host);
-        if let Err(e) = self.certs.delete_cert(&cert_id_for(host)).await {
-            let message = format!(
-                "offboarded custom domain {host} but could not delete its certificate: {e}. The \
-                 certificate and private key are still on disk"
-            );
-            tracing::warn!("{message}");
-            (self.reporter)(message);
-            return false;
-        }
-        true
-    }
-
-    /// Retract the operator alert once NOTHING is failing any more.
-    ///
-    /// Offboarding the one domain that was failing removes the failure from the
-    /// registry but is not itself a success, so without this the
-    /// `scheduled_task_failure` alert it raised would stand for a domain that
-    /// no longer exists.
-    fn clear_alert_if_healthy(&self, now_unix: i64) {
-        if let Some(recovery) = &self.recovery
-            && self.registry.health_report(now_unix).is_empty()
-        {
-            recovery();
-        }
+        self.pruner().offboard(hostname).await
     }
 
     /// Offboard every domain a tenant owns. Returns how many were removed.
-    ///
-    /// The hostname list is a snapshot and each offboard awaits, so every
-    /// removal re-asserts the tenant: a hostname freed early in the sweep can
-    /// be re-registered by ANOTHER tenant before a later one runs, and removing
-    /// it unconditionally would disconnect a tenant who was never part of this
-    /// teardown.
     ///
     /// # Errors
     ///
     /// Propagates the registry store's delete error.
     pub async fn offboard_tenant(&self, tenant: &str) -> std::io::Result<usize> {
-        let hostnames: Vec<String> = self
-            .registry
-            .list_for_tenant(tenant)
-            .into_iter()
-            .map(|d| d.hostname)
-            .collect();
-        let mut removed = 0;
-        for hostname in hostnames {
-            let Ok(host) = crate::custom_domain::normalize_hostname(&hostname) else {
-                continue;
-            };
-            if self
-                .offboard_guarded(&host, |current| current.tenant == tenant)
-                .await?
-            {
-                removed += 1;
-            }
-        }
-        Ok(removed)
+        self.pruner().offboard_tenant(tenant).await
     }
 
     /// Load one domain's stored certificate into the cache. Returns whether a
@@ -922,50 +1129,14 @@ impl crate::custom_domain::CustomDomainPruner for CustomDomainTask {
         cutoff_unix: i64,
         dry_run: bool,
     ) -> futures::future::BoxFuture<'_, Result<u64, String>> {
+        let pruner = self.pruner();
         Box::pin(async move {
-            // An index that failed to hydrate knows nothing, so EVERY tenant
-            // certificate would read as an orphan and be deleted. One transient
-            // read error at boot must not cost the deployment every private key
-            // it holds.
-            if !self.registry.is_hydrated() {
-                return Err(
-                    "refusing to prune: the custom-domain registry did not load at boot, so \
-                     every certificate would look orphaned"
-                        .to_owned(),
-                );
-            }
-            let mut removed = 0_u64;
-            // Abandoned connections: a tenant was handed DNS instructions and
-            // never published the record. Nothing else ever deletes these.
-            for domain in self.registry.list() {
-                if domain.status == crate::custom_domain::DomainStatus::PendingDns
-                    && domain.registered_at_unix < cutoff_unix
-                {
-                    if dry_run {
-                        removed += 1;
-                        continue;
-                    }
-                    // These candidates came from a `list()` snapshot and each
-                    // offboard below awaits, so by the time this one runs the
-                    // domain may have verified, issued and gone `Active` — the
-                    // orchestrator ticks concurrently. Deleting it then would
-                    // disconnect a tenant seconds after their domain came up,
-                    // and take the certificate with it, so the record is
-                    // re-asserted inside the registry's per-hostname gate.
-                    if self
-                        .offboard_if_unchanged(&domain)
-                        .await
-                        .map_err(|e| format!("failed to offboard {}: {e}", domain.hostname))?
-                    {
-                        removed += 1;
-                    }
-                }
-            }
-            // Orphaned certificates: a pair whose hostname is no longer
-            // registered at all. Pruned regardless of the cutoff — there is no
-            // record left to age.
-            removed += self.prune_orphan_certs(dry_run)?;
-            Ok(removed)
+            <PruneOnlyCustomDomainPruner as crate::custom_domain::CustomDomainPruner>::prune(
+                &pruner,
+                cutoff_unix,
+                dry_run,
+            )
+            .await
         })
     }
 
@@ -973,74 +1144,26 @@ impl crate::custom_domain::CustomDomainPruner for CustomDomainTask {
         &'a self,
         hostname: &'a str,
     ) -> futures::future::BoxFuture<'a, std::io::Result<bool>> {
-        Box::pin(self.offboard(hostname))
+        let pruner = self.pruner();
+        Box::pin(async move {
+            <PruneOnlyCustomDomainPruner as crate::custom_domain::CustomDomainPruner>::offboard_domain(
+                &pruner, hostname,
+            )
+            .await
+        })
     }
 
     fn offboard_tenant_domains<'a>(
         &'a self,
         tenant: &'a str,
     ) -> futures::future::BoxFuture<'a, std::io::Result<usize>> {
-        Box::pin(self.offboard_tenant(tenant))
-    }
-}
-
-impl CustomDomainTask {
-    /// Delete stored certificate pairs no registered hostname maps to.
-    ///
-    /// Only certificates whose [`CertId`] matches some *removed* custom domain
-    /// can be identified: an id is a hash, so the deployment's own certificate
-    /// (and any other) is left alone by construction — we delete only ids that
-    /// no longer appear in the registry AND are not the configured cert.
-    fn prune_orphan_certs(&self, dry_run: bool) -> Result<u64, String> {
-        let Some(fs) = self.cert_store_paths.as_ref() else {
-            // A non-filesystem store cannot be enumerated through this seam.
-            return Ok(0);
-        };
-        // Enumerate the store FIRST, then snapshot the registry. The reverse
-        // order deletes a certificate issued in between: its hostname was
-        // registered after the registry snapshot, so it is missing from `live`,
-        // while its freshly written pair is already in `stored`. Activation
-        // would then complete with its durable certificate gone, and the domain
-        // would fail the first handshake after a cache eviction or a restart.
-        // This way, a pair written after the enumeration is simply not a
-        // candidate, and one written before it has a record the later snapshot
-        // sees.
-        let stored = fs
-            .list_certs()
-            .map_err(|e| format!("failed to enumerate stored certificates: {e}"))?;
-        let live: std::collections::HashSet<String> = self
-            .registry
-            .list()
-            .into_iter()
-            .map(|d| cert_id_for(&d.hostname).as_str().to_owned())
-            .collect();
-        let mut removed = 0;
-        for (id, chain, key) in stored {
-            if live.contains(id.as_str()) || self.retained_cert_ids.contains(id.as_str()) {
-                continue;
-            }
-            if dry_run {
-                removed += 1;
-                continue;
-            }
-            let mut deleted = true;
-            // The KEY first. `list_certs` discovers candidates from their
-            // `.chain.pem`, so a crash after removing the chain would strand a
-            // private key no later sweep can ever find again. This order leaves
-            // at worst a public chain behind, which the next sweep re-lists.
-            for path in [&key, &chain] {
-                if let Err(e) = std::fs::remove_file(path) {
-                    tracing::warn!(path = %path.display(), "failed to remove an orphaned certificate: {e}");
-                    deleted = false;
-                }
-            }
-            // Count only what actually went: the retention report must not
-            // claim a deletion that failed.
-            if deleted {
-                removed += 1;
-            }
-        }
-        Ok(removed)
+        let pruner = self.pruner();
+        Box::pin(async move {
+            <PruneOnlyCustomDomainPruner as crate::custom_domain::CustomDomainPruner>::offboard_tenant_domains(
+                &pruner, tenant,
+            )
+            .await
+        })
     }
 }
 
