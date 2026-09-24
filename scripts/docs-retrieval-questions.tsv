@@ -120,3 +120,37 @@ generate inbound mail	docs/guide/generators.md
 # to say "incoming". Same reasoning as "gzip" and "policy generator" above: a
 # phrasing question is a different defect from the coverage one this change
 # closes, and it gets its own change on its own evidence.
+
+# --- Passwordless sign-in -------------------------------------------------
+# All six failed cold before this change, over all 164 guide pages.
+# `--magic-link` and `--passkeys` are two flags on `autumn generate auth`, and
+# the only place the guide named either was one row each in the flag table
+# under "Quick start", plus three cross-references. No slug, H1 or heading in
+# the corpus carried "magic link", "passwordless" or "passkey", so the
+# capability was reachable by reading the flag table and findable by nothing.
+#
+# The reader's spelling made it worse than the 2FA case it repeats: the corpus
+# wrote "magic-link", hyphenated, so "magic link" matched ZERO guide pages even
+# on a full-text grep, not merely zero headings.
+#
+# "webauthn" was the mis-landing rather than the no-answer: it landed on
+# `generators.md`'s "WebAuthn native dependency note" — a build-time note about
+# a native dependency — which is not where a reader configuring a relying party
+# needs to arrive.
+passwordless login	docs/guide/authentication.md
+magic link	docs/guide/authentication.md
+magic link expiry	docs/guide/authentication.md
+passkey	docs/guide/authentication.md
+webauthn	docs/guide/authentication.md
+rp_id	docs/guide/authentication.md
+# "how long does a magic link last" is NOT admitted. It misses cold, and
+# closing it means a heading written in a sentence no page has a reason to
+# spell — the matcher's words, not a reader's. "magic link expiry" and "magic
+# link ttl" are the searches that carry the same intent and a heading can
+# honestly answer. Same reasoning as "gzip" and "incoming email" above.
+#
+# "2fa" and "two factor authentication" still miss, and are still not admitted
+# here. #2736 closed that class at the first screen deliberately — the words
+# are in the intro and the flag table, not in a heading — and moving it to a
+# heading is a change to that section's structure and anchors, on its own
+# evidence, not a ride on this one.
