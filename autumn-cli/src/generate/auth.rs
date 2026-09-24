@@ -1741,25 +1741,29 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
                                 let close_idx = tk.find(']').unwrap_or(tk.len());
                                 let before_close = tk[..close_idx].trim();
                                 // The closing bracket's own line may have no
-                                // entry before it (just `]`), in which case
-                                // the last real entry — needed to know
-                                // whether a comma must be inserted — is on an
-                                // earlier line.
-                                let last_entry = if before_close.is_empty() {
-                                    (j..k).rev().find_map(|idx| {
-                                        let raw = if idx == j {
-                                            lines[idx]
-                                                .split_once('[')
-                                                .map_or("", |(_, rest)| rest)
-                                                .trim()
-                                        } else {
-                                            lines[idx].trim()
-                                        };
-                                        (!raw.is_empty()).then(|| raw.to_owned())
-                                    })
-                                } else {
-                                    Some(before_close.to_owned())
-                                };
+                                // entry before it (just `]`, or just a
+                                // comment), in which case the last real entry
+                                // — needed to know whether a comma must be
+                                // inserted — is on an earlier line. A trailing
+                                // `# comment` never counts as the entry: strip
+                                // it before checking, or a commented `"ws", #
+                                // note` line reads as not ending in ',' and
+                                // gets a second, invalid comma inserted ahead
+                                // of it.
+                                let last_entry = (j..=k).rev().find_map(|idx| {
+                                    let raw: &str = if idx == k {
+                                        before_close
+                                    } else if idx == j {
+                                        lines[idx].split_once('[').map_or("", |(_, rest)| rest)
+                                    } else {
+                                        &lines[idx]
+                                    };
+                                    let raw = raw
+                                        .split_once('#')
+                                        .map_or(raw, |(before, _)| before)
+                                        .trim();
+                                    (!raw.is_empty()).then(|| raw.to_owned())
+                                });
                                 let sep = if last_entry.is_some_and(|e| !e.ends_with(',')) {
                                     ", "
                                 } else {
@@ -1978,25 +1982,29 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
                                 let close_idx = tk.find(']').unwrap_or(tk.len());
                                 let before_close = tk[..close_idx].trim();
                                 // The closing bracket's own line may have no
-                                // entry before it (just `]`), in which case
-                                // the last real entry — needed to know
-                                // whether a comma must be inserted — is on an
-                                // earlier line.
-                                let last_entry = if before_close.is_empty() {
-                                    (j..k).rev().find_map(|idx| {
-                                        let raw = if idx == j {
-                                            lines[idx]
-                                                .split_once('[')
-                                                .map_or("", |(_, rest)| rest)
-                                                .trim()
-                                        } else {
-                                            lines[idx].trim()
-                                        };
-                                        (!raw.is_empty()).then(|| raw.to_owned())
-                                    })
-                                } else {
-                                    Some(before_close.to_owned())
-                                };
+                                // entry before it (just `]`, or just a
+                                // comment), in which case the last real entry
+                                // — needed to know whether a comma must be
+                                // inserted — is on an earlier line. A trailing
+                                // `# comment` never counts as the entry: strip
+                                // it before checking, or a commented `"ws", #
+                                // note` line reads as not ending in ',' and
+                                // gets a second, invalid comma inserted ahead
+                                // of it.
+                                let last_entry = (j..=k).rev().find_map(|idx| {
+                                    let raw: &str = if idx == k {
+                                        before_close
+                                    } else if idx == j {
+                                        lines[idx].split_once('[').map_or("", |(_, rest)| rest)
+                                    } else {
+                                        &lines[idx]
+                                    };
+                                    let raw = raw
+                                        .split_once('#')
+                                        .map_or(raw, |(before, _)| before)
+                                        .trim();
+                                    (!raw.is_empty()).then(|| raw.to_owned())
+                                });
                                 let sep = if last_entry.is_some_and(|e| !e.ends_with(',')) {
                                     ", "
                                 } else {
@@ -11300,25 +11308,29 @@ fn ensure_autumn_web_webauthn_feature(toml: &str) -> String {
                                 let close_idx = tk.find(']').unwrap_or(tk.len());
                                 let before_close = tk[..close_idx].trim();
                                 // The closing bracket's own line may have no
-                                // entry before it (just `]`), in which case
-                                // the last real entry — needed to know
-                                // whether a comma must be inserted — is on an
-                                // earlier line.
-                                let last_entry = if before_close.is_empty() {
-                                    (j..k).rev().find_map(|idx| {
-                                        let raw = if idx == j {
-                                            lines[idx]
-                                                .split_once('[')
-                                                .map_or("", |(_, rest)| rest)
-                                                .trim()
-                                        } else {
-                                            lines[idx].trim()
-                                        };
-                                        (!raw.is_empty()).then(|| raw.to_owned())
-                                    })
-                                } else {
-                                    Some(before_close.to_owned())
-                                };
+                                // entry before it (just `]`, or just a
+                                // comment), in which case the last real entry
+                                // — needed to know whether a comma must be
+                                // inserted — is on an earlier line. A trailing
+                                // `# comment` never counts as the entry: strip
+                                // it before checking, or a commented `"ws", #
+                                // note` line reads as not ending in ',' and
+                                // gets a second, invalid comma inserted ahead
+                                // of it.
+                                let last_entry = (j..=k).rev().find_map(|idx| {
+                                    let raw: &str = if idx == k {
+                                        before_close
+                                    } else if idx == j {
+                                        lines[idx].split_once('[').map_or("", |(_, rest)| rest)
+                                    } else {
+                                        &lines[idx]
+                                    };
+                                    let raw = raw
+                                        .split_once('#')
+                                        .map_or(raw, |(before, _)| before)
+                                        .trim();
+                                    (!raw.is_empty()).then(|| raw.to_owned())
+                                });
                                 let sep = if last_entry.is_some_and(|e| !e.ends_with(',')) {
                                     ", "
                                 } else {
@@ -15991,6 +16003,46 @@ mod tests {
         // Same gap as its two siblings, in the one copy that already had the
         // multiline fallback before #2948.
         let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\"\n]\n";
+        let out = ensure_autumn_web_oauth2_feature(toml);
+        assert!(
+            out.contains("\"oauth2\""),
+            "oauth2 feature must be merged: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_autumn_web_mail_feature_trailing_comment_on_last_entry_stays_valid_toml() {
+        // Codex review on #2948's first fix: the backward scan for "does the
+        // last entry already end with a comma?" read a commented entry line
+        // (`"ws", # note`) as not ending in ',' — since the comment text was
+        // still attached — and inserted a second, invalid comma ahead of it.
+        let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\", # websocket support\n]\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert!(
+            out.contains("\"mail\""),
+            "mail feature must be merged: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_autumn_web_webauthn_feature_trailing_comment_on_last_entry_stays_valid_toml() {
+        let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\", # websocket support\n]\n";
+        let out = ensure_autumn_web_webauthn_feature(toml);
+        assert!(
+            out.contains("\"webauthn\""),
+            "webauthn feature must be merged: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_autumn_web_oauth2_feature_trailing_comment_on_last_entry_stays_valid_toml() {
+        let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\", # websocket support\n]\n";
         let out = ensure_autumn_web_oauth2_feature(toml);
         assert!(
             out.contains("\"oauth2\""),
