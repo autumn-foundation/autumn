@@ -1333,14 +1333,17 @@ async fn pg_last_seat_contention_fresh_pool_per_trial() {
    session's data confirms the fix (row lock / `SELECT ... FOR UPDATE` /
    advisory lock, per #2407's own proposed remediation) applies to Postgres
    too, and that the deciding factor for urgency is deployment shape, not
-   backend choice — under a fully cold-start-matched comparison Postgres
-   and SQLite are roughly comparable and both low (condition A1, 3.3-13.3%
-   vs. SQLite's ~4%), but under conditions representative of an
-   already-running deployment's warm connection pool, contention for a
-   room's last seat is essentially deterministic on *either* backend
-   (condition A2/B1, 100%) — worth citing the warm-pool number as the
-   operationally relevant one, since "Postgres is worse than SQLite" is
-   not what this session's fully-corrected data supports.
+   backend choice — under a fully cold-start-matched comparison (the only
+   axis tested on both backends) Postgres and SQLite are roughly comparable
+   and both low (condition A1, 3.3-13.3% vs. SQLite's ~4%), but under
+   conditions representative of an already-running deployment's warm
+   connection pool, contention for a room's last seat is essentially
+   deterministic **on Postgres** (condition A2/B1, 100% — SQLite's
+   warm-pool rate was never measured, by this session or #2864's own, so
+   this is not a claim about "either backend") — worth citing the
+   Postgres warm-pool number as the operationally relevant one, since
+   "Postgres is worse than SQLite" is not what this session's
+   fully-corrected data supports.
 2. **`create_room`'s registry-cap race, against Postgres** — carried over
    unattempted from 2026-09-20's charter 2, now that Docker access is
    confirmed working in-session; worth probing with *all three*
