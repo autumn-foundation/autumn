@@ -632,6 +632,15 @@ impl BillingStore for FailingStore {
         delegate!(self, customer_by_provider_id, provider_customer_id)
     }
 
+    fn relink_customer<'a>(
+        &'a self,
+        id: &'a str,
+        user_id: String,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Customer>> {
+        delegate!(self, relink_customer, id, user_id, now)
+    }
+
     fn upsert_subscription(
         &self,
         upsert: autumn_billing::store::SubscriptionUpsert,

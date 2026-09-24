@@ -3752,9 +3752,12 @@ pub async fn import_revisions(
         diesel::delete(revisions::table.filter(revisions::post_id.eq(post_id)))
             .execute(conn)
             .await?;
-        for revision in &keep {
-            diesel::insert_into(revisions::table)
-                .values((
+        // One multi-row INSERT for the whole batch (`keep` is bounded by
+        // `REVISION_LIMIT`), not one round trip per kept revision.
+        let rows: Vec<_> = keep
+            .iter()
+            .map(|revision| {
+                (
                     revisions::post_id.eq(post_id),
                     revisions::title.eq(&revision.title),
                     revisions::excerpt.eq(&revision.excerpt),
@@ -3768,10 +3771,13 @@ pub async fn import_revisions(
                     // Explicit, like a comment's: a history whose timestamps all
                     // say "the moment of the restore" is not a history.
                     revisions::created_at.eq(revision.created_at),
-                ))
-                .execute(conn)
-                .await?;
-        }
+                )
+            })
+            .collect();
+        diesel::insert_into(revisions::table)
+            .values(rows)
+            .execute(conn)
+            .await?;
         Ok::<_, AutumnError>(keep.len())
     })
     .await
@@ -3819,13 +3825,24 @@ pub async fn import_post_meta(
         )
         .execute(conn)
         .await?;
-        for (key, value) in &fields {
+        // Multi-row INSERTs, not one round trip per custom field: a file's
+        // per-post field count is unbounded (a plugin-heavy WordPress export
+        // routinely carries dozens), so this is chunked like `import_terms`'s
+        // batched insert rather than assumed to always fit one statement.
+        const CHUNK: usize = 1000;
+        for chunk in fields.chunks(CHUNK) {
+            let rows: Vec<_> = chunk
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        post_meta::post_id.eq(post_id),
+                        post_meta::meta_key.eq(key),
+                        post_meta::meta_value.eq(value),
+                    )
+                })
+                .collect();
             diesel::insert_into(post_meta::table)
-                .values((
-                    post_meta::post_id.eq(post_id),
-                    post_meta::meta_key.eq(key),
-                    post_meta::meta_value.eq(value),
-                ))
+                .values(rows)
                 .execute(conn)
                 .await?;
         }
