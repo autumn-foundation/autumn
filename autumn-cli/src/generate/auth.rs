@@ -154,7 +154,7 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
                         .chars()
                         .take_while(char::is_ascii_whitespace)
                         .collect();
-                    if t.contains(']') {
+                    if strip_line_comment(&t).contains(']') {
                         // Single-line `features = [...]`.
                         if let Some(new_line) = merge_missing(&t) {
                             lines[j] = format!("{ind2}{new_line}");
@@ -167,9 +167,6 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
                         // or trailing text inside one is never real syntax —
                         // every raw-text scan and join below works only on
                         // each line's code portion (before its first `#`).
-                        fn strip_comment(s: &str) -> &str {
-                            s.split_once('#').map_or(s, |(before, _)| before)
-                        }
                         let mut close_line = None;
                         let mut k = j;
                         while k < lines.len() {
@@ -177,7 +174,7 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
                             if k > j && tk.starts_with('[') {
                                 break; // next table header — array never closed
                             }
-                            if strip_comment(&lines[k]).contains(']') {
+                            if strip_line_comment(&lines[k]).contains(']') {
                                 close_line = Some(k);
                                 break;
                             }
@@ -186,16 +183,16 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
                         if let Some(cl) = close_line {
                             let j_bracket = lines[j].find('[').unwrap_or(lines[j].len());
                             let mut list_text =
-                                strip_comment(&lines[j][j_bracket + 1..]).to_owned();
+                                strip_line_comment(&lines[j][j_bracket + 1..]).to_owned();
                             for line in &lines[j + 1..cl] {
                                 list_text.push(' ');
-                                list_text.push_str(strip_comment(line.trim()));
+                                list_text.push_str(strip_line_comment(line.trim()));
                             }
-                            let cl_close = strip_comment(&lines[cl])
+                            let cl_close = strip_line_comment(&lines[cl])
                                 .find(']')
                                 .unwrap_or(lines[cl].len());
                             list_text.push(' ');
-                            list_text.push_str(strip_comment(&lines[cl][..cl_close]));
+                            list_text.push_str(strip_line_comment(&lines[cl][..cl_close]));
                             let trailing = lines[cl]
                                 [cl_close.saturating_add(1).min(lines[cl].len())..]
                                 .to_owned();
@@ -385,7 +382,7 @@ fn ensure_totp_rs_features(toml: &str) -> String {
                     .chars()
                     .take_while(char::is_ascii_whitespace)
                     .collect();
-                if tj.contains(']') {
+                if strip_line_comment(&tj).contains(']') {
                     // Single-line `features = [...]`.
                     match merge_into_list(&tj, "[") {
                         Some(Some(new_line)) => lines[fl] = format!("{indent_j}{new_line}"),
@@ -400,9 +397,6 @@ fn ensure_totp_rs_features(toml: &str) -> String {
                     // inside one is never real syntax — every raw-text scan
                     // and join below works only on each line's code portion
                     // (before its first `#`).
-                    fn strip_comment(s: &str) -> &str {
-                        s.split_once('#').map_or(s, |(before, _)| before)
-                    }
                     let mut close_line = None;
                     let mut k = fl;
                     while k < lines.len() {
@@ -410,7 +404,7 @@ fn ensure_totp_rs_features(toml: &str) -> String {
                         if k > fl && tk.starts_with('[') {
                             break; // next table header — array never closed
                         }
-                        if strip_comment(&lines[k]).contains(']') {
+                        if strip_line_comment(&lines[k]).contains(']') {
                             close_line = Some(k);
                             break;
                         }
@@ -418,16 +412,17 @@ fn ensure_totp_rs_features(toml: &str) -> String {
                     }
                     if let Some(cl) = close_line {
                         let fl_bracket = lines[fl].find('[').unwrap_or(lines[fl].len());
-                        let mut list_text = strip_comment(&lines[fl][fl_bracket + 1..]).to_owned();
+                        let mut list_text =
+                            strip_line_comment(&lines[fl][fl_bracket + 1..]).to_owned();
                         for line in &lines[fl + 1..cl] {
                             list_text.push(' ');
-                            list_text.push_str(strip_comment(line.trim()));
+                            list_text.push_str(strip_line_comment(line.trim()));
                         }
-                        let cl_close = strip_comment(&lines[cl])
+                        let cl_close = strip_line_comment(&lines[cl])
                             .find(']')
                             .unwrap_or(lines[cl].len());
                         list_text.push(' ');
-                        list_text.push_str(strip_comment(&lines[cl][..cl_close]));
+                        list_text.push_str(strip_line_comment(&lines[cl][..cl_close]));
                         let trailing =
                             lines[cl][cl_close.saturating_add(1).min(lines[cl].len())..].to_owned();
 
@@ -1708,11 +1703,17 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
                 }
                 if t.starts_with("features") {
                     found_features = true;
-                    if t.contains(FEATURE) {
+                    // A trailing `# comment` on the opener line is not TOML —
+                    // check only the code portion, both for "is the feature
+                    // already mentioned" and for locating a real closing `]`
+                    // (a `]` inside the comment would misclassify a genuinely
+                    // multiline array as single-line and merge into dead text
+                    // past the `#`).
+                    if strip_line_comment(&t).contains(FEATURE) {
                         break;
                     }
                     if let Some(open) = t.find('[') {
-                        if let Some(close) = t.rfind(']') {
+                        if let Some(close) = strip_line_comment(&t).rfind(']') {
                             let inner = t[open + 1..close].trim();
                             let new_inner = if inner.is_empty() {
                                 FEATURE.to_owned()
@@ -1956,11 +1957,17 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
                 }
                 if t.starts_with("features") {
                     found_features = true;
-                    if t.contains(FEATURE) {
+                    // A trailing `# comment` on the opener line is not TOML —
+                    // check only the code portion, both for "is the feature
+                    // already mentioned" and for locating a real closing `]`
+                    // (a `]` inside the comment would misclassify a genuinely
+                    // multiline array as single-line and merge into dead text
+                    // past the `#`).
+                    if strip_line_comment(&t).contains(FEATURE) {
                         break;
                     }
                     if let Some(open) = t.find('[') {
-                        if let Some(close) = t.rfind(']') {
+                        if let Some(close) = strip_line_comment(&t).rfind(']') {
                             let inner = t[open + 1..close].trim();
                             let new_inner = if inner.is_empty() {
                                 FEATURE.to_owned()
@@ -11289,11 +11296,17 @@ fn ensure_autumn_web_webauthn_feature(toml: &str) -> String {
                 }
                 if t.starts_with("features") {
                     found_features = true;
-                    if t.contains(FEATURE) {
+                    // A trailing `# comment` on the opener line is not TOML —
+                    // check only the code portion, both for "is the feature
+                    // already mentioned" and for locating a real closing `]`
+                    // (a `]` inside the comment would misclassify a genuinely
+                    // multiline array as single-line and merge into dead text
+                    // past the `#`).
+                    if strip_line_comment(&t).contains(FEATURE) {
                         break;
                     }
                     if let Some(open) = t.find('[') {
-                        if let Some(close) = t.rfind(']') {
+                        if let Some(close) = strip_line_comment(&t).rfind(']') {
                             let inner = t[open + 1..close].trim();
                             let new_inner = if inner.is_empty() {
                                 FEATURE.to_owned()
@@ -16153,6 +16166,94 @@ mod tests {
             2,
             "oauth2 must be merged as a real feature (the comment's mention is the other match): {out}"
         );
+    }
+
+    #[test]
+    fn ensure_autumn_web_mail_feature_opener_comment_neither_hides_feature_nor_misclassifies() {
+        // Codex review on 40a19c56: the same comment-blindness bug in the
+        // *opener* line itself (`features = [ # ...`), one step earlier than
+        // the interior-line scans already fixed — a `"mail"` mention in the
+        // opener's comment falsely read as "already present", and a `]`
+        // inside that same comment falsely dispatched a genuinely multiline
+        // array down the single-line merge path (which would then merge
+        // into dead text past the `#`, never touching the real array below).
+        let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [ # \"mail\" is disabled, see [defaults] doc\n    \"ws\",\n]\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert!(
+            out.contains("\"ws\""),
+            "existing feature must survive: {out}"
+        );
+        assert_eq!(
+            out.matches("\"mail\"").count(),
+            2,
+            "mail must be merged as a real feature (the comment's mention is the other match): {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_autumn_web_webauthn_feature_opener_comment_neither_hides_feature_nor_misclassifies() {
+        let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [ # \"webauthn\" is disabled, see [defaults] doc\n    \"ws\",\n]\n";
+        let out = ensure_autumn_web_webauthn_feature(toml);
+        assert!(
+            out.contains("\"ws\""),
+            "existing feature must survive: {out}"
+        );
+        assert_eq!(
+            out.matches("\"webauthn\"").count(),
+            2,
+            "webauthn must be merged as a real feature (the comment's mention is the other match): {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_autumn_web_oauth2_feature_opener_comment_neither_hides_feature_nor_misclassifies() {
+        let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [ # \"oauth2\" is disabled, see [defaults] doc\n    \"ws\",\n]\n";
+        let out = ensure_autumn_web_oauth2_feature(toml);
+        assert!(
+            out.contains("\"ws\""),
+            "existing feature must survive: {out}"
+        );
+        assert_eq!(
+            out.matches("\"oauth2\"").count(),
+            2,
+            "oauth2 must be merged as a real feature (the comment's mention is the other match): {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_webauthn_rs_features_opener_comment_bracket_does_not_misclassify() {
+        // Codex review on 40a19c56: the single-line-vs-multiline dispatch
+        // itself scanned the raw opener line, so a `]` inside a comment on
+        // that same line (`features = [ # defaults [see docs]`) made a
+        // genuinely multiline array look single-line — merging the missing
+        // feature into dead text past the `#` instead of the real array.
+        let toml = "[dependencies.webauthn-rs]\nversion = \"0.5\"\nfeatures = [ # defaults [see docs]\n    \"conditional-ui\",\n]\n";
+        let out = ensure_webauthn_rs_features(toml);
+        assert!(
+            out.contains("\"conditional-ui\"")
+                && out.contains("\"danger-allow-state-serialisation\""),
+            "both features must be present: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_totp_rs_features_opener_comment_bracket_does_not_misclassify() {
+        let toml = "[dependencies.totp-rs]\nversion = \"5\"\nfeatures = [ # defaults [see docs]\n    \"qr\",\n]\n";
+        let out = ensure_totp_rs_features(toml);
+        assert!(
+            out.contains("\"qr\"") && out.contains("\"gen_secret\"") && out.contains("\"otpauth\""),
+            "all three features must be present: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
     }
 
     #[test]
