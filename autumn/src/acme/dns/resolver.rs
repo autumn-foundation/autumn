@@ -175,9 +175,9 @@ impl DnsLookup for UdpDnsLookup {
 
 /// Discover the addresses of the nameservers **authoritative** for `fqdn`.
 ///
-/// Walks the label suffixes of `fqdn` from most to least specific asking `NS`
-/// through `recursive` (the configured resolvers), takes the first suffix that
-/// answers with nameserver names, and resolves those names to addresses. The
+/// Asks `NS` for every label suffix of `fqdn` at once, through `recursive`
+/// (the configured resolvers), takes the most specific suffix that answers
+/// with nameserver names, and resolves those names to addresses. The
 /// `_acme-challenge` label is dropped first: it is a record name inside the
 /// zone, never a zone cut of its own.
 ///
@@ -197,39 +197,64 @@ pub async fn authoritative_resolvers(
     // out. It is simply the most specific candidate, tried first (issue #1620).
     let base = normalize_name(fqdn);
     let labels: Vec<&str> = base.split('.').filter(|l| !l.is_empty()).collect();
-
-    for start in 0..labels.len().saturating_sub(1) {
-        let zone = labels[start..].join(".");
-        let mut names = Vec::new();
-        for server in recursive {
-            if let Ok(answer) = lookup.query(*server, &zone, QTYPE_NS, true).await {
-                names = answer.ns_names();
-                if !names.is_empty() {
-                    break;
-                }
-            }
-        }
+    let zones: Vec<String> = (0..labels.len().saturating_sub(1))
+        .map(|start| labels[start..].join("."))
+        .collect();
+    // Every candidate zone is asked at once, so a resolver that drops packets
+    // costs one query timeout in total, not one per candidate (#2642).
+    let ns_answers = futures::future::join_all(
+        zones
+            .iter()
+            .map(|zone| first_found(recursive, zone, QTYPE_NS, lookup, DnsAnswer::ns_names)),
+    )
+    .await;
+    for names in ns_answers {
         if names.is_empty() {
             continue;
         }
+        let a_answers = futures::future::join_all(
+            names
+                .iter()
+                .map(|name| first_found(recursive, name, QTYPE_A, lookup, DnsAnswer::a_addrs)),
+        )
+        .await;
         let mut addrs = Vec::new();
-        for name in &names {
-            for server in recursive {
-                if let Ok(answer) = lookup.query(*server, name, QTYPE_A, true).await {
-                    for addr in answer.a_addrs() {
-                        let socket = SocketAddr::new(std::net::IpAddr::V4(addr), 53);
-                        if !addrs.contains(&socket) {
-                            addrs.push(socket);
-                        }
-                    }
-                    if !addrs.is_empty() {
-                        break;
-                    }
-                }
+        for addr in a_answers.into_iter().flatten() {
+            let socket = SocketAddr::new(std::net::IpAddr::V4(addr), 53);
+            if !addrs.contains(&socket) {
+                addrs.push(socket);
             }
         }
         if !addrs.is_empty() {
             return addrs;
+        }
+    }
+    Vec::new()
+}
+
+/// Ask every server in `servers` at once, with recursion desired, and return
+/// what `pick` finds in the first answer that has anything.
+///
+/// It returns as soon as one answer has something, so a server that drops
+/// packets delays only a query that no server can answer.
+async fn first_found<T>(
+    servers: &[SocketAddr],
+    name: &str,
+    qtype: u16,
+    lookup: &dyn DnsLookup,
+    pick: impl Fn(&DnsAnswer) -> Vec<T>,
+) -> Vec<T> {
+    use futures::StreamExt as _;
+    let mut pending: futures::stream::FuturesUnordered<_> = servers
+        .iter()
+        .map(|server| lookup.query(*server, name, qtype, true))
+        .collect();
+    while let Some(answer) = pending.next().await {
+        if let Ok(answer) = answer {
+            let found = pick(&answer);
+            if !found.is_empty() {
+                return found;
+            }
         }
     }
     Vec::new()
@@ -1984,6 +2009,81 @@ mod tests {
             "_autumn-challenge.app.clientco.com",
             &[resolver(53)],
             &DelegatedLookup,
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(values, vec!["token-b".to_owned()]);
+    }
+
+    /// Resolver 1 drops every packet. Resolver 2 answers, but still caches
+    /// NXDOMAIN for the ownership record. Only the zone's own nameserver has
+    /// the token.
+    struct PartlyDeadLookup;
+
+    impl DnsLookup for PartlyDeadLookup {
+        fn query<'a>(
+            &'a self,
+            server: SocketAddr,
+            name: &'a str,
+            qtype: u16,
+            recursion_desired: bool,
+        ) -> BoxFuture<'a, Result<DnsAnswer, String>> {
+            Box::pin(async move {
+                if server == resolver(1) {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    return Err(format!("resolver {server} did not answer"));
+                }
+                let owner = normalize_name(name);
+                let record = |rtype: u16, rdata: Rdata| ResourceRecord {
+                    name: owner.clone(),
+                    rtype,
+                    rdata,
+                };
+                let records = match (qtype, recursion_desired, owner.as_str()) {
+                    (QTYPE_NS, _, "clientco.com") => {
+                        vec![record(QTYPE_NS, Rdata::Name("ns.test".to_owned()))]
+                    }
+                    (QTYPE_A, _, "ns.test") => {
+                        vec![record(
+                            QTYPE_A,
+                            Rdata::A(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+                        )]
+                    }
+                    (QTYPE_TXT, false, "_autumn-challenge.app.clientco.com") => {
+                        vec![record(QTYPE_TXT, Rdata::Txt("token-b".to_owned()))]
+                    }
+                    _ => Vec::new(),
+                };
+                let rcode = if records.is_empty() { 3 } else { 0 };
+                Ok(DnsAnswer { rcode, records })
+            })
+        }
+    }
+
+    // Codex review on #2936: a resolver that drops packets costs discovery one
+    // timeout in total, not one per zone candidate, so the zone's nameserver
+    // is still reached inside the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_resolver_does_not_stall_discovery_past_the_deadline() {
+        let started = tokio::time::Instant::now();
+        let found = authoritative_resolvers(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(1), resolver(2)],
+            &PartlyDeadLookup,
+        )
+        .await;
+        assert_eq!(found, vec![SocketAddr::from(([192, 0, 2, 1], 53))]);
+        assert!(
+            started.elapsed() <= Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+
+        let values = txt_values(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(1), resolver(2)],
+            &PartlyDeadLookup,
             DEADLINE,
         )
         .await
