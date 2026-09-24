@@ -1,4 +1,4 @@
-# 🪝 Snag: `DbRoomStore` seat-cap race confirmed on Postgres — near-deterministic on a warm production pool, indistinguishable from SQLite's rate once cold-start methodology is fully matched
+# 🪝 Snag: `DbRoomStore` seat-cap race confirmed on Postgres — near-deterministic on a warm production pool with burst-sized idle capacity, indistinguishable from SQLite's rate once cold-start methodology is fully matched
 
 **Charter:** proposed charter 1 from
 [2026-09-20's session](2026-09-20-snag-db-room-store-seat-race.md) — "the
@@ -12,8 +12,9 @@ info` succeeds), so this closes that gap.
 ## 🐛 Repro
 
 **Title:** 🪝 Snag: `DbRoomStore::join_room` seat-cap race is near-
-deterministic on a properly-warmed Postgres pool for a room's last seat
-(59/59 and 40/40 once two measurement artifacts are corrected); under a
+deterministic on a properly-warmed Postgres pool with burst-sized idle
+capacity, for a room's last seat (59/59 and 40/40 once two measurement
+artifacts are corrected); under a
 fully cold-start-matched comparison to #2864's SQLite baseline it is no
 longer clearly distinguishable from SQLite's own ~4/100 (data-correctness,
 oracle: docs/guide/media.md "Both backends enforce the absolute 6-seat mesh
@@ -292,10 +293,14 @@ unchanged since #2864 was filed.
 **Confirms #2864 on Postgres. The headline is not "Postgres races more
 readily than SQLite" — under full methodology matching that claim doesn't
 hold up — it's "under conditions representative of an actually-running
-Postgres deployment, this race is essentially deterministic." This session
-tested warm-pool conditions only on Postgres; #2864's SQLite numbers are
-all cold-start (fresh pool and database every trial), so nothing below
-claims to know SQLite's warm-pool rate — it wasn't measured:**
+Postgres deployment whose connection pool has burst-sized idle capacity
+available, this race is essentially deterministic." This session tested
+warm-pool conditions only on Postgres, and only at two idle-capacity
+extremes (1 idle connection for a 4-racer burst, and burst-sized idle
+capacity); #2864's SQLite numbers are all cold-start (fresh pool and
+database every trial), so nothing below claims to know SQLite's warm-pool
+rate — it wasn't measured, and nothing below claims a pool with less than
+burst-sized idle capacity behaves the same as one with enough:**
 
 - Under a fully cold-start-matched comparison to #2864's SQLite baseline
   (condition A1: fresh pools *and* fresh schema every trial, matching
@@ -341,8 +346,9 @@ claims to know SQLite's warm-pool rate — it wasn't measured:**
   horizontally-scaled or multi-process deployment," i.e. the one operators
   choose specifically because they expect concurrent load. When a burst of
   simultaneous joins for a room's last seat does occur against an
-  already-warm **Postgres** production pool, the claim is essentially
-  always false. This session found no evidence that Postgres is
+  already-warm **Postgres** production pool that has **burst-sized idle
+  capacity available at that moment**, the claim is essentially always
+  false. This session found no evidence that Postgres is
   meaningfully worse than SQLite at resisting the race itself under
   equivalent cold-start conditions — but it also did not test SQLite under
   warm-pool conditions, so it cannot say whether SQLite's warm-pool rate is
@@ -357,8 +363,11 @@ claims to know SQLite's warm-pool rate — it wasn't measured:**
   chosen to bound. Severity classification stays "data-correctness /
   documented-claim violation," per the same reasoning #2864 already gives;
   the *likelihood* component is "the common case" under a warm **Postgres**
-  production pool contending for a room's last seat (not claimed for
-  SQLite, which this session never tested warm), and "low but real,
+  production pool **with burst-sized idle capacity available** contending
+  for a room's last seat (not claimed for SQLite, which this session never
+  tested warm, and not claimed for a Postgres pool without that idle
+  capacity, which this session measured behaving correctly instead), and
+  "low but real,
   roughly comparable between backends" under the cold-start-matched
   comparison that *was* run on both — not the SQLite-vs-Postgres severity
   gradient earlier revisions of this report claimed.
@@ -1376,10 +1385,13 @@ async fn pg_last_seat_contention_fresh_pool_per_trial() {
    axis tested on both backends) Postgres and SQLite are roughly comparable
    and both low (condition A1, 3.3-13.3% vs. SQLite's ~4%), but under
    conditions representative of an already-running deployment's warm
-   connection pool, contention for a room's last seat is essentially
-   deterministic **on Postgres** (condition A2/B1, 100% — SQLite's
-   warm-pool rate was never measured, by this session or #2864's own, so
-   this is not a claim about "either backend") — worth citing the
+   connection pool **that has burst-sized idle capacity available at the
+   moment of the burst** (not warm pools generally — this session's B1
+   data shows a pool with only 1 idle connection for a 4-racer burst
+   behaves correctly, 0/40 overshoots), contention for a room's last seat
+   is essentially deterministic **on Postgres** (condition A2/B1, 100% —
+   SQLite's warm-pool rate was never measured, by this session or #2864's
+   own, so this is not a claim about "either backend") — worth citing the
    Postgres warm-pool number as the operationally relevant one, since
    "Postgres is worse than SQLite" is not what this session's
    fully-corrected data supports.
