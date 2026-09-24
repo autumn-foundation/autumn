@@ -74,9 +74,10 @@ instead of SQLite:**
 **Result: 17/60 trials overshot the 1-seat cap (28%).** Histogram of
 `successes` across all 60 trials:
 `{1: 43, 2: 7, 3: 5, 4: 3, 5: 2}` — the modal, and majority, outcome (43/60,
-72%) is the *correct* one (exactly one racer admitted); when it does
-overshoot it's usually by a small margin (2-3 extra), not the near-total
-admission condition A2 (below) shows. Still ~7x #2864's SQLite rate
+72%) is the *correct* one (exactly one racer admitted); of the 17
+overshoots, 12/17 (71%) admitted only 1-2 extra racers (`successes` 2 or 3),
+not the near-total admission condition A2 (below) shows. Still ~7x #2864's
+SQLite rate
 (28% vs. ~4%), so Postgres does appear to race somewhat more readily than
 SQLite even under matched methodology — plausibly because SQLite's
 `busy_timeout`+WAL locking serializes writers to some degree that
@@ -166,20 +167,25 @@ rather than leading with the more dramatic one:**
   number to cite for "is Postgres worse than SQLite for this specific
   race," and it does not support "order of magnitude" or "near-certain."
 - Under a warm-connection-pool condition representative of an
-  already-running production deployment (condition A2, and condition B in
-  both its warm and fresh-pool variants), the rate is 34-60/60 (85-100%) —
-  effectively guaranteed to overshoot, and condition A2 specifically shows
-  the overshoot is usually total (every racer admitted), not a small
-  margin over the cap. This is the number to cite for "how likely is a
-  real Postgres-backed deployment to hit this," since production pools are
-  built once at startup and stay warm, not recreated per request.
+  already-running production deployment's pool (condition A2: 60/60;
+  condition B: 37/40 warm, 34/40 fresh-pool), the failure rate **given that
+  a burst of simultaneous join requests for a room's last seat(s) actually
+  occurs** is 85-100%, and condition A2 specifically shows full admission
+  (every racer let in) as the single most common individual outcome
+  (27/60, 45% — not a majority, and not "usually," but more common than any
+  other single result). None of these probes measured real arrival rates or
+  workload patterns, only the outcome of a deliberately-launched concurrent
+  burst — so this is a statement about what happens *if* such a burst
+  occurs, not an estimate of how often one does in a live deployment.
 - Postgres is the backend the docs frame as "the correct backend for a
   horizontally-scaled or multi-process deployment," i.e. the one operators
-  choose specifically because they expect concurrent load. Under the
-  production-representative condition, the claim is falsest exactly where
-  it's relied on most; even under the more conservative matched-methodology
-  condition, it's still measurably false roughly 1 in 4 times a room's last
-  seat is contended.
+  choose specifically because they expect concurrent load. When a burst of
+  simultaneous joins for a room's last seat(s) does occur, the claim is
+  falsest exactly where it's relied on most (production-representative
+  condition) to measurably-but-moderately false even under the more
+  conservative matched-methodology condition (17/60, 28%) — but how often
+  such a burst occurs in any given deployment is outside what this session
+  measured.
 - Still not crash/hang/data-loss — no error, no corruption, the room
   simply silently seats more participants than its documented ceiling,
   which for a WebRTC mesh (O(n²) peer connections) can push participant
