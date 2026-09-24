@@ -13,7 +13,7 @@ info` succeeds), so this closes that gap.
 
 **Title:** 🪝 Snag: `DbRoomStore::join_room` seat-cap race is near-certain
 under ordinary concurrency on Postgres, not a narrow window (data-correctness,
-repro 59/60 and 39/40 across two conditions, oracle: docs/guide/media.md
+repro 60/60 and 37/40 across two conditions, oracle: docs/guide/media.md
 "Both backends enforce the absolute 6-seat mesh ceiling")
 
 This is **the same bug already filed as
@@ -43,12 +43,18 @@ prioritized.
 6. Repeat for 60 trials, fresh namespace per trial (same container/pool,
    isolated rows).
 
-**Result: 59/60 trials overshot.** Not by one or two seats — most trials
-let *every* racer in: `successes=16 final_seat_count=16 (cap=1)` was the
-modal outcome, not the exception (trials 21, 22, 29, 35–39, 41, 43, 46, 47,
-51, 53, 56, 59 all show full 16/16 admission into a 1-seat room). The one
-clean trial let nothing worse happen than the room filling once through
-normal timing luck.
+**Result: 60/60 trials overshot** in the run whose full output is quoted
+below (a first run, not separately logged, measured 59/60 — consistent
+with this being a real, high-but-not-100% rate rather than a deterministic
+always-fails bug). Not by one or two seats — the single most common
+outcome was letting *every* racer in: `successes=16` (all 16 racers
+admitted into the 1-seat room) occurred in **27 of 60 trials (45%)**, more
+than any other value, with `successes=15` next most common (14/60, 23%).
+Full histogram of `successes` across all 60 trials:
+`{3: 1, 5: 1, 8: 1, 10: 2, 11: 1, 12: 3, 13: 5, 14: 5, 15: 14, 16: 27}` — no
+trial admitted fewer than 3 racers, and the distribution is heavily
+right-skewed toward "nearly everyone gets in," not clustered near the
+correct outcome of 1.
 
 **Condition B — realistic load, not a synthetic worst case:** to rule out
 "only an aggressively-tuned 16-way barrier race triggers this," a second,
@@ -56,12 +62,16 @@ deliberately less adversarial probe: 4 concurrent joiners (no barrier, just
 `tokio::spawn` fired back-to-back), **single pool** (no two-process
 simulation), room capped at 3 seats, 40 trials.
 
-**Result: 39/40 trials overshot**, nearly always to `successes=4` (all four
-racers admitted into a 3-seat room). This is not a multi-process artifact
-and does not need adversarial synchronization — ordinary same-process
-concurrent request handling (e.g. an httpd worker pool handling four join
-requests that land in the same tens-of-milliseconds window) reproduces it
-almost every time on Postgres.
+**Result: 37/40 trials overshot (92.5%)**, and of those, every single one
+overshot to exactly `successes=4` (all four racers admitted into a 3-seat
+room) — the full histogram is `{3: 3, 4: 37}`, i.e. only 3 of 40 trials
+produced the correct outcome, and there is no partial-overshoot case at
+all at this concurrency level: a trial either lands exactly on the cap or
+blows straight through it to the maximum possible. This is not a
+multi-process artifact and does not need adversarial synchronization —
+ordinary same-process concurrent request handling (e.g. an httpd worker
+pool handling four join requests that land in the same tens-of-milliseconds
+window) reproduces it almost every time on Postgres.
 
 **Sanity check performed:** before trusting either result, a third probe
 confirmed the cap enforces correctly under *sequential* (non-concurrent)
@@ -101,8 +111,8 @@ difference matters for prioritization:
 
 - #2864's SQLite numbers (~4/100, requiring a synchronized 16-way race)
   read as an edge case that needs unlucky timing to hit in production.
-- This session's Postgres numbers (59/60 under the same synchronized
-  conditions, 39/40 under *ordinary* 4-way concurrency with no
+- This session's Postgres numbers (60/60 under the same synchronized
+  conditions, 37/40 under *ordinary* 4-way concurrency with no
   synchronization at all) mean any room whose capacity is contended by
   even a handful of simultaneous join requests — the exact "several
   people click Join for a popular scheduled event" scenario #2864 already
@@ -133,20 +143,41 @@ from #2864's own dedup note.
 
 ## 🔬 Reproduce
 
-Three scratch test files were added to `autumn-media-plugin/tests/` for
-this session, run against a live Docker/testcontainers Postgres, and then
-**removed** (not committed) — for the same reason #2864's SQLite probe
-wasn't committed as a permanent test: a probe that reproduces a known, open,
-unfixed bug at a 90%+ rate would turn the CI Docker sweep
-(`.github/workflows/ci.yml`'s "Run Docker-dependent tests" step, which bare
-`--ignored`-sweeps every `#[ignore]`d test in this binary per
-`autumn-cli/tests/integration/repo_hygiene.rs`'s enforced convention) red on
+Two scratch test files (one per condition, each its own `[[test]]`-shaped
+file under `autumn-media-plugin/tests/`) were added for this session, run
+against a live Docker/testcontainers Postgres, and then **removed** (not
+committed).
+
+**Correction from this report's first revision:** that revision claimed
+committing these as permanent tests would "turn the CI Docker sweep red on
+every run," describing `autumn-media-plugin` as covered by the same bare
+`--ignored` sweep `autumn`'s `integration_tests` and `autumn-cli`'s
+`cli_tests` binaries get. That's wrong, and `.github/workflows/ci.yml`
+itself says so directly — its "Run Docker-dependent tests" step comment
+reads: *"autumn-media-plugin has no crate-wide `--ignored` sweep, so each
+of its Docker test targets is named here"*, followed by explicit,
+individually-named invocations of exactly two targets:
+`cargo test -p autumn-media-plugin --test room_reaper_batch_profile --
+--ignored` and `cargo test -p autumn-media-plugin --test room_store_db --
+--ignored`. A **new**, differently-named test file added under
+`autumn-media-plugin/tests/` — as this session's scratch files were — would
+not run in CI at all unless also added to that explicit list; it would be
+silently absent, not red.
+
+The corrected reasoning for not committing: the natural permanent home for
+this reproduction — per 2026-09-20's report's own conclusion — is as a new
+`#[ignore]`d test *function added inside `room_store_db.rs`*, since that
+target **is** one of the two ci.yml already names and runs unconditionally.
+Adding it there, given a 92–100% observed failure rate across both
+conditions in this session, would make that Docker CI step fail on nearly
 every run, and this repo has no established "expected-fail/quarantined"
-marking mechanism the sweep respects — unlike #2864's SQLite variant, this
-one isn't blocked by the `sqlite`-feature-unification hazard, so a
-permanent version is a smaller lift once someone picks a quarantine
-convention or fixes the underlying race; until then it stays a reproduction
-script here, matching #2864's own precedent.
+marking convention the step would respect. That is the same practical
+outcome the first revision described (a committed version would break CI),
+reached by the correct mechanism (naming it into an always-run target, not
+tripping a sweep that doesn't exist for this crate) — worth being precise
+about, since a future contributor relying on the wrong mechanism could
+wrongly conclude a *different* new standalone file is safe to commit when
+it would in fact just never run.
 
 ```bash
 cd /home/user/autumn
@@ -154,14 +185,20 @@ cd /home/user/autumn
 # a normal CI/dev box with the Docker daemon already up can skip this):
 #   nohup dockerd >/tmp/dockerd.log 2>&1 & sleep 5 && docker info
 
-# Add autumn-media-plugin/tests/snag_pg_seat_race_probe.rs — full listing
-# below — then:
+# Add autumn-media-plugin/tests/snag_pg_seat_race_probe.rs (condition A —
+# full listing below), then:
 cargo test -p autumn-media-plugin --test snag_pg_seat_race_probe -- --ignored --nocapture
-# Expect ~59/60 trials to overshoot the 1-seat cap, frequently to the full
-# 16/16 racer count.
-
-# Then remove the scratch file (not committed):
+# Expect the large majority of 60 trials to overshoot the 1-seat cap, most
+# often to the full 16/16 racer count (this session: 60/60 overshot, mode
+# successes=16 in 27/60 trials).
 rm autumn-media-plugin/tests/snag_pg_seat_race_probe.rs
+
+# Add autumn-media-plugin/tests/snag_pg_seat_race_lowconc.rs (condition B —
+# full listing below), then:
+cargo test -p autumn-media-plugin --test snag_pg_seat_race_lowconc -- --ignored --nocapture
+# Expect the large majority of 40 trials to overshoot the 3-seat cap, almost
+# always to exactly 4/4 (this session: 37/40 overshot, all 37 at successes=4).
+rm autumn-media-plugin/tests/snag_pg_seat_race_lowconc.rs
 ```
 
 <details>
@@ -264,26 +301,114 @@ async fn pg_concurrent_joins_across_two_pools_can_exceed_the_absolute_seat_cap()
 
     const TRIALS: usize = 60;
     let mut overshoots = 0;
+    let mut histogram: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
     for trial in 0..TRIALS {
         let (successes, final_count) = run_trial(&pool_a, &pool_b, trial).await;
         println!("trial {trial}: successes={successes} final_seat_count={final_count} (cap=1)");
+        *histogram.entry(successes).or_insert(0) += 1;
         if final_count > 1 || successes > 1 {
             overshoots += 1;
         }
     }
     println!("overshoots: {overshoots}/{TRIALS}");
+    println!("histogram of successes-per-trial: {histogram:?}");
     assert_eq!(overshoots, 0, "cap exceeded in {overshoots}/{TRIALS} trials");
 }
 ```
 
 </details>
 
-For condition B (4 racers, no barrier, single pool, cap=3, 40 trials — same
-DDL and imports, minus the second pool and barrier, looping
-`store.join_room` calls fired via plain `tokio::spawn` with no
-synchronization primitive), see this report's revision history or ask —
-the shape is a direct simplification of the above with `RACERS = 4`, one
-pool, and no `Barrier`.
+<details>
+<summary><code>snag_pg_seat_race_lowconc.rs</code> (4-racer / single-pool / no-barrier, condition B)</summary>
+
+```rust
+use std::sync::Arc;
+use autumn_media_plugin::rooms::RoomStore;
+use autumn_media_plugin::rooms_db::DbRoomStore;
+use chrono::Duration;
+use diesel::prelude::*;
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use diesel_async::pooled_connection::deadpool::Pool;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::postgres::Postgres;
+
+const CREATE_TABLES_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS media_rooms (
+        namespace TEXT NOT NULL, room_id TEXT NOT NULL,
+        max_participants INTEGER NOT NULL, created_at TIMESTAMP NOT NULL,
+        PRIMARY KEY (namespace, room_id));
+    CREATE TABLE IF NOT EXISTS media_room_participants (
+        namespace TEXT NOT NULL, room_id TEXT NOT NULL, participant_id TEXT NOT NULL,
+        display_name TEXT, token TEXT NOT NULL, joined_at TIMESTAMP NOT NULL,
+        token_expires_at TIMESTAMP NOT NULL, last_seen_at TIMESTAMP NOT NULL,
+        PRIMARY KEY (namespace, room_id, participant_id),
+        FOREIGN KEY (namespace, room_id) REFERENCES media_rooms (namespace, room_id) ON DELETE CASCADE);
+";
+
+#[derive(diesel::QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker (testcontainers) - SCRATCH PROBE, not for CI"]
+async fn pg_low_concurrency_no_barrier_still_overshoots() {
+    let container = Postgres::default().start().await.expect("start postgres");
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
+    let pool = Pool::builder(manager).max_size(20).build().expect("pool");
+    {
+        let mut conn = pool.get().await.expect("conn");
+        for stmt in CREATE_TABLES_SQL.split(';') {
+            let stmt = stmt.trim();
+            if !stmt.is_empty() { diesel::sql_query(stmt).execute(&mut conn).await.expect("ddl"); }
+        }
+    }
+    let store: Arc<dyn RoomStore> = Arc::new(DbRoomStore::new(pool.clone(), 6));
+
+    const TRIALS: usize = 40;
+    const CAP: i64 = 3;
+    const RACERS: usize = 4;
+    let mut overshoots = 0;
+    let mut histogram: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    for trial in 0..TRIALS {
+        let ns = format!("tenant-{trial}");
+        let room = store.create_room(&ns, CAP as usize).await.expect("create");
+        let mut handles = Vec::new();
+        for i in 0..RACERS {
+            let (s, room_id, ns2) = (store.clone(), room.id.clone(), ns.clone());
+            handles.push(tokio::spawn(async move {
+                s.join_room(&ns2, &room_id, Some(format!("racer-{i}")), Duration::seconds(300)).await
+            }));
+        }
+        let mut successes = 0;
+        for h in handles { if h.await.expect("panic").is_ok() { successes += 1; } }
+        let mut conn = pool.get().await.expect("conn");
+        let final_count: i64 = diesel::sql_query(
+            "SELECT COUNT(*) as count FROM media_room_participants WHERE namespace = $1 AND room_id = $2",
+        )
+        .bind::<diesel::sql_types::Text, _>(ns.clone())
+        .bind::<diesel::sql_types::Text, _>(room.id.clone())
+        .get_result::<CountRow>(&mut conn)
+        .await
+        .expect("count")
+        .count;
+        println!("trial {trial}: successes={successes} final_seat_count={final_count} (cap={CAP})");
+        *histogram.entry(successes).or_insert(0) += 1;
+        if final_count > CAP { overshoots += 1; }
+    }
+    println!("overshoots: {overshoots}/{TRIALS}");
+    println!("histogram of successes-per-trial: {histogram:?}");
+    assert_eq!(overshoots, 0, "cap exceeded in {overshoots}/{TRIALS} trials");
+}
+```
+
+</details>
 
 ## Proposed next charters
 
