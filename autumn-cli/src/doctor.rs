@@ -4224,11 +4224,20 @@ fn tailwind_file_is_executable(_path: &std::path::Path, _metadata: &std::fs::Met
 }
 
 fn check_tailwind_binary() -> CheckResult {
-    let path = if cfg!(windows) {
-        std::path::PathBuf::from("target/autumn/tailwindcss.exe")
+    // Resolve the SAME `<target_dir>/autumn` directory `autumn setup` writes
+    // to and `autumn dev`/the scaffold's `build.rs` read from (issue #2457):
+    // a `target`-relative literal reports the binary missing whenever
+    // `CARGO_TARGET_DIR` points elsewhere, even though `setup` put it exactly
+    // where `dev` expects it. Tolerant, not `resolve_target_directory`'s
+    // hard-exit form: one unreadable check must not abort every other check
+    // `doctor` still has to report.
+    let target_dir = crate::dev::try_resolve_target_directory()
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    let path = target_dir.join("autumn").join(if cfg!(windows) {
+        "tailwindcss.exe"
     } else {
-        std::path::PathBuf::from("target/autumn/tailwindcss")
-    };
+        "tailwindcss"
+    });
 
     check_tailwind_binary_at(&path)
 }
