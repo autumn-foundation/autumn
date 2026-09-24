@@ -845,6 +845,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "postgresql_embedded",
+ "pq-src",
  "pq-sys",
  "printpdf",
  "proptest",
