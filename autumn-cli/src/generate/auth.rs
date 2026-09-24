@@ -52,6 +52,14 @@ const PASSKEY_EXTRA_DEPS: &[(&str, &str)] = &[
     ("base64", "\"0.22\""),
 ];
 
+/// The code portion of a Cargo.toml line, up to (not including) its first
+/// `#` — the start of a TOML comment. A raw substring/character search over
+/// a whole line risks matching text that isn't syntax at all: a feature
+/// name mentioned in a comment, or a stray `]`/`}` inside one.
+fn strip_line_comment(s: &str) -> &str {
+    s.split_once('#').map_or(s, |(before, _)| before)
+}
+
 /// Required features for the `webauthn-rs` dependency.
 ///
 /// `danger-allow-state-serialisation` enables session storage of ceremony state.
@@ -1607,7 +1615,10 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
         }
 
         if trimmed.starts_with(&table_prefix) {
-            if trimmed.contains(FEATURE) {
+            // A trailing `# comment` mentioning the feature is not TOML —
+            // check only the code portion of the line, the same guard the
+            // subtable branch below needs against a commented-out mention.
+            if strip_line_comment(&trimmed).contains(FEATURE) {
                 break; // already present
             }
             if let Some(feat_bracket) = trimmed.find("features = [") {
@@ -1877,7 +1888,10 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
         }
 
         if trimmed.starts_with(&table_prefix) {
-            if trimmed.contains(FEATURE) {
+            // A trailing `# comment` mentioning the feature is not TOML —
+            // check only the code portion of the line, the same guard the
+            // subtable branch below needs against a commented-out mention.
+            if strip_line_comment(&trimmed).contains(FEATURE) {
                 break; // already present
             }
             if let Some(feat_bracket) = trimmed.find("features = [") {
@@ -11180,7 +11194,10 @@ fn ensure_autumn_web_webauthn_feature(toml: &str) -> String {
         }
 
         if trimmed.starts_with(&table_prefix) {
-            if trimmed.contains(FEATURE) {
+            // A trailing `# comment` mentioning the feature is not TOML —
+            // check only the code portion of the line, the same guard the
+            // subtable branch below needs against a commented-out mention.
+            if strip_line_comment(&trimmed).contains(FEATURE) {
                 break; // already present
             }
             if let Some(feat_bracket) = trimmed.find("features = [") {
@@ -16094,6 +16111,42 @@ mod tests {
     #[test]
     fn ensure_autumn_web_oauth2_feature_ignores_commented_out_feature_mention() {
         let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\", # \"oauth2\" is intentionally disabled\n]\n";
+        let out = ensure_autumn_web_oauth2_feature(toml);
+        assert_eq!(
+            out.matches("\"oauth2\"").count(),
+            2,
+            "oauth2 must be merged as a real feature (the comment's mention is the other match): {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_mail_feature_inline_table_ignores_commented_out_mention() {
+        // Same comment-blindness bug as the subtable branch's "already
+        // present?" check, in the inline-table (`autumn-web = { ... }`)
+        // branch's own guard.
+        let toml = "autumn-web = { version = \"0.3\", features = [\"ws\"] } # \"mail\" is intentionally disabled\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert_eq!(
+            out.matches("\"mail\"").count(),
+            2,
+            "mail must be merged as a real feature (the comment's mention is the other match): {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_webauthn_feature_inline_table_ignores_commented_out_mention() {
+        let toml = "autumn-web = { version = \"0.3\", features = [\"ws\"] } # \"webauthn\" is intentionally disabled\n";
+        let out = ensure_autumn_web_webauthn_feature(toml);
+        assert_eq!(
+            out.matches("\"webauthn\"").count(),
+            2,
+            "webauthn must be merged as a real feature (the comment's mention is the other match): {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_oauth2_feature_inline_table_ignores_commented_out_mention() {
+        let toml = "autumn-web = { version = \"0.3\", features = [\"ws\"] } # \"oauth2\" is intentionally disabled\n";
         let out = ensure_autumn_web_oauth2_feature(toml);
         assert_eq!(
             out.matches("\"oauth2\"").count(),
