@@ -2591,6 +2591,31 @@ jobs:
             throw "autumn-web resolved from a registry — the [patch.crates-io] override did not take. Its lock entry: $block"
           }
 
+          # Assert the "Journey: autumn setup" step's Tailwind download was
+          # actually CONSUMED, not merely present at the path it wrote to
+          # (issue #2457). Before that fix, `setup` installed to
+          # `target\autumn\tailwindcss` (no `.exe`, and CWD-relative rather
+          # than honoring this job's `CARGO_TARGET_DIR`), the scaffold's
+          # `build.rs` looked for `target/autumn/tailwindcss` and found
+          # nothing on Windows, and — because a missing Tailwind CLI is
+          # treated as optional — the cargo build above passed anyway with no
+          # CSS ever compiled. `static/css/autumn.css` is generated only by a
+          # real Tailwind run (it ships in no template), so its absence here
+          # means the exact silent-degradation this job exists to catch.
+          $tailwindBin = "$env:CARGO_TARGET_DIR\autumn\tailwindcss.exe"
+          if (-not (Test-Path $tailwindBin)) {
+            throw "autumn setup did not install Tailwind where autumn dev/build.rs look for it: $tailwindBin"
+          }
+          $css = "static\css\autumn.css"
+          if (-not (Test-Path $css)) {
+            throw "build.rs never ran Tailwind: $css was not generated"
+          }
+          $cssBytes = (Get-Item $css).Length
+          if ($cssBytes -lt 100) {
+            throw "generated $css is suspiciously small ($cssBytes bytes) — Tailwind likely did not run against real content"
+          }
+          Write-Host "Tailwind CLI consumed from $tailwindBin; generated $css ($cssBytes bytes)"
+
       - name: "Journey: managed Postgres boots and shuts down cleanly"
         # THE regression this whole target exists to prevent, tested at the
         # runtime seam. The app is started exactly the way `autumn dev` starts
