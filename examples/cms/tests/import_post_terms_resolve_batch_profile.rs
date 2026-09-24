@@ -235,9 +235,7 @@ fn build_export_payload() -> String {
                 post_terms.push(',');
             }
             let tag = (post_index * TERMS_PER_POST + offset) % NUM_TAGS;
-            post_terms.push_str(&format!(
-                r#"{{"taxonomy":"post_tag","slug":"tag-{tag}"}}"#
-            ));
+            post_terms.push_str(&format!(r#"{{"taxonomy":"post_tag","slug":"tag-{tag}"}}"#));
         }
         posts.push_str(&format!(
             r#"{{"post_type":"post","title":"Post {post_index}","slug":"post-{post_index}","status":"draft","password":"","author":"owner","terms":[{post_terms}]}}"#
@@ -451,9 +449,7 @@ async fn import_post_terms_resolve_batch_profile() {
     let unknown_ref_resp = import_export(
         &client,
         &cookie,
-        &format!(
-            r#"{{"version":5,"site_title":"Fixture Site","exported_at":"2026-09-14T00:00:00Z","terms":[],"posts":[{{"post_type":"post","title":"Unknown Ref Post","slug":"unknown-ref-post","status":"draft","password":"","author":"owner","terms":[{{"taxonomy":"post_tag","slug":"does-not-exist"}}]}}],"attachments":[]}}"#
-        ),
+        r#"{"version":5,"site_title":"Fixture Site","exported_at":"2026-09-14T00:00:00Z","terms":[],"posts":[{"post_type":"post","title":"Unknown Ref Post","slug":"unknown-ref-post","status":"draft","password":"","author":"owner","terms":[{"taxonomy":"post_tag","slug":"does-not-exist"}]}],"attachments":[]}"#,
     )
     .await;
     assert!(
@@ -468,12 +464,11 @@ async fn import_post_terms_resolve_batch_profile() {
         #[diesel(sql_type = BigInt)]
         n: i64,
     }
-    let unknown_post_id = diesel::sql_query(
-        "SELECT id AS n FROM posts WHERE slug = 'unknown-ref-post'",
-    )
-    .get_result::<IdRow>(&mut conn)
-    .expect("unknown-ref post exists")
-    .n;
+    let unknown_post_id =
+        diesel::sql_query("SELECT id AS n FROM posts WHERE slug = 'unknown-ref-post'")
+            .get_result::<IdRow>(&mut conn)
+            .expect("unknown-ref post exists")
+            .n;
     let unknown_post_links = diesel::sql_query(format!(
         "SELECT count(*) AS n FROM post_terms WHERE post_id = {unknown_post_id}"
     ))

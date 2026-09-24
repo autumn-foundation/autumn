@@ -3929,6 +3929,56 @@ pub async fn mark_imports_complete(
     Ok(())
 }
 
+/// Batch-resolve `(taxonomy, slug)` term references to the id of the local
+/// term they name -- one to a few chunked `slug = ANY(...)` queries total,
+/// grouped by taxonomy, rather than one single-row lookup per reference.
+///
+/// Mirrors `import_terms`'s own batching one call up: this call's terms
+/// pass has already created every term the file itself declares, so by the
+/// time the posts pass runs, every reference a post carries either already
+/// exists or names nothing this site has -- there is nothing left to insert
+/// here, only to look up. A reference naming no local term is simply absent
+/// from the result, matching what the old per-post `find_by_slug` lookup
+/// found (nothing, once filtered to the right taxonomy in application code).
+///
+/// Grouped by taxonomy so the round trips scale with the site's registered-
+/// taxonomy count (usually low single digits), not with how many term
+/// references the file's posts carry in total -- a heavily-tagged blog's
+/// backup can carry many more references than distinct taxonomies.
+pub async fn resolve_term_refs<'a, I>(
+    conn: &mut AsyncPgConnection,
+    wanted: I,
+) -> AutumnResult<std::collections::HashMap<(String, String), i64>>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    use std::collections::{HashMap, HashSet};
+
+    const CHUNK: usize = 1000;
+
+    let mut by_taxonomy: HashMap<&'a str, HashSet<&'a str>> = HashMap::new();
+    for (taxonomy, slug) in wanted {
+        by_taxonomy.entry(taxonomy).or_default().insert(slug);
+    }
+
+    let mut by_key: HashMap<(String, String), i64> = HashMap::new();
+    for (taxonomy, slugs) in by_taxonomy {
+        let slugs: Vec<&str> = slugs.into_iter().collect();
+        for chunk in slugs.chunks(CHUNK) {
+            let rows: Vec<(String, String, i64)> = terms::table
+                .filter(terms::taxonomy.eq(taxonomy))
+                .filter(terms::slug.eq_any(chunk.iter().copied()))
+                .select((terms::taxonomy, terms::slug, terms::id))
+                .load(conn)
+                .await?;
+            for (row_taxonomy, row_slug, row_id) in rows {
+                by_key.insert((row_taxonomy, row_slug), row_id);
+            }
+        }
+    }
+    Ok(by_key)
+}
+
 /// The imported rows a previous run finished.
 pub async fn completed_import_ids(
     conn: &mut AsyncPgConnection,

@@ -15,9 +15,7 @@ use crate::capabilities::Capability;
 use crate::content;
 use crate::models::NewPost;
 use crate::plugins::{Action, do_action};
-use crate::repositories::{
-    AttachmentRepository as _, PostRepository as _, TermRepository as _, UserRepository as _,
-};
+use crate::repositories::{AttachmentRepository as _, PostRepository as _, UserRepository as _};
 use crate::require_capability;
 
 use super::super::site::{Csrf, Repos};
@@ -261,20 +259,24 @@ pub struct ExportTermRef {
 /// `(taxonomy, slug)` — an id from another installation means nothing — and one
 /// the destination does not have is skipped rather than created, because an
 /// import restores content and the taxonomy list is the site's own.
-async fn resolve_import_terms(repos: &Repos, post: &ExportPost) -> AutumnResult<Vec<i64>> {
-    let mut term_ids = Vec::new();
-    for reference in &post.terms {
-        if let Some(term) = repos
-            .terms
-            .find_by_slug(reference.slug.clone())
-            .await?
-            .into_iter()
-            .find(|t| t.taxonomy == reference.taxonomy)
-        {
-            term_ids.push(term.id);
-        }
-    }
-    Ok(term_ids)
+///
+/// A pure lookup against `term_ids`, which `content::resolve_term_refs`
+/// builds once for every post in the file before this runs per post — this
+/// used to be its own `find_by_slug` round trip per term reference, so a
+/// heavily-tagged import paid one single-row SELECT per (post, term) pair
+/// instead of a handful of batched queries for the whole file.
+fn resolve_import_terms(
+    term_ids: &std::collections::HashMap<(String, String), i64>,
+    post: &ExportPost,
+) -> Vec<i64> {
+    post.terms
+        .iter()
+        .filter_map(|reference| {
+            term_ids
+                .get(&(reference.taxonomy.clone(), reference.slug.clone()))
+                .copied()
+        })
+        .collect()
 }
 
 /// `open`, matching the column default, for a file that predates the field.
@@ -1366,6 +1368,26 @@ pub async fn import(
         })
         .await?;
 
+    // Every `(taxonomy, slug)` a post in the file names, resolved to a local
+    // term id in one batched pass rather than a lookup per post. The terms
+    // pass just above has already created every term the file itself
+    // declares, so this is a pure read: a reference naming no local term
+    // (this site doesn't have that taxonomy or slug) is simply absent below,
+    // the same outcome the old per-post `find_by_slug` lookup produced.
+    let term_ids_by_ref = repos
+        .with_conn(async |conn| {
+            content::resolve_term_refs(
+                conn,
+                payload
+                    .posts
+                    .iter()
+                    .flat_map(|post| post.terms.iter())
+                    .map(|reference| (reference.taxonomy.as_str(), reference.slug.as_str())),
+            )
+            .await
+        })
+        .await?;
+
     // Attachment metadata first, so posts can reference it. Matched by slug —
     // the same "ids mean nothing across installations" rule the author and
     // parent references follow. A row already present is left alone rather than
@@ -1630,7 +1652,7 @@ pub async fn import(
             // it to the ancestry pass. The marker commits before that work, so
             // a failure in between leaves exactly this state, and a retry that
             // only skipped would never repair it.
-            let term_ids = resolve_import_terms(&repos, post).await?;
+            let term_ids = resolve_import_terms(&term_ids_by_ref, post);
             // Same mapping the creation path uses: a retry of a backup whose
             // schedules have since elapsed must not be refused either.
             let wanted_status = import_status(&post.status, post.published_at).to_owned();
@@ -1750,7 +1772,7 @@ pub async fn import(
             published_at: post.published_at,
         };
 
-        let term_ids = resolve_import_terms(&repos, post).await?;
+        let term_ids = resolve_import_terms(&term_ids_by_ref, post);
         // The terms and the transition commit together. They were separate
         // transactions after an already-committed insert, so a failure in
         // either left the post present but unfinished — and the dedupe above
