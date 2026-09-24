@@ -834,6 +834,66 @@ fn mount_entropy_seed(seed: u64, mount: u64) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
+/// The longest timer tokio accepts (about 2.2 years). A larger liveness
+/// budget is clamped to it.
+const MAX_LIVENESS_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(68_719_476_734);
+
+/// Resolve the liveness budget from the raw `AUTUMN_SIM_LIVENESS_BUDGET_SECS`
+/// value. A positive whole number of seconds arms the watchdog. Unset, blank,
+/// `0` or unparseable leaves it off.
+fn parse_liveness_budget(raw: Option<&str>) -> Option<std::time::Duration> {
+    let secs = raw.map(str::trim)?.parse::<u64>().ok()?;
+    if secs == 0 {
+        return None;
+    }
+    Some(std::time::Duration::from_secs(secs).min(MAX_LIVENESS_BUDGET))
+}
+
+/// Run a `#[sim_test]` body under the liveness watchdog, when
+/// `AUTUMN_SIM_LIVENESS_BUDGET_SECS` arms it.
+///
+/// Hidden macro plumbing, like [`__seed_from_env`]. See
+/// [`__with_liveness_budget`] for what the watchdog detects.
+#[doc(hidden)]
+pub async fn __with_liveness_watchdog<F: std::future::Future>(seed: u64, body: F) -> F::Output {
+    let raw = std::env::var("AUTUMN_SIM_LIVENESS_BUDGET_SECS").ok();
+    __with_liveness_budget(seed, parse_liveness_budget(raw.as_deref()), body).await
+}
+
+/// Run `body`, and panic with a message that names `seed` when it is still
+/// running after `budget` of virtual time. `None` runs `body` with no watchdog.
+///
+/// A deadlock parks every task with no timer that could wake one, so without a
+/// watchdog the test hangs. The watchdog is itself a timer, so the paused
+/// runtime advances straight to it and the test fails at once; the
+/// `#[sim_test]` macro then prints the replay line.
+///
+/// Two limits. A busy loop that never parks keeps the runtime from advancing,
+/// so it is not detected. And the paused runtime also advances while a task
+/// waits on something outside it (a lock another thread holds, real I/O), so
+/// arm the watchdog only where sim tests run one at a time
+/// (`--test-threads=1`) and do no real I/O.
+#[doc(hidden)]
+pub async fn __with_liveness_budget<F: std::future::Future>(
+    seed: u64,
+    budget: Option<std::time::Duration>,
+    body: F,
+) -> F::Output {
+    let Some(budget) = budget else {
+        return body.await;
+    };
+    match tokio::time::timeout(budget, body).await {
+        Ok(output) => output,
+        Err(_) => panic!(
+            "sim liveness: the test body did not finish within {budget:?} of virtual time \
+             (seed=0x{seed:x}). Every task was parked with no timer to wake one, which is a \
+             deadlock, or the body waited past the budget. Raise \
+             AUTUMN_SIM_LIVENESS_BUDGET_SECS for a legitimately long run."
+        ),
+    }
+}
+
 /// Upper bound on cooperative yield rounds [`Sim::run_to_idle`] performs before
 /// returning, so a misbehaving always-ready task can never hang the drain.
 /// Generous relative to the handful of hops a job takes from the queue through
@@ -1141,11 +1201,42 @@ pub fn __replay_line(seed: u64, pkg: &str, test: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        __replay_line, AdvancePlan, DEFAULT_STRICT_WALL_CLOCK_BUDGET, Sim, parse_seed,
+        __replay_line, AdvancePlan, DEFAULT_STRICT_WALL_CLOCK_BUDGET, MAX_LIVENESS_BUDGET, Sim, mount_entropy_seed, parse_liveness_budget, parse_seed,
         parse_strict_budget_ms, plan_advance_to, resolve_local_to_utc, strict_budget_from_env_or,
     };
     use chrono::{NaiveDate, TimeZone, Utc};
     use rand::RngCore;
+
+    #[test]
+    fn liveness_budget_is_off_unless_armed() {
+        assert_eq!(parse_liveness_budget(None), None);
+        assert_eq!(parse_liveness_budget(Some("")), None);
+        assert_eq!(parse_liveness_budget(Some("0")), None);
+        assert_eq!(parse_liveness_budget(Some("soon")), None);
+        assert_eq!(parse_liveness_budget(Some("-5")), None);
+    }
+
+    #[test]
+    fn liveness_budget_takes_seconds_and_clamps_to_the_tokio_maximum() {
+        assert_eq!(
+            parse_liveness_budget(Some(" 90 ")),
+            Some(std::time::Duration::from_secs(90))
+        );
+        assert_eq!(
+            parse_liveness_budget(Some("18446744073709551615")),
+            Some(MAX_LIVENESS_BUDGET)
+        );
+    }
+
+    #[test]
+    fn mount_entropy_seed_is_the_sim_seed_first_then_derived() {
+        assert_eq!(mount_entropy_seed(7, 0), 7);
+        let restart = mount_entropy_seed(7, 1);
+        assert_ne!(restart, 7, "a restart draws a new stream");
+        assert_eq!(restart, mount_entropy_seed(7, 1), "and it is deterministic");
+        assert_ne!(restart, mount_entropy_seed(7, 2));
+        assert_ne!(restart, mount_entropy_seed(8, 1));
+    }
 
     #[test]
     fn replay_line_zero_seed_is_exact() {
