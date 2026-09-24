@@ -641,7 +641,19 @@ pub async fn set_post_terms(
         // Ascending id order, and every fan-out over terms uses the same order,
         // so two transactions touching overlapping sets can never hold the
         // halves of each other's cycle.
-        lock_terms(conn, &affected).await?;
+        let locked = lock_terms(conn, &affected).await?;
+
+        // A caller's `term_ids` can be stale by the time this transaction
+        // runs -- the id was resolved earlier (an editor's form round trip,
+        // or an import's up-front batch resolution of every post's term
+        // references) and the term was deleted in between. `lock_terms`
+        // already tolerates that for locking/recounting purposes (see its
+        // own doc comment); filtering `wanted` down to what it actually
+        // found does the same for the insert below, so a deleted term is
+        // silently dropped from the post's assignment instead of the insert
+        // failing its foreign key.
+        let locked_ids: HashSet<i64> = locked.into_iter().collect();
+        wanted.retain(|id| locked_ids.contains(id));
 
         diesel::delete(post_terms::table.filter(post_terms::post_id.eq(post_id)))
             .execute(conn)
@@ -695,21 +707,21 @@ pub async fn set_post_terms(
 /// the loop's `.optional()`; `recount_term` reaches the same conclusion for
 /// the one lock it still takes per row (see its own doc comment for why that
 /// one stays unbatched).
-async fn lock_terms(conn: &mut AsyncPgConnection, term_ids: &[i64]) -> AutumnResult<()> {
+async fn lock_terms(conn: &mut AsyncPgConnection, term_ids: &[i64]) -> AutumnResult<Vec<i64>> {
     let mut ordered = term_ids.to_vec();
     ordered.sort_unstable();
     ordered.dedup();
     if ordered.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    let _locked: Vec<i64> = terms::table
+    let locked: Vec<i64> = terms::table
         .filter(terms::id.eq_any(&ordered))
         .select(terms::id)
         .order(terms::id.asc())
         .for_update()
         .load(conn)
         .await?;
-    Ok(())
+    Ok(locked)
 }
 
 /// Rebuild the counts of every term a post is filed under.
