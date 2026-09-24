@@ -1525,6 +1525,20 @@ impl TestApp {
         self
     }
 
+    /// Install `entropy` unless the test already injected a source with
+    /// [`with_entropy`](Self::with_entropy). [`crate::sim::Sim::build`] uses
+    /// this to seed the app from the simulation seed by default.
+    #[must_use]
+    pub(crate) fn with_default_entropy(
+        mut self,
+        entropy: std::sync::Arc<dyn crate::entropy::Entropy>,
+    ) -> Self {
+        if self.entropy.is_none() {
+            self.entropy = Some(entropy);
+        }
+        self
+    }
+
     /// Register event listeners with the test app.
     ///
     /// Collect them with `listeners![..]`, exactly as in `AppBuilder::listeners`.

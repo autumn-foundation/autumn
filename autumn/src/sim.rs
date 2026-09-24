@@ -217,6 +217,11 @@ pub struct Sim {
     /// interior mutability — that keeps `Sim: Sync` and the `&self`
     /// advance/drain futures `Send` (a `Cell`/`RefCell` field would break both).
     strict_budget: Option<std::time::Duration>,
+
+    /// How many times [`mount`](Sim::mount) has run. The first mount seeds the
+    /// app's entropy from [`seed`](Sim::seed); each restart derives a new seed
+    /// from it, so a restarted process does not replay the crashed one's ids.
+    mounts: u64,
 }
 
 impl Sim {
@@ -244,6 +249,7 @@ impl Sim {
             chaos_state: None,
             app: SimApp::default(),
             strict_budget: None,
+            mounts: 0,
         }
     }
 
@@ -338,6 +344,13 @@ impl Sim {
     /// path. When chaos is active this re-derives the chaos decision state from
     /// the seed, so a restart's fault schedule replays deterministically.
     fn mount(&mut self, app: crate::test::TestApp) -> &crate::test::TestClient {
+        // Seed the app's entropy unless the test injected its own source, so
+        // framework-minted ids replay from the seed with no extra call.
+        let app = app.with_default_entropy(SeededEntropy::shared(mount_entropy_seed(
+            self.seed,
+            self.mounts,
+        )));
+        self.mounts += 1;
         // When chaos is active, install its deterministic hooks (which also own
         // the clock so a skew wrapper can be applied); otherwise the build is
         // byte-for-byte the pre-W5 path — just the virtual clock.
@@ -802,6 +815,23 @@ impl Sim {
 
         self.enforce_wall_clock_budget(guard_start);
     }
+}
+
+/// The entropy seed for the `mount`-th app a simulation mounts.
+///
+/// Mount 0 uses `seed` itself, so the default equals
+/// `with_entropy(SeededEntropy::new(sim.seed))`. A later mount (a restart after
+/// [`Sim::kill`]) derives its seed from `seed` and the mount number: a real
+/// restarted process draws new ids, and this keeps them seed-driven.
+fn mount_entropy_seed(seed: u64, mount: u64) -> u64 {
+    if mount == 0 {
+        return seed;
+    }
+    let derived = SeededEntropy::new(seed).derive_uuid(format!("sim-mount-{mount}"));
+    let bytes: [u8; 8] = derived.as_bytes()[..8]
+        .try_into()
+        .expect("a uuid has 16 bytes");
+    u64::from_le_bytes(bytes)
 }
 
 /// Upper bound on cooperative yield rounds [`Sim::run_to_idle`] performs before
