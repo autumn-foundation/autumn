@@ -57,7 +57,10 @@ fn a_built_app_replays_its_ids_from_the_seed() {
         sim.build(TestApp::new().routes(routes![ping]));
         request_ids(sim, 4).await
     });
-    assert_eq!(first, second, "same seed, no with_entropy: same request ids");
+    assert_eq!(
+        first, second,
+        "same seed, no with_entropy: same request ids"
+    );
 
     let other = run_sim(8, async |sim| {
         sim.build(TestApp::new().routes(routes![ping]));

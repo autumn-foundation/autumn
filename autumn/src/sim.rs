@@ -843,8 +843,7 @@ fn mount_entropy_seed(seed: u64, mount: u64) -> u64 {
 
 /// The longest timer tokio accepts (about 2.2 years). A larger liveness
 /// budget is clamped to it.
-const MAX_LIVENESS_BUDGET: std::time::Duration =
-    std::time::Duration::from_millis(68_719_476_734);
+const MAX_LIVENESS_BUDGET: std::time::Duration = std::time::Duration::from_millis(68_719_476_734);
 
 /// Resolve the liveness budget from the raw `AUTUMN_SIM_LIVENESS_BUDGET_SECS`
 /// value. A positive whole number of seconds arms the watchdog. Unset, blank,
@@ -1208,8 +1207,9 @@ pub fn __replay_line(seed: u64, pkg: &str, test: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        __replay_line, AdvancePlan, DEFAULT_STRICT_WALL_CLOCK_BUDGET, MAX_LIVENESS_BUDGET, Sim, mount_entropy_seed, parse_liveness_budget, parse_seed,
-        parse_strict_budget_ms, plan_advance_to, resolve_local_to_utc, strict_budget_from_env_or,
+        __replay_line, AdvancePlan, DEFAULT_STRICT_WALL_CLOCK_BUDGET, MAX_LIVENESS_BUDGET, Sim,
+        mount_entropy_seed, parse_liveness_budget, parse_seed, parse_strict_budget_ms,
+        plan_advance_to, resolve_local_to_utc, strict_budget_from_env_or,
     };
     use chrono::{NaiveDate, TimeZone, Utc};
     use rand::RngCore;

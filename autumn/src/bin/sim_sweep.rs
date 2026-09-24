@@ -77,7 +77,9 @@ fn apply_ops(ops: &[Op]) {
 /// `AUTUMN_SIM_SEEDS` values. An unset or unparseable value takes its default
 /// (start `0`, count 256). The range saturates at `u64::MAX`.
 fn seed_range(start: Option<&str>, count: Option<&str>) -> std::ops::Range<u64> {
-    let start = start.and_then(|value| value.trim().parse().ok()).unwrap_or(0);
+    let start = start
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0);
     let count = count
         .and_then(|value| value.trim().parse().ok())
         .unwrap_or(DEFAULT_SEED_COUNT);
