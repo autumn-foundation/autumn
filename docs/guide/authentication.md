@@ -505,8 +505,13 @@ rp_name   = "My App (dev)"
 rp_origin = "http://localhost:3000"
 ```
 
-- `rp_id` must be the registrable domain, or a parent of it — `example.com`
-  covers `app.example.com`, and the reverse does not hold.
+- `rp_id` must be the origin's own domain, or a registrable domain suffix of
+  it. For an origin of `https://app.example.com`, both `app.example.com` and
+  `example.com` are valid, and the choice sets the credential's scope:
+  `app.example.com` binds it to that host, `example.com` also covers sibling
+  subdomains. Pick the narrowest one that covers every origin you sign in from.
+  A public suffix is not a registrable domain, so `com` is never a valid
+  `rp_id`.
 - `rp_origin` must parse as a URL and must be an origin that `rp_id` covers.
   `WebauthnBuilder` rejects a mismatch, so a wrong pair surfaces as a `500` from
   the passkey routes rather than as a ceremony that fails in the browser.
