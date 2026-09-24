@@ -638,3 +638,111 @@ async fn policy_without_scope_returns_empty_when_no_records_pass_can_show() {
     assert!(body.is_empty());
     assert_eq!(envelope["total_elements"], 0);
 }
+
+// ── `policy = ...` declared but never registered on the builder ─
+//
+// `docs/guide/security-posture-manifest.md` names `policy_registration` a
+// "runtime-only" dimension: the route→action→resource binding is proven at
+// build time from the macro expansion, but *which* `impl Policy<Resource>`
+// actually serves it is resolved from the live `PolicyRegistry` at boot
+// (`AppBuilder::policy::<R, _>(...)`), and "a missing registration is not
+// visible at build time." `autumn/src/authorization.rs::authorize` /
+// `authorize_with_scopes` both resolve the policy with
+// `.ok_or_else(...).with_status(INTERNAL_SERVER_ERROR)`, so the documented
+// (and, in `prod`/`production` profiles, boot-enforced via
+// `validate_repository_policies_registered` in `app.rs`) contract is that a
+// forgotten `.policy(...)` call fails a protected request closed (`500`)
+// rather than serving it unguarded. `TestApp` never runs that boot-time
+// `prod`-profile check (see `test.rs::TestApp::build`, which only replays
+// `policy_registrations` onto the live registry, never calls
+// `validate_repository_policies_registered`), so a dev-profile boot with the
+// registration accidentally omitted is exactly the state this test builds by
+// hand and drives through a real HTTP request — nothing here reaches the
+// hypothesis via a hand-built extractor call or a private helper.
+//
+// No prior test in the workspace exercises this end to end through the
+// router: `app.rs`'s own unit tests cover only the pure
+// `collect_unregistered_repository_handlers` boot-detection helper, never a
+// real request against a route left in that state.
+fn build_app_without_policy_registration(
+    pool: Pool<AsyncPgConnection>,
+    store: MemoryStore,
+) -> autumn_web::test::TestClient {
+    // Deliberately omits `.policy::<Note, _>(NotePolicy)` — the footgun
+    // `validate_repository_policies_registered` exists to catch at boot in
+    // `prod`/`production` profiles. `TestApp` runs no such profile-gated
+    // check, so this reproduces the exact live state a `dev`-profile boot
+    // would silently reach.
+    TestApp::new()
+        .with_db(pool)
+        .routes(vec![
+            __autumn_route_info_note_api_list(),
+            __autumn_route_info_note_api_get(),
+        ])
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .build()
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn get_via_repository_endpoint_fails_closed_when_policy_is_not_registered() {
+    let (pool, _container) = setup_pool().await;
+    let note_id = seed_note(&pool, "Nobody should ever see this title", 42).await;
+
+    let store = MemoryStore::new();
+    // Any authenticated session — even the record's own owner — must be
+    // refused. This is not an authorization decision (no `Policy` ran to
+    // make one); it is the framework refusing to serve a route it cannot
+    // prove is guarded.
+    seed_session(&store, "sess-owner", "42", None).await;
+    let client = build_app_without_policy_registration(pool, store);
+
+    let response = client
+        .get(&format!("/api/notes/{note_id}"))
+        .header("Cookie", "autumn.sid=sess-owner")
+        .send()
+        .await;
+
+    assert_eq!(
+        response.status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a `policy = ...` route with no `.policy::<R, _>(...)` registration must fail \
+         closed (500), never serve the record: body was {:?}",
+        String::from_utf8_lossy(&response.body)
+    );
+    let body = String::from_utf8_lossy(&response.body);
+    assert!(
+        !body.contains("Nobody should ever see this title"),
+        "the unguarded route must never leak the record body into the error response: {body}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn list_via_repository_endpoint_fails_closed_when_policy_is_not_registered() {
+    let (pool, _container) = setup_pool().await;
+    seed_note(&pool, "alice's private note", 1).await;
+    seed_note(&pool, "bob's private note", 2).await;
+
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-stranger", "999", None).await;
+    let client = build_app_without_policy_registration(pool, store);
+
+    let response = client
+        .get("/api/notes")
+        .header("Cookie", "autumn.sid=sess-stranger")
+        .send()
+        .await;
+
+    assert_eq!(
+        response.status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the list endpoint's per-row `can_show` filtering never runs without a \
+         registered policy, so it must fail closed rather than fall back to returning \
+         every row: body was {:?}",
+        String::from_utf8_lossy(&response.body)
+    );
+    let body = String::from_utf8_lossy(&response.body);
+    assert!(!body.contains("alice's private note"));
+    assert!(!body.contains("bob's private note"));
+}
