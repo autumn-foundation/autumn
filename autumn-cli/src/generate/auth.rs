@@ -170,15 +170,24 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
                             k += 1;
                         }
                         if let Some(cl) = close_line {
+                            // Collapsing every line onto one loses each line's
+                            // own trailing `# comment`, if any — and worse,
+                            // leaving one in would swallow the rest of the
+                            // rebuilt line (including its closing `]`) behind
+                            // `#` once everything lands on a single line.
+                            fn strip_comment(s: &str) -> &str {
+                                s.split_once('#').map_or(s, |(before, _)| before)
+                            }
                             let j_bracket = lines[j].find('[').unwrap_or(lines[j].len());
-                            let mut list_text = lines[j][j_bracket + 1..].to_owned();
+                            let mut list_text =
+                                strip_comment(&lines[j][j_bracket + 1..]).to_owned();
                             for line in &lines[j + 1..cl] {
                                 list_text.push(' ');
-                                list_text.push_str(line.trim());
+                                list_text.push_str(strip_comment(line.trim()));
                             }
                             let cl_close = lines[cl].find(']').unwrap_or(lines[cl].len());
                             list_text.push(' ');
-                            list_text.push_str(&lines[cl][..cl_close]);
+                            list_text.push_str(strip_comment(&lines[cl][..cl_close]));
                             let trailing = lines[cl]
                                 [cl_close.saturating_add(1).min(lines[cl].len())..]
                                 .to_owned();
@@ -393,15 +402,23 @@ fn ensure_totp_rs_features(toml: &str) -> String {
                         k += 1;
                     }
                     if let Some(cl) = close_line {
+                        // Collapsing every line onto one loses each line's own
+                        // trailing `# comment`, if any — and worse, leaving
+                        // one in would swallow the rest of the rebuilt line
+                        // (including its closing `]`) behind `#` once
+                        // everything lands on a single line.
+                        fn strip_comment(s: &str) -> &str {
+                            s.split_once('#').map_or(s, |(before, _)| before)
+                        }
                         let fl_bracket = lines[fl].find('[').unwrap_or(lines[fl].len());
-                        let mut list_text = lines[fl][fl_bracket + 1..].to_owned();
+                        let mut list_text = strip_comment(&lines[fl][fl_bracket + 1..]).to_owned();
                         for line in &lines[fl + 1..cl] {
                             list_text.push(' ');
-                            list_text.push_str(line.trim());
+                            list_text.push_str(strip_comment(line.trim()));
                         }
                         let cl_close = lines[cl].find(']').unwrap_or(lines[cl].len());
                         list_text.push(' ');
-                        list_text.push_str(&lines[cl][..cl_close]);
+                        list_text.push_str(strip_comment(&lines[cl][..cl_close]));
                         let trailing =
                             lines[cl][cl_close.saturating_add(1).min(lines[cl].len())..].to_owned();
 
@@ -1696,31 +1713,66 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
                                 .collect();
                             lines[j] = format!("{indent_j}features = [{new_inner}]");
                         } else {
+                            // Multiline `features = [` … `]` array: scan every
+                            // line up to the closing bracket. The feature may
+                            // already be merged on a line other than the
+                            // opener, in which case nothing should be
+                            // appended (it would otherwise be duplicated on
+                            // every re-run of the generator).
                             let mut k = j + 1;
+                            let mut already_present = false;
+                            let mut close_line = None;
                             while k < lines.len() {
                                 let tk = lines[k].trim();
                                 if tk.starts_with('[') {
                                     break;
                                 }
-                                if let Some(close_idx) = tk.find(']') {
-                                    let before_close = tk[..close_idx].trim();
-                                    let sep =
-                                        if before_close.is_empty() || before_close.ends_with(',') {
-                                            ""
-                                        } else {
-                                            ", "
-                                        };
-                                    let indent_k: String = lines[k]
-                                        .chars()
-                                        .take_while(char::is_ascii_whitespace)
-                                        .collect();
-                                    lines[k] = format!(
-                                        "{indent_k}{before_close}{sep}{FEATURE}{}",
-                                        &tk[close_idx..]
-                                    );
+                                if tk.contains(FEATURE) {
+                                    already_present = true;
+                                }
+                                if tk.contains(']') {
+                                    close_line = Some(k);
                                     break;
                                 }
                                 k += 1;
+                            }
+                            if !already_present && let Some(k) = close_line {
+                                let tk = lines[k].trim().to_owned();
+                                let close_idx = tk.find(']').unwrap_or(tk.len());
+                                let before_close = tk[..close_idx].trim();
+                                // The closing bracket's own line may have no
+                                // entry before it (just `]`), in which case
+                                // the last real entry — needed to know
+                                // whether a comma must be inserted — is on an
+                                // earlier line.
+                                let last_entry = if before_close.is_empty() {
+                                    (j..k).rev().find_map(|idx| {
+                                        let raw = if idx == j {
+                                            lines[idx]
+                                                .split_once('[')
+                                                .map_or("", |(_, rest)| rest)
+                                                .trim()
+                                        } else {
+                                            lines[idx].trim()
+                                        };
+                                        (!raw.is_empty()).then(|| raw.to_owned())
+                                    })
+                                } else {
+                                    Some(before_close.to_owned())
+                                };
+                                let sep = if last_entry.is_some_and(|e| !e.ends_with(',')) {
+                                    ", "
+                                } else {
+                                    ""
+                                };
+                                let indent_k: String = lines[k]
+                                    .chars()
+                                    .take_while(char::is_ascii_whitespace)
+                                    .collect();
+                                lines[k] = format!(
+                                    "{indent_k}{before_close}{sep}{FEATURE}{}",
+                                    &tk[close_idx..]
+                                );
                             }
                         }
                     }
@@ -1898,34 +1950,66 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
                                 .collect();
                             lines[j] = format!("{indent_j}features = [{new_inner}]");
                         } else {
-                            // Multiline `features = [` … `]` array: the closing
-                            // bracket is on a later line, so scan forward for it
-                            // and insert the feature there.
+                            // Multiline `features = [` … `]` array: scan every
+                            // line up to the closing bracket. The feature may
+                            // already be merged on a line other than the
+                            // opener, in which case nothing should be
+                            // appended (it would otherwise be duplicated on
+                            // every re-run of the generator).
                             let mut k = j + 1;
+                            let mut already_present = false;
+                            let mut close_line = None;
                             while k < lines.len() {
                                 let tk = lines[k].trim();
                                 if tk.starts_with('[') {
                                     break;
                                 }
-                                if let Some(close_idx) = tk.find(']') {
-                                    let before_close = tk[..close_idx].trim();
-                                    let sep =
-                                        if before_close.is_empty() || before_close.ends_with(',') {
-                                            ""
-                                        } else {
-                                            ", "
-                                        };
-                                    let indent_k: String = lines[k]
-                                        .chars()
-                                        .take_while(char::is_ascii_whitespace)
-                                        .collect();
-                                    lines[k] = format!(
-                                        "{indent_k}{before_close}{sep}{FEATURE}{}",
-                                        &tk[close_idx..]
-                                    );
+                                if tk.contains(FEATURE) {
+                                    already_present = true;
+                                }
+                                if tk.contains(']') {
+                                    close_line = Some(k);
                                     break;
                                 }
                                 k += 1;
+                            }
+                            if !already_present && let Some(k) = close_line {
+                                let tk = lines[k].trim().to_owned();
+                                let close_idx = tk.find(']').unwrap_or(tk.len());
+                                let before_close = tk[..close_idx].trim();
+                                // The closing bracket's own line may have no
+                                // entry before it (just `]`), in which case
+                                // the last real entry — needed to know
+                                // whether a comma must be inserted — is on an
+                                // earlier line.
+                                let last_entry = if before_close.is_empty() {
+                                    (j..k).rev().find_map(|idx| {
+                                        let raw = if idx == j {
+                                            lines[idx]
+                                                .split_once('[')
+                                                .map_or("", |(_, rest)| rest)
+                                                .trim()
+                                        } else {
+                                            lines[idx].trim()
+                                        };
+                                        (!raw.is_empty()).then(|| raw.to_owned())
+                                    })
+                                } else {
+                                    Some(before_close.to_owned())
+                                };
+                                let sep = if last_entry.is_some_and(|e| !e.ends_with(',')) {
+                                    ", "
+                                } else {
+                                    ""
+                                };
+                                let indent_k: String = lines[k]
+                                    .chars()
+                                    .take_while(char::is_ascii_whitespace)
+                                    .collect();
+                                lines[k] = format!(
+                                    "{indent_k}{before_close}{sep}{FEATURE}{}",
+                                    &tk[close_idx..]
+                                );
                             }
                         }
                     }
@@ -11188,34 +11272,66 @@ fn ensure_autumn_web_webauthn_feature(toml: &str) -> String {
                                 .collect();
                             lines[j] = format!("{indent_j}features = [{new_inner}]");
                         } else {
-                            // Multiline `features = [` … `]` array: the closing
-                            // bracket is on a later line, so scan forward for it
-                            // and insert the feature there.
+                            // Multiline `features = [` … `]` array: scan every
+                            // line up to the closing bracket. The feature may
+                            // already be merged on a line other than the
+                            // opener, in which case nothing should be
+                            // appended (it would otherwise be duplicated on
+                            // every re-run of the generator).
                             let mut k = j + 1;
+                            let mut already_present = false;
+                            let mut close_line = None;
                             while k < lines.len() {
                                 let tk = lines[k].trim();
                                 if tk.starts_with('[') {
                                     break;
                                 }
-                                if let Some(close_idx) = tk.find(']') {
-                                    let before_close = tk[..close_idx].trim();
-                                    let sep =
-                                        if before_close.is_empty() || before_close.ends_with(',') {
-                                            ""
-                                        } else {
-                                            ", "
-                                        };
-                                    let indent_k: String = lines[k]
-                                        .chars()
-                                        .take_while(char::is_ascii_whitespace)
-                                        .collect();
-                                    lines[k] = format!(
-                                        "{indent_k}{before_close}{sep}{FEATURE}{}",
-                                        &tk[close_idx..]
-                                    );
+                                if tk.contains(FEATURE) {
+                                    already_present = true;
+                                }
+                                if tk.contains(']') {
+                                    close_line = Some(k);
                                     break;
                                 }
                                 k += 1;
+                            }
+                            if !already_present && let Some(k) = close_line {
+                                let tk = lines[k].trim().to_owned();
+                                let close_idx = tk.find(']').unwrap_or(tk.len());
+                                let before_close = tk[..close_idx].trim();
+                                // The closing bracket's own line may have no
+                                // entry before it (just `]`), in which case
+                                // the last real entry — needed to know
+                                // whether a comma must be inserted — is on an
+                                // earlier line.
+                                let last_entry = if before_close.is_empty() {
+                                    (j..k).rev().find_map(|idx| {
+                                        let raw = if idx == j {
+                                            lines[idx]
+                                                .split_once('[')
+                                                .map_or("", |(_, rest)| rest)
+                                                .trim()
+                                        } else {
+                                            lines[idx].trim()
+                                        };
+                                        (!raw.is_empty()).then(|| raw.to_owned())
+                                    })
+                                } else {
+                                    Some(before_close.to_owned())
+                                };
+                                let sep = if last_entry.is_some_and(|e| !e.ends_with(',')) {
+                                    ", "
+                                } else {
+                                    ""
+                                };
+                                let indent_k: String = lines[k]
+                                    .chars()
+                                    .take_while(char::is_ascii_whitespace)
+                                    .collect();
+                                lines[k] = format!(
+                                    "{indent_k}{before_close}{sep}{FEATURE}{}",
+                                    &tk[close_idx..]
+                                );
                             }
                         }
                     }
@@ -15838,6 +15954,112 @@ mod tests {
             1,
             "conditional-ui duplicated: {out}"
         );
+    }
+
+    #[test]
+    fn ensure_autumn_web_mail_feature_multiline_array_without_trailing_comma_stays_valid_toml() {
+        // Codex review on #2948: when the last entry before `]` has no
+        // trailing comma, inserting the new feature right before the
+        // bracket produced e.g. `"ws"\n"mail"]` — invalid TOML (missing the
+        // separator between array elements).
+        let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\"\n]\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert!(
+            out.contains("\"mail\""),
+            "mail feature must be merged: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_autumn_web_webauthn_feature_multiline_array_without_trailing_comma_stays_valid_toml()
+    {
+        // Same gap as the mail copy, in the webauthn copy.
+        let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\"\n]\n";
+        let out = ensure_autumn_web_webauthn_feature(toml);
+        assert!(
+            out.contains("\"webauthn\""),
+            "webauthn feature must be merged: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_autumn_web_oauth2_feature_multiline_array_without_trailing_comma_stays_valid_toml() {
+        // Same gap as its two siblings, in the one copy that already had the
+        // multiline fallback before #2948.
+        let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\"\n]\n";
+        let out = ensure_autumn_web_oauth2_feature(toml);
+        assert!(
+            out.contains("\"oauth2\""),
+            "oauth2 feature must be merged: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_autumn_web_mail_feature_does_not_duplicate_across_multiline_array() {
+        // Codex review on #2948: the "already present?" check only looked at
+        // the `features = [` opener line, not the rest of a multiline array,
+        // so re-running the generator kept appending another `"mail"`.
+        let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\",\n    \"mail\",\n]\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert_eq!(out.matches("\"mail\"").count(), 1, "mail duplicated: {out}");
+    }
+
+    #[test]
+    fn ensure_autumn_web_webauthn_feature_does_not_duplicate_across_multiline_array() {
+        let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\",\n    \"webauthn\",\n]\n";
+        let out = ensure_autumn_web_webauthn_feature(toml);
+        assert_eq!(
+            out.matches("\"webauthn\"").count(),
+            1,
+            "webauthn duplicated: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_oauth2_feature_does_not_duplicate_across_multiline_array() {
+        let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\",\n    \"oauth2\",\n]\n";
+        let out = ensure_autumn_web_oauth2_feature(toml);
+        assert_eq!(
+            out.matches("\"oauth2\"").count(),
+            1,
+            "oauth2 duplicated: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_webauthn_rs_features_preserves_valid_toml_around_interior_comment() {
+        // Codex review on #2948: collapsing every line of a multiline array
+        // onto one line without stripping trailing `# comment`s let a
+        // comment on an interior entry swallow the rest of the line
+        // (including the real closing `]`), producing an unterminated
+        // array — invalid TOML.
+        let toml = "[dependencies.webauthn-rs]\nversion = \"0.5\"\nfeatures = [\n    \"conditional-ui\", # keep this one\n]\n";
+        let out = ensure_webauthn_rs_features(toml);
+        assert!(
+            out.contains("\"conditional-ui\"")
+                && out.contains("\"danger-allow-state-serialisation\""),
+            "both features must be present: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_totp_rs_features_preserves_valid_toml_around_interior_comment() {
+        let toml = "[dependencies.totp-rs]\nversion = \"5\"\nfeatures = [\n    \"qr\", # needed for enrollment\n]\n";
+        let out = ensure_totp_rs_features(toml);
+        assert!(
+            out.contains("\"qr\"") && out.contains("\"gen_secret\"") && out.contains("\"otpauth\""),
+            "all three features must be present: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
     }
 
     #[test]
