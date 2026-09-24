@@ -272,36 +272,52 @@ pub struct ExportTermRef {
 /// import is one HTTP request spanning real wall-clock time across
 /// potentially thousands of posts, and someone else's unrelated write
 /// (creating a term under the same `(taxonomy, slug)` a not-yet-processed
-/// post references) can land in between. So a miss here is re-checked
-/// against the live table and, if found, cached into `term_ids` for any
-/// later post that names the same reference — bounded by this post's own
-/// miss count, not the file's total reference count, so the common case
-/// (everything already resolved by the up-front pass) pays nothing extra.
-/// A term deleted and recreated under the same key in that window is not
-/// covered by this cache-then-trust-the-cache-forever strategy — closing
-/// that fully would mean re-checking every cache *hit* too, i.e. a query
-/// per reference regardless of outcome, which is the exact per-reference
-/// round trip this batching exists to remove. `set_post_terms` already
-/// drops a since-deleted id rather than failing its foreign key (see its
-/// own doc comment), so that residual case fails soft — the post ends up
-/// untagged for that one reference, the same outcome an outright missing
-/// term produces — rather than aborting the import.
+/// post references) can land in between. So the first post to encounter a
+/// miss re-checks it against the live table; whatever that one extra check
+/// finds (or does not find) is cached into `term_ids` and `checked` for
+/// every later post naming the same reference. `checked` is what makes
+/// that a one-time check per distinct missing key rather than a recheck
+/// per post: without it, many posts sharing one reference this site
+/// genuinely does not have -- an easy shape, e.g. a deprecated tag the
+/// destination dropped, still named by hundreds of posts in the backup --
+/// would each treat it as a fresh miss and requery, silently degrading
+/// back to the O(posts) round trip this whole batching pass exists to
+/// remove.
+///
+/// A term deleted and recreated under the same key in the window between
+/// a key's one check and the end of the import is not covered by this
+/// check-once strategy — closing that too would mean rechecking every
+/// cache *hit* on every post, i.e. a query per reference regardless of
+/// outcome, which is the exact per-reference round trip this batching
+/// exists to remove. `set_post_terms` already drops a since-deleted id
+/// rather than failing its foreign key (see its own doc comment), so that
+/// residual case fails soft — the post ends up untagged for that one
+/// reference, the same outcome an outright missing term produces —
+/// rather than aborting the import.
 async fn resolve_import_terms(
     conn: &mut AsyncPgConnection,
     term_ids: &mut std::collections::HashMap<(String, String), i64>,
+    checked: &mut std::collections::HashSet<(String, String)>,
     post: &ExportPost,
 ) -> AutumnResult<Vec<i64>> {
-    let misses: Vec<(&str, &str)> = post
+    use std::collections::HashSet;
+
+    let misses: HashSet<(String, String)> = post
         .terms
         .iter()
-        .filter(|reference| {
-            !term_ids.contains_key(&(reference.taxonomy.clone(), reference.slug.clone()))
-        })
-        .map(|reference| (reference.taxonomy.as_str(), reference.slug.as_str()))
+        .map(|reference| (reference.taxonomy.clone(), reference.slug.clone()))
+        .filter(|key| !term_ids.contains_key(key) && !checked.contains(key))
         .collect();
     if !misses.is_empty() {
-        let refreshed = content::resolve_term_refs(conn, misses).await?;
+        let refreshed = content::resolve_term_refs(
+            conn,
+            misses
+                .iter()
+                .map(|(taxonomy, slug)| (taxonomy.as_str(), slug.as_str())),
+        )
+        .await?;
         term_ids.extend(refreshed);
+        checked.extend(misses);
     }
     Ok(post
         .terms
@@ -1422,6 +1438,12 @@ pub async fn import(
             .await
         })
         .await?;
+    // Distinct `(taxonomy, slug)` keys `resolve_import_terms` has already
+    // spent one live re-check on during the loop below (a miss against the
+    // up-front snapshot above) -- whether that check found the term or not.
+    // Without this, a reference many posts share but this site genuinely
+    // does not have would be re-queried by every one of them.
+    let mut checked_term_refs = std::collections::HashSet::new();
 
     // Attachment metadata first, so posts can reference it. Matched by slug —
     // the same "ids mean nothing across installations" rule the author and
@@ -1696,7 +1718,13 @@ pub async fn import(
             let transitioned = repos
                 .with_conn(async |conn| {
                     use diesel_async::AsyncConnection as _;
-                    let term_ids = resolve_import_terms(conn, &mut term_ids_by_ref, post).await?;
+                    let term_ids = resolve_import_terms(
+                        conn,
+                        &mut term_ids_by_ref,
+                        &mut checked_term_refs,
+                        post,
+                    )
+                    .await?;
                     conn.transaction(async move |conn| {
                         content::set_post_terms(conn, ours_id, term_ids).await?;
                         if wanted_status != current_status {
@@ -1840,7 +1868,9 @@ pub async fn import(
         let outcome = repos
             .with_conn(async |conn| {
                 use diesel_async::AsyncConnection as _;
-                let term_ids = resolve_import_terms(conn, &mut term_ids_by_ref, post).await?;
+                let term_ids =
+                    resolve_import_terms(conn, &mut term_ids_by_ref, &mut checked_term_refs, post)
+                        .await?;
                 conn.transaction(async move |conn| {
                     // The parent resolved above is only *used* if it is one the
                     // editor would accept — a live row of the same type, no

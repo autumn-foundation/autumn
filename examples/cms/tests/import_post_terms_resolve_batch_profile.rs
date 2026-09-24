@@ -527,3 +527,105 @@ async fn import_post_terms_resolve_batch_profile() {
         ),
     );
 }
+
+/// A reference many posts share but this site genuinely does not have (a
+/// deprecated tag the destination dropped, still named by every post in an
+/// old backup, is exactly this shape) must be re-checked against the live
+/// table **at most once for the whole import**, not once per post that
+/// names it -- `resolve_import_terms`'s post-review follow-up fix (the live
+/// miss re-check that catches a term created mid-import) would otherwise
+/// silently degrade back to the O(posts) per-reference round trip this
+/// whole PR exists to remove, for exactly this shape.
+///
+/// 50 posts, each referencing one tag (`ghost-tag`) that is declared
+/// nowhere in the file and does not exist on the site. The up-front batch
+/// resolves nothing for it (1 call); the first post to see it miss spends
+/// one live re-check (1 more call, also finding nothing) and every other
+/// post reuses that same negative result. Total batched-lookup calls: 2,
+/// never 51.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn import_post_terms_resolve_shared_miss_is_checked_once() {
+    let container = Postgres::default()
+        .with_tag("16-alpine")
+        .with_cmd([
+            "-c",
+            "fsync=off",
+            "-c",
+            "shared_preload_libraries=pg_stat_statements",
+            "-c",
+            "pg_stat_statements.track=all",
+            "-c",
+            "pg_stat_statements.max=2000",
+        ])
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+    let mut conn = PgConnection::establish(&url).expect("sync db connection");
+    conn.batch_execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+        .expect("create pg_stat_statements extension");
+    apply_migration(&mut conn);
+
+    let config = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
+    let pool = Pool::builder(config).build().expect("pool");
+
+    cms::bootstrap();
+    let mut app_config = AutumnConfig::default();
+    app_config.security.csrf.enabled = false;
+    let client: TestClient = TestApp::new()
+        .routes(cms::all_routes())
+        .config(app_config)
+        .with_db(pool)
+        .build();
+
+    let cookie = register(&client, "owner").await;
+
+    const NUM_POSTS: usize = 50;
+    let mut posts = String::new();
+    for post_index in 0..NUM_POSTS {
+        if !posts.is_empty() {
+            posts.push(',');
+        }
+        posts.push_str(&format!(
+            r#"{{"post_type":"post","title":"Post {post_index}","slug":"post-{post_index}","status":"draft","password":"","author":"owner","terms":[{{"taxonomy":"post_tag","slug":"ghost-tag"}}]}}"#
+        ));
+    }
+    let payload = format!(
+        r#"{{"version":5,"site_title":"Fixture Site","exported_at":"2026-09-14T00:00:00Z","terms":[],"posts":[{posts}],"attachments":[]}}"#
+    );
+
+    reset_stats(&mut conn);
+    let resp = import_export(&client, &cookie, &payload).await;
+    assert!(
+        resp.status.is_success(),
+        "an import referencing a term this site does not have must still succeed, every post \
+         just untagged; body was: {}",
+        resp.text()
+    );
+    let posts_count = count_table(&mut conn, "posts");
+    assert_eq!(
+        posts_count, NUM_POSTS as i64,
+        "every post must still import"
+    );
+    let links = count_table(&mut conn, "post_terms");
+    assert_eq!(
+        links, 0,
+        "a term this site never has must leave every post untagged, no spurious link anywhere"
+    );
+
+    let (_, _, any_calls, _) = print_profile(
+        &mut conn,
+        "50 posts sharing one term this site does not have",
+    );
+    assert!(
+        any_calls <= 2,
+        "a reference every post shares but this site does not have must cost at most one \
+         up-front batch call plus one live re-check for the whole import, not one per post \
+         (got {any_calls} calls for {NUM_POSTS} posts) -- see resolve_import_terms's `checked` \
+         negative cache"
+    );
+}
