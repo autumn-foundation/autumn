@@ -41,7 +41,15 @@ All 4 in-window failures triaged at job/log level:
 | 35806829348 | `dependabot/github_actions/dtolnay/rust-toolchain-1.120.0` | `MSRV`, `Test (macos/ubuntu/windows-latest)`, `Test suite` | `rustup` failed installing toolchain `1.120.0` itself — **own subject matter** (the pin bump), unmerged. |
 
 None of the 4 match `live_upgrade`, `cache_stampede`, `sim_fault_plan`, or any
-other tracked signature.
+other tracked signature. **Caveat, per a Codex review comment on this pass's
+own PR (#2942)**: this only inspected the 4 runs that resolved to a `failure`
+conclusion. 64 of the 100 sampled runs resolved to `cancelled` — `ci.yml`'s
+`concurrency.cancel-in-progress: true` (lines 9-11) means a job inside one of
+those runs could still have completed with a failing test before the overall
+run was marked cancelled by a superseding push. Those 64 runs' job-level logs
+were not inspected this pass, so the "zero new hits" claims below are scoped
+to the 36 runs that resolved to `success`/`failure` and were actually
+checked, not proven exhaustive across the full 100-run window.
 
 ## 🔍 Diagnosis
 
@@ -57,23 +65,27 @@ before the fix landed on `trunk-dev`.
 None needed. This pass is verification-only:
 
 - Confirmed `sqlite_job_backend_tracks_job_status_durably`'s fix (PR #2925)
-  is holding: zero recurrences in the ~14.2h of ordinary PR traffic sampled
-  since its merge (2026-09-23T19:33:05Z through this pass's window end,
+  is holding: zero recurrences among the runs that reached a `success`/
+  `failure` conclusion in the ~14.2h of ordinary PR traffic sampled since its
+  merge (2026-09-23T19:33:05Z through this pass's window end,
   2026-09-24T09:42:24Z — not the full ~37.85h sampling window, most of which
-  predates the merge and contains the one known pre-fix hit).
+  predates the merge and contains the one known pre-fix hit). Cancelled runs
+  in that post-merge slice were not inspected at job level (see the Symptom
+  section's caveat).
 - Added dated 2026-09-24 updates to the `live_upgrade`, `cache_stampede`, and
   `sim_fault_plan` entries in `docs/ci-health/quarantine-ledger.md` recording
-  this pass's clean sampling window, and a verification addendum to the
-  closed `sqlite_job_backend_tracks_job_status_durably` entry.
+  this pass's sampling window (with the same cancelled-run caveat), and a
+  verification addendum to the closed `sqlite_job_backend_tracks_job_status_durably`
+  entry.
 
 ## 📊 Measurement
 
 | Item | Before this pass | This pass | After |
 |---|---|---|---|
-| `sqlite_job_backend_tracks_job_status_durably` | Closed 2026-09-23 (PR #2925) | 1 hit found, predates the fix's merge by ~6h; 0 hits after | Unchanged, still closed — fix confirmed holding |
-| `live_upgrade` (3 signatures) | Uncampaigned, 14 consecutive clean passes | No new organic hits | Unchanged |
-| `cache_stampede` | Uncampaigned | No new organic hits | Unchanged |
-| `sim_fault_plan` | n=1, uncampaigned | No new organic hits | Unchanged |
+| `sqlite_job_backend_tracks_job_status_durably` | Closed 2026-09-23 (PR #2925) | 1 hit found, predates the fix's merge by ~6h; 0 hits after among inspected runs | Unchanged, still closed — fix confirmed holding |
+| `live_upgrade` (3 signatures) | Uncampaigned, 14 consecutive clean passes | No new organic hits among inspected runs | Unchanged |
+| `cache_stampede` | Uncampaigned | No new organic hits among inspected runs | Unchanged |
+| `sim_fault_plan` | n=1, uncampaigned | No new organic hits among inspected runs | Unchanged |
 | `manual-macos-contention-check.yml` dispatches | 0 (14 idle passes, ~330.5h) | 0 (15th idle pass, ~378.6h) | Needs human sign-off for CI spend |
 
 ## 🔬 Reproduce

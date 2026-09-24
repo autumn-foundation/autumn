@@ -1391,11 +1391,21 @@ _None as of 2026-09-05._
   fix's merge, and outside the ~14.2h post-merge window this verification
   actually covers — it is the same pre-fix occurrence this entry's own
   reproduction campaign already accounts for, not a new recurrence. Zero
-  hits in the ~14.2h sampled after the merge.
+  hits among the `success`/`failure`-concluded runs in the ~14.2h sampled
+  after the merge.
   **Correction (post-review, via a Codex review comment on PR #2942): an
   earlier version of this note and the corresponding `live_upgrade` update
   below misstated the post-merge verification interval as "~38h," which was
   the full sampling window's span, not the portion after the merge.**
+  **Second correction (post-review, via a further Codex review comment on PR
+  #2942): the "zero hits" claim was not scoped to what was actually
+  inspected.** `ci.yml`'s `concurrency.cancel-in-progress: true` (lines 9-11)
+  means a job inside a `cancelled`-overall run can still have completed with
+  a failing test before the run itself was marked cancelled by a superseding
+  push. The cancelled runs inside the post-merge window were not inspected
+  at job level this pass, so this verification covers only the
+  `success`/`failure`-concluded runs in that window, not an exhaustive sweep
+  of every job that ran.
 
 
 ## Under active investigation, not yet quarantined
@@ -2132,6 +2142,17 @@ without also filling in the intake form above.
   the API's pagination did not behave as a stable continuation this pass, so
   the ~13.4h gap between this window's start and the 2026-09-22 report's own
   cutoff (2026-09-22T06:24:50Z–19:51:14Z) was not independently sampled.
+  **Second coverage gap (post-review, via a Codex review comment on PR
+  #2942): only the runs that resolved to `failure` were triaged.** `ci.yml`'s
+  `concurrency.cancel-in-progress: true` (lines 9-11) means a job inside one
+  of the 64 `cancelled`-overall runs could still have completed with a
+  failing test before the run itself was marked cancelled by a superseding
+  push. Those 64 runs' job-level logs were not inspected this pass, so the
+  "zero new hits" findings below are scoped to the 36 runs that resolved to
+  `success`/`failure` and were actually checked — not a proven-exhaustive
+  zero-hit finding across the full 100-run window (the same caveat this
+  ledger's 2026-09-15 update already established as this role's working
+  standard when cancelled-run job-level sampling isn't repeated).
   All 4 in-window failures triaged at job/log level:
   - Run 35909966810 (`vesper/bugbash-2881-busy-timeout-shared-cache`,
     `SQLite runtime (feature=sqlite)`, 2026-09-23T19:32:07Z): `E0061`,
@@ -2159,10 +2180,11 @@ without also filling in the intake form above.
 
   None of the 4 match `live_upgrade`, `cache_stampede`, `sim_fault_plan`, or
   any other tracked signature. **`sqlite_job_backend_tracks_job_status_durably`'s
-  fix (PR #2925) is holding**: zero recurrences in the ~14.2h of PR traffic
-  sampled since its 2026-09-23T19:33:05Z merge, out of this pass's broader
-  ~37.85h window (see the closed entry's own 2026-09-24 verification note
-  above).
+  fix (PR #2925) is holding**: zero recurrences among the `success`/
+  `failure`-concluded runs in the ~14.2h of PR traffic sampled since its
+  2026-09-23T19:33:05Z merge, out of this pass's broader ~37.85h window (see
+  the closed entry's own 2026-09-24 verification note above, including its
+  cancelled-run caveat).
 
   `manual-macos-contention-check.yml`: still `total_count: 0` against
   `workflow_dispatch` runs, checked 2026-09-24T~09:5xZ — **15th** straight
