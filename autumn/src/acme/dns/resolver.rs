@@ -308,10 +308,10 @@ pub async fn txt_values(
                 .collect();
             let mut target = None;
             while let Some(answer) = pending.next().await {
-                if target.is_none() {
-                    if let Ok(answer) = &answer {
-                        target = answer.unresolved_cname_target(&name);
-                    }
+                if target.is_none()
+                    && let Ok(answer) = &answer
+                {
+                    target = answer.unresolved_cname_target(&name);
                 }
                 keep(&name, answer);
             }
