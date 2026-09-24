@@ -168,8 +168,15 @@ the seeded last-seat condition B1 that follows.
 
 **Result: 37/40 trials overshot (92.5%)**, and every overshoot landed at
 exactly `successes=4` (all four racers admitted) — histogram `{3: 3, 4: 37}`,
-no partial-overshoot case at this concurrency level. **Rerun with a fresh
-pool built inside each trial** (the same A1-vs-A2 check, applied to
+no partial-overshoot case at this concurrency level. **Checked for the same
+trial-0 warm-up artifact found in A2 and B1** (this listing also opens only
+one DDL connection before the trial loop, with no explicit prewarm): trial
+0 *is* one of the three `successes=3` outcomes in the saved log. Excluding
+it: **37/39 overshot (94.9%)**. Unlike A2 and B1, though, the other **two**
+non-overshoot trials are *not* trial 0 — genuine variance survives even
+after removing the one confirmed-contaminated trial, so B0 is not fully
+explained by the warm-up artifact the way A2 and B1 were. **Rerun with a
+fresh pool built inside each trial** (the same A1-vs-A2 check, applied to
 condition B0): **34/40 overshot (85%)**, histogram `{3: 6, 4: 34}` — a small
 drop, not the ~4x collapse condition A showed. Condition B0's result is
 therefore largely robust to the pool-warmth confound; the barrier in
@@ -256,8 +263,10 @@ unchanged since #2864 was filed.
 **Confirms #2864 on Postgres. The headline is not "Postgres races more
 readily than SQLite" — under full methodology matching that claim doesn't
 hold up — it's "under conditions representative of an actually-running
-deployment, this race is essentially deterministic, on both backends the
-data supports drawing a conclusion about":**
+Postgres deployment, this race is essentially deterministic." This session
+tested warm-pool conditions only on Postgres; #2864's SQLite numbers are
+all cold-start (fresh pool and database every trial), so nothing below
+claims to know SQLite's warm-pool rate — it wasn't measured:**
 
 - Under a fully cold-start-matched comparison to #2864's SQLite baseline
   (condition A1: fresh pools *and* fresh schema every trial, matching
@@ -285,9 +294,11 @@ data supports drawing a conclusion about":**
   incompletely-warmed pool contaminating trial 0 in both A2 and B1) were
   found and corrected. A related but distinct scenario — an empty room's
   initial-fill burst rather than contention for its last seat specifically
-  (condition B0) — shows a somewhat lower rate: 92.5% with a warm pool,
-  85% with a fresh pool per trial (these are two different conditions, not
-  a single range — see condition B0 above for which number is which). None
+  (condition B0) — shows a somewhat lower rate: 92.5% with a warm pool
+  (94.9% excluding its own confirmed trial-0 warm-up artifact — see
+  condition B0 above), 85% with a fresh pool per trial (these are separate
+  conditions, not points on one range — see condition B0 above for which
+  number is which). None
   of these probes measured real arrival rates or workload patterns, only
   the outcome of a deliberately-launched concurrent burst — so this is a
   statement about what happens *if* such a burst occurs, not an estimate of
@@ -296,23 +307,27 @@ data supports drawing a conclusion about":**
   horizontally-scaled or multi-process deployment," i.e. the one operators
   choose specifically because they expect concurrent load. When a burst of
   simultaneous joins for a room's last seat does occur against an
-  already-warm production pool, the claim is essentially always false. This
-  session found no evidence that Postgres is meaningfully worse than SQLite
-  at resisting the race itself under equivalent cold-start conditions — the
-  severity comes from how deterministic the failure is under ordinary warm
-  production load, on either backend, not from a Postgres-specific
-  weakness.
+  already-warm **Postgres** production pool, the claim is essentially
+  always false. This session found no evidence that Postgres is
+  meaningfully worse than SQLite at resisting the race itself under
+  equivalent cold-start conditions — but it also did not test SQLite under
+  warm-pool conditions, so it cannot say whether SQLite's warm-pool rate is
+  similarly deterministic, lower, or untestable in the same way (SQLite's
+  own connection is typically process-local, not pooled the same way
+  Postgres's is). The severity claim here is scoped to Postgres, the
+  backend actually measured warm.
 - Still not crash/hang/data-loss — no error, no corruption, the room
   simply silently seats more participants than its documented ceiling,
   which for a WebRTC mesh (O(n²) peer connections) can push participant
   clients into far more simultaneous connections than the ceiling was
   chosen to bound. Severity classification stays "data-correctness /
   documented-claim violation," per the same reasoning #2864 already gives;
-  the *likelihood* component is "the common case" under a warm production
-  pool contending for a room's last seat (both backends), and "low but
-  real, roughly comparable between backends" under a cold-start-matched
-  comparison — not the SQLite-vs-Postgres severity gradient earlier
-  revisions of this report claimed.
+  the *likelihood* component is "the common case" under a warm **Postgres**
+  production pool contending for a room's last seat (not claimed for
+  SQLite, which this session never tested warm), and "low but real,
+  roughly comparable between backends" under the cold-start-matched
+  comparison that *was* run on both — not the SQLite-vs-Postgres severity
+  gradient earlier revisions of this report claimed.
 
 ## Dedup search
 
