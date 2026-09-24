@@ -155,7 +155,13 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
                         // Multiline `features = [` … `]` array: find the closing
                         // `]`, collect the existing entries, and rebuild the list
                         // (collapsed to one line) with the missing features
-                        // appended.
+                        // appended. A `#` comment is not TOML, so a stray `]`
+                        // or trailing text inside one is never real syntax —
+                        // every raw-text scan and join below works only on
+                        // each line's code portion (before its first `#`).
+                        fn strip_comment(s: &str) -> &str {
+                            s.split_once('#').map_or(s, |(before, _)| before)
+                        }
                         let mut close_line = None;
                         let mut k = j;
                         while k < lines.len() {
@@ -163,21 +169,13 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
                             if k > j && tk.starts_with('[') {
                                 break; // next table header — array never closed
                             }
-                            if lines[k].contains(']') {
+                            if strip_comment(&lines[k]).contains(']') {
                                 close_line = Some(k);
                                 break;
                             }
                             k += 1;
                         }
                         if let Some(cl) = close_line {
-                            // Collapsing every line onto one loses each line's
-                            // own trailing `# comment`, if any — and worse,
-                            // leaving one in would swallow the rest of the
-                            // rebuilt line (including its closing `]`) behind
-                            // `#` once everything lands on a single line.
-                            fn strip_comment(s: &str) -> &str {
-                                s.split_once('#').map_or(s, |(before, _)| before)
-                            }
                             let j_bracket = lines[j].find('[').unwrap_or(lines[j].len());
                             let mut list_text =
                                 strip_comment(&lines[j][j_bracket + 1..]).to_owned();
@@ -185,7 +183,9 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
                                 list_text.push(' ');
                                 list_text.push_str(strip_comment(line.trim()));
                             }
-                            let cl_close = lines[cl].find(']').unwrap_or(lines[cl].len());
+                            let cl_close = strip_comment(&lines[cl])
+                                .find(']')
+                                .unwrap_or(lines[cl].len());
                             list_text.push(' ');
                             list_text.push_str(strip_comment(&lines[cl][..cl_close]));
                             let trailing = lines[cl]
@@ -387,7 +387,14 @@ fn ensure_totp_rs_features(toml: &str) -> String {
                 } else {
                     // Multiline `features = [` … `]` array: find the closing `]`,
                     // collect the existing entries, and rebuild the list (collapsed
-                    // to one line) with the missing features appended.
+                    // to one line) with the missing features appended. A `#`
+                    // comment is not TOML, so a stray `]` or trailing text
+                    // inside one is never real syntax — every raw-text scan
+                    // and join below works only on each line's code portion
+                    // (before its first `#`).
+                    fn strip_comment(s: &str) -> &str {
+                        s.split_once('#').map_or(s, |(before, _)| before)
+                    }
                     let mut close_line = None;
                     let mut k = fl;
                     while k < lines.len() {
@@ -395,28 +402,22 @@ fn ensure_totp_rs_features(toml: &str) -> String {
                         if k > fl && tk.starts_with('[') {
                             break; // next table header — array never closed
                         }
-                        if lines[k].contains(']') {
+                        if strip_comment(&lines[k]).contains(']') {
                             close_line = Some(k);
                             break;
                         }
                         k += 1;
                     }
                     if let Some(cl) = close_line {
-                        // Collapsing every line onto one loses each line's own
-                        // trailing `# comment`, if any — and worse, leaving
-                        // one in would swallow the rest of the rebuilt line
-                        // (including its closing `]`) behind `#` once
-                        // everything lands on a single line.
-                        fn strip_comment(s: &str) -> &str {
-                            s.split_once('#').map_or(s, |(before, _)| before)
-                        }
                         let fl_bracket = lines[fl].find('[').unwrap_or(lines[fl].len());
                         let mut list_text = strip_comment(&lines[fl][fl_bracket + 1..]).to_owned();
                         for line in &lines[fl + 1..cl] {
                             list_text.push(' ');
                             list_text.push_str(strip_comment(line.trim()));
                         }
-                        let cl_close = lines[cl].find(']').unwrap_or(lines[cl].len());
+                        let cl_close = strip_comment(&lines[cl])
+                            .find(']')
+                            .unwrap_or(lines[cl].len());
                         list_text.push(' ');
                         list_text.push_str(strip_comment(&lines[cl][..cl_close]));
                         let trailing =
@@ -1727,10 +1728,14 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
                                 if tk.starts_with('[') {
                                     break;
                                 }
-                                if tk.contains(FEATURE) {
+                                // A `#`-commented-out mention of the feature or
+                                // a stray `]` inside a comment is not TOML —
+                                // check only the code portion of the line.
+                                let code = tk.split_once('#').map_or(tk, |(before, _)| before);
+                                if code.contains(FEATURE) {
                                     already_present = true;
                                 }
-                                if tk.contains(']') {
+                                if code.contains(']') {
                                     close_line = Some(k);
                                     break;
                                 }
@@ -1968,10 +1973,14 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
                                 if tk.starts_with('[') {
                                     break;
                                 }
-                                if tk.contains(FEATURE) {
+                                // A `#`-commented-out mention of the feature or
+                                // a stray `]` inside a comment is not TOML —
+                                // check only the code portion of the line.
+                                let code = tk.split_once('#').map_or(tk, |(before, _)| before);
+                                if code.contains(FEATURE) {
                                     already_present = true;
                                 }
-                                if tk.contains(']') {
+                                if code.contains(']') {
                                     close_line = Some(k);
                                     break;
                                 }
@@ -11294,10 +11303,14 @@ fn ensure_autumn_web_webauthn_feature(toml: &str) -> String {
                                 if tk.starts_with('[') {
                                     break;
                                 }
-                                if tk.contains(FEATURE) {
+                                // A `#`-commented-out mention of the feature or
+                                // a stray `]` inside a comment is not TOML —
+                                // check only the code portion of the line.
+                                let code = tk.split_once('#').map_or(tk, |(before, _)| before);
+                                if code.contains(FEATURE) {
                                     already_present = true;
                                 }
-                                if tk.contains(']') {
+                                if code.contains(']') {
                                     close_line = Some(k);
                                     break;
                                 }
@@ -16047,6 +16060,73 @@ mod tests {
         assert!(
             out.contains("\"oauth2\""),
             "oauth2 feature must be merged: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_autumn_web_mail_feature_ignores_commented_out_feature_mention() {
+        // Codex review on #2948's second fix: a commented-out mention of the
+        // feature (`# "mail" is intentionally disabled`) is not TOML, but the
+        // raw substring check treated it as though the feature were already
+        // present and left it unset.
+        let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\", # \"mail\" is intentionally disabled\n]\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert_eq!(
+            out.matches("\"mail\"").count(),
+            2,
+            "mail must be merged as a real feature (the comment's mention is the other match): {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_webauthn_feature_ignores_commented_out_feature_mention() {
+        let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\", # \"webauthn\" is intentionally disabled\n]\n";
+        let out = ensure_autumn_web_webauthn_feature(toml);
+        assert_eq!(
+            out.matches("\"webauthn\"").count(),
+            2,
+            "webauthn must be merged as a real feature (the comment's mention is the other match): {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_oauth2_feature_ignores_commented_out_feature_mention() {
+        let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\", # \"oauth2\" is intentionally disabled\n]\n";
+        let out = ensure_autumn_web_oauth2_feature(toml);
+        assert_eq!(
+            out.matches("\"oauth2\"").count(),
+            2,
+            "oauth2 must be merged as a real feature (the comment's mention is the other match): {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_webauthn_rs_features_ignores_bracket_inside_comment_before_real_close() {
+        // Codex review on #2948's second fix: a comment containing a `]`
+        // before the real closing bracket (e.g. `# defaults [see docs]`) is
+        // not TOML syntax, but the raw-text search for the array's close
+        // matched the bracket inside the comment instead of the real one,
+        // truncating the rebuilt array and leaving the true tail behind.
+        let toml = "[dependencies.webauthn-rs]\nversion = \"0.5\"\nfeatures = [\n    \"conditional-ui\", # defaults [see docs]\n]\n";
+        let out = ensure_webauthn_rs_features(toml);
+        assert!(
+            out.contains("\"conditional-ui\"")
+                && out.contains("\"danger-allow-state-serialisation\""),
+            "both features must be present: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_totp_rs_features_ignores_bracket_inside_comment_before_real_close() {
+        let toml = "[dependencies.totp-rs]\nversion = \"5\"\nfeatures = [\n    \"qr\", # defaults [see docs]\n]\n";
+        let out = ensure_totp_rs_features(toml);
+        assert!(
+            out.contains("\"qr\"") && out.contains("\"gen_secret\"") && out.contains("\"otpauth\""),
+            "all three features must be present: {out}"
         );
         toml::from_str::<toml::Value>(&out)
             .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
