@@ -851,6 +851,14 @@ its certificate back from the store and caches it. Nothing requires every
 certificate to be resident, so `cert_cache_size` is a memory knob, not a
 correctness one.
 
+A stored pair that rots *while its certificate is still cached* is not
+re-read until the cache stops holding it: the repair pass re-reads and
+re-parses the pair on the first tick after an eviction (or a restart), and a
+pair that will not load is treated as missing and re-ordered. So a
+corrupted-on-disk certificate is detected within one tick of the eviction
+that exposes it — never earlier, never silently permanent — but also never
+proactively while the cached copy is still serving.
+
 Custom domains live **inside** the ACME TLS listener, so they exist only where
 autumn terminates TLS itself. Behind
 [reverse-proxy termination](#terminating-tls-at-a-reverse-proxy) there is no

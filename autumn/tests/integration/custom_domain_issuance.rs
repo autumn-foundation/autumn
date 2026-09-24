@@ -2333,8 +2333,86 @@ async fn a_failed_order_for_a_hostname_that_changed_hands_spares_the_new_tenant(
     );
 }
 
+/// An issuer that offboards and re-registers the hostname for the SAME tenant
+/// and then fails, so the error belongs to a registration that no longer
+/// exists (#2655, item 1).
+#[derive(Debug)]
+struct FailingReregisterIssuer {
+    registry: Arc<CustomDomainRegistry>,
+}
+
+impl DomainIssuer for FailingReregisterIssuer {
+    fn issue<'a>(&'a self, hostname: &'a str) -> BoxFuture<'a, Result<IssuedCertificate, String>> {
+        Box::pin(async move {
+            self.registry.remove(hostname).await.unwrap();
+            // Same tenant, new generation: `registered_at` moves on.
+            self.registry
+                .register(hostname, "tenant-a", NOW + 1)
+                .await
+                .unwrap();
+            Err("the CA rejected the order".to_owned())
+        })
+    }
+}
+
 #[tokio::test]
-async fn a_failure_is_recorded_only_for_the_tenant_that_still_owns_the_hostname() {
+async fn a_failed_order_for_a_hostname_that_was_re_registered_spares_the_new_generation() {
+    // The same-tenant twin of the takeover test: the stale failure must not
+    // charge the re-registered successor either — it is a fresh `PendingDns`
+    // an order never flew against, so it gets no reason, no backoff, no
+    // failure count, and no alert.
+    let dir = tempfile::tempdir().unwrap();
+    let certs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::new(MemoryCustomDomainStore::new()),
+        10,
+    ));
+    registry.load().await.unwrap();
+    let cache = Arc::new(CustomDomainCertCache::new(4));
+    let alerts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&alerts);
+    let mut task = task_over(
+        Arc::clone(&registry),
+        cache,
+        certs,
+        TableVerifier::new(&[("app.clientco.com", points_here())]),
+        Arc::new(FailingReregisterIssuer {
+            registry: Arc::clone(&registry),
+        }) as Arc<dyn DomainIssuer>,
+    );
+    task.reporter = Arc::new(move |message: String| sink.lock().unwrap().push(message));
+
+    registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    task.tick(NOW).await;
+
+    let record = registry.get("app.clientco.com").unwrap();
+    assert_eq!(record.tenant, "tenant-a");
+    assert_eq!(record.status, DomainStatus::PendingDns);
+    assert_eq!(
+        record.registered_at_unix,
+        NOW + 1,
+        "the assertions below are about the re-registered generation"
+    );
+    assert!(
+        record.failure_reason.is_none(),
+        "the re-registered generation must not show the old order's error: {record:?}"
+    );
+    assert_eq!(record.consecutive_failures, 0);
+    assert!(
+        record.next_attempt_unix.is_none(),
+        "the re-registered generation must not wait out a backoff it did not earn"
+    );
+    assert!(
+        alerts.lock().unwrap().is_empty(),
+        "a failure belonging to a dead registration must not page an operator"
+    );
+}
+
+#[tokio::test]
+async fn a_failure_is_recorded_only_for_the_tenant_and_generation_that_still_own_the_hostname() {
     let registry = CustomDomainRegistry::new(Arc::new(MemoryCustomDomainStore::new()), 10);
     registry.load().await.unwrap();
     registry
@@ -2347,6 +2425,7 @@ async fn a_failure_is_recorded_only_for_the_tenant_that_still_owns_the_hostname(
         .await
         .unwrap();
 
+    // A failure must never charge a tenant that does not own the hostname.
     assert!(
         !registry
             .record_failure_for("app.clientco.com", "tenant-a", NOW, "stale", 300)
@@ -2361,6 +2440,30 @@ async fn a_failure_is_recorded_only_for_the_tenant_that_still_owns_the_hostname(
             .is_none()
     );
 
+    // ...and never a `PendingDns` record either, even for its own tenant: an
+    // order never flies against one, so a failure arriving for it is stale
+    // (#2655, item 1).
+    assert!(
+        !registry
+            .record_failure_for("app.clientco.com", "tenant-b", NOW, "stale", 300)
+            .await
+            .unwrap(),
+        "a failure must not charge a re-registered generation"
+    );
+    assert!(
+        registry
+            .get("app.clientco.com")
+            .unwrap()
+            .failure_reason
+            .is_none()
+    );
+
+    // Once the record is the orderable generation, its own tenant's failure
+    // applies.
+    registry
+        .record_verified("app.clientco.com", NOW)
+        .await
+        .unwrap();
     assert!(
         registry
             .record_failure_for("app.clientco.com", "tenant-b", NOW, "mine", 300)
