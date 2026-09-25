@@ -19,6 +19,16 @@
   is a single app-wide switch, so turning it on to take a snapshot also mounts
   `/actuator/env`, `/actuator/configprops`, `/actuator/jobs` and
   `/actuator/shadow`.
+- **docs:** the section also records that `autumn export` hard-codes the
+  `/actuator` prefix into its four URLs and does not follow `[actuator] prefix`
+  or `AUTUMN_ACTUATOR__PREFIX`. Under a custom prefix every endpoint moves,
+  including the two mounted regardless of `sensitive`, so the command fails on
+  the first one and no `--url` value recovers it — pointing `--url` at the
+  prefix asks for `/ops/actuator/health`. The guide now states the
+  default-prefix assumption the way
+  [logging-pii.md](docs/guide/logging-pii.md) and
+  [operator-alerts.md](docs/guide/operator-alerts.md) already state it for
+  their own actuator paths.
 
 ### Testing
 

@@ -3013,8 +3013,9 @@ Failed to fetch tasks from http://your-host:3000: HTTP 404 Not Found
 ```
 
 So the command works as shipped against a dev app, and against staging or
-production only where `actuator.sensitive = true`. There is no partial
-snapshot and no flag to ask for one.
+production only where `actuator.sensitive = true` — and, either way, only at
+the default actuator prefix (below). There is no partial snapshot and no flag
+to ask for one.
 
 `sensitive` is a single app-wide switch, not a per-endpoint or per-listener
 one: turning it on to take a snapshot also mounts `/actuator/env`,
@@ -3026,6 +3027,33 @@ two always-mounted endpoints by hand:
 ```console
 $ curl -s http://your-host:3000/actuator/health
 $ curl -s http://your-host:3000/actuator/metrics
+```
+
+### It also requires the default actuator prefix
+
+`autumn export` builds its four URLs by appending `/actuator/health`,
+`/actuator/metrics`, `/actuator/tasks` and `/actuator/loggers` to whatever
+`--url` you pass. That prefix is a literal in the command, so it does **not**
+follow `[actuator] prefix` or `AUTUMN_ACTUATOR__PREFIX`. Under a custom prefix
+every endpoint moves — including the two that are always mounted — so `export`
+fails on the very first one, whatever `sensitive` is set to:
+
+```console
+# the app mounts its actuator at /ops
+$ autumn export --url http://your-host:3000
+Exporting diagnostics from http://your-host:3000
+Failed to fetch health from http://your-host:3000: HTTP 404 Not Found
+```
+
+Pointing `--url` at the prefix does not help — that asks for
+`/ops/actuator/health` — so under a custom prefix there is no invocation of
+`autumn export` that works. Collect the endpoints at your own prefix instead:
+
+```console
+$ curl -s http://your-host:3000/ops/health
+$ curl -s http://your-host:3000/ops/metrics
+$ curl -s http://your-host:3000/ops/tasks     # sensitive = true only
+$ curl -s http://your-host:3000/ops/loggers   # sensitive = true only
 ```
 
 ---
