@@ -227,7 +227,13 @@ pub fn plan_admin_with_options(
     options.encrypted_deterministic.extend(det_deterministic);
 
     let fields = parse_fields(field_tokens)?;
-    reject_translatable_fields(&fields)?;
+    // Issue #2291: the MODEL is the source of truth for whether a column is a
+    // per-locale container — `#[translatable]` is what makes `Translated`
+    // refuse the bare string the admin's text control produces. Detect it from
+    // the model AST (mirroring `detect_encrypted_fields` above) and refuse any
+    // submitted field bound to one, no matter how the DSL token is spelled.
+    let model_translatable = detect_translatable_fields(&model_source, &pascal_name);
+    reject_translatable_fields(&fields, &model_translatable)?;
     // Issue #1340: the MODEL is the only source of truth for whether a column is
     // encrypted at rest — `#[encrypted]` is what puts the `serialize_as` wrapper
     // on the insert/update path. A `{encrypted}` DSL token here declares the same
@@ -338,9 +344,17 @@ pub fn plan_admin_with_options(
 /// would fail validation on a required field, and a value that *did* decode
 /// would wipe every other language. Editing translated content needs a
 /// per-locale editor, which is translation-workflow UI and out of scope here.
-fn reject_translatable_fields(fields: &[Field]) -> Result<(), GenerateError> {
+///
+/// The refusal keys off BOTH the DSL token and the model AST (issue #2291):
+/// a submitted field whose backing model field is `#[translatable]` is
+/// refused no matter how the token is spelled — the model is the source of
+/// truth, mirroring the `#[encrypted]` handling from #1340.
+fn reject_translatable_fields(
+    fields: &[Field],
+    model_translatable: &[String],
+) -> Result<(), GenerateError> {
     let Some(field) = fields.iter().find(|f| f.is_translatable()) else {
-        return Ok(());
+        return reject_model_translatable_fields(fields, model_translatable);
     };
     Err(GenerateError::Config(format!(
         "a `{{translatable}}` field (`{}`) is not supported by `generate admin`: the generated \
@@ -349,6 +363,32 @@ fn reject_translatable_fields(fields: &[Field]) -> Result<(), GenerateError> {
          did decode would replace every other locale. Leave the column out of the admin field \
          list, or write a per-locale editor: `record.available_locales(\"{}\")` and \
          `record.set_{}(locale, value)` are generated for you.",
+        field.name, field.name, field.name
+    )))
+}
+
+/// Refuse a submitted field bound to a `#[translatable]` model field (issue
+/// #2291), even when the DSL token carries no `{translatable}` marker. Same
+/// hazard as the token-based refusal above; the only difference is where the
+/// marker was found.
+fn reject_model_translatable_fields(
+    fields: &[Field],
+    model_translatable: &[String],
+) -> Result<(), GenerateError> {
+    let Some(field) = fields
+        .iter()
+        .find(|f| model_translatable.iter().any(|t| t == &f.name))
+    else {
+        return Ok(());
+    };
+    Err(GenerateError::Config(format!(
+        "field `{}` is `#[translatable]` on the model, and `generate admin` does not support \
+         translatable columns: the generated admin binds one plain text control to the whole \
+         per-locale container, and `Translated` refuses a bare string — so create and update \
+         would fail validation, and a value that did decode would replace every other locale. \
+         Leave the column out of the admin field list, or write a per-locale editor: \
+         `record.available_locales(\"{}\")` and `record.set_{}(locale, value)` are generated \
+         for you.",
         field.name, field.name, field.name
     )))
 }
@@ -505,6 +545,45 @@ fn detect_encrypted_fields(
         }
     }
     (redacted, visible, deterministic)
+}
+
+/// Detect `#[translatable]` fields from the model AST (issue #2291).
+///
+/// Mirrors [`detect_encrypted_fields`]: the marker's last path segment is the
+/// spelling that matters, so a bare `#[translatable]` and a qualified
+/// `#[autumn_web::translatable]` both match. A field that carries the marker
+/// must be refused by `generate admin` no matter how its DSL token is spelled
+/// — see [`reject_translatable_fields`].
+fn detect_translatable_fields(model_source: &str, pascal_name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(parsed) = syn::parse_file(model_source) else {
+        return out;
+    };
+    for item in parsed.items {
+        let syn::Item::Struct(item_struct) = item else {
+            continue;
+        };
+        if item_struct.ident != pascal_name {
+            continue;
+        }
+        let syn::Fields::Named(fields) = item_struct.fields else {
+            continue;
+        };
+        for field in fields.named {
+            let carries_marker = field.attrs.iter().any(|attr| {
+                attr.path()
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == "translatable")
+            });
+            if carries_marker {
+                if let Some(name) = field.ident.as_ref().map(ToString::to_string) {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    out
 }
 
 // ── Field metadata derivation ────────────────────────────────────────────────
@@ -1548,6 +1627,97 @@ mod tests {
             .to_string();
         assert!(err.contains("translatable"), "{err}");
         assert!(err.contains("title"), "{err}");
+    }
+
+    /// #2291: the refusal keys off the model AST, not the DSL token. A model
+    /// whose `title` is `#[translatable]` must be refused even when the admin
+    /// field token carries no `{translatable}` marker — otherwise the token
+    /// is an opt-out of a guard the model demands.
+    #[test]
+    fn plan_admin_rejects_a_model_translatable_field_without_token_marker() {
+        let model_source = "#[autumn_web::model]\n\
+            pub struct Post {\n\
+            \x20   #[id]\n\
+            \x20   pub id: i64,\n\
+            \x20   #[translatable]\n\
+            \x20   pub title: autumn_web::i18n::Translated,\n\
+            }\n";
+        let tmp = project_with_model_source("post", model_source);
+        let err = plan_admin(tmp.path(), "Post", &["title:String".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("translatable"), "{err}");
+        assert!(err.contains("title"), "{err}");
+        assert!(
+            err.contains("#[translatable]"),
+            "the refusal must name the model attribute, got: {err}"
+        );
+    }
+
+    /// #2291: the model-AST refusal holds for every spelling of the field
+    /// token, since the token is never the source of truth here.
+    #[test]
+    fn plan_admin_rejects_a_model_translatable_field_for_every_token_spelling() {
+        let model_source = "#[autumn_web::model]\n\
+            pub struct Post {\n\
+            \x20   #[id]\n\
+            \x20   pub id: i64,\n\
+            \x20   #[translatable]\n\
+            \x20   pub title: autumn_web::i18n::Translated,\n\
+            }\n";
+        for token in ["title:String", "title:Text", "title:String{nullable}"] {
+            let tmp = project_with_model_source("post", model_source);
+            let err = plan_admin(tmp.path(), "Post", &[token.into()])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("translatable") && err.contains("title"),
+                "token `{token}` on a #[translatable] model field must be refused, got: {err}"
+            );
+        }
+    }
+
+    /// #2291 regression guard: a plain model with a plain token must NOT be
+    /// refused by the new model-AST half of the gate.
+    #[test]
+    fn plan_admin_accepts_a_plain_field_on_a_plain_model() {
+        let model_source = "#[autumn_web::model]\n\
+            pub struct Post {\n\
+            \x20   #[id]\n\
+            \x20   pub id: i64,\n\
+            \x20   pub title: String,\n\
+            }\n";
+        let tmp = project_with_model_source("post", model_source);
+        assert!(
+            plan_admin(tmp.path(), "Post", &["title:String".into()]).is_ok(),
+            "a non-translatable field on a non-translatable model must not be refused"
+        );
+    }
+
+    /// Unit pins for the AST detector itself: bare and qualified marker
+    /// spellings match; other structs, other attributes, and other fields do
+    /// not leak in.
+    #[test]
+    fn detect_translatable_fields_pins_marker_spellings() {
+        let source = "pub struct Post {\n\
+            \x20   pub id: i64,\n\
+            \x20   #[translatable]\n\
+            \x20   pub title: String,\n\
+            \x20   #[autumn_web::translatable]\n\
+            \x20   pub summary: String,\n\
+            \x20   #[encrypted]\n\
+            \x20   pub secret: String,\n\
+            }\n\
+            pub struct Other {\n\
+            \x20   #[translatable]\n\
+            \x20   pub title: String,\n\
+            }\n";
+        assert_eq!(
+            detect_translatable_fields(source, "Post"),
+            vec!["title".to_owned(), "summary".to_owned()]
+        );
+        assert!(detect_translatable_fields(source, "Missing").is_empty());
+        assert!(detect_translatable_fields("not rust at all", "Post").is_empty());
     }
 
     #[test]
