@@ -57,8 +57,28 @@ quickstart (install → new → setup → build → serve → scaffold →
 scaffold-build → scaffold-migrate → scaffold-serve) against the *published*
 crates.io artifacts in CI, not just the in-tree workspace — this is already
 the Tier-1 clean-room harness the Hard Gate asks for, and it is green.
-Issue #2795 (open, cold-start compile time) is the one known live gap on this
-journey; see below for why it isn't actionable this cycle.
+
+**Correction (caught by Codex review on this PR): an earlier draft called
+issue #2795 "the one known live gap" on this journey.** There's a second,
+documented one: `.github/workflows/quickstart-gate.yml`'s
+`local-dev-quickstart` job covers the *other* install path README.md and
+`docs/guide/getting-started.md` document — `cargo install --path autumn-cli`
+from a source checkout, then `autumn new` — which pairs a source-built CLI
+(today's `trunk-dev`) against whatever `autumn-web` is currently *published*
+(the version `autumn new` pins). Any commit that changes a public
+`autumn-web` API the base scaffold calls, before the next release ships it,
+breaks that pairing, and `autumn doctor`'s `version_compat` check can't see
+it (it compares version strings, not API surface). PR #2840 (already in
+this survey's prior-work list) didn't fix this — its own title says so
+("job red→continue-on-error"): it downgraded the job's build step to
+advisory, because the job's own extensive comment explains this gap is
+*inherent* to the repo's release-only versioning policy (CLAUDE.md: never
+bump the workspace version outside a deliberate release) — there is no
+commit that makes it permanently green. That's exactly the process's own
+escape valve for an inherent gap ("the fix is a map of the inherent steps,
+not a crusade against them. Report it.") — already done, in the workflow's
+own comment and its documented `[patch.crates-io]` workaround — so this
+doesn't change the conclusion, but #2795 was never the *only* known gap.
 
 **First real integration — correction (caught by Codex review on this PR):**
 an earlier draft of this paragraph claimed `examples/wiki` and
