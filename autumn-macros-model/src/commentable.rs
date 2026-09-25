@@ -647,6 +647,38 @@ pub fn emit_commentable_items(
             };
         }
     });
+    // A typo'd `author_name = usernme` passed macro expansion (the macro only
+    // checked identifier syntax) and failed at run time with an
+    // undefined-column or decoding error on the first request — the generated
+    // SQL references the column in both `insert_comment` and `comment_thread`.
+    // Read through the FIELD here, exactly as `author_guard` reads the key
+    // field, so a misspelled column is a name-resolution error at compile
+    // time. The bound is on the field's type, on autumn's own sealed
+    // `CommentAuthorName` (`String` / `Option<String>`): a non-text field is a
+    // schema mismatch the same way a non-i64 key is, and a trait bound would
+    // have demanded `#[model]`, which hand-written author structs deliberately
+    // do not derive. Only emitted when the author MODEL is available — an
+    // explicit `author_table` with no `by` names a table the macro cannot see
+    // into, so there is nothing to resolve.
+    let author_name_guard = match (spec.author_model.as_ref(), spec.author_name_column.as_ref()) {
+        (Some(author_model), Some(column)) => {
+            let author_name_ident = format_ident!("{column}");
+            Some(quote! {
+                const _: fn(&#author_model) = |__autumn_commentable_author| {
+                    fn __autumn_commentable_author_name<
+                        T: ::autumn_web::commentable::CommentAuthorName,
+                    >(
+                        _: &T,
+                    ) {
+                    }
+                    __autumn_commentable_author_name(
+                        &__autumn_commentable_author.#author_name_ident
+                    );
+                };
+            })
+        }
+        _ => None,
+    };
     let author_model_name = spec
         .author_model
         .as_ref()
@@ -793,6 +825,7 @@ pub fn emit_commentable_items(
         #pk_guard
         #counter_guard
         #author_guard
+        #author_name_guard
 
         // Keep this a `static`, never a `const`. The runtime finds a model's
         // repository facts by comparing THIS item's address
@@ -1311,6 +1344,73 @@ mod tests {
         assert!(
             emitted.contains("author_pk") || emitted.contains("id"),
             "read through the author's key field"
+        );
+    }
+
+    /// Emit the `#[commentable]` surface for a spec, as token text.
+    fn emit(attr: &proc_macro2::TokenStream) -> String {
+        let spec = parse(attr).expect("valid");
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let vis: syn::Visibility = syn::parse_quote!(pub);
+        let pk: syn::Ident = syn::parse_quote!(id);
+        emit_commentable_items(
+            &model,
+            &vis,
+            &spec,
+            "posts",
+            &ParentShape {
+                has_deleted_at: false,
+                has_tenant_id: false,
+                is_sharded: false,
+                pk_ident: Some(&pk),
+            },
+        )
+        .to_token_stream()
+        .to_string()
+    }
+
+    /// A typo'd `author_name` used to pass macro expansion and fail at run
+    /// time; the guard reads the field on the author model, so a misspelled
+    /// column is a compile error, and the sealed `CommentAuthorName` bound
+    /// rejects a non-text field the same way `CommentAuthorKey` rejects a
+    /// non-i64 key.
+    #[test]
+    fn an_author_name_column_is_guard_bound_when_an_author_model_is_available() {
+        let emitted = emit(&quote! { (by = User, author_name = username) });
+        assert!(
+            emitted.contains("CommentAuthorName"),
+            "the author-name bound, {emitted}"
+        );
+        assert!(
+            emitted.contains("username"),
+            "read through the author's name field, {emitted}"
+        );
+    }
+
+    /// No `author_name` configured means no name is ever read, so there is
+    /// nothing to guard — the key guard stands alone.
+    #[test]
+    fn no_author_name_guard_without_an_author_name() {
+        let emitted = emit(&quote! { (by = User) });
+        assert!(
+            emitted.contains("CommentAuthorKey"),
+            "the key guard is still there, {emitted}"
+        );
+        assert!(
+            !emitted.contains("CommentAuthorName"),
+            "no name guard without author_name, {emitted}"
+        );
+    }
+
+    /// An explicit `author_table` with no `by` names a table the macro cannot
+    /// see into — there is no author type to read a field on, so no guard is
+    /// emitted (and none is possible).
+    #[test]
+    fn no_author_name_guard_without_an_author_model() {
+        let emitted = emit(&quote! { (author_table = users, author_name = username) });
+        assert!(
+            !emitted.contains("CommentAuthorName"),
+            "no name guard without an author model, {emitted}"
         );
     }
 

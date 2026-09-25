@@ -112,10 +112,34 @@ pub trait CommentAuthorKey: sealed::Sealed {}
 impl CommentAuthorKey for i64 {}
 impl CommentAuthorKey for i32 {}
 
+/// The author display-name types the comments API can carry.
+///
+/// The author-name column is read as `Nullable<Text>` — the generated
+/// `insert_comment` resolves it through a `(SELECT {column} …)` sub-select
+/// and `comment_thread` through a `LEFT JOIN`, and both decode it into
+/// `Comment.author_name: Option<String>`. A typo'd `author_name = usernme`
+/// compiled fine before (the macro only checked identifier syntax) and then
+/// failed at run time with an undefined-column or decoding error on the first
+/// request; a non-text field (say, an `i64`) would do the same. Nothing said
+/// so until the column was actually read.
+///
+/// `String` and `Option<String>` are admitted: a non-nullable name column
+/// surfaces as `String`, a nullable one as `Option<String>`, and both decode
+/// into the `Option<String>` the public surface carries.
+///
+/// Sealed, because implementing it for a wider type would re-open exactly the
+/// runtime failure it exists to prevent.
+pub trait CommentAuthorName: sealed::Sealed {}
+
+impl CommentAuthorName for String {}
+impl CommentAuthorName for Option<String> {}
+
 mod sealed {
     pub trait Sealed {}
     impl Sealed for i64 {}
     impl Sealed for i32 {}
+    impl Sealed for String {}
+    impl Sealed for Option<String> {}
 }
 
 /// The soft-delete marker column. Autumn's `soft_delete` convention is fixed,
