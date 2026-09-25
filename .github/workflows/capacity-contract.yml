@@ -125,7 +125,10 @@ jobs:
         # this runner class, not that the app regressed.
         shell: bash
         run: |
-          N="${{ inputs.noop_rebuilds || '3' }}"
+          # `inputs` is empty on the schedule trigger, so the literal fallback
+          # below IS the scheduled probe's sample size — it must stay equal to
+          # the `workflow_dispatch` default ("20") for `noop_rebuilds`.
+          N="${{ inputs.noop_rebuilds || '20' }}"
           for i in $(seq 1 "$N"); do
             echo "── no-op rebuild $i/$N ──"
             PKG="$(basename "${{ inputs.example || 'examples/hello' }}")"
