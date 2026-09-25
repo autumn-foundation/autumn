@@ -166,31 +166,30 @@ serde interaction, and the `autumn-macros` crate split, among others — this
 is a real, substantial upgrade journey, not an empty draft.
 
 **Narrowing the claim to what was actually checked — correction (caught by
-Codex review on this PR three times on the same paragraph; simplifying
-rather than adding a fourth layer of detail that risks the same fate):**
-this gate has more moving parts than a couple of sentences can safely
-summarize, so rather than re-itemize exactly which check enforces which
-sub-piece (getting that split precisely right took three review rounds and
-still wasn't fully right), the accurate, defensible statement is narrower:
-between `scripts/check-migration-guides.sh` (guide-level shape, the
-`**Breaking:**` marker/coverage/linkage convention, and a same-entry
-`**Automation:**` label check that applies at least to rename-class
-changes) and a separate Rust test in `autumn-cli`
-(`every_breaking_change_in_every_guide_carries_a_confidence_label`, which
-the shell script's own Check 5 comment names as the thing that "asserts
-... over the real guides as a set" that *every* entry carries a label,
-covering what the shell heuristic alone doesn't), the `next.md`
-entries this survey sampled are more gated than an empty template would be.
-Entry-level **Why/Before/After** prose is not gated by either. "Media rooms"
-(`docs/migrations/next.md:608-637`) illustrates that: no explicit
-`**Why:**`/Before/After blocks, just prose, but it does carry a conforming
-`**Automation:** manual` label. So: no *open issue* reports a broken or
-confusing upgrade step for the pending release (a targeted search found
-none), Automation labels are
-gate-enforced across every entry, and most sampled entries also follow the
-Why/Before/After convention closely even though nothing requires it. This
-survey did **not** audit the entries themselves for clarity, completeness, or
-`autumn upgrade` codemod coverage — that would be its own Tier-1 journey
+Codex review on this PR four times on the same paragraph now; retreating to
+the most conservative accurate statement rather than trying again to
+characterize the exact boundary):** this gate has enough moving parts —
+two separate mechanisms, each scoped differently (the shell script's
+Check 5 requires a label only for rename-class entries but scans every
+`## ` section; a separate Rust test in `autumn-cli` requires a label on
+every entry but, per its own `breaking_entries` helper, only under the
+literal `## Breaking changes` heading, so an unlabeled non-rename entry
+filed under `## Behavior changes` — `next.md` has two, "HTTPS: the
+listener's connect-info type changed" and the CI dependency-audit entry —
+passes both) — that "Automation is gate-enforced across every entry" is
+**not** an accurate summary either, and this report has now spent five
+correction rounds failing to state the real boundary precisely from memory.
+So: no *open issue* reports a broken or confusing upgrade step for the
+pending release (a targeted search found none); *some* entries carry a
+gate-enforced Automation label (rename-class ones, and every literal
+`## Breaking changes` entry) and *some* don't need to; entry-level
+**Why/Before/After** prose is gated by neither mechanism, though most
+sampled entries follow that shape anyway by convention. Whether the
+`## Behavior changes`/`## Configuration changes` entries that escape both
+label checks are themselves well-labeled in practice, and whether the
+entries otherwise hold up for clarity, completeness, or
+`autumn upgrade` codemod coverage generally, is exactly what this survey did
+**not** audit — that would be its own Tier-1 journey
 arithmetic pass (concepts, steps, and misuse-compile checks for a real
 version bump), not something a few minutes of issue-search can stand in
 for. So "the upgrade journey has no gap" is retracted; the honest statement
