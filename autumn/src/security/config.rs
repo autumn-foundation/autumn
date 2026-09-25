@@ -239,11 +239,11 @@ pub fn validate_signing_secret(
 
 /// HMAC-SHA256 of `message` under `key`, returned as lowercase hex.
 ///
-/// Re-keys a fresh `Hmac<Sha256>` from `key` on every call (via [`keyed_mac`]),
+/// Re-keys a fresh `Hmac<Sha256>` from `key` on every call (via `keyed_mac`),
 /// so it is the right tool for a one-off or rarely-repeated signature — webhook
 /// delivery signing, mail, alerts, `read_your_writes`, cluster wire messages —
 /// but not for a key that signs or verifies many messages in a request's
-/// lifetime. [`ResolvedSigningKeys::sign`]/[`ResolvedSigningKeys::verify`] (the
+/// lifetime. `ResolvedSigningKeys::sign`/`ResolvedSigningKeys::verify` (the
 /// CSRF and session-cookie hot path, driven every request regardless of
 /// method) instead keep a pre-keyed `Hmac<Sha256>` in `current_mac`/
 /// `previous_macs` and clone it per call, skipping the ipad/opad
