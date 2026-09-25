@@ -2,8 +2,8 @@
 
 ## Corrections (from Codex review on this PR)
 
-This report's first six revisions made twelve claims that don't hold up, all
-caught by an automated Codex review on the PR and independently verified
+This report's first seven revisions made fourteen claims that don't hold up,
+all caught by an automated Codex review on the PR and independently verified
 before accepting each one. Fixed in place below rather than left standing,
 per the charter's own VERIFY step:
 
@@ -56,10 +56,16 @@ per the charter's own VERIFY step:
    insert is charged in full, with no credit for what the delete removes —
    a tombstone costs what a character costs. So a document at the limit
    refuses this too."* A genuinely net-neutral edit is still refused at the
-   cap, which the doc's own prose already prepares the reader for
-   ("`max_document_chars` does not cover this" — see
-   `docs/guide/collaboration.md`'s wire-protocol section on `replace`). Worth
-   stating plainly since it's easy to misread as a bug on a first pass.
+   cap, which the guide's own prose already prepares the reader for: *"A
+   tombstone costs what a character costs, so a document at
+   `max_document_chars` frees nothing by deleting... `replace` is checked in
+   full before anything is applied, so a refusal leaves the text as it
+   was"* (`docs/guide/collaboration.md`'s wire-protocol section on
+   `replace`, lines 193-198 — an earlier revision of this report misquoted
+   a *different* sentence here, from `hub.rs:1354`, which is about the
+   causal-buffer limit, not `replace`; fixed to cite the guide's actual
+   wording). Worth stating plainly since it's easy to misread as a bug on a
+   first pass.
 5. **The Findings summary overclaimed the close/finalize write-window race
    as black-box driven.** The only live-disconnect probe this session ran
    sent one insert and called `.close()` immediately after — the sole
@@ -131,6 +137,22 @@ per the charter's own VERIFY step:
     added by that change (see correction 9). Narrowed to say the run
     confirms #2851's fix via those two tests, not that #2851 added the
     suite.
+13. **A quote attributed to the guide was actually from unrelated code.**
+    ""`max_document_chars` does not cover this"" doesn't appear in
+    `docs/guide/collaboration.md` at all — a repo-wide search finds it only
+    at `hub.rs:1354`, where it explains why that limit doesn't bound the
+    *causal buffer* (`MAX_WIRE_PENDING`), nothing to do with `replace`. The
+    guide does support the same conclusion, in different words ("A tombstone
+    costs what a character costs... `replace` is checked in full before
+    anything is applied," lines 193-198) — fixed to quote that instead of
+    the misattributed sentence.
+14. **"Two editors typing concurrently" overstated what
+    `two_browser_sessions_converge_on_the_same_text` guarantees.** Checked
+    the test body directly: it `await`s Ada's edit before starting Linus's,
+    with no barrier forcing overlap. On a fast local server Ada's edit can
+    finish before Linus's begins, so the test proves convergence after both
+    edit, not a guaranteed concurrent race. Reworded to describe what the
+    test actually does.
 
 The rest of the report is corrected in place (not left as strikethrough) so
 it reads as one coherent record; this section exists so the correction
@@ -298,9 +320,13 @@ increasing realism:
   one combined one (an earlier revision of this report wrongly described
   them as "typing at both ends while a round trip is still in flight," which
   no single test actually does):
-  `two_browser_sessions_converge_on_the_same_text` has **two editors typing
-  concurrently** (Ada at the end, Linus at the start) but doesn't
-  deliberately hold a round trip open between their edits; the two
+  `two_browser_sessions_converge_on_the_same_text` has **two editors
+  editing the same document, one after the other** (`smoke.rs:54-55`
+  `await`s Ada's `type_at_end` before starting Linus's `type_at_start`, with
+  no barrier forcing overlap — on a fast local server Ada's edit can finish
+  before Linus's begins, so this proves convergence after both edit, not a
+  guaranteed concurrent race) and doesn't deliberately hold a round trip
+  open between their edits either way; the two
   round-trip tests, `a_keystroke_typed_during_a_round_trip_survives` and
   `a_backspace_typed_during_a_round_trip_survives`, have **one editor
   typing a fast burst that outruns its own round trip**, then open a
