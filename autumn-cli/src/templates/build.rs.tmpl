@@ -2,8 +2,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=static/css/input.css");
     println!("cargo:rerun-if-changed=tailwind.config.js");
-    println!("cargo:rerun-if-changed=target/autumn/tailwindcss");
     println!("cargo:rerun-if-env-changed=PATH");
+    println!("cargo:rerun-if-env-changed=CARGO_TARGET_DIR");
     #[cfg(target_os = "windows")]
     println!("cargo:rerun-if-env-changed=PATHEXT");
 
@@ -11,7 +11,26 @@ fn main() {
     // report exactly which commit/build is running (deploy/rollback checks).
     emit_build_provenance();
 
-    if let Some(tailwind) = find_tailwind_cli() {
+    let tailwind = find_tailwind_cli();
+    // Watch the path `find_tailwind_cli` actually resolved (wherever
+    // `CARGO_TARGET_DIR`/workspace nesting really put it), not a
+    // package-relative `target/autumn/...` guess — `cargo:rerun-if-changed`
+    // on a path that can never resolve to where the binary really lives
+    // makes Cargo treat the build script as permanently dirty, so it (and
+    // the Tailwind rebuild) reruns on every single `cargo build` even with
+    // nothing changed. When nothing was found yet, fall back to the primary
+    // candidate's expected path, so the first `autumn setup` afterwards is
+    // still picked up without an unrelated source edit.
+    match &tailwind {
+        Some(path) => println!("cargo:rerun-if-changed={}", path.display()),
+        None => {
+            if let Some(expected) = expected_tailwind_path() {
+                println!("cargo:rerun-if-changed={}", expected.display());
+            }
+        }
+    }
+
+    if let Some(tailwind) = tailwind {
         let status = std::process::Command::new(&tailwind)
             .args([
                 "-i",
@@ -263,10 +282,17 @@ fn iso8601_utc(secs: u64) -> String {
 }
 
 fn find_tailwind_cli() -> Option<std::path::PathBuf> {
-    // 1. Check local download (from `autumn setup`)
-    let local = std::path::PathBuf::from("target/autumn/tailwindcss");
-    if local.exists() {
-        return Some(local);
+    // 1. Check the workspace target directory (from `autumn setup`), trying
+    //    each candidate and picking the platform's binary name — matching
+    //    `autumn setup`/`autumn dev`. A hardcoded `target/autumn/tailwindcss`
+    //    finds nothing on Windows (`setup` installs `tailwindcss.exe`) or
+    //    whenever `CARGO_TARGET_DIR` points somewhere else, and Tailwind
+    //    silently becomes "optional" instead.
+    for target_dir in candidate_target_dirs() {
+        let local = target_dir.join("autumn").join(tailwind_bin_name());
+        if local.exists() {
+            return Some(local);
+        }
     }
 
     // 2. Check PATH
@@ -276,6 +302,71 @@ fn find_tailwind_cli() -> Option<std::path::PathBuf> {
 
     // 3. Return None to treat this as optional.
     None
+}
+
+/// Where `autumn setup` is expected to install the CLI, going by the FIRST
+/// (most likely correct) candidate target directory — used only to still
+/// pick up a first `autumn setup` run when nothing was found yet; see the
+/// call site in `main`.
+fn expected_tailwind_path() -> Option<std::path::PathBuf> {
+    Some(
+        candidate_target_dirs()
+            .into_iter()
+            .next()?
+            .join("autumn")
+            .join(tailwind_bin_name()),
+    )
+}
+
+fn tailwind_bin_name() -> &'static str {
+    if cfg!(windows) {
+        "tailwindcss.exe"
+    } else {
+        "tailwindcss"
+    }
+}
+
+/// Candidate Cargo target directories to look for `autumn setup`'s download
+/// in, most-likely first. `autumn setup`/`autumn dev` resolve the install
+/// directory via `cargo metadata`'s `target_directory`, which is always the
+/// WORKSPACE-level target dir with no target-triple component — however the
+/// build is invoked. A build script has no such single source of truth, so
+/// every candidate below is tried rather than picking just one:
+///
+/// - `CARGO_TARGET_DIR`, when the *user* set it as an env var (not via
+///   `.cargo/config.toml`), is inherited directly into this process's
+///   environment and matches `cargo metadata` exactly, triple or not — EXCEPT
+///   when it is a *relative* path and the generated crate is a workspace
+///   member: Cargo then still resolves it against the workspace root, but
+///   runs this build script with the member directory as CWD, so re-joining
+///   the raw env var here would resolve against the wrong base. It is tried
+///   first because it is the more direct answer when it applies, but it is
+///   never the ONLY candidate for exactly that reason.
+/// - `OUT_DIR` is always absolute and already resolved by Cargo itself
+///   (`<target_dir>[/<triple>]/<profile>/build/<pkg>/out`), so its ancestors
+///   are tried unconditionally as well, not only when `CARGO_TARGET_DIR` is
+///   unset. An explicit `--target` or a `.cargo/config.toml` default target
+///   inserts an EXTRA path segment, so both the no-triple and one-triple
+///   parent are offered rather than guessed.
+fn candidate_target_dirs() -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+        candidates.push(std::path::PathBuf::from(dir));
+    }
+
+    if let Ok(out_dir) = std::env::var("OUT_DIR") {
+        let out_dir = std::path::PathBuf::from(out_dir);
+        // ancestors: out → <pkg> → build → <profile> → [<triple> →] target
+        candidates.extend(
+            [out_dir.ancestors().nth(4), out_dir.ancestors().nth(5)]
+                .into_iter()
+                .flatten()
+                .map(std::path::Path::to_path_buf),
+        );
+    }
+
+    candidates
 }
 
 fn which(binary: &str) -> Option<std::path::PathBuf> {

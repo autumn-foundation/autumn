@@ -46,7 +46,108 @@ quarantine, per the rule above.
 
 ## Open entries
 
-_None as of 2026-09-05._
+### `offsite_backup::offsite_backup_upload_then_restore_round_trips` / `offsite_backup::offsite_backup_uploads_large_artifact_via_multipart` / `sqlite_replication_s3::replicates_to_and_restores_from_a_real_s3_endpoint`
+
+- **Quarantined**: 2026-09-25 in #2953.
+- **Owner**: @madmax983 (repo owner) — the fix needs a business/infra decision
+  (pay for authenticated `quay.io` pulls, or stand up and maintain a
+  self-hosted/mirrored MinIO image) that this role cannot make unilaterally
+  per its own "ask before: new CI spend" rule. Not the person who diagnosed
+  it (this pass); the person on the hook for the remediation decision.
+- **Diagnose-by**: N/A — mechanism is confirmed, not pending (see below).
+  **Revisit-by**: 2026-10-02 — check whether `quay.io/minio/minio` anonymous
+  pulls have been restored, or whether a decision has been made, before this
+  entry goes stale.
+- **Rerun-rate baseline**: not applicable in the stochastic sense — this is a
+  deterministic, 100% external-dependency outage, not a flake. 6/6 `Test
+  (Docker)` failures carry the identical signature in the ~12h window sampled
+  before this quarantine (2026-09-24T20:21:13Z-2026-09-25T09:09Z): 5
+  independent PRs (`claude/tender-galileo-q43orv`, `claude/busy-cerf-0i7k5y`,
+  `claude/friendly-ritchie-nv7uw7`, `claude/wizardly-wright-dyva9u`,
+  `claude/brave-goldberg-h3c4cr`) plus this repo's own `trunk-dev` push of the
+  2026-09-24 Semaphore follow-up (#2942, run 36004498723, a docs-only ledger
+  PR with zero code changes — confirming the failure tracks the external
+  dependency, not any PR's own diff). No PR in the sampled window that
+  reached the `Test (Docker)` job passed it.
+- **Failure signature**: panic `` start MinIO — is Docker running?:
+  Client(PullImage { descriptor: "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z",
+  err: DockerResponseServerError { status_code: 500, message: "unauthorized:
+  access to the requested resource is not authorized" } }) `` at
+  `autumn-cli/tests/integration/offsite_backup.rs:82:10` (and the identical
+  shape at `autumn/tests/integration/sqlite_replication_s3.rs`'s own
+  `MinIO::default()` call site).
+- **Mechanism**: unpinned/vanished external dependency — the same category as
+  the closed MinIO/Docker-Hub entry above, recurring against the fallback
+  that entry's own fix (#2740) switched to. Confirmed directly, not inferred
+  from the CI error text alone: an anonymous `quay.io/v2/auth` token request
+  for `repository:minio/minio:pull` succeeds (200) but the returned JWT's
+  `access` grant carries `"actions":[]` — empty, no `pull` — and a manifest
+  GET against `quay.io/v2/minio/minio/manifests/RELEASE.2025-09-07T16-13-09Z`
+  with that token still 401s (`www-authenticate: Bearer ...`). The identical
+  probe against an unrelated public quay.io repo, `quay.io/prometheus/prometheus`,
+  returns a normal 200 with a real manifest — so this is scoped to
+  `minio/minio` specifically, not a quay.io-wide policy change or outage.
+  MinIO Inc.'s own repository page (`quay.io/repository/minio/minio`, the web
+  UI, not the registry API) still returns 200, so the repository exists and
+  is browsable; only anonymous registry pulls are cut off. This is the same
+  vendor that deleted its Docker Hub org outright in October 2025 (see the
+  closed entry above) now also closing off the last public registry this
+  repo's tests depended on.
+- **Test-vs-product**: neither — pure external CI/test infrastructure
+  dependency (a third-party vendor's container distribution policy), no
+  product code path is implicated, the same classification as every other
+  "unpinned external service" entry in this ledger.
+- **Remediation attempted, not found**: searched for a still-anonymously-pullable
+  MinIO-compatible replacement image before quarantining rather than after.
+  `docker.io/minio/minio` remains gone (the October 2025 org deletion, see
+  above — not re-checked in depth this pass since nothing suggests it
+  returned). `docker.io/bitnami/minio`: Docker Hub's own repository API
+  reports it `"is_private": false` and `"status": "active"` with 58M+
+  historical pulls, but its registry tags list (`GET
+  /v2/bitnami/minio/tags/list`, both with and without a token, and via
+  `hub.docker.com`'s own tags API) returns zero tags — consistent with
+  Broadcom's 2025 Bitnami Secure Images move, which pulled free-tier tags
+  behind a paid catalog while leaving the repository shell/description in
+  place. `ghcr.io/minio/minio` and `public.ecr.aws/minio/minio` both 401.
+  No further candidates were tried this pass. A working replacement, if one
+  exists, was not found by registry-probing alone — this may need the
+  vendor's own current documentation (unavailable to check further in this
+  pass) or a self-hosted mirror.
+- **Fix, not applied — quarantined instead, per the "ask before: new CI
+  spend" rule and because no Docker daemon is available in this sandbox to
+  verify a replacement image's compatibility with `testcontainers_modules::minio::MinIO`'s
+  wait strategy and env-var expectations before committing to one.** Swapping
+  registries blind, a second time, risks repeating the multi-PR collision
+  the first swap caused (see the escape entry above) — and this time there
+  is no confirmed working target to swap to. Instead: `--skip
+  offsite_backup_upload_then_restore_round_trips --skip
+  offsite_backup_uploads_large_artifact_via_multipart` added to `ci.yml`'s
+  `cli_tests` bare `--ignored` sweep, and `--skip
+  replicates_to_and_restores_from_a_real_s3_endpoint` added to the
+  `integration_tests` sweep — both by exact test name, the same convention
+  this repo already uses for the non-Docker generator-conformance skips in
+  the same block (CLAUDE.md's "Docker / testcontainer DB tests run
+  automatically in CI" section). This is quarantine, not deletion: the tests
+  are untouched, still compile, and still run for anyone with Docker and
+  working `quay.io` credentials locally.
+- **Not covered by this quarantine**: `examples/reddit-clone/tests/avatar_s3_integration.rs`'s
+  `avatar_blob_store_roundtrip` — same `MinIO::default().with_name(MINIO_IMAGE)`
+  call site, same outage, but (per the closed MinIO entry above) this test
+  was never part of either CI Docker sweep to begin with, so no `ci.yml`
+  change is needed to stop it from failing CI; it simply fails identically
+  whenever anyone runs it directly.
+- **Impact while open**: this fails the required `Test (Docker)` job — and
+  therefore the required `Test suite` (`test-gate`) aggregator — on every PR
+  whose run reaches that job, independent of the PR's own diff, until this
+  quarantine merges. Given the ~12h/6-for-6 sampling above, that was
+  effectively every PR reaching the Docker sweep in that window.
+- **Linked issue/PR**: none filed separately — tracked here and in #2953,
+  which is the fix (the quarantine) as well as the diagnosis.
+- **Skip mechanism**: `ci.yml`'s `cli_tests` and `integration_tests` bare
+  `--ignored` sweeps, `--skip <exact test name>`, chosen over `#[ignore]`ing
+  the test bodies themselves so the quarantine is visible and reversible in
+  one place (this ledger entry names both `ci.yml` lines) rather than
+  scattered across test source files.
 
 ## Closed entries
 
@@ -1380,6 +1481,38 @@ _None as of 2026-09-05._
   Match the harness to how CI actually runs the binary before reading a clean
   result as evidence.
 
+- **2026-09-24 verification — fix holding, 0 new recurrences.** Sampled
+  `ci.yml` `pull_request` runs across the ~14.2h following PR #2925's merge
+  (2026-09-23T19:33:05Z through 2026-09-24T09:42:24Z — the tail end of the
+  broader ~37.85h window described in the `live_upgrade` entry's 2026-09-24
+  dated update below, most of which predates the merge). One hit of this
+  test's own failure signature was found in that broader window (run
+  35866381449, branch `claude/sleepy-brown-7ke3xk`, job completed
+  2026-09-23T13:36:52Z), but that completion time is ~6 hours **before** the
+  fix's merge, and outside the ~14.2h post-merge window this verification
+  actually covers — it is the same pre-fix occurrence this entry's own
+  reproduction campaign already accounts for, not a new recurrence. Zero
+  hits among the `success`/`failure`-concluded runs in the ~14.2h sampled
+  after the merge.
+  **Correction (post-review, via a Codex review comment on PR #2942): an
+  earlier version of this note and the corresponding `live_upgrade` update
+  below misstated the post-merge verification interval as "~38h," which was
+  the full sampling window's span, not the portion after the merge.**
+  **Second correction (post-review, via a further Codex review comment on PR
+  #2942): the "zero hits" claim was not scoped to what was actually
+  inspected.** `ci.yml`'s `concurrency.cancel-in-progress: true` (lines 9-11)
+  means a job inside a `cancelled`-overall run can still have completed with
+  a failing test before the run itself was marked cancelled by a superseding
+  push. The cancelled runs inside the post-merge window were not inspected
+  at job level this pass, so this verification covers only the
+  `success`/`failure`-concluded runs in that window, not an exhaustive sweep
+  of every job that ran.
+- **2026-09-25 verification — still holding, 0 new recurrences.** All 6
+  `Test (Docker)`-family failures found in this pass's sampling (see the
+  `live_upgrade` entry's 2026-09-25 dated update, and the new **Open
+  entries** section above) are the newly-quarantined `quay.io/minio/minio`
+  outage; none carry this test's own signature. Same cancelled-run and
+  reliable-window caveats as every prior verification note apply.
 
 ## Under active investigation, not yet quarantined
 
@@ -2103,6 +2236,108 @@ without also filling in the intake form above.
   2026-09-22T~10:1xZ — **14th** straight idle pass (now ~330.5 hours idle,
   past 13.75 days). Still needs a human sign-off for new macOS CI spend;
   not dispatched this pass for that reason.
+- **2026-09-24 update — 15th consecutive pass, harness still undispatched;
+  zero new hits on any of the three `live_upgrade` signatures.** Sampled
+  `ci.yml` `pull_request` runs, page 1 of `list_workflow_runs`
+  (`event=pull_request`, `status=completed`, `perPage=100`): 100 runs
+  spanning 2026-09-22T19:51:14Z–2026-09-24T09:42:24Z (~37.85h) — 64
+  cancelled, 32 success, 4 failure. **Coverage gap, recorded rather than
+  hidden**: page 2 of the identical query returned runs from
+  2026-09-07–2026-09-09 instead of continuing backward from page 1's start,
+  and `total_count` itself differed between the two calls (9315 vs. 7616) —
+  the API's pagination did not behave as a stable continuation this pass, so
+  the ~13.4h gap between this window's start and the 2026-09-22 report's own
+  cutoff (2026-09-22T06:24:50Z–19:51:14Z) was not independently sampled.
+  **Second coverage gap (post-review, via a Codex review comment on PR
+  #2942): only the runs that resolved to `failure` were triaged.** `ci.yml`'s
+  `concurrency.cancel-in-progress: true` (lines 9-11) means a job inside one
+  of the 64 `cancelled`-overall runs could still have completed with a
+  failing test before the run itself was marked cancelled by a superseding
+  push. Those 64 runs' job-level logs were not inspected this pass, so the
+  "zero new hits" findings below are scoped to the 36 runs that resolved to
+  `success`/`failure` and were actually checked — not a proven-exhaustive
+  zero-hit finding across the full 100-run window (the same caveat this
+  ledger's 2026-09-15 update already established as this role's working
+  standard when cancelled-run job-level sampling isn't repeated).
+  All 4 in-window failures triaged at job/log level:
+  - Run 35909966810 (`vesper/bugbash-2881-busy-timeout-shared-cache`,
+    `SQLite runtime (feature=sqlite)`, 2026-09-23T19:32:07Z): `E0061`,
+    `reject_sqlite_statement_timeout` called with 1 argument instead of 2 at
+    `autumn/src/app.rs:11164` and `:11248` — that branch's own in-progress
+    statement-timeout work, unmerged, not a flake.
+  - Run 35894739084 (`vesper/bugbash-2921-create-project-submit-token`,
+    `Lint`/`Test suite`, 2026-09-23T17:18:51Z): `E0308`,
+    `extract_submit_token` expects `&str`, given `String`, at
+    `examples/saas/tests/integration_test.rs:574` — that branch's own
+    submit-token test helper, unmerged, not a flake.
+  - Run 35866381449 (`claude/sleepy-brown-7ke3xk`, `SQLite runtime
+    (feature=sqlite)`, 2026-09-23T13:20:28Z):
+    `sqlite_job_backend_tracks_job_status_durably` FAILED — the exact
+    signature closed above, but this job completed 2026-09-23T13:36:52Z, ~6
+    hours **before** PR #2925's merge (`ff406e0`, 2026-09-23T19:33:05Z). The
+    same pre-fix occurrence the closed entry's own campaign already
+    accounts for, not a new recurrence.
+  - Run 35806829348
+    (`dependabot/github_actions/dtolnay/rust-toolchain-1.120.0`,
+    `MSRV`/`Test (macos-latest)`/`Test (ubuntu-latest)`/
+    `Test (windows-latest)`/`Test suite`, 2026-09-23T01:34:17Z): `rustup`
+    failed installing toolchain `1.120.0` itself — that PR's own subject
+    matter (the pin bump), unmerged.
+
+  None of the 4 match `live_upgrade`, `cache_stampede`, `sim_fault_plan`, or
+  any other tracked signature. **`sqlite_job_backend_tracks_job_status_durably`'s
+  fix (PR #2925) is holding**: zero recurrences among the `success`/
+  `failure`-concluded runs in the ~14.2h of PR traffic sampled since its
+  2026-09-23T19:33:05Z merge, out of this pass's broader ~37.85h window (see
+  the closed entry's own 2026-09-24 verification note above, including its
+  cancelled-run caveat).
+
+  `manual-macos-contention-check.yml`: still `total_count: 0` against
+  `workflow_dispatch` runs, checked 2026-09-24T~09:5xZ — **15th** straight
+  idle pass since it became dispatchable 2026-09-08T15:07:44Z (now ~378.6
+  hours idle, past 15.77 days). Still needs a human sign-off for new macOS CI
+  spend; not dispatched this pass for that reason.
+- **2026-09-25 update — 16th consecutive pass, harness still undispatched;
+  zero new hits on any of the three `live_upgrade` signatures, but this
+  pass's sampling was dominated by a single unrelated infra outage.**
+  `list_workflow_runs(event=pull_request)` at `perPage=100` (with or without
+  `status=completed`) consistently returned a stale page (runs from
+  2026-09-03/04, not current) this pass, worse than the prior pass's
+  page-2 issue — reducing `perPage` to 30 with no `status` filter returned
+  current data reliably, at page 1 only (page 2 again jumped back to
+  2026-09-03). Sampled that reliable window: 30 `ci.yml` `pull_request`
+  runs spanning 2026-09-24T20:21:13Z-2026-09-25T08:05:14Z (~11.7h) — 5
+  failures, all 5 triaged at job/log level. **Coverage gap, recorded rather
+  than hidden**: the ~10.6h between this window's start and the prior
+  pass's own cutoff (2026-09-24T09:42:24Z-20:21:13Z) was not independently
+  sampled — the `perPage=100`/`status=completed` staleness left no reliable
+  way to reach it this pass. Cancelled runs inside the sampled window were
+  also not inspected at job level (same caveat as every prior pass since
+  2026-09-15).
+
+  **All 5 failures — plus this repo's own `trunk-dev` push of the prior
+  pass's PR (#2942, run 36004498723, completed 2026-09-24T15:32:51Z) — hit
+  the identical new signature**, a total, deterministic `quay.io/minio/minio`
+  anonymous-pull outage recurring against the fallback registry the closed
+  MinIO/Docker-Hub entry's own fix (#2740) switched to; see the new **Open
+  entries** section above for the full diagnosis, evidence, and this pass's
+  quarantine fix. None of the 6 failures match `live_upgrade`,
+  `cache_stampede`, `sim_fault_plan`, `job_tracking_stores_integration`, or
+  `sqlite_job_backend_tracks_job_status_durably` — this pass found zero
+  organic hits on any of those, but the sample is unusually uninformative
+  for that purpose: with `Test (Docker)` failing on essentially every run
+  that reached it, a live_upgrade/cache_stampede/sim_fault_plan hit inside
+  the same run would still show as a `Test (Docker)`-attributed failure
+  unless separately checked — and the failing runs sampled here reached
+  their MinIO panic well before the point in the suite those three
+  Linux/coverage-shaped signatures fire from, so a concurrent hit hiding
+  behind this outage in-window cannot be ruled out from these 6 alone.
+
+  `manual-macos-contention-check.yml`: still `total_count: 0` against
+  `workflow_dispatch` runs, checked 2026-09-25T~10:2xZ — **16th** straight
+  idle pass since it became dispatchable 2026-09-08T15:07:44Z (now ~403
+  hours idle, past 16.8 days). Still needs a human sign-off for new macOS CI
+  spend; not dispatched this pass for that reason.
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
   committed as `.github/workflows/manual-macos-contention-check.yml`, gated
@@ -2185,6 +2420,14 @@ without also filling in the intake form above.
 - **2026-09-22 update**: no repeat in the ~20.5h window sampled this pass
   (see the `live_upgrade` entry's 2026-09-22 dated update above for the
   window and method).
+- **2026-09-24 update**: no repeat in the ~37.85h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-24 dated update above for the
+  window and method).
+- **2026-09-25 update**: no repeat in the ~11.7h reliable window sampled this
+  pass (see the `live_upgrade` entry's 2026-09-25 dated update above for the
+  window, method, and the caveat that a `quay.io/minio/minio` outage
+  dominated every in-window failure and left the sample less informative
+  than usual for this signature specifically).
 
 ### `sim_fault_plan::same_seed_replays_a_byte_identical_outcome_100_times`
 
@@ -2218,6 +2461,15 @@ without also filling in the intake form above.
 - **2026-09-22 update**: no repeat in the ~20.5h window sampled this pass
   (see the `live_upgrade` entry's 2026-09-22 dated update above for the
   window and method). Still n=1, still not campaigned.
+- **2026-09-24 update**: no repeat in the ~37.85h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-24 dated update above for the
+  window and method). Still n=1, still not campaigned.
+- **2026-09-25 update**: no repeat in the ~11.7h reliable window sampled this
+  pass (see the `live_upgrade` entry's 2026-09-25 dated update above for the
+  window, method, and the caveat that a `quay.io/minio/minio` outage
+  dominated every in-window failure and left the sample less informative
+  than usual for this signature specifically). Still n=1, still not
+  campaigned.
 
 `sqlite_jobs_scheduler_e2e::sqlite_job_backend_tracks_job_status_durably` was
 opened here 2026-09-21 and **closed 2026-09-23** — see its entry under "Closed
