@@ -159,14 +159,21 @@ restatement of the same open question.
 2026-09-21 report is explicit that it feeds, rather than resolves, issue
 #2795's decision: gap 1 (re-measuring against the real `autumn
 new`-scaffolded project via `cold_start_driver.rs`, not `examples/hello`) is
-still open in both reports, `dev-loop-latency.yml`'s own measurement driver
-isn't wired up yet (`build_placeholder_results` always passes every budget
-with zero samples — see that report's "Cost to productionize"), and the
-2026-09-17 report's own reason for deferring to a human — a permanent,
-every-build backtrace-quality trade-off is a named-decision call, not an
-autonomous default flip — still applies regardless of how much stronger the
-compile-time case has gotten. No maintainer decision is recorded on either
-report as of this cycle. The `-Z self-profile`/`measureme` tooling gap the
+still open in both reports, and `dev-loop-latency.yml`'s own measurement
+driver isn't wired up yet (`build_placeholder_results` always passes every
+budget with zero samples — see that report's "Cost to productionize").
+**Correction (caught by Codex review on this PR): an earlier draft said the
+2026-09-17 report's backtrace-quality trade-off "still applies regardless of
+how much stronger the compile-time case has gotten." That overstates it for
+`limited` specifically** — this report's own correction two paragraphs up
+already says `debug=1`/`limited` preserves file:line resolution, so that
+particular cost only attaches to `debug=0`, not to every level. For
+`limited`, what's actually still missing is simply that no maintainer
+decision is recorded on either report as of this cycle, on top of the two
+open measurement gaps above — not an unresolved backtrace cost. The
+backtrace trade-off remains the live reason `debug=0` specifically needs a
+named human call rather than an autonomous flip; it isn't a reason `limited`
+does too. The `-Z self-profile`/`measureme` tooling gap the
 2026-09-17 report hit is unrelated to this and remains blocked by this
 sandbox's `crates.io` egress policy
 (`curl -sS -o /dev/null -w '%{http_code}' https://crates.io` → `403`,
@@ -221,8 +228,12 @@ than manufacturing a cosmetic change to have something to ship.
 ## 🔬 Reproduce
 
 ```bash
-# Prior Onramp work:
-git log --oneline --all | grep -iE "onramp|🛣️"
+# Prior Onramp work — NOT this (undercounts in a shallow clone, see the
+# correction above — `git rev-parse --is-shallow-repository` first to check):
+#   git log --oneline --all | grep -iE "onramp|🛣️"
+# Use GitHub's own PR search instead, which isn't limited by local clone depth
+# (via the GitHub MCP server / API, or the web UI):
+#   search_pull_requests(owner, repo, query: 'Onramp in:title is:merged')
 
 # Question-log check (Tier 2) — repeat periodically, not just this cycle:
 #   search open issues for "confusing", "unclear", "doesn't work",
