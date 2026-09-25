@@ -773,6 +773,7 @@ pub struct TestApp {
     http_mock_registry: Option<std::sync::Arc<crate::http_client::MockRegistry>>,
     state_initializers: Vec<Box<dyn FnOnce(&AppState) + Send>>,
     jobs: Vec<crate::job::JobInfo>,
+    tasks: Vec<crate::task::TaskInfo>,
     listeners: Vec<crate::events::ListenerInfo>,
     exception_filters: Vec<std::sync::Arc<dyn crate::middleware::ExceptionFilter>>,
     #[cfg(feature = "mail")]
@@ -855,6 +856,7 @@ impl TestApp {
             http_mock_registry: None,
             state_initializers: Vec::new(),
             jobs: Vec::new(),
+            tasks: Vec::new(),
             listeners: Vec::new(),
             exception_filters: Vec::new(),
             #[cfg(feature = "mail")]
@@ -1142,6 +1144,7 @@ impl TestApp {
             probes: crate::probe::ProbeState::ready_for_test(),
             state,
             _job_runtime: None,
+            _task_scheduler: None,
             clock_as_any: None,
             #[cfg(feature = "mail")]
             mail_recorder: None,
@@ -1298,6 +1301,7 @@ impl TestApp {
         self.static_gate_layers
             .extend(app_builder.static_gate_layers);
         self.jobs.extend(app_builder.jobs);
+        self.tasks.extend(app_builder.tasks);
         self.listeners.extend(app_builder.listeners);
         self.exception_filters.extend(app_builder.exception_filters);
         self.metrics_sources.extend(app_builder.metrics_sources);
@@ -1494,6 +1498,44 @@ impl TestApp {
     #[must_use]
     pub fn with_fault_plan(mut self, plan: crate::sim::fault::FaultPlan) -> Self {
         self.fault_plan = Some(plan);
+        self
+    }
+
+    /// Register background jobs with the test app.
+    ///
+    /// Collect them with `jobs![..]`, exactly as in `AppBuilder::jobs`. They
+    /// run under the in-process test job runtime that [`build`](Self::build)
+    /// starts.
+    #[must_use]
+    pub fn jobs(mut self, jobs: Vec<crate::job::JobInfo>) -> Self {
+        self.jobs.extend(jobs);
+        self
+    }
+
+    /// Register `#[scheduled]` tasks with the test app.
+    ///
+    /// Collect them with `tasks![..]`, exactly as in `AppBuilder::tasks`.
+    /// [`build`](Self::build) starts them on the in-process scheduler, and
+    /// dropping the [`TestClient`] stops them. Their timers are tokio timers
+    /// and they read the injected clock, so under a `#[sim_test]` a tick fires
+    /// when [`crate::sim::Sim::advance`] crosses its deadline.
+    #[must_use]
+    pub fn tasks(mut self, tasks: Vec<crate::task::TaskInfo>) -> Self {
+        self.tasks.extend(tasks);
+        self
+    }
+
+    /// Install `entropy` unless the test already injected a source with
+    /// [`with_entropy`](Self::with_entropy). [`crate::sim::Sim::build`] uses
+    /// this to seed the app from the simulation seed by default.
+    #[must_use]
+    pub(crate) fn with_default_entropy(
+        mut self,
+        entropy: std::sync::Arc<dyn crate::entropy::Entropy>,
+    ) -> Self {
+        if self.entropy.is_none() {
+            self.entropy = Some(entropy);
+        }
         self
     }
 
@@ -2310,6 +2352,23 @@ impl TestApp {
             Some(TestJobRuntime { shutdown })
         };
 
+        // Start `#[scheduled]` tasks on the in-process scheduler. Their loops
+        // sleep on tokio timers and read the injected clock, so under a
+        // `#[sim_test]` they tick in virtual time.
+        let task_scheduler = if self.tasks.is_empty() {
+            None
+        } else {
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            crate::app::start_task_scheduler_with_config(
+                std::mem::take(&mut self.tasks),
+                &state,
+                &shutdown,
+                &self.config.scheduler,
+            )
+            .expect("Failed to start scheduled tasks in test");
+            Some(TestTaskScheduler { shutdown })
+        };
+
         // Retain the registered job metadata so `perform_enqueued_jobs` can look
         // up each captured job's handler by name and dispatch it directly.
         let jobs_for_client = self.jobs.clone();
@@ -2451,6 +2510,7 @@ impl TestApp {
             probes,
             state,
             _job_runtime: job_runtime,
+            _task_scheduler: task_scheduler,
             clock_as_any: self.clock_as_any,
             #[cfg(feature = "mail")]
             mail_recorder: Some(mail_recorder_for_client),
@@ -2513,6 +2573,8 @@ pub struct TestClient {
     probes: crate::probe::ProbeState,
     pub(crate) state: AppState,
     _job_runtime: Option<TestJobRuntime>,
+    /// Stops the `#[scheduled]` task loops [`TestApp::build`] started.
+    _task_scheduler: Option<TestTaskScheduler>,
     /// Retained so `advance_clock` can downcast to [`crate::time::TickingClock`].
     clock_as_any: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     /// `None` when built via [`TestApp::from_router`], which bypasses recorder
@@ -2582,6 +2644,17 @@ type CookieJar = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Strin
 
 struct TestJobRuntime {
     shutdown: tokio_util::sync::CancellationToken,
+}
+
+/// Cancels the scheduled-task loops of one [`TestClient`] when it drops.
+struct TestTaskScheduler {
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for TestTaskScheduler {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
 }
 
 impl Drop for TestJobRuntime {

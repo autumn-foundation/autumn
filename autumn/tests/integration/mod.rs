@@ -384,17 +384,21 @@ mod sim_chaos_clock_skew_monotonic;
 mod sim_clock_drain;
 #[cfg(feature = "collab")]
 mod sim_collab_convergence;
+mod sim_default_entropy;
 mod sim_delayed_enqueue;
 mod sim_deterministic_ids;
 mod sim_fault_plan;
 mod sim_fault_plan_pg;
 mod sim_job_clock;
+mod sim_liveness_watchdog;
 mod sim_llm_stub;
 mod sim_monotonic_clock;
 mod sim_rate_limit_clock;
 mod sim_retry_storm;
+mod sim_scheduled_ticks;
 mod sim_strict_wall_clock;
 mod sim_test_smoke;
+mod sim_testapp_jobs;
 mod sqlite_ci_coverage;
 #[cfg(feature = "db")]
 mod sqlite_replication;

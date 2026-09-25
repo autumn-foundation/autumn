@@ -52,26 +52,21 @@
 //! construction, so it isn't a hard invariant in the DST sense (see the
 //! comment beside the assertion itself for the full reasoning).
 //!
-//! # Wiring seeded entropy explicitly (Codex review)
+//! # Seeded entropy
 //!
-//! `Sim::build` wires the virtual clock into a mounted app automatically, but
-//! entropy injection is opt-in (see [`Sim::seeded_entropy`]'s own docs). The
-//! first draft of `run_storm` below omitted `.with_entropy(...)`, so the
-//! jitter this test exists to demonstrate was drawn from real `OsEntropy`
-//! rather than the sim's seed — the test still passed (a real random spread
-//! still satisfies "more than one checkpoint"), but a failure would **not**
-//! have reproduced from the printed `AUTUMN_SIM_SEED` replay line, quietly
-//! defeating the whole point of the harness. Fixed by mounting with
-//! `.with_entropy(SeededEntropy::new(sim.seed))`, and proved by
-//! `retry_checkpoints_replay_deterministically_from_the_seed` below, which
-//! runs the same seed twice and asserts on the identical outcome.
+//! The jitter draws from `state.entropy()`. The first draft of this test ran
+//! when `Sim::build` left entropy to the OS, so the spread came from real
+//! `OsEntropy`: the test still passed, but a failure would **not** have
+//! reproduced from the printed `AUTUMN_SIM_SEED` replay line. `Sim::build` now
+//! seeds the app's entropy from `sim.seed` by default, and
+//! `retry_checkpoints_replay_deterministically_from_the_seed` below runs the
+//! same seed twice and asserts on the identical outcome.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use autumn_web::app::AppBuilder;
-use autumn_web::entropy::SeededEntropy;
 use autumn_web::job;
 use autumn_web::plugin::Plugin;
 use autumn_web::prelude::*;
@@ -173,19 +168,9 @@ async fn run_storm(sim: &mut Sim) -> Vec<u32> {
     job::clear_global_job_client();
     reset_probe_state();
 
-    // `Sim::build` wires the virtual clock automatically but, unlike the
-    // clock, entropy injection is opt-in (`Sim::seeded_entropy`'s own docs:
-    // "ready to inject ... via `AppState::with_entropy`") — omitting this
-    // call is exactly the gap Codex review caught: `jittered_retry_delay_ms`
-    // draws from `state.entropy()`, so without a seeded source here the
-    // retry jitter comes from real `OsEntropy`, not `AUTUMN_SIM_SEED`, and
-    // the whole point of this test (a seed replaying deterministically) is
-    // lost.
-    sim.build(
-        TestApp::new()
-            .plugin(StormProbeJobPlugin)
-            .with_entropy(SeededEntropy::new(sim.seed)),
-    );
+    // `jittered_retry_delay_ms` draws from `state.entropy()`, which
+    // `Sim::build` seeds from `sim.seed`, so the jitter replays from the seed.
+    sim.build(TestApp::new().plugin(StormProbeJobPlugin));
 
     // Enqueue every job before draining anything: on the paused runtime no
     // real time passes between these calls, so all `STORM_SIZE` first
@@ -260,7 +245,7 @@ async fn retries_are_not_synchronized_under_load(mut sim: Sim) {
 
 /// Proves the claim `run_storm`'s doc comment (and this module's docs) make:
 /// the same seed reproduces the identical retry-checkpoint sequence. This is
-/// what the missing `with_entropy` wiring above would have broken silently —
+/// what an unseeded entropy source would break silently —
 /// the herd-detection assertions alone can't tell "properly seeded" apart
 /// from "spread by real OS randomness that happens to differ every run,"
 /// since both look like a passing, non-vacuous test. Builds its own paused
