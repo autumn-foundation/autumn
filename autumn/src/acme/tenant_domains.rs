@@ -354,16 +354,35 @@ impl CustomDomainTask {
 
     /// Check where one hostname points and record the result.
     async fn verify_one(&self, hostname: &str, now_unix: i64) {
+        // Snapshot the generation BEFORE the DNS lookup: the lookup is the
+        // slowest await in the tick, and its result must never land on a
+        // re-registered successor. `apply_verification` carries this snapshot
+        // into its guarded write and discards the outcome when the record no
+        // longer matches.
+        let generation = self.registry.get(hostname);
         let observed = self.verifier.observe(hostname).await;
         let outcome = grade_dns_verification(&observed, &self.effective_ingress().await);
-        let failures = self
-            .registry
-            .get(hostname)
-            .map_or(0, |d| d.consecutive_failures);
+        let Some(generation) = generation else {
+            tracing::debug!(
+                hostname,
+                "skipping custom-domain verification: the hostname was offboarded while its DNS \
+                 lookup was in flight"
+            );
+            return;
+        };
+        let failures = generation.consecutive_failures;
         let backoff =
             i64::try_from(self.limiter.backoff_for(failures.saturating_add(1))).unwrap_or(i64::MAX);
-        if let Err(e) =
-            apply_verification(&self.registry, hostname, &outcome, now_unix, backoff).await
+        if let Err(e) = apply_verification(
+            &self.registry,
+            hostname,
+            &generation.tenant,
+            generation.registered_at_unix,
+            &outcome,
+            now_unix,
+            backoff,
+        )
+        .await
         {
             tracing::warn!(
                 hostname,
@@ -683,8 +702,8 @@ impl CustomDomainTask {
                 tracing::debug!(
                     hostname,
                     tenant,
-                    "discarded a custom-domain failure: the hostname no longer belongs to this \
-                     tenant"
+                    "discarded a custom-domain failure: the hostname changed hands or was \
+                     re-registered while the order was in flight"
                 );
                 return;
             }

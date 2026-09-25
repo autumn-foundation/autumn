@@ -1409,6 +1409,46 @@ turned on or has been running alongside billing all along — needs the
 `recipient_for` implementation, `SessionUser`/`Entitled<R>`, and every other
 consumer of `Customer.user_id` need no change.
 
+### Custom domains: `apply_verification` takes a generation snapshot
+
+**Why:** a DNS verification result was applied to whatever record held the
+hostname when the lookup finished, so a stale success could promote — or a
+stale failure could back off — a re-registered successor, even when the
+tenant was unchanged (#2655). The generation the verification started for
+(`tenant` plus `registered_at_unix`) now travels with the outcome into a
+guarded write, and the result is discarded when the record no longer matches.
+
+**You are affected only if you call `apply_verification` directly.** The
+framework's own verification task snapshots the generation for you. The
+function also returns `bool` now: `false` means the result was discarded
+because the hostname was re-registered while the lookup was in flight.
+
+**Before (`{X.Y}`):**
+
+```rust
+apply_verification(&registry, hostname, &outcome, now_unix, backoff_secs).await?;
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+// Snapshot the generation BEFORE the lookup starts: the guarded write needs
+// the record as it was when the verification began, not as it is now.
+let record = registry.get(hostname).expect("registration is current");
+apply_verification(
+    &registry,
+    hostname,
+    &record.tenant,
+    record.registered_at_unix,
+    &outcome,
+    now_unix,
+    backoff_secs,
+)
+.await?;
+```
+
+**Automation:** `manual` — the snapshot must come from before the lookup,
+which only the caller can know.
 
 ## Plugin authors
 

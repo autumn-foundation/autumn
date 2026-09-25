@@ -266,6 +266,8 @@ async fn a_domain_pointing_elsewhere_never_reaches_the_acme_provider() {
     autumn_web::custom_domain::apply_verification(
         &registry,
         "app.clientco.com",
+        "tenant-a",
+        NOW,
         &outcome,
         NOW,
         300,
@@ -289,6 +291,104 @@ async fn a_domain_pointing_elsewhere_never_reaches_the_acme_provider() {
         issuer.count(),
         0,
         "an unverified domain must place no ACME order"
+    );
+}
+
+/// A DNS verification result must not land on a re-registered generation,
+/// even when the tenant is unchanged (#2655, item 2).
+///
+/// The generation snapshot is taken when the lookup starts; the hostname is
+/// then offboarded and re-registered before the result arrives. Both a stale
+/// success and a stale failure must be discarded, while the current
+/// generation's own result still applies.
+#[tokio::test]
+async fn a_stale_verification_result_is_discarded_for_a_re_registered_hostname() {
+    let registry = registry();
+    registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    // The generation the verification started for...
+    registry.remove("app.clientco.com").await.unwrap();
+    // ...is gone before its result arrives; the successor is a fresh
+    // `PendingDns` with its own DNS proof to make.
+    registry
+        .register("app.clientco.com", "tenant-a", NOW + 1)
+        .await
+        .unwrap();
+
+    // A stale SUCCESS must not promote the replacement without proof.
+    assert!(
+        !autumn_web::custom_domain::apply_verification(
+            &registry,
+            "app.clientco.com",
+            "tenant-a",
+            NOW,
+            &VerificationOutcome::PointsHere,
+            NOW,
+            300,
+        )
+        .await
+        .unwrap(),
+        "a stale verification success must be discarded"
+    );
+    let record = registry.get("app.clientco.com").unwrap();
+    assert_eq!(
+        record.status,
+        DomainStatus::PendingDns,
+        "the replacement must still prove its own DNS"
+    );
+    assert!(record.verified_at_unix.is_none());
+
+    // A stale FAILURE must not back it off either.
+    let failed = grade_dns_verification(
+        &ObservedTarget::Cname("elsewhere.example.com".to_owned()),
+        &ingress(),
+    );
+    assert!(!failed.is_verified());
+    assert!(
+        !autumn_web::custom_domain::apply_verification(
+            &registry,
+            "app.clientco.com",
+            "tenant-a",
+            NOW,
+            &failed,
+            NOW,
+            300,
+        )
+        .await
+        .unwrap(),
+        "a stale verification failure must be discarded"
+    );
+    let record = registry.get("app.clientco.com").unwrap();
+    assert!(
+        record.failure_reason.is_none(),
+        "the replacement must not inherit the old generation's error"
+    );
+    assert_eq!(record.consecutive_failures, 0);
+    assert!(
+        record.next_attempt_unix.is_none(),
+        "the replacement must not wait out a backoff it did not earn"
+    );
+
+    // The current generation's own result still applies: the guards did not
+    // break the happy path.
+    assert!(
+        autumn_web::custom_domain::apply_verification(
+            &registry,
+            "app.clientco.com",
+            "tenant-a",
+            NOW + 1,
+            &VerificationOutcome::PointsHere,
+            NOW,
+            300,
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        registry.get("app.clientco.com").unwrap().status,
+        DomainStatus::Verified
     );
 }
 
