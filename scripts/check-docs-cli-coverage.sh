@@ -178,13 +178,6 @@ BACKLOG = {
     'assets list': 'see `assets add`.',
     'assets update': 'see `assets add`.',
     'assets verify': 'see `assets add`.',
-    'export':
-        'top-level `autumn export` — an offline diagnostic snapshot of the '
-        'app — appears on NO reader-facing page. The likeliest reader is '
-        'someone assembling a support ticket, which is the worst moment to '
-        'find nothing. Distinct from the documented `autumn openapi export` '
-        'and `autumn data export`, which is why a text matcher reported it '
-        'covered and `resolve()` does not.',
     'schema parse':
         '`autumn schema` is marked experimental in its own doc comment '
         '("Slices 2-3 ship `parse` and `snapshot`; `diff`/… arrive in later '
