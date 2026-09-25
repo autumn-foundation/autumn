@@ -2,7 +2,7 @@
 
 ## Corrections (from Codex review on this PR)
 
-This report's first five revisions made ten claims that don't hold up, all
+This report's first six revisions made twelve claims that don't hold up, all
 caught by an automated Codex review on the PR and independently verified
 before accepting each one. Fixed in place below rather than left standing,
 per the charter's own VERIFY step:
@@ -116,6 +116,21 @@ per the charter's own VERIFY step:
     (`state.entropy().uuid_v4().to_string()`), so this session's wire probes
     had no way to exercise a non-ASCII actor even in principle. Separated out
     in the Findings summary as a code-traced-only result.
+11. **The "Data safety across an unclean disconnect" probe was mislabeled.**
+    It called WHATWG `WebSocket.close()`, which sends a proper close frame —
+    orderly shutdown, not an unclean disconnect. A close handshake can flush
+    an already-sent message as part of normal closing, so the probe's
+    success doesn't demonstrate resilience to an actually lost connection.
+    Relabeled as "send-then-graceful-close data safety," which is what it
+    is: real, but a narrower and less interesting claim than the original
+    title suggested. A genuinely abrupt client loss stays in "Not toured."
+12. **The Findings summary still attributed the whole two-browser acceptance
+    test to #2851 after the Charter section was fixed.** Missed updating a
+    second occurrence in the same pass. `two_browser_sessions_converge_on_the_same_text`
+    and the smoke target predate #2851; only its two round-trip tests were
+    added by that change (see correction 9). Narrowed to say the run
+    confirms #2851's fix via those two tests, not that #2851 added the
+    suite.
 
 The rest of the report is corrected in place (not left as strikethrough) so
 it reads as one coherent record; this section exists so the correction
@@ -267,12 +282,15 @@ increasing realism:
   no reply within 1.5s, and a fresh connection's snapshot shows nothing
   changed. Every case left the connection usable afterward (confirmed by
   sending a normal insert immediately after and having it succeed).
-- **Data safety across an unclean disconnect**: sent an insert and closed
-  the socket without waiting for the acknowledgement; reconnecting
-  afterward showed the character had landed. (This exercises the
-  send-then-immediately-navigate-away case, not a true TCP-level abrupt
-  drop, which this sandbox's tooling — Node's WHATWG `WebSocket`, no raw
-  socket access — cannot simulate; see "Not toured" below.)
+- **Send-then-graceful-close data safety**: sent an insert and immediately
+  called WHATWG `WebSocket.close()` (which sends a proper close frame — see
+  "Corrections" below for where an earlier revision mislabeled this as an
+  "unclean disconnect"); reconnecting afterward showed the character had
+  landed. This is orderly shutdown, not a lost connection — the close
+  handshake can flush an already-sent message as part of a normal close, so
+  this doesn't demonstrate resilience to an actual dropped connection. A
+  genuinely abrupt client loss (TCP RST, no close frame) is untested; see
+  "Not toured" below.
 - **The repo's own two-Chromium-tab acceptance suite**
   (`examples/collab-notes/tests/system/smoke.rs`, `#[ignore]`d, needs
   Chromium) passed in full when re-run this session — 3/3, real browsers,
@@ -347,10 +365,12 @@ else — `replace` atomicity (including the same-size-replace-at-cap edge
 case), the `max_document_chars` boundary specifically, and malformed-input
 handling — held up under live black-box driving, including a genuine three-way
 concurrent race across real async connections and a re-run of the project's
-own two-browser acceptance test (added by, and confirming, #2851's earlier
-fix). The close/finalize write-window race itself was **not** black-box
-driven this session: the "unclean disconnect" probe above only sent an
-insert and closed immediately after, which the sole session's own edit
+own two-browser acceptance test (confirming #2851's earlier fix, whose two
+round-trip regression tests this run re-verified; the two-browser test
+itself and the smoke target predate #2851, per "Corrections" above). The
+close/finalize write-window race itself was **not** black-box driven this
+session: the send-then-graceful-close probe above only sent an insert and
+closed immediately after, which the sole session's own edit
 lands before the socket closes — it never puts a *second* editor's
 reconnect-and-edit inside the window between `store.save_body` starting and
 `guard.finalize()` running again, which is the actual race that loop
