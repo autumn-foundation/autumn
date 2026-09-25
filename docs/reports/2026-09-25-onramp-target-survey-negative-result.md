@@ -3,13 +3,23 @@
 ## 🎯 Journey
 
 All three journeys Onramp tracks — first run, first real integration, upgrade
-— surveyed for a target meeting the Hard Gate (committed clean-room harness,
-weighted evidence, pre-change baseline, a specific mechanism, an
-after-measurement plus compatibility check) before opening any PR. No source
-or docs change accompanies this report: per the process, "If you cannot
-produce these, the correct outcome is a findings issue or a harness PR, not a
-rewrite," and per the impact floor, "Shaving one step off a nine-step setup
-nobody complained about is indistinguishable from churn. Do not ship it."
+— checked for a *known or reported* gap before opening any PR.
+**Correction (caught by Codex review on this PR): an earlier draft of this
+line claimed all three were "surveyed for a target meeting the Hard Gate."**
+That overstates the upgrade journey specifically — as the Evidence section
+now states plainly, this survey checked only whether an open issue reports
+upgrade confusion (none found); it did **not** audit `docs/migrations/
+next.md`'s dozens of real entries for clarity, completeness, or codemod
+coverage the way a genuine Hard-Gate-caliber pass would require. So: first
+run and first real integration were surveyed at that depth (existing
+harnesses, issue search, and direct code/doc verification); upgrade was
+checked only for reported problems, not audited to the same depth — and
+that gap is itself named below as unfinished work, not silently folded into
+"surveyed." No source or docs change accompanies this report: per the
+process, "If you cannot produce these, the correct outcome is a findings
+issue or a harness PR, not a rewrite," and per the impact floor, "Shaving
+one step off a nine-step setup nobody complained about is indistinguishable
+from churn. Do not ship it."
 
 Reproduce this survey: see **🔬 Reproduce** below.
 
@@ -122,6 +132,32 @@ route."* Re-verified live: **this gap is still open** — `wiki` has no
 `autumn-search` dependency today. `autumn-billing` isn't a named row in
 #2320's matrix at all (likely added to the workspace after that audit ran)
 and also has no real consumer anywhere in the tree.
+
+**A more concrete finding on `autumn-billing` specifically (caught by Codex
+review on this PR): "no real consumer" undersold it.** `autumn-billing` is
+one of six production entries in `autumn-cli/src/plugin/catalog.rs`'s
+`FIRST_PARTY` catalog (`autumn-admin-plugin`, `autumn-billing`,
+`autumn-cache-redis`, `autumn-media-plugin`, `autumn-search`,
+`autumn-storage-s3`), and `autumn-billing/README.md` documents `autumn
+plugin add autumn-billing` as a real, public install path. But the CI
+scaffold-and-`cargo check` coverage described above
+(`plugin_add_first_party_scaffolds_cargo_check`'s `FIRST_PARTY_PLUGINS`,
+`autumn-cli/tests/generate.rs:8886`) only has five entries — `autumn-billing`
+is the one catalog plugin with a documented install command and **zero**
+CI coverage proving that command still works. That's a harness gap, not
+just a docs/example gap: unlike `autumn-search`'s T3 issue (a missing
+*example*, on a path that at least compiles per the scaffold check),
+nothing catches `autumn plugin add autumn-billing` breaking outright.
+Per the process's own Acceptable Outcome #3 ("the journey wasn't
+measurable, now it is ... a complete deliverable on its own"), extending
+`FIRST_PARTY_PLUGINS` to include it is a small, well-bounded harness fix —
+**not attempted in this pass** because it needs its own verification (does
+the scaffold actually compile today, added carefully rather than assumed)
+that this already-long correction cycle isn't the place to start, but it is
+now this survey's single most concrete, most directly actionable lead for
+a future cycle — more bounded than the `autumn-search`/`wiki` gap above,
+since it's a test-list addition pending one real scaffold-compile check,
+not new feature code.
 
 This is a real, evidence-backed, previously-identified target for a future
 Onramp cycle — mount `autumn-search` on `examples/wiki` per #2320's own
@@ -271,11 +307,21 @@ than manufacturing a cosmetic change to have something to ship.
 
 **Left for whoever picks either up next:**
 
+- **Most concrete lead:** add `autumn-billing` to
+  `FIRST_PARTY_PLUGINS` (`autumn-cli/tests/generate.rs:8886`), verifying
+  first that its scaffold genuinely compiles via
+  `plugin_add_first_party_scaffolds_cargo_check`. It's the one catalog
+  plugin (`autumn-cli/src/plugin/catalog.rs`) with a documented public
+  install command (`autumn-billing/README.md`: `autumn plugin add
+  autumn-billing`) and no CI coverage proving that command still works — a
+  harness gap, not a feature-implementation one, so it's a small, bounded
+  fix rather than the multi-part work the `autumn-search`/`wiki` item below
+  needs.
 - Mount `autumn-search` on `examples/wiki` per issue #2320's own T3 Gap 6
   fix suggestion — a real, still-open, previously-identified gap on the
-  "first real integration" journey (see above). This is the most
-  concretely-scoped candidate this survey found; it needs its own
-  implementation + harness cycle, not a fold-in here.
+  "first real integration" journey (see above). This is a real,
+  well-evidenced candidate; it needs its own implementation + harness
+  cycle, not a fold-in here.
 - If a human decides #2829's debuginfo trade-off, that unblocks a real win,
   the size depending on which level they pick — **correction (caught by
   Codex review on this PR): an earlier draft attached both the ~18%
