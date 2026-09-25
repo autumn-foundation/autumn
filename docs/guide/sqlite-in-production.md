@@ -258,6 +258,46 @@ semantics plus the pool `busy_timeout`. An explicit `BEGIN IMMEDIATE`
 reservation to close that same-host overlap window is **planned, not yet
 implemented**.
 
+### Shared-cache mode and write transactions
+
+A `SQLite` target whose URL carries `cache=shared` (e.g.
+`sqlite:file:app?mode=memory&cache=shared`) enables SQLite's **shared-cache
+mode**: several pooled connections multiplex over one database inside the
+process. Autumn's own test harness uses it deliberately (no files, no cleanup),
+and it stays supported — but it has a sharp edge you should know about.
+
+Shared cache has its own table-lock protocol, and it is where SQLite's
+"deferred is the default" stops being harmless: two connections that each
+**read, then write** in a deferred transaction can deadlock **permanently**.
+The deferred read→write lock upgrade fails with `SQLITE_LOCKED`
+(`SQLITE_BUSY_SNAPSHOT`), which **bypasses the busy-timeout handler** — so no
+amount of retrying unblocks it, and the pool's 5-second `busy_timeout` never
+gets a say. WAL mode does **not** fix this; the table-lock protocol is
+orthogonal to the journal mode. SQLite's own docs now call shared-cache mode
+"obsolete" and "discouraged", recommending WAL mode instead.
+
+Two things Autumn does about it (issue #2885):
+
+- **A loud boot warning.** Building a pool over a `cache=shared` target logs a
+  `WARN` naming the deadlock class and the remedies. It is a warning, not a
+  refusal — the test suite needs shared cache — but in production you should
+  treat it as a nudge toward a WAL-mode file database.
+- **`Db::tx_immediate`.** The explicit user-facing transaction for write-heavy
+  closures: on SQLite it begins with `BEGIN IMMEDIATE`, taking the write lock
+  up front through diesel's transaction manager (so nested savepoints keep
+  working). A concurrent writer then queues on `busy_timeout` instead of
+  failing its snapshot upgrade — the permanent deadlock becomes a bounded
+  wait. `Db::tx` itself deliberately **stays deferred** so read-only
+  transactions keep their read concurrency; the generated write-RMW paths
+  (`with_lock`, `update`, `delete_by_id`, `find_or_create_by`) already issue
+  `BEGIN IMMEDIATE` since #1996.
+
+Rule of thumb: on a shared-cache target, pure reads go through `Db::tx`,
+anything that reads-then-writes goes through `Db::tx_immediate`. On a WAL-mode
+file database the same split is still the right habit — it just matters less,
+because the shared-cache table-lock protocol is what turns the upgrade failure
+into a deadlock.
+
 ### `#[scheduled]` tasks
 
 The [multi-replica scheduler](./scheduled-multi-replica.md) uses advisory-lock
