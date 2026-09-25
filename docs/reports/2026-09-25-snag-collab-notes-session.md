@@ -2,7 +2,7 @@
 
 ## Corrections (from Codex review on this PR)
 
-This report's first three revisions made seven claims that don't hold up,
+This report's first four revisions made eight claims that don't hold up,
 all caught by an automated Codex review on the PR and independently verified
 before accepting each one. Fixed in place below rather than left standing,
 per the charter's own VERIFY step:
@@ -93,6 +93,14 @@ per the charter's own VERIFY step:
    that outruns its own round trip and only open a second session afterward,
    once the first has settled — Linus never types concurrently with Ada's
    burst in either. Corrected to describe the two properties separately.
+8. **The `collab_session.rs` test count was wrong.** Said 44 tests twice;
+   `grep -c '^#\[test\]\|^#\[tokio::test'` at commit `9d66a66` (this
+   report's stated base) counts 38. The inflated number came from an earlier
+   `grep -n "fn [a-z_]*("` listing used to survey the file, which also
+   matched non-test helper functions (`hub()`, `serve()`, `connect()`,
+   `read_snapshot()`, `drain_until()`, and a handful more) — worth naming
+   since it's an easy mistake to repeat with the same grep pattern. Both
+   occurrences corrected to 38.
 
 The rest of the report is corrected in place (not left as strikethrough) so
 it reads as one coherent record; this section exists so the correction
@@ -134,7 +142,7 @@ Time-boxed to one sitting (~2 hours). Driven three ways, in order of
 increasing realism:
 
 1. Direct reading of `autumn/src/collab/{text,hub}.rs` and the existing test
-   suite (`autumn/tests/integration/collab_session.rs`, 44 tests) to build the
+   suite (`autumn/tests/integration/collab_session.rs`, 38 tests) to build the
    claims inventory and see what was already covered — not itself admissible
    as a finding source, but necessary to avoid re-filing something already
    fixed or already tested. (This step's own dedup search was run against a
@@ -336,7 +344,7 @@ public routes at all (see "Not toured" below) — so "the four `CollabLimits`"
 is not a claim this session can make in full; scoped to what was actually
 driven, it holds. This is a "toured and solid" result for what it covers,
 not an absence of effort: three different driving methods (hand-rolled
-WebSocket client, real Chromium, and reading the existing 44-test suite)
+WebSocket client, real Chromium, and reading the existing 38-test suite)
 converged on the same conclusion, and it builds on — rather than duplicates —
 #2851's own earlier, narrower charter.
 
