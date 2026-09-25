@@ -2,8 +2,8 @@
 
 ## Corrections (from Codex review on this PR)
 
-This report's first two revisions made five claims that don't hold up, all
-caught by an automated Codex review on the PR and independently verified
+This report's first three revisions made seven claims that don't hold up,
+all caught by an automated Codex review on the PR and independently verified
 before accepting each one. Fixed in place below rather than left standing,
 per the charter's own VERIFY step:
 
@@ -74,6 +74,25 @@ per the charter's own VERIFY step:
    `an_edit_made_and_ended_inside_the_write_window_survives` (which control
    the timing directly, in-process) — not by anything new this session
    drove. Corrected in the Findings summary and added to "Not toured."
+6. **The existing in-process suite is not wholly single-threaded,
+   one-message-at-a-time.** `autumn/tests/integration/collab_session.rs`
+   already has `two_websocket_clients_converge_on_the_same_text`, a
+   `#[tokio::test(flavor = "multi_thread")]` that starts a real server and
+   drives two genuine concurrent WebSocket clients. Narrowed the "real
+   three-way concurrent race" bullet's novelty claim to what's actually new
+   — the three-way **overlapping** delete/replace/insert combination, which
+   that test's two clients editing at different, non-overlapping anchors
+   doesn't exercise — rather than claiming concurrent WebSocket testing
+   itself was new.
+7. **The Chromium suite doesn't test what the coverage record said it
+   does.** "Typing at both ends while a round trip is still in flight"
+   described a combined property no single test actually demonstrates:
+   `two_browser_sessions_converge_on_the_same_text` has two editors typing
+   concurrently but never deliberately holds a round trip open between their
+   edits, while the two round-trip tests have *one* editor typing a burst
+   that outruns its own round trip and only open a second session afterward,
+   once the first has settled — Linus never types concurrently with Ada's
+   burst in either. Corrected to describe the two properties separately.
 
 The rest of the report is corrected in place (not left as strikethrough) so
 it reads as one coherent record; this section exists so the correction
@@ -201,9 +220,14 @@ increasing realism:
   replace-of-the-same-span vs. insert-anchored-to-a-character-about-to-be-
   tombstoned). All three replicas' independent reconstructions converged on
   identical text, and a fourth, freshly-joining connection's server-sent
-  snapshot matched it exactly. This exercises genuine OS-scheduled
-  concurrency across real tokio tasks, which the existing sequential
-  in-process unit tests (single-threaded, one message at a time) cannot.
+  snapshot matched it exactly. The existing suite already has a genuine
+  multi-threaded two-client concurrency test over a real server
+  (`two_websocket_clients_converge_on_the_same_text`,
+  `#[tokio::test(flavor = "multi_thread")]`) — so "concurrent WebSocket
+  testing" itself isn't new; what's novel here is specifically the
+  three-way **overlapping** combination (delete vs. replace-of-the-same-span
+  vs. insert-anchored-to-a-soon-tombstoned-character), which that test's two
+  clients editing at different, non-overlapping anchors doesn't exercise.
 - **Malformed and adversarial wire input never crashes or wedges the
   connection.** Unparseable JSON, an unknown message `type`, a missing
   required field, and an `insert` referencing a never-issued anchor id each
@@ -225,12 +249,20 @@ increasing realism:
   socket access — cannot simulate; see "Not toured" below.)
 - **The repo's own two-Chromium-tab acceptance suite**
   (`examples/collab-notes/tests/system/smoke.rs`, `#[ignore]`d, needs
-  Chromium) passed in full when re-run this session:
-  `two_browser_sessions_converge_on_the_same_text`,
-  `a_keystroke_typed_during_a_round_trip_survives`, and
-  `a_backspace_typed_during_a_round_trip_survives` — 3/3, real browsers, real
-  WebSockets, typing at both ends while a round trip is still in flight.
-  These two round-trip tests were **added by #2851** as the regression
+  Chromium) passed in full when re-run this session — 3/3, real browsers,
+  real WebSockets — but the three tests cover two *separate* properties, not
+  one combined one (an earlier revision of this report wrongly described
+  them as "typing at both ends while a round trip is still in flight," which
+  no single test actually does):
+  `two_browser_sessions_converge_on_the_same_text` has **two editors typing
+  concurrently** (Ada at the end, Linus at the start) but doesn't
+  deliberately hold a round trip open between their edits; the two
+  round-trip tests, `a_keystroke_typed_during_a_round_trip_survives` and
+  `a_backspace_typed_during_a_round_trip_survives`, have **one editor
+  typing a fast burst that outruns its own round trip**, then open a
+  *second* session only after the first has settled, to confirm the server
+  holds the same text — Linus isn't concurrently typing during Ada's burst
+  in either. These two round-trip tests were **added by #2851** as the regression
   coverage for the keystroke-drop bug it fixed (see "What #2851 already
   found and fixed" above) — this run confirms that fix still holds on the
   current `trunk-dev` tip, not a first-ever run.
