@@ -1092,6 +1092,63 @@ async fn a_hard_delete_comments_table_removes_the_subtree_outright() {
     assert_eq!(remaining, 0, "hard delete leaves nothing behind");
 }
 
+/// Issues #2285/#2275: a cross-record `parent_id` edge (writable only outside
+/// the framework — `add_comment` refuses it, so this test grafts it with raw
+/// SQL the way an import, backfill, or hand edit would) must not let the
+/// hard-delete path's `ON DELETE CASCADE` silently remove another record's
+/// rows while its counter is never adjusted. The delete is refused, loudly,
+/// before anything is removed: both counters and every row stay exactly as
+/// they were.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_hard_delete_refuses_a_cross_record_parent_id_edge() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtHardRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let record_a = seed_one_col(&mut conn, "cmt_hards", "title", "a").await;
+    let record_b = seed_one_col(&mut conn, "cmt_hards", "title", "b").await;
+
+    let root_a = repo
+        .add_comment(record_a, author, "a-root", None)
+        .await
+        .expect("a root");
+    let stray_b = repo
+        .add_comment(record_b, author, "b-stray", None)
+        .await
+        .expect("b stray");
+    assert_eq!(counter(&mut conn, "cmt_hards", record_a).await, 1);
+    assert_eq!(counter(&mut conn, "cmt_hards", record_b).await, 1);
+
+    // The framework's own write path refuses this graft; only raw SQL can
+    // create it.
+    diesel::sql_query("UPDATE cmt_hard_comments SET parent_id = $1 WHERE id = $2")
+        .bind::<BigInt, _>(root_a.id)
+        .bind::<BigInt, _>(stray_b.id)
+        .execute(&mut conn)
+        .await
+        .expect("graft the stray");
+
+    let err = repo
+        .delete_comment(record_a, root_a.id)
+        .await
+        .expect_err("a cross-record edge must refuse the hard delete");
+    assert_eq!(err.status().as_u16(), 422);
+    let msg = err.to_string();
+    assert!(msg.contains("another record"), "directed error, got: {msg}");
+
+    // Nothing moved: the refusal fires before the `DELETE`, so both counters
+    // and every row are exactly as they were.
+    assert_eq!(counter(&mut conn, "cmt_hards", record_a).await, 1);
+    assert_eq!(counter(&mut conn, "cmt_hards", record_b).await, 1);
+    let remaining = diesel::sql_query("SELECT COUNT(*) AS count FROM cmt_hard_comments")
+        .get_result::<CountRow>(&mut conn)
+        .await
+        .expect("count")
+        .count;
+    assert_eq!(remaining, 2, "the refused delete removes nothing");
+}
+
 /// The body cap is enforced in **bytes**, as documented — a multi-byte body
 /// that is well under the cap in characters is still over it in bytes.
 #[tokio::test]

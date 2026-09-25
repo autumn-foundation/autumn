@@ -382,6 +382,86 @@ struct SubtreeRow {
     depth: i64,
 }
 
+/// A hard-path subtree row: the id and depth like [`SubtreeRow`], plus the
+/// discriminator pair the cross-record-edge refusal checks.
+///
+/// The hard-delete walk follows `parent_id` edges wherever they lead — the
+/// database's `ON DELETE CASCADE` would too — so each row carries where it
+/// claims to live, and [`delete_subtree`] refuses the delete when any of them
+/// is not this record's.
+#[derive(diesel::QueryableByName)]
+struct HardSubtreeRow {
+    #[diesel(sql_type = BigInt)]
+    id: i64,
+    #[diesel(sql_type = Text)]
+    commentable_type: String,
+    #[diesel(sql_type = BigInt)]
+    commentable_id: i64,
+    #[diesel(sql_type = BigInt)]
+    depth: i64,
+}
+
+/// The `(id, depth)` projection every subtree-walk row carries, so the
+/// cycle-dedup below is written once for both the record-scoped (soft) and
+/// the record-agnostic (hard) walk shapes.
+trait SubtreeWalkRow {
+    fn walk_id(&self) -> i64;
+    fn walk_depth(&self) -> i64;
+}
+
+impl SubtreeWalkRow for SubtreeRow {
+    fn walk_id(&self) -> i64 {
+        self.id
+    }
+    fn walk_depth(&self) -> i64 {
+        self.depth
+    }
+}
+
+impl SubtreeWalkRow for HardSubtreeRow {
+    fn walk_id(&self) -> i64 {
+        self.id
+    }
+    fn walk_depth(&self) -> i64 {
+        self.depth
+    }
+}
+
+/// The rows of a hard-path subtree walk whose discriminator is NOT this
+/// record's — the cross-record `parent_id` edges [`delete_subtree`] refuses
+/// to delete through.
+///
+/// Pure, so the partition itself is unit-tested below; the recursive walk
+/// that feeds it is covered by the Docker integration tests. The anchor row
+/// always matches by construction (the walk's `WHERE` pins it), so any hit
+/// here is a genuinely corrupt edge: imported, backfilled, or hand-edited.
+fn cross_record_strays<'r>(
+    rows: &'r [HardSubtreeRow],
+    parent_type: &str,
+    parent_id: i64,
+) -> Vec<&'r HardSubtreeRow> {
+    rows.iter()
+        .filter(|row| row.commentable_type != parent_type || row.commentable_id != parent_id)
+        .collect()
+}
+
+/// Deduplicate a subtree walk before ANY of it is used as a count.
+/// `UNION ALL` does not deduplicate, and a `parent_id` cycle among imported
+/// or hand-edited rows has no terminating edge, so the walk re-emits the same
+/// handful of ids at every depth until the guard stops it — roughly a thousand
+/// rows for a two-comment cycle. The `UPDATE`/`DELETE` is keyed on `id IN (…)`
+/// and so touches each physical row once, but `ids.len()` is the counter
+/// delta, and an inflated one drives `comment_count` sharply negative with no
+/// error anywhere. Counters are deliberately unclamped, so it stays wrong
+/// until someone runs `recompute_comment_count`.
+///
+/// Sorted by depth first so the retained copy of each id is its shallowest,
+/// keeping the truncation check below meaningful.
+fn dedup_subtree_rows<R: SubtreeWalkRow>(rows: &mut Vec<R>) {
+    rows.sort_by_key(|row| (row.walk_id(), row.walk_depth()));
+    rows.dedup_by_key(|row| row.walk_id());
+}
+
 #[derive(diesel::QueryableByName)]
 struct TargetRow {
     #[diesel(sql_type = Text)]
@@ -826,6 +906,12 @@ pub async fn add_comment(
 ///   when that record is not visible to this caller. The record is part of the
 ///   check on purpose: without it, any comment id would be deletable from any
 ///   record of the same model.
+/// - `422` on the hard-delete path when the reply chain reaches a comment on
+///   another record — a cross-record `parent_id` edge the framework's own
+///   write path can never produce, writable only by an import, backfill, or
+///   hand edit. The delete is refused, before anything is removed, rather
+///   than letting the foreign key cascade silently delete another record's
+///   rows while its counter is never adjusted.
 /// - Any database error.
 pub async fn delete_comment(
     conn: &mut RuntimeConnection,
@@ -1445,11 +1531,15 @@ async fn insert_comment(
 /// permanently two too high with no recompute in sight. Counting the ids is the
 /// one measure both engines agree on.
 ///
-/// The walk is confined to `(parent_type, parent_id)`. Nothing the framework
-/// writes can produce a cross-record `parent_id` chain (`comment_depth` refuses
-/// it), but no foreign key or `CHECK` enforces that, and an app that inserts
-/// comments with raw Diesel can. Without the predicate one parent's counter
-/// would absorb the whole span.
+/// On the HARD-delete path the walk follows `parent_id` edges wherever they
+/// lead — the database's cascade would too — and any walked row whose
+/// discriminator is not this record's is a cross-record edge the framework's
+/// own write path can never produce (`comment_depth` refuses it). The delete is
+/// refused rather than letting the cascade silently remove another record's
+/// rows while its counter is never adjusted. The SOFT-delete path keeps the
+/// record-scoped walk: its `UPDATE` touches exactly the rows it lists, no
+/// foreign-key action fires, and a stray row is correctly left live on its own
+/// record.
 async fn delete_subtree(
     conn: &mut RuntimeConnection,
     spec: &CommentableSpec,
@@ -1466,81 +1556,53 @@ async fn delete_subtree(
     let anchor_live = spec.live_comments("c");
     let descendant_live = spec.live_comments("d");
 
-    let ids: Vec<SubtreeRow> = diesel::sql_query(format!(
-        "WITH RECURSIVE __autumn_cmt_sub(id, depth) AS (\
-           SELECT c.{pk}, CAST(0 AS BIGINT) FROM {comments} AS c \
-            WHERE c.{pk} = {} AND c.{type_column} = {} AND c.{id_column} = {}{anchor_live} \
-           UNION ALL \
-           SELECT d.{pk}, s.depth + 1 \
-             FROM {comments} AS d JOIN __autumn_cmt_sub AS s ON d.{parent_column} = s.id \
-            WHERE s.depth < {RECURSION_GUARD} \
-              AND d.{type_column} = {} AND d.{id_column} = {}{descendant_live}\
-         ) SELECT id, depth FROM __autumn_cmt_sub",
-        ph(1),
-        ph(2),
-        ph(3),
-        ph(4),
-        ph(5),
-    ))
-    .bind::<BigInt, _>(comment_id)
-    .bind::<Text, _>(parent_type)
-    .bind::<BigInt, _>(parent_id)
-    .bind::<Text, _>(parent_type)
-    .bind::<BigInt, _>(parent_id)
-    .load::<SubtreeRow>(conn)
-    .await
-    .map_err(AutumnError::from)?;
-
-    // Deduplicate before ANY of it is used as a count. `UNION ALL` does not
-    // deduplicate, and a `parent_id` cycle among imported or hand-edited rows
-    // has no terminating edge, so the walk re-emits the same handful of ids at
-    // every depth until the guard stops it — roughly a thousand rows for a
-    // two-comment cycle. The `UPDATE`/`DELETE` is keyed on `id IN (…)` and so
-    // touches each physical row once, but `ids.len()` is the counter delta, and
-    // an inflated one drives `comment_count` sharply negative with no error
-    // anywhere. Counters are deliberately unclamped, so it stays wrong until
-    // someone runs `recompute_comment_count`.
-    //
-    // Sorted by depth first so the retained copy of each id is its shallowest,
-    // keeping the truncation check below meaningful.
-    let mut ids = ids;
-    ids.sort_by_key(|row| (row.id, row.depth));
-    ids.dedup_by_key(|row| row.id);
-
-    // The walk stops at `RECURSION_GUARD`. On the SOFT-delete path that is
-    // survivable: the rows past it stay live, stay counted, and surface as
-    // promoted roots. On the HARD-delete path it is not — the `parent_id`
-    // foreign key cascades, so the database removes every deeper descendant
-    // while `ids.len()` counts only what the walk reached, and the parent's
-    // counter is left permanently too high with no error anywhere.
-    //
-    // Refusing is the honest answer. A chain this deep cannot be produced by
-    // the framework's own write path (`max_depth` is capped below the guard),
-    // so reaching here means imported or hand-edited rows, and quietly
-    // corrupting a counter is a worse service than saying so.
-    if !spec.soft_delete && ids.iter().any(|row| row.depth >= RECURSION_GUARD) {
-        return Err(AutumnError::unprocessable_msg(format!(
-            "comment {comment_id} has a reply chain deeper than {RECURSION_GUARD}, which this \
-             hard-delete path cannot remove without leaving the parent's comment counter wrong: \
-             the database would cascade past what the traversal can see. Shorten or repair the \
-             chain, or run the delete in batches from the leaves."
-        )));
-    }
-
-    if ids.is_empty() {
-        return Ok(0);
-    }
-    let ids: Vec<i64> = ids.into_iter().map(|row| row.id).collect();
-    // Bound the `IN (…)` list: the ids are framework-produced `i64`s, never
-    // caller text, so they are formatted rather than bound — Postgres caps
-    // bind parameters at 65535 and a deep thread could exceed it.
-    let id_list = ids
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-
+    // Soft delete keeps the record-scoped walk it always had: the `UPDATE`
+    // touches exactly the rows it lists, no foreign-key action fires, and a
+    // cross-record `parent_id` edge — writable only outside the framework's
+    // own `add_comment` — is correctly left live and counted on its own
+    // record.
     if spec.soft_delete {
+        let ids: Vec<SubtreeRow> = diesel::sql_query(format!(
+            "WITH RECURSIVE __autumn_cmt_sub(id, depth) AS (\
+               SELECT c.{pk}, CAST(0 AS BIGINT) FROM {comments} AS c \
+                WHERE c.{pk} = {} AND c.{type_column} = {} AND c.{id_column} = {}{anchor_live} \
+               UNION ALL \
+               SELECT d.{pk}, s.depth + 1 \
+                 FROM {comments} AS d JOIN __autumn_cmt_sub AS s ON d.{parent_column} = s.id \
+                WHERE s.depth < {RECURSION_GUARD} \
+                  AND d.{type_column} = {} AND d.{id_column} = {}{descendant_live}\
+             ) SELECT id, depth FROM __autumn_cmt_sub",
+            ph(1),
+            ph(2),
+            ph(3),
+            ph(4),
+            ph(5),
+        ))
+        .bind::<BigInt, _>(comment_id)
+        .bind::<Text, _>(parent_type)
+        .bind::<BigInt, _>(parent_id)
+        .bind::<Text, _>(parent_type)
+        .bind::<BigInt, _>(parent_id)
+        .load::<SubtreeRow>(conn)
+        .await
+        .map_err(AutumnError::from)?;
+
+        let mut ids = ids;
+        dedup_subtree_rows(&mut ids);
+
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let ids: Vec<i64> = ids.into_iter().map(|row| row.id).collect();
+        // Bound the `IN (…)` list: the ids are framework-produced `i64`s, never
+        // caller text, so they are formatted rather than bound — Postgres caps
+        // bind parameters at 65535 and a deep thread could exceed it.
+        let id_list = ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+
         diesel::sql_query(format!(
             "UPDATE {comments} SET {deleted_at} = {} \
              WHERE {pk} IN ({id_list}) AND {deleted_at} IS NULL",
@@ -1550,12 +1612,108 @@ async fn delete_subtree(
         .execute(conn)
         .await
         .map_err(AutumnError::from)?;
-    } else {
-        diesel::sql_query(format!("DELETE FROM {comments} WHERE {pk} IN ({id_list})"))
-            .execute(conn)
-            .await
-            .map_err(AutumnError::from)?;
+
+        return Ok(ids.len());
     }
+
+    // Hard delete. The anchor is this record's comment; the recursive step
+    // walks `parent_id` with NO record predicate, because the database's
+    // `ON DELETE CASCADE` follows those edges too — a walk that stops at the
+    // record boundary would miss the rows the cascade removes. Each walked
+    // row carries its discriminator so the refusal below can spot the
+    // cross-record edges the scoped walk was blind to.
+    let rows: Vec<HardSubtreeRow> = diesel::sql_query(format!(
+        "WITH RECURSIVE __autumn_cmt_sub(id, commentable_type, commentable_id, depth) AS (\
+           SELECT c.{pk}, c.{type_column}, c.{id_column}, CAST(0 AS BIGINT) \
+             FROM {comments} AS c \
+            WHERE c.{pk} = {} AND c.{type_column} = {} AND c.{id_column} = {}{anchor_live} \
+           UNION ALL \
+           SELECT d.{pk}, d.{type_column}, d.{id_column}, s.depth + 1 \
+             FROM {comments} AS d JOIN __autumn_cmt_sub AS s ON d.{parent_column} = s.id \
+            WHERE s.depth < {RECURSION_GUARD}{descendant_live}\
+         ) SELECT id, commentable_type, commentable_id, depth FROM __autumn_cmt_sub",
+        ph(1),
+        ph(2),
+        ph(3),
+    ))
+    .bind::<BigInt, _>(comment_id)
+    .bind::<Text, _>(parent_type)
+    .bind::<BigInt, _>(parent_id)
+    .load::<HardSubtreeRow>(conn)
+    .await
+    .map_err(AutumnError::from)?;
+
+    let mut rows = rows;
+    dedup_subtree_rows(&mut rows);
+
+    // The walk stops at `RECURSION_GUARD`. On the HARD-delete path that is
+    // not survivable — the `parent_id` foreign key cascades, so the database
+    // removes every deeper descendant while `rows.len()` counts only what the
+    // walk reached, and the parent's counter is left permanently too high
+    // with no error anywhere.
+    //
+    // Refusing is the honest answer. A chain this deep cannot be produced by
+    // the framework's own write path (`max_depth` is capped below the guard),
+    // so reaching here means imported or hand-edited rows, and quietly
+    // corrupting a counter is a worse service than saying so.
+    if rows.iter().any(|row| row.depth >= RECURSION_GUARD) {
+        return Err(AutumnError::unprocessable_msg(format!(
+            "comment {comment_id} has a reply chain deeper than {RECURSION_GUARD}, which this \
+             hard-delete path cannot remove without leaving the parent's comment counter wrong: \
+             the database would cascade past what the traversal can see. Shorten or repair the \
+             chain, or run the delete in batches from the leaves."
+        )));
+    }
+
+    // A cross-record `parent_id` edge: the walk above follows threading edges
+    // wherever they lead, so the database's cascade would remove these rows
+    // too — silently, and without ever adjusting their own records' counters.
+    // The framework's write path cannot produce such an edge (`comment_depth`
+    // refuses it), so its presence means imported, backfilled, or hand-edited
+    // data, and deleting through it would corrupt a record the caller never
+    // named. Refuse loudly instead: re-point or remove the stray rows and
+    // retry. This runs before the `DELETE`, so the refusal leaves every row
+    // and every counter exactly as it found them.
+    let strays = cross_record_strays(&rows, parent_type, parent_id);
+    if !strays.is_empty() {
+        let sample = strays
+            .iter()
+            .take(3)
+            .map(|row| {
+                format!(
+                    "comment {} on ({}, {})",
+                    row.id, row.commentable_type, row.commentable_id
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(AutumnError::unprocessable_msg(format!(
+            "refusing to hard-delete comment {comment_id}: its reply chain reaches a comment on \
+             another record ({sample}) — the comments table's parent_id foreign key would \
+             cascade-delete it while its own record's comment counter was never adjusted. A \
+             cross-record parent_id edge is never written by add_comment; it comes from \
+             imported, backfilled, or hand-edited rows. Re-point or delete the stray rows and \
+             retry."
+        )));
+    }
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let ids: Vec<i64> = rows.into_iter().map(|row| row.id).collect();
+    // Bound the `IN (…)` list: the ids are framework-produced `i64`s, never
+    // caller text, so they are formatted rather than bound — Postgres caps
+    // bind parameters at 65535 and a deep thread could exceed it.
+    let id_list = ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    diesel::sql_query(format!("DELETE FROM {comments} WHERE {pk} IN ({id_list})"))
+        .execute(conn)
+        .await
+        .map_err(AutumnError::from)?;
 
     Ok(ids.len())
 }
@@ -1938,6 +2096,76 @@ mod tests {
             MAX_NESTING + 10,
             "every comment still renders; only the nesting is capped"
         );
+    }
+
+    fn hard_row(
+        id: i64,
+        commentable_type: &str,
+        commentable_id: i64,
+        depth: i64,
+    ) -> HardSubtreeRow {
+        HardSubtreeRow {
+            id,
+            commentable_type: commentable_type.to_owned(),
+            commentable_id,
+            depth,
+        }
+    }
+
+    /// The issue #2285/#2275 partition: a clean subtree has no strays, so the
+    /// delete proceeds; anything else is flagged for refusal.
+    #[test]
+    fn cross_record_strays_is_empty_for_a_clean_subtree() {
+        let rows = vec![
+            hard_row(1, "CmtHard", 7, 0),
+            hard_row(2, "CmtHard", 7, 1),
+            hard_row(3, "CmtHard", 7, 2),
+        ];
+        assert!(cross_record_strays(&rows, "CmtHard", 7).is_empty());
+    }
+
+    #[test]
+    fn cross_record_strays_flags_a_row_on_another_record() {
+        let rows = vec![
+            hard_row(1, "CmtHard", 7, 0),
+            hard_row(2, "CmtHard", 7, 1),
+            hard_row(9, "CmtHard", 8, 2),
+        ];
+        let strays = cross_record_strays(&rows, "CmtHard", 7);
+        assert_eq!(strays.len(), 1);
+        assert_eq!(strays[0].id, 9);
+    }
+
+    #[test]
+    fn cross_record_strays_flags_a_row_on_another_model() {
+        // Same record id, different model type: still another record, still
+        // a counter the delete must not touch.
+        let rows = vec![hard_row(1, "CmtHard", 7, 0), hard_row(9, "CmtPost", 7, 1)];
+        let strays = cross_record_strays(&rows, "CmtHard", 7);
+        assert_eq!(strays.len(), 1);
+        assert_eq!(strays[0].id, 9);
+    }
+
+    #[test]
+    fn cross_record_strays_is_empty_for_an_empty_walk() {
+        assert!(cross_record_strays(&[], "CmtHard", 7).is_empty());
+    }
+
+    /// The cycle-dedup shared by both walk shapes: a two-row `parent_id`
+    /// cycle re-emitted at every depth collapses to the two physical rows,
+    /// keeping the shallowest depth for the truncation check.
+    #[test]
+    fn dedup_subtree_rows_collapses_cycles_to_physical_rows() {
+        let mut rows: Vec<HardSubtreeRow> = (0..4)
+            .flat_map(|depth| {
+                [1, 2]
+                    .into_iter()
+                    .map(move |id| hard_row(id, "CmtHard", 7, 1000 - i64::from(depth)))
+            })
+            .collect();
+        dedup_subtree_rows(&mut rows);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.depth == 997));
     }
 }
 
