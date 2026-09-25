@@ -29,6 +29,13 @@
   [logging-pii.md](docs/guide/logging-pii.md) and
   [operator-alerts.md](docs/guide/operator-alerts.md) already state it for
   their own actuator paths.
+- **docs:** the section no longer implies the bundle is one coherent instant.
+  `run_inner` fetches the four endpoints one after another over a blocking
+  client with a five-second timeout each, and computes `timestamp` only after
+  all four have returned — so readings can be seconds apart and the timestamp
+  marks when collection finished, not when anything was sampled. The guide now
+  says so, and warns against reading `metrics` and `tasks` as describing the
+  same moment.
 
 ### Testing
 

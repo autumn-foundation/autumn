@@ -2960,8 +2960,8 @@ Autumn does not add implicitly.
 ## Capturing a diagnostic snapshot for a bug report (`autumn export`)
 
 `autumn export` reads a **running** app over HTTP and writes one JSON file —
-the thing to attach to a bug report or an incident ticket, instead of four
-hand-copied `curl` outputs that may not be from the same moment.
+the thing to attach to a bug report or an incident ticket, so you are not
+hand-assembling four `curl` outputs and hoping you got them all.
 
 ```console
 $ autumn export --url http://your-host:3000 --output autumn-diag.json
@@ -2970,8 +2970,8 @@ Successfully exported diagnostics to autumn-diag.json
 ```
 
 Both flags are optional: `--url` defaults to `http://localhost:3000`, and
-`--output` to `autumn-diag.json` in the working directory. This is a
-point-in-time read, not a stream — for a live view of the same app, see
+`--output` to `autumn-diag.json` in the working directory. It runs once and
+exits rather than streaming — for a live view of the same app, see
 `autumn monitor` under [Next steps](#next-steps).
 
 Do not confuse it with `autumn openapi export` (writes your API schema) or
@@ -2989,6 +2989,15 @@ four actuator endpoints under those four keys:
 | `metrics` | `/actuator/metrics` | always |
 | `tasks` | `/actuator/tasks` | only when `actuator.sensitive = true` |
 | `loggers` | `/actuator/loggers` | only when `actuator.sensitive = true` |
+
+**The four readings are not simultaneous, and `timestamp` is not when they were
+taken.** `autumn export` requests the endpoints one after another over a
+blocking client with a five-second timeout each, so a slow app can put several
+seconds between the first reading and the last; `timestamp` is recorded *after*
+all four have returned, which makes it the moment collection finished. Treat
+the file as a bundle of four readings taken in the order the table lists them,
+not as one coherent instant — in particular, do not read `metrics` and `tasks` as
+describing the same moment when diagnosing a race or a spike.
 
 A snapshot is **operational data about your app**, not a sanitized report:
 `/actuator/loggers` names your modules and their levels, `/actuator/tasks`
