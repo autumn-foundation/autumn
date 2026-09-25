@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS idx_posts_author_status_published;

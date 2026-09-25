@@ -1,0 +1,149 @@
+    Blocking waiting for file lock on artifact directory
+   Compiling cms v0.7.0 (/home/user/autumn/examples/cms)
+warning: cms@0.7.0: Tailwind CSS CLI not found — CSS will not be compiled. Run `autumn setup` or install tailwindcss manually.
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4m 33s
+     Running tests/author_archive_batch_profile.rs (target/debug/deps/author_archive_batch_profile-be154492cb672a64)
+
+running 1 test
+test author_archive_batch_profile ... tier guestauthor (user_id=2): 14 published posts
+tier contributor (user_id=3): 660 published posts
+tier staffwriter (user_id=4): 11442 published posts
+
+#################### BASELINE (no author-covering index) ####################
+
+=== pg_stat_statements: baseline / guestauthor ===
+calls=2      buffers=32       SELECT COUNT(*) FROM "posts" WHERE ((("posts"."author_id" = $1) AND ("posts"."status" = $2)) AND ("posts"."post_type" = ANY($3)))
+calls=1      buffers=22       SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ((("posts"."author_id" = $1) AND ("posts"."status" = $2)) AND ("posts"."post_type" = ANY($3))) ORDER BY "posts"."published_at" DESC, "posts"."id" DESC LIMIT $4 OFFSET $5
+-- total (author_id-filtered posts statements): calls=3 buffers=54 --
+-- share of this request's own workload: calls 3/20 (15.0%), buffers 54/65 (83.1%) --
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): baseline / guestauthor (14 published) (author_id=2) ===
+Limit  (cost=25.59..25.61 rows=8 width=355) (actual time=0.142..0.144 rows=10 loops=1)
+  Output: id, post_type, title, slug, excerpt, body, status, author_id, parent_id, featured_media_id, menu_order, comment_status, password, sticky, comment_count, published_at, lock_version, created_at, updated_at, search_vector
+  Buffers: shared hit=16
+  ->  Sort  (cost=25.59..25.61 rows=8 width=355) (actual time=0.140..0.142 rows=10 loops=1)
+        Output: id, post_type, title, slug, excerpt, body, status, author_id, parent_id, featured_media_id, menu_order, comment_status, password, sticky, comment_count, published_at, lock_version, created_at, updated_at, search_vector
+        Sort Key: posts.published_at DESC, posts.id DESC
+        Sort Method: quicksort  Memory: 32kB
+        Buffers: shared hit=16
+        ->  Index Scan using idx_posts_author on public.posts  (cost=0.29..25.47 rows=8 width=355) (actual time=0.033..0.109 rows=14 loops=1)
+              Output: id, post_type, title, slug, excerpt, body, status, author_id, parent_id, featured_media_id, menu_order, comment_status, password, sticky, comment_count, published_at, lock_version, created_at, updated_at, search_vector
+              Index Cond: (posts.author_id = '2'::bigint)
+              Filter: ((posts.post_type = ANY ('{post,page}'::text[])) AND (posts.status = 'publish'::text))
+              Buffers: shared hit=16
+Query Identifier: 7825196732707467797
+Planning:
+  Buffers: shared hit=68
+Planning Time: 1.362 ms
+Execution Time: 0.261 ms
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): baseline / guestauthor (14 published) count (author_id=2) ===
+Aggregate  (cost=25.49..25.50 rows=1 width=8) (actual time=0.086..0.087 rows=1 loops=1)
+  Output: count(*)
+  Buffers: shared hit=16
+  ->  Index Scan using idx_posts_author on public.posts  (cost=0.29..25.47 rows=8 width=0) (actual time=0.048..0.080 rows=14 loops=1)
+        Output: id, post_type, title, slug, excerpt, body, status, author_id, parent_id, featured_media_id, menu_order, comment_status, password, sticky, comment_count, published_at, lock_version, created_at, updated_at, search_vector
+        Index Cond: (posts.author_id = '2'::bigint)
+        Filter: ((posts.post_type = ANY ('{post,page}'::text[])) AND (posts.status = 'publish'::text))
+        Buffers: shared hit=16
+Query Identifier: 6611866704272938201
+Planning:
+  Buffers: shared hit=1
+Planning Time: 0.338 ms
+Execution Time: 0.172 ms
+
+=== pg_stat_statements: baseline / contributor ===
+calls=2      buffers=1324     SELECT COUNT(*) FROM "posts" WHERE ((("posts"."author_id" = $1) AND ("posts"."status" = $2)) AND ("posts"."post_type" = ANY($3)))
+calls=1      buffers=1043     SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ((("posts"."author_id" = $1) AND ("posts"."status" = $2)) AND ("posts"."post_type" = ANY($3))) ORDER BY "posts"."published_at" DESC, "posts"."id" DESC LIMIT $4 OFFSET $5
+-- total (author_id-filtered posts statements): calls=3 buffers=2367 --
+-- share of this request's own workload: calls 3/16 (18.8%), buffers 2367/2375 (99.7%) --
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): baseline / contributor (660 published) (author_id=3) ===
+Limit  (cost=33.56..365.11 rows=10 width=355) (actual time=0.946..0.949 rows=10 loops=1)
+  Output: id, post_type, title, slug, excerpt, body, status, author_id, parent_id, featured_media_id, menu_order, comment_status, password, sticky, comment_count, published_at, lock_version, created_at, updated_at, search_vector
+  Buffers: shared hit=765
+  ->  Incremental Sort  (cost=33.56..15019.80 rows=452 width=355) (actual time=0.944..0.945 rows=10 loops=1)
+        Output: id, post_type, title, slug, excerpt, body, status, author_id, parent_id, featured_media_id, menu_order, comment_status, password, sticky, comment_count, published_at, lock_version, created_at, updated_at, search_vector
+        Sort Key: posts.published_at DESC, posts.id DESC
+        Presorted Key: posts.published_at
+        Full-sort Groups: 1  Sort Method: quicksort  Average Memory: 30kB  Peak Memory: 30kB
+        Buffers: shared hit=765
+        ->  Index Scan using idx_posts_status_published on public.posts  (cost=0.29..14999.49 rows=452 width=355) (actual time=0.091..0.902 rows=11 loops=1)
+              Output: id, post_type, title, slug, excerpt, body, status, author_id, parent_id, featured_media_id, menu_order, comment_status, password, sticky, comment_count, published_at, lock_version, created_at, updated_at, search_vector
+              Index Cond: (posts.status = 'publish'::text)
+              Filter: ((posts.post_type = ANY ('{post,page}'::text[])) AND (posts.author_id = '3'::bigint))
+              Rows Removed by Filter: 560
+              Buffers: shared hit=765
+Query Identifier: 7825196732707467797
+Planning:
+  Buffers: shared hit=1
+Planning Time: 0.289 ms
+Execution Time: 1.082 ms
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): baseline / contributor (660 published) count (author_id=3) ===
+Aggregate  (cost=971.98..971.99 rows=1 width=8) (actual time=1.328..1.329 rows=1 loops=1)
+  Output: count(*)
+  Buffers: shared hit=662
+  ->  Index Scan using idx_posts_author on public.posts  (cost=0.29..970.85 rows=452 width=0) (actual time=0.045..1.260 rows=660 loops=1)
+        Output: id, post_type, title, slug, excerpt, body, status, author_id, parent_id, featured_media_id, menu_order, comment_status, password, sticky, comment_count, published_at, lock_version, created_at, updated_at, search_vector
+        Index Cond: (posts.author_id = '3'::bigint)
+        Filter: ((posts.post_type = ANY ('{post,page}'::text[])) AND (posts.status = 'publish'::text))
+        Buffers: shared hit=662
+Query Identifier: 6611866704272938201
+Planning:
+  Buffers: shared hit=1
+Planning Time: 0.242 ms
+Execution Time: 1.405 ms
+
+=== pg_stat_statements: baseline / staffwriter ===
+calls=2      buffers=7426     SELECT COUNT(*) FROM "posts" WHERE ((("posts"."author_id" = $1) AND ("posts"."status" = $2)) AND ("posts"."post_type" = ANY($3)))
+calls=1      buffers=14       SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ((("posts"."author_id" = $1) AND ("posts"."status" = $2)) AND ("posts"."post_type" = ANY($3))) ORDER BY "posts"."published_at" DESC, "posts"."id" DESC LIMIT $4 OFFSET $5
+-- total (author_id-filtered posts statements): calls=3 buffers=7440 --
+-- share of this request's own workload: calls 3/16 (18.8%), buffers 7440/7448 (99.9%) --
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): baseline / staffwriter (11442 published) (author_id=4) ===
+Limit  (cost=2.24..21.40 rows=10 width=355) (actual time=0.130..0.132 rows=10 loops=1)
+  Output: id, post_type, title, slug, excerpt, body, status, author_id, parent_id, featured_media_id, menu_order, comment_status, password, sticky, comment_count, published_at, lock_version, created_at, updated_at, search_vector
+  Buffers: shared hit=14
+  ->  Incremental Sort  (cost=2.24..15350.15 rows=8011 width=355) (actual time=0.129..0.130 rows=10 loops=1)
+        Output: id, post_type, title, slug, excerpt, body, status, author_id, parent_id, featured_media_id, menu_order, comment_status, password, sticky, comment_count, published_at, lock_version, created_at, updated_at, search_vector
+        Sort Key: posts.published_at DESC, posts.id DESC
+        Presorted Key: posts.published_at
+        Full-sort Groups: 1  Sort Method: quicksort  Average Memory: 30kB  Peak Memory: 30kB
+        Buffers: shared hit=14
+        ->  Index Scan using idx_posts_status_published on public.posts  (cost=0.29..14999.49 rows=8011 width=355) (actual time=0.076..0.093 rows=11 loops=1)
+              Output: id, post_type, title, slug, excerpt, body, status, author_id, parent_id, featured_media_id, menu_order, comment_status, password, sticky, comment_count, published_at, lock_version, created_at, updated_at, search_vector
+              Index Cond: (posts.status = 'publish'::text)
+              Filter: ((posts.post_type = ANY ('{post,page}'::text[])) AND (posts.author_id = '4'::bigint))
+              Rows Removed by Filter: 22
+              Buffers: shared hit=14
+Query Identifier: 7825196732707467797
+Planning:
+  Buffers: shared hit=1
+Planning Time: 0.218 ms
+Execution Time: 0.189 ms
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): baseline / staffwriter (11442 published) count (author_id=4) ===
+Aggregate  (cost=4485.52..4485.53 rows=1 width=8) (actual time=12.150..12.152 rows=1 loops=1)
+  Output: count(*)
+  Buffers: shared hit=3713
+  ->  Bitmap Heap Scan on public.posts  (cost=159.85..4465.49 rows=8011 width=0) (actual time=1.715..11.443 rows=11442 loops=1)
+        Recheck Cond: (posts.author_id = '4'::bigint)
+        Filter: ((posts.post_type = ANY ('{post,page}'::text[])) AND (posts.status = 'publish'::text))
+        Heap Blocks: exact=3701
+        Buffers: shared hit=3713
+        ->  Bitmap Index Scan on idx_posts_author  (cost=0.00..157.85 rows=11408 width=0) (actual time=1.187..1.188 rows=11442 loops=1)
+              Index Cond: (posts.author_id = '4'::bigint)
+              Buffers: shared hit=12
+Query Identifier: 6611866704272938201
+Planning:
+  Buffers: shared hit=1
+Planning Time: 0.213 ms
+Execution Time: 12.350 ms
+
+=== baseline summary (calls, buffers per tier) ===
+guestauthor  calls=3      buffers=54
+contributor  calls=3      buffers=2367
+staffwriter  calls=3      buffers=7440
+=== WAL bytes for 2000 inserts (baseline (no covering index)): 2053336 ===
+
