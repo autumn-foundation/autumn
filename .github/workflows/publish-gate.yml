@@ -380,7 +380,7 @@ jobs:
         with:
           name: sbom
       - name: Attest build provenance for the SBOM
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: sbom.cdx.json
 
