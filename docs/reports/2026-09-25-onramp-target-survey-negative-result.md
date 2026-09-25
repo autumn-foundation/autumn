@@ -90,9 +90,16 @@ publishing. Direct check: neither `examples/wiki/Cargo.toml` nor
 a real dependency; both crate names appear only in an unrelated comment
 about a shared testcontainer convention
 (`grep -n "autumn-billing\s*=\|autumn-search\s*=" examples/*/Cargo.toml` →
-no matches). No crate in the workspace depends on `autumn-billing` at all
-(`grep -rl "autumn-billing\s*=" --include=Cargo.toml .` → only the root
-workspace manifest, which just declares it as a member, not a consumer).
+no matches). **Correction (caught by Codex review on this PR): an earlier
+draft claimed the next command "matches only the root workspace manifest."**
+Run for real, it matches nothing at all —
+`grep -rl "autumn-billing\s*=" --include=Cargo.toml .` exits 1 with no
+output, because the root manifest names `autumn-billing` only inside its
+`members = [...]` array (`"autumn-billing",`, a list element, not a
+`key = value` line the pattern would match). So: no crate in the workspace
+depends on `autumn-billing` as a real dependency; the only place its name
+appears at all is that one `members` list entry, confirmed by
+`grep -n "autumn-billing" Cargo.toml`.
 
 `plugin_add_first_party_scaffolds_cargo_check`'s own `FIRST_PARTY_PLUGINS`
 list (`autumn-cli/tests/generate.rs:8886`) is `autumn-admin-plugin`,
