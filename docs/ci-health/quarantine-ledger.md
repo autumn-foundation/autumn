@@ -48,7 +48,7 @@ quarantine, per the rule above.
 
 ### `offsite_backup::offsite_backup_upload_then_restore_round_trips` / `offsite_backup::offsite_backup_uploads_large_artifact_via_multipart` / `sqlite_replication_s3::replicates_to_and_restores_from_a_real_s3_endpoint`
 
-- **Quarantined**: 2026-09-25 in this pass's own PR.
+- **Quarantined**: 2026-09-25 in #2953.
 - **Owner**: @madmax983 (repo owner) — the fix needs a business/infra decision
   (pay for authenticated `quay.io` pulls, or stand up and maintain a
   self-hosted/mirrored MinIO image) that this role cannot make unilaterally
@@ -141,8 +141,8 @@ quarantine, per the rule above.
   whose run reaches that job, independent of the PR's own diff, until this
   quarantine merges. Given the ~12h/6-for-6 sampling above, that was
   effectively every PR reaching the Docker sweep in that window.
-- **Linked issue/PR**: none filed separately — tracked here and in this
-  pass's own PR, which is the fix (the quarantine) as well as the diagnosis.
+- **Linked issue/PR**: none filed separately — tracked here and in #2953,
+  which is the fix (the quarantine) as well as the diagnosis.
 - **Skip mechanism**: `ci.yml`'s `cli_tests` and `integration_tests` bare
   `--ignored` sweeps, `--skip <exact test name>`, chosen over `#[ignore]`ing
   the test bodies themselves so the quarantine is visible and reversible in
