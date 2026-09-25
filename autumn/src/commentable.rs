@@ -1020,6 +1020,17 @@ pub async fn comment_thread(
     let soft_deletes = resolve_soft_deletes(spec);
     probe_parent(conn, spec, parent_id, tenant, soft_deletes, false).await?;
 
+    // The probe and this read take separate snapshots under read-committed, so
+    // a parent soft-deleted or moved to another tenant in the window between
+    // them would still have its thread served. Re-evaluating the probe's
+    // visibility rule as an `EXISTS` inside this statement closes that window:
+    // one snapshot by construction (issue #2281). The probe is kept: it is
+    // what turns a missing/invisible parent into a `404`.
+    //
+    // If the parent disappears mid-flight, this now returns an empty thread
+    // rather than a `404` — the safe direction.
+    let visibility = parent_visibility(spec, 3, 4, soft_deletes, tenant);
+    let parent_table = quote_ident(spec.parent_table);
     let comments = quote_ident(spec.comments_table);
     let pk = quote_ident(spec.comment_pk);
     let parent_column = quote_ident(spec.parent_column);
@@ -1037,16 +1048,29 @@ pub async fn comment_thread(
                 c.{created_at} AS created_at, {author_name} AS author_name \
          FROM {comments} AS c{author_join} \
          WHERE c.{type_column} = {} AND c.{id_column} = {}{live} \
+           AND EXISTS (SELECT 1 FROM {parent_table} WHERE {}) \
          ORDER BY c.{created_at} ASC, c.{pk} ASC",
         ph(1),
-        ph(2)
+        ph(2),
+        visibility.predicate
     );
-    let rows: Vec<Comment> = diesel::sql_query(sql)
+    let query = diesel::sql_query(sql)
         .bind::<Text, _>(parent_type)
         .bind::<BigInt, _>(parent_id)
-        .load::<Comment>(conn)
-        .await
-        .map_err(AutumnError::from)?;
+        .bind::<BigInt, _>(parent_id);
+    // Binds follow the predicate order `parent_visibility` documents: the
+    // parent id, then the tenant when the predicate carries it.
+    let rows: Vec<Comment> = match visibility.tenant {
+        Some(tenant) => query
+            .bind::<Text, _>(tenant)
+            .load::<Comment>(conn)
+            .await
+            .map_err(AutumnError::from)?,
+        None => query
+            .load::<Comment>(conn)
+            .await
+            .map_err(AutumnError::from)?,
+    };
 
     Ok(nest(rows))
 }
@@ -1213,6 +1237,77 @@ fn resolve_soft_deletes(spec: &CommentableSpec) -> bool {
         .unwrap_or(spec.parent_soft_delete)
 }
 
+/// One parent-visibility rule, evaluated two ways (issue #2281).
+///
+/// [`probe_parent`] asks "does a live, visible parent row exist?" as a
+/// standalone statement, so a missing one is a `404`. [`comment_thread`]
+/// asks the same question as an `EXISTS` inside its read statement, because
+/// under read-committed the two statements take separate snapshots — a
+/// parent soft-deleted or moved to another tenant in the window between them
+/// would otherwise have its whole thread served to a caller no longer
+/// entitled to see it.
+///
+/// Both build from this one constructor so the rule cannot drift. The
+/// predicate is returned *without* the `WHERE` keyword; `pk_placeholder` and
+/// `tenant_placeholder` are the bind indexes the enclosing statement assigns
+/// them (numbered, so the fragment can sit anywhere in the statement). Binds
+/// are pushed in predicate order: the parent id, then the tenant when the
+/// predicate carries it.
+struct ParentVisibility {
+    /// `"parent"."pk" = <pk_placeholder> [AND "parent"."<tenant>" =
+    /// <tenant_placeholder>] [AND "parent"."deleted_at" IS NULL]`
+    predicate: String,
+    /// `Some` exactly when the predicate carries the tenant placeholder —
+    /// the caller then binds the tenant right after the parent id.
+    tenant: Option<String>,
+}
+
+/// [`ParentVisibility`] for `spec`: existence, the tenant check, and the
+/// soft-delete liveness check — the same three-valued tenant contract
+/// [`probe_parent`] documents (the tenant predicate is emitted only when the
+/// model HAS a tenant column AND the caller resolved a tenant; a
+/// tenant-columned model used through `across_tenants()` resolves `None` and
+/// gets the unscoped predicate).
+///
+/// The clause order matches `probe_parent`'s historical SQL (tenant before
+/// the liveness check) so the refactored probe emits byte-identical text.
+fn parent_visibility(
+    spec: &CommentableSpec,
+    pk_placeholder: usize,
+    tenant_placeholder: usize,
+    soft_deletes: bool,
+    tenant: Option<&str>,
+) -> ParentVisibility {
+    let parent_table = quote_ident(spec.parent_table);
+    let parent_pk = quote_ident(spec.parent_pk);
+    let (tenant_fragment, tenant_bind) = match (spec.parent_tenant_column, tenant) {
+        (Some(column), Some(tenant)) => (
+            format!(
+                " AND {parent_table}.{} = {}",
+                quote_ident(column),
+                ph(tenant_placeholder)
+            ),
+            Some(tenant.to_owned()),
+        ),
+        // Branching on the pair, not the spec alone: binding `NULL` into
+        // `IS NOT DISTINCT FROM` would match only untenanted rows, turning
+        // every call on a tenant-columned model into a 404.
+        _ => (String::new(), None),
+    };
+    let live = if soft_deletes {
+        format!(" AND {parent_table}.{} IS NULL", quote_ident(DELETED_AT))
+    } else {
+        String::new()
+    };
+    ParentVisibility {
+        predicate: format!(
+            "{parent_table}.{parent_pk} = {}{tenant_fragment}{live}",
+            ph(pk_placeholder)
+        ),
+        tenant: tenant_bind,
+    }
+}
+
 /// Probe the parent row, optionally taking the row lock.
 ///
 /// The single point that enforces "this parent exists, is live, and belongs to
@@ -1231,52 +1326,26 @@ async fn probe_parent(
 ) -> AutumnResult<()> {
     let parent_table = quote_ident(spec.parent_table);
     let parent_pk = quote_ident(spec.parent_pk);
-    let live = if soft_deletes {
-        format!(" AND {parent_table}.{} IS NULL", quote_ident(DELETED_AT))
-    } else {
-        String::new()
-    };
+    let visibility = parent_visibility(spec, 1, 2, soft_deletes, tenant);
     let lock_clause = if lock { FOR_NO_KEY_UPDATE } else { "" };
 
-    // Three-valued, exactly like `#[votable]`'s `__autumn_m2m_tenant_scope()`
-    // contract: the predicate is emitted only when the model HAS a tenant
-    // column AND this caller resolved a tenant. A repository that is not
-    // `tenant_scoped` — or one used through `across_tenants()` — passes `None`
-    // and must get the unscoped query. Branching on the spec alone would bind
-    // `NULL` into `IS NOT DISTINCT FROM`, which matches only untenanted rows,
-    // turning every call on a tenant-columned model into a 404.
-    let found: Option<ParentRow> =
-        if let (Some(column), Some(tenant)) = (spec.parent_tenant_column, tenant) {
-            {
-                let sql = format!(
-                    "SELECT {parent_pk} AS id FROM {parent_table} \
-                 WHERE {parent_table}.{parent_pk} = {} \
-                   AND {parent_table}.{} = {}{live}{lock_clause}",
-                    ph(1),
-                    quote_ident(column),
-                    ph(2),
-                );
-                diesel::sql_query(sql)
-                    .bind::<BigInt, _>(parent_id)
-                    .bind::<Text, _>(tenant)
-                    .get_result::<ParentRow>(conn)
-                    .await
-                    .optional_row()?
-            }
-        } else {
-            {
-                let sql = format!(
-                    "SELECT {parent_pk} AS id FROM {parent_table} \
-                 WHERE {parent_table}.{parent_pk} = {}{live}{lock_clause}",
-                    ph(1),
-                );
-                diesel::sql_query(sql)
-                    .bind::<BigInt, _>(parent_id)
-                    .get_result::<ParentRow>(conn)
-                    .await
-                    .optional_row()?
-            }
-        };
+    let sql = format!(
+        "SELECT {parent_pk} AS id FROM {parent_table} \
+         WHERE {}{lock_clause}",
+        visibility.predicate,
+    );
+    let query = diesel::sql_query(sql).bind::<BigInt, _>(parent_id);
+    let found: Option<ParentRow> = match visibility.tenant {
+        // `tenant` is `Some` exactly when the predicate carries the tenant
+        // placeholder (see `parent_visibility`), so this bind is the one the
+        // predicate names.
+        Some(tenant) => query
+            .bind::<Text, _>(tenant)
+            .get_result::<ParentRow>(conn)
+            .await
+            .optional_row()?,
+        None => query.get_result::<ParentRow>(conn).await.optional_row()?,
+    };
 
     if found.is_none() {
         return Err(AutumnError::not_found_msg("Comment target not found"));
@@ -1755,6 +1824,78 @@ mod tests {
             max_depth: DEFAULT_MAX_DEPTH,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
         }
+    }
+
+    /// Issue #2281: the probe and the thread's inlined `EXISTS` must evaluate
+    /// the same visibility rule. The probe is a statement; the thread splices
+    /// the same fragment, so a parent soft-deleted or moved to another tenant
+    /// between the two statements cannot have its thread served.
+    #[test]
+    fn the_thread_exists_predicate_matches_the_probe_rule() {
+        let mut spec = sample_spec();
+        spec.parent_tenant_column = Some("tenant_id");
+
+        // Tenant-scoped, parent soft-deletes: existence + tenant + liveness.
+        let v = parent_visibility(&spec, 3, 4, true, Some("acme"));
+        assert!(
+            v.predicate
+                .contains(&format!(r#""posts"."id" = {}"#, ph(3)))
+        );
+        assert!(
+            v.predicate
+                .contains(&format!(r#""posts"."tenant_id" = {}"#, ph(4)))
+        );
+        assert!(v.predicate.contains(r#""posts"."deleted_at" IS NULL"#));
+        assert_eq!(v.tenant.as_deref(), Some("acme"));
+
+        // Tenant columned model through `across_tenants()`: no tenant
+        // predicate, no tenant bind — exactly the probe's three-valued
+        // contract, or every such call would 404.
+        let v = parent_visibility(&spec, 3, 4, true, None);
+        assert!(!v.predicate.contains("tenant_id"));
+        assert!(v.tenant.is_none());
+
+        // No soft-delete on the parent: no liveness predicate.
+        let v = parent_visibility(&spec, 1, 2, false, Some("acme"));
+        assert!(!v.predicate.contains("deleted_at"));
+        assert_eq!(v.tenant.as_deref(), Some("acme"));
+
+        // Single-tenant app: existence only.
+        spec.parent_tenant_column = None;
+        let v = parent_visibility(&spec, 1, 2, false, None);
+        assert_eq!(
+            v.predicate,
+            format!(r#""posts"."id" = {}"#, ph(1)),
+            "unscoped apps keep the probe's old bare predicate"
+        );
+        assert!(v.tenant.is_none());
+    }
+
+    /// The placeholders the fragment occupies must be the ones the enclosing
+    /// statement binds: `comment_thread` binds `(type, id)` first, so the
+    /// `EXISTS` re-binds the parent id at the fragment's own positions.
+    #[test]
+    fn the_thread_exists_predicate_binds_the_parent_id_twice() {
+        let mut spec = sample_spec();
+        spec.parent_tenant_column = Some("tenant_id");
+
+        // Spliced exactly the way `comment_thread` splices it.
+        let v = parent_visibility(&spec, 3, 4, false, Some("acme"));
+        let exists = format!(
+            "AND EXISTS (SELECT 1 FROM {} WHERE {})",
+            quote_ident(spec.parent_table),
+            v.predicate
+        );
+        assert_eq!(
+            exists,
+            format!(
+                "AND EXISTS (SELECT 1 FROM \"posts\" WHERE \"posts\".\"id\" = {} \
+                 AND \"posts\".\"tenant_id\" = {})",
+                ph(3),
+                ph(4)
+            ),
+            "the EXISTS re-binds the parent id and tenant at its own positions"
+        );
     }
 
     /// A spec built by hand — the one way past the macro's guarantee — is
