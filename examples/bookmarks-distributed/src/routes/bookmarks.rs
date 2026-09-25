@@ -1,5 +1,7 @@
 use autumn_web::extract::Path;
+use autumn_web::form::Changeset;
 use autumn_web::prelude::*;
+use autumn_web::reexports::axum::response::Response;
 
 use crate::models::{Bookmark, NewBookmark};
 use crate::repositories::BookmarkRepository;
@@ -107,30 +109,21 @@ pub async fn by_tag(Path(tag): Path<String>) -> AutumnResult<Markup> {
     ))
 }
 
-#[get("/new")]
-pub async fn new_form() -> Markup {
+/// Shared new-bookmark form body: rendered both by the plain `GET /new` and
+/// by `create`'s `422` re-render, from a `Changeset<NewBookmark>` — so a
+/// rejected submission (invalid `url`, blank/overlong `title`) redisplays the
+/// exact same form with every field preserved and an inline error next to
+/// the offending input, instead of silently persisting bad data or
+/// redirecting away with the user's input dropped.
+fn new_bookmark_form(changeset: &Changeset<NewBookmark>) -> Markup {
     layout(
         "Add Bookmark",
         html! {
             h1 class="text-2xl font-bold mb-6" { "Add Bookmark" }
             form action=(paths::create()) method="post" class="space-y-4" {
-                div {
-                    label for="url" class="block text-sm font-medium" { "URL" }
-                    input type="url" id="url" name="url" required
-                          placeholder="https://example.com"
-                          class="w-full border rounded p-2 mt-1";
-                }
-                div {
-                    label for="title" class="block text-sm font-medium" { "Title" }
-                    input type="text" id="title" name="title" required
-                          placeholder="My favorite site"
-                          class="w-full border rounded p-2 mt-1";
-                }
-                div {
-                    label for="tag" class="block text-sm font-medium" { "Tag" }
-                    input type="text" id="tag" name="tag" value="general"
-                          class="w-full border rounded p-2 mt-1";
-                }
+                (autumn_web::form::text_input(changeset, "url", "URL"))
+                (autumn_web::form::text_input(changeset, "title", "Title"))
+                (autumn_web::form::text_input(changeset, "tag", "Tag"))
                 button type="submit"
                        class="bg-indigo-600 text-white px-6 py-2 rounded hover:bg-indigo-700" {
                     "Save"
@@ -140,18 +133,36 @@ pub async fn new_form() -> Markup {
     )
 }
 
+#[get("/new")]
+pub async fn new_form() -> Markup {
+    let blank = NewBookmark {
+        url: String::new(),
+        title: String::new(),
+        tag: "general".to_owned(),
+    };
+    new_bookmark_form(&Changeset::new(blank))
+}
+
 #[post("/bookmarks")]
 pub async fn create(
     State(state): State<AppState>,
     form: Form<NewBookmark>,
-) -> AutumnResult<Redirect> {
+) -> AutumnResult<Response> {
+    let changeset = form.0.into_changeset();
+    if !changeset.is_valid() {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            new_bookmark_form(&changeset),
+        )
+            .into_response());
+    }
     let repo = BookmarkRepository;
-    repo.save(&form).await?;
+    repo.save(&changeset.into_inner()).await?;
     // Cluster-wide, coordination-service-free: this replica adds to its own
     // entry and the other replica sees the new total within a push interval.
     // See `src/routes/cluster.rs`.
     crate::routes::cluster::record_bookmark_created(&state);
-    Ok(Redirect::to(&paths::list()))
+    Ok(Redirect::to(&paths::list()).into_response())
 }
 
 autumn_web::paths![list, by_tag, new_form, create];
