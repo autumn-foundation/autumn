@@ -2,7 +2,7 @@
 
 ## Corrections (from Codex review on this PR)
 
-This report's first eight revisions made fifteen claims that don't hold up,
+This report's first nine revisions made sixteen claims that don't hold up,
 all caught by an automated Codex review on the PR and independently verified
 before accepting each one. Fixed in place below rather than left standing,
 per the charter's own VERIFY step:
@@ -93,8 +93,10 @@ per the charter's own VERIFY step:
 7. **The Chromium suite doesn't test what the coverage record said it
    does.** "Typing at both ends while a round trip is still in flight"
    described a combined property no single test actually demonstrates:
-   `two_browser_sessions_converge_on_the_same_text` has two editors typing
-   concurrently but never deliberately holds a round trip open between their
+   `two_browser_sessions_converge_on_the_same_text` has two editors editing
+   the same document, one after the other (not concurrently — see
+   correction 14, which this correction's own first revision still got
+   wrong) and never deliberately holds a round trip open between their
    edits, while the two round-trip tests have *one* editor typing a burst
    that outruns its own round trip and only open a second session afterward,
    once the first has settled — Linus never types concurrently with Ada's
@@ -161,6 +163,11 @@ per the charter's own VERIFY step:
     boundary. So `max_delete_ids`'s `DeleteTooLarge` path has no test
     coverage anywhere in this repo, code-traced only. Corrected the Findings
     summary and added a test-gap item to "Proposed next charters."
+16. **Correction 7 itself still said "typing concurrently" after correction
+    14 established that's wrong.** Fixing one instance of an overclaim and
+    missing a second, restated instance of the same overclaim two sections
+    away is its own pattern in this report — worth being honest about, not
+    just silently patching. Fixed correction 7's wording to match.
 
 The rest of the report is corrected in place (not left as strikethrough) so
 it reads as one coherent record; this section exists so the correction
