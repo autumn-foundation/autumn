@@ -2,8 +2,8 @@
 
 ## Corrections (from Codex review on this PR)
 
-This report's first four revisions made eight claims that don't hold up,
-all caught by an automated Codex review on the PR and independently verified
+This report's first five revisions made ten claims that don't hold up, all
+caught by an automated Codex review on the PR and independently verified
 before accepting each one. Fixed in place below rather than left standing,
 per the charter's own VERIFY step:
 
@@ -101,6 +101,21 @@ per the charter's own VERIFY step:
    `read_snapshot()`, `drain_until()`, and a handful more) — worth naming
    since it's an easy mistake to repeat with the same grep pattern. Both
    occurrences corrected to 38.
+9. **The Charter section implied the whole Chromium acceptance test, not
+   just its round-trip tests, was added by #2851.** `git diff 90661bc8^
+   90661bc8 -- examples/collab-notes/tests/system/smoke.rs` shows the file
+   and `two_browser_sessions_converge_on_the_same_text` already existed
+   before #2851 — that commit only appends the two round-trip tests. The
+   Coverage record section already scoped this correctly; only the Charter
+   section's phrasing was ambiguous. Fixed to match.
+10. **The Findings summary counted the UTF-16/UTF-8 actor tie-break footgun
+    as held up under live black-box driving.** It wasn't — it was checked by
+    reading `collab.js`'s `actorGreater()` directly (the Coverage record
+    bullet already said this correctly). `examples/collab-notes/src/main.rs:181`
+    generates every live actor prefix as an ASCII UUID
+    (`state.entropy().uuid_v4().to_string()`), so this session's wire probes
+    had no way to exercise a non-ASCII actor even in principle. Separated out
+    in the Findings summary as a code-traced-only result.
 
 The rest of the report is corrected in place (not left as strikethrough) so
 it reads as one coherent record; this section exists so the correction
@@ -153,8 +168,11 @@ increasing realism:
    harness so a reported "divergence" couldn't be an artifact of a naive
    reconstruction.
 3. The repo's own `#[ignore]`d two-Chromium-tab acceptance test
-   (`examples/collab-notes/tests/system/smoke.rs`) — added by #2851, re-run
-   here to confirm its fix still holds, not run for the first time.
+   (`examples/collab-notes/tests/system/smoke.rs`, which predates #2851 —
+   only its two round-trip tests were added by #2851; see "Corrections"
+   below for where an earlier revision got this wrong) — re-run here, which
+   for the round-trip tests confirms #2851's fix still holds rather than
+   running them for the first time.
 
 ## 📌 Environment
 
@@ -317,11 +335,17 @@ increasing realism:
 
 ## Findings summary
 
-**No bugs filed.** Every claim tested — convergence (including the
-UTF-16/UTF-8 actor tie-break the docs call out as a footgun), `replace`
-atomicity (including the same-size-replace-at-cap edge case), the
-`max_document_chars` boundary specifically, and malformed-input handling —
-held up under live black-box driving, including a genuine three-way
+**No bugs filed.** Every claim tested held up. That includes one claim
+verified only by code tracing, not by live driving, worth being precise
+about: the UTF-16/UTF-8 actor tie-break the docs call out as a footgun was
+checked by reading `collab.js`'s `actorGreater()` directly, not by actually
+driving a non-ASCII actor id through the wire — `examples/collab-notes/src/main.rs:181`
+generates every live actor prefix as an ASCII UUID
+(`state.entropy().uuid_v4().to_string()`), so this session's wire probes
+had no way to exercise that disagreement even if they'd tried. Everything
+else — `replace` atomicity (including the same-size-replace-at-cap edge
+case), the `max_document_chars` boundary specifically, and malformed-input
+handling — held up under live black-box driving, including a genuine three-way
 concurrent race across real async connections and a re-run of the project's
 own two-browser acceptance test (added by, and confirming, #2851's earlier
 fix). The close/finalize write-window race itself was **not** black-box
