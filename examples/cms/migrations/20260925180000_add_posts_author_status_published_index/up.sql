@@ -1,0 +1,25 @@
+-- `/author/{username}` (`content::published_posts_by_author` and the
+-- `has_public_content` gate ahead of it, `content::published_post_count_by_author`
+-- — both in `examples/cms/src/content.rs`) filter `posts` by
+-- `(author_id, status, post_type)` and, for the row fetch, order by
+-- `published_at DESC, id DESC` with a `LIMIT`/`OFFSET`.
+--
+-- Neither existing index serves that combination: `idx_posts_author` covers
+-- only `author_id` (no status/order), and `idx_posts_status_published`
+-- (`status`, `published_at DESC`) gives the sort order but not the author
+-- filter, so the planner has to walk it in `published_at` order filtering out
+-- every non-matching author's row until it collects enough for the page.
+-- That is cheap for a prolific author (most rows already match) and
+-- increasingly expensive the smaller an author's share of the site's
+-- published content is — exactly the common case on a real multi-author
+-- site, where a handful of staff writers account for most of the archive and
+-- most bylines are occasional contributors. See
+-- `docs/reports/2026-09-25-ledger-cms-author-archive-index/` for the
+-- measured buffers/rows-read delta across three author-share tiers.
+--
+-- `CONCURRENTLY` (needs `run_in_transaction = false` in this migration's
+-- `metadata.toml` — Postgres refuses `CREATE INDEX CONCURRENTLY` inside a
+-- transaction block) so this never takes more than a `SHARE UPDATE
+-- EXCLUSIVE` lock on `posts`, which does not block reads or writes.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_posts_author_status_published
+    ON posts (author_id, status, published_at DESC);
