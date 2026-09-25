@@ -323,6 +323,17 @@ revert of this line) or evidence the plugin needs a documented
 prerequisite before `autumn plugin add` — either way, actionable follow-up
 on this same PR rather than silent unverified deferral.
 
+**A second, related gap surfaced while fixing the first:**
+`.github/workflows/generator-conformance.yml`'s `pull_request`/`push`
+path filters list `autumn-admin-plugin/**`, `autumn-cache-redis/**`,
+`autumn-media-plugin/**`, `autumn-search/**` and `autumn-storage-s3/**` —
+"a change to any of them can break the mount this workflow is the only
+proof of," per the workflow's own comment — but not `autumn-billing/**`,
+so a future change to `autumn-billing`'s own source wouldn't re-trigger
+this gate even with today's fix in place. Added `autumn-billing/**` to
+both path lists (mirroring the other five plugins exactly), closing the
+same class of gap one layer up.
+
 For every other candidate this survey found, the deferral is real and
 grounded in a stated Hard Gate criterion, not scope-fatigue: the two
 strongest hard-failure candidates are already being fixed elsewhere by
