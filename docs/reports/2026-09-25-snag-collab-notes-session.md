@@ -2,10 +2,10 @@
 
 ## Corrections (from Codex review on this PR)
 
-This report's first revision made four claims that don't hold up, all caught
-by an automated Codex review on the PR and independently verified before
-accepting each one. Fixed in place below rather than left standing, per the
-charter's own VERIFY step:
+This report's first two revisions made five claims that don't hold up, all
+caught by an automated Codex review on the PR and independently verified
+before accepting each one. Fixed in place below rather than left standing,
+per the charter's own VERIFY step:
 
 1. **The charter premise — "no prior Snag session" — was wrong, and wrong for
    an avoidable reason.** The original dedup search
@@ -60,6 +60,20 @@ charter's own VERIFY step:
    ("`max_document_chars` does not cover this" — see
    `docs/guide/collaboration.md`'s wire-protocol section on `replace`). Worth
    stating plainly since it's easy to misread as a bug on a first pass.
+5. **The Findings summary overclaimed the close/finalize write-window race
+   as black-box driven.** The only live-disconnect probe this session ran
+   sent one insert and called `.close()` immediately after — the sole
+   session's own edit is already handled before its socket closes, so it
+   never puts a *second* editor's reconnect-and-edit inside the actual
+   race window (between `store.save_body` starting and `guard.finalize()`
+   running again). `examples/collab-notes`' in-memory `save_body` also has
+   no realistic delay to time a reconnect against, so driving this race
+   black-box through this example isn't really possible without changing
+   it. That race is covered by code tracing plus the existing suite's
+   `a_reconnect_during_the_write_window_finds_the_live_document` and
+   `an_edit_made_and_ended_inside_the_write_window_survives` (which control
+   the timing directly, in-process) — not by anything new this session
+   drove. Corrected in the Findings summary and added to "Not toured."
 
 The rest of the report is corrected in place (not left as strikethrough) so
 it reads as one coherent record; this section exists so the correction
@@ -253,19 +267,37 @@ increasing realism:
    likely a rendering quirk than a correctness bug, and there is no
    documented claim about grapheme atomicity to hold it against; would need
    real browser rendering to even characterize, not just wire-level driving.
+6. **The close/finalize write-window race itself, black-box.** As corrected
+   above, the "unclean disconnect" probe this session ran doesn't put a
+   second editor's reconnect-and-edit inside the actual race window, and
+   `examples/collab-notes`' in-memory `save_body` has no realistic delay to
+   time one against anyway. Driving this black-box would need either an
+   example with a slow (database-backed) persistence step, or a way to pause
+   `store.save_body` mid-write from the outside — neither exists here.
 
 ## Findings summary
 
 **No bugs filed.** Every claim tested — convergence (including the
 UTF-16/UTF-8 actor tie-break the docs call out as a footgun), `replace`
 atomicity (including the same-size-replace-at-cap edge case), the
-`max_document_chars` boundary specifically, malformed-input handling, and
-the close/finalize write-window race — held up under both code-level tracing
-and live black-box driving, including a genuine three-way concurrent race
-across real async connections and a re-run of the project's own two-browser
-acceptance test (added by, and confirming, #2851's earlier fix). This session
-drove `max_document_chars` directly at the wire level; `max_insert_chars` and
-`max_delete_ids` are covered by code tracing and the existing in-process
+`max_document_chars` boundary specifically, and malformed-input handling —
+held up under live black-box driving, including a genuine three-way
+concurrent race across real async connections and a re-run of the project's
+own two-browser acceptance test (added by, and confirming, #2851's earlier
+fix). The close/finalize write-window race itself was **not** black-box
+driven this session: the "unclean disconnect" probe above only sent an
+insert and closed immediately after, which the sole session's own edit
+lands before the socket closes — it never puts a *second* editor's
+reconnect-and-edit inside the window between `store.save_body` starting and
+`guard.finalize()` running again, which is the actual race that loop
+guards against, and this example's in-memory `save_body` has no realistic
+delay to time a reconnect against in the first place. That race is covered
+by code tracing plus the existing in-process suite's
+`a_reconnect_during_the_write_window_finds_the_live_document` and
+`an_edit_made_and_ended_inside_the_write_window_survives` (which control the
+timing directly), not by anything new this session drove. This session
+drove `max_document_chars` directly at the wire level; `max_insert_chars`
+and `max_delete_ids` are covered by code tracing and the existing in-process
 suite rather than an independent wire-level probe this session, and
 `max_documents`/`RegistryFull` was not reachable through this example's
 public routes at all (see "Not toured" below) — so "the four `CollabLimits`"
