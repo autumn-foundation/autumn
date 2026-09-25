@@ -139,19 +139,27 @@ serde interaction, and the `autumn-macros` crate split, among others — this
 is a real, substantial upgrade journey, not an empty draft.
 
 **Narrowing the claim to what was actually checked — correction (caught by
-Codex review on this PR): an earlier draft of this paragraph also overstated
-what `scripts/check-migration-guides.sh` gates.** It checks the guide-level
-TEMPLATE.md shape (required headings, each with content, indexed in
-`docs/migrations/README.md`) and, over `CHANGELOG.md`, the `**Breaking:**`
-marker/coverage/linkage convention — it does **not** gate each entry's own
-Why/Before/After/Automation shape, which is a house convention, not an
-enforced one. It also isn't universal in practice: the "Media rooms" entry
-(`docs/migrations/next.md:608-637`) has no explicit `**Why:**`/Before/After
-blocks at all, just prose. So: no *open issue* reports a broken or
-confusing upgrade step for the pending release (a targeted search found
-none), and most sampled entries do follow the Why/Before/After/Automation
-convention closely — but not gated, and not universal. This survey did
-**not** audit the entries themselves for clarity, completeness, or
+Codex review on this PR, twice on the same paragraph): the second pass still
+misdescribed what `scripts/check-migration-guides.sh` gates.** It checks the
+guide-level TEMPLATE.md shape (required headings, each with content, indexed
+in `docs/migrations/README.md`); the `**Breaking:**` marker/coverage/linkage
+convention over the *merged* changelog view (`CHANGELOG.md` with every
+`changelog.d/*.md` fragment spliced into `## [Unreleased]` first — per this
+repo's own note-per-fragment convention, not `CHANGELOG.md` alone); **and**,
+separately (Check 5, `scripts/check-migration-guides.sh` around lines
+2101-2140+), each breaking entry's own `**Automation:**` label — `auto`/
+`review` naming a real, registered codemod id, `manual` on a rename-class
+change justified with a reason, and a `- **Codemod:**` walkthrough line for
+any released guide shipping an `auto`/`review` codemod. So **Automation is
+enforced**, not a bare convention — only the entry's **Why/Before/After**
+prose is unenforced. "Media rooms" (`docs/migrations/next.md:608-637`) still
+illustrates that half accurately: it has no explicit `**Why:**`/Before/After
+blocks, just prose, but it does carry a conforming `**Automation:** manual`
+label. So: no *open issue* reports a broken or confusing upgrade step for
+the pending release (a targeted search found none), Automation labels are
+gate-enforced across every entry, and most sampled entries also follow the
+Why/Before/After convention closely even though nothing requires it. This
+survey did **not** audit the entries themselves for clarity, completeness, or
 `autumn upgrade` codemod coverage — that would be its own Tier-1 journey
 arithmetic pass (concepts, steps, and misuse-compile checks for a real
 version bump), not something a few minutes of issue-search can stand in
