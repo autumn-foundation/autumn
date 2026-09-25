@@ -1,4 +1,4 @@
-# 🛣️ Onramp: this cycle's target survey — nothing cleared the bar (negative result)
+# 🛣️ Onramp: this cycle's target survey (one small harness fix shipped, rest negative/deferred)
 
 ## 🎯 Journey
 
@@ -15,11 +15,14 @@ run and first real integration were surveyed at that depth (existing
 harnesses, issue search, and direct code/doc verification); upgrade was
 checked only for reported problems, not audited to the same depth — and
 that gap is itself named below as unfinished work, not silently folded into
-"surveyed." No source or docs change accompanies this report: per the
-process, "If you cannot produce these, the correct outcome is a findings
-issue or a harness PR, not a rewrite," and per the impact floor, "Shaving
-one step off a nine-step setup nobody complained about is indistinguishable
-from churn. Do not ship it."
+"surveyed." **One small source change accompanies this report** — see
+**💡 Conclusion** below (`autumn-cli/tests/generate.rs`, adding
+`autumn-billing` to the plugin scaffold-check harness, Acceptable Outcome
+#3) — everything else follows the process's guidance: "If you cannot
+produce these, the correct outcome is a findings issue or a harness PR, not
+a rewrite," and per the impact floor, "Shaving one step off a nine-step
+setup nobody complained about is indistinguishable from churn. Do not ship
+it."
 
 Reproduce this survey: see **🔬 Reproduce** below.
 
@@ -150,14 +153,11 @@ just a docs/example gap: unlike `autumn-search`'s T3 issue (a missing
 nothing catches `autumn plugin add autumn-billing` breaking outright.
 Per the process's own Acceptable Outcome #3 ("the journey wasn't
 measurable, now it is ... a complete deliverable on its own"), extending
-`FIRST_PARTY_PLUGINS` to include it is a small, well-bounded harness fix —
-**not attempted in this pass** because it needs its own verification (does
-the scaffold actually compile today, added carefully rather than assumed)
-that this already-long correction cycle isn't the place to start, but it is
-now this survey's single most concrete, most directly actionable lead for
-a future cycle — more bounded than the `autumn-search`/`wiki` gap above,
-since it's a test-list addition pending one real scaffold-compile check,
-not new feature code.
+`FIRST_PARTY_PLUGINS` to include it is a small, well-bounded harness fix.
+**Fixed in this PR** — see **💡 Conclusion** below for the verification
+story (this sandbox can't itself run the scaffold's `cargo check`, so the
+fix is verified by `generator-conformance.yml`'s `plugin-install` job on
+this PR's own CI run instead of asserted unverified).
 
 This is a real, evidence-backed, previously-identified target for a future
 Onramp cycle — mount `autumn-search` on `examples/wiki` per #2320's own
@@ -296,27 +296,48 @@ the full picture rather than re-discovering it.
 
 ## 💡 Conclusion
 
-No target this cycle clears the Hard Gate: the two strongest hard-failure
-candidates are already being fixed elsewhere, the one open findings report
-explicitly awaits a human decision, and no organic question-log class meets
-the occurrence bar. Per the process's own escape valve ("If the top entries
-are inherent... that is a legitimate finding — the fix is a map of the
-inherent steps, not a crusade against them. Report it.") and per Acceptable
-Outcome #4, recording this as a negative result is the correct action rather
-than manufacturing a cosmetic change to have something to ship.
+**Correction (caught by Codex review on this PR): an earlier draft of this
+section named the `autumn-billing` harness gap above as a deferred lead,
+then still concluded "no target this cycle clears the Hard Gate" — deferring
+it only because "this correction cycle is already long" is not a Hard Gate
+criterion, so that conclusion was unsupported for this one target.**
+Checked properly instead of deferred: this sandbox cannot verify the fix
+itself (`~/.cargo/registry` is empty and `curl -sS -o /dev/null -w
+'%{http_code}' https://crates.io` → `403`, the same egress constraint the
+2026-09-17 report hit — `cargo check` on a freshly scaffolded project needs
+real registry access this environment doesn't have), but
+`plugin_add_first_party_scaffolds_cargo_check` is `#[ignore]`d specifically
+so it runs under `.github/workflows/generator-conformance.yml`'s
+`plugin-install` job, which does have that access — so the fix belongs in
+this PR, verified by that job rather than by hand here. Added
+`autumn-billing` to `FIRST_PARTY_PLUGINS`
+(`autumn-cli/tests/generate.rs:8886`, alphabetical, matching `plugin
+list`'s own order and the catalog's) — a one-line, additive harness change
+per Acceptable Outcome #3 ("the journey wasn't measurable, now it is ... a
+complete deliverable on its own"), local `cargo check -p autumn-cli --test
+generate` confirms the test file itself compiles, and
+`generator-conformance.yml`'s `plugin-install` job on this PR's own CI run
+is what proves the scaffold compiles. If that job goes red, the fix is
+either a real bug in `autumn-billing`'s scaffold (its own repair, not a
+revert of this line) or evidence the plugin needs a documented
+prerequisite before `autumn plugin add` — either way, actionable follow-up
+on this same PR rather than silent unverified deferral.
 
-**Left for whoever picks either up next:**
+For every other candidate this survey found, the deferral is real and
+grounded in a stated Hard Gate criterion, not scope-fatigue: the two
+strongest hard-failure candidates are already being fixed elsewhere by
+in-flight PRs (duplication risk, not effort), the debuginfo cold-start
+lever explicitly awaits a human decision on a permanent trade-off (not an
+autonomous call to make), the `autumn-search`/`wiki` gap needs real feature
+implementation (a different Hard Gate — its own RED/GREEN cycle), and no
+organic question-log class meets the occurrence bar. Per the process's own
+escape valve ("If the top entries are inherent... that is a legitimate
+finding — the fix is a map of the inherent steps, not a crusade against
+them. Report it.") those remain negative-result/findings items this cycle,
+alongside the one small fix this cycle did ship.
 
-- **Most concrete lead:** add `autumn-billing` to
-  `FIRST_PARTY_PLUGINS` (`autumn-cli/tests/generate.rs:8886`), verifying
-  first that its scaffold genuinely compiles via
-  `plugin_add_first_party_scaffolds_cargo_check`. It's the one catalog
-  plugin (`autumn-cli/src/plugin/catalog.rs`) with a documented public
-  install command (`autumn-billing/README.md`: `autumn plugin add
-  autumn-billing`) and no CI coverage proving that command still works — a
-  harness gap, not a feature-implementation one, so it's a small, bounded
-  fix rather than the multi-part work the `autumn-search`/`wiki` item below
-  needs.
+**Left for whoever picks up the rest:**
+
 - Mount `autumn-search` on `examples/wiki` per issue #2320's own T3 Gap 6
   fix suggestion — a real, still-open, previously-identified gap on the
   "first real integration" journey (see above). This is a real,

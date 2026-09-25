@@ -8883,8 +8883,9 @@ fn controller_api_generates_json() {
 // ── `autumn plugin add` / `autumn plugin list` (issue #1606) ────────────────
 
 /// Every first-party plugin the install catalog ships, in `plugin list` order.
-const FIRST_PARTY_PLUGINS: [&str; 5] = [
+const FIRST_PARTY_PLUGINS: [&str; 6] = [
     "autumn-admin-plugin",
+    "autumn-billing",
     "autumn-cache-redis",
     "autumn-media-plugin",
     "autumn-search",
