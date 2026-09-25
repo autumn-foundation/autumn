@@ -96,7 +96,7 @@ fn decode_encoded_slashes(path: &str) -> std::borrow::Cow<'_, str> {
 /// Returns `Some(dot_count)` when `segment` consists solely of one or two
 /// dots, where each dot may be literal (`.`) or percent-encoded (`%2e` /
 /// `%2E`). Returns `None` for every other segment.
-const fn dot_segment_len(segment: &str) -> Option<usize> {
+pub const fn dot_segment_len(segment: &str) -> Option<usize> {
     let bytes = segment.as_bytes();
     let mut i = 0;
     let mut dots = 0usize;
@@ -120,6 +120,24 @@ const fn dot_segment_len(segment: &str) -> Option<usize> {
         }
     }
     if dots == 0 { None } else { Some(dots) }
+}
+
+/// Yields each well-formed percent-escape in `text` as its decoded byte, and
+/// whether its hex digits are upper case.
+///
+/// One level only, as in [`dot_segment_len`]: `%252e` yields `%` once. A `%`
+/// without two hex digits after it is not an escape and yields nothing.
+#[cfg(any(feature = "plugin-sandbox", test))]
+pub fn percent_escapes(text: &str) -> impl Iterator<Item = (u8, bool)> + '_ {
+    text.as_bytes().windows(3).filter_map(|window| {
+        let [b'%', high, low] = *window else {
+            return None;
+        };
+        let digit = |byte: u8| char::from(byte).to_digit(16);
+        let byte = u8::try_from(digit(high)? * 16 + digit(low)?).ok()?;
+        let upper = !high.is_ascii_lowercase() && !low.is_ascii_lowercase();
+        Some((byte, upper))
+    })
 }
 
 /// Whether `path` matches one of `exempt_paths` on an exact-or-subtree basis.
@@ -154,6 +172,13 @@ pub fn is_exempt_path(path: &str, exempt_paths: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percent_escapes_decodes_one_level() {
+        let found: Vec<(u8, bool)> = percent_escapes("/a%2Fb%2e%252e%zz%4").collect();
+        assert_eq!(found, [(b'/', true), (b'.', false), (b'%', true)]);
+        assert_eq!(percent_escapes("%%41").collect::<Vec<_>>(), [(b'A', true)]);
+    }
 
     #[test]
     fn passes_through_plain_paths() {
