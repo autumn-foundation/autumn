@@ -1,0 +1,46 @@
+   Compiling cms v0.7.0 (/home/user/autumn/examples/cms)
+warning: cms@0.7.0: Tailwind CSS CLI not found — CSS will not be compiled. Run `autumn setup` or install tailwindcss manually.
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 21s
+     Running tests/import_post_terms_resolve_batch_profile.rs (target/debug/deps/import_post_terms_resolve_batch_profile-708fa4be381b7a8b)
+
+running 1 test
+test import_post_terms_resolve_batch_profile ... 
+=== pg_stat_statements: fresh restore (600 new posts) ===
+calls=3000   buffers=171000   SELECT "terms"."id", "terms"."taxonomy", "terms"."name", "terms"."slug", "terms"."description", "terms"."parent_id", "terms"."post_count", "terms"."created_at" FROM "terms" WHERE ("terms"."slug" = $1)
+calls=1200   buffers=19203    SELECT "terms"."id" FROM "terms" WHERE ("terms"."id" = ANY($1)) ORDER BY "terms"."id" ASC FOR UPDATE
+calls=1      buffers=57       SELECT "terms"."id", "terms"."taxonomy", "terms"."name", "terms"."slug", "terms"."description", "terms"."parent_id", "terms"."post_count", "terms"."created_at" FROM "terms" WHERE (("terms"."taxonomy" = $1) AND ("terms"."slug" = ANY($2)))
+-- unbatched per-reference slug-only lookup (find_by_slug, pre-fix): calls=3000 buffers=171000 -- batched taxonomy+slug ANY() lookup (the fix): calls=1 buffers=57 --
+
+=== statement-count summary ===
+scenario                     single calls single buffers    any calls    any buffers
+fresh restore (600 posts)            3000         171000            1             57
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): single-row slug-only lookup shape (find_by_slug, one per (post, term) reference, unbatched) ===
+SELECT * FROM terms WHERE slug = 'tag-30'
+Seq Scan on public.terms  (cost=0.00..107.00 rows=1 width=75) (actual time=0.354..0.357 rows=1 loops=1)
+  Output: id, taxonomy, name, slug, description, parent_id, post_count, created_at
+  Filter: (terms.slug = 'tag-30'::text)
+  Rows Removed by Filter: 4059
+  Buffers: shared hit=57
+Query Identifier: 1186276229613392486
+Planning:
+  Buffers: shared hit=12
+Planning Time: 0.129 ms
+Execution Time: 0.369 ms
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): batched taxonomy+slug ANY() lookup shape (the fix, one call for the whole post_tag vocabulary) ===
+SELECT * FROM terms WHERE taxonomy = 'post_tag' AND slug = ANY(ARRAY['tag-0','tag-1','tag-2','tag-3','tag-4','tag-5','tag-6','tag-7','tag-8','tag-9','tag-10','tag-11','tag-12','tag-13','tag-14','tag-15','tag-16','tag-17','tag-18','tag-19','tag-20','tag-21','tag-22','tag-23','tag-24','tag-25','tag-26','tag-27','tag-28','tag-29','tag-30','tag-31','tag-32','tag-33','tag-34','tag-35','tag-36','tag-37','tag-38','tag-39','tag-40','tag-41','tag-42','tag-43','tag-44','tag-45','tag-46','tag-47','tag-48','tag-49','tag-50','tag-51','tag-52','tag-53','tag-54','tag-55','tag-56','tag-57','tag-58','tag-59'])
+Seq Scan on public.terms  (cost=0.15..127.15 rows=30 width=75) (actual time=0.428..0.436 rows=60 loops=1)
+  Output: id, taxonomy, name, slug, description, parent_id, post_count, created_at
+  Filter: ((terms.taxonomy = 'post_tag'::text) AND (terms.slug = ANY ('{tag-0,tag-1,tag-2,tag-3,tag-4,tag-5,tag-6,tag-7,tag-8,tag-9,tag-10,tag-11,tag-12,tag-13,tag-14,tag-15,tag-16,tag-17,tag-18,tag-19,tag-20,tag-21,tag-22,tag-23,tag-24,tag-25,tag-26,tag-27,tag-28,tag-29,tag-30,tag-31,tag-32,tag-33,tag-34,tag-35,tag-36,tag-37,tag-38,tag-39,tag-40,tag-41,tag-42,tag-43,tag-44,tag-45,tag-46,tag-47,tag-48,tag-49,tag-50,tag-51,tag-52,tag-53,tag-54,tag-55,tag-56,tag-57,tag-58,tag-59}'::text[])))
+  Rows Removed by Filter: 4000
+  Buffers: shared hit=57
+Query Identifier: 2119583187444449945
+Planning:
+  Buffers: shared hit=3
+Planning Time: 0.117 ms
+Execution Time: 0.447 ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 34.99s
+
