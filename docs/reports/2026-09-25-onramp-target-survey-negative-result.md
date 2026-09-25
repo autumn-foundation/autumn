@@ -15,17 +15,35 @@ Reproduce this survey: see **🔬 Reproduce** below.
 
 ## 📈 Evidence / Prior art
 
-**Prior Onramp work (`git log --oneline --all | grep -iE "onramp|🛣️"`).** Seven
-prior PRs, most recent first: #2937 (Tailwind install-dir mismatch across
-setup/dev/build.rs), #2915 (scaffold's own generated CI failed clippy -D
-warnings), #2840 (local-dev-quickstart permadrift, job red→continue-on-error),
+**Prior Onramp work — correction (caught by Codex review on this PR): an
+earlier draft cited `git log --oneline --all | grep -iE "onramp|🛣️"` and
+found only 7 prior PRs.** That command undercounts badly in this checkout —
+`git rev-parse --is-shallow-repository` confirms this is a **shallow clone**
+(52 commits of local `trunk-dev` history), so a plain local `git log` misses
+anything older than that window. The correct source is GitHub's own PR
+search (`is:merged "Onramp" in:title`), which returns **13 merged prior
+PRs**, not 7: #2426 (stale `createdb` step in the CRUD-generators fast
+path), #2459 (source-built-CLI vs. published-`autumn-web` drift, local-dev
+quickstart uncovered→red), #2494 (`autumn setup` retries a dropped Tailwind
+download), #2641 (getting-started's overclaim about `version_compat` drift
+detection), #2707 (compile the getting-started snippets in CI, 0 harness → 5
+fences checked), #2758 (SQLite unique-violation resolves by column, not just
+constraint name), #2798 (route-attr typo cascading through `routes!`, 3
+errors→1), #2817 (gating test/sim behind test-support: negative result),
 #2829 (dev-profile debuginfo cold-start lever, findings, needs a human
-decision — still undecided, see below), #2817 (gating test/sim behind
-test-support: negative result), #2798 (route-attr typo cascading through
-routes!, 3 errors→1), #2758 (SQLite unique-violation resolves by column, not
-just constraint name). Between them: setup/build reproducibility, generated-
-CI health, cold-start compile time (twice), macro error UX, and one
-SQLite-in-production correctness fix are already covered ground.
+decision — still undecided, see below), #2840 (local-dev-quickstart
+permadrift, job red→continue-on-error), #2876 (Todo Tutorial's 8 stub
+chapters, dead-end→redirect), #2915 (scaffold's own generated CI failed
+clippy -D warnings), #2937 (Tailwind install-dir mismatch across
+setup/dev/build.rs). (#2755, same title as #2840, is closed-but-unmerged —
+superseded by it, not a distinct fourteenth PR.) Between them: setup/build
+reproducibility (several rounds), generated-CI health, cold-start compile
+time (twice), snippet/quickstart harness construction, macro error UX, one
+tutorial dead-end fix, and one SQLite-in-production correctness fix are
+already covered ground — a wider swath than the undercounted list first
+suggested, which only reinforces this survey's conclusion that the easy,
+uncovered targets are scarcer than a first pass over this repository would
+suggest.
 
 **Question log (Tier 2).** This repository's issue tracker is almost
 entirely internal automated-analysis reports (🪞 Echo, ⚡ Bolt, 🪝 Snag, 📐
@@ -175,10 +193,17 @@ than manufacturing a cosmetic change to have something to ship.
   "first real integration" journey (see above). This is the most
   concretely-scoped candidate this survey found; it needs its own
   implementation + harness cycle, not a fold-in here.
-- If a human decides #2829's debuginfo trade-off, that unblocks a real
-  ~18% cold-start win *and* (per the 2026-09-21 report above) a
-  properly-replicated ~26-28% warm-edit win for `debug=1`/`limited` —
-  pending one more round of above-noise-floor cold-build measurement
+- If a human decides #2829's debuginfo trade-off, that unblocks a real win,
+  the size depending on which level they pick — **correction (caught by
+  Codex review on this PR): an earlier draft attached both the ~18%
+  cold-start figure and the ~26-28% warm-edit figure to `debug=1`/`limited`.
+  They're for different levels.** `debug=0` (no debug info) is the one that
+  measured ~18% cold-start / ~36-39% warm-edit, but it drops file:line
+  resolution from every locally-compiled backtrace frame. `debug=1`/
+  `limited` — the level that the 2026-09-21 report confirmed *preserves*
+  file:line resolution — measured a thinner ~8.7% cold-start win but a
+  properly-replicated ~26-28% warm-edit win. Either way, the pending
+  decision needs one more round of above-noise-floor cold-build measurement
   against the real `cold_start_driver.rs` harness (not just `-p
   autumn-web`/`examples/hello` in isolation) and the `dev-loop-latency.yml`
   live measurement driver actually being wired up — see the 2026-09-17
