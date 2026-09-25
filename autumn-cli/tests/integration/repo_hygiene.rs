@@ -9219,3 +9219,105 @@ fn the_minio_registry_scan_sees_an_unqualified_call_site() {
     assert!(flags(wrong_registry), "a different registry must be caught");
     assert!(!flags(tag_only), "reading the tag pulls nothing");
 }
+
+// ── Capacity contract false-positive probe (issue #2445) ────────────────────
+
+#[test]
+fn capacity_contract_scheduled_probe_uses_declared_defaults() {
+    let root = workspace_root();
+    let workflow_path = root.join(".github/workflows/capacity-contract.yml");
+    let workflow = std::fs::read_to_string(&workflow_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflow_path.display()));
+
+    // The `inputs` context is populated only on `workflow_dispatch` and
+    // `workflow_call`. The Monday schedule trigger runs with an EMPTY inputs
+    // context, so every `${{ inputs.<name> || '<fallback>' }}` expression
+    // resolves to the literal fallback on the schedule — the fallback IS the
+    // scheduled behavior. If it drifts from the declared
+    // `workflow_dispatch` default, the scheduled probe silently differs from
+    // what a human sees running the workflow by hand (exactly what #2445 did
+    // to the no-op rebuild count: the declared default was 20, the schedule
+    // ran 3).
+    let mut declared = std::collections::BTreeMap::<String, String>::new();
+    let mut input_name: Option<String> = None;
+    for line in workflow.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        if indent <= 4 {
+            // Left the `inputs:` block (or never entered it).
+            input_name = None;
+            continue;
+        }
+        if indent == 6 && trimmed.ends_with(':') {
+            input_name = Some(trimmed.trim_end_matches(':').to_string());
+        } else if indent == 8 && trimmed.starts_with("default:") {
+            if let Some(name) = input_name.take() {
+                let value = trimmed["default:".len()..]
+                    .trim()
+                    .trim_matches(|c| c == '"' || c == '\'');
+                declared.insert(name, value.to_string());
+            }
+        }
+    }
+    assert!(
+        !declared.is_empty(),
+        "capacity-contract.yml must declare workflow_dispatch inputs with defaults",
+    );
+
+    // The false-positive probe must read the rebuild count through an
+    // explicit fallback: a bare `inputs.noop_rebuilds` evaluates to an empty
+    // string on the schedule trigger, so the `|| '<n>'` is the scheduled
+    // behavior, not a nicety.
+    assert!(
+        workflow.contains("inputs.noop_rebuilds ||"),
+        "capacity-contract.yml must read the probe size through an explicit \
+         `inputs.noop_rebuilds || '<n>'` fallback; the schedule trigger has \
+         an empty inputs context — see issue #2445",
+    );
+
+    for (lineno, line) in workflow.lines().enumerate() {
+        let mut rest = line;
+        while let Some(at) = rest.find("inputs.") {
+            let after = &rest[at + "inputs.".len()..];
+            let name_len = after
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(after.len());
+            let name = &after[..name_len];
+            let tail = after[name_len..].trim_start();
+            if let Some(fallback) = tail.strip_prefix("||") {
+                let fallback = fallback.trim_start();
+                let quote = fallback.chars().next();
+                assert!(
+                    matches!(quote, Some('\'') | Some('"')),
+                    "capacity-contract.yml line {}: `inputs.{name}` fallback must be a quoted literal",
+                    lineno + 1,
+                );
+                let q = quote.unwrap();
+                let literal = fallback[1..]
+                    .split(q)
+                    .next()
+                    .expect("unterminated fallback literal");
+                let default = declared.get(name).unwrap_or_else(|| {
+                    panic!(
+                        "capacity-contract.yml line {}: `inputs.{name}` has no declared \
+                         workflow_dispatch default to fall back to",
+                        lineno + 1,
+                    )
+                });
+                assert_eq!(
+                    literal,
+                    default,
+                    "capacity-contract.yml line {}: the `inputs.{name}` fallback \
+                     ('{literal}') must equal the declared workflow_dispatch default \
+                     ('{default}'); the schedule trigger runs with an empty inputs \
+                     context, so the fallback IS the scheduled value — see #2445",
+                    lineno + 1,
+                );
+            }
+            rest = &after[name_len..];
+        }
+    }
+}
