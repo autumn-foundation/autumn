@@ -42,17 +42,50 @@ the Tier-1 clean-room harness the Hard Gate asks for, and it is green.
 Issue #2795 (open, cold-start compile time) is the one known live gap on this
 journey; see below for why it isn't actionable this cycle.
 
-**First real integration.** Issue #2320 (closed 2026-08-30) audited every
-first-party plugin's guide-vs-example coverage. Re-checked live: `autumn
-plugin add` for every first-party plugin (`autumn-billing`, `autumn-search`,
-`autumn-storage-s3`, `autumn-media-plugin`) is covered by
-`plugin_add_first_party_scaffolds_cargo_check` in CI; `examples/wiki` and
-`examples/cms` now exercise `autumn-search`/`autumn-billing`,
-`examples/reddit-clone` exercises `autumn-storage-s3`, and the media-room
-example exercises `autumn-media-plugin`. #2320's one remaining "no doc, no
-example" row (inbound mail) is already closed by the in-flight
-`changelog.d/inbound-mail-docs.md` fragment. This journey is thoroughly
-covered; no fresh gap found.
+**First real integration — correction (caught by Codex review on this PR):**
+an earlier draft of this paragraph claimed `examples/wiki` and
+`examples/cms` "now exercise `autumn-search`/`autumn-billing`" and that this
+closed issue #2320's plugin-coverage gaps. **That was wrong** — sourced from
+a background research pass this report failed to independently verify before
+publishing. Direct check: neither `examples/wiki/Cargo.toml` nor
+`examples/cms/Cargo.toml` depends on `autumn-search` or `autumn-billing` as
+a real dependency; both crate names appear only in an unrelated comment
+about a shared testcontainer convention
+(`grep -n "autumn-billing\s*=\|autumn-search\s*=" examples/*/Cargo.toml` →
+no matches). No crate in the workspace depends on `autumn-billing` at all
+(`grep -rl "autumn-billing\s*=" --include=Cargo.toml .` → only the root
+workspace manifest, which just declares it as a member, not a consumer).
+
+`plugin_add_first_party_scaffolds_cargo_check`'s own `FIRST_PARTY_PLUGINS`
+list (`autumn-cli/tests/generate.rs:8886`) is `autumn-admin-plugin`,
+`autumn-cache-redis`, `autumn-media-plugin`, `autumn-search`,
+`autumn-storage-s3` — five entries, and **`autumn-billing` is not among
+them**, so that gate doesn't even scaffold-check it. For the four plugins it
+does cover, the gate only proves `autumn plugin add` + `cargo check`
+succeeds on a freshly scaffolded project — not that any example actually
+*uses* the plugin's features, which is what issue #2320's coverage matrix
+scores as "Example."
+
+Issue #2320 (closed 2026-08-30, docs/examples coverage audit) explicitly
+named this as **T3 Gap 6**: *"`autumn-search` plugin (keyword + vector) —
+`search.md` is one of the most detailed guides in the tree; no example
+installs the crate. Fix: mount `autumn-search` on `wiki` (which already has
+`#[searchable]` FTS) as the keyword-backend example, or add a vector-search
+route."* Re-verified live: **this gap is still open** — `wiki` has no
+`autumn-search` dependency today. `autumn-billing` isn't a named row in
+#2320's matrix at all (likely added to the workspace after that audit ran)
+and also has no real consumer anywhere in the tree.
+
+This is a real, evidence-backed, previously-identified target for a future
+Onramp cycle — mount `autumn-search` on `examples/wiki` per #2320's own
+suggested fix, closing a T3 example gap on the "first real integration"
+journey. **Not pursued in this cycle**: it's a real feature-integration
+implementation (a new dependency, real search-index wiring, tests, and
+`docs/guide/search.md` cross-linking), not a same-layer docs/error-message/
+default fix, so it needs its own RED/GREEN cycle with its own baseline and
+harness rather than being folded into this survey's correction pass. Left
+open for the next cycle, now with the false "already resolved" claim
+retracted so it doesn't mislead anyone re-reading this report.
 
 The one severe, well-evidenced candidate on this journey — a `cache=shared`
 SQLite pool (`docs/guide/sqlite-in-production.md`'s documented, supported
@@ -85,15 +118,44 @@ gate itself turned out to have a wide, incompletely-mapped blast radius) and
 floor on the honest pooled number — but degrades panic-backtrace file:line
 resolution for every locally-compiled frame in every generated project,
 forever, and the report explicitly asks for a named human decision rather
-than an autonomous default flip). Checked this cycle: issue #2795 is still
-open, the debuginfo report's PR (#2829) has no maintainer decision recorded
-beyond an automated Codex review pass, and no new commits or reports have
-landed against #2795 since. Nothing new to act on without either (a) the
-still-pending human decision, or (b) the `-Z self-profile`/`measureme`
-tooling the 2026-09-17 report found blocked by this sandbox's `crates.io`
-egress policy (`curl -sS -o /dev/null -w '%{http_code}' https://crates.io` →
-`403`, re-confirmed this cycle) — an environment constraint, not something a
-docs/API-layer change can route around.
+than an autonomous default flip).
+
+**Correction (caught by Codex review on this PR): an earlier draft of this
+paragraph claimed "no new commits or reports have landed against #2795"
+since 2026-09-17. That's false** —
+`docs/reports/2026-09-21-prospect-debuginfo-warm-edit-rebuild-cost.md` (PR
+#2882, filed 2026-09-21, already on `trunk-dev` before this survey started)
+closes exactly the gap the 2026-09-17 report left open: it measured the same
+`debug = 1`/`limited` level on the *warm*, incremental edit loop (not just
+the cold build) and found a properly-replicated, order-reversal-checked
+**~26-28% reduction** in compile-and-link wall time — well clear of its own
+pre-registered 10% materiality line — and independently confirmed (the
+2026-09-17 report only asserted this in prose) that `limited` preserves
+backtrace file:line resolution. That changes the shape of the pending
+decision from "one-time cold-start win vs. a permanent backtrace-quality
+cost" to "a cold-start win *and* a large recurring per-edit win vs. that same
+cost" — a materially stronger case for picking `limited`, not just a
+restatement of the same open question.
+
+**This still doesn't clear the bar for autonomous action here.** The
+2026-09-21 report is explicit that it feeds, rather than resolves, issue
+#2795's decision: gap 1 (re-measuring against the real `autumn
+new`-scaffolded project via `cold_start_driver.rs`, not `examples/hello`) is
+still open in both reports, `dev-loop-latency.yml`'s own measurement driver
+isn't wired up yet (`build_placeholder_results` always passes every budget
+with zero samples — see that report's "Cost to productionize"), and the
+2026-09-17 report's own reason for deferring to a human — a permanent,
+every-build backtrace-quality trade-off is a named-decision call, not an
+autonomous default flip — still applies regardless of how much stronger the
+compile-time case has gotten. No maintainer decision is recorded on either
+report as of this cycle. The `-Z self-profile`/`measureme` tooling gap the
+2026-09-17 report hit is unrelated to this and remains blocked by this
+sandbox's `crates.io` egress policy
+(`curl -sS -o /dev/null -w '%{http_code}' https://crates.io` → `403`,
+re-confirmed this cycle) — an environment constraint, not something a
+docs/API-layer change can route around. Flagging the 2026-09-21 report's
+existence here so the next cycle (or the human deciding #2795) starts from
+the full picture rather than re-discovering it.
 
 ## 💡 Conclusion
 
@@ -108,11 +170,20 @@ than manufacturing a cosmetic change to have something to ship.
 
 **Left for whoever picks either up next:**
 
+- Mount `autumn-search` on `examples/wiki` per issue #2320's own T3 Gap 6
+  fix suggestion — a real, still-open, previously-identified gap on the
+  "first real integration" journey (see above). This is the most
+  concretely-scoped candidate this survey found; it needs its own
+  implementation + harness cycle, not a fold-in here.
 - If a human decides #2829's debuginfo trade-off, that unblocks a real
-  ~18% cold-start win pending one more round of above-noise-floor
-  measurement against the real `cold_start_driver.rs` harness (not just
-  `-p autumn-web` in isolation) — see that report's "Decision needed"
-  section for the three options.
+  ~18% cold-start win *and* (per the 2026-09-21 report above) a
+  properly-replicated ~26-28% warm-edit win for `debug=1`/`limited` —
+  pending one more round of above-noise-floor cold-build measurement
+  against the real `cold_start_driver.rs` harness (not just `-p
+  autumn-web`/`examples/hello` in isolation) and the `dev-loop-latency.yml`
+  live measurement driver actually being wired up — see the 2026-09-17
+  report's "Decision needed" section and the 2026-09-21 report's "Cost to
+  productionize" for the full list.
 - Once PR #2918 and/or #2930 land, `docs/guide/sqlite-in-production.md` and
   `docs/guide/money.md` should be revisited: both currently describe
   `cache=shared` concurrency behavior (`busy_timeout` bounding lock waits,
