@@ -1866,9 +1866,13 @@ ingress_ipv4     = ["203.0.113.10"]      # A records, for tenant APEX domains
 
 The app drives the journey through
 `autumn_web::custom_domain::CustomDomainRegistry` (published in `AppState`):
-`register(hostname, tenant, now)` connects one, `DnsInstructions::for_hostname`
-renders the exact record to show the tenant, and `list_for_tenant` renders
-status. States are `pending_dns` → `verified` → `issuing` → `active`; a stuck
+`register(hostname, tenant, now)` connects one, `DnsInstructions::for_domain`
+renders the exact records to show the tenant, and `list_for_tenant` renders
+status. A domain verifies only when it points at the ingress AND its
+`_autumn-challenge.<hostname>` TXT record carries the registration's
+`verification_token`; each registration mints a new token, so DNS a previous
+tenant left behind proves nothing. `active` domains from before the token are
+grandfathered. States are `pending_dns` → `verified` → `issuing` → `active`; a stuck
 domain carries `failure_reason`, and an `active` domain that fails renewal STAYS
 active and serving.
 

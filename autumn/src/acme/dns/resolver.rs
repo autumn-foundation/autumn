@@ -48,6 +48,16 @@ use super::TxtRecord;
 const QTYPE_A: u16 = 1;
 /// `NS` query type.
 const QTYPE_NS: u16 = 2;
+/// `AAAA` query type (RFC 3596).
+const QTYPE_AAAA: u16 = 28;
+/// Most candidate zones NS discovery asks about at the same time.
+const MAX_ZONE_PROBES: usize = 8;
+/// Most nameserver names of one zone that discovery resolves.
+const MAX_NAMESERVERS: usize = 8;
+/// `CNAME` record type.
+const QTYPE_CNAME: u16 = 5;
+/// Most CNAME hops [`DnsAnswer::txt_values_via_cnames`] follows.
+const MAX_CNAME_HOPS: usize = 8;
 /// `TXT` query type.
 const QTYPE_TXT: u16 = 16;
 /// `OPT` pseudo-record type (EDNS0, RFC 6891).
@@ -171,11 +181,10 @@ impl DnsLookup for UdpDnsLookup {
 
 /// Discover the addresses of the nameservers **authoritative** for `fqdn`.
 ///
-/// Walks the label suffixes of `fqdn` from most to least specific asking `NS`
-/// through `recursive` (the configured resolvers), takes the first suffix that
-/// answers with nameserver names, and resolves those names to addresses. The
-/// `_acme-challenge` label is dropped first: it is a record name inside the
-/// zone, never a zone cut of its own.
+/// Asks `NS` for the label suffixes of `fqdn`, most specific first, through
+/// `recursive` (the configured resolvers), takes the most specific suffix
+/// that answers with nameserver names, and resolves those names to IPv4 and
+/// IPv6 addresses.
 ///
 /// Returns an empty vector when discovery fails at any step — the caller then
 /// falls back to probing the recursive resolvers, which is worse but not
@@ -185,6 +194,18 @@ pub async fn authoritative_resolvers(
     recursive: &[SocketAddr],
     lookup: &dyn DnsLookup,
 ) -> Vec<SocketAddr> {
+    discover(fqdn, recursive, &Failed::default(), lookup).await
+}
+
+/// `authoritative_resolvers`, skipping the servers in `failed` and adding
+/// each server that fails to it.
+async fn discover(
+    fqdn: &str,
+    recursive: &[SocketAddr],
+    failed: &Failed,
+    lookup: &dyn DnsLookup,
+) -> Vec<SocketAddr> {
+    use futures::{FutureExt as _, StreamExt as _};
     // The `_acme-challenge` label stays on: it can itself be a delegated zone
     // with its own NS records, which is a recommended way to give an ACME
     // client credentials that reach nothing else. Stripping it skipped that
@@ -193,35 +214,55 @@ pub async fn authoritative_resolvers(
     // out. It is simply the most specific candidate, tried first (issue #1620).
     let base = normalize_name(fqdn);
     let labels: Vec<&str> = base.split('.').filter(|l| !l.is_empty()).collect();
-
-    for start in 0..labels.len().saturating_sub(1) {
-        let zone = labels[start..].join(".");
-        let mut names = Vec::new();
-        for server in recursive {
-            if let Ok(answer) = lookup.query(*server, &zone, QTYPE_NS, true).await {
-                names = answer.ns_names();
-                if !names.is_empty() {
-                    break;
-                }
-            }
-        }
+    let zones: Vec<String> = (0..labels.len().saturating_sub(1))
+        .map(|start| labels[start..].join("."))
+        .collect();
+    // Candidate zones are asked `MAX_ZONE_PROBES` at a time, most specific
+    // first, so a hostname with many labels cannot start a lookup for each at
+    // once. A resolver that fails a query is not asked again, so one that
+    // drops packets costs one query timeout in total (#2642).
+    // Boxed first: a lazily mapped iterator here makes the future not `Send`
+    // for every lifetime, which the spawned tasks need.
+    let probes: Vec<BoxFuture<'_, Vec<String>>> = zones
+        .iter()
+        .map(|zone| {
+            first_found(
+                recursive,
+                failed,
+                zone,
+                &[QTYPE_NS],
+                lookup,
+                DnsAnswer::ns_names,
+            )
+            .boxed()
+        })
+        .collect();
+    let mut ns_answers = futures::stream::iter(probes).buffered(MAX_ZONE_PROBES);
+    while let Some(mut names) = ns_answers.next().await {
         if names.is_empty() {
             continue;
         }
+        // A zone can list many names; only the first `MAX_NAMESERVERS` are
+        // resolved, so one tenant's zone cannot start a lookup for each.
+        names.sort();
+        names.dedup();
+        names.truncate(MAX_NAMESERVERS);
+        let ip_answers = futures::future::join_all(names.iter().map(|name| {
+            first_found(
+                recursive,
+                failed,
+                name,
+                &[QTYPE_A, QTYPE_AAAA],
+                lookup,
+                DnsAnswer::ip_addrs,
+            )
+        }))
+        .await;
         let mut addrs = Vec::new();
-        for name in &names {
-            for server in recursive {
-                if let Ok(answer) = lookup.query(*server, name, QTYPE_A, true).await {
-                    for addr in answer.a_addrs() {
-                        let socket = SocketAddr::new(std::net::IpAddr::V4(addr), 53);
-                        if !addrs.contains(&socket) {
-                            addrs.push(socket);
-                        }
-                    }
-                    if !addrs.is_empty() {
-                        break;
-                    }
-                }
+        for ip in ip_answers.into_iter().flatten() {
+            let socket = SocketAddr::new(ip, 53);
+            if !addrs.contains(&socket) {
+                addrs.push(socket);
             }
         }
         if !addrs.is_empty() {
@@ -229,6 +270,203 @@ pub async fn authoritative_resolvers(
         }
     }
     Vec::new()
+}
+
+/// Servers that failed a query during one lookup.
+type Failed = std::sync::Mutex<Vec<SocketAddr>>;
+
+/// Ask every server in `servers` that has not failed yet for every type in
+/// `qtypes` at once, with recursion desired, and return what `pick` finds.
+///
+/// For each type, the first answer with records counts. It returns once each
+/// type has records or has no query left, so a server that drops packets
+/// delays only a type that no other server has records for. A server that
+/// fails is added to `failed` and is not asked again.
+async fn first_found<T>(
+    servers: &[SocketAddr],
+    failed: &Failed,
+    name: &str,
+    qtypes: &[u16],
+    lookup: &dyn DnsLookup,
+    pick: impl Fn(&DnsAnswer) -> Vec<T>,
+) -> Vec<T> {
+    use futures::{FutureExt as _, StreamExt as _};
+    let live: Vec<SocketAddr> = {
+        let failed = failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        servers
+            .iter()
+            .copied()
+            .filter(|server| !failed.contains(server))
+            .collect()
+    };
+    let mut pending: futures::stream::FuturesUnordered<_> = live
+        .iter()
+        .flat_map(|&server| {
+            qtypes.iter().enumerate().map(move |(slot, &qtype)| {
+                lookup
+                    .query(server, name, qtype, true)
+                    .map(move |answer| (server, slot, answer))
+            })
+        })
+        .collect();
+    let mut outstanding = vec![live.len(); qtypes.len()];
+    let mut found: Vec<Vec<T>> = qtypes.iter().map(|_| Vec::new()).collect();
+    while let Some((server, slot, answer)) = pending.next().await {
+        outstanding[slot] -= 1;
+        if let Ok(answer) = answer {
+            if found[slot].is_empty() {
+                found[slot] = pick(&answer);
+            }
+        } else {
+            let mut failed = failed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !failed.contains(&server) {
+                failed.push(server);
+            }
+        }
+        if found
+            .iter()
+            .zip(&outstanding)
+            .all(|(found, left)| !found.is_empty() || *left == 0)
+        {
+            break;
+        }
+    }
+    found.into_iter().flatten().collect()
+}
+
+/// Every TXT value published at `fqdn`, for a custom domain's ownership check
+/// (#2642).
+///
+/// Asks the zone's authoritative nameservers, found through `recursive`, with
+/// recursion not desired: their answer is fresh even when a recursive resolver
+/// cached a negative answer from before the tenant published. Also asks
+/// `recursive`, which covers a failed discovery and a record delegated by CNAME
+/// to another zone, which only a recursive resolver follows. Values from every
+/// server that answered are merged, following any CNAME chain in each answer.
+/// When an authoritative answer ends at a CNAME to another zone, the target
+/// is asked of its own authoritative servers, up to the CNAME hop bound.
+///
+/// All servers are asked at the same time, so a server that drops packets
+/// costs one query timeout, not one per server. Discovery and the
+/// authoritative queries stop at `deadline`; the recursive answers still count.
+///
+/// # Errors
+///
+/// Returns the last error when no server answered at all.
+pub async fn txt_values(
+    fqdn: &str,
+    recursive: &[SocketAddr],
+    lookup: &dyn DnsLookup,
+    deadline: Duration,
+) -> Result<Vec<String>, String> {
+    // Each authoritative answer is kept as it arrives, so the deadline drops
+    // only the servers still silent, not answers already in.
+    let collected: std::sync::Mutex<Vec<(String, Result<DnsAnswer, String>)>> =
+        std::sync::Mutex::new(Vec::new());
+    let keep = |asked: &str, answer: Result<DnsAnswer, String>| {
+        collected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((asked.to_owned(), answer));
+    };
+    let from_authoritative = async {
+        use futures::StreamExt as _;
+        let mut asked: Vec<String> = Vec::new();
+        let mut name = normalize_name(fqdn);
+        // Shared by every hop, so a server that drops packets costs one
+        // timeout for the whole chain.
+        let failed = Failed::default();
+        for _ in 0..=MAX_CNAME_HOPS {
+            asked.push(name.clone());
+            let servers = discover(&name, recursive, &failed, lookup).await;
+            let mut pending: futures::stream::FuturesUnordered<_> = servers
+                .iter()
+                .map(|server| lookup.query(*server, &name, QTYPE_TXT, false))
+                .collect();
+            // The servers of one zone agree, so the first CNAME target is
+            // followed at once and the rest of this hop is not waited for.
+            let mut target = None;
+            while let Some(answer) = pending.next().await {
+                if let Ok(answer) = &answer {
+                    target = answer.unresolved_cname_target(&name);
+                }
+                keep(&name, answer);
+                if target.is_some() {
+                    break;
+                }
+            }
+            drop(pending);
+            match target {
+                Some(target) if !asked.contains(&target) => name = target,
+                _ => break,
+            }
+        }
+    };
+    let from_authoritative = async {
+        if tokio::time::timeout(deadline, from_authoritative)
+            .await
+            .is_err()
+        {
+            keep(
+                fqdn,
+                Err(format!(
+                    "the authoritative TXT lookup for {fqdn} did not finish within {}s",
+                    deadline.as_secs()
+                )),
+            );
+        }
+    };
+    let from_recursive = async {
+        ask_txt_of_all(recursive, fqdn, true, lookup)
+            .await
+            .into_iter()
+            .map(|answer| (fqdn.to_owned(), answer))
+            .collect::<Vec<_>>()
+    };
+    let ((), recursive) = futures::future::join(from_authoritative, from_recursive).await;
+    let authoritative = collected
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut values: Vec<String> = Vec::new();
+    let mut answered = false;
+    let mut last_error = "no resolvers were configured".to_owned();
+    for (asked, result) in authoritative.into_iter().chain(recursive) {
+        match result {
+            Ok(answer) => {
+                answered = true;
+                for value in answer.txt_values_via_cnames(&asked) {
+                    if !values.contains(&value) {
+                        values.push(value);
+                    }
+                }
+            }
+            Err(e) => last_error = e,
+        }
+    }
+    if answered {
+        Ok(values)
+    } else {
+        Err(last_error)
+    }
+}
+
+/// Ask every server in `servers` for `fqdn`'s TXT record at the same time.
+async fn ask_txt_of_all(
+    servers: &[SocketAddr],
+    fqdn: &str,
+    recursion_desired: bool,
+    lookup: &dyn DnsLookup,
+) -> Vec<Result<DnsAnswer, String>> {
+    futures::future::join_all(
+        servers
+            .iter()
+            .map(|server| lookup.query(*server, fqdn, QTYPE_TXT, recursion_desired)),
+    )
+    .await
 }
 
 /// Query one resolver for a name's TXT values, blocking.
@@ -386,6 +624,8 @@ pub enum Rdata {
     Name(String),
     /// An `A` record's address.
     A(std::net::Ipv4Addr),
+    /// An `AAAA` record's address.
+    Aaaa(std::net::Ipv6Addr),
     /// A record type this client does not decode.
     Other,
 }
@@ -427,6 +667,60 @@ impl DnsAnswer {
             .collect()
     }
 
+    /// The `TXT` values at `name`, or at the end of the CNAME chain that
+    /// starts at `name`, as a recursive resolver returns it.
+    ///
+    /// A tenant can delegate its ownership record with a CNAME. The answer
+    /// then holds the CNAME at `name` and the TXT under the target, so
+    /// [`txt_values`](Self::txt_values) alone finds nothing. The chain is
+    /// bounded, so a CNAME loop cannot run forever.
+    #[must_use]
+    pub fn txt_values_via_cnames(&self, name: &str) -> Vec<String> {
+        let mut owner = normalize_name(name);
+        let mut values = self.txt_values(&owner);
+        for _ in 0..MAX_CNAME_HOPS {
+            let next = self.records.iter().find_map(|r| match &r.rdata {
+                Rdata::Name(target) if r.rtype == QTYPE_CNAME && r.name == owner => {
+                    Some(normalize_name(target))
+                }
+                _ => None,
+            });
+            let Some(next) = next else {
+                break;
+            };
+            owner = next;
+            values.extend(self.txt_values(&owner));
+        }
+        values
+    }
+
+    /// The end of the CNAME chain that starts at `name`, when the chain has
+    /// at least one hop and the answer carries no TXT value along it.
+    ///
+    /// An authoritative server answers only for its own zone, so a CNAME to
+    /// another zone arrives without the target's records.
+    #[must_use]
+    pub fn unresolved_cname_target(&self, name: &str) -> Option<String> {
+        if !self.txt_values_via_cnames(name).is_empty() {
+            return None;
+        }
+        let start = normalize_name(name);
+        let mut owner = start.clone();
+        for _ in 0..MAX_CNAME_HOPS {
+            let next = self.records.iter().find_map(|r| match &r.rdata {
+                Rdata::Name(target) if r.rtype == QTYPE_CNAME && r.name == owner => {
+                    Some(normalize_name(target))
+                }
+                _ => None,
+            });
+            let Some(next) = next else {
+                break;
+            };
+            owner = next;
+        }
+        (owner != start).then_some(owner)
+    }
+
     /// The `NS` names in the answer.
     #[must_use]
     pub fn ns_names(&self) -> Vec<String> {
@@ -435,6 +729,19 @@ impl DnsAnswer {
             .filter(|r| r.rtype == QTYPE_NS)
             .filter_map(|r| match &r.rdata {
                 Rdata::Name(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `A` and `AAAA` addresses in the answer.
+    #[must_use]
+    pub fn ip_addrs(&self) -> Vec<std::net::IpAddr> {
+        self.records
+            .iter()
+            .filter_map(|r| match &r.rdata {
+                Rdata::A(addr) => Some(std::net::IpAddr::V4(*addr)),
+                Rdata::Aaaa(addr) => Some(std::net::IpAddr::V6(*addr)),
                 _ => None,
             })
             .collect()
@@ -459,7 +766,8 @@ fn normalize_name(name: &str) -> String {
     name.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
-/// Parse a DNS response into the TXT values it carries for `name`.
+/// Parse a DNS response into the TXT values it carries for `name`, following
+/// a CNAME chain in the answer (see [`DnsAnswer::txt_values_via_cnames`]).
 ///
 /// # Errors
 ///
@@ -467,7 +775,7 @@ fn normalize_name(name: &str) -> String {
 pub fn parse_txt_response(id: u16, name: &str, msg: &[u8]) -> Result<TxtAnswer, String> {
     let answer = parse_response(id, name, msg)?;
     Ok(TxtAnswer {
-        values: answer.txt_values(name),
+        values: answer.txt_values_via_cnames(name),
         rcode: answer.rcode,
     })
 }
@@ -557,13 +865,18 @@ pub fn parse_response(id: u16, name: &str, msg: &[u8]) -> Result<DnsAnswer, Stri
             // An NS target is a domain name in the message, so it may be
             // compressed against an earlier one — decode it against the WHOLE
             // message rather than the RDATA slice.
-            QTYPE_NS => Rdata::Name(read_name(msg, header_end)?.0),
+            QTYPE_NS | QTYPE_CNAME => Rdata::Name(read_name(msg, header_end)?.0),
             QTYPE_A if rdlength == 4 => Rdata::A(std::net::Ipv4Addr::new(
                 msg[header_end],
                 msg[header_end + 1],
                 msg[header_end + 2],
                 msg[header_end + 3],
             )),
+            QTYPE_AAAA if rdlength == 16 => {
+                let mut octets = [0_u8; 16];
+                octets.copy_from_slice(&msg[header_end..rdata_end]);
+                Rdata::Aaaa(std::net::Ipv6Addr::from(octets))
+            }
             _ => Rdata::Other,
         };
         records.push(ResourceRecord {
@@ -1573,6 +1886,826 @@ mod tests {
 
     fn resolver(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    // #2642: the ownership lookup merges what every answering server saw, and
+    // one resolver failing does not hide another's answer.
+    #[tokio::test]
+    async fn txt_values_merge_every_answer_and_survive_one_failing_resolver() {
+        let lookup = ScriptedLookup::new(vec![
+            (resolver(53), Err("timed out".to_owned())),
+            (
+                resolver(5353),
+                Ok(TxtAnswer {
+                    values: vec!["token-b".to_owned(), "v=spf1 -all".to_owned()],
+                    rcode: 0,
+                }),
+            ),
+        ]);
+        let values = txt_values(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(53), resolver(5353)],
+            lookup.as_ref(),
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(values, vec!["token-b".to_owned(), "v=spf1 -all".to_owned()]);
+    }
+
+    // #2642: a TXT record delegated by CNAME is read at the chain's end.
+    #[test]
+    fn txt_values_follow_a_cname_chain_in_the_answer() {
+        let record = |name: &str, rtype: u16, rdata: Rdata| ResourceRecord {
+            name: name.to_owned(),
+            rtype,
+            rdata,
+        };
+        let answer = DnsAnswer {
+            rcode: 0,
+            records: vec![
+                record(
+                    "_autumn-challenge.app.clientco.com",
+                    QTYPE_CNAME,
+                    Rdata::Name("verify.dns-host.net".to_owned()),
+                ),
+                record(
+                    "verify.dns-host.net",
+                    QTYPE_TXT,
+                    Rdata::Txt("token-b".to_owned()),
+                ),
+                record(
+                    "unrelated.example",
+                    QTYPE_TXT,
+                    Rdata::Txt("other".to_owned()),
+                ),
+            ],
+        };
+        assert_eq!(
+            answer.txt_values_via_cnames("_autumn-challenge.app.clientco.com."),
+            vec!["token-b".to_owned()]
+        );
+
+        // A loop ends at the hop bound instead of spinning.
+        let looped = DnsAnswer {
+            rcode: 0,
+            records: vec![
+                record("a.test", QTYPE_CNAME, Rdata::Name("b.test".to_owned())),
+                record("b.test", QTYPE_CNAME, Rdata::Name("a.test".to_owned())),
+            ],
+        };
+        assert!(looped.txt_values_via_cnames("a.test").is_empty());
+    }
+
+    // The wire parser decodes a CNAME's target, so the chain can be walked.
+    #[test]
+    fn a_cname_answer_record_decodes_its_target() {
+        let name = "_autumn-challenge.app.clientco.com";
+        let mut msg = response_head(0x4242, name, 1, 0);
+        push_answer(&mut msg, QTYPE_CNAME, &encode_labels("verify.dns-host.net"));
+        let answer = parse_response(0x4242, name, &msg).unwrap();
+        assert_eq!(
+            answer.records[0].rdata,
+            Rdata::Name("verify.dns-host.net".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn txt_values_fail_only_when_no_server_answers() {
+        let lookup = ScriptedLookup::new(vec![(resolver(53), Err("REFUSED".to_owned()))]);
+        let err = txt_values(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(53)],
+            lookup.as_ref(),
+            DEADLINE,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("REFUSED"), "{err}");
+
+        // NXDOMAIN is an answer: nothing is published yet.
+        let lookup = ScriptedLookup::new(vec![]);
+        let values = txt_values(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(53)],
+            lookup.as_ref(),
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+        assert!(values.is_empty());
+    }
+
+    const DEADLINE: Duration = Duration::from_secs(6);
+
+    /// Answers every TXT query after `txt_delay` with one value naming the
+    /// server, and every discovery query after `discovery_delay` with nothing.
+    struct SlowLookup {
+        txt_delay: Duration,
+        discovery_delay: Duration,
+    }
+
+    impl DnsLookup for SlowLookup {
+        fn query<'a>(
+            &'a self,
+            server: SocketAddr,
+            name: &'a str,
+            qtype: u16,
+            _recursion_desired: bool,
+        ) -> BoxFuture<'a, Result<DnsAnswer, String>> {
+            Box::pin(async move {
+                if qtype != QTYPE_TXT {
+                    tokio::time::sleep(self.discovery_delay).await;
+                    return Ok(DnsAnswer {
+                        rcode: 0,
+                        records: Vec::new(),
+                    });
+                }
+                tokio::time::sleep(self.txt_delay).await;
+                Ok(DnsAnswer {
+                    rcode: 0,
+                    records: vec![ResourceRecord {
+                        name: normalize_name(name),
+                        rtype: QTYPE_TXT,
+                        rdata: Rdata::Txt(format!("from-{}", server.port())),
+                    }],
+                })
+            })
+        }
+    }
+
+    // #2642: slow servers are asked at the same time, so one lookup costs one
+    // server timeout, not one per server.
+    #[tokio::test(start_paused = true)]
+    async fn txt_values_ask_every_server_at_once() {
+        let lookup = SlowLookup {
+            txt_delay: Duration::from_secs(3),
+            discovery_delay: Duration::ZERO,
+        };
+        let started = tokio::time::Instant::now();
+        let values = txt_values(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(53), resolver(54), resolver(55), resolver(56)],
+            &lookup,
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(values.len(), 4, "{values:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    // #2642: a discovery that stalls stops at the deadline, and the recursive
+    // resolvers' answers still count.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_discovery_stops_at_the_deadline_and_keeps_recursive_answers() {
+        let lookup = SlowLookup {
+            txt_delay: Duration::ZERO,
+            discovery_delay: Duration::from_secs(3600),
+        };
+        let started = tokio::time::Instant::now();
+        let values = txt_values(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(53)],
+            &lookup,
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(values, vec!["from-53".to_owned()]);
+        assert!(
+            started.elapsed() <= DEADLINE,
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A tenant delegated its ownership record by CNAME after a recursive
+    /// resolver cached NXDOMAIN. Authoritative servers answer each name only
+    /// with what they own; recursive servers still answer NXDOMAIN.
+    struct DelegatedLookup;
+
+    impl DnsLookup for DelegatedLookup {
+        fn query<'a>(
+            &'a self,
+            _server: SocketAddr,
+            name: &'a str,
+            qtype: u16,
+            recursion_desired: bool,
+        ) -> BoxFuture<'a, Result<DnsAnswer, String>> {
+            let owner = normalize_name(name);
+            let record = |rtype: u16, rdata: Rdata| ResourceRecord {
+                name: owner.clone(),
+                rtype,
+                rdata,
+            };
+            let records = match (qtype, recursion_desired, owner.as_str()) {
+                (QTYPE_NS, _, _) => vec![record(QTYPE_NS, Rdata::Name("ns.test".to_owned()))],
+                (QTYPE_A, _, "ns.test") => {
+                    vec![record(
+                        QTYPE_A,
+                        Rdata::A(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+                    )]
+                }
+                (QTYPE_TXT, false, "_autumn-challenge.app.clientco.com") => vec![record(
+                    QTYPE_CNAME,
+                    Rdata::Name("verify.dns-host.net".to_owned()),
+                )],
+                (QTYPE_TXT, false, "verify.dns-host.net") => {
+                    vec![record(QTYPE_TXT, Rdata::Txt("token-b".to_owned()))]
+                }
+                _ => Vec::new(),
+            };
+            let rcode = if records.is_empty() { 3 } else { 0 };
+            Box::pin(async move { Ok(DnsAnswer { rcode, records }) })
+        }
+    }
+
+    // #2642: a CNAME target missing from the authoritative answer is asked of
+    // its own zone's servers, so a stale recursive NXDOMAIN does not hide it.
+    #[tokio::test]
+    async fn txt_values_ask_a_cname_target_of_its_own_nameservers() {
+        let values = txt_values(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(53)],
+            &DelegatedLookup,
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(values, vec!["token-b".to_owned()]);
+    }
+
+    /// `DelegatedLookup` with only `clientco.com` and `dns-host.net` as zones,
+    /// and resolver 1 dropping every packet. Each answer takes 10ms.
+    struct DeadDelegatedLookup;
+
+    impl DnsLookup for DeadDelegatedLookup {
+        fn query<'a>(
+            &'a self,
+            server: SocketAddr,
+            name: &'a str,
+            qtype: u16,
+            recursion_desired: bool,
+        ) -> BoxFuture<'a, Result<DnsAnswer, String>> {
+            Box::pin(async move {
+                if server == resolver(1) {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    return Err(format!("resolver {server} did not answer"));
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let owner = normalize_name(name);
+                if qtype == QTYPE_NS && owner != "clientco.com" && owner != "dns-host.net" {
+                    return Ok(DnsAnswer {
+                        rcode: 0,
+                        records: Vec::new(),
+                    });
+                }
+                DelegatedLookup
+                    .query(server, name, qtype, recursion_desired)
+                    .await
+            })
+        }
+    }
+
+    // Codex review on #2936: a resolver that drops packets costs one timeout
+    // for the whole CNAME chain, not one per hop.
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_resolver_costs_one_timeout_across_cname_hops() {
+        let values = txt_values(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(1), resolver(2)],
+            &DeadDelegatedLookup,
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(values, vec!["token-b".to_owned()]);
+    }
+
+    /// Resolver 1 and nameserver `ns2.test` drop every packet. `ns1.test`
+    /// answers the ownership record with a CNAME to `dns-host.net`, whose
+    /// nameserver has the token. Resolver 2 still caches NXDOMAIN. Each answer
+    /// takes 10ms.
+    struct SilentPeerLookup;
+
+    impl DnsLookup for SilentPeerLookup {
+        fn query<'a>(
+            &'a self,
+            server: SocketAddr,
+            name: &'a str,
+            qtype: u16,
+            recursion_desired: bool,
+        ) -> BoxFuture<'a, Result<DnsAnswer, String>> {
+            Box::pin(async move {
+                if server == resolver(1) || server == SocketAddr::from(([192, 0, 2, 2], 53)) {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    return Err(format!("{server} did not answer"));
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let owner = normalize_name(name);
+                let record = |rtype: u16, rdata: Rdata| ResourceRecord {
+                    name: owner.clone(),
+                    rtype,
+                    rdata,
+                };
+                let ns = |host: &str| record(QTYPE_NS, Rdata::Name(host.to_owned()));
+                let a =
+                    |last: u8| record(QTYPE_A, Rdata::A(std::net::Ipv4Addr::new(192, 0, 2, last)));
+                let records = match (qtype, recursion_desired, owner.as_str()) {
+                    (QTYPE_NS, _, "clientco.com") => vec![ns("ns1.test"), ns("ns2.test")],
+                    (QTYPE_NS, _, "dns-host.net") => vec![ns("ns3.test")],
+                    (QTYPE_A, _, "ns1.test") => vec![a(1)],
+                    (QTYPE_A, _, "ns2.test") => vec![a(2)],
+                    (QTYPE_A, _, "ns3.test") => vec![a(3)],
+                    (QTYPE_TXT, false, "_autumn-challenge.app.clientco.com") => vec![record(
+                        QTYPE_CNAME,
+                        Rdata::Name("verify.dns-host.net".to_owned()),
+                    )],
+                    (QTYPE_TXT, false, "verify.dns-host.net") => {
+                        vec![record(QTYPE_TXT, Rdata::Txt("token-b".to_owned()))]
+                    }
+                    _ => Vec::new(),
+                };
+                Ok(DnsAnswer { rcode: 0, records })
+            })
+        }
+    }
+
+    // Codex review on #2936: a CNAME target is asked at once, not after every
+    // nameserver of the current hop has answered.
+    #[tokio::test(start_paused = true)]
+    async fn a_cname_target_is_asked_without_waiting_for_a_silent_nameserver() {
+        let values = txt_values(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(1), resolver(2)],
+            &SilentPeerLookup,
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(values, vec!["token-b".to_owned()]);
+    }
+
+    /// Resolver 1 drops every packet. Resolver 2 answers, but still caches
+    /// NXDOMAIN for the ownership record. Only the zone's own nameserver has
+    /// the token.
+    struct PartlyDeadLookup;
+
+    impl DnsLookup for PartlyDeadLookup {
+        fn query<'a>(
+            &'a self,
+            server: SocketAddr,
+            name: &'a str,
+            qtype: u16,
+            recursion_desired: bool,
+        ) -> BoxFuture<'a, Result<DnsAnswer, String>> {
+            Box::pin(async move {
+                if server == resolver(1) {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    return Err(format!("resolver {server} did not answer"));
+                }
+                let owner = normalize_name(name);
+                let record = |rtype: u16, rdata: Rdata| ResourceRecord {
+                    name: owner.clone(),
+                    rtype,
+                    rdata,
+                };
+                let records = match (qtype, recursion_desired, owner.as_str()) {
+                    (QTYPE_NS, _, "clientco.com") => {
+                        vec![record(QTYPE_NS, Rdata::Name("ns.test".to_owned()))]
+                    }
+                    (QTYPE_A, _, "ns.test") => {
+                        vec![record(
+                            QTYPE_A,
+                            Rdata::A(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+                        )]
+                    }
+                    (QTYPE_TXT, false, "_autumn-challenge.app.clientco.com") => {
+                        vec![record(QTYPE_TXT, Rdata::Txt("token-b".to_owned()))]
+                    }
+                    _ => Vec::new(),
+                };
+                let rcode = if records.is_empty() { 3 } else { 0 };
+                Ok(DnsAnswer { rcode, records })
+            })
+        }
+    }
+
+    // Codex review on #2936: a resolver that drops packets costs discovery one
+    // timeout in total, not one per zone candidate, so the zone's nameserver
+    // is still reached inside the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_resolver_does_not_stall_discovery_past_the_deadline() {
+        let started = tokio::time::Instant::now();
+        let found = authoritative_resolvers(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(1), resolver(2)],
+            &PartlyDeadLookup,
+        )
+        .await;
+        assert_eq!(found, vec![SocketAddr::from(([192, 0, 2, 1], 53))]);
+        assert!(
+            started.elapsed() <= Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+
+        let values = txt_values(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(1), resolver(2)],
+            &PartlyDeadLookup,
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(values, vec!["token-b".to_owned()]);
+    }
+
+    /// Resolver 1 drops every packet, and so does the zone's second
+    /// nameserver. The first nameserver has the token at once; resolver 2
+    /// still caches NXDOMAIN.
+    struct SlowAuthoritativeLookup;
+
+    impl DnsLookup for SlowAuthoritativeLookup {
+        fn query<'a>(
+            &'a self,
+            server: SocketAddr,
+            name: &'a str,
+            qtype: u16,
+            recursion_desired: bool,
+        ) -> BoxFuture<'a, Result<DnsAnswer, String>> {
+            Box::pin(async move {
+                if server == resolver(1) {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    return Err(format!("resolver {server} did not answer"));
+                }
+                if server == SocketAddr::from(([192, 0, 2, 2], 53)) {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    return Err(format!("resolver {server} did not answer"));
+                }
+                let owner = normalize_name(name);
+                let record = |rtype: u16, rdata: Rdata| ResourceRecord {
+                    name: owner.clone(),
+                    rtype,
+                    rdata,
+                };
+                let records = match (qtype, recursion_desired, owner.as_str()) {
+                    (QTYPE_NS, _, "clientco.com") => vec![
+                        record(QTYPE_NS, Rdata::Name("ns1.test".to_owned())),
+                        record(QTYPE_NS, Rdata::Name("ns2.test".to_owned())),
+                    ],
+                    (QTYPE_A, _, "ns1.test") => {
+                        vec![record(
+                            QTYPE_A,
+                            Rdata::A(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+                        )]
+                    }
+                    (QTYPE_A, _, "ns2.test") => {
+                        vec![record(
+                            QTYPE_A,
+                            Rdata::A(std::net::Ipv4Addr::new(192, 0, 2, 2)),
+                        )]
+                    }
+                    (QTYPE_TXT, false, "_autumn-challenge.app.clientco.com") => {
+                        vec![record(QTYPE_TXT, Rdata::Txt("token-b".to_owned()))]
+                    }
+                    _ => Vec::new(),
+                };
+                let rcode = if records.is_empty() { 3 } else { 0 };
+                Ok(DnsAnswer { rcode, records })
+            })
+        }
+    }
+
+    // Codex review on #2936: an answer that arrived before the deadline counts,
+    // even when another authoritative server is still silent at the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn answers_in_before_the_deadline_survive_a_silent_nameserver() {
+        let values = txt_values(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(1), resolver(2)],
+            &SlowAuthoritativeLookup,
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(values, vec!["token-b".to_owned()]);
+    }
+
+    #[test]
+    fn an_aaaa_answer_record_decodes_its_address() {
+        let name = "ns6.test";
+        let mut msg = response_head(0x4243, name, 1, 0);
+        push_answer(
+            &mut msg,
+            QTYPE_AAAA,
+            &[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        );
+        let answer = parse_response(0x4243, name, &msg).unwrap();
+        assert_eq!(
+            answer.ip_addrs(),
+            vec!["2001:db8::1".parse::<std::net::IpAddr>().unwrap()]
+        );
+    }
+
+    /// NS and address answers from one table; every other query is empty.
+    struct TableLookup {
+        ns: Vec<(&'static str, &'static str)>,
+        addrs: Vec<(&'static str, std::net::IpAddr)>,
+        ns_delay: Duration,
+        aaaa_delay: Duration,
+        in_flight: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        addr_queries: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TableLookup {
+        fn new(
+            ns: Vec<(&'static str, &'static str)>,
+            addrs: Vec<(&'static str, std::net::IpAddr)>,
+            ns_delay: Duration,
+        ) -> Self {
+            Self {
+                ns,
+                addrs,
+                ns_delay,
+                aaaa_delay: Duration::ZERO,
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                peak: std::sync::atomic::AtomicUsize::new(0),
+                addr_queries: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl DnsLookup for TableLookup {
+        fn query<'a>(
+            &'a self,
+            _server: SocketAddr,
+            name: &'a str,
+            qtype: u16,
+            _recursion_desired: bool,
+        ) -> BoxFuture<'a, Result<DnsAnswer, String>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            Box::pin(async move {
+                let owner = normalize_name(name);
+                let record = |rtype: u16, rdata: Rdata| ResourceRecord {
+                    name: owner.clone(),
+                    rtype,
+                    rdata,
+                };
+                let records = match qtype {
+                    QTYPE_NS => {
+                        let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+                        self.peak.fetch_max(now, SeqCst);
+                        tokio::time::sleep(self.ns_delay).await;
+                        self.in_flight.fetch_sub(1, SeqCst);
+                        self.ns
+                            .iter()
+                            .filter(|(zone, _)| *zone == owner)
+                            .map(|(_, ns)| record(QTYPE_NS, Rdata::Name((*ns).to_owned())))
+                            .collect()
+                    }
+                    QTYPE_A | QTYPE_AAAA => {
+                        self.addr_queries.fetch_add(1, SeqCst);
+                        if qtype == QTYPE_AAAA {
+                            tokio::time::sleep(self.aaaa_delay).await;
+                        }
+                        self.addrs
+                            .iter()
+                            .filter(|(host, _)| *host == owner)
+                            .filter_map(|(_, ip)| match (qtype, ip) {
+                                (QTYPE_A, std::net::IpAddr::V4(v4)) => {
+                                    Some(record(QTYPE_A, Rdata::A(*v4)))
+                                }
+                                (QTYPE_AAAA, std::net::IpAddr::V6(v6)) => {
+                                    Some(record(QTYPE_AAAA, Rdata::Aaaa(*v6)))
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                };
+                Ok(DnsAnswer { rcode: 0, records })
+            })
+        }
+    }
+
+    // Codex review on #2936: a zone whose nameservers have only IPv6
+    // addresses is still found.
+    #[tokio::test]
+    async fn discovery_finds_ipv6_only_nameservers() {
+        let lookup = TableLookup::new(
+            vec![("clientco.com", "ns6.test")],
+            vec![("ns6.test", "2001:db8::1".parse().unwrap())],
+            Duration::ZERO,
+        );
+        let found = authoritative_resolvers(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(53)],
+            &lookup,
+        )
+        .await;
+        assert_eq!(
+            found,
+            vec!["[2001:db8::1]:53".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    // Codex review on #2936: a hostname with many labels does not start an NS
+    // lookup for every candidate zone at once.
+    #[tokio::test(start_paused = true)]
+    async fn discovery_caps_how_many_zones_it_asks_at_once() {
+        let lookup = TableLookup::new(
+            vec![("clientco.com", "ns1.test")],
+            vec![("ns1.test", "192.0.2.1".parse().unwrap())],
+            Duration::from_millis(100),
+        );
+        let host = format!("{}clientco.com", "a.".repeat(60));
+        let found = authoritative_resolvers(&host, &[resolver(53)], &lookup).await;
+        assert_eq!(found, vec![SocketAddr::from(([192, 0, 2, 1], 53))]);
+        let peak = lookup.peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(peak <= MAX_ZONE_PROBES, "{peak} NS lookups at once");
+    }
+
+    // Codex review on #2936: a resolver that drops packets is not asked
+    // again, so a hostname with many labels still reaches its zone's
+    // nameserver after one query timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_resolver_costs_one_timeout_for_a_long_hostname() {
+        let started = tokio::time::Instant::now();
+        let host = format!("{}_autumn-challenge.app.clientco.com", "a.".repeat(24));
+        let found =
+            authoritative_resolvers(&host, &[resolver(1), resolver(2)], &PartlyDeadLookup).await;
+        assert_eq!(found, vec![SocketAddr::from(([192, 0, 2, 1], 53))]);
+        assert!(
+            started.elapsed() <= Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    // Codex review on #2936: a large NS set does not start an address lookup
+    // for every name.
+    #[tokio::test]
+    async fn discovery_caps_how_many_nameservers_it_resolves() {
+        const NAMES: [&str; 40] = [
+            "ns00.test",
+            "ns01.test",
+            "ns02.test",
+            "ns03.test",
+            "ns04.test",
+            "ns05.test",
+            "ns06.test",
+            "ns07.test",
+            "ns08.test",
+            "ns09.test",
+            "ns10.test",
+            "ns11.test",
+            "ns12.test",
+            "ns13.test",
+            "ns14.test",
+            "ns15.test",
+            "ns16.test",
+            "ns17.test",
+            "ns18.test",
+            "ns19.test",
+            "ns20.test",
+            "ns21.test",
+            "ns22.test",
+            "ns23.test",
+            "ns24.test",
+            "ns25.test",
+            "ns26.test",
+            "ns27.test",
+            "ns28.test",
+            "ns29.test",
+            "ns30.test",
+            "ns31.test",
+            "ns32.test",
+            "ns33.test",
+            "ns34.test",
+            "ns35.test",
+            "ns36.test",
+            "ns37.test",
+            "ns38.test",
+            "ns39.test",
+        ];
+        let lookup = TableLookup::new(
+            NAMES.iter().map(|name| ("clientco.com", *name)).collect(),
+            NAMES
+                .iter()
+                .zip(1_u8..)
+                .map(|(name, n)| (*name, std::net::IpAddr::from([192, 0, 2, n])))
+                .collect(),
+            Duration::ZERO,
+        );
+        let found = authoritative_resolvers(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(53)],
+            &lookup,
+        )
+        .await;
+        assert_eq!(found.len(), MAX_NAMESERVERS);
+        let asked = lookup
+            .addr_queries
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(asked <= 2 * MAX_NAMESERVERS, "{asked} address lookups");
+    }
+
+    // Codex review on #2936: a dual-stack nameserver keeps both addresses,
+    // even when the A answer comes first.
+    #[tokio::test(start_paused = true)]
+    async fn discovery_keeps_both_addresses_of_a_dual_stack_nameserver() {
+        let mut lookup = TableLookup::new(
+            vec![("clientco.com", "ns.test")],
+            vec![
+                ("ns.test", "192.0.2.1".parse().unwrap()),
+                ("ns.test", "2001:db8::1".parse().unwrap()),
+            ],
+            Duration::ZERO,
+        );
+        lookup.aaaa_delay = Duration::from_millis(100);
+        let found = authoritative_resolvers(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(53)],
+            &lookup,
+        )
+        .await;
+        assert_eq!(
+            found,
+            vec![
+                SocketAddr::from(([192, 0, 2, 1], 53)),
+                "[2001:db8::1]:53".parse::<SocketAddr>().unwrap(),
+            ]
+        );
+    }
+
+    /// Resolver 1 knows only the nameserver's A record and answers AAAA with
+    /// nothing at once. Resolver 2 knows only its AAAA record and is slower.
+    struct SplitStackLookup;
+
+    impl DnsLookup for SplitStackLookup {
+        fn query<'a>(
+            &'a self,
+            server: SocketAddr,
+            name: &'a str,
+            qtype: u16,
+            _recursion_desired: bool,
+        ) -> BoxFuture<'a, Result<DnsAnswer, String>> {
+            Box::pin(async move {
+                let owner = normalize_name(name);
+                let record = |rtype: u16, rdata: Rdata| ResourceRecord {
+                    name: owner.clone(),
+                    rtype,
+                    rdata,
+                };
+                if server == resolver(2) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let records = match (qtype, server == resolver(1), owner.as_str()) {
+                    (QTYPE_NS, _, "clientco.com") => {
+                        vec![record(QTYPE_NS, Rdata::Name("ns.test".to_owned()))]
+                    }
+                    (QTYPE_A, true, "ns.test") => {
+                        vec![record(
+                            QTYPE_A,
+                            Rdata::A(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+                        )]
+                    }
+                    (QTYPE_AAAA, false, "ns.test") => vec![record(
+                        QTYPE_AAAA,
+                        Rdata::Aaaa("2001:db8::1".parse().unwrap()),
+                    )],
+                    _ => Vec::new(),
+                };
+                Ok(DnsAnswer { rcode: 0, records })
+            })
+        }
+    }
+
+    // Codex review on #2936: an empty AAAA answer from one resolver does not
+    // stop the wait for another resolver's AAAA records.
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_answer_does_not_cut_off_the_other_address_family() {
+        let found = authoritative_resolvers(
+            "_autumn-challenge.app.clientco.com",
+            &[resolver(1), resolver(2)],
+            &SplitStackLookup,
+        )
+        .await;
+        assert_eq!(
+            found,
+            vec![
+                SocketAddr::from(([192, 0, 2, 1], 53)),
+                "[2001:db8::1]:53".parse::<SocketAddr>().unwrap(),
+            ]
+        );
     }
 
     #[tokio::test]

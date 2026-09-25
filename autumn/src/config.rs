@@ -7738,6 +7738,13 @@ pub struct CustomDomainsConfig {
     /// How often the orchestrator verifies, issues and renews. Default: `60`.
     #[serde(default = "default_custom_domains_poll_secs")]
     pub poll_interval_secs: u64,
+
+    /// Recursive resolvers used to read each domain's ownership TXT record
+    /// and to find its zone's authoritative nameservers. Each entry is `IP`
+    /// (port 53 implied) or `IP:port`. Default: Cloudflare and Google public
+    /// DNS.
+    #[serde(default = "default_acme_dns_resolvers")]
+    pub resolvers: Vec<String>,
 }
 
 impl Default for CustomDomainsConfig {
@@ -7755,11 +7762,25 @@ impl Default for CustomDomainsConfig {
             failure_backoff_secs: default_custom_domains_base_backoff(),
             max_failure_backoff_secs: default_custom_domains_max_backoff(),
             poll_interval_secs: default_custom_domains_poll_secs(),
+            resolvers: default_acme_dns_resolvers(),
         }
     }
 }
 
 impl CustomDomainsConfig {
+    /// Parse [`resolvers`](Self::resolvers) into socket addresses, defaulting a
+    /// bare IP to port 53.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the first unparseable entry.
+    pub fn resolver_addrs(&self) -> Result<Vec<std::net::SocketAddr>, String> {
+        self.resolvers
+            .iter()
+            .map(|entry| parse_resolver_addr("[server.tls.acme.custom_domains]", entry))
+            .collect()
+    }
+
     /// A scheme, a port or a path in `ingress_hostname` reaches tenants
     /// verbatim as their CNAME target. The record would be invalid, the
     /// ingress would never resolve, and every subdomain domain would sit at
@@ -7880,6 +7901,14 @@ impl CustomDomainsConfig {
                     .to_owned(),
             );
         }
+        if self.resolvers.is_empty() {
+            return Err(
+                "[server.tls.acme.custom_domains] resolvers must list at least one DNS resolver: \
+                 without one no ownership TXT record can be read, so no domain can verify"
+                    .to_owned(),
+            );
+        }
+        self.resolver_addrs()?;
         Ok(())
     }
 
@@ -8117,7 +8146,7 @@ impl AcmeDnsConfig {
     pub fn resolver_addrs(&self) -> Result<Vec<std::net::SocketAddr>, String> {
         self.resolvers
             .iter()
-            .map(|entry| parse_resolver_addr(entry))
+            .map(|entry| parse_resolver_addr("[server.tls.acme.dns]", entry))
             .collect()
     }
 
@@ -8214,9 +8243,9 @@ impl AcmeDnsConfig {
     }
 }
 
-/// Parse one `[server.tls.acme.dns] resolvers` entry into a socket address,
+/// Parse one `resolvers` entry of `section` into a socket address,
 /// defaulting a bare IP address to port 53.
-fn parse_resolver_addr(entry: &str) -> Result<std::net::SocketAddr, String> {
+fn parse_resolver_addr(section: &str, entry: &str) -> Result<std::net::SocketAddr, String> {
     let trimmed = entry.trim();
     if let Ok(addr) = trimmed.parse::<std::net::SocketAddr>() {
         return Ok(addr);
@@ -8225,9 +8254,9 @@ fn parse_resolver_addr(entry: &str) -> Result<std::net::SocketAddr, String> {
         return Ok(std::net::SocketAddr::new(ip, 53));
     }
     Err(format!(
-        "[server.tls.acme.dns] resolvers entry `{entry}` is not a resolver address: write it as \
-         an IP (`1.1.1.1`, port 53 implied) or `IP:port` (`1.1.1.1:53`). Hostnames are not \
-         accepted — resolving the resolver would defeat the purpose of the propagation check"
+        "{section} resolvers entry `{entry}` is not a resolver address: write it as an IP \
+         (`1.1.1.1`, port 53 implied) or `IP:port` (`1.1.1.1:53`). Hostnames are not accepted — \
+         resolving the resolver would defeat the purpose of the DNS check"
     ))
 }
 

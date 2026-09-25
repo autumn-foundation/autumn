@@ -17,15 +17,17 @@
 //!
 //! A tenant's domain lives in the *tenant's* zone, so autumn holds no
 //! credential that could write a DNS-01 `_acme-challenge` record there. The
-//! verification gate already proves the hostname points at this deployment,
-//! which is exactly the condition that makes HTTP-01 work — so the challenge
+//! verification gate already proves the hostname points at this deployment
+//! (and, with the TXT token, that the tenant controls it), which is exactly
+//! the condition that makes HTTP-01 work — so the challenge
 //! the operator can actually answer is the one used, even when the
 //! deployment's own certificate is issued over DNS-01.
 //!
 //! # Abuse posture
 //!
 //! Every order passes three gates first: the hostname is registered by the
-//! app, DNS independently points here, and the
+//! app, DNS independently points here and carries the registration's TXT
+//! token, and the
 //! [budget](crate::custom_domain::IssuanceLimiter) has headroom. An SNI
 //! hostname failing the first never reaches this module at all —
 //! [`SniCertResolver`](crate::custom_domain::SniCertResolver) refuses the
@@ -39,6 +41,7 @@ use crate::config::AcmeConfig;
 use crate::custom_domain::{
     CustomDomainCertCache, CustomDomainRegistry, DomainIssuer, DomainVerifier, ExpectedIngress,
     IssuanceLimiter, IssuedCertificate, apply_verification, grade_dns_verification,
+    grade_ownership,
 };
 use crate::scheduler::SchedulerCoordinator;
 use crate::task::TaskCoordination;
@@ -46,6 +49,9 @@ use rustls::crypto::CryptoProvider;
 
 /// The scheduled-task name custom-domain leases and alerts are keyed on.
 pub const CUSTOM_DOMAIN_TASK: &str = "custom_domain_certificates";
+
+/// How many pending domains one tick verifies at the same time.
+const VERIFY_CONCURRENCY: usize = 16;
 
 /// Callback that dispatches a custom-domain failure to the operator (#1610).
 pub type ReporterFn = Arc<dyn Fn(String) + Send + Sync>;
@@ -223,9 +229,15 @@ impl CustomDomainTask {
 
     /// One pass over every registered domain.
     pub async fn tick(&self, now_unix: i64) {
-        for domain in self.registry.pending_verification(now_unix) {
-            self.verify_one(&domain.hostname, now_unix).await;
-        }
+        // Each check can wait out a DNS timeout, so checks run
+        // `VERIFY_CONCURRENCY` at a time instead of adding up. Each write goes
+        // through the registry's per-hostname gate.
+        futures::StreamExt::for_each_concurrent(
+            futures::stream::iter(self.registry.pending_verification(now_unix)),
+            VERIFY_CONCURRENCY,
+            |domain| async move { self.verify_one(&domain.hostname, now_unix).await },
+        )
+        .await;
         for domain in self.registry.due_for_issuance(now_unix) {
             self.issue_one(&domain.hostname, &domain.tenant, now_unix)
                 .await;
@@ -352,18 +364,51 @@ impl CustomDomainTask {
         false
     }
 
-    /// Check where one hostname points and record the result.
+    /// Check where one hostname points, and that its owner published this
+    /// registration's token, and record the result.
+    ///
+    /// Pointing here is not enough on its own: a record another tenant left
+    /// behind also points here, and HTTP-01 would then issue to whoever
+    /// registered the hostname next (#2642).
     async fn verify_one(&self, hostname: &str, now_unix: i64) {
+        let Some(mut domain) = self.registry.get(hostname) else {
+            return;
+        };
+        // `load` gives a pre-token record its token; this retries a load whose
+        // write failed.
+        if domain.needs_verification_token() {
+            if let Err(e) = self
+                .registry
+                .adopt_verification_token(hostname, now_unix)
+                .await
+            {
+                tracing::warn!(
+                    hostname,
+                    "could not give a custom domain its verification token: {e}"
+                );
+                return;
+            }
+            match self.registry.get(hostname) {
+                Some(adopted) if adopted.verification_token.is_some() => domain = adopted,
+                _ => return,
+            }
+        }
         let observed = self.verifier.observe(hostname).await;
-        let outcome = grade_dns_verification(&observed, &self.effective_ingress().await);
-        let failures = self
-            .registry
-            .get(hostname)
-            .map_or(0, |d| d.consecutive_failures);
-        let backoff =
-            i64::try_from(self.limiter.backoff_for(failures.saturating_add(1))).unwrap_or(i64::MAX);
+        let mut outcome = grade_dns_verification(&observed, &self.effective_ingress().await);
+        if outcome.is_verified() {
+            let txt = self
+                .verifier
+                .observe_txt(&domain.verification_record_name())
+                .await;
+            outcome = grade_ownership(&domain, &txt);
+        }
+        let backoff = i64::try_from(
+            self.limiter
+                .backoff_for(domain.consecutive_failures.saturating_add(1)),
+        )
+        .unwrap_or(i64::MAX);
         if let Err(e) =
-            apply_verification(&self.registry, hostname, &outcome, now_unix, backoff).await
+            apply_verification(&self.registry, &domain, &outcome, now_unix, backoff).await
         {
             tracing::warn!(
                 hostname,
