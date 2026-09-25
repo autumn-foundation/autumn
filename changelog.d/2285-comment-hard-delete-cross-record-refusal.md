@@ -1,0 +1,3 @@
+### Fixed
+
+- **commentable:** hard `delete_comment` now refuses (HTTP 422) when the reply chain reaches a comment on another record (issues #2285, #2275). A cross-record `parent_id` edge can only be written outside the framework's own `add_comment` — an import, backfill, or hand edit — and previously the hard-delete path's `ON DELETE CASCADE` would silently remove that other record's rows while its `comment_count` was never adjusted, permanently corrupting it. The delete is now rejected before anything is removed, with an error naming the stray rows and the repair path (re-point or delete them, then retry).
