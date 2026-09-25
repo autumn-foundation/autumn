@@ -109,6 +109,50 @@ pub async fn by_tag(Path(tag): Path<String>) -> AutumnResult<Markup> {
     ))
 }
 
+/// Like `autumn_web::form::text_input`, but also sets the native `type` and
+/// `required` attributes on the rendered `<input>`. `text_input` itself only
+/// ever renders `type="text"` with no `required` (see `autumn/src/form.rs`),
+/// so a bare swap to it — as an earlier draft of this fix did — silently
+/// drops the browser-native required-field check, the URL keyboard/format
+/// hint, and the `aria-required` signal that the original hand-rolled `<input
+/// type="url" required>` markup gave assistive tech (caught in review on
+/// #2954). Otherwise identical to `text_input`: same wrapper id, same
+/// per-field error rendering sourced from the changeset.
+fn required_typed_input(
+    changeset: &Changeset<NewBookmark>,
+    field: &str,
+    label: &str,
+    input_type: &str,
+) -> Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let value = changeset.field_value(field).unwrap_or_default();
+    let error_id = has_errors.then(|| format!("{field}-error"));
+    let wrapper_id = format!("{field}-field");
+
+    html! {
+        div id=(wrapper_id) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
+            input
+                type=(input_type)
+                id=(field)
+                name=(field)
+                value=(value)
+                required
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(error_id.as_deref().unwrap_or(""));
+            @if has_errors {
+                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Shared new-bookmark form body: rendered both by the plain `GET /new` and
 /// by `create`'s `422` re-render, from a `Changeset<NewBookmark>` — so a
 /// rejected submission (invalid `url`, blank/overlong `title`) redisplays the
@@ -121,8 +165,8 @@ fn new_bookmark_form(changeset: &Changeset<NewBookmark>) -> Markup {
         html! {
             h1 class="text-2xl font-bold mb-6" { "Add Bookmark" }
             form action=(paths::create()) method="post" class="space-y-4" {
-                (autumn_web::form::text_input(changeset, "url", "URL"))
-                (autumn_web::form::text_input(changeset, "title", "Title"))
+                (required_typed_input(changeset, "url", "URL", "url"))
+                (required_typed_input(changeset, "title", "Title", "text"))
                 (autumn_web::form::text_input(changeset, "tag", "Tag"))
                 button type="submit"
                        class="bg-indigo-600 text-white px-6 py-2 rounded hover:bg-indigo-700" {
