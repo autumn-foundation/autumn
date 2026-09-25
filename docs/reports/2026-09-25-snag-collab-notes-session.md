@@ -2,7 +2,7 @@
 
 ## Corrections (from Codex review on this PR)
 
-This report's first seven revisions made fourteen claims that don't hold up,
+This report's first eight revisions made fifteen claims that don't hold up,
 all caught by an automated Codex review on the PR and independently verified
 before accepting each one. Fixed in place below rather than left standing,
 per the charter's own VERIFY step:
@@ -153,6 +153,14 @@ per the charter's own VERIFY step:
     finish before Linus's begins, so the test proves convergence after both
     edit, not a guaranteed concurrent race. Reworded to describe what the
     test actually does.
+15. **`max_delete_ids` was wrongly grouped with the suite-covered limits.**
+    `oversized_messages_are_refused` sets `max_delete_ids: 2` but never sends
+    a `Delete` message, and the suite's only other `Delete`
+    (`a_delete_cannot_pre_empt_a_character_that_does_not_exist`) sends
+    1 000 ids against the *default* 10 000-id limit — nowhere near either
+    boundary. So `max_delete_ids`'s `DeleteTooLarge` path has no test
+    coverage anywhere in this repo, code-traced only. Corrected the Findings
+    summary and added a test-gap item to "Proposed next charters."
 
 The rest of the report is corrected in place (not left as strikethrough) so
 it reads as one coherent record; this section exists so the correction
@@ -406,9 +414,19 @@ by code tracing plus the existing in-process suite's
 `a_reconnect_during_the_write_window_finds_the_live_document` and
 `an_edit_made_and_ended_inside_the_write_window_survives` (which control the
 timing directly), not by anything new this session drove. This session
-drove `max_document_chars` directly at the wire level; `max_insert_chars`
-and `max_delete_ids` are covered by code tracing and the existing in-process
-suite rather than an independent wire-level probe this session, and
+drove `max_document_chars` directly at the wire level; `max_insert_chars` is
+covered by code tracing and the existing suite's
+`oversized_messages_are_refused` (which sets `max_insert_chars: 4` and sends
+a 5-char insert, asserting refusal), not by an independent wire-level probe
+this session. `max_delete_ids`, despite an earlier revision of this report
+grouping it with the other suite-covered limits, has **no test coverage at
+all** for its actual boundary: `oversized_messages_are_refused` sets
+`max_delete_ids: 2` but never sends a `Delete` message, and the suite's only
+other `CollabClientMessage::Delete` (`a_delete_cannot_pre_empt_a_character_that_does_not_exist`)
+sends 1 000 ids against the *default* 10 000-id limit, nowhere near it. So
+`max_delete_ids`'s `DeleteTooLarge` path is verified only by reading
+`hub.rs`'s check, not by any test this repository runs — a real, if narrow,
+coverage gap worth flagging rather than glossing over. And
 `max_documents`/`RegistryFull` was not reachable through this example's
 public routes at all (see "Not toured" below) — so "the four `CollabLimits`"
 is not a claim this session can make in full; scoped to what was actually
@@ -438,7 +456,14 @@ server fell over." Rough edge, digest-only.
 3. **Presence/roster correctness under connection churn** — many actors
    joining and leaving rapidly, checked for stale or duplicate roster
    entries.
-4. Continue the still-open carried-over charters from the media-room and CMS
+4. **A test-gap fix for `max_delete_ids`'s `DeleteTooLarge` boundary**
+   (found this session, see "Corrections" above) — no test anywhere in the
+   repo actually sends a `Delete` message that exceeds `max_delete_ids`.
+   A small addition to `oversized_messages_are_refused` (which already sets
+   `max_delete_ids: 2` but never uses it) would close this — a candidate for
+   this charter's own "test-gap PR" outcome, not attempted in this session
+   since it surfaced very late in review.
+5. Continue the still-open carried-over charters from the media-room and CMS
    import sessions (`docs/reports/2026-09-24-snag-db-room-store-seat-race-postgres.md`,
    `docs/reports/2026-09-12-snag-cms-import-session.md`) — unrelated to this
    session's charter, listed here only so a scheduler picking a next charter
