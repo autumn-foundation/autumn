@@ -14,15 +14,23 @@
 //! row's `author_id` and discarding the ones that don't match, until it has
 //! collected a page's worth.
 //!
-//! That is cheap when the requested author accounts for a large share of the
-//! site's published posts (most rows visited match) and increasingly
-//! expensive the smaller that author's share is — which is the *common*
-//! case on a real multi-author site: a handful of staff writers account for
-//! most of the archive, and most bylines are occasional contributors with a
-//! handful of posts each. This harness measures that gap directly across
-//! three author-share tiers on one fixture, then (in the fix commit) adds a
-//! covering `(author_id, status, published_at DESC)` index and re-measures
-//! in the same session.
+//! For the *row fetch*, that is cheap when the requested author accounts for
+//! a large share of the site's published posts (most rows visited match) and
+//! increasingly expensive the smaller that author's share is. For the
+//! *count* (no `LIMIT` to stop early), it is the other way around: it has to
+//! visit every matching row regardless of share, so it costs the most,
+//! measured, for the *most* prolific author — 7,426 of that tier's 7,440
+//! total buffers were the count, not the row fetch. Both are real, and both
+//! are common: a handful of staff writers account for most of a real
+//! multi-author site's archive, and most bylines are occasional
+//! contributors with a handful of posts each — so both the "prolific
+//! author's page renders" case and the "most authors' pages render" case
+//! are hot in practice. This harness measures both across three
+//! author-share tiers on one fixture, then (in the fix commit) adds a
+//! covering `(author_id, status, published_at DESC) INCLUDE (post_type)`
+//! index — the `INCLUDE` lets the count run as an Index Only Scan once
+//! autovacuum sets the visibility map, with no heap fetch at all — and
+//! re-measures in the same session.
 //!
 //! **Requires Docker.** Run manually with:
 //!
@@ -67,6 +75,8 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
 const BASE_SCHEMA: &str = include_str!("../migrations/20260908005714_create_content_schema/up.sql");
+const AUTHOR_INDEX_MIGRATION: &str =
+    include_str!("../migrations/20260925180000_add_posts_author_status_published_index/up.sql");
 
 /// Split a migration file into individual statements — Postgres refuses more
 /// than one command per prepared statement, and (for `CREATE INDEX
@@ -278,6 +288,127 @@ fn print_profile(conn: &mut PgConnection, label: &str) -> (i64, i64) {
     (total_calls, total_buffers)
 }
 
+/// Sum of every statement `pg_stat_statements` recorded since the last
+/// reset, across the *whole* workload (not just the `author_id`-filtered
+/// subset `print_profile` isolates) — the denominator the Hard Gate's
+/// "% of total buffers / % of total calls" needs. Excludes the meta query
+/// itself, same as `print_profile`.
+fn total_workload_buffers_calls(conn: &mut PgConnection) -> (i64, i64) {
+    use diesel::RunQueryDsl;
+    #[derive(QueryableByName)]
+    struct TotalsRow {
+        #[diesel(sql_type = BigInt)]
+        calls: i64,
+        #[diesel(sql_type = BigInt)]
+        buffers: i64,
+    }
+    let row = diesel::sql_query(
+        "SELECT COALESCE(SUM(calls), 0)::bigint AS calls, \
+                COALESCE(SUM(shared_blks_hit + shared_blks_read), 0)::bigint AS buffers \
+         FROM pg_stat_statements WHERE query NOT ILIKE '%pg_stat_statements%'",
+    )
+    .get_result::<TotalsRow>(conn)
+    .expect("total workload buffers/calls");
+    (row.calls, row.buffers)
+}
+
+/// The WAL cost of inserting `n` ordinary posts, measured via the
+/// `pg_current_wal_lsn()` delta around the batch — the admissible technique
+/// for "any write-path claim" (Ledger process), used here to price the new
+/// index's tax on every future insert into `posts`.
+fn wal_bytes_for_insert_batch(
+    conn: &mut PgConnection,
+    label: &str,
+    author_id: i64,
+    slug_prefix: &str,
+    offset: i64,
+    n: i64,
+) -> i64 {
+    use diesel::RunQueryDsl;
+
+    #[derive(QueryableByName)]
+    struct LsnRow {
+        #[diesel(sql_type = Text)]
+        lsn: String,
+    }
+    let before = diesel::sql_query("SELECT pg_current_wal_lsn()::text AS lsn")
+        .get_result::<LsnRow>(conn)
+        .expect("wal lsn before")
+        .lsn;
+
+    conn.batch_execute(&format!(
+        "INSERT INTO posts \
+         (post_type, title, slug, excerpt, body, status, author_id, created_at, updated_at) \
+         SELECT 'post', 'WAL bench ' || i, '{slug_prefix}-' || i, '', 'x', 'draft', \
+                {author_id}, NOW(), NOW() \
+         FROM generate_series({start}, {end}) AS i",
+        start = offset + 1,
+        end = offset + n,
+    ))
+    .expect("wal bench insert batch");
+
+    #[derive(QueryableByName)]
+    struct DiffRow {
+        #[diesel(sql_type = BigInt)]
+        bytes: i64,
+    }
+    let bytes = diesel::sql_query(format!(
+        "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '{before}'::pg_lsn)::bigint AS bytes"
+    ))
+    .get_result::<DiffRow>(conn)
+    .expect("wal lsn diff")
+    .bytes;
+    println!("=== WAL bytes for {n} inserts ({label}): {bytes} ===");
+    bytes
+}
+
+/// `idx_scan` for `idx_posts_author_status_published` — confirms the new
+/// index is actually chosen by the planner in this session, not merely
+/// created and left unused.
+///
+/// `pg_stat_force_next_flush()` first: PG 15+ keeps per-backend statistics in
+/// local memory and only flushes them to the shared stats snapshot
+/// `pg_stat_user_indexes` reads from at transaction end or on its own
+/// ~500ms timer — so a check performed immediately after the `EXPLAIN
+/// EXECUTE` calls above, even on the same connection, can read a snapshot
+/// that has not absorbed them yet and report `idx_scan=0` despite the plan
+/// visibly using the index. Forcing the flush makes this deterministic
+/// instead of a timing-dependent flake.
+fn author_status_published_idx_scan(conn: &mut PgConnection) -> i64 {
+    use diesel::RunQueryDsl;
+    #[derive(QueryableByName)]
+    struct ScanRow {
+        #[diesel(sql_type = BigInt)]
+        idx_scan: i64,
+    }
+    diesel::sql_query("SELECT pg_stat_force_next_flush()")
+        .execute(conn)
+        .expect("force stats flush");
+    diesel::sql_query(
+        "SELECT idx_scan FROM pg_stat_user_indexes \
+         WHERE indexrelname = 'idx_posts_author_status_published'",
+    )
+    .get_result::<ScanRow>(conn)
+    .map(|row| row.idx_scan)
+    .unwrap_or(0)
+}
+
+/// The new index's on-disk size in bytes, for the write-cost report.
+fn author_status_published_index_size(conn: &mut PgConnection) -> i64 {
+    use diesel::RunQueryDsl;
+    #[derive(QueryableByName)]
+    struct SizeRow {
+        #[diesel(sql_type = BigInt)]
+        bytes: i64,
+    }
+    diesel::sql_query(
+        "SELECT pg_relation_size('idx_posts_author_status_published')::bigint AS bytes",
+    )
+    .get_result::<SizeRow>(conn)
+    .expect("index size")
+    .bytes
+}
+
 #[derive(QueryableByName, Debug)]
 struct ExplainLine {
     #[diesel(sql_type = Text, column_name = "QUERY PLAN")]
@@ -315,6 +446,37 @@ fn explain_row_fetch(conn: &mut PgConnection, label: &str, author_id: i64) {
         println!("{}", line.line);
     }
     diesel::sql_query("DEALLOCATE ledger_author_page")
+        .execute(conn)
+        .expect("deallocate");
+}
+
+/// `EXPLAIN` the count shape (identical predicate, no `ORDER BY`/`LIMIT`) —
+/// the query with no `LIMIT` to exploit, so it is the one the row-fetch's
+/// early-exit plan does nothing for. See `explain_row_fetch` for why this
+/// uses `PREPARE`/`EXECUTE` rather than a literal or subquery.
+fn explain_count(conn: &mut PgConnection, label: &str, author_id: i64) {
+    use diesel::RunQueryDsl;
+    println!(
+        "\n=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): {label} count (author_id={author_id}) ==="
+    );
+    diesel::sql_query(
+        "PREPARE ledger_author_count (bigint) AS \
+         SELECT count(*) FROM \"posts\" \
+         WHERE \"posts\".\"author_id\" = $1 \
+           AND \"posts\".\"status\" = 'publish' \
+           AND \"posts\".\"post_type\" = ANY(ARRAY['post', 'page'])",
+    )
+    .execute(conn)
+    .expect("prepare");
+    let lines = diesel::sql_query(format!(
+        "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) EXECUTE ledger_author_count({author_id})"
+    ))
+    .load::<ExplainLine>(conn)
+    .expect("explain");
+    for line in lines {
+        println!("{}", line.line);
+    }
+    diesel::sql_query("DEALLOCATE ledger_author_count")
         .execute(conn)
         .expect("deallocate");
 }
@@ -373,6 +535,7 @@ async fn author_archive_batch_profile() {
 
     println!("\n#################### BASELINE (no author-covering index) ####################");
     let mut baseline_shares = Vec::new();
+    let mut baseline_bodies = Vec::new();
     for (username, user_id, published) in &tiers {
         reset_stats(&mut conn);
         let body = client
@@ -387,16 +550,156 @@ async fn author_archive_batch_profile() {
             &body[..body.len().min(2000)]
         );
         let (calls, buffers) = print_profile(&mut conn, &format!("baseline / {username}"));
+        let (total_calls, total_buffers) = total_workload_buffers_calls(&mut conn);
+        println!(
+            "-- share of this request's own workload: calls {calls}/{total_calls} \
+             ({:.1}%), buffers {buffers}/{total_buffers} ({:.1}%) --",
+            100.0 * calls as f64 / total_calls.max(1) as f64,
+            100.0 * buffers as f64 / total_buffers.max(1) as f64,
+        );
         explain_row_fetch(
             &mut conn,
             &format!("baseline / {username} ({published} published)"),
             *user_id,
         );
+        explain_count(
+            &mut conn,
+            &format!("baseline / {username} ({published} published)"),
+            *user_id,
+        );
         baseline_shares.push((*username, calls, buffers));
+        baseline_bodies.push((*username, body));
     }
 
     println!("\n=== baseline summary (calls, buffers per tier) ===");
     for (username, calls, buffers) in &baseline_shares {
         println!("{username:<12} calls={calls:<6} buffers={buffers}");
+    }
+
+    let wal_before = wal_bytes_for_insert_batch(
+        &mut conn,
+        "baseline (no covering index)",
+        DEFAULT_AUTHOR_ID,
+        "wal-bench-before",
+        0,
+        2_000,
+    );
+
+    println!("\n#################### FIX: apply the covering index ####################");
+    apply_migration(&mut conn, AUTHOR_INDEX_MIGRATION);
+    // `VACUUM` (not just `ANALYZE`): the count query's Index Only Scan needs
+    // the visibility map set to skip heap fetches entirely — the whole point
+    // of `INCLUDE (post_type)`. A real table gets this from autovacuum over
+    // time; this harness forces it immediately so the "after" numbers show
+    // the index's steady-state benefit rather than its cold, not-yet-vacuumed
+    // one.
+    conn.batch_execute("VACUUM ANALYZE posts")
+        .expect("vacuum analyze after adding the covering index");
+
+    let wal_after = wal_bytes_for_insert_batch(
+        &mut conn,
+        "after (covering index present)",
+        DEFAULT_AUTHOR_ID,
+        "wal-bench-after",
+        2_000,
+        2_000,
+    );
+    println!(
+        "\n=== WAL write-cost of the new index: {wal_before} -> {wal_after} bytes for 2,000 \
+         inserts ({:+.1}%) ===",
+        100.0 * (wal_after - wal_before) as f64 / wal_before.max(1) as f64
+    );
+    println!(
+        "=== new index on-disk size: {} bytes ===",
+        author_status_published_index_size(&mut conn)
+    );
+
+    println!("\n#################### AFTER (covering index present) ####################");
+    let mut after_shares = Vec::new();
+    let mut after_bodies = Vec::new();
+    for (username, user_id, published) in &tiers {
+        reset_stats(&mut conn);
+        let body = client
+            .get(&format!("/author/{username}"))
+            .send()
+            .await
+            .assert_ok()
+            .text();
+        assert!(
+            body.contains("Post "),
+            "author archive for {username} must render at least one post card:\n{}",
+            &body[..body.len().min(2000)]
+        );
+        let (calls, buffers) = print_profile(&mut conn, &format!("after / {username}"));
+        let (total_calls, total_buffers) = total_workload_buffers_calls(&mut conn);
+        println!(
+            "-- share of this request's own workload: calls {calls}/{total_calls} \
+             ({:.1}%), buffers {buffers}/{total_buffers} ({:.1}%) --",
+            100.0 * calls as f64 / total_calls.max(1) as f64,
+            100.0 * buffers as f64 / total_buffers.max(1) as f64,
+        );
+        explain_row_fetch(
+            &mut conn,
+            &format!("after / {username} ({published} published)"),
+            *user_id,
+        );
+        explain_count(
+            &mut conn,
+            &format!("after / {username} ({published} published)"),
+            *user_id,
+        );
+        after_shares.push((*username, calls, buffers));
+        after_bodies.push((*username, body));
+    }
+
+    println!("\n=== equivalence: baseline vs. after HTML body, per tier ===");
+    for ((username, before_body), (username2, after_body)) in
+        baseline_bodies.iter().zip(&after_bodies)
+    {
+        assert_eq!(username, username2, "tier order must match between phases");
+        assert_eq!(
+            before_body, after_body,
+            "the covering index must not change {username}'s rendered author-archive page \
+             at all — same rows, same order, same HTML"
+        );
+        println!("{username:<12} identical ({} bytes)", before_body.len());
+    }
+
+    // `pg_stat_user_indexes.idx_scan` is fed by each backend's periodic stats
+    // flush (Postgres 15+'s shared-memory stats subsystem reports at most
+    // once per `PGSTAT_MIN_INTERVAL`, ~1s, not synchronously per statement),
+    // and the archive requests ran on the connection *pool*'s backends, not
+    // this harness's own `conn` — so a query issued immediately after the
+    // loop above can race the flush and see a stale 0. Poll rather than
+    // sleep-and-hope: succeeds the moment the flush lands, and still fails
+    // loudly (not silently passes) if the index is genuinely never chosen.
+    let mut idx_scan = 0;
+    for _ in 0..20 {
+        idx_scan = author_status_published_idx_scan(&mut conn);
+        if idx_scan > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert!(
+        idx_scan > 0,
+        "idx_posts_author_status_published must actually be chosen by the planner at least \
+         once in this run — idx_scan={idx_scan} after polling for 5s means it would be a pure \
+         write tax nobody reads (the reddit-clone covering-index negative-result outcome)"
+    );
+    println!("\n=== idx_posts_author_status_published: idx_scan={idx_scan} (must be > 0) ===");
+
+    println!("\n=== delta summary: baseline -> after (calls, buffers per tier) ===");
+    println!(
+        "{:<12} {:>16} {:>16} {:>16} {:>16} {:>10}",
+        "tier", "calls before", "calls after", "buffers before", "buffers after", "delta %"
+    );
+    for ((username, bcalls, bbuffers), (_, acalls, abuffers)) in
+        baseline_shares.iter().zip(&after_shares)
+    {
+        let delta_pct = 100.0 * (*abuffers - *bbuffers) as f64 / (*bbuffers).max(1) as f64;
+        println!(
+            "{username:<12} {bcalls:>16} {acalls:>16} {bbuffers:>16} {abuffers:>16} {delta_pct:>9.1}%"
+        );
     }
 }

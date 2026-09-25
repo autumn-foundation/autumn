@@ -17,6 +17,23 @@
 -- `docs/reports/2026-09-25-ledger-cms-author-archive-index/` for the
 -- measured buffers/rows-read delta across three author-share tiers.
 --
+-- `INCLUDE (post_type)` carries the one remaining filter column that isn't
+-- part of the key, so the *count* query
+-- (`published_post_count_by_author`'s gate check, and
+-- `published_posts_by_author`'s own internal count — identical SQL shape)
+-- can be answered as an Index Only Scan once autovacuum has set the
+-- visibility map: no heap fetch per matching row at all, versus one per row
+-- today. That matters more than it looks: the count has no `LIMIT` to
+-- exploit, so it is the *more* expensive of the two queries for a
+-- high-share author (measured: 7,426 of a prolific author's 7,440 total
+-- buffers were the count, not the row fetch) even though the row fetch is
+-- the one whose plan visibly changes shape by author share. The row fetch
+-- (`SELECT posts.*`) still needs a heap visit per row it returns, but
+-- `LIMIT` already bounds that to the page size once the index gives it
+-- correctly-ordered candidates. See
+-- `docs/reports/2026-09-25-ledger-cms-author-archive-index/` for the
+-- measured buffers/rows-read delta across three author-share tiers.
+--
 -- `CONCURRENTLY` (needs `run_in_transaction = false` in this migration's
 -- `metadata.toml` — Postgres refuses `CREATE INDEX CONCURRENTLY` inside a
 -- transaction block) so this never takes more than a `SHARE UPDATE
@@ -31,4 +48,4 @@
 -- so an operator has to `DROP INDEX CONCURRENTLY idx_posts_author_status_published`
 -- and rerun before this can silently succeed.
 CREATE INDEX CONCURRENTLY idx_posts_author_status_published
-    ON posts (author_id, status, published_at DESC);
+    ON posts (author_id, status, published_at DESC) INCLUDE (post_type);
