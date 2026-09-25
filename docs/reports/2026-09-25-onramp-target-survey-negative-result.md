@@ -78,8 +78,10 @@ workspace manifest, which just declares it as a member, not a consumer).
 list (`autumn-cli/tests/generate.rs:8886`) is `autumn-admin-plugin`,
 `autumn-cache-redis`, `autumn-media-plugin`, `autumn-search`,
 `autumn-storage-s3` — five entries, and **`autumn-billing` is not among
-them**, so that gate doesn't even scaffold-check it. For the four plugins it
-does cover, the gate only proves `autumn plugin add` + `cargo check`
+them**, so that gate doesn't even scaffold-check it. **Correction (caught by
+Codex review on this PR): the five plugins it does list are all five it
+covers, not four** — for those five, the gate only proves `autumn plugin
+add` + `cargo check`
 succeeds on a freshly scaffolded project — not that any example actually
 *uses* the plugin's features, which is what issue #2320's coverage matrix
 scores as "Example."
@@ -121,10 +123,35 @@ adjacent locking path — exactly the kind of blast radius this charter asks
 to route through "ask before" rather than parallel, uncoordinated fixes. Not
 pursued this cycle for that reason, not for lack of evidence.
 
-**Upgrade.** `docs/migrations/next.md` is the standard rolling-draft
-template with no unresolved breaking-change section outstanding. No open
-issue or fragment describes a broken or confusing upgrade step for the most
-recent version bump.
+**Upgrade — correction (caught by Codex review on this PR): an earlier draft
+claimed `docs/migrations/next.md` is "the standard rolling-draft template
+with no unresolved breaking-change section outstanding."** That's false —
+checked only the file's boilerplate header, not its body. `next.md` is
+1,743 lines and, past the `{X.Y.Z}`-placeholder template section, carries
+dozens of real, in-flight breaking-change entries for the next release: TLS
+mTLS config, audit metadata, OpenAPI parameters, SSG manifest types, failure
+capsules, two config additions, media-room `RoomStore`, admin-plugin
+timestamps, capacity contracts, job admin records, DB scrub trigger
+refusal, ACME DNS-01, an `#[authorize]` aliasing security fix, a
+`#[feature_flag]`/`static_get` interaction fix, a `#[repository]`
+owner/policy security fix, `#[lifecycle]` graph soundness, `OpenApiSchema`
+serde interaction, and the `autumn-macros` crate split, among others — this
+is a real, substantial upgrade journey, not an empty draft.
+
+**Narrowing the claim to what was actually checked:** no *open issue*
+reports a broken or confusing upgrade step for the pending release (a
+targeted search found none), and every entry sampled follows the file's own
+required shape (Why / Before / After / **Automation** label, gated by
+`scripts/check-migration-guides.sh`) unusually thoroughly. But this survey
+did **not** audit the entries themselves for clarity, completeness, or
+`autumn upgrade` codemod coverage — that would be its own Tier-1 journey
+arithmetic pass (concepts, steps, and misuse-compile checks for a real
+version bump), not something a few minutes of issue-search can stand in
+for. So "the upgrade journey has no gap" is retracted; the honest statement
+is narrower: no *reported* gap, and a real content audit of `next.md`
+remains undone and is a legitimate candidate to scope for a future cycle
+given how much breaking-change surface has accumulated there, including two
+security-motivated changes.
 
 **Cold-start compile time (issue #2795, open).** Two prior Onramp reports
 already invested here without a shippable result:
@@ -149,10 +176,14 @@ the cold build) and found a properly-replicated, order-reversal-checked
 **~26-28% reduction** in compile-and-link wall time — well clear of its own
 pre-registered 10% materiality line — and independently confirmed (the
 2026-09-17 report only asserted this in prose) that `limited` preserves
-backtrace file:line resolution. That changes the shape of the pending
-decision from "one-time cold-start win vs. a permanent backtrace-quality
-cost" to "a cold-start win *and* a large recurring per-edit win vs. that same
-cost" — a materially stronger case for picking `limited`, not just a
+backtrace file:line resolution. **Fix (caught a second time by Codex review
+on this PR, after an intervening edit still left it wrong): `limited` does
+not carry the backtrace-quality cost at all** — that cost is `debug=0`'s
+alone (see the correction further below). So the 2026-09-21 report doesn't
+just add a warm-edit number to the same trade-off; it strengthens `limited`
+specifically into a cold-start win *and* a large recurring per-edit win
+*with no backtrace cost*, which is a materially stronger case for picking it
+over `debug=0` than the 2026-09-17 report alone showed, not just a
 restatement of the same open question.
 
 **This still doesn't clear the bar for autonomous action here.** The
