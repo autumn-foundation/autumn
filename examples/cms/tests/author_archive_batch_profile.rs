@@ -66,8 +66,7 @@ use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
-const BASE_SCHEMA: &str =
-    include_str!("../migrations/20260908005714_create_content_schema/up.sql");
+const BASE_SCHEMA: &str = include_str!("../migrations/20260908005714_create_content_schema/up.sql");
 
 /// Split a migration file into individual statements — Postgres refuses more
 /// than one command per prepared statement, and (for `CREATE INDEX
@@ -197,12 +196,7 @@ fn seed_authors(conn: &mut PgConnection) -> Vec<(&'static str, i64, i64)> {
            WHEN id % {} = 0 THEN {} \
            ELSE author_id END \
          WHERE status = 'publish'",
-        TIERS[0].modulus,
-        user_ids[0],
-        TIERS[1].modulus,
-        user_ids[1],
-        TIERS[2].modulus,
-        user_ids[2],
+        TIERS[0].modulus, user_ids[0], TIERS[1].modulus, user_ids[1], TIERS[2].modulus, user_ids[2],
     ))
     .expect("carve out tier authors");
 
@@ -278,7 +272,9 @@ fn print_profile(conn: &mut PgConnection, label: &str) -> (i64, i64) {
         total_calls += row.calls;
         total_buffers += row.buffers;
     }
-    println!("-- total (author_id-filtered posts statements): calls={total_calls} buffers={total_buffers} --");
+    println!(
+        "-- total (author_id-filtered posts statements): calls={total_calls} buffers={total_buffers} --"
+    );
     (total_calls, total_buffers)
 }
 
@@ -296,7 +292,9 @@ struct ExplainLine {
 /// from a plain SQL string.
 fn explain_row_fetch(conn: &mut PgConnection, label: &str, author_id: i64) {
     use diesel::RunQueryDsl;
-    println!("\n=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): {label} (author_id={author_id}) ===");
+    println!(
+        "\n=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): {label} (author_id={author_id}) ==="
+    );
     diesel::sql_query(
         "PREPARE ledger_author_page (bigint) AS \
          SELECT \"posts\".* FROM \"posts\" \
