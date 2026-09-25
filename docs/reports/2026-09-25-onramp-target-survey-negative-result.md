@@ -138,12 +138,20 @@ owner/policy security fix, `#[lifecycle]` graph soundness, `OpenApiSchema`
 serde interaction, and the `autumn-macros` crate split, among others — this
 is a real, substantial upgrade journey, not an empty draft.
 
-**Narrowing the claim to what was actually checked:** no *open issue*
-reports a broken or confusing upgrade step for the pending release (a
-targeted search found none), and every entry sampled follows the file's own
-required shape (Why / Before / After / **Automation** label, gated by
-`scripts/check-migration-guides.sh`) unusually thoroughly. But this survey
-did **not** audit the entries themselves for clarity, completeness, or
+**Narrowing the claim to what was actually checked — correction (caught by
+Codex review on this PR): an earlier draft of this paragraph also overstated
+what `scripts/check-migration-guides.sh` gates.** It checks the guide-level
+TEMPLATE.md shape (required headings, each with content, indexed in
+`docs/migrations/README.md`) and, over `CHANGELOG.md`, the `**Breaking:**`
+marker/coverage/linkage convention — it does **not** gate each entry's own
+Why/Before/After/Automation shape, which is a house convention, not an
+enforced one. It also isn't universal in practice: the "Media rooms" entry
+(`docs/migrations/next.md:608-637`) has no explicit `**Why:**`/Before/After
+blocks at all, just prose. So: no *open issue* reports a broken or
+confusing upgrade step for the pending release (a targeted search found
+none), and most sampled entries do follow the Why/Before/After/Automation
+convention closely — but not gated, and not universal. This survey did
+**not** audit the entries themselves for clarity, completeness, or
 `autumn upgrade` codemod coverage — that would be its own Tier-1 journey
 arithmetic pass (concepts, steps, and misuse-compile checks for a real
 version bump), not something a few minutes of issue-search can stand in
