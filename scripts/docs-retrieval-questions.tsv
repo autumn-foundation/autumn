@@ -154,3 +154,30 @@ rp_id	docs/guide/authentication.md
 # are in the intro and the flag table, not in a heading — and moving it to a
 # heading is a change to that section's structure and anchors, on its own
 # evidence, not a ride on this one.
+
+# --- Capturing a diagnostic snapshot --------------------------------------
+# All three failed cold before this change. `autumn export` — the command that
+# writes a running app's health/metrics/tasks/loggers to one JSON file —
+# appeared on NO reader-facing page across all 164 guide pages; it was one of
+# the six entries on `check-docs-cli-coverage.sh`'s triaged backlog, entered
+# there with the note that "the likeliest reader is someone assembling a
+# support ticket, which is the worst moment to find nothing." Coverage, not
+# findability: there was no second page splitting the rank, there was no page.
+#
+# "diagnostic snapshot", "export diagnostics" and "bug report" landed nowhere.
+# The bare word "diagnostics" landed on four pages, none of them an answer —
+# `constela.md`'s "Diagnostics are a repair prompt", `dev-loop-latency.md`'s
+# "Regression Diagnostics", `getting-started.md`'s "Route collision
+# diagnostics" and `tls.md`'s "Failure diagnostics" — so the reader who did
+# search got four wrong answers rather than silence.
+diagnostic snapshot	docs/guide/deployment.md
+export diagnostics	docs/guide/deployment.md
+bug report	docs/guide/deployment.md
+# "diagnostics" alone is deliberately NOT admitted. It would pass the moment
+# the section lands — the gate asks only that the named page be AMONG the hits
+# — while the four mis-landings above are all still there, so the row would go
+# green over a defect it does not measure. Narrowing it is a findability
+# question about four other pages' headings, on its own evidence, not a ride
+# here. "support bundle" and "collect diagnostics" are not admitted either:
+# closing them means a heading spelled for the matcher rather than the reader,
+# the same reasoning as "gzip", "incoming email" and "policy generator" above.

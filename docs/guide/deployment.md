@@ -2957,6 +2957,116 @@ Autumn does not add implicitly.
 
 ---
 
+## Capturing a diagnostic snapshot for a bug report (`autumn export`)
+
+`autumn export` reads a **running** app over HTTP and writes one JSON file —
+the thing to attach to a bug report or an incident ticket, so you are not
+hand-assembling four `curl` outputs and hoping you got them all.
+
+```console
+$ autumn export --url http://your-host:3000 --output autumn-diag.json
+Exporting diagnostics from http://your-host:3000
+Successfully exported diagnostics to autumn-diag.json
+```
+
+Both flags are optional: `--url` defaults to `http://localhost:3000`, and
+`--output` to `autumn-diag.json` in the working directory. It runs once and
+exits rather than streaming — for a live view of the same app, see
+`autumn monitor` under [Next steps](#next-steps).
+
+Do not confuse it with `autumn openapi export` (writes your API schema) or
+`autumn data export` (writes model rows as CSV). Neither is a diagnostic
+snapshot.
+
+### What the file contains
+
+A `timestamp` (Unix seconds), the `url` it read, and the verbatim JSON body of
+four actuator endpoints under those four keys:
+
+| Key | Endpoint | Mounted |
+| --- | --- | --- |
+| `health` | `/actuator/health` | always |
+| `metrics` | `/actuator/metrics` | always |
+| `tasks` | `/actuator/tasks` | only when `actuator.sensitive = true` |
+| `loggers` | `/actuator/loggers` | only when `actuator.sensitive = true` |
+
+**The four readings are not simultaneous, and `timestamp` is not when they were
+taken.** `autumn export` requests the endpoints one after another over a
+blocking client with a five-second timeout each, so a slow app can put several
+seconds between the first reading and the last; `timestamp` is recorded *after*
+all four have returned, which makes it the moment collection finished. Treat
+the file as a bundle of four readings taken in the order the table lists them,
+not as one coherent instant — in particular, do not read `metrics` and `tasks` as
+describing the same moment when diagnosing a race or a spike.
+
+A snapshot is **operational data about your app**, not a sanitized report:
+`/actuator/loggers` names your modules and their levels, `/actuator/tasks`
+names your scheduled work and its recent runs, and `/actuator/health` carries
+the per-component `details` map unless `health.detailed = false`, which is
+[the `prod` default](health-indicators.md#hiding-details-in-production). Read
+the file before attaching it to anything public.
+
+### It fails outright against a hardened production app
+
+The `dev` profile sets `actuator.sensitive = true`; every other profile
+leaves it at its **`false`** default — the shape [recommended
+above](#prometheus-metrics-for-platform-scraping) — and an actuator path that
+is not mounted answers `404`. `autumn export` treats *any* endpoint it cannot
+read as fatal: it writes no file at all, prints the first failure, and exits
+`1`.
+
+```console
+$ autumn export --url http://your-host:3000
+Exporting diagnostics from http://your-host:3000
+Failed to fetch tasks from http://your-host:3000: HTTP 404 Not Found
+```
+
+So the command works as shipped against a dev app, and against staging or
+production only where `actuator.sensitive = true` — and, either way, only at
+the default actuator prefix (below). There is no partial snapshot and no flag
+to ask for one.
+
+`sensitive` is a single app-wide switch, not a per-endpoint or per-listener
+one: turning it on to take a snapshot also mounts `/actuator/env`,
+`/actuator/configprops`, `/actuator/jobs` and `/actuator/shadow`, which is the
+posture the section above exists to talk you out of. Either take the snapshot
+from an environment that already runs with `sensitive = true`, or collect the
+two always-mounted endpoints by hand:
+
+```console
+$ curl -s http://your-host:3000/actuator/health
+$ curl -s http://your-host:3000/actuator/metrics
+```
+
+### It also requires the default actuator prefix
+
+`autumn export` builds its four URLs by appending `/actuator/health`,
+`/actuator/metrics`, `/actuator/tasks` and `/actuator/loggers` to whatever
+`--url` you pass. That prefix is a literal in the command, so it does **not**
+follow `[actuator] prefix` or `AUTUMN_ACTUATOR__PREFIX`. Under a custom prefix
+every endpoint moves — including the two that are always mounted — so `export`
+fails on the very first one, whatever `sensitive` is set to:
+
+```console
+# the app mounts its actuator at /ops
+$ autumn export --url http://your-host:3000
+Exporting diagnostics from http://your-host:3000
+Failed to fetch health from http://your-host:3000: HTTP 404 Not Found
+```
+
+Pointing `--url` at the prefix does not help — that asks for
+`/ops/actuator/health` — so under a custom prefix there is no invocation of
+`autumn export` that works. Collect the endpoints at your own prefix instead:
+
+```console
+$ curl -s http://your-host:3000/ops/health
+$ curl -s http://your-host:3000/ops/metrics
+$ curl -s http://your-host:3000/ops/tasks     # sensitive = true only
+$ curl -s http://your-host:3000/ops/loggers   # sensitive = true only
+```
+
+---
+
 ## Run locally with Docker Compose (app + Postgres)
 
 Scaffold a `docker-compose.yml` with an app service, a one-shot migration job,
@@ -3177,7 +3287,9 @@ workflow, the replacement strategies, and the full drill.
 Once the container is running:
 
 - **Monitor**: `autumn monitor --url http://your-host:3000` for a live TUI
-  dashboard of metrics, logs, and routes.
+  dashboard of metrics, logs, and routes. For a one-shot snapshot written to a
+  file instead — what a bug report wants attached — see [Capturing a diagnostic
+  snapshot](#capturing-a-diagnostic-snapshot-for-a-bug-report-autumn-export).
 - **Scale**: add `min_machines_running = 1` in `fly.toml` to keep a warm
   instance; use `pool_size` in `autumn.production.toml.example` to tune
   database concurrency.
