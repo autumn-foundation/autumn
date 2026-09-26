@@ -100,6 +100,13 @@ The row lock is doing a second job too. It is held from the probe until commit,
 so the counter `UPDATE` that follows can key on the parent id alone: no
 concurrent writer can re-tenant or delete the row underneath it.
 
+The parent probe addresses the model's physical primary-key column: if the
+`#[id]` field is renamed in the database with `#[diesel(column_name =
+"…")]`, the generated SQL names the renamed column, not the Rust field.
+(Child-side maintenance — counter caches and derivations — cannot see the
+parent's fields, so those take an explicit `parent_pk = "…"` override
+instead; see the counter-cache and derivations guides.)
+
 ### Hard deletes (#2265)
 
 The write-path check stops an unknown parent from getting a comment. It does
