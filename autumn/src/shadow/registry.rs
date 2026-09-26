@@ -75,6 +75,14 @@ pub struct ShadowStats {
     /// `ADMISSION_CONTROL_STATUSES`. Diffing those against a candidate under
     /// none of the same pressure reports a divergence every time.
     pub skipped_refused: u64,
+    /// Requests not mirrored because they were conditional (`If-None-Match`,
+    /// `If-Modified-Since`, `If-Range`, `If-Match`, `If-Unmodified-Since`).
+    /// A validator is scoped to the build that issued it, so replaying the
+    /// primary's validator to the candidate compares `304`-against-`200`
+    /// noise — or compares two empty `304` bodies and records a vacuous match
+    /// (issue #2335). Counted apart from the other skips so the report shows
+    /// how much coverage this costs on cache-heavy routes.
+    pub skipped_conditional: u64,
     /// Mirrored requests whose primary response never completed within the
     /// deadline — the client disconnected, stopped reading, or the response was
     /// a long-lived stream. Counted so `mirrored` always accounts for itself:
@@ -241,6 +249,7 @@ struct Counters {
     dropped_at_capacity: AtomicU64,
     skipped_oversize: AtomicU64,
     skipped_refused: AtomicU64,
+    skipped_conditional: AtomicU64,
     primary_incomplete: AtomicU64,
 }
 
@@ -341,6 +350,11 @@ impl ShadowRegistry {
         bump(&self.counters.skipped_refused);
     }
 
+    /// Count a request not mirrored because it was conditional.
+    pub fn record_skipped_conditional(&self) {
+        bump(&self.counters.skipped_conditional);
+    }
+
     /// Count a mirrored request whose primary response never completed.
     pub fn record_primary_incomplete(&self) {
         bump(&self.counters.primary_incomplete);
@@ -418,6 +432,7 @@ impl ShadowRegistry {
             dropped_at_capacity: self.counters.dropped_at_capacity.load(Ordering::Relaxed),
             skipped_oversize: self.counters.skipped_oversize.load(Ordering::Relaxed),
             skipped_refused: self.counters.skipped_refused.load(Ordering::Relaxed),
+            skipped_conditional: self.counters.skipped_conditional.load(Ordering::Relaxed),
             primary_incomplete: self.counters.primary_incomplete.load(Ordering::Relaxed),
         }
     }
@@ -612,9 +627,11 @@ mod tests {
         registry.record_shadow_timeout();
         registry.record_skipped_oversize();
         registry.record_skipped_refused();
+        registry.record_skipped_conditional();
         registry.record_primary_incomplete();
         let stats = registry.stats();
         assert_eq!(stats.skipped_refused, 1);
+        assert_eq!(stats.skipped_conditional, 1);
         assert_eq!(stats.primary_incomplete, 1);
         assert_eq!(stats.mirrored, 2);
         assert_eq!(stats.dropped_at_capacity, 1);
