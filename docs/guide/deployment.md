@@ -1880,6 +1880,9 @@ hosts = ["app.example.com", ".example.com"]
 - `app.example.com` matches exactly that hostname.
 - `.example.com` matches both `example.com` and any subdomain like `api.example.com`.
 - `hosts = ["*"]` disables host filtering (escape hatch; not recommended for production).
+- A tenant hostname connected through
+  [custom domains](tls.md#tenant-custom-domains-servertlsacmecustom_domains) is
+  trusted while it is `active`, without a line here.
 
 In `prod`/`production` profile, startup fails when `security.trusted_hosts.hosts` is empty.
 Health/probe routes (`/actuator/health`, `/live`, `/ready`, `/startup`) intentionally bypass host checks so orchestration probes remain reliable.

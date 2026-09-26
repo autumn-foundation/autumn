@@ -30,6 +30,28 @@ pub fn should_own_replay(input_fn: &syn::ItemFn) -> bool {
         && !has_pending_authorize_attr(input_fn)
 }
 
+/// The gate body for a guard that [`should_own_replay`]: look up a cached
+/// `IdempotencyReplayResponse` and return it immediately when present.
+///
+/// Callers splice this into their own gate assembly wherever their ordering
+/// requires it — `#[secured]` and `#[throttle]` place it after their own
+/// check, `#[step_up]` before — so it takes no ordering flag; the identical
+/// token stream (issue #1668) is the only thing shared between them.
+pub fn owned_replay_check_tokens() -> proc_macro2::TokenStream {
+    quote::quote! {
+        let __autumn_idempotency_replay = parts
+            .extensions
+            .get::<::autumn_web::idempotency::IdempotencyReplayResponse>()
+            .cloned()
+            .map(::autumn_web::reexports::axum::extract::Extension);
+        if let ::core::option::Option::Some(__autumn_response) =
+            ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+        {
+            return ::core::result::Result::Err(__autumn_response);
+        }
+    }
+}
+
 fn has_pending_authorize_attr(input_fn: &syn::ItemFn) -> bool {
     input_fn
         .attrs
@@ -793,7 +815,7 @@ fn path_matches(path: &syn::Path, expected: &[&str]) -> bool {
     // (already-finalized) output is rooted at instead (Codex review, #2552).
     let root_matches = if expected.first() == Some(&"autumn_web") {
         path.segments.first().is_some_and(|segment| {
-            segment.ident == crate::crate_path::current_target_path_segment()
+            segment.ident == autumn_macros_support::crate_path::current_target_path_segment()
         })
     } else {
         path.segments

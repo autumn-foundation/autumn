@@ -1,4 +1,4 @@
-# File Storage in Autumn
+# File Uploads and Storage
 
 Autumn ships a pluggable file-storage abstraction so apps that accept
 user-uploaded files (avatars, attachments, generated reports) don't

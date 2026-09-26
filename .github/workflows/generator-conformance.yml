@@ -73,6 +73,11 @@ on:
       - "autumn/src/**"
       - "autumn/Cargo.toml"
       - "autumn-macros/**"
+      # The macro crate split (#2809). These shards generate the model and
+      # repository surface a fresh scaffold compiles against.
+      - "autumn-macros-model/**"
+      - "autumn-macros-repository/**"
+      - "autumn-macros-support/**"
       # The `autumn plugin add` install gate (#1606) compiles each
       # first-party plugin into a fresh scaffold, so a change to any of
       # them can break the mount this workflow is the only proof of.
@@ -142,6 +147,11 @@ on:
       - "autumn/src/**"
       - "autumn/Cargo.toml"
       - "autumn-macros/**"
+      # The macro crate split (#2809). These shards generate the model and
+      # repository surface a fresh scaffold compiles against.
+      - "autumn-macros-model/**"
+      - "autumn-macros-repository/**"
+      - "autumn-macros-support/**"
       # The `autumn plugin add` install gate (#1606) compiles each
       # first-party plugin into a fresh scaffold, so a change to any of
       # them can break the mount this workflow is the only proof of.
@@ -707,6 +717,31 @@ jobs:
             | tee "$RUNNER_TEMP/conformance-constrained_scaffold_cargo_checks.log"
 
           assert_ran "$RUNNER_TEMP/conformance-constrained_scaffold_cargo_checks.log" constrained_scaffold_cargo_checks
+
+      # ── Onramp: the documented quickstart scaffold must build warning-free ──
+      #
+      # The literal `docs/guide/generators.md` example
+      # (`Post title:String body:Text published:bool`) used to leave three
+      # unused-import/unused-variable warnings in the generated routes.rs —
+      # not a `cargo build` failure, but a hard failure of the generated
+      # project's OWN `ci.yml.tmpl` (`cargo clippy --all-targets -- -D
+      # warnings`), i.e. red CI on a brand-new user's first push. Same
+      # `cli_tests` caveat as the blocks above — named explicitly here or it
+      # never runs anywhere.
+      - name: documented_scaffold_example_builds_without_warnings
+        run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_validation::documented_scaffold_example_builds_without_warnings \
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-documented_scaffold_example_builds_without_warnings.log"
+
+          assert_ran "$RUNNER_TEMP/conformance-documented_scaffold_example_builds_without_warnings.log" documented_scaffold_example_builds_without_warnings
+
       # ── cli_tests per-test triage (#1945) ───────────────────────────────
       #
       # These `#[ignore]`d tests each scaffold a fresh project and cargo-check

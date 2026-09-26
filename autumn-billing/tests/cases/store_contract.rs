@@ -943,6 +943,108 @@ pub async fn customer_one_row_per_user(store: &dyn BillingStore) {
     assert_eq!(store.customer_by_user("u-d").await.unwrap(), Some(first));
 }
 
+/// `relink_customer` overwrites an existing link — the one operation
+/// `upsert_customer` deliberately refuses (`customer_one_row_per_user`
+/// above).
+pub async fn customer_relink_overwrites_existing_link(store: &dyn BillingStore) {
+    let customer = store
+        .upsert_customer(
+            CustomerUpsert::new("cust-relink-1", "stripe", "cus_relink_1", at(0))
+                .with_user("legacy-7"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(customer.user_id.as_deref(), Some("legacy-7"));
+
+    let relinked = store
+        .relink_customer("cust-relink-1", "tenant-scoped-7".to_string(), at(1))
+        .await
+        .unwrap()
+        .expect("customer exists");
+    assert_eq!(relinked.user_id.as_deref(), Some("tenant-scoped-7"));
+    assert_eq!(relinked.updated_at, at(1));
+
+    // The store agrees: old id is gone, new id resolves.
+    assert_eq!(store.customer_by_user("legacy-7").await.unwrap(), None);
+    assert_eq!(
+        store.customer_by_user("tenant-scoped-7").await.unwrap(),
+        Some(relinked)
+    );
+}
+
+/// Relinking a customer that does not exist is `Ok(None)`, not an error.
+pub async fn customer_relink_missing_customer_is_none(store: &dyn BillingStore) {
+    let result = store
+        .relink_customer("cust-relink-missing", "someone".to_string(), at(0))
+        .await
+        .unwrap();
+    assert_eq!(result, None);
+}
+
+/// Existence is checked before the conflict scan: relinking a missing `id`
+/// is `Ok(None)` even when the target `user_id` is already claimed by a
+/// different, existing customer — a missing row is not a conflict.
+pub async fn customer_relink_missing_customer_is_none_even_with_a_conflicting_target(
+    store: &dyn BillingStore,
+) {
+    store
+        .upsert_customer(
+            CustomerUpsert::new("cust-relink-3a", "stripe", "cus_relink_3a", at(0))
+                .with_user("taken"),
+        )
+        .await
+        .unwrap();
+
+    let result = store
+        .relink_customer("cust-relink-missing-2", "taken".to_string(), at(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        result, None,
+        "a missing customer id is Ok(None), not a Conflict, regardless of \
+         whether some other existing customer already holds the target user_id"
+    );
+}
+
+/// Relinking onto a `user_id` another customer already holds is a conflict,
+/// not a silent double-link — the same partial-unique constraint
+/// `upsert_customer` observes (`customer_one_row_per_user`), now enforced on
+/// the write path that is allowed to overwrite a link.
+pub async fn customer_relink_conflicts_with_existing_target(store: &dyn BillingStore) {
+    store
+        .upsert_customer(
+            CustomerUpsert::new("cust-relink-2a", "stripe", "cus_relink_2a", at(0))
+                .with_user("already-claimed"),
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_customer(CustomerUpsert::new(
+            "cust-relink-2b",
+            "stripe",
+            "cus_relink_2b",
+            at(1),
+        ))
+        .await
+        .unwrap();
+
+    let err = store
+        .relink_customer("cust-relink-2b", "already-claimed".to_string(), at(2))
+        .await
+        .expect_err("target user_id is already linked to a different customer");
+    assert!(
+        matches!(err, autumn_billing::BillingError::Conflict(_)),
+        "expected Conflict, got {err:?}"
+    );
+    // Nothing changed.
+    let unchanged = store
+        .customer_by_id("cust-relink-2b")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.user_id, None);
+}
+
 /// The same event again (same instant, same status) is `Unchanged`, also
 /// for a terminal row.
 pub async fn subscription_unchanged_redelivery(store: &dyn BillingStore) {
@@ -1213,6 +1315,10 @@ pub async fn run_contract(store: &dyn BillingStore) {
     open_dunning_ordered_and_filtered(store).await;
     open_dunning_for_subscription_is_scoped_and_filtered(store).await;
     customer_one_row_per_user(store).await;
+    customer_relink_overwrites_existing_link(store).await;
+    customer_relink_missing_customer_is_none(store).await;
+    customer_relink_missing_customer_is_none_even_with_a_conflicting_target(store).await;
+    customer_relink_conflicts_with_existing_target(store).await;
     subscription_unchanged_redelivery(store).await;
     subscription_missing_fields_keep_stored_values(store).await;
     invoice_unchanged_redelivery(store).await;
@@ -1253,6 +1359,10 @@ mod memory {
         open_dunning_ordered_and_filtered,
         open_dunning_for_subscription_is_scoped_and_filtered,
         customer_one_row_per_user,
+        customer_relink_overwrites_existing_link,
+        customer_relink_missing_customer_is_none,
+        customer_relink_missing_customer_is_none_even_with_a_conflicting_target,
+        customer_relink_conflicts_with_existing_target,
         subscription_unchanged_redelivery,
         subscription_missing_fields_keep_stored_values,
         invoice_unchanged_redelivery,
@@ -1265,4 +1375,178 @@ mod memory {
         let store = MemoryBillingStore::new();
         run_contract(&store).await;
     }
+}
+
+/// A `BillingStore` implementor from before `relink_customer` existed —
+/// every method except it, backed by `unimplemented!()` since the point is
+/// only to prove this compiles and what the un-overridden default does.
+/// Adding a required (non-defaulted) method to a `pub trait` is a breaking
+/// change for every external implementor of it; `relink_customer` has a
+/// default body specifically so this keeps compiling.
+struct LegacyStoreWithoutRelink;
+
+impl BillingStore for LegacyStoreWithoutRelink {
+    fn claim_event<'a>(
+        &'a self,
+        _event_id: &'a str,
+        _kind: &'a str,
+        _now: DateTime<Utc>,
+        _stale_after: Duration,
+    ) -> autumn_billing::store::StoreFuture<'a, EventClaim> {
+        unimplemented!()
+    }
+    fn finish_event<'a>(
+        &'a self,
+        _event_id: &'a str,
+        _now: DateTime<Utc>,
+    ) -> autumn_billing::store::StoreFuture<'a, ()> {
+        unimplemented!()
+    }
+    fn release_event<'a>(
+        &'a self,
+        _event_id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, ()> {
+        unimplemented!()
+    }
+    fn applied_event_count(&self) -> autumn_billing::store::StoreFuture<'_, u64> {
+        unimplemented!()
+    }
+    fn upsert_customer(
+        &self,
+        _upsert: CustomerUpsert,
+    ) -> autumn_billing::store::StoreFuture<'_, autumn_billing::Customer> {
+        unimplemented!()
+    }
+    fn customer_by_id<'a>(
+        &'a self,
+        _id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Customer>> {
+        unimplemented!()
+    }
+    fn customer_by_user<'a>(
+        &'a self,
+        _user_id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Customer>> {
+        unimplemented!()
+    }
+    fn customer_by_provider_id<'a>(
+        &'a self,
+        _provider_customer_id: &'a ProviderId,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Customer>> {
+        unimplemented!()
+    }
+    // relink_customer: deliberately not overridden.
+    fn upsert_subscription(
+        &self,
+        _upsert: SubscriptionUpsert,
+    ) -> autumn_billing::store::StoreFuture<
+        '_,
+        autumn_billing::store::Write<autumn_billing::Subscription>,
+    > {
+        unimplemented!()
+    }
+    fn subscription_by_id<'a>(
+        &'a self,
+        _id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Subscription>> {
+        unimplemented!()
+    }
+    fn subscription_by_provider_id<'a>(
+        &'a self,
+        _provider_subscription_id: &'a ProviderId,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Subscription>> {
+        unimplemented!()
+    }
+    fn subscriptions_for_customer<'a>(
+        &'a self,
+        _customer_id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, Vec<autumn_billing::Subscription>> {
+        unimplemented!()
+    }
+    fn set_subscription_status<'a>(
+        &'a self,
+        _id: &'a str,
+        _status: SubscriptionStatus,
+        _now: DateTime<Utc>,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Subscription>> {
+        unimplemented!()
+    }
+    fn upsert_invoice(
+        &self,
+        _upsert: InvoiceUpsert,
+    ) -> autumn_billing::store::StoreFuture<'_, autumn_billing::store::Write<autumn_billing::Invoice>>
+    {
+        unimplemented!()
+    }
+    fn invoice_by_id<'a>(
+        &'a self,
+        _id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Invoice>> {
+        unimplemented!()
+    }
+    fn invoice_by_provider_id<'a>(
+        &'a self,
+        _provider_invoice_id: &'a ProviderId,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Invoice>> {
+        unimplemented!()
+    }
+    fn upsert_dunning(
+        &self,
+        _attempt: DunningAttempt,
+    ) -> autumn_billing::store::StoreFuture<'_, ()> {
+        unimplemented!()
+    }
+    fn dunning_by_invoice<'a>(
+        &'a self,
+        _invoice_id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<DunningAttempt>> {
+        unimplemented!()
+    }
+    fn claim_dunning_attempt<'a>(
+        &'a self,
+        _invoice_id: &'a str,
+        _attempt: i64,
+        _now: DateTime<Utc>,
+    ) -> autumn_billing::store::StoreFuture<'a, bool> {
+        unimplemented!()
+    }
+    fn open_dunning(&self) -> autumn_billing::store::StoreFuture<'_, Vec<DunningAttempt>> {
+        unimplemented!()
+    }
+    fn open_dunning_for_subscription<'a>(
+        &'a self,
+        _subscription_id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, Vec<DunningAttempt>> {
+        unimplemented!()
+    }
+    fn settle_dunning<'a>(
+        &'a self,
+        _invoice_id: &'a str,
+        _expected_attempt: i64,
+        _from: &'a [DunningState],
+        _row: DunningAttempt,
+    ) -> autumn_billing::store::StoreFuture<'a, bool> {
+        unimplemented!()
+    }
+    fn prune_events(&self, _before: DateTime<Utc>) -> autumn_billing::store::StoreFuture<'_, u64> {
+        unimplemented!()
+    }
+}
+
+/// Adding `relink_customer` to `BillingStore` must not break a store
+/// implemented before it existed: `LegacyStoreWithoutRelink` compiles
+/// (proving the trait stayed source-compatible) and its un-overridden call
+/// returns the documented `BillingError::Unsupported`, not a compile error
+/// and not a silent no-op.
+#[tokio::test]
+async fn relink_customer_default_is_unsupported_for_a_store_that_predates_it() {
+    let store = LegacyStoreWithoutRelink;
+    let err = store
+        .relink_customer("any", "any".to_string(), at(0))
+        .await
+        .expect_err("the default implementation must not silently succeed");
+    assert!(
+        matches!(err, autumn_billing::BillingError::Unsupported(_)),
+        "expected Unsupported, got {err:?}"
+    );
 }

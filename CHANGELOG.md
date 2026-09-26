@@ -187,6 +187,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **🌐 Custom domains reach the app in production (issue #2657):** a tenant
+  hostname is never in `[security.trusted_hosts] hosts` — that is the point of
+  the feature — and `TrustedHostPolicy::from_config` read only that list. So a
+  request for `app.clientco.com`, registered, verified, `active` and holding
+  its own certificate, got `400 Invalid Host header` before tenancy resolution
+  ran. Every part below the trusted-host layer was correct; nothing reached it.
+  The only workaround was `hosts = ["*"]`, which turns host validation off for
+  the whole deployment — "custom domains **or** Host-header protection, pick
+  one". The policy now asks the custom-domain registry about a host its static
+  rules do not match, and admits it only while the domain is servable
+  (`active`), which is the rule SNI already applies at the handshake: a
+  `pending_dns` registration is not a way past host validation. The registry is
+  read per request, not captured, because the app publishes it at bind time —
+  after the router is built — so a domain connected or offboarded while the app
+  runs takes effect with no restart. A deployment with no registry pays one
+  extension lookup on the path that was about to answer `400` anyway.
+  The acceptance test for this behaviour called the tenancy extractor
+  directly, so the middleware that rejected the request was never in the path;
+  the new test drives a **mounted router** through the whole stack, and
+  publishes the registry after the build, as production does.
+  `AppState::late_extensions` is the small seam that makes the late read
+  possible. `docs/guide/tls.md` and `docs/guide/deployment.md` now state the
+  interaction.
+
 - **🛣️ Onramp: stop treating `local-dev-quickstart`'s permanent drift as a
   CI failure [no-plugin]:** nothing here is agent-facing — it's a
   CI-workflow-only change plus a test split, not new framework surface
@@ -2338,6 +2362,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   suite (29 tests, including diamond-cascade and hook/soft-delete cases)
   passes unchanged. See
   `docs/reports/2026-09-08-ledger-dependent-destroy-leaf-batch/`.
+
+- **🗃️ Ledger: batch `examples/cms`'s `recount_terms` per-term loop
+  (statements 3N→3):** `content::recount_terms` — called from
+  `set_post_terms`'s editor save path, the scheduled-publish sweep, and the
+  delete-user cascade whenever more than one term needs its published-post
+  count rebuilt — looped its ids one at a time and called `recount_term`
+  per id, which itself issued three round trips (a single-row `FOR UPDATE`
+  lock, a single-term scalar `COUNT(*)`, a single-row `UPDATE`). N affected
+  terms cost 3N round trips through this function alone. Now it locks every
+  row up front in one batched, ascending-id-order `FOR UPDATE` (the same
+  guarantee `lock_terms` uses, needed here too since `recount_terms_for_post`
+  reaches this function without a prior `lock_terms` call), computes every
+  count in one call to the already-batched `term_post_counts` helper
+  (previously used only by read-path screens), and writes every count back
+  in one bulk `UPDATE ... FROM UNNEST(...)` instead of N single-row updates.
+  Profiled through the real editor "Update" route against a 5,000-term/
+  2,000-post fixture at three tiers of affected-term count: statements
+  79→61 (N=7), 210→132 (N=27), 467→275 (N=65) — this function's own
+  contribution drops from 3N to 3 at every tier. `cargo test -p cms` (99
+  tests) and the full Docker-gated integration suite (211 tests) pass
+  unchanged. See `docs/reports/2026-09-18-ledger-cms-recount-terms-batch/`.
 
 - **⚡ Bolt: `feed::escape` ASCII fast path (instructions -38.4%):** a new
   `autumn/benches/feed_render.rs` profiling harness — rendering a realistic

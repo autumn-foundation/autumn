@@ -799,6 +799,22 @@ Once a domain is `active`, requests carrying that `Host` resolve to its tenant.
 The usual `[tenancy] base_domain` rejection does not apply to a registered
 domain, and subdomain tenancy is unchanged for every other host.
 
+### Connected domains and the host allow-list
+
+[`[security.trusted_hosts] hosts`](deployment.md#trusted-hosts-host-header-allow-list)
+is mandatory in production, and a tenant hostname is never in it — a thousand
+tenants must not mean a thousand configuration lines. So the ingress layer asks
+the registry about each host its static rules do not match:
+
+- An `active` domain is trusted, and the request reaches your handler.
+- A domain that is still `pending_dns`, `verified` or `issuing` is not. It gets
+  `400 Invalid Host header`, the same answer SNI gives at the handshake.
+- A hostname nobody registered gets the same `400`.
+
+Connect or offboard a domain and the answer changes at once. **Do not set
+`hosts = ["*"]` for this**: that turns host validation off for the whole
+deployment.
+
 ### Abuse posture toward the CA
 
 Custom domains mean tenant-supplied hostnames drive certificate orders, so

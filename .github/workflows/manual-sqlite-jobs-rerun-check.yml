@@ -1,0 +1,106 @@
+name: Manual sqlite_jobs_scheduler_e2e rerun check (Semaphore rerun harness)
+
+# Manual dispatch only. Same-commit rerun-rate harness for
+# sqlite_jobs_scheduler_e2e::sqlite_job_backend_tracks_job_status_durably
+# (docs/ci-health/quarantine-ledger.md, "under active investigation" section):
+# n=2 organic hits (2026-09-21, two independent branches, one docs-only),
+# panic "sqlite job enqueue failed: ON CONFLICT clause does not match any
+# PRIMARY KEY or UNIQUE constraint" at
+# autumn/tests/sqlite_jobs_scheduler_e2e.rs:1301. Same rationale as
+# manual-job-tracking-rerun-check.yml: this test needs no new runner class or
+# CI spend to rerun — it's the ordinary ubuntu-latest + SQLite (no Docker,
+# no network service) shape ci.yml's "SQLite runtime (feature=sqlite)" job
+# already runs on every PR via its own "Run the sqlite integration suite"
+# step — so this harness doesn't need the human sign-off
+# manual-macos-contention-check.yml does. Gated on workflow_dispatch rather
+# than folded into ci.yml: it exists to generate a same-commit rerun-rate
+# baseline on demand, not to run on every push.
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit to test. Must build the sqlite_jobs_scheduler_e2e test target."
+        required: true
+      iterations:
+        description: "Number of same-process reruns of the target test"
+        required: false
+        default: "50"
+        type: choice
+        options: ["20", "50"]
+
+env:
+  # Same values as ci.yml.
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUST_MIN_STACK: 8388608
+
+jobs:
+  # #2594 taught this repo that a dispatch-only workflow can still be
+  # evaluated on other events (observed on manual-macos-contention-check.yml)
+  # -- guard on the event so anything but a manual dispatch skips cleanly
+  # rather than running the build/test steps below unasked.
+  rerun:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+      - name: Build the sqlite_jobs_scheduler_e2e test binary once
+        # Same package/feature set ci.yml's "SQLite runtime (feature=sqlite)"
+        # job uses for this test (its "Run the sqlite integration suite"
+        # step) so the binary under test is byte-for-byte what CI actually
+        # exercises. --no-run so the loop below only pays compile cost once,
+        # not once per iteration.
+        run: |
+          cargo test -p autumn-web --features "sqlite,test-support,storage" \
+            --test sqlite_jobs_scheduler_e2e --no-run
+      - name: Rerun the target test against a fresh on-disk SQLite file each time
+        env:
+          ITERATIONS: ${{ inputs.iterations }}
+        # workflow_dispatch's `type: choice` only constrains the manual UI
+        # dropdown - the API/CLI (`gh workflow run -f iterations=...`) can
+        # pass any string, so it's re-validated here rather than trusted.
+        run: |
+          case "$ITERATIONS" in
+            20|50) ;;
+            *) echo "::error::iterations must be 20 or 50 (got: $ITERATIONS)"; exit 1 ;;
+          esac
+          fail=0
+          pass=0
+          for i in $(seq 1 "$ITERATIONS"); do
+            echo "=== iteration $i/$ITERATIONS ==="
+            cargo test -p autumn-web --features "sqlite,test-support,storage" \
+              --test sqlite_jobs_scheduler_e2e -- \
+              --test-threads=1 \
+              sqlite_job_backend_tracks_job_status_durably \
+              2>&1 | tee "iteration-$i.log"
+            rc="${PIPESTATUS[0]}"
+            if ! grep -qE 'test result: ok\. 1 passed' "iteration-$i.log"; then
+              echo "iteration $i: NO MATCHING PASS LINE (rc=$rc) - treating as a failure/miss, not silently skipping"
+              fail=$((fail + 1))
+            elif [ "$rc" -eq 0 ]; then
+              echo "iteration $i: PASS"
+              pass=$((pass + 1))
+            else
+              echo "iteration $i: FAIL (rc=$rc)"
+              fail=$((fail + 1))
+            fi
+          done
+          {
+            echo "## sqlite_jobs_scheduler_e2e rerun result"
+            echo ""
+            echo "\`$fail\`/\`$ITERATIONS\` failed, \`$pass\`/\`$ITERATIONS\` passed."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "RESULT: $fail/$ITERATIONS failed, $pass/$ITERATIONS passed"
+      - name: Upload every iteration's full log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sqlite-jobs-rerun-logs
+          path: iteration-*.log
+          retention-days: 14

@@ -1217,6 +1217,199 @@ accepts, so a codemod that added it everywhere would silently widen a request
 contract. `#[model]` is unaffected: its read schema describes a response only,
 so a conditionally-skipped column there stays sound without the attribute.
 
+### Macros: `autumn-macros` no longer holds the database macros (#2809)
+
+**Why:** `autumn-macros` was one 87k-line proc-macro dylib, and a full-crate
+check ran rustc out of memory on a modest machine. The database codegen —
+`#[model]`, `#[commentable]`, `#[repository]`, `#[service]` — now lives in two
+sibling crates, `autumn-macros-model` and `autumn-macros-repository`, so a
+no-database build never compiles it.
+
+**You are affected only if you depend on `autumn-macros` directly.** Nearly
+nobody does. Every `autumn_web::` path is unchanged, so an app that writes
+`use autumn_web::prelude::*` or `autumn_web::{model, repository, service}`
+needs no change at all.
+
+A direct dependant loses these three macro paths. `autumn-macros`'s `db`
+feature still resolves, but it is now an empty no-op: the macros it used to
+switch on are in other crates. Rust does not let a proc-macro crate re-export
+another crate's proc macro, so a compatibility facade in `autumn-macros` is
+not possible.
+
+**Before (`{X.Y}`):**
+
+```toml
+autumn-macros = { version = "{X.Y.Z}", features = ["db"] }
+```
+
+```rust
+#[autumn_macros::model]
+struct Post { id: i32 }
+```
+
+**After (`{(X+1).0}`):**
+
+```toml
+autumn-macros-model = "{X.Z.0}"
+autumn-macros-repository = "{X.Z.0}"
+```
+
+```rust
+#[autumn_macros_model::model]
+struct Post { id: i32 }
+```
+
+`#[repository]` comes from `autumn_macros_repository`; `#[model]`,
+`#[commentable]` and `#[service]` come from `autumn_macros_model`. Depending
+on `autumn-web` instead is the better fix, and the one we recommend: it pins
+both crates for you and keeps the paths you already write.
+
+**Automation:** `manual` — the rewrite needs a new dependency in `Cargo.toml`
+that no codemod may add on the reader's behalf, and the right answer for most
+readers is to depend on `autumn-web` instead, which is a design decision.
+
+### Widgets: widget CSS classes are now `autumn-`-prefixed (#2354)
+
+**Why:** several widgets emitted unprefixed class hooks (`card`,
+`card-header`, `stat-card`, `active`, …) that the widget stylesheet
+(`/static/css/autumn-widgets.css`) never styled — so the `/_stories`
+previews and any app linking only the bundle rendered those widgets
+unstyled, and generic hooks like `active` collided with app CSS. Every
+widget-emitted class now lives in the `autumn-*` namespace and is backed by
+a rule in the widget stylesheet.
+
+**You are affected only if your own CSS or JS targets the old hooks.**
+Widget output is unchanged apart from the class names.
+
+**Before (`{X.Y}`):**
+
+```css
+.card { border: 1px solid #e5e7eb; }
+.card-header { font-weight: 600; }
+a.active { color: red; }
+```
+
+**After (`{(X+1).0}`):**
+
+```css
+.autumn-card { border: 1px solid #e5e7eb; }
+.autumn-card__header { font-weight: 600; }
+a.autumn-active { color: red; }
+```
+
+Full mapping: `card` → `autumn-card`, `card-header` →
+`autumn-card__header`, `card-title` → `autumn-card__title`, `card-body` →
+`autumn-card__body`, `card-footer` → `autumn-card__footer`, `stat-card` →
+`autumn-stat-card`, `stat-label` → `autumn-stat-card__label`, `stat-value` →
+`autumn-stat-card__value`, `stat-link` → `autumn-stat-card__link`,
+`search-empty` → `autumn-search-empty`, `autocomplete-empty` →
+`autumn-autocomplete-empty`, `alert__icon-svg` → `autumn-alert__icon-svg`,
+`active` → `autumn-active` (on `nav_link()` output only).
+
+**Automation:** `manual` — the selectors live in the reader's own
+stylesheets, which no codemod may rewrite on their behalf.
+### autumn-billing: `Customer.user_id` is tenant-scoped under tenancy
+
+**Why:** `SessionUser`/`Entitled<R>` keyed every `autumn-billing` store lookup
+on the bare session user id, with no tenant component. That id is only
+guaranteed unique WITHIN one tenant — a sharded, `tenant_scoped` `User`
+model's row id is a **shard-local** `BIGSERIAL` (`docs/guide/sharding.md`),
+so two different tenants routinely produce the identical id — while
+`BillingPlugin` always resolves the app's one primary connection pool, never
+a per-shard one. An app combining `BillingPlugin` with tenancy could have one
+tenant's user read, and through the hosted Stripe portal potentially manage,
+another tenant's subscription the instant both users' ids collided. See
+`docs/security/2026-09-23-billing-cross-tenant-identity-collision/`.
+
+**You are affected only if your app enables Autumn's tenancy feature AND
+mounts `BillingPlugin`.** An app without tenancy enabled sees no change at
+all — `Customer.user_id` is computed exactly as before.
+
+For an affected app, `Customer.user_id` — and therefore whatever
+[`BillingHooks::recipient_for`](../../autumn-billing/src/hooks.rs) receives —
+is now an opaque, tenant-scoped identity rather than the bare session id.
+Recover the raw id with
+[`autumn_billing::gate::strip_tenant_scope`](../../autumn-billing/src/gate.rs);
+the exact wire format is deliberately not documented here — it is not public
+API and is not guaranteed stable. The **default** `recipient_for`
+implementation already calls it, so it needs no change. A custom override
+that assumed the bare session id under tenancy needs the same one-line
+change:
+
+```diff
+ fn recipient_for(&self, user_id: &str) -> Option<i64> {
+-    user_id.parse().ok()
++    autumn_billing::gate::strip_tenant_scope(user_id).parse().ok()
+ }
+```
+
+**Every pre-existing `billing_customers` row keyed by a bare, unscoped
+`user_id` goes dark, immediately, on upgrade** — not "eventually" or
+"indistinguishably": every lookup now keys on the tenant-scoped identity, so
+`customer_by_user` misses the row on the very next request, and `Entitled<R>`
+reports `entitled: false` for an already-paying user until it is relinked.
+This is not only the app newly enabling tenancy on top of existing billing
+data — **it is every tenancy-enabled app upgrading `autumn-billing` past
+this fix**, including one that already ran tenancy and `BillingPlugin`
+together before this release: pre-fix, `Customer.user_id` was never
+tenant-scoped regardless of when tenancy was turned on, so every row any
+such app has today is a bare id. Nothing relinks it automatically:
+`upsert_customer` deliberately never replaces an existing `user_id` link (see
+its doc), so even a fresh checkout does not repair the row — it creates a
+**second** provider customer instead, which can produce a duplicate Stripe
+subscription. Relink every pre-existing row explicitly — before upgrading if
+you can stage it, immediately after if you cannot — with the tenant you
+already know it belongs to from your own records:
+
+```rust
+let service = autumn_billing::BillingService::require(&state)?;
+let scoped_id = autumn_billing::gate::scope_identity(tenant, &legacy_user_id);
+service
+    .store()
+    .relink_customer(&customer_id, scoped_id, Utc::now())
+    .await?;
+```
+
+`relink_customer` is the one store method allowed to overwrite an existing
+link — restricted to operator-driven migrations for exactly this reason (see
+its doc on [`BillingStore`](../../autumn-billing/src/store/mod.rs)); nothing
+in request-handling or webhook code calls it. It returns
+`BillingError::Conflict` if `scoped_id` already links a different customer
+(for example, a fresh checkout already created one under the new id before
+you relinked the old row) — resolve that by hand, since it means two
+provider customers now exist for the one legacy row.
+
+`relink_customer` is a **new method on the `BillingStore` trait**, which an
+app can implement its own backend against (`BillingPlugin::store`). It has a
+default implementation returning `BillingError::Unsupported`, specifically
+so a `BillingStore` implemented before this method existed keeps compiling
+unchanged — this is source-compatible for every implementor, tenancy or not.
+A custom store that wants to support the relink recipe above needs to
+override it; `MemoryBillingStore` and `DbBillingStore` already do.
+
+**A caller of `Billing::current_subscription`, `is_entitled`, or `require`
+directly** — outside `SessionUser`/`Entitled<R>`, which already resolve the
+right value internally — must pass the same tenant-scoped identity these
+three methods key their store lookup on. If your own code resolves "the
+current user" some other way (your own auth extractor, a background job) and
+calls one of these three with that bare id under tenancy, it silently misses
+an otherwise-paying user's row and denies entitlement — nothing in these
+methods' `user_id: &str` signature stops you from passing the wrong one.
+Pass whatever `Billing::current_user`/`session_user_id` already returned for
+this request, or build the identity explicitly with
+`autumn_billing::gate::scope_identity(tenant, &raw_user_id)` when you don't
+have that value at hand.
+
+**Automation:** `manual` — a custom `recipient_for` override, if one exists,
+needs the diff above; every pre-existing `billing_customers` row of every
+tenancy-enabled app running `BillingPlugin` — whether tenancy was just
+turned on or has been running alongside billing all along — needs the
+`relink_customer` call above; a direct caller of `current_subscription`/
+`is_entitled`/`require` needs the scoped-identity fix above; the default
+`recipient_for` implementation, `SessionUser`/`Entitled<R>`, and every other
+consumer of `Customer.user_id` need no change.
+
+
 ## Plugin authors
 
 This release **adds** plugin-facing surface and removes none, so no plugin that

@@ -165,7 +165,15 @@
 #     `INFO  autumn_web::router: bot_protection provider=…`, and `router` is
 #     `pub(crate) mod`: correct as output, unwritable as a path.
 #
-# A third shape is not a path claim at all and is dropped before resolution
+#   - A migration guide's **Before** block. It quotes what the reader wrote
+#     against the previous release, so where the release REMOVED the item the
+#     path is dead on purpose -- that removal is what the section announces.
+#     `next.md`'s #2809 section shows `#[autumn_macros::model]` as the old
+#     spelling; `model` is in `autumn-macros-model` now, and the block would
+#     be wrong if it resolved. The **After** block beside it is the live
+#     recommendation and stays audited, as a cheat-sheet row's FIX cell does.
+#
+# A fourth shape is not a path claim at all and is dropped before resolution
 # rather than waived: a brace group containing `(`. A `use` group never does,
 # and the skill's api-reference writes
 # `autumn_web::widgets::{localized_path(path, locale), locale_switcher(path,
@@ -173,8 +181,9 @@
 # invents `autumn_web::widgets::current_locale` out of an argument name, so the
 # module prefix is kept as the claim and the group is discarded.
 #
-# All three are rules because a named list would have to grow every time a guide
-# quotes a real rename or a real log line; these do not.
+# All of these are rules because a named list would have to grow every time a
+# guide quotes a real rename, a real log line, or removes an item; these do
+# not.
 #
 # USAGE:
 #   scripts/check-docs-symbols.sh              # gate the corpus
@@ -216,6 +225,12 @@ ROOT = sys.argv[2]
 CRATES = {
     'autumn_web': 'autumn/src',
     'autumn_macros': 'autumn-macros/src',
+    # The macro crate split (#2809). These three are publishable libraries, so
+    # `workspace_crates` requires them here; readers reach their macros through
+    # the `autumn_web` re-exports, not by these prefixes.
+    'autumn_macros_model': 'autumn-macros-model/src',
+    'autumn_macros_repository': 'autumn-macros-repository/src',
+    'autumn_macros_support': 'autumn-macros-support/src',
     'autumn_edge': 'autumn-edge/src',
     'autumn_search': 'autumn-search/src',
     'autumn_billing': 'autumn-billing/src',
@@ -1361,6 +1376,38 @@ PATH_SHAPE = re.compile(r'[a-zA-Z_]\w*(?:::[a-zA-Z_]\w*)*\Z')
 ERROR_CODE = re.compile(r'error\[E\d{4}\]')
 LOG_LEVEL = re.compile(r'^\s*(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR)\b')
 
+# A migration guide's **Before** block is the third shape that SHOWS a path.
+# It quotes what the reader wrote against the OLD release, so where the release
+# removed the item the path is dead on purpose -- that is the change the
+# section is announcing. The **After** block beside it is the live
+# recommendation and stays audited, exactly as a cheat-sheet row's FIX cell
+# does.
+#
+# Scoped to `docs/migrations/`, and to a fenced block between a `**Before`
+# label and the `**After` label that answers it, so a path outside that block
+# is unaffected. A rule, not a name list, for the reason the other two are:
+# every future guide that removes an item needs it, and a list would have to
+# grow each time.
+BEFORE_LABEL = re.compile(r'^\s*\*\*Before\b', re.M)
+AFTER_LABEL = re.compile(r'^\s*\*\*After\b', re.M)
+FENCE = re.compile(r'^\s*```', re.M)
+
+
+def before_block_spans(rel, text):
+    """Character spans of the fenced **Before** blocks in a migration guide."""
+    if not rel.startswith('docs/migrations/'):
+        return []
+    stops = [m.start() for m in AFTER_LABEL.finditer(text)]
+    spans = []
+    for label in BEFORE_LABEL.finditer(text):
+        stop = next((s for s in stops if s > label.start()), len(text))
+        fences = [m for m in FENCE.finditer(text, label.end(), stop)]
+        # Fences pair up; an unterminated one is ignored rather than swallowing
+        # the rest of the section.
+        for open_m, close_m in zip(fences[::2], fences[1::2]):
+            spans.append((open_m.end(), close_m.start()))
+    return spans
+
 
 def is_shown_as_output(line, col):
     """Whether the path at column `col` is being SHOWN rather than recommended.
@@ -1447,13 +1494,15 @@ def occurrences(root, files, pattern):
                 text = fh.read()
         except OSError:
             continue
+        shown = before_block_spans(rel, text)
         for crate, raw, offset in scan_paths(text, pattern):
             line_no = text.count('\n', 0, offset) + 1
             line_end = text.find('\n', offset)
             line = text[text.rfind('\n', 0, offset) + 1:
                         line_end if line_end != -1 else len(text)]
             col = offset - (text.rfind('\n', 0, offset) + 1)
-            waived = is_shown_as_output(line, col)
+            waived = (is_shown_as_output(line, col)
+                      or any(lo <= offset < hi for lo, hi in shown))
             spec = re.sub(r'\s+', ' ', raw).strip()
             spec = re.sub(r'\s*::\s*', '::', spec)
             spec = re.sub(r'\s*([{},])\s*', r'\1', spec)
@@ -1536,7 +1585,8 @@ def main():
     print(f'  resolved: {ok}')
     print(f'  opaque (re-export of a crate outside this workspace): '
           f'{sum(opaque.values())}')
-    print(f'  waived (shown as output: compiler error or log line): {waived}')
+    print('  waived (shown, not written: compiler error, log line, '
+          f'migration Before block): {waived}')
     print('')
     for (crate, path, rel, line, broke, near) in sorted(
             dead, key=lambda d: (d[2], d[3])):
@@ -1821,6 +1871,32 @@ macro_rules! declassify { () => {} }
         check('path in the fix column is still audited',
               sorted(p for (_, p, _, _, w) in rows if not w),
               ['app::AppBuilder'])
+
+        # A migration guide's **Before** block shows the OLD spelling, which a
+        # removal makes dead on purpose. The **After** block is the live
+        # recommendation and stays audited.
+        _write(tmp, 'docs/migrations/next.md',
+               '**Before (`0.7`):**\n\n'
+               '```rust\n'
+               'use autumn_web::gone::Removed;\n'
+               '```\n\n'
+               '**After (`0.8`):**\n\n'
+               '```rust\n'
+               'use autumn_web::app::AppBuilder;\n'
+               '```\n')
+        mig = occurrences(tmp, ['docs/migrations/next.md'], pat)
+        check('migration Before block is waived',
+              sorted(p for (_, p, _, _, w) in mig if w), ['gone::Removed'])
+        check('migration After block is still audited',
+              sorted(p for (_, p, _, _, w) in mig if not w),
+              ['app::AppBuilder'])
+        # The rule is scoped to the guides: the same prose elsewhere is a
+        # recommendation, not a quotation of a past release.
+        _write(tmp, 'docs/guide/before.md',
+               '**Before:**\n\n```rust\nuse autumn_web::gone::Removed;\n```\n')
+        check('a Before block outside docs/migrations is not waived',
+              [p for (_, p, _, _, w) in
+               occurrences(tmp, ['docs/guide/before.md'], pat) if w], [])
 
         # -- sibling crates are scanned, and attributed to their own crate ----
         # Before this, `PREFIX_RE` was `autumn_web::` alone: a path into a
@@ -2257,9 +2333,10 @@ Fix each one where it lives:
                       (`autumn_web::http::Client`, not
                       `autumn_web::http_client::Client`)
   - never existed  -> drop it, or name the item that does the job
-  - shown, not written -> a path inside a compiler-error line or a log line is
-                      already waived as output; if you are illustrating a
-                      failure, quote the compiler error with it
+  - shown, not written -> a path inside a compiler-error line, a log line, or
+                      a migration guide's **Before** block is already waived;
+                      if you are illustrating a failure, quote the compiler
+                      error with it
   - non-public     -> a `pub(crate)`/`pub(super)` module is E0603 for a reader
                       even when the item inside is re-exported at the crate
                       root: name the re-export (`::autumn_web::Route`, not

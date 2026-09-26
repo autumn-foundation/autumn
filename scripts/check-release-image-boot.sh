@@ -142,17 +142,29 @@ vendor_in_tree_autumn_web() {
   # autumn-edge is vendored for the same manifest-resolution reason: autumn-web's
   # `edge` feature declares `autumn-edge = { path = "../autumn-edge", optional =
   # true }`, and cargo reads every path dependency's manifest even when the
-  # feature is off. The shared target/ lives at the workspace root, so these
-  # crate dirs are source-only and cheap to copy.
-  cp -R "${REPO_ROOT}/autumn" "${vendor_dir}/autumn"
-  cp -R "${REPO_ROOT}/autumn-macros" "${vendor_dir}/autumn-macros"
-  cp -R "${REPO_ROOT}/autumn-cli" "${vendor_dir}/autumn-cli"
-  cp -R "${REPO_ROOT}/autumn-schema-core" "${vendor_dir}/autumn-schema-core"
-  cp -R "${REPO_ROOT}/autumn-edge" "${vendor_dir}/autumn-edge"
-  # Drop any stray build artifacts so the context stays small and deterministic.
-  rm -rf "${vendor_dir}/autumn/target" "${vendor_dir}/autumn-macros/target" \
-         "${vendor_dir}/autumn-cli/target" "${vendor_dir}/autumn-schema-core/target" \
-         "${vendor_dir}/autumn-edge/target"
+  # feature is off. The macro crate split (#2809) adds three more for that same
+  # reason: autumn-web declares `autumn-macros-model` and
+  # `autumn-macros-repository` as optional path dependencies, and each of those
+  # (and autumn-macros itself) path-depends on autumn-macros-support, so cargo
+  # reads all three manifests whatever the feature state. The shared target/
+  # lives at the workspace root, so these crate dirs are source-only and cheap
+  # to copy.
+  local vendored=(
+    autumn
+    autumn-macros
+    autumn-macros-support
+    autumn-macros-model
+    autumn-macros-repository
+    autumn-cli
+    autumn-schema-core
+    autumn-edge
+  )
+  local crate
+  for crate in "${vendored[@]}"; do
+    cp -R "${REPO_ROOT}/${crate}" "${vendor_dir}/${crate}"
+    # Drop any stray build artifacts so the context stays small and deterministic.
+    rm -rf "${vendor_dir}/${crate}/target"
+  done
   # Copy the monorepo Cargo.lock into vendor/ so `cargo install --locked` inside
   # Docker uses the same pinned dependency versions as the main workspace (e.g.
   # time=0.3.47, which is compatible with cookie-0.18.1; free resolution picks
@@ -161,7 +173,7 @@ vendor_in_tree_autumn_web() {
 
   # A workspace root so the vendored crates' `*.workspace = true` keys,
   # `[workspace.dependencies]`, and `[workspace.lints]` resolve exactly as in the
-  # real tree. Derived from the real root manifest (members trimmed to the five
+  # real tree. Derived from the real root manifest (members trimmed to the
   # vendored crates) so it stays in sync automatically.
   # autumn-cli is included so that `cargo install --path ./vendor/autumn-cli` (used
   # by inject_local_autumn_binary) resolves workspace dependencies correctly and
@@ -169,7 +181,10 @@ vendor_in_tree_autumn_web() {
   # mismatch that arises when copying a runner-built binary into the container.
   # autumn-schema-core is a member because autumn-cli path-depends on it and it
   # inherits `*.workspace = true` keys that must resolve against this root.
-  sed 's|^members = \[.*\]|members = ["autumn", "autumn-macros", "autumn-cli", "autumn-schema-core", "autumn-edge"]|' \
+  local members
+  members="$(printf '"%s", ' "${vendored[@]}")"
+  members="[${members%, }]"
+  sed "s|^members = \[.*\]|members = ${members}|" \
     "${REPO_ROOT}/Cargo.toml" > "${vendor_dir}/Cargo.toml"
 
   # The scaffold's own Cargo.toml declares an (empty) `[workspace]`, which makes

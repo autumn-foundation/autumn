@@ -1101,6 +1101,10 @@ pub use autumn_macros::sim_test;
 #[cfg(feature = "maud")]
 pub use autumn_macros::story;
 
+/// Annotate an OAuth2/OIDC callback handler.
+///
+/// Convenience alias for `#[get(...)]` with callback-focused naming.
+pub use autumn_macros::oauth2_callback;
 /// Derive Diesel and Serde traits for a database model struct.
 ///
 /// Applies `Queryable`, `Selectable`, `Insertable`, `Serialize`, and
@@ -1171,17 +1175,13 @@ pub use autumn_macros::story;
 /// registry, backfill and status API, `GET /actuator/derivations` for state and
 /// drift, and `docs/guide/derivations.md` for the guide.
 #[cfg(feature = "db")]
-pub use autumn_macros::model;
-/// Annotate an OAuth2/OIDC callback handler.
-///
-/// Convenience alias for `#[get(...)]` with callback-focused naming.
-pub use autumn_macros::oauth2_callback;
+pub use autumn_macros_model::model;
 
 /// Derive a repository with CRUD operations and derived queries.
 ///
 /// See [`macro@repository`] for details.
 #[cfg(feature = "db")]
-pub use autumn_macros::repository;
+pub use autumn_macros_repository::repository;
 
 /// Define a service for cross-model orchestration and non-DB side effects.
 ///
@@ -1208,7 +1208,7 @@ pub use autumn_macros::repository;
 /// }
 /// ```
 #[cfg(feature = "db")]
-pub use autumn_macros::service;
+pub use autumn_macros_model::service;
 
 /// Mark a typed handler as a service endpoint (issue #1755).
 ///
