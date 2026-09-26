@@ -59,6 +59,7 @@ fn read_values(path: &std::path::Path) -> Vec<String> {
 #[ignore = "requires Docker (testcontainers: minio)"]
 async fn replicates_to_and_restores_from_a_real_s3_endpoint() {
     use testcontainers::ImageExt as _;
+    use testcontainers::core::IntoContainerPort as _;
     use testcontainers::runners::AsyncRunner as _;
     use testcontainers_modules::minio::MinIO;
 
@@ -69,6 +70,8 @@ async fn replicates_to_and_restores_from_a_real_s3_endpoint() {
     let minio = MinIO::default()
         .with_name("cgr.dev/chainguard/minio")
         .with_tag("latest@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1")
+        // The image has no `EXPOSE`, so publish the API port by hand.
+        .with_mapped_port(0, 9000.tcp())
         .start()
         .await
         .expect("start MinIO — is Docker running?");

@@ -2487,7 +2487,9 @@ measured fix, and verification; not repeated here.
   `cgr.dev/chainguard/minio` image, pinned by digest, and removed the three
   `--skip` lines. It is the upstream `minio` binary with the same entrypoint,
   so `testcontainers_modules::minio::MinIO`'s command, `minioadmin`
-  credentials and wait strategy work unchanged. Anonymous pulls need no
+  credentials and wait strategy work unchanged. The image has no `EXPOSE`, so
+  each call site publishes port 9000 with `.with_mapped_port(0, 9000.tcp())`.
+  Anonymous pulls need no
   account or secret. Chainguard's free tier serves only the `latest` tag, but
   it keeps old digests pullable, so the pin holds. Verified by running all
   three tests plus the reddit-clone avatar test against a local Docker daemon

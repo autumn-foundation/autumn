@@ -9127,7 +9127,7 @@ fn builder_window(source: &str, index: usize) -> String {
     source
         .lines()
         .skip(index)
-        .take(4)
+        .take(8)
         .collect::<Vec<_>>()
         .join("\n")
 }

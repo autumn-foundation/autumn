@@ -211,9 +211,12 @@ fn incompressible_bytes(len: usize) -> Vec<u8> {
 /// digest. Chainguard keeps old digests pullable.
 fn minio_image() -> testcontainers::ContainerRequest<testcontainers_modules::minio::MinIO> {
     use testcontainers::ImageExt as _;
+    use testcontainers::core::IntoContainerPort as _;
     testcontainers_modules::minio::MinIO::default()
         .with_name("cgr.dev/chainguard/minio")
         .with_tag("latest@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1")
+        // The image has no `EXPOSE`, so publish the API port by hand.
+        .with_mapped_port(0, 9000.tcp())
 }
 
 /// Guards the registry override without needing Docker.
@@ -229,7 +232,10 @@ fn minio_image_pulls_from_the_public_registry() {
         name, "cgr.dev/chainguard/minio",
         "Docker Hub and quay.io no longer serve minio/minio anonymously",
     );
-    assert!(tag.contains("@sha256:"), "the image must be pinned by digest");
+    assert!(
+        tag.contains("@sha256:"),
+        "the image must be pinned by digest"
+    );
 }
 
 #[tokio::test]
