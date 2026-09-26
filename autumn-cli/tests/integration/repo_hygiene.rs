@@ -9103,7 +9103,7 @@ fn codemod_gate_accepts_a_walkthrough_codemod_bullet_wrapped_onto_a_continuation
 }
 
 /// The registry every `MinIO` testcontainer must be pulled from.
-const MINIO_REGISTRY: &str = "quay.io/minio/minio";
+const MINIO_REGISTRY: &str = "cgr.dev/chainguard/minio";
 
 /// Collect `.rs` files under `dir`, skipping build output.
 fn rust_sources(dir: &Path, found: &mut Vec<PathBuf>) {
@@ -9134,9 +9134,9 @@ fn builder_window(source: &str, index: usize) -> String {
 
 #[test]
 fn every_minio_container_is_pulled_from_the_public_registry() {
-    // Docker Hub refuses anonymous pulls of `minio/minio` — its registry answers
-    // 401, which Docker reports as "repository does not exist". Every call site
-    // must therefore override the name that `testcontainers-modules` pins.
+    // Docker Hub no longer serves `minio/minio`, and `quay.io/minio/minio`
+    // refuses anonymous pulls. Every call site must therefore override the name
+    // that `testcontainers-modules` pins.
     //
     // This is a whole-tree scan rather than a list, because the tests it guards
     // run only in the Docker sweep: a fourth call site added without the
@@ -9184,8 +9184,8 @@ fn every_minio_container_is_pulled_from_the_public_registry() {
     assert!(
         offenders.is_empty(),
         "every MinIO container must be started with \
-         `.with_name(\"{MINIO_REGISTRY}\")` — Docker Hub denies anonymous pulls \
-         of minio/minio. Unqualified call sites:\n{offenders}",
+         `.with_name(\"{MINIO_REGISTRY}\")` — Docker Hub and quay.io deny \
+         anonymous pulls of minio/minio. Unqualified call sites:\n{offenders}",
     );
 }
 
