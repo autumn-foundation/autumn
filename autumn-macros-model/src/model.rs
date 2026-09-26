@@ -218,6 +218,17 @@ struct CounterCacheDecl {
     /// `column does not exist` error. Naming it is the author asserting the
     /// parent really has it.
     tenant_column: Option<String>,
+    /// The parent's physical primary-key column, from
+    /// `parent_pk = "<column>"` (#2662).
+    ///
+    /// Explicit rather than inferred, for the same visibility reason as
+    /// `tenant_column`: `#[model]` on the *child* cannot see the parent's
+    /// `#[id]` field or its `#[diesel(column_name)]`, and the maintenance SQL
+    /// interpolates this column straight into `WHERE <parent>.<parent_pk> =
+    /// ...` — a wrong guess would be a runtime SQL error, not a compile error.
+    /// `None` keeps the `"id"` default. Naming it is the author asserting the
+    /// parent really is keyed by it.
+    parent_pk: Option<String>,
     /// Span of the `counter_cache` key, for diagnostics raised after parsing.
     span: proc_macro2::Span,
 }
@@ -671,6 +682,7 @@ fn parse_assoc_attr(
         explicit_helper,
         counter_cache,
         counter_cache_tenant,
+        parent_pk,
     ) = attr.parse_args_with(|input: ParseStream| {
         let target: syn::Ident = input.parse()?;
         let mut explicit_fk: Option<String> = None;
@@ -685,6 +697,9 @@ fn parse_assoc_attr(
         let mut explicit_helper: Option<String> = None;
         let mut counter_cache: Option<CounterCacheDecl> = None;
         let mut counter_cache_tenant: Option<(String, proc_macro2::Span)> = None;
+        // `parent_pk` rides along with its span like `counter_cache_tenant`:
+        // a later cross-key rejection points its caret at the offending key.
+        let mut parent_pk: Option<(String, proc_macro2::Span)> = None;
         // Zero or more trailing `, key = value` pairs (`fk`, `name`,
         // `through`, `target_fk`, `helper`), any order — plus `counter_cache`,
         // the one key that is also legal as a bare flag.
@@ -698,6 +713,7 @@ fn parse_assoc_attr(
                 counter_cache = Some(CounterCacheDecl {
                     column: None,
                     tenant_column: None,
+                    parent_pk: None,
                     span: key.span(),
                 });
                 continue;
@@ -715,11 +731,18 @@ fn parse_assoc_attr(
                 counter_cache = Some(CounterCacheDecl {
                     column: Some(value),
                     tenant_column: None,
+                    parent_pk: None,
                     span: key.span(),
                 });
             } else if key == "counter_cache_tenant" {
                 check_column_ident(&key, "counter_cache", &value)?;
                 counter_cache_tenant = Some((value, key.span()));
+            } else if key == "parent_pk" {
+                // The parent's physical primary-key column: only meaningful
+                // alongside `counter_cache`, which is the only maintenance
+                // that addresses the parent by key.
+                check_column_ident(&key, "parent_pk", &value)?;
+                parent_pk = Some((value, key.span()));
             } else if key == "fk" {
                 explicit_fk = Some(value);
             } else if key == "name" {
@@ -738,8 +761,9 @@ fn parse_assoc_attr(
                     "expected `fk = <column>`, `name = <accessor>`, \
                          `through = <join_table>`, `target_fk = <column>`, \
                          `helper = <singular>`, `counter_cache` / \
-                         `counter_cache = <column>`, or \
-                         `counter_cache_tenant = <column>` in association \
+                         `counter_cache = <column>`, \
+                         `counter_cache_tenant = <column>`, or \
+                         `parent_pk = <column>` in association \
                          attribute",
                 ));
             }
@@ -754,19 +778,26 @@ fn parse_assoc_attr(
             explicit_helper,
             counter_cache,
             counter_cache_tenant,
+            parent_pk,
         ))
     })?;
 
     // `counter_cache_tenant` scopes the counter cache; on its own it means
     // nothing, and silently ignoring it would leave a multi-tenant app believing
-    // it was protected.
-    let counter_cache = match (counter_cache, counter_cache_tenant) {
-        (Some(decl), Some((tenant_column, _))) => Some(CounterCacheDecl {
+    // it was protected. `parent_pk` names the key the maintenance addresses the
+    // parent by; without a counter cache to maintain there is nothing to
+    // address.
+    let counter_cache = match (counter_cache, counter_cache_tenant, parent_pk) {
+        (Some(decl), Some((tenant_column, _)), parent_pk) => Some(CounterCacheDecl {
             tenant_column: Some(tenant_column),
+            parent_pk: parent_pk.map(|(parent_pk, _)| parent_pk),
             ..decl
         }),
-        (decl @ Some(_), None) => decl,
-        (None, Some((_, span))) => {
+        (Some(decl), None, parent_pk) => Some(CounterCacheDecl {
+            parent_pk: parent_pk.map(|(parent_pk, _)| parent_pk),
+            ..decl
+        }),
+        (None, Some((_, span)), _) => {
             return Err(syn::Error::new(
                 span,
                 "`counter_cache_tenant = \"<column>\"` scopes a counter cache to \
@@ -774,7 +805,15 @@ fn parse_assoc_attr(
                  association",
             ));
         }
-        (None, None) => None,
+        (None, None, Some((_, span))) => {
+            return Err(syn::Error::new(
+                span,
+                "`parent_pk = \"<column>\"` names the parent primary-key column \
+                 the counter maintenance addresses, so it requires \
+                 `counter_cache` on the same association",
+            ));
+        }
+        (None, None, None) => None,
     };
 
     if let Some(decl) = counter_cache.as_ref()
@@ -1060,6 +1099,16 @@ struct DerivationDecl {
     /// The `parent_table = "<table>"` override. `None` means the table name
     /// inferred from the parent type.
     parent_table: Option<String>,
+    /// The `parent_pk = "<column>"` override (#2662). `None` means `"id"`.
+    ///
+    /// The parent's physical primary-key column, which the maintenance SQL
+    /// interpolates straight into `WHERE <parent>.<parent_pk> = ...`. The
+    /// macro cannot see the parent's `#[id]` field or its
+    /// `#[diesel(column_name)]` from the child, so a differently-keyed parent
+    /// names its key explicitly rather than failing at runtime against a
+    /// column that does not exist. The `check_column_ident` gate applies: the
+    /// value is spliced verbatim into SQL.
+    parent_pk: Option<String>,
     /// Span of the attribute, for diagnostics raised after parsing.
     span: proc_macro2::Span,
 }
@@ -1164,79 +1213,97 @@ fn parse_derivation_attr(attr: &syn::Attribute) -> syn::Result<DerivationDecl> {
         .get_ident()
         .map_or_else(proc_macro2::Span::call_site, syn::Ident::span);
 
-    let (target, column, transform, filter, explicit_fk, tenant_column, name, parent_table) = attr
-        .parse_args_with(|input: ParseStream| {
-            let target: syn::Ident = input.parse()?;
-            let mut column: Option<String> = None;
-            let mut transform: Option<DerivationTransform> = None;
-            let mut filter: Option<syn::Expr> = None;
-            let mut explicit_fk: Option<String> = None;
-            let mut tenant_column: Option<String> = None;
-            let mut name: Option<String> = None;
-            let mut parent_table: Option<String> = None;
-            while input.peek(syn::Token![,]) {
-                input.parse::<syn::Token![,]>()?;
-                if input.is_empty() {
-                    break;
-                }
-                let key: syn::Ident = input.parse()?;
-                input.parse::<syn::Token![=]>()?;
-                if key == "transform" {
-                    set_derivation_key(&mut transform, &key, parse_derivation_transform(input)?)?;
-                    continue;
-                }
-                if key == "filter" {
-                    set_derivation_key(&mut filter, &key, input.parse()?)?;
-                    continue;
-                }
-                // Every remaining key takes a bare identifier or a string
-                // literal, the same pair the association attributes accept.
-                // A bare identifier drops its raw prefix: `r#type` is the Rust
-                // spelling of column `type`.
-                let value = if input.peek(LitStr) {
-                    input.parse::<LitStr>()?.value()
-                } else {
-                    unraw_ident(&input.parse::<syn::Ident>()?)
-                };
-                if key == "column" {
-                    check_column_ident(&key, "column", &value)?;
-                    set_derivation_key(&mut column, &key, value)?;
-                } else if key == "fk" {
-                    // Checked before `format_ident!` sees it: an invalid
-                    // identifier there panics with no span.
-                    check_column_ident(&key, "fk", &value)?;
-                    set_derivation_key(&mut explicit_fk, &key, value)?;
-                } else if key == "tenant" {
-                    check_column_ident(&key, "tenant", &value)?;
-                    set_derivation_key(&mut tenant_column, &key, value)?;
-                } else if key == "parent_table" {
-                    check_column_ident(&key, "parent_table", &value)?;
-                    set_derivation_key(&mut parent_table, &key, value)?;
-                } else if key == "name" {
-                    check_derivation_name(&key, &value)?;
-                    set_derivation_key(&mut name, &key, value)?;
-                } else {
-                    return Err(syn::Error::new_spanned(
-                        &key,
-                        "expected `column = \"<column>\"`, `transform = count` / \
+    let (
+        target,
+        column,
+        transform,
+        filter,
+        explicit_fk,
+        tenant_column,
+        name,
+        parent_table,
+        parent_pk,
+    ) = attr.parse_args_with(|input: ParseStream| {
+        let target: syn::Ident = input.parse()?;
+        let mut column: Option<String> = None;
+        let mut transform: Option<DerivationTransform> = None;
+        let mut filter: Option<syn::Expr> = None;
+        let mut explicit_fk: Option<String> = None;
+        let mut tenant_column: Option<String> = None;
+        let mut name: Option<String> = None;
+        let mut parent_table: Option<String> = None;
+        let mut parent_pk: Option<String> = None;
+        while input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+            if input.is_empty() {
+                break;
+            }
+            let key: syn::Ident = input.parse()?;
+            input.parse::<syn::Token![=]>()?;
+            if key == "transform" {
+                set_derivation_key(&mut transform, &key, parse_derivation_transform(input)?)?;
+                continue;
+            }
+            if key == "filter" {
+                set_derivation_key(&mut filter, &key, input.parse()?)?;
+                continue;
+            }
+            // Every remaining key takes a bare identifier or a string
+            // literal, the same pair the association attributes accept.
+            // A bare identifier drops its raw prefix: `r#type` is the Rust
+            // spelling of column `type`.
+            let value = if input.peek(LitStr) {
+                input.parse::<LitStr>()?.value()
+            } else {
+                unraw_ident(&input.parse::<syn::Ident>()?)
+            };
+            if key == "column" {
+                check_column_ident(&key, "column", &value)?;
+                set_derivation_key(&mut column, &key, value)?;
+            } else if key == "fk" {
+                // Checked before `format_ident!` sees it: an invalid
+                // identifier there panics with no span.
+                check_column_ident(&key, "fk", &value)?;
+                set_derivation_key(&mut explicit_fk, &key, value)?;
+            } else if key == "tenant" {
+                check_column_ident(&key, "tenant", &value)?;
+                set_derivation_key(&mut tenant_column, &key, value)?;
+            } else if key == "parent_table" {
+                check_column_ident(&key, "parent_table", &value)?;
+                set_derivation_key(&mut parent_table, &key, value)?;
+            } else if key == "parent_pk" {
+                // The value is interpolated verbatim into the maintenance
+                // SQL, so the same plain-identifier gate as `parent_table`
+                // applies.
+                check_column_ident(&key, "parent_pk", &value)?;
+                set_derivation_key(&mut parent_pk, &key, value)?;
+            } else if key == "name" {
+                check_derivation_name(&key, &value)?;
+                set_derivation_key(&mut name, &key, value)?;
+            } else {
+                return Err(syn::Error::new_spanned(
+                    &key,
+                    "expected `column = \"<column>\"`, `transform = count` / \
                          `transform = sum(<field>)`, `filter = <expr>`, \
                          `fk = <column>`, `tenant = \"<column>\"`, \
-                         `parent_table = \"<table>\"`, or `name = \"<name>\"` in \
+                         `parent_table = \"<table>\"`, `parent_pk = \
+                         \"<column>\"`, or `name = \"<name>\"` in \
                          `#[derivation(...)]`",
-                    ));
-                }
+                ));
             }
-            Ok((
-                target,
-                column,
-                transform,
-                filter,
-                explicit_fk,
-                tenant_column,
-                name,
-                parent_table,
-            ))
-        })?;
+        }
+        Ok((
+            target,
+            column,
+            transform,
+            filter,
+            explicit_fk,
+            tenant_column,
+            name,
+            parent_table,
+            parent_pk,
+        ))
+    })?;
 
     let Some(column) = column else {
         return Err(syn::Error::new(
@@ -1255,6 +1322,7 @@ fn parse_derivation_attr(attr: &syn::Attribute) -> syn::Result<DerivationDecl> {
         tenant_column,
         name,
         parent_table,
+        parent_pk,
         span,
     })
 }
@@ -2360,6 +2428,13 @@ fn emit_counter_caches_impl(
             );
         let parent_table = infer_table_name(&assoc.target);
         let fk = &assoc.fk;
+        // The parent's physical primary-key column (#2662): the explicit
+        // `parent_pk = "<column>"` override, else the `"id"` default. `#[model]`
+        // on the child cannot see the parent's `#[id]` field or its
+        // `#[diesel(column_name)]`, so the override is the only way to name a
+        // differently-keyed parent — without it the maintenance SQL would
+        // address a column that does not exist.
+        let parent_pk = decl.parent_pk.as_deref().unwrap_or("id");
         let fk_ident = format_ident!("{fk}");
 
         // The foreign key has to be a real field: without this check the
@@ -2405,7 +2480,7 @@ fn emit_counter_caches_impl(
                 child_soft_delete: #has_deleted_at,
                 fk_column: #fk,
                 parent_table: #parent_table,
-                parent_pk: "id",
+                parent_pk: #parent_pk,
                 counter_column: #column,
                 fk_of: #fk_fn,
                 pk_of: __autumn_counter_cache_pk,
@@ -2786,6 +2861,10 @@ fn emit_counter_caches_impl(
         let transform_src = decl.transform.as_source();
         let def_ident = format_ident!("__AUTUMN_DERIVATION_{}_{}", model_ident, index);
         let target = &decl.target;
+        // The parent's physical primary-key column (#2662): the explicit
+        // `parent_pk = "<column>"` override, else the `"id"` default — the
+        // same visibility story as `parent_table`'s override above.
+        let parent_pk = decl.parent_pk.as_deref().unwrap_or("id");
         derivation_items.push(quote! {
             /// The parent type is otherwise never named in the expansion: the
             /// parent table is a string and the maintenance is SQL. This makes
@@ -2806,7 +2885,7 @@ fn emit_counter_caches_impl(
                     child_soft_delete: #has_deleted_at,
                     fk_column: #fk_column,
                     parent_table: #parent_table,
-                    parent_pk: "id",
+                    parent_pk: #parent_pk,
                     column: #column,
                     transform: #transform_src,
                     filter: #filter_src,
@@ -2829,7 +2908,7 @@ fn emit_counter_caches_impl(
                 child_soft_delete: #has_deleted_at,
                 fk_column: #fk_column,
                 parent_table: #parent_table,
-                parent_pk: "id",
+                parent_pk: #parent_pk,
                 counter_column: #column,
                 fk_of: #fk_fn,
                 pk_of: __autumn_counter_cache_pk,
@@ -3546,10 +3625,12 @@ fn emit_association_items(
 /// is never type-checked).
 ///
 /// `pk_ident` is the model's primary-key field (resolved by the caller exactly
-/// as the CRUD codegen resolves it). It is used both for the `i64`-primary-key
-/// compile-time guard and as the primary-key column of the hidden target
-/// projection — a model whose `#[id]` field is not named `id` (e.g. `memo_id`)
-/// has no `id` column for S1/S5 to lock and update.
+/// as the CRUD codegen resolves it). It is used for the `i64`-primary-key
+/// compile-time guard, which addresses the Rust field. `pk_column` is the
+/// physical primary-key column for the hidden target projection and the
+/// `WHERE` filters — a model whose `#[id]` field is not named `id` (e.g.
+/// `memo_id`) has no `id` column for S1/S5 to lock and update, and a
+/// `#[diesel(column_name)]` rename must be honored there too (#2662).
 ///
 /// `has_tenant_id` mirrors `has_deleted_at`: when the model carries a
 /// `tenant_id` column the projection declares it and S1/S5 (and
@@ -3565,6 +3646,7 @@ fn emit_votable_items(
     has_deleted_at: bool,
     has_tenant_id: bool,
     pk_ident: Option<&syn::Ident>,
+    pk_column: &str,
 ) -> TokenStream {
     let model_snake = pascal_to_snake(&model_ident.to_string());
     // Length-prefixed for the same reason as the m2m join module: it keeps two
@@ -3584,10 +3666,10 @@ fn emit_votable_items(
     // The target projection must name the model's real primary-key column:
     // `react()` locks and updates `WHERE #pk_column = $target_id`, and a
     // hard-coded `id` would miss (or worse, hit an unrelated column on) a
-    // model whose `#[id]` field is named differently. `None` only happens for
-    // models the rest of the macro already refuses to generate CRUD for; keep
-    // the historical `id` there so the error surface is unchanged.
-    let pk_column = pk_ident.map_or_else(|| format_ident!("id"), ::std::clone::Clone::clone);
+    // model whose `#[id]` field is named differently. `pk_column` is the
+    // physical column — the caller resolves any `#[diesel(column_name)]`
+    // rename (#2662) — so the `table!` declaration's SQL name is right.
+    let pk_column = format_ident!("{pk_column}");
     let trait_ident = format_ident!("{model_ident}Reactions");
     let is_sum = spec.aggregate == VoteAggregate::Sum;
 
@@ -5722,6 +5804,24 @@ fn diesel_column_name(field: &syn::Field) -> Option<String> {
     found
 }
 
+/// The physical primary-key column for generated SQL: the `#[id]` field's
+/// `#[diesel(column_name)]` when present, else the (unrawed) Rust field name,
+/// else the historical `"id"` default.
+///
+/// `#[votable]` and `#[commentable]` resolve the key on the model itself, so —
+/// unlike the child-side counter-cache/derivation maintenance, which cannot
+/// see the parent's fields and takes an explicit `parent_pk` override (#2662)
+/// — they must honor a renamed `#[id]` here rather than splicing the Rust
+/// field name into SQL. With no rename the result equals the old spelling, so
+/// existing expansions are byte-for-byte unchanged.
+fn physical_pk_column(pk_field: Option<&syn::Field>) -> String {
+    pk_field
+        .and_then(|field| {
+            diesel_column_name(field).or_else(|| field.ident.as_ref().map(unraw_ident))
+        })
+        .unwrap_or_else(|| "id".to_owned())
+}
+
 /// Build the `impl` block a model's `#[translatable]` fields contribute:
 /// per-field accessors plus the field-name-keyed surface an app renders a
 /// "needs translation" affordance from (issue #1384 AC5).
@@ -7807,16 +7907,17 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 )
                 .to_compile_error();
             }
-            let pk_ident = all_fields
-                .iter()
-                .find(|f| has_attr(f, "id"))
-                .or_else(|| {
-                    all_fields.iter().find(|f| match &f.ty {
-                        syn::Type::Path(tp) => tp.path.is_ident("i32") || tp.path.is_ident("i64"),
-                        _ => false,
-                    })
+            let pk_field = all_fields.iter().find(|f| has_attr(f, "id")).or_else(|| {
+                all_fields.iter().find(|f| match &f.ty {
+                    syn::Type::Path(tp) => tp.path.is_ident("i32") || tp.path.is_ident("i64"),
+                    _ => false,
                 })
-                .and_then(|f| f.ident.as_ref());
+            });
+            let pk_ident = pk_field.and_then(|f| f.ident.as_ref());
+            // The `table!` projection and the `WHERE` filters address the
+            // physical column, which a `#[diesel(column_name)]` on the `#[id]`
+            // field may have renamed away from the Rust field name (#2662).
+            let pk_column = physical_pk_column(pk_field.copied());
             emit_votable_items(
                 name,
                 &table_ident,
@@ -7825,6 +7926,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 has_deleted_at,
                 has_tenant_id,
                 pk_ident,
+                &pk_column,
             )
         }
     };
@@ -7910,16 +8012,17 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 )
                 .to_compile_error();
             }
-            let cmt_pk_ident = all_fields
-                .iter()
-                .find(|f| has_attr(f, "id"))
-                .or_else(|| {
-                    all_fields.iter().find(|f| match &f.ty {
-                        syn::Type::Path(tp) => tp.path.is_ident("i32") || tp.path.is_ident("i64"),
-                        _ => false,
-                    })
+            let cmt_pk_field = all_fields.iter().find(|f| has_attr(f, "id")).or_else(|| {
+                all_fields.iter().find(|f| match &f.ty {
+                    syn::Type::Path(tp) => tp.path.is_ident("i32") || tp.path.is_ident("i64"),
+                    _ => false,
                 })
-                .and_then(|f| f.ident.as_ref());
+            });
+            let cmt_pk_ident = cmt_pk_field.and_then(|f| f.ident.as_ref());
+            // The spec's `parent_pk` addresses the parent row in SQL: resolve
+            // the physical column, honoring a `#[diesel(column_name)]` rename
+            // on the `#[id]` field (#2662).
+            let cmt_pk_column = physical_pk_column(cmt_pk_field.copied());
             emit_commentable_items(
                 name,
                 vis,
@@ -7930,6 +8033,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     has_tenant_id: cmt_has_tenant_id,
                     is_sharded: shard_key_field.is_some(),
                     pk_ident: cmt_pk_ident,
+                    pk_column: &cmt_pk_column,
                 },
             )
         }
@@ -12958,6 +13062,49 @@ mod tests {
     }
 
     #[test]
+    fn derivation_parent_pk_override_reaches_def_and_spec() {
+        // #2662: the override must reach both the registered `DerivationDef`
+        // (what the drift probe and recompute read) and the
+        // `CounterCacheSpec` (what the live mutation paths read).
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "comment_count", parent_pk = "post_uuid")] },
+            &TokenStream::new(),
+        );
+        assert_eq!(
+            generated.matches("parent_pk : \"post_uuid\"").count(),
+            2,
+            "the override must reach the def and the spec: {generated}"
+        );
+        assert!(
+            !generated.contains("parent_pk : \"id\""),
+            "the hard-coded default must not survive an override: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_parent_pk_defaults_to_id() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "comment_count")] },
+            &TokenStream::new(),
+        );
+        assert_eq!(
+            generated.matches("parent_pk : \"id\"").count(),
+            2,
+            "without the override the historical default holds in def and spec: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_duplicate_parent_pk_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(
+            #[derivation(Post, column = "comment_count", parent_pk = "a", parent_pk = "b")]
+        )];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("duplicate"), "{message}");
+    }
+
+    #[test]
     fn model_self_referential_derivation_cannot_read_the_column_it_maintains() {
         // Onto its own table, summing (or filtering on) the maintained column
         // would make a row's new aggregate change its own contribution to its
@@ -13031,6 +13178,62 @@ mod tests {
             generated.contains("derivation : :: core :: option :: Option :: None"),
             "a counter cache is not a derivation: {generated}"
         );
+    }
+
+    #[test]
+    fn counter_cache_parent_pk_override_reaches_the_spec() {
+        // #2662: a parent whose `#[id]` field is not named `id` (or is renamed
+        // with `#[diesel(column_name)]`) names its key explicitly, and the
+        // maintenance SQL addresses it instead of the hard-coded `"id"`.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, counter_cache, parent_pk = "post_uuid")]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("parent_pk : \"post_uuid\""),
+            "the override must reach the spec: {generated}"
+        );
+        assert!(
+            !generated.contains("parent_pk : \"id\""),
+            "the hard-coded default must not survive an override: {generated}"
+        );
+    }
+
+    #[test]
+    fn counter_cache_parent_pk_defaults_to_id() {
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, counter_cache)]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("parent_pk : \"id\""),
+            "without the override the historical default holds: {generated}"
+        );
+    }
+
+    #[test]
+    fn counter_cache_parent_pk_without_counter_cache_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Post, parent_pk = "post_uuid")])];
+        let message = expect_assoc_error(&model, &attrs);
+        assert!(message.contains("requires `counter_cache`"), "{message}");
     }
 
     #[test]
@@ -14376,6 +14579,46 @@ mod tests {
                 >= 3,
             "S1 (both backend arms) and S5 must filter the target table on the \
              resolved primary key, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_target_projection_honors_diesel_renamed_primary_key() {
+        // #2662: a `#[diesel(column_name)]` on the `#[id]` field renames the
+        // physical column; the hidden projection and the S1/S5 filters must
+        // name it, not the Rust field — otherwise the lock and the aggregate
+        // UPDATE hit a column that does not exist.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    #[diesel(column_name = "post_uuid")]
+                    pub uuid: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("posts (post_uuid)"),
+            "expected the target projection keyed on the physical primary \
+             key, got: {generated}"
+        );
+        assert!(
+            !generated.contains("posts (uuid)"),
+            "the Rust field name must not survive as the projection key, got: \
+             {generated}"
+        );
+        assert!(
+            generated
+                .matches("posts :: post_uuid . eq (target_id)")
+                .count()
+                >= 3,
+            "S1 (both backend arms) and S5 must filter the target table on \
+             the physical primary key, got: {generated}"
         );
     }
 

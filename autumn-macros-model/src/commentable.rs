@@ -506,13 +506,21 @@ pub struct ParentShape<'a> {
     pub is_sharded: bool,
     /// The model's primary key field, for the `i64` guard.
     pub pk_ident: Option<&'a syn::Ident>,
+    /// The model's physical primary-key column, for the spec's `parent_pk`.
+    /// The caller resolves any `#[diesel(column_name)]` rename on the `#[id]`
+    /// field (#2662); the spec's SQL must name the column the database has,
+    /// not the Rust field.
+    pub pk_column: &'a str,
 }
 
 /// Emit everything a `#[commentable]` declaration generates.
 ///
 /// `pk_ident` is the model's primary-key field, resolved by the caller exactly
-/// as the CRUD codegen resolves it — it becomes `parent_pk` in the spec, so a
-/// model whose `#[id]` is not named `id` still gets a correct parent probe.
+/// as the CRUD codegen resolves it — it drives the `i64` guard. `pk_column`
+/// is the physical primary-key column (any `#[diesel(column_name)]` rename
+/// resolved); it becomes `parent_pk` in the spec, so a model whose `#[id]`
+/// is not named `id` — or is renamed in the database — still gets a correct
+/// parent probe (#2662).
 ///
 /// `has_deleted_at` / `has_tenant_id` mirror `#[votable]`: the parent's
 /// soft-delete and tenant columns are *projected into the spec* rather than
@@ -534,6 +542,7 @@ pub fn emit_commentable_items(
         has_tenant_id,
         is_sharded,
         pk_ident,
+        pk_column,
     } = *parent;
     let model_snake = pascal_to_snake(&model_ident.to_string());
     let spec_static = format_ident!("__AUTUMN_COMMENTABLE_SPEC_{}", model_snake.to_uppercase());
@@ -549,7 +558,9 @@ pub fn emit_commentable_items(
     let body_column = &spec.body_column;
     let created_at_column = &spec.created_at_column;
     let soft_delete = spec.soft_delete;
-    let parent_pk = pk_ident.map_or_else(|| "id".to_owned(), std::string::ToString::to_string);
+    // The spec's `parent_pk` addresses the parent row in SQL, so it names the
+    // physical column the caller resolved — not the Rust field (#2662).
+    let parent_pk = pk_column;
     let max_depth = spec.max_depth;
     let max_body_bytes = spec.max_body_bytes;
 
@@ -1292,6 +1303,7 @@ mod tests {
                 has_tenant_id: false,
                 is_sharded: false,
                 pk_ident: Some(&pk),
+                pk_column: "id",
             },
         )
         .to_token_stream()
@@ -1311,6 +1323,43 @@ mod tests {
         assert!(
             emitted.contains("author_pk") || emitted.contains("id"),
             "read through the author's key field"
+        );
+    }
+
+    /// #2662: the spec's `parent_pk` must name the physical primary-key
+    /// column. The caller resolves any `#[diesel(column_name)]` rename on the
+    /// `#[id]` field into `ParentShape::pk_column`; the parent probe SQL must
+    /// address the column the database has, not the Rust field.
+    #[test]
+    fn the_spec_parent_pk_names_the_physical_primary_key_column() {
+        let spec = parse(&quote! { (by = User, author_name = username) }).expect("valid");
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let vis: syn::Visibility = syn::parse_quote!(pub);
+        let pk: syn::Ident = syn::parse_quote!(uuid);
+        let emitted = emit_commentable_items(
+            &model,
+            &vis,
+            &spec,
+            "posts",
+            &ParentShape {
+                has_deleted_at: false,
+                has_tenant_id: false,
+                is_sharded: false,
+                pk_ident: Some(&pk),
+                pk_column: "post_uuid",
+            },
+        )
+        .to_token_stream()
+        .to_string();
+
+        assert!(
+            emitted.contains("parent_pk : \"post_uuid\""),
+            "the renamed physical column must reach the spec, got: {emitted}"
+        );
+        assert!(
+            !emitted.contains("parent_pk : \"uuid\""),
+            "the Rust field name must not survive as the parent probe key, \
+             got: {emitted}"
         );
     }
 
@@ -1334,6 +1383,7 @@ mod tests {
                 has_tenant_id: false,
                 is_sharded: false,
                 pk_ident: Some(&pk),
+                pk_column: "id",
             },
         )
         .to_token_stream()
@@ -1354,6 +1404,7 @@ mod tests {
                 has_tenant_id: true,
                 is_sharded: false,
                 pk_ident: Some(&pk),
+                pk_column: "id",
             },
         )
         .to_token_stream()
