@@ -918,7 +918,7 @@ impl TenantCellRegistry {
         }
         element_capacity
             .checked_next_power_of_two()
-            .map_or(element_capacity, |bucket_count| bucket_count)
+            .unwrap_or(element_capacity)
     }
 }
 
