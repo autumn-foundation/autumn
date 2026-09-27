@@ -2350,7 +2350,10 @@ mod security_tests {
     #[test]
     fn test_inject_oob_attr_escapes_input() {
         let result = inject_oob_attr("<div></div>", "\"><script>alert(1)</script>");
-        assert!(!result.contains("<script>alert(1)</script>"), "channels::inject_oob_attr is vulnerable!");
+        assert!(
+            !result.contains("<script>alert(1)</script>"),
+            "channels::inject_oob_attr is vulnerable!"
+        );
         assert!(result.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
     }
 }
