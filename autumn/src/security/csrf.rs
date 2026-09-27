@@ -435,15 +435,7 @@ where
         // satisfy an `/api/` exemption prefix while targeting another route.
         let clean = crate::security::path::clean_path(req.uri().path());
         let path = clean.as_str();
-        let is_exempt = self.settings.exempt_paths.iter().any(|prefix| {
-            if path == prefix {
-                true
-            } else if let Some(stripped) = path.strip_prefix(prefix) {
-                prefix.ends_with('/') || stripped.starts_with('/')
-            } else {
-                false
-            }
-        });
+        let is_exempt = crate::security::path::is_exempt_path(path, &self.settings.exempt_paths);
         let is_safe = is_exempt || self.settings.safe_methods.contains(req.method());
         let raw_cookie_token = extract_cookie_token(req.headers(), &self.settings.cookie_name);
 
@@ -579,80 +571,14 @@ fn validate_cookie_token_hmac(cookie_token: &str, settings: &CsrfSettings) -> bo
     keys.verify(uuid_part.as_bytes(), sig)
 }
 
-/// Extract the `boundary` parameter from a `multipart/form-data` Content-Type value.
-fn extract_multipart_boundary(content_type: &str) -> Option<&str> {
-    content_type.split(';').find_map(|part| {
-        part.trim()
-            .strip_prefix("boundary=")
-            .map(|b| b.trim_matches('"'))
-    })
-}
-
-/// Return the byte position of the first occurrence of `needle` in `haystack`.
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-/// Scan a buffered `multipart/form-data` body for a named text field.
+/// Verify the submitted token against `cookie_token`.
 ///
-/// Returns the field value as a `&str` slice into `bytes`, or `None` when the
-/// field is absent or the body is malformed / truncated.  Callers pre-limit the
-/// buffer via `max_scan_bytes` so we never allocate more than that.
-fn scan_multipart_field<'a>(bytes: &'a [u8], boundary: &str, field_name: &str) -> Option<&'a str> {
-    let delimiter = format!("--{boundary}");
-    let delim = delimiter.as_bytes();
-    let end_marker = format!("\r\n{delimiter}");
-    let end_bytes = end_marker.as_bytes();
-    let mut pos = 0;
-
-    loop {
-        let rel = find_bytes(&bytes[pos..], delim)?;
-        pos += rel + delim.len();
-
-        // After the boundary: \r\n begins a part; anything else ends the multipart.
-        match bytes.get(pos..pos + 2) {
-            Some(b"\r\n") => pos += 2,
-            _ => break, // final boundary (--), truncated, or malformed
-        }
-
-        let header_end = find_bytes(&bytes[pos..], b"\r\n\r\n")?;
-        let headers = std::str::from_utf8(&bytes[pos..pos + header_end]).ok()?;
-        let value_start = pos + header_end + 4;
-
-        let is_match = headers.lines().any(|line| {
-            if !line
-                .to_ascii_lowercase()
-                .starts_with("content-disposition:")
-            {
-                return false;
-            }
-            line.split(';').skip(1).any(|attr| {
-                attr.trim()
-                    .strip_prefix("name=")
-                    .map(|v| v.trim_matches('"'))
-                    == Some(field_name)
-            })
-        });
-
-        if is_match {
-            let end = find_bytes(&bytes[value_start..], end_bytes)
-                .map_or(bytes.len(), |i| value_start + i);
-            return std::str::from_utf8(&bytes[value_start..end]).ok();
-        }
-
-        let next = find_bytes(&bytes[value_start..], end_bytes)?;
-        // Advance to the start of the boundary delimiter (skip only the leading
-        // \r\n of end_bytes so the next loop iteration finds --boundary at
-        // rel=0 and processes it normally).
-        pos = value_start + next + 2;
-    }
-
-    None
-}
-
+/// `cookie_token` is already known HMAC-valid by the time it gets here:
+/// `CsrfService::call` only ever passes `Some` after `validate_cookie_token_hmac`
+/// confirmed it (or signing is inactive, where that check is trivially `true`).
+/// The candidate-location checks below must not re-run
+/// `validate_cookie_token_hmac` on it — that would recompute the same
+/// HMAC-SHA256 the caller already paid for, on every mutating request.
 async fn verify_csrf_token(
     req: &mut Request<axum::body::Body>,
     settings: &CsrfSettings,
@@ -669,7 +595,6 @@ async fn verify_csrf_token(
     if let (Some(c), Some(h)) = (cookie_token, header_token)
         && !c.is_empty()
         && !h.is_empty()
-        && validate_cookie_token_hmac(c, settings)
         && constant_time_eq(c, h)
     {
         token_found = true;
@@ -689,7 +614,6 @@ async fn verify_csrf_token(
     if let (Some(c), Some(q)) = (cookie_token, &query_token)
         && !c.is_empty()
         && !q.is_empty()
-        && validate_cookie_token_hmac(c, settings)
         && constant_time_eq(c, q)
     {
         token_found = true;
@@ -706,12 +630,24 @@ async fn verify_csrf_token(
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
 
-    let is_urlencoded = content_type.starts_with("application/x-www-form-urlencoded");
-    let multipart_boundary = if content_type.starts_with("multipart/form-data") {
-        extract_multipart_boundary(content_type).map(str::to_owned)
-    } else {
-        None
-    };
+    // Media types are case-insensitive (RFC 9110 8.3.1) and the header may carry
+    // leading whitespace; normalize the type token for the urlencoded check.
+    let is_urlencoded = content_type
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("application/x-www-form-urlencoded");
+    // Parse the boundary with `multer::parse_boundary` — the exact parser
+    // `axum::extract::Multipart` uses downstream (via `mime`) — so this CSRF
+    // guard and the extractor can never disagree about the boundary, and it
+    // matches the sibling `submit_token` replay guard. A hand-rolled
+    // `split(';')` diverges on quoted values: `mime` permits a `;` inside a
+    // quoted parameter value, so `boundary="x;y"` parses to the boundary `x;y`
+    // in the real extractor while a split truncates it to `x`, so the `_csrf`
+    // field is never located and a legitimate form is wrongly rejected (403).
+    // `parse_boundary` is case-insensitive on the media type / `boundary` param
+    // NAME and preserves the boundary VALUE's case (RFC 2046); it returns `Err`
+    // for a non-multipart type, so `.ok()` yields `None`.
+    let multipart_boundary = multer::parse_boundary(content_type).ok();
     // NLL: content_type borrow ends here; req.body_mut() is safe to call below.
 
     if !is_urlencoded && multipart_boundary.is_none() {
@@ -748,7 +684,6 @@ async fn verify_csrf_token(
                 if let Some(c) = cookie_token
                     && !c.is_empty()
                     && !value.is_empty()
-                    && validate_cookie_token_hmac(c, settings)
                     && constant_time_eq(c, value.as_ref())
                 {
                     token_found = true;
@@ -758,11 +693,12 @@ async fn verify_csrf_token(
         }
     } else if let Some(ref boundary) = multipart_boundary {
         #[allow(clippy::collapsible_if)]
-        if let Some(value) = scan_multipart_field(&prefix, boundary, &settings.form_field) {
+        if let Some(value) =
+            super::multipart_scan::scan_multipart_field(&prefix, boundary, &settings.form_field)
+        {
             if let Some(c) = cookie_token
                 && !c.is_empty()
                 && !value.is_empty()
-                && validate_cookie_token_hmac(c, settings)
                 && constant_time_eq(c, value)
             {
                 token_found = true;
@@ -1992,5 +1928,109 @@ mod tests {
             )));
         let resp = large.oneshot(make_request()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── Case-insensitive Content-Type matching (RFC 9110 8.3.1) ───────────────
+
+    #[tokio::test]
+    async fn post_mixed_case_multipart_content_type_with_valid_token_passes() {
+        // Media types are case-insensitive (RFC 9110 8.3.1); the Multipart
+        // extractor accepts `Multipart/Form-Data` with a `Boundary=` parameter.
+        // A valid `_csrf` field in such a body must be scanned and the request
+        // ACCEPTED — a case-sensitive `starts_with("multipart/form-data")` gate
+        // wrongly rejects it (403). The weird-case boundary VALUE is identical in
+        // the header and the body delimiters, which also proves the boundary
+        // VALUE stays case-sensitive (RFC 2046) while the media type / param NAME
+        // are matched case-insensitively.
+        let token = "test-csrf-token-uuid-mixedmp";
+        let boundary = "BoUnDaRy-XyZ-123";
+        let body = multipart_body(boundary, &[("_csrf", token), ("name", "alice")]);
+        let app = Router::new()
+            .route("/upload", post(|| async { "ok" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header("Cookie", format!("autumn-csrf={token}"))
+                    .header(http::header::ACCEPT, "text/html")
+                    .header(
+                        "Content-Type",
+                        format!("Multipart/Form-Data; Boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn post_mixed_case_urlencoded_content_type_with_valid_token_passes() {
+        // Media types are case-insensitive (RFC 9110 8.3.1). A urlencoded form
+        // POST carrying a valid `_csrf` field with an upper/mixed-case
+        // Content-Type (`Application/x-www-form-urlencoded`) must be ACCEPTED — a
+        // case-sensitive `starts_with("application/x-www-form-urlencoded")` gate
+        // wrongly rejects it (403), skipping body scanning entirely.
+        let token = "test-csrf-token-uuid-mixeduenc";
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", format!("autumn-csrf={token}"))
+                    .header(http::header::ACCEPT, "text/html")
+                    .header("Content-Type", "Application/x-www-form-urlencoded")
+                    .body(Body::from(format!("_csrf={token}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn post_multipart_quoted_boundary_with_semicolon_passes() {
+        // `mime` permits a `;` inside a QUOTED boundary parameter value, so
+        // `boundary="x;y"` parses to the boundary `x;y` in the real Multipart
+        // extractor (via `multer`). A hand-rolled `split(';')` truncates it to
+        // `x`, so the `_csrf` field is never located and the request is wrongly
+        // rejected (403). Parsing with `multer::parse_boundary` — the exact
+        // parser the extractor uses — keeps the guard and the extractor in
+        // agreement, so the valid token is found and the request ACCEPTED.
+        let token = "test-csrf-token-uuid-quotedsemi";
+        let boundary = "x;y";
+        let body = multipart_body(boundary, &[("_csrf", token), ("name", "alice")]);
+        let app = Router::new()
+            .route("/upload", post(|| async { "ok" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header("Cookie", format!("autumn-csrf={token}"))
+                    .header(http::header::ACCEPT, "text/html")
+                    .header(
+                        "Content-Type",
+                        format!("multipart/form-data; boundary=\"{boundary}\""),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

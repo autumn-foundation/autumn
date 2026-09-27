@@ -19,6 +19,9 @@ glyph-agent becomes the last character of **Autumn's own source code** it eats.
 > `examples/flock/src/main.rs` (the `GET /` route). The crate is a peer of the
 > `flock` example and builds its wasm into `examples/flock/static/islands/`.
 
+<!-- cli-surface-allow: autumn generate island — named above only to state that it does not exist -->
+
+
 ## Why a WASM island (and not htmx)
 
 htmx is a swap engine: an event fires, the browser asks the server for a chunk
@@ -340,8 +343,9 @@ serves `static/` at `/static/` out of the box, so no route wiring is required.
 
 - **Dev** (`cargo run`): `asset_url("islands/flock-boot.js")` returns
   `/static/islands/flock-boot.js` verbatim — edits are visible immediately.
-- **Release** (`autumn build --release`): the asset pipeline fingerprints and
-  long-caches files it knows about (`public, max-age=31536000, immutable`). The
+- **Release** (`autumn build`, which builds in release by default): the asset
+  pipeline fingerprints and long-caches files it knows about
+  (`public, max-age=31536000, immutable`). The
   `.wasm`/`.js` pair flows through the existing manifest unchanged. The one
   wrinkle: the loader imports the glue by a relative name
   (`./autumn_island_flock.js`), so keep the glue+wasm pair addressed the way
