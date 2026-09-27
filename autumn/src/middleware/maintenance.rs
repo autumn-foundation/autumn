@@ -25,9 +25,28 @@
 //! 4. **Read-only mode** – when `readonly = true`, `GET`, `HEAD`, and
 //!    `OPTIONS` requests pass through; write methods are gated.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
+
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::body::Body;
@@ -75,7 +94,7 @@ pub(crate) fn prefix_with_trailing_slash(prefix: &str) -> String {
     if prefix.is_empty() || prefix.ends_with('/') {
         prefix.to_owned()
     } else {
-        let mut s = String::with_capacity(prefix.len() + 1);
+        let mut s = String::with_capacity(prefix.len().saturating_add(1));
         s.push_str(prefix);
         s.push('/');
         s
@@ -89,6 +108,18 @@ pub(crate) fn prefix_with_trailing_slash(prefix: &str) -> String {
 #[derive(Clone)]
 pub struct MaintenanceLayer {
     state: MaintenanceState,
+    paths: Arc<GatePaths>,
+}
+
+/// The path sets the gate consults, resolved once at router-assembly time.
+///
+/// Held behind an `Arc` because the produced [`MaintenanceService`] is cloned
+/// on the request path — once per traversal of the ingress stack above it — and
+/// this layer is applied unconditionally (there is no router-level "maintenance
+/// disabled" gate). Storing the strings by value made every one of those clones
+/// deep-copy two `String`s and two `Vec<String>`s (issue #2193).
+#[derive(Clone)]
+struct GatePaths {
     health_prefix: String,
     health_prefix_slash: String,
     bypass_paths: Vec<String>,
@@ -105,11 +136,23 @@ impl MaintenanceLayer {
         let health_prefix_slash = prefix_with_trailing_slash(&health_prefix);
         Self {
             state,
-            health_prefix,
-            health_prefix_slash,
-            bypass_paths: Vec::new(),
-            probe_paths: Vec::new(),
+            paths: Arc::new(GatePaths {
+                health_prefix,
+                health_prefix_slash,
+                bypass_paths: Vec::new(),
+                probe_paths: Vec::new(),
+            }),
         }
+    }
+
+    /// Mutate the (build-time) path set, cloning it only when the `Arc` is
+    /// already shared. Router assembly chains the builders below on a
+    /// freshly-constructed layer, so that path never copies; the
+    /// clone-this-layer-then-override usage documented on the type copies once,
+    /// at build time. Either way no mutation is lost — `make_mut` forks and
+    /// mutates the copy `self` then owns.
+    fn paths_mut(&mut self) -> &mut GatePaths {
+        Arc::make_mut(&mut self.paths)
     }
 
     /// Override the health-check prefix (e.g. `/health`).
@@ -119,8 +162,9 @@ impl MaintenanceLayer {
     /// in rotation.
     #[must_use]
     pub fn with_health_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.health_prefix = prefix.into();
-        self.health_prefix_slash = prefix_with_trailing_slash(&self.health_prefix);
+        let paths = self.paths_mut();
+        paths.health_prefix = prefix.into();
+        paths.health_prefix_slash = prefix_with_trailing_slash(&paths.health_prefix);
         self
     }
 
@@ -129,14 +173,14 @@ impl MaintenanceLayer {
     /// Requests to these paths (or starting with them as slash-delimited segments) always pass through.
     #[must_use]
     pub fn with_bypass_paths(mut self, paths: Vec<String>) -> Self {
-        self.bypass_paths = paths;
+        self.paths_mut().bypass_paths = paths;
         self
     }
 
     /// Configure exact-match health probe paths that escape maintenance mode.
     #[must_use]
     pub fn with_probe_paths(mut self, paths: Vec<String>) -> Self {
-        self.probe_paths = paths;
+        self.paths_mut().probe_paths = paths;
         self
     }
 }
@@ -148,10 +192,7 @@ impl<S> Layer<S> for MaintenanceLayer {
         MaintenanceService {
             inner,
             state: self.state.clone(),
-            health_prefix: self.health_prefix.clone(),
-            health_prefix_slash: self.health_prefix_slash.clone(),
-            bypass_paths: self.bypass_paths.clone(),
-            probe_paths: self.probe_paths.clone(),
+            paths: Arc::clone(&self.paths),
         }
     }
 }
@@ -161,10 +202,7 @@ impl<S> Layer<S> for MaintenanceLayer {
 pub struct MaintenanceService<S> {
     inner: S,
     state: MaintenanceState,
-    health_prefix: String,
-    health_prefix_slash: String,
-    bypass_paths: Vec<String>,
-    probe_paths: Vec<String>,
+    paths: Arc<GatePaths>,
 }
 
 impl<S> MaintenanceService<S> {
@@ -179,15 +217,19 @@ impl<S> MaintenanceService<S> {
     ) -> Option<Response<Body>> {
         // 1. Actuator/health routes and configured bypass paths always pass through.
         let path = req.uri().path();
-        if health_prefix_matches(path, &self.health_prefix, &self.health_prefix_slash) {
+        if health_prefix_matches(
+            path,
+            &self.paths.health_prefix,
+            &self.paths.health_prefix_slash,
+        ) {
             return None;
         }
-        for probe in &self.probe_paths {
+        for probe in &self.paths.probe_paths {
             if path == probe {
                 return None;
             }
         }
-        for bypass in &self.bypass_paths {
+        for bypass in &self.paths.bypass_paths {
             if path == bypass {
                 return None;
             }
@@ -272,6 +314,10 @@ where
 {
     type Output = Result<Response<Body>, E>;
 
+    #[allow(
+        clippy::expect_used,
+        reason = "unreachable: future not polled after Ready"
+    )]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.project() {
             MaintenanceFutureProj::ShortCircuit { response } => Poll::Ready(Ok(response
@@ -324,6 +370,7 @@ fn extract_client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
 }
 
 /// Build a 503 response with the appropriate content type.
+#[allow(clippy::expect_used, reason = "infallible: static 503 response")]
 fn build_503_response<B>(req: &Request<B>, config: &MaintenanceConfig) -> Response<Body> {
     let message = config
         .message

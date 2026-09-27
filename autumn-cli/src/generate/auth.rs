@@ -20,8 +20,8 @@ use super::emit::Plan;
 use super::model::ensure_cargo_dependencies;
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
-    add_mod_declaration, add_remember_middleware_to_app, append_schema_table, schema_has_table,
-    unique_index_sql, update_main_rs,
+    add_mod_declaration, add_remember_middleware_to_app, append_schema_table, declares_package,
+    schema_has_table, unique_index_sql, update_main_rs,
 };
 use super::{Flags, GenerateError, ensure_project_root, read_or_empty, timestamp_now};
 
@@ -49,6 +49,7 @@ const PASSKEY_EXTRA_DEPS: &[(&str, &str)] = &[
         "{ version = \"0.5\", features = [\"danger-allow-state-serialisation\", \"conditional-ui\"] }",
     ),
     ("uuid", "{ version = \"1\", features = [\"v4\"] }"),
+    ("base64", "\"0.22\""),
 ];
 
 /// Required features for the `webauthn-rs` dependency.
@@ -425,7 +426,6 @@ pub fn plan_auth_with_providers(
 ///
 /// # Errors
 /// Same as [`plan_auth`].
-#[allow(clippy::too_many_lines)]
 pub fn plan_auth_with_providers_ex(
     project_root: &Path,
     name: &str,
@@ -434,8 +434,46 @@ pub fn plan_auth_with_providers_ex(
     totp: bool,
     magic_link: bool,
 ) -> Result<Plan, GenerateError> {
+    // Generation path: run the full plan, including the shared-layout preflight.
+    // `autumn destroy auth` recomputes the identical plan before reverting it,
+    // and must bypass that generate-only preflight (issue #1353 follow-up); it
+    // reaches the builder through `plan_auth_full_ex2_for_revert` instead.
+    plan_auth_with_providers_ex_impl(
+        project_root,
+        name,
+        timestamp,
+        providers,
+        totp,
+        magic_link,
+        false,
+    )
+}
+
+/// Shared implementation of [`plan_auth_with_providers_ex`]. `for_revert`
+/// suppresses the generate-only shared-layout preflight so `autumn destroy
+/// auth` (which recomputes this same plan before [`Plan::revert`]) can remove
+/// generated files even in a project whose shared `pub fn layout` is missing or
+/// renamed — a regression the preflight would otherwise introduce.
+#[allow(clippy::too_many_lines)]
+fn plan_auth_with_providers_ex_impl(
+    project_root: &Path,
+    name: &str,
+    timestamp: &str,
+    providers: &[String],
+    totp: bool,
+    magic_link: bool,
+    for_revert: bool,
+) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     super::model::validate_resource_name(name)?;
+
+    // Determine the target app's database backend so the scaffolded migrations
+    // emit backend-aware DDL (issue #1927): a SQLite app gets SQLite-dialect DDL
+    // (`INTEGER PRIMARY KEY AUTOINCREMENT`, `DEFAULT CURRENT_TIMESTAMP`) instead
+    // of the Postgres-only `BIGSERIAL`/`NOW()` form. Detected identically on the
+    // generate and destroy/revert paths (both read the same config), so a
+    // `destroy auth` round-trip recomputes byte-identical migration content.
+    let backend = super::detect_backend(project_root);
 
     let pascal_name = pascal(name);
     let snake_name = snake(name);
@@ -468,6 +506,47 @@ pub fn plan_auth_with_providers_ex(
         ));
     }
 
+    // Issue #1353: the generated auth views render through the application's
+    // shared `crate::layout(title, current_path, flash, content)` (nav bar,
+    // stylesheet links, skip-link, footer) rather than a private per-file
+    // layout stub, so the target app must expose a shared layout with the
+    // matching 4-arg signature (as `autumn new` emits). Detect it by looking
+    // for a `pub fn layout` in `src/main.rs`. If it is missing — or present
+    // with the wrong arity (e.g. an older/custom 2-arg
+    // `pub fn layout(title, content)`) — fail early with an actionable message
+    // rather than emitting routes that call a nonexistent or mismatched
+    // `crate::layout`. This mirrors the scaffold generator's preflight
+    // (issue #1130) and reuses its lexically-aware detector.
+    //
+    // The preflight is a generate-time guard only. `autumn destroy auth`
+    // recomputes this same plan before reverting it, so running the preflight
+    // on that path would hard-fail cleanup in a project whose shared
+    // `pub fn layout` is missing or renamed — stranding the very files destroy
+    // is meant to remove. Skip it when `for_revert` is set.
+    if !for_revert {
+        let main_for_layout_check = project_root.join("src").join("main.rs");
+        let main_src = match std::fs::read_to_string(&main_for_layout_check) {
+            Ok(src) => src,
+            // `main.rs` genuinely absent: surface the actionable message below by
+            // treating it as an empty source (no `pub fn layout` present).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            // Any other io error (e.g. PermissionDenied) preserves its original
+            // `ErrorKind` + OS message rather than being masked.
+            Err(e) => return Err(GenerateError::Io(e)),
+        };
+        if !super::scaffold::has_shared_layout(&main_src) {
+            return Err(GenerateError::Config(
+                "`autumn generate auth` requires a shared `pub fn layout` in src/main.rs \
+                 so the generated views can render through \
+                 `crate::layout(title, current_path, flash, content)` (4 args). Run this inside \
+                 an app created by `autumn new`, or add a shared \
+                 `pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup` \
+                 to src/main.rs and re-run."
+                    .to_owned(),
+            ));
+        }
+    }
+
     let mut plan = Plan::new(project_root);
 
     // ── Migration ──────────────────────────────────────────────────────────
@@ -476,7 +555,7 @@ pub fn plan_auth_with_providers_ex(
         .join(format!("{timestamp}_create_{table}"));
     plan.create(
         mig_dir.join("up.sql"),
-        render_migration_up(&snake_name, &table, totp, magic_link),
+        render_migration_up(backend, &snake_name, &table, totp, magic_link),
     );
     plan.create(
         mig_dir.join("down.sql"),
@@ -802,12 +881,12 @@ pub fn plan_auth_with_providers_ex(
     let docs_dir = project_root.join("docs").join("guide");
     plan.create(
         docs_dir.join("authentication.md"),
-        render_docs_file(&pascal_name, totp, magic_link),
+        render_docs_file(backend, &pascal_name, totp, magic_link),
     );
     plan.create(docs_dir.join("gdpr-compliance.md"), render_gdpr_docs_file());
     plan.create(
         docs_dir.join("session-management.md"),
-        render_sessions_docs_file(&pascal_name, &snake_name, &table),
+        render_sessions_docs_file(backend, &pascal_name, &snake_name, &table),
     );
 
     // ── src/main.rs — module declarations + route registration ────────────
@@ -840,6 +919,18 @@ pub fn plan_auth_with_providers_ex(
         .chain(AUTH_EXTRA_DEPS.iter().copied())
         .chain(if totp { TOTP_EXTRA_DEPS } else { &[] }.iter().copied())
         .collect();
+    // The `--totp` routes add `base64 = "0.22"` and use its 0.21+ `Engine`
+    // API; `ensure_cargo_dependencies` is name-only, so an app pinning an older
+    // `base64` keeps it and the generated 2FA code won't compile. Warn instead.
+    if totp {
+        super::model::warn_if_existing_dep_below_version(
+            &mut plan,
+            &cargo_existing,
+            "base64",
+            0,
+            22,
+        );
+    }
     // Apply dep additions then enable the mail feature in a single write.
     let with_deps = ensure_cargo_dependencies(&cargo_existing, &all_deps);
     // `ensure_cargo_dependencies` no-ops on an already-declared `totp-rs`, so
@@ -906,7 +997,16 @@ pub fn plan_auth_with_options(
     timestamp: &str,
     oauth: &AuthOAuthOptions,
 ) -> Result<Plan, GenerateError> {
-    plan_auth_options_impl(project_root, name, timestamp, oauth, false, false, false)
+    plan_auth_options_impl(
+        project_root,
+        name,
+        timestamp,
+        oauth,
+        false,
+        false,
+        false,
+        false,
+    )
 }
 
 /// Compute the file actions for `autumn generate auth [--oauth …] [--totp]`.
@@ -924,7 +1024,16 @@ pub fn plan_auth_full(
     oauth: &AuthOAuthOptions,
     totp: bool,
 ) -> Result<Plan, GenerateError> {
-    plan_auth_options_impl(project_root, name, timestamp, oauth, totp, false, false)
+    plan_auth_options_impl(
+        project_root,
+        name,
+        timestamp,
+        oauth,
+        totp,
+        false,
+        false,
+        false,
+    )
 }
 
 /// Compute the file actions for `autumn generate auth [--oauth …] [--totp] [--passkeys]`.
@@ -941,7 +1050,16 @@ pub fn plan_auth_full_ex(
     totp: bool,
     passkeys: bool,
 ) -> Result<Plan, GenerateError> {
-    plan_auth_options_impl(project_root, name, timestamp, oauth, totp, passkeys, false)
+    plan_auth_options_impl(
+        project_root,
+        name,
+        timestamp,
+        oauth,
+        totp,
+        passkeys,
+        false,
+        false,
+    )
 }
 
 /// Compute the file actions for
@@ -970,14 +1088,22 @@ pub fn plan_auth_full_ex2(
         totp,
         passkeys,
         magic_link,
+        false,
     )
 }
 
-/// Shared implementation: base (optionally TOTP-aware, optionally passkey-aware,
-/// optionally magic-link-aware) scaffold plus, when providers are supplied, the
-/// OAuth artifacts.
-#[allow(clippy::too_many_lines)]
-fn plan_auth_options_impl(
+/// Compute the file actions for `autumn destroy auth …`.
+///
+/// Identical to [`plan_auth_full_ex2`] except it recomputes the plan for the
+/// revert path: it skips the generate-only shared-layout preflight so cleanup
+/// still succeeds in a project whose shared `pub fn layout` is missing or
+/// renamed (e.g. one scaffolded by an older CLI). `autumn destroy auth` reverts
+/// the returned plan; the preflight would otherwise hard-fail the destroy
+/// before any generated file is removed (issue #1353 follow-up).
+///
+/// # Errors
+/// Same as [`plan_auth_full_ex2`], minus the shared-layout preflight.
+pub fn plan_auth_full_ex2_for_revert(
     project_root: &Path,
     name: &str,
     timestamp: &str,
@@ -986,17 +1112,56 @@ fn plan_auth_options_impl(
     passkeys: bool,
     magic_link: bool,
 ) -> Result<Plan, GenerateError> {
+    plan_auth_options_impl(
+        project_root,
+        name,
+        timestamp,
+        oauth,
+        totp,
+        passkeys,
+        magic_link,
+        true,
+    )
+}
+
+/// Shared implementation: base (optionally TOTP-aware, optionally passkey-aware,
+/// optionally magic-link-aware) scaffold plus, when providers are supplied, the
+/// OAuth artifacts.
+// The three feature flags (`totp`/`passkeys`/`magic_link`) already saturate the
+// bool/arg budget; the fourth (`for_revert`) is an internal generate-vs-destroy
+// toggle threaded only from this crate's two public wrappers, so keep the flat
+// signature rather than wrap it in a one-off options struct.
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools
+)]
+fn plan_auth_options_impl(
+    project_root: &Path,
+    name: &str,
+    timestamp: &str,
+    oauth: &AuthOAuthOptions,
+    totp: bool,
+    passkeys: bool,
+    magic_link: bool,
+    for_revert: bool,
+) -> Result<Plan, GenerateError> {
     // Start with the base auth plan with providers (and optional TOTP, and
-    // optional magic-link) applied.
-    let mut plan = plan_auth_with_providers_ex(
+    // optional magic-link) applied. `for_revert` threads through to suppress the
+    // generate-only shared-layout preflight on the `autumn destroy auth` path.
+    let mut plan = plan_auth_with_providers_ex_impl(
         project_root,
         name,
         timestamp,
         &oauth.providers,
         totp,
         magic_link,
+        for_revert,
     )?;
 
+    // Determine the target app's database backend so the scaffolded migrations
+    // emit backend-aware DDL (issue #1927), matching the base auth plan above.
+    let backend = super::detect_backend(project_root);
     let pascal_name = pascal(name);
     let snake_name = snake(name);
     let user_table = pluralize(&snake_name);
@@ -1013,7 +1178,7 @@ fn plan_auth_options_impl(
             .join(format!("{oauth_ts_str}_create_oauth_identities"));
         plan.create(
             mig_dir.join("up.sql"),
-            render_oauth_migration_up(&user_table),
+            render_oauth_migration_up(backend, &user_table),
         );
         plan.create(mig_dir.join("down.sql"), render_oauth_migration_down());
 
@@ -1091,7 +1256,7 @@ fn plan_auth_options_impl(
         let docs_dir = project_root.join("docs").join("guide");
         plan.create(
             docs_dir.join("oauth.md"),
-            render_oauth_docs_file(&oauth.providers),
+            render_oauth_docs_file(backend, &oauth.providers, &user_table),
         );
 
         // ── Cargo.toml: add oauth2 feature to autumn-web ─────────────────────
@@ -1162,7 +1327,7 @@ fn plan_auth_options_impl(
             .join(format!("{passkey_ts_str}_create_webauthn_credentials"));
         plan.create(
             mig_dir.join("up.sql"),
-            render_passkey_migration_up(&user_table),
+            render_passkey_migration_up(backend, &user_table),
         );
         plan.create(mig_dir.join("down.sql"), render_passkey_migration_down());
 
@@ -1281,6 +1446,10 @@ fn plan_auth_options_impl(
         let base_cargo = find_plan_content_for_path(&plan, &cargo_toml_path)
             .unwrap_or_else(|| read_or_empty(&cargo_toml_path));
         let all_passkey_deps: Vec<(&str, &str)> = PASSKEY_EXTRA_DEPS.to_vec();
+        // `ensure_cargo_dependencies` is name-only, so an app that already pins
+        // an older `base64` keeps it and never gets `0.22`; the emitted
+        // `encode_cred_id` needs the 0.21+ `Engine` API, so warn if it's too old.
+        super::model::warn_if_existing_dep_below_version(&mut plan, &base_cargo, "base64", 0, 22);
         let with_deps = super::model::ensure_cargo_dependencies(&base_cargo, &all_passkey_deps);
         // If the project already declared webauthn-rs without the required features,
         // ensure_cargo_dependencies would have skipped it; merge them here.
@@ -1330,6 +1499,11 @@ fn find_plan_content_for_path(plan: &Plan, path: &std::path::Path) -> Option<Str
 }
 
 /// Ensure `autumn-web` in `[dependencies]` has `features = ["oauth2"]`.
+///
+/// The `[dependencies.autumn_web]` underscore spelling is only treated as this
+/// dependency when the table body renames the package back with
+/// `package = "autumn-web"` — without that rename Cargo resolves the table to a
+/// different package literally named `autumn_web`, which must be left untouched.
 #[allow(clippy::too_many_lines)]
 fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
     const CRATE: &str = "autumn-web";
@@ -1422,7 +1596,24 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
             break;
         }
 
-        if trimmed == subtable_header || trimmed == subtable_header_underscore {
+        // Cargo does not normalize `-`/`_` in a dependency table key: unlike
+        // `[dependencies.autumn-web]`, `[dependencies.autumn_web]` names an
+        // unrelated package `autumn_web` unless its body renames it back with
+        // `package = "autumn-web"` (confirmed via `cargo metadata`). Require
+        // that declaration before treating the underscore form as a match, the
+        // same way `find_section_start_with_autumn_web_package` does.
+        let underscore_aliases_autumn_web = trimmed == subtable_header_underscore && {
+            let body_end = lines[i + 1..]
+                .iter()
+                .position(|l| l.trim_start().starts_with('['))
+                .map_or(lines.len(), |p| i + 1 + p);
+            lines[i + 1..body_end].iter().any(|l| {
+                let code = l.split_once('#').map_or(l.as_str(), |(before, _)| before);
+                declares_package(code, CRATE)
+            })
+        };
+
+        if trimmed == subtable_header || underscore_aliases_autumn_web {
             let mut j = i + 1;
             let mut found_features = false;
             while j < lines.len() {
@@ -1534,7 +1725,12 @@ pub fn run_with_options(
 /// Handles the three common forms a fresh Autumn project may use:
 /// - `autumn-web = "x.y"` (simple string)
 /// - `autumn-web = { version = "x.y", ... }` (inline table)
-/// - `[dependencies.autumn-web]` subtable
+/// - `[dependencies.autumn-web]` subtable (hyphenated spelling, or the
+///   underscore-normalized `[dependencies.autumn_web]` spelling — but only when
+///   its body renames the package back with `package = "autumn-web"`; without
+///   that rename Cargo resolves the table to a different package literally
+///   called `autumn_web`, which must be left untouched)
+#[allow(clippy::too_many_lines)]
 fn ensure_autumn_web_mail_feature(toml: &str) -> String {
     const CRATE: &str = "autumn-web";
     const FEATURE: &str = "\"mail\"";
@@ -1545,6 +1741,7 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
     let simple_prefix = format!("{CRATE} = \"");
     let table_prefix = format!("{CRATE} = {{");
     let subtable_header = format!("[dependencies.{CRATE}]");
+    let subtable_header_underscore = format!("[dependencies.{}]", CRATE.replace('-', "_"));
 
     let mut i = 0;
     while i < lines.len() {
@@ -1600,7 +1797,24 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
             break;
         }
 
-        if trimmed == subtable_header {
+        // Cargo does not normalize `-`/`_` in a dependency table key: unlike
+        // `[dependencies.autumn-web]`, `[dependencies.autumn_web]` names an
+        // unrelated package `autumn_web` unless its body renames it back with
+        // `package = "autumn-web"` (confirmed via `cargo metadata`). Require
+        // that declaration before treating the underscore form as a match, the
+        // same way `find_section_start_with_autumn_web_package` does.
+        let underscore_aliases_autumn_web = trimmed == subtable_header_underscore && {
+            let body_end = lines[i + 1..]
+                .iter()
+                .position(|l| l.trim_start().starts_with('['))
+                .map_or(lines.len(), |p| i + 1 + p);
+            lines[i + 1..body_end].iter().any(|l| {
+                let code = l.split_once('#').map_or(l.as_str(), |(before, _)| before);
+                declares_package(code, CRATE)
+            })
+        };
+
+        if trimmed == subtable_header || underscore_aliases_autumn_web {
             // Scan ahead within the subtable.
             let mut j = i + 1;
             let mut found_features = false;
@@ -1718,6 +1932,60 @@ scope = "openid profile email"
 
 // ── Template rendering ────────────────────────────────────────────────────────
 
+/// Backend-specific SQL fragments for the hand-written auth migration DDL
+/// (issue #1927).
+///
+/// The auth generator scaffolds several tables (users, sessions, remember
+/// tokens, recovery codes, magic-link tokens, OAuth identities, `WebAuthn`
+/// credentials) via hand-written `CREATE TABLE` strings. This carries the small
+/// set of column-type fragments that differ between backends so the Postgres
+/// output stays byte-for-byte identical while a `SQLite` app gets valid DDL:
+/// `INTEGER PRIMARY KEY AUTOINCREMENT` for auto-increment ids (`SQLite` has no
+/// `BIGSERIAL`), plain `INTEGER` for `BIGINT`/`INT`, and ISO-8601 `TEXT`
+/// timestamps defaulted to `CURRENT_TIMESTAMP` (`SQLite` has no dedicated
+/// timestamp type nor `NOW()`). Portable pieces (`TEXT`, `REFERENCES`, `UNIQUE`,
+/// `CREATE INDEX`) are shared and unchanged. Mirrors the dialect mapping the
+/// backend-aware model/migration generators use
+/// (`super::dsl::IdType::pk_sql_for` / `FieldKind::sqlite_sql_type`).
+#[derive(Clone, Copy)]
+struct AuthDdl {
+    /// Auto-increment primary-key column definition (the SQL after `id `).
+    pk: &'static str,
+    /// A `BIGINT` foreign-key / integer column type.
+    big_int: &'static str,
+    /// A nullable timestamp column type (used as `{ts} NULL`).
+    ts: &'static str,
+    /// A `NOT NULL` timestamp column defaulted to the creation time.
+    ts_not_null_default_now: &'static str,
+    /// A `BOOLEAN NOT NULL DEFAULT FALSE` column.
+    bool_not_null_false: &'static str,
+    /// A small-integer `NOT NULL DEFAULT 0` column (`failed_attempts`).
+    int_not_null_zero: &'static str,
+}
+
+impl AuthDdl {
+    const fn for_backend(backend: autumn_web::config::DatabaseBackend) -> Self {
+        match backend {
+            autumn_web::config::DatabaseBackend::Postgres => Self {
+                pk: "BIGSERIAL PRIMARY KEY",
+                big_int: "BIGINT",
+                ts: "TIMESTAMP",
+                ts_not_null_default_now: "TIMESTAMP NOT NULL DEFAULT NOW()",
+                bool_not_null_false: "BOOLEAN NOT NULL DEFAULT FALSE",
+                int_not_null_zero: "INT NOT NULL DEFAULT 0",
+            },
+            autumn_web::config::DatabaseBackend::Sqlite => Self {
+                pk: "INTEGER PRIMARY KEY AUTOINCREMENT",
+                big_int: "INTEGER",
+                ts: "TEXT",
+                ts_not_null_default_now: "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+                bool_not_null_false: "INTEGER NOT NULL DEFAULT 0",
+                int_not_null_zero: "INTEGER NOT NULL DEFAULT 0",
+            },
+        }
+    }
+}
+
 /// Name of the per-login session-tracking table (issue #819), derived from
 /// the auth resource: `User` → `user_sessions`, `Account` → `account_sessions`.
 fn sessions_table_name(snake_name: &str) -> String {
@@ -1729,70 +1997,22 @@ fn remember_table_name(snake_name: &str) -> String {
     format!("{snake_name}_remember_tokens")
 }
 
-#[allow(clippy::too_many_lines)]
-fn render_migration_up(snake_name: &str, table: &str, totp: bool, magic_link: bool) -> String {
-    // TOTP columns are inserted after password_digest so the column order
-    // matches the generated model struct and `schema.rs` block.
-    let totp_columns = if totp {
-        "\x20   totp_secret_encrypted TEXT NULL,\n\
-         \x20   totp_enabled BOOLEAN NOT NULL DEFAULT FALSE,\n\
-         \x20   totp_last_used_step BIGINT NULL,\n"
-    } else {
-        ""
-    };
-    let mut out = format!(
-        "CREATE TABLE {table} (\n\
-         \x20   id BIGSERIAL PRIMARY KEY,\n\
-         \x20   email TEXT NOT NULL,\n\
-         \x20   time_zone TEXT NULL,\n\
-         \x20   password_digest TEXT NOT NULL,\n\
-         {totp_columns}\
-         \x20   failed_attempts INT NOT NULL DEFAULT 0,\n\
-         \x20   locked_at TIMESTAMP NULL,\n\
-         \x20   reset_token_digest TEXT NULL,\n\
-         \x20   reset_token_expires_at TIMESTAMP NULL,\n\
-         \x20   confirm_token_digest TEXT NULL,\n\
-         \x20   confirm_token_expires_at TIMESTAMP NULL,\n\
-         \x20   email_confirmed_at TIMESTAMP NULL,\n\
-         \x20   pending_email TEXT NULL,\n\
-         \x20   export_requested_at TIMESTAMP NULL,\n\
-         \x20   delete_requested_at TIMESTAMP NULL,\n\
-         \x20   delete_scheduled_at TIMESTAMP NULL,\n\
-         \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW()\n\
-         );\n"
-    );
-    // `email`'s uniqueness is expressed through the same shared primitive
-    // `field:String:unique` scaffolds elsewhere (issue #1032), rather than a
-    // parallel hand-rolled `UNIQUE` column constraint.
-    out.push_str(&unique_index_sql(table, "email", &[]));
-    if totp {
-        out.push_str(
-            "\n\
-             CREATE TABLE recovery_codes (\n\
-             \x20   id BIGSERIAL PRIMARY KEY,\n\
-             \x20   user_id BIGINT NOT NULL REFERENCES ",
-        );
-        out.push_str(table);
-        out.push_str(
-            "(id) ON DELETE CASCADE,\n\
-             \x20   code_digest TEXT NOT NULL,\n\
-             \x20   used_at TIMESTAMP NULL,\n\
-             \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW()\n\
-             );\n\
-             \n\
-             CREATE INDEX recovery_codes_user_id_idx ON recovery_codes (user_id);\n",
-        );
-    }
-    // Active login sessions (issue #819): one row per login, keyed by the
-    // SHA-256 digest of the opaque server-side session id. Only the digest
-    // is stored so a database leak cannot be replayed as a session cookie.
+/// DDL for the tracked-sessions table, in the app's own dialect.
+///
+/// Shared by the scaffolded migration and the generated session-management
+/// guide (issue #1908) so a `SQLite` app is never handed Postgres-only
+/// `BIGSERIAL` / `NOW()` DDL, and the two copies cannot drift.
+fn render_sessions_table_ddl(
+    backend: autumn_web::config::DatabaseBackend,
+    snake_name: &str,
+    user_table: &str,
+) -> String {
+    let d = AuthDdl::for_backend(backend);
     let sess_table = sessions_table_name(snake_name);
-    let _ = write!(
-        out,
-        "\n\
-         CREATE TABLE {sess_table} (\n\
-         \x20   id BIGSERIAL PRIMARY KEY,\n\
-         \x20   user_id BIGINT NOT NULL REFERENCES {table}(id) ON DELETE CASCADE,\n\
+    format!(
+        "CREATE TABLE {sess_table} (\n\
+         \x20   id {pk},\n\
+         \x20   user_id {big_int} NOT NULL REFERENCES {user_table}(id) ON DELETE CASCADE,\n\
          \x20   token_digest TEXT NOT NULL UNIQUE,\n\
          \x20   ip TEXT NOT NULL DEFAULT '',\n\
          \x20   user_agent TEXT NOT NULL DEFAULT '',\n\
@@ -1800,11 +2020,94 @@ fn render_migration_up(snake_name: &str, table: &str, totp: bool, magic_link: bo
          \x20   ua_os TEXT NOT NULL DEFAULT '',\n\
          \x20   ua_device TEXT NOT NULL DEFAULT '',\n\
          \x20   label TEXT NULL,\n\
-         \x20   last_seen_at TIMESTAMP NOT NULL DEFAULT NOW(),\n\
-         \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW()\n\
+         \x20   last_seen_at {created_at},\n\
+         \x20   created_at {created_at}\n\
          );\n\
          \n\
          CREATE INDEX {sess_table}_user_id_idx ON {sess_table} (user_id);\n",
+        pk = d.pk,
+        big_int = d.big_int,
+        created_at = d.ts_not_null_default_now,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_migration_up(
+    backend: autumn_web::config::DatabaseBackend,
+    snake_name: &str,
+    table: &str,
+    totp: bool,
+    magic_link: bool,
+) -> String {
+    let d = AuthDdl::for_backend(backend);
+    // TOTP columns are inserted after password_digest so the column order
+    // matches the generated model struct and `schema.rs` block.
+    let totp_columns = if totp {
+        format!(
+            "\x20   totp_secret_encrypted TEXT NULL,\n\
+             \x20   totp_enabled {bool_default_false},\n\
+             \x20   totp_last_used_step {big_int} NULL,\n",
+            bool_default_false = d.bool_not_null_false,
+            big_int = d.big_int,
+        )
+    } else {
+        String::new()
+    };
+    let mut out = format!(
+        "CREATE TABLE {table} (\n\
+         \x20   id {pk},\n\
+         \x20   email TEXT NOT NULL,\n\
+         \x20   time_zone TEXT NULL,\n\
+         \x20   password_digest TEXT NOT NULL,\n\
+         {totp_columns}\
+         \x20   failed_attempts {int_zero},\n\
+         \x20   locked_at {ts} NULL,\n\
+         \x20   reset_token_digest TEXT NULL,\n\
+         \x20   reset_token_expires_at {ts} NULL,\n\
+         \x20   confirm_token_digest TEXT NULL,\n\
+         \x20   confirm_token_expires_at {ts} NULL,\n\
+         \x20   email_confirmed_at {ts} NULL,\n\
+         \x20   pending_email TEXT NULL,\n\
+         \x20   export_requested_at {ts} NULL,\n\
+         \x20   delete_requested_at {ts} NULL,\n\
+         \x20   delete_scheduled_at {ts} NULL,\n\
+         \x20   created_at {created_at}\n\
+         );\n",
+        pk = d.pk,
+        int_zero = d.int_not_null_zero,
+        ts = d.ts,
+        created_at = d.ts_not_null_default_now,
+    );
+    // `email`'s uniqueness is expressed through the same shared primitive
+    // `field:String:unique` scaffolds elsewhere (issue #1032), rather than a
+    // parallel hand-rolled `UNIQUE` column constraint.
+    out.push_str(&unique_index_sql(table, "email", &[]));
+    if totp {
+        let _ = write!(
+            out,
+            "\n\
+             CREATE TABLE recovery_codes (\n\
+             \x20   id {pk},\n\
+             \x20   user_id {big_int} NOT NULL REFERENCES {table}(id) ON DELETE CASCADE,\n\
+             \x20   code_digest TEXT NOT NULL,\n\
+             \x20   used_at {ts} NULL,\n\
+             \x20   created_at {created_at}\n\
+             );\n\
+             \n\
+             CREATE INDEX recovery_codes_user_id_idx ON recovery_codes (user_id);\n",
+            pk = d.pk,
+            big_int = d.big_int,
+            ts = d.ts,
+            created_at = d.ts_not_null_default_now,
+        );
+    }
+    // Active login sessions (issue #819): one row per login, keyed by the
+    // SHA-256 digest of the opaque server-side session id. Only the digest
+    // is stored so a database leak cannot be replayed as a session cookie.
+    let _ = write!(
+        out,
+        "\n{ddl}",
+        ddl = render_sessions_table_ddl(backend, snake_name, table),
     );
     // Persistent "remember-me" login chains (issue #1397): one row per device
     // login-chain, keyed by the stable opaque `series`. `token_hash` rotates on
@@ -1816,24 +2119,28 @@ fn render_migration_up(snake_name: &str, table: &str, totp: bool, magic_link: bo
         out,
         "\n\
          CREATE TABLE {rem_table} (\n\
-         \x20   id BIGSERIAL PRIMARY KEY,\n\
+         \x20   id {pk},\n\
          \x20   series TEXT NOT NULL UNIQUE,\n\
-         \x20   user_id BIGINT NOT NULL REFERENCES {table}(id) ON DELETE CASCADE,\n\
+         \x20   user_id {big_int} NOT NULL REFERENCES {table}(id) ON DELETE CASCADE,\n\
          \x20   token_hash TEXT NOT NULL,\n\
          \x20   previous_token_hash TEXT NULL,\n\
-         \x20   rotated_at TIMESTAMP NULL,\n\
-         \x20   expires_at TIMESTAMP NOT NULL,\n\
+         \x20   rotated_at {ts} NULL,\n\
+         \x20   expires_at {ts} NOT NULL,\n\
          \x20   ip TEXT NOT NULL DEFAULT '',\n\
          \x20   user_agent TEXT NOT NULL DEFAULT '',\n\
          \x20   ua_family TEXT NOT NULL DEFAULT '',\n\
          \x20   ua_os TEXT NOT NULL DEFAULT '',\n\
          \x20   ua_device TEXT NOT NULL DEFAULT '',\n\
          \x20   label TEXT NULL,\n\
-         \x20   last_used_at TIMESTAMP NULL,\n\
-         \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW()\n\
+         \x20   last_used_at {ts} NULL,\n\
+         \x20   created_at {created_at}\n\
          );\n\
          \n\
          CREATE INDEX {rem_table}_user_id_idx ON {rem_table} (user_id);\n",
+        pk = d.pk,
+        big_int = d.big_int,
+        ts = d.ts,
+        created_at = d.ts_not_null_default_now,
     );
     // Passwordless magic-link tokens (issue #1328): one row per issued link,
     // keyed by the SHA-256 digest of the raw token. Only the digest is stored —
@@ -1844,15 +2151,19 @@ fn render_migration_up(snake_name: &str, table: &str, totp: bool, magic_link: bo
             out,
             "\n\
              CREATE TABLE magic_link_tokens (\n\
-             \x20   id BIGSERIAL PRIMARY KEY,\n\
-             \x20   user_id BIGINT NOT NULL REFERENCES {table}(id) ON DELETE CASCADE,\n\
+             \x20   id {pk},\n\
+             \x20   user_id {big_int} NOT NULL REFERENCES {table}(id) ON DELETE CASCADE,\n\
              \x20   token_digest TEXT NOT NULL UNIQUE,\n\
-             \x20   expires_at TIMESTAMP NOT NULL,\n\
-             \x20   consumed_at TIMESTAMP NULL,\n\
-             \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW()\n\
+             \x20   expires_at {ts} NOT NULL,\n\
+             \x20   consumed_at {ts} NULL,\n\
+             \x20   created_at {created_at}\n\
              );\n\
              \n\
              CREATE INDEX magic_link_tokens_user_id_idx ON magic_link_tokens (user_id);\n",
+            pk = d.pk,
+            big_int = d.big_int,
+            ts = d.ts,
+            created_at = d.ts_not_null_default_now,
         );
     }
     out
@@ -2040,7 +2351,7 @@ impl {user_pascal} {{
     /// All active login sessions for this account, most recently seen first.
     pub async fn sessions(
         &self,
-        conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+        conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
     ) -> autumn_web::AutumnResult<Vec<{user_pascal}Session>> {{
         {sess_table}::table
             .filter({sess_table}::user_id.eq(self.id))
@@ -2060,7 +2371,7 @@ impl {user_pascal} {{
     /// was actually revoked.
     pub async fn revoke_session(
         &self,
-        conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+        conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
         session_id: i64,
     ) -> autumn_web::AutumnResult<bool> {{
         let rows = diesel::delete(
@@ -2083,7 +2394,7 @@ impl {user_pascal} {{
     /// number of sessions revoked.
     pub async fn revoke_other_sessions(
         &self,
-        conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+        conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
         current_token_digest: &str,
     ) -> autumn_web::AutumnResult<usize> {{
         diesel::delete(
@@ -2104,7 +2415,7 @@ impl {user_pascal} {{
     /// Used on password change, where all existing sessions are suspect.
     pub async fn revoke_all_sessions(
         &self,
-        conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+        conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
     ) -> autumn_web::AutumnResult<usize> {{
         diesel::delete({sess_table}::table.filter({sess_table}::user_id.eq(self.id)))
             .execute(conn)
@@ -2208,7 +2519,7 @@ impl {user_pascal}RememberToken {{
 
 /// Persist a new remember chain for a successful "remember me" login.
 pub async fn insert_remember_token(
-    conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+    conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
     row: &New{user_pascal}RememberToken,
 ) -> autumn_web::AutumnResult<()> {{
     diesel::insert_into({rem_table}::table)
@@ -2225,7 +2536,7 @@ pub async fn insert_remember_token(
 
 /// Look a chain up by its stable series id.
 pub async fn find_remember_token(
-    conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+    conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
     series: &str,
 ) -> autumn_web::AutumnResult<Option<{user_pascal}RememberToken>> {{
     {rem_table}::table
@@ -2248,7 +2559,7 @@ pub async fn find_remember_token(
 /// request already rotated the chain, 1 on success), so the caller can detect a
 /// lost race and re-evaluate rather than silently double-rotating (issue #1397).
 pub async fn rotate_remember_token(
-    conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+    conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
     series: &str,
     old_hash: &str,
     new_hash: &str,
@@ -2278,7 +2589,7 @@ pub async fn rotate_remember_token(
 
 /// Delete a single chain by series (theft / this-device logout revocation).
 pub async fn delete_remember_series(
-    conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+    conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
     series: &str,
 ) -> autumn_web::AutumnResult<usize> {{
     diesel::delete({rem_table}::table.filter({rem_table}::series.eq(series)))
@@ -2297,7 +2608,7 @@ impl {user_pascal} {{
     /// revoked individually (issue #1397.6).
     pub async fn remember_tokens(
         &self,
-        conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+        conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
     ) -> autumn_web::AutumnResult<Vec<{user_pascal}RememberToken>> {{
         {rem_table}::table
             .filter({rem_table}::user_id.eq(self.id))
@@ -2317,7 +2628,7 @@ impl {user_pascal} {{
     /// chain was actually revoked (issue #1397.6).
     pub async fn revoke_remember_series(
         &self,
-        conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+        conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
         series: &str,
     ) -> autumn_web::AutumnResult<bool> {{
         let rows = diesel::delete(
@@ -2341,7 +2652,7 @@ impl {user_pascal} {{
     /// rejected. Returns the number of chains revoked.
     pub async fn revoke_all_remember_tokens(
         &self,
-        conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+        conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
     ) -> autumn_web::AutumnResult<usize> {{
         diesel::delete({rem_table}::table.filter({rem_table}::user_id.eq(self.id)))
             .execute(conn)
@@ -2579,20 +2890,6 @@ use crate::schema::{table};
 
 // ── Layout helpers ────────────────────────────────────────────────────────────
 
-fn layout(title: &str, content: Markup) -> Markup {{
-    html! {{
-        (autumn_web::PreEscaped("<!DOCTYPE html>"))
-        html lang="en" {{
-            head {{
-                meta charset="utf-8";
-                title {{ (title) }}
-                link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);
-            }}
-            body {{ (content) }}
-        }}
-    }}
-}}
-
 fn redirect_to(url: &str) -> Response {{
     axum::response::Redirect::to(url).into_response()
 }}
@@ -2620,7 +2917,7 @@ fn redirect_to(url: &str) -> Response {{
 /// `AUTUMN_AUTH__REMEMBER__*`) are honoured instead of the compiled defaults
 /// (issue #1397.2).
 struct RememberMiddlewareState {{
-    pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+    pool: diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
     config: RememberConfig,
     // The configured `[auth].session_key` (default `"user_id"`), captured at
     // startup so a remember-me restore writes the SAME identity key that
@@ -2635,7 +2932,7 @@ static REMEMBER_STATE: std::sync::OnceLock<RememberMiddlewareState> = std::sync:
 /// remember middleware uses. Idempotent — a second call is ignored. Called by
 /// `remember_me_startup`.
 pub fn init_remember_pool(
-    pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+    pool: diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
     config: RememberConfig,
     auth_session_key: String,
 ) {{
@@ -2741,18 +3038,21 @@ pub async fn issue_remember_cookie(
     ))
 }}
 
-/// Revoke the remember chain identified by the request's remember cookie (used
-/// by logout). No-op when the cookie is absent or malformed.
+/// Revoke the remember chain named by the request's remember cookie (used by
+/// logout). Does nothing when the cookie is absent or malformed. Returns the
+/// delete error on failure: the remember cookie is a long-lived credential,
+/// so the caller must not report logout as successful when revocation fails.
 async fn revoke_remember_from_cookie(
     db: &mut Db,
     config: &RememberConfig,
     headers: &axum::http::HeaderMap,
-) {{
+) -> autumn_web::AutumnResult<()> {{
     if let Some(value) = read_cookie(headers, &config.cookie_name)
         && let Some((series, _token)) = parse_remember_cookie_value(&value)
     {{
-        let _ = delete_remember_series(&mut **db, &series).await;
+        delete_remember_series(&mut **db, &series).await?;
     }}
+    Ok(())
 }}
 
 /// Project a stored row into the pure [`RememberRecord`] the decision function
@@ -2773,7 +3073,7 @@ fn to_remember_record(r: &{pascal_name}RememberToken) -> RememberRecord {{
 /// + #1397).
 async fn establish_remember_login(
     session: &Session,
-    pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+    pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
     auth_session_key: &str,
     {snake_name}_id: i64,
     ip: std::net::IpAddr,
@@ -3136,7 +3436,10 @@ pub async fn require_tracked_session(
     }};
 
     // Bounded write amplification: skip the UPDATE inside the window.
-    let sessions_cfg = state.config().auth.sessions;
+    // `config_arc` shares the resolved config behind an `Arc`; `config()`
+    // would deep-clone every section to read one field on a request path.
+    let config = state.config_arc();
+    let sessions_cfg = &config.auth.sessions;
     let now = chrono::Utc::now().naive_utc();
     let window =
         chrono::Duration::seconds(i64::try_from(sessions_cfg.last_seen_update_secs).unwrap_or(60));
@@ -3309,7 +3612,7 @@ pub async fn sessions_page(
     if hx.is_htmx {{
         return Ok(fragment.into_response());
     }}
-    Ok(layout("Active Sessions", html! {{
+    Ok(crate::layout("Active Sessions", "/account/sessions", html! {{}}, html! {{
         @if let Some(ref csrf) = csrf {{ meta name="csrf-token" content=(csrf.token()); }}
         script src=(HTMX_JS_PATH) {{}}
         script src=(HTMX_CSRF_JS_PATH) {{}}
@@ -3434,7 +3737,7 @@ fn render_signup_form(
     csrf: Option<&CsrfToken>,
     csrf_field: Option<&CsrfFormField>,
 ) -> Markup {{
-    layout("Sign Up", html! {{
+    crate::layout("Sign Up", "/signup", html! {{}}, html! {{
         h1 {{ "Create an Account" }}
         @if let Some(error) = error {{
             p role="alert" {{ (error) }}
@@ -3463,7 +3766,7 @@ pub async fn signup_form(
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
 ) -> AutumnResult<Markup> {{
-    let min_len = state.config().auth.password.min_length;
+    let min_len = state.config_arc().auth.password.min_length;
     Ok(render_signup_form(min_len, None, csrf.as_ref(), csrf_field.as_ref()))
 }}
 
@@ -3516,7 +3819,10 @@ pub async fn signup(
     // the supplied email, and optional HIBP breach check) instead of a bare
     // length gate. On failure, re-render the form with the specific message at
     // HTTP 200 rather than accepting a weak credential or returning an error page.
-    let password_cfg = state.config().auth.password;
+    // `config_arc` shares the resolved config behind an `Arc`; `config()`
+    // would deep-clone every section to read one field on a request path.
+    let config = state.config_arc();
+    let password_cfg = &config.auth.password;
     let mut policy = password_cfg.policy();
     if password_cfg.breach_check != autumn_web::auth::BreachCheck::Off {{
         // Breach checking needs an HTTP client for the HIBP k-anonymity lookup;
@@ -3602,9 +3908,7 @@ pub async fn signup(
 /// `GET /login` — render the login form.
 #[get("/login")]
 pub async fn login_form(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>) -> AutumnResult<Markup> {{
-    let flash_html = flash.render().await;
-    Ok(layout("Log In", html! {{
-        (flash_html)
+    Ok(crate::layout("Log In", "/login", flash_messages(&flash.consume().await), html! {{
         h1 {{ "Log In" }}
         form action="/login" method="post" {{
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
@@ -3702,7 +4006,10 @@ pub async fn login(
 
     // ── Account lockout policy ────────────────────────────────────────────────
     // Read lockout config from the standard Autumn config surface.
-    let lockout_cfg = state.config().auth.lockout;
+    // `config_arc` shares the resolved config behind an `Arc`; `config()`
+    // would deep-clone every section to read one field on a request path.
+    let config = state.config_arc();
+    let lockout_cfg = &config.auth.lockout;
     let lockout_enabled = lockout_cfg.enabled && lockout_cfg.threshold > 0;
 
     if let Some(ref {snake_name}) = found_{snake_name} {{
@@ -3761,52 +4068,78 @@ pub async fn login(
                 }};
 
                 if new_attempts >= lockout_cfg.threshold && current_locked_at.is_none() {{
-                    // Account transitions into the locked state — stamp locked_at
-                    // atomically. Propagate errors: if this write fails the account
-                    // is not locked despite the counter crossing the threshold, which
-                    // would allow a successful login to slip through.
-                    diesel::update({table}::table.find({snake_name}.id))
+                    // Account transitions into the locked state — stamp locked_at,
+                    // but only if the row still shows an over-threshold, not-yet-locked
+                    // state at write time. `current_locked_at` above is a stale
+                    // in-memory read from before the password check; without a
+                    // fresh DB-level guard, a concurrent *successful* login could
+                    // reset failed_attempts/locked_at between our increment and this
+                    // write, and this UPDATE would silently re-lock an account that
+                    // just logged in successfully (#2500). Filtering on the row's
+                    // current failed_attempts and locked_at makes the write a no-op
+                    // in that case instead of clobbering the reset. Propagate errors:
+                    // if this write fails the account is not locked despite the
+                    // counter crossing the threshold, which would allow a successful
+                    // login to slip through.
+                    let locked_rows = diesel::update(
+                        {table}::table
+                            .find({snake_name}.id)
+                            .filter({table}::failed_attempts.ge(lockout_cfg.threshold))
+                            .filter({table}::locked_at.is_null()),
+                    )
                         .set({table}::locked_at.eq(Some(now)))
                         .execute(&mut *db)
                         .await
                         .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to lock account: {{e}}")))?;
 
-                    // Truncate to a coarse IP prefix (IPv4 /24, IPv6 /64) so
-                    // the telemetry event enables incident response without
-                    // logging a precise user identifier.
-                    let ip_prefix = match addr_ip {{
-                        std::net::IpAddr::V4(ip) => {{
-                            let [a, b, c, _] = ip.octets();
-                            format!("{{a}}.{{b}}.{{c}}.0/24")
-                        }}
-                        std::net::IpAddr::V6(ip) => {{
-                            let s = ip.segments();
-                            format!("{{:x}}:{{:x}}:{{:x}}:{{:x}}::/64", s[0], s[1], s[2], s[3])
-                        }}
-                    }};
-                    // Salt the digest with the deployment secret so the
-                    // account ID cannot be recovered by hashing small integers.
-                    let account_id_digest = {{
-                        use sha2::{{Digest, Sha256}};
-                        // Require a deployment secret for the digest salt. Operators
-                        // MUST set SECRET_KEY_BASE (already required for sessions) or
-                        // AUTUMN_ADMIN_SECRET. The static fallback prevents reversibility
-                        // only within this process; set the env var in production.
-                        let salt = std::env::var("SECRET_KEY_BASE")
-                            .or_else(|_| std::env::var("AUTUMN_ADMIN_SECRET"))
-                            .unwrap_or_else(|_| "autumn-lockout-fallback-salt".to_string());
-                        let hash = Sha256::digest(
-                            format!("{{}}:{{}}", salt, {snake_name}.id).as_bytes(),
+                    // Only emit lockout telemetry when this request's write actually
+                    // applied the lock — a concurrent successful login winning the
+                    // race above means the account never ends up locked, so it must
+                    // not be reported as such.
+                    if locked_rows > 0 {{
+                        // Truncate to a coarse IP prefix (IPv4 /24, IPv6 /64) so
+                        // the telemetry event enables incident response without
+                        // logging a precise user identifier.
+                        let ip_prefix = match addr_ip {{
+                            std::net::IpAddr::V4(ip) => {{
+                                let [a, b, c, _] = ip.octets();
+                                format!("{{a}}.{{b}}.{{c}}.0/24")
+                            }}
+                            std::net::IpAddr::V6(ip) => {{
+                                let s = ip.segments();
+                                format!("{{:x}}:{{:x}}:{{:x}}:{{:x}}::/64", s[0], s[1], s[2], s[3])
+                            }}
+                        }};
+                        // Salt the digest with the app's signing secret. This
+                        // stops recovery of the account ID from small integers.
+                        // Production always has this secret set (see
+                        // fail_fast_on_invalid_signing_secret). Dev and test may
+                        // not; the fallback salt below only affects those local,
+                        // process-only logs.
+                        let account_id_digest = {{
+                            use sha2::{{Digest, Sha256}};
+                            let salt = config.security.signing_secret.secret.as_deref()
+                                .unwrap_or_else(|| {{
+                                    tracing::warn!(
+                                        "account_locked digest is salted with a public \
+                                         constant: set AUTUMN_SECURITY__SIGNING_SECRET so \
+                                         it cannot be reversed to an account id"
+                                    );
+                                    "autumn-lockout-fallback-salt"
+                                }});
+                            let hash = Sha256::digest(
+                                format!("{{}}:{{}}", salt, {snake_name}.id).as_bytes(),
+                            );
+                            hex::encode(&hash[..8])
+                        }};
+                        tracing::warn!(
+                            event = "account_locked",
+                            account_id_digest = %account_id_digest,
+                            ip_prefix = %ip_prefix,
+                            failed_attempts = new_attempts,
+                            "account locked after repeated failed login attempts"
                         );
-                        hex::encode(&hash[..8])
-                    }};
-                    tracing::warn!(
-                        event = "account_locked",
-                        account_id_digest = %account_id_digest,
-                        ip_prefix = %ip_prefix,
-                        failed_attempts = new_attempts,
-                        "account locked after repeated failed login attempts"
-                    );
+                    }}
                 }}
                 return Err(auth_err());
             }}
@@ -3881,12 +4214,16 @@ pub async fn login(
     // Persistent "remember-me" opt-in (issue #1397): when the box is ticked and
     // policy allows it, mint a rotating remember chain and attach its cookie
     // alongside the session cookie. Unticked → behaviour is unchanged.
-    if form.remember.is_some() && state.config().auth.remember.enabled {{
+    // One shared read of the config serves both the opt-in check and the
+    // resolved `[auth.remember]` section — `config()` would deep-clone every
+    // config section twice per login.
+    let config = state.config_arc();
+    if form.remember.is_some() && config.auth.remember.enabled {{
         // Thread the resolved `[auth.remember]` config so cookie_name/duration
         // overrides are honoured (issue #1397.2).
-        let remember_cfg = state.config().auth.remember.clone();
+        let remember_cfg = &config.auth.remember;
         let cookie =
-            issue_remember_cookie(&mut db, &remember_cfg, {snake_name}.id, addr_ip, &headers).await?;
+            issue_remember_cookie(&mut db, remember_cfg, {snake_name}.id, addr_ip, &headers).await?;
         append_set_cookie(&mut response, &cookie);
     }}
     Ok(response)
@@ -3908,23 +4245,39 @@ pub async fn logout(
     flash: Flash,
 ) -> AutumnResult<Response> {{
     // Thread the resolved `[auth.remember]` config so an overridden cookie name
-    // is the one we revoke and clear (issue #1397.2).
-    let remember_cfg = state.config().auth.remember.clone();
+    // is the one we revoke and clear (issue #1397.2). Read through the shared
+    // `Arc` — a logout must not deep-clone every config section.
+    let config = state.config_arc();
+    let remember_cfg = &config.auth.remember;
     // Best-effort: the device must sign out even if the row delete hiccups.
     let _ = untrack_current_session(&mut db, &session).await;
     // Revoke this device's remember chain (issue #1397) so a stolen remember
     // cookie cannot re-establish a login after logout. No-op when absent.
-    revoke_remember_from_cookie(&mut db, &remember_cfg, &headers).await;
+    // Hold the result rather than propagating it here: the session below is
+    // the primary credential and must be invalidated even if this failed.
+    let revoke_result = revoke_remember_from_cookie(&mut db, remember_cfg, &headers).await;
     // Invalidate the session: clear all data (drops the auth keys) and rotate
     // the id so the pre-logout cookie can no longer be replayed — the old id is
     // destroyed in the session store on save. This is equivalent to `destroy()`
     // for replay safety while letting a one-shot logout notice ride the freshly
-    // rotated session through to the login page.
+    // rotated session through to the login page. Unconditional: it must not
+    // be skipped by a remember-chain delete failure propagated below.
     session.clear().await;
     session.rotate_id().await;
+    // Fail the logout if the remember chain survived: it is a long-lived
+    // bearer credential and reporting success would be false. Still clear the
+    // cookie on THIS browser even on failure — otherwise it keeps presenting
+    // a still-valid remember cookie, and once the database recovers,
+    // `remember_me` would silently re-establish a session on the next
+    // request, undoing this logout.
+    if let Err(error) = revoke_result {{
+        let mut response = error.into_response();
+        append_set_cookie(&mut response, &build_remember_clear_cookie(remember_cfg));
+        return Ok(response);
+    }}
     flash.info("You have been logged out.").await;
     let mut response = redirect_to("/login");
-    append_set_cookie(&mut response, &build_remember_clear_cookie(&remember_cfg));
+    append_set_cookie(&mut response, &build_remember_clear_cookie(remember_cfg));
     Ok(response)
 }}
 
@@ -3982,7 +4335,7 @@ pub async fn unlock_account(
         .execute(&mut *db)
         .await
         .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to unlock account: {{e}}")))?;
-    Ok(layout("Account Unlocked", html! {{
+    Ok(crate::layout("Account Unlocked", "/account", html! {{}}, html! {{
         h1 {{ "Account Unlocked" }}
         p {{ "The lockout for " (email) " has been cleared if it existed." }}
     }}))
@@ -4009,9 +4362,7 @@ pub async fn account(session: Session, State(state): State<AppState>, mut db: Db
         return Ok(redirect_to("/check-your-email").into_response());
     }}
 
-    let flash_html = flash.render().await;
-    Ok(layout("Your Account", html! {{
-        (flash_html)
+    Ok(crate::layout("Your Account", "/account", flash_messages(&flash.consume().await), html! {{
         h1 {{ "Your Account" }}
         @if let Some(scheduled) = {snake_name}.delete_scheduled_at {{
             div style="border:1px solid #c00;padding:0.75rem;margin-bottom:1rem;" {{
@@ -4097,7 +4448,7 @@ fn render_change_password_form(
     csrf: Option<&CsrfToken>,
     csrf_field: Option<&CsrfFormField>,
 ) -> Markup {{
-    layout("Change Password", html! {{
+    crate::layout("Change Password", "/account/password", html! {{}}, html! {{
         h1 {{ "Change Password" }}
         @if let Some(error) = error {{
             p role="alert" {{ (error) }}
@@ -4191,7 +4542,10 @@ pub async fn change_password(
 
     // Enforce the configured password policy, passing the account email as
     // similarity context (matches the signup path).
-    let password_cfg = state.config().auth.password;
+    // `config_arc` shares the resolved config behind an `Arc`; `config()`
+    // would deep-clone every section to read one field on a request path.
+    let config = state.config_arc();
+    let password_cfg = &config.auth.password;
     let mut policy = password_cfg.policy();
     if password_cfg.breach_check != autumn_web::auth::BreachCheck::Off {{
         policy = policy.with_client(autumn_web::http_client::Client::new());
@@ -4235,7 +4589,7 @@ pub async fn change_password(
     // When that flag is false we still rotate + rebind the CURRENT session (so
     // this device stays signed in on a fresh id) and still clear reset/magic-link
     // tokens — only the other-device sign-out is skipped.
-    let revoke_other_sessions_in_txn = state.config().auth.sessions.revoke_on_credential_change;
+    let revoke_other_sessions_in_txn = state.config_arc().auth.sessions.revoke_on_credential_change;
     let pre_rotation_digest = session_token_digest(&session).await;
     session.rotate_id().await;
     let post_rotation_digest = session_token_digest(&session).await;
@@ -4299,7 +4653,7 @@ fn render_change_email_form(
     csrf: Option<&CsrfToken>,
     csrf_field: Option<&CsrfFormField>,
 ) -> Markup {{
-    layout("Change Email Address", html! {{
+    crate::layout("Change Email Address", "/account/email", html! {{}}, html! {{
         h1 {{ "Change Email Address" }}
         p {{ "We'll send a confirmation link to the new address. Your current \
               address keeps working until you confirm the change." }}
@@ -4549,7 +4903,7 @@ pub async fn confirm_email_change(
         return Err(generic());
     }}
 
-    Ok(layout("Email Address Updated", html! {{
+    Ok(crate::layout("Email Address Updated", "/account/email", html! {{}}, html! {{
         h1 {{ "Email Address Updated" }}
         p {{ "Your email address has been changed to " (new_email_display) "." }}
         p {{ a href="/account" {{ "← Back to account" }} }}
@@ -4666,7 +5020,7 @@ pub async fn reauth_form(
     // Validates the tracked session row (401s immediately if revoked).
     let _ = require_tracked_session(&session, &mut db, &state).await?;
     let return_to = params.get("return_to").cloned().unwrap_or_default();
-    Ok(layout("Confirm your identity", html! {{
+    Ok(crate::layout("Confirm your identity", "/reauth", html! {{}}, html! {{
         h1 {{ "Confirm your identity" }}
         p {{ "For security, please re-enter your password to continue." }}
         form action="/reauth" method="post" {{
@@ -4729,7 +5083,7 @@ pub async fn reauth(
     if !pw_verified_recently {{
         // Helper to render the reauth error form without duplicating markup.
         let reauth_form_err = |ret: &str| {{
-            layout("Confirm your identity", html! {{
+            crate::layout("Confirm your identity", "/reauth", html! {{}}, html! {{
                 h1 {{ "Confirm your identity" }}
                 p style="color:red" {{ "Incorrect password. Please try again." }}
                 form action="/reauth" method="post" {{
@@ -4746,7 +5100,10 @@ pub async fn reauth(
         }};
 
         // ── Account lockout policy ──────────────────────────────────────────
-        let lockout_cfg = state.config().auth.lockout;
+        // `config_arc` shares the resolved config behind an `Arc`; `config()`
+        // would deep-clone every section to read one field on a request path.
+        let config = state.config_arc();
+        let lockout_cfg = &config.auth.lockout;
         let lockout_enabled = lockout_cfg.enabled && lockout_cfg.threshold > 0;
 
         if lockout_enabled {{
@@ -4793,7 +5150,16 @@ pub async fn reauth(
                     1i32
                 }};
                 if new_attempts >= lockout_cfg.threshold && current_locked_at.is_none() {{
-                    diesel::update({table}::table.find({snake_name}.id))
+                    // See the login handler's matching guard (#2500): filter on the
+                    // row's current failed_attempts/locked_at rather than writing
+                    // unconditionally, so a concurrent successful reauth that already
+                    // reset the counter cannot be silently re-locked.
+                    diesel::update(
+                        {table}::table
+                            .find({snake_name}.id)
+                            .filter({table}::failed_attempts.ge(lockout_cfg.threshold))
+                            .filter({table}::locked_at.is_null()),
+                    )
                         .set({table}::locked_at.eq(Some(now)))
                         .execute(&mut *db)
                         .await
@@ -4876,7 +5242,7 @@ pub async fn reauth(
 /// `GET /forgot-password` — render the forgot-password form.
 #[get("/forgot-password")]
 pub async fn forgot_password_form(csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>) -> AutumnResult<Markup> {{
-    Ok(layout("Forgot Password", html! {{
+    Ok(crate::layout("Forgot Password", "/forgot-password", html! {{}}, html! {{
         h1 {{ "Forgot Your Password?" }}
         form action="/forgot-password" method="post" {{
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
@@ -4959,7 +5325,7 @@ pub async fn forgot_password(
         tokio::time::sleep(remaining).await;
     }}
 
-    Ok(layout("Check Your Email", html! {{
+    Ok(crate::layout("Check Your Email", "/forgot-password", html! {{}}, html! {{
         h1 {{ "Check Your Email" }}
         p {{
             "If that address is registered you'll receive a reset link shortly."
@@ -4984,7 +5350,7 @@ fn render_reset_password_form(
     csrf: Option<&CsrfToken>,
     csrf_field: Option<&CsrfFormField>,
 ) -> Markup {{
-    layout("Reset Password", html! {{
+    crate::layout("Reset Password", "/reset-password", html! {{}}, html! {{
         h1 {{ "Set a New Password" }}
         @if let Some(error) = error {{
             p role="alert" {{ (error) }}
@@ -5010,7 +5376,7 @@ pub async fn reset_password_form(
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
 ) -> AutumnResult<Markup> {{
-    let min_len = state.config().auth.password.min_length;
+    let min_len = state.config_arc().auth.password.min_length;
     Ok(render_reset_password_form(
         &query.token,
         min_len,
@@ -5046,7 +5412,10 @@ pub async fn reset_password(
     // user identifier in scope at this point (the token is validated below), so
     // no similarity context is supplied. On failure, re-render the form with the
     // specific message at HTTP 200 rather than accepting a weak credential.
-    let password_cfg = state.config().auth.password;
+    // `config_arc` shares the resolved config behind an `Arc`; `config()`
+    // would deep-clone every section to read one field on a request path.
+    let config = state.config_arc();
+    let password_cfg = &config.auth.password;
     let mut policy = password_cfg.policy();
     if password_cfg.breach_check != autumn_web::auth::BreachCheck::Off {{
         policy = policy.with_client(autumn_web::http_client::Client::new());
@@ -5112,7 +5481,7 @@ pub async fn reset_password(
     // half-applied. Revoking every existing session is the standard
     // response to credential theft (defaulted on, configurable via
     // [auth.sessions].revoke_on_credential_change).
-    let revoke_existing_sessions = state.config().auth.sessions.revoke_on_credential_change;
+    let revoke_existing_sessions = state.config_arc().auth.sessions.revoke_on_credential_change;
     let {snake_name}_id = {snake_name}.id;
     (*db)
         .transaction::<_, diesel::result::Error, _>(async move |conn| {{
@@ -5230,9 +5599,7 @@ async fn send_reset_email(mailer: &Mailer, to: &str, token: &str) -> AutumnResul
 /// `GET /check-your-email` — shown after signup while awaiting email confirmation.
 #[get("/check-your-email")]
 pub async fn check_your_email(flash: Flash) -> AutumnResult<Markup> {{
-    let flash_html = flash.render().await;
-    Ok(layout("Check Your Email", html! {{
-        (flash_html)
+    Ok(crate::layout("Check Your Email", "/check-your-email", flash_messages(&flash.consume().await), html! {{
         h1 {{ "Check Your Email" }}
         p {{ "We've sent a confirmation link to your email address." }}
         p {{ "Please click the link in the email to activate your account. The link expires in 24 hours." }}
@@ -5327,7 +5694,7 @@ pub async fn resend_confirmation_form(
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
 ) -> AutumnResult<Markup> {{
-    Ok(layout("Resend Confirmation Email", html! {{
+    Ok(crate::layout("Resend Confirmation Email", "/auth/confirm/resend", html! {{}}, html! {{
         h1 {{ "Resend Confirmation Email" }}
         form action="/auth/confirm/resend" method="post" {{
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
@@ -5424,7 +5791,7 @@ pub async fn resend_confirmation(
         tokio::time::sleep(remaining).await;
     }}
 
-    Ok(layout("Confirmation Email Sent", html! {{
+    Ok(crate::layout("Confirmation Email Sent", "/auth/confirm/resend", html! {{}}, html! {{
         h1 {{ "Check Your Email" }}
         p {{
             "If that address has a pending unconfirmed account, you'll receive a new \
@@ -5496,7 +5863,7 @@ pub async fn data_export_form(
 ) -> AutumnResult<Response> {{
     // Validates the tracked session row (401s immediately if revoked).
     let _ = require_tracked_session(&session, &mut db, &state).await?;
-    Ok(layout("Download My Data", html! {{
+    Ok(crate::layout("Download My Data", "/account/data-export", html! {{}}, html! {{
         h1 {{ "Download My Data" }}
         p {{
             "Request a copy of all data we hold about you. You will receive an email \
@@ -5544,7 +5911,7 @@ pub async fn data_export(
         .map_err(|_| AutumnError::internal_server_error_msg("Failed to record export request."))?;
 
     if updated == 0 {{
-        return Ok(layout("Export Already Pending", html! {{
+        return Ok(crate::layout("Export Already Pending", "/account/data-export", html! {{}}, html! {{
             h1 {{ "Export Already Pending" }}
             p {{
                 "A data export was already requested within the last hour. \
@@ -5570,7 +5937,7 @@ pub async fn data_export(
     .await
     .ok();
 
-    Ok(layout("Export Requested", html! {{
+    Ok(crate::layout("Export Requested", "/account/data-export", html! {{}}, html! {{
         h1 {{ "Export Requested" }}
         p {{
             "Your data export is being prepared. You will receive an email with a \
@@ -5620,7 +5987,7 @@ pub async fn delete_account_form(
 ) -> AutumnResult<Response> {{
     // Validates the tracked session row (401s immediately if revoked).
     let _ = require_tracked_session(&session, &mut db, &state).await?;
-    Ok(layout("Delete My Account", html! {{
+    Ok(crate::layout("Delete My Account", "/account/delete", html! {{}}, html! {{
         h1 {{ "Delete My Account" }}
         p class="warning" {{
             "⚠️ This action schedules your account for permanent deletion after a \
@@ -5666,7 +6033,7 @@ pub async fn delete_account(
 
     // Require the user to type DELETE as a confirmation step.
     if form.confirmation.trim() != "DELETE" {{
-        return Ok(layout("Delete My Account", html! {{
+        return Ok(crate::layout("Delete My Account", "/account/delete", html! {{}}, html! {{
             h1 {{ "Delete My Account" }}
             p class="error" {{ "You must type DELETE (in uppercase) to confirm." }}
             p {{ a href="/account/delete" {{ "← Back" }} }}
@@ -5700,7 +6067,7 @@ pub async fn delete_account(
 
     session.destroy().await;
 
-    Ok(layout("Deletion Scheduled", html! {{
+    Ok(crate::layout("Deletion Scheduled", "/account/delete", html! {{}}, html! {{
         h1 {{ "Account Deletion Scheduled" }}
         p {{
             "Your account has been scheduled for deletion in 30 days. \
@@ -6858,8 +7225,20 @@ fn revoke_other_sessions_keeps_current_session_alive() {{
 /// handler APIs, the auto-revocation policy, the privacy posture for stored
 /// IP / User-Agent data, and how to plug in a custom UA parser (issue #819).
 #[allow(clippy::too_many_lines)]
-fn render_sessions_docs_file(pascal_name: &str, snake_name: &str, user_table: &str) -> String {
+fn render_sessions_docs_file(
+    backend: autumn_web::config::DatabaseBackend,
+    pascal_name: &str,
+    snake_name: &str,
+    user_table: &str,
+) -> String {
     let sess_table = sessions_table_name(snake_name);
+    // The stale-row sweep and the retrofit DDL are copy-paste SQL for the
+    // operator, so both must be in the app's own dialect (issue #1908).
+    let stale_cutoff = match backend {
+        autumn_web::config::DatabaseBackend::Postgres => "NOW() - INTERVAL '90 days'",
+        autumn_web::config::DatabaseBackend::Sqlite => "datetime('now', '-90 days')",
+    };
+    let sessions_ddl = render_sessions_table_ddl(backend, snake_name, user_table);
     format!(
         r#"# Active Session Management
 
@@ -6944,7 +7323,7 @@ recognise their own devices. Treat both as personal data:
   rows until revoked — pick a retention window and scrub on a schedule:
 
   ```sql
-  DELETE FROM {sess_table} WHERE last_seen_at < NOW() - INTERVAL '90 days';
+  DELETE FROM {sess_table} WHERE last_seen_at < {stale_cutoff};
   ```
 
   Pair this with your session cookie `max_age_secs` so rows do not outlive
@@ -6985,22 +7364,7 @@ Already generated the auth starter before session management existed? The
 upgrade is one additive table:
 
 ```sql
-CREATE TABLE {sess_table} (
-    id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT NOT NULL REFERENCES {user_table}(id) ON DELETE CASCADE,
-    token_digest TEXT NOT NULL UNIQUE,
-    ip TEXT NOT NULL DEFAULT '',
-    user_agent TEXT NOT NULL DEFAULT '',
-    ua_family TEXT NOT NULL DEFAULT '',
-    ua_os TEXT NOT NULL DEFAULT '',
-    ua_device TEXT NOT NULL DEFAULT '',
-    label TEXT NULL,
-    last_seen_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    created_at TIMESTAMP NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX {sess_table}_user_id_idx ON {sess_table} (user_id);
-```
+{sessions_ddl}```
 
 Existing logged-in sessions have no row, so `require_tracked_session`
 treats them as revoked: every user re-authenticates once after the
@@ -7018,13 +7382,65 @@ them against a live server.
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_docs_file(pascal_name: &str, totp: bool, magic_link: bool) -> String {
+fn render_docs_file(
+    backend: autumn_web::config::DatabaseBackend,
+    pascal_name: &str,
+    totp: bool,
+    magic_link: bool,
+) -> String {
     let totp_docs = if totp { TOTP_DOCS_SECTION } else { "" };
     let magic_link_docs = if magic_link {
         MAGIC_LINK_DOCS_SECTION
     } else {
         ""
     };
+    // The lockout retrofit DDL and the confirm-existing-accounts statement are
+    // copy-paste SQL for the operator, so both must be in the app's own dialect
+    // (issue #1927), matching `render_sessions_docs_file` /
+    // `render_oauth_docs_file`. `SQLite` takes one `ADD COLUMN` per `ALTER
+    // TABLE`, has no `IF NOT EXISTS` / `IF EXISTS` on either, and no `NOW()`.
+    let (lockout_up, lockout_down, confirmed_now, confirm_up, confirm_down) = match backend {
+        // `{table}` stays a literal placeholder for the reader, exactly as the
+        // template emitted it before this fork — these fragments are inserted
+        // as data, so they are NOT format-escaped the way `{{table}}` was.
+        autumn_web::config::DatabaseBackend::Postgres => (
+            "ALTER TABLE {table}\n  \
+             ADD COLUMN IF NOT EXISTS failed_attempts INT NOT NULL DEFAULT 0,\n  \
+             ADD COLUMN IF NOT EXISTS locked_at TIMESTAMP NULL;",
+            "ALTER TABLE {table}\n  \
+             DROP COLUMN IF EXISTS failed_attempts,\n  \
+             DROP COLUMN IF EXISTS locked_at;",
+            "NOW()",
+            "ALTER TABLE {table}\n  \
+             ADD COLUMN IF NOT EXISTS confirm_token_digest TEXT NULL,\n  \
+             ADD COLUMN IF NOT EXISTS confirm_token_expires_at TIMESTAMP NULL,\n  \
+             ADD COLUMN IF NOT EXISTS email_confirmed_at TIMESTAMP NULL,\n  \
+             ADD COLUMN IF NOT EXISTS pending_email TEXT NULL;",
+            "ALTER TABLE {table}\n  \
+             DROP COLUMN IF EXISTS confirm_token_digest,\n  \
+             DROP COLUMN IF EXISTS confirm_token_expires_at,\n  \
+             DROP COLUMN IF EXISTS email_confirmed_at,\n  \
+             DROP COLUMN IF EXISTS pending_email;",
+        ),
+        // `SQLite` takes one `ADD COLUMN` per `ALTER TABLE`, has no
+        // `IF NOT EXISTS` / `IF EXISTS` on either, and no `NOW()`.
+        autumn_web::config::DatabaseBackend::Sqlite => (
+            "ALTER TABLE {table} ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0;\n\
+             ALTER TABLE {table} ADD COLUMN locked_at TEXT NULL;",
+            "ALTER TABLE {table} DROP COLUMN failed_attempts;\n\
+             ALTER TABLE {table} DROP COLUMN locked_at;",
+            "CURRENT_TIMESTAMP",
+            "ALTER TABLE {table} ADD COLUMN confirm_token_digest TEXT NULL;\n\
+             ALTER TABLE {table} ADD COLUMN confirm_token_expires_at TEXT NULL;\n\
+             ALTER TABLE {table} ADD COLUMN email_confirmed_at TEXT NULL;\n\
+             ALTER TABLE {table} ADD COLUMN pending_email TEXT NULL;",
+            "ALTER TABLE {table} DROP COLUMN confirm_token_digest;\n\
+             ALTER TABLE {table} DROP COLUMN confirm_token_expires_at;\n\
+             ALTER TABLE {table} DROP COLUMN email_confirmed_at;\n\
+             ALTER TABLE {table} DROP COLUMN pending_email;",
+        ),
+    };
+
     format!(
         r#"# Authentication Guide
 
@@ -7180,16 +7596,12 @@ autumn generate migration add_lockout_to_{{table}}
 
 ```sql
 -- migrations/<timestamp>_add_lockout_to_{{table}}/up.sql
-ALTER TABLE {{table}}
-  ADD COLUMN IF NOT EXISTS failed_attempts INT NOT NULL DEFAULT 0,
-  ADD COLUMN IF NOT EXISTS locked_at TIMESTAMP NULL;
+{lockout_up}
 ```
 
 ```sql
 -- migrations/<timestamp>_add_lockout_to_{{table}}/down.sql
-ALTER TABLE {{table}}
-  DROP COLUMN IF EXISTS failed_attempts,
-  DROP COLUMN IF EXISTS locked_at;
+{lockout_down}
 ```
 
 ```sh
@@ -7343,20 +7755,12 @@ autumn generate migration add_email_confirmation_to_{{table}}
 
 ```sql
 -- migrations/<timestamp>_add_email_confirmation_to_{{table}}/up.sql
-ALTER TABLE {{table}}
-  ADD COLUMN IF NOT EXISTS confirm_token_digest TEXT NULL,
-  ADD COLUMN IF NOT EXISTS confirm_token_expires_at TIMESTAMP NULL,
-  ADD COLUMN IF NOT EXISTS email_confirmed_at TIMESTAMP NULL,
-  ADD COLUMN IF NOT EXISTS pending_email TEXT NULL;
+{confirm_up}
 ```
 
 ```sql
 -- migrations/<timestamp>_add_email_confirmation_to_{{table}}/down.sql
-ALTER TABLE {{table}}
-  DROP COLUMN IF EXISTS confirm_token_digest,
-  DROP COLUMN IF EXISTS confirm_token_expires_at,
-  DROP COLUMN IF EXISTS email_confirmed_at,
-  DROP COLUMN IF EXISTS pending_email;
+{confirm_down}
 ```
 
 ```sh
@@ -7378,7 +7782,7 @@ they can log in immediately (opt-in migration), run:
 
 ```sql
 -- Only run this if you trust all existing accounts (no spam/abuse backlog).
-UPDATE {{table}} SET email_confirmed_at = NOW() WHERE email_confirmed_at IS NULL;
+UPDATE {{table}} SET email_confirmed_at = {confirmed_now} WHERE email_confirmed_at IS NULL;
 ```
 
 No behaviour changes for existing accounts until the migration is applied and
@@ -7582,20 +7986,27 @@ fn oauth_route_entries() -> Vec<String> {
     ]
 }
 
-fn render_oauth_migration_up(user_table: &str) -> String {
+fn render_oauth_migration_up(
+    backend: autumn_web::config::DatabaseBackend,
+    user_table: &str,
+) -> String {
+    let d = AuthDdl::for_backend(backend);
     format!(
         "CREATE TABLE oauth_identities (\n\
-         \x20   id BIGSERIAL PRIMARY KEY,\n\
+         \x20   id {pk},\n\
          \x20   provider TEXT NOT NULL,\n\
          \x20   subject TEXT NOT NULL,\n\
-         \x20   user_id BIGINT NOT NULL REFERENCES {user_table}(id) ON DELETE CASCADE,\n\
+         \x20   user_id {big_int} NOT NULL REFERENCES {user_table}(id) ON DELETE CASCADE,\n\
          \x20   email TEXT NULL,\n\
          \x20   name TEXT NULL,\n\
-         \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW(),\n\
+         \x20   created_at {created_at},\n\
          \x20   UNIQUE (provider, subject)\n\
          );\n\
          \n\
-         CREATE INDEX oauth_identities_user_id_idx ON oauth_identities (user_id);\n"
+         CREATE INDEX oauth_identities_user_id_idx ON oauth_identities (user_id);\n",
+        pk = d.pk,
+        big_int = d.big_int,
+        created_at = d.ts_not_null_default_now,
     )
 }
 
@@ -7701,7 +8112,10 @@ pub async fn oauth_redirect(
         return Redirect::to("/login?error=unknown_provider").into_response();
     }}
 
-    let auth_cfg = state.config().auth;
+    // `config_arc` shares the resolved config behind an `Arc`; `config()`
+    // would deep-clone every section to read one field on a request path.
+    let config = state.config_arc();
+    let auth_cfg = &config.auth;
     let Some(provider) = auth_cfg.oauth2.providers.get(&provider_name) else {{
         warn!(provider = %provider_name, "oauth provider not configured in autumn.toml");
         return Redirect::to("/login?error=provider_not_configured").into_response();
@@ -7735,7 +8149,10 @@ pub async fn oauth_callback(
         return Redirect::to("/login?error=unknown_provider").into_response();
     }}
 
-    let auth_cfg = state.config().auth;
+    // `config_arc` shares the resolved config behind an `Arc`; `config()`
+    // would deep-clone every section to read one field on a request path.
+    let config = state.config_arc();
+    let auth_cfg = &config.auth;
     let Some(provider) = auth_cfg.oauth2.providers.get(&provider_name) else {{
         warn!(provider = %provider_name, "oauth provider not configured in autumn.toml");
         return Redirect::to("/login?error=provider_not_configured").into_response();
@@ -7791,7 +8208,14 @@ fn user_table_placeholder_{snake_name}() -> &'static str {{
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_oauth_docs_file(providers: &[String]) -> String {
+fn render_oauth_docs_file(
+    backend: autumn_web::config::DatabaseBackend,
+    providers: &[String],
+    user_table: &str,
+) -> String {
+    // The documented schema must match the migration this same run writes, so
+    // it takes its column types from the same dialect table (issue #1908).
+    let d = AuthDdl::for_backend(backend);
     let provider_list = providers.join(", ");
     let provider_config_examples = providers
         .iter()
@@ -7931,13 +8355,13 @@ sticky-session misconfiguration.
 
 ```sql
 CREATE TABLE oauth_identities (
-    id         BIGSERIAL PRIMARY KEY,
+    id         {pk},
     provider   TEXT NOT NULL,
     subject    TEXT NOT NULL,         -- provider's user identifier (sub / id)
-    user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    user_id    {big_int} NOT NULL REFERENCES {user_table}(id) ON DELETE CASCADE,
     email      TEXT NULL,
     name       TEXT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    created_at {created_at},
     UNIQUE (provider, subject)        -- collision guard: one local account per identity
 );
 ```
@@ -7947,6 +8371,9 @@ account. A second local user trying to claim the same identity returns an error 
 never silently merges accounts.
 "#,
         first_provider = providers.first().map_or("github", String::as_str),
+        pk = d.pk,
+        big_int = d.big_int,
+        created_at = d.ts_not_null_default_now,
     )
 }
 
@@ -8138,7 +8565,7 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
         let code = form.totp_code.trim().to_owned();
         if code.is_empty() {
             let return_to = form.return_to.clone();
-            return Ok(layout("Confirm your identity", html! {{
+            return Ok(crate::layout("Confirm your identity", "/reauth", html! {}, html! {{
                 h1 {{ "Confirm your identity" }}
                 p style="color:red" {{ "Your account uses two-factor authentication. Please also enter your authenticator code." }}
                 form action="/reauth" method="post" {{
@@ -8204,7 +8631,7 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
         }
         if !totp_verified {
             let return_to = form.return_to.clone();
-            return Ok(layout("Confirm your identity", html! {{
+            return Ok(crate::layout("Confirm your identity", "/reauth", html! {}, html! {{
                 h1 {{ "Confirm your identity" }}
                 p style="color:red" {{ "Invalid authenticator code. Please try again." }}
                 form action="/reauth" method="post" {{
@@ -8435,7 +8862,7 @@ pub async fn two_factor_status(
         0
     };
 
-    Ok(layout("Two-Factor Authentication", html! {
+    Ok(crate::layout("Two-Factor Authentication", "/account/2fa", html! {}, html! {
         h1 { "Two-Factor Authentication" }
         @if __SNAKE__.totp_enabled {
             p { "Two-factor authentication is " strong { "enabled" } "." }
@@ -8533,7 +8960,7 @@ pub async fn two_factor_enable(
     let encrypted = encrypt_secret(&secret_bytes)?;
     session.insert("totp_pending_secret", &encrypted).await;
 
-    Ok(layout("Enable Two-Factor", html! {
+    Ok(crate::layout("Enable Two-Factor", "/account/2fa", html! {}, html! {
         h1 { "Scan this QR code" }
         p { "Scan with Google Authenticator, 1Password, or any RFC 6238 app." }
         img src=(format!("data:image/png;base64,{}", qr)) alt="TOTP QR code";
@@ -8600,7 +9027,7 @@ pub async fn two_factor_confirm(
     // Capture the revocation policy up front so the delete can run inside
     // the same transaction as the enablement (a post-commit failure here
     // would 500 before the one-time recovery codes are ever shown).
-    let revoke_other_sessions_in_txn = state.config().auth.sessions.revoke_on_credential_change;
+    let revoke_other_sessions_in_txn = state.config_arc().auth.sessions.revoke_on_credential_change;
     let current_token_digest = session_token_digest(&session).await;
     let txn_result = (*db)
         .transaction::<_, diesel::result::Error, _>(async move |conn| {
@@ -8672,7 +9099,7 @@ pub async fn two_factor_confirm(
 
     session.remove("totp_pending_secret").await;
 
-    Ok(layout("Save Your Recovery Codes", html! {
+    Ok(crate::layout("Save Your Recovery Codes", "/account/2fa", html! {}, html! {
         h1 { "Two-factor authentication enabled" }
         p { strong { "Save these recovery codes now." } " Each can be used once if you lose your device. They will not be shown again." }
         ul {
@@ -8748,7 +9175,7 @@ pub async fn two_factor_disable(
     // 500 after the factor was already removed. Revocation is defaulted on,
     // configurable via [auth.sessions].revoke_on_credential_change.
     let user_id = __SNAKE__.id;
-    let revoke_other_sessions_in_txn = state.config().auth.sessions.revoke_on_credential_change;
+    let revoke_other_sessions_in_txn = state.config_arc().auth.sessions.revoke_on_credential_change;
     let current_token_digest = session_token_digest(&session).await;
     (*db)
         .transaction::<_, diesel::result::Error, _>(async move |conn| {
@@ -8791,7 +9218,7 @@ pub async fn login_verify_form(
     if session.get("totp_pending_id").await.is_none() {
         return Ok(redirect_to("/login"));
     }
-    Ok(layout("Two-Factor Verification", html! {
+    Ok(crate::layout("Two-Factor Verification", "/login/verify", html! {}, html! {
         h1 { "Two-Factor Verification" }
         form action="/login/verify" method="post" {
             @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
@@ -8915,7 +9342,7 @@ pub async fn login_verify(
             // atomically; a transaction error rolls both back (token
             // preserved) and is treated as not-committed below.
             let revoke_existing_sessions =
-                state.config().auth.sessions.revoke_on_credential_change;
+                state.config_arc().auth.sessions.revoke_on_credential_change;
             let user_id = __SNAKE__.id;
             (*db)
                 .transaction::<_, diesel::result::Error, _>(async move |conn| {
@@ -9112,7 +9539,7 @@ fn magic_link_routes_section_src(
 //   authenticated session (session-fixation defense).
 
 // Magic-link token TTL and per-email cooldown are sourced from `autumn.toml`
-// via `state.config().auth.magic_link` (see docs/guide/authentication.md):
+// via `state.config_arc().auth.magic_link` (see docs/guide/authentication.md):
 //
 //   [auth.magic_link]
 //   ttl_minutes = 15          # link lifetime; keep ≤ 15 min for a tight window (AC5)
@@ -9134,7 +9561,7 @@ pub async fn magic_link_request_form(
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
 ) -> AutumnResult<Markup> {
-    Ok(layout("Sign in with a magic link", html! {
+    Ok(crate::layout("Sign in with a magic link", "/login/magic", html! {}, html! {
         h1 { "Sign in with a magic link" }
         p { "Enter your email and we'll send you a one-time sign-in link — no password required." }
         form action="/login/magic" method="post" {
@@ -9178,8 +9605,11 @@ pub async fn magic_link_request(
     let now = chrono::Utc::now().naive_utc();
     // Sourced from `[auth.magic_link]` in autumn.toml (defaults: 15 min TTL, 60s
     // cooldown). Keep `ttl_minutes` ≤ 15 for a tight link-lifetime window.
-    let ttl_minutes = state.config().auth.magic_link.ttl_minutes;
-    let email_cooldown_secs = state.config().auth.magic_link.email_cooldown_secs;
+    // One shared read for both fields; `config()` would deep-clone every
+    // config section twice per request.
+    let config = state.config_arc();
+    let ttl_minutes = config.auth.magic_link.ttl_minutes;
+    let email_cooldown_secs = config.auth.magic_link.email_cooldown_secs;
     // Record start time; the response is padded to a constant minimum below so
     // an attacker cannot infer registration status from response latency.
     let t0 = std::time::Instant::now();
@@ -9239,7 +9669,7 @@ pub async fn magic_link_request(
         tokio::time::sleep(remaining).await;
     }
 
-    Ok(layout("Check Your Email", html! {
+    Ok(crate::layout("Check Your Email", "/login/magic", html! {}, html! {
         h1 { "Check Your Email" }
         p {
             "If that address is registered, a one-time sign-in link is on its way. \
@@ -9262,7 +9692,7 @@ pub struct MagicLinkVerifyForm {
 /// Generic magic-link failure page. Expired, consumed, unknown, and malformed
 /// tokens ALL render this identical page so nothing acts as an oracle (AC5).
 fn magic_link_invalid_page() -> Markup {
-    layout("Sign-in link invalid", html! {
+    crate::layout("Sign-in link invalid", "/login/magic/verify", html! {}, html! {
         h1 { "This sign-in link is invalid or has expired" }
         p { "Magic sign-in links can be used once and expire quickly. Please request a new one." }
         p { a href="/login/magic" { "Request a new link" } }
@@ -9287,9 +9717,7 @@ pub async fn magic_link_verify_form(
     csrf_field: Option<CsrfFormField>,
     Query(query): Query<MagicLinkVerifyQuery>,
 ) -> AutumnResult<Markup> {
-    let flash_html = flash.render().await;
-    Ok(layout("Confirm sign-in", html! {
-        (flash_html)
+    Ok(crate::layout("Confirm sign-in", "/login/magic/verify", flash_messages(&flash.consume().await), html! {
         h1 { "Confirm sign-in" }
         p { "Click the button below to finish signing in to your account." }
         form action="/login/magic/verify" method="post" {
@@ -9370,7 +9798,10 @@ pub async fn magic_link_verify(
     // the SAME generic failure page as an expired/consumed/unknown token — no
     // oracle distinguishes "locked" from "bad link". This sits before the TOTP
     // branch below, so it gates BOTH the 2FA-park and the direct-login paths.
-    let lockout_cfg = state.config().auth.lockout;
+    // `config_arc` shares the resolved config behind an `Arc`; `config()`
+    // would deep-clone every section to read one field on a request path.
+    let config = state.config_arc();
+    let lockout_cfg = &config.auth.lockout;
     let lockout_enabled = lockout_cfg.enabled && lockout_cfg.threshold > 0;
     if lockout_enabled {
         let cooloff = chrono::Duration::seconds(lockout_cfg.cooloff_secs as i64);
@@ -9590,7 +10021,7 @@ with `--oauth`, `--passkeys`, and `--totp` on the same model.
 
 ### Configuration Knobs
 
-The TTL and per-email cooldown are read from `autumn.toml` via `state.config()`,
+The TTL and per-email cooldown are read from `autumn.toml` via `state.config_arc()`,
 so you can tune them without editing the generated handler:
 
 ```toml
@@ -9604,8 +10035,8 @@ documented defaults below.
 
 | Knob | Location | Default | Purpose |
 |------|----------|---------|---------|
-| `auth.magic_link.ttl_minutes` | `[auth.magic_link]` in `autumn.toml` (via `state.config()`) | `15` | Link lifetime (TTL) in minutes. Keep ≤ 15 min for a tight window — a magic link is a bearer credential, so a short expiry bounds the blast radius of a leaked link. |
-| `auth.magic_link.email_cooldown_secs` | `[auth.magic_link]` in `autumn.toml` (via `state.config()`) | `60` | Per-email cooldown in seconds: suppresses re-minting a token for the same address within the window (email-bomb throttle). |
+| `auth.magic_link.ttl_minutes` | `[auth.magic_link]` in `autumn.toml` (via `state.config_arc()`) | `15` | Link lifetime (TTL) in minutes. Keep ≤ 15 min for a tight window — a magic link is a bearer credential, so a short expiry bounds the blast radius of a leaked link. |
+| `auth.magic_link.email_cooldown_secs` | `[auth.magic_link]` in `autumn.toml` (via `state.config_arc()`) | `60` | Per-email cooldown in seconds: suppresses re-minting a token for the same address within the window (email-bomb throttle). |
 | `#[throttle(limit = 5, per = "1m", key = "ip")]` | attribute on `POST /login/magic` and `POST /login/magic/verify` | 5/min/IP | Per-IP rate limit via autumn's existing rate-limit middleware (request minting + token brute-force bound). |
 
 ### Security Guarantees
@@ -9625,7 +10056,7 @@ documented defaults below.
   malformed tokens all render the same generic failure page; the GET confirm page
   is likewise rendered identically regardless of token validity.
 - **Configurable TTL**: tokens expire after `auth.magic_link.ttl_minutes`
-  (default 15), sourced from `autumn.toml` via `state.config()`.
+  (default 15), sourced from `autumn.toml` via `state.config_arc()`.
 - **Rate-limited**: per-IP (`#[throttle]`) and per-email (DB cooldown).
 - **Session-fixation defense**: the session id is rotated before the
   authenticated session is established.
@@ -9722,19 +10153,27 @@ fn passkey_route_entries() -> Vec<String> {
     ]
 }
 
-fn render_passkey_migration_up(user_table: &str) -> String {
+fn render_passkey_migration_up(
+    backend: autumn_web::config::DatabaseBackend,
+    user_table: &str,
+) -> String {
+    let d = AuthDdl::for_backend(backend);
     format!(
         "CREATE TABLE webauthn_credentials (\n\
-         \x20   id BIGSERIAL PRIMARY KEY,\n\
-         \x20   user_id BIGINT NOT NULL REFERENCES {user_table}(id) ON DELETE CASCADE,\n\
+         \x20   id {pk},\n\
+         \x20   user_id {big_int} NOT NULL REFERENCES {user_table}(id) ON DELETE CASCADE,\n\
          \x20   credential_id TEXT NOT NULL UNIQUE,\n\
          \x20   credential_json TEXT NOT NULL,\n\
          \x20   name TEXT NOT NULL DEFAULT 'Passkey',\n\
-         \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW(),\n\
-         \x20   last_used_at TIMESTAMP NULL\n\
+         \x20   created_at {created_at},\n\
+         \x20   last_used_at {ts} NULL\n\
          );\n\
          \n\
-         CREATE INDEX webauthn_credentials_user_id_idx ON webauthn_credentials (user_id);\n"
+         CREATE INDEX webauthn_credentials_user_id_idx ON webauthn_credentials (user_id);\n",
+        pk = d.pk,
+        big_int = d.big_int,
+        ts = d.ts,
+        created_at = d.ts_not_null_default_now,
     )
 }
 
@@ -9757,9 +10196,9 @@ pub struct WebauthnCredential {{
     pub credential_id: String,
     pub credential_json: String,
     pub name: String,
-    pub created_at: chrono::NaiveDateTime,
     #[default]
     pub last_used_at: Option<chrono::NaiveDateTime>,
+    pub created_at: chrono::NaiveDateTime,
 }}
 
 diesel::joinable!(webauthn_credentials -> {user_table} (user_id));
@@ -9793,20 +10232,34 @@ fn render_passkeys_routes_file(pascal_name: &str, snake_name: &str, user_table: 
 //!   state returned by webauthn-rs and should not be inspected by app code.
 
 use autumn_web::prelude::*;
+use base64::Engine as _;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection as _;
 use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
 use webauthn_rs::prelude::*;
 
-fn redirect_to(url: &str) -> impl IntoResponse {
+/// Encode an opaque credential ID as a base64url (no padding) string.
+///
+/// webauthn-rs 0.5's `CredentialID` is a `HumanBinaryData` newtype over
+/// `Vec<u8>` and no longer implements `Display`/`ToString`, so encode the raw
+/// bytes explicitly. Registration and login use this same helper, keeping the
+/// stored `credential_id` and the login lookup key byte-for-byte consistent.
+fn encode_cred_id(cred_id: &CredentialID) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cred_id.as_ref())
+}
+
+fn redirect_to(url: &str) -> axum::response::Redirect {
     axum::response::Redirect::to(url)
 }
 
 // ── Config helper ──────────────────────────────────────────────────────────────
 
 fn build_webauthn(state: &AppState) -> AutumnResult<Webauthn> {
-    let cfg = &state.config().auth.webauthn;
+    // `config_arc` shares the resolved config behind an `Arc`; `config()`
+    // would deep-clone every section to read one field on a request path.
+    let config = state.config_arc();
+    let cfg = &config.auth.webauthn;
     if cfg.rp_id.is_empty() || cfg.rp_origin.is_empty() {
         return Err(AutumnError::internal_server_error_msg(
             "WebAuthn is not configured. Set [auth.webauthn] rp_id, rp_name, and rp_origin \
@@ -10014,7 +10467,7 @@ pub async fn passkey_register_finish(
     let passkey = webauthn
         .finish_passkey_registration(&rpk_finish, &reg_state)
         .map_err(|e| AutumnError::unprocessable_msg(format!("Registration failed: {e}")))?;
-    let cred_id = passkey.cred_id().to_string();
+    let cred_id = encode_cred_id(passkey.cred_id());
     let cred_json = serde_json::to_string(&passkey)
         .map_err(|_| AutumnError::internal_server_error_msg("Failed to serialise passkey."))?;
     // Store the passkey and revoke every *other* session in one
@@ -10023,7 +10476,7 @@ pub async fn passkey_register_finish(
     // [auth.sessions].revoke_on_credential_change) can never be silently
     // skipped, and a failure rolls the credential back so the client can
     // retry without storing a duplicate.
-    let revoke_other_sessions_in_txn = state.config().auth.sessions.revoke_on_credential_change;
+    let revoke_other_sessions_in_txn = state.config_arc().auth.sessions.revoke_on_credential_change;
     let current_token_digest = crate::routes::auth::session_token_digest(&session).await;
     (*db)
         .transaction::<_, diesel::result::Error, _>(async move |conn| {
@@ -10176,7 +10629,7 @@ pub async fn passkey_login_finish(
     let auth_result = webauthn
         .finish_discoverable_authentication(&pkc, auth_state, &disc_keys)
         .map_err(|e| AutumnError::unauthorized_msg(format!("Authentication failed: {e}")))?;
-    let cred_id_str = auth_result.cred_id().to_string();
+    let cred_id_str = encode_cred_id(auth_result.cred_id());
     let (wc_id, cred_json) = {
         use crate::schema::webauthn_credentials;
         webauthn_credentials::table
@@ -10316,7 +10769,7 @@ pub async fn passkey_revoke(
     State(state): State<AppState>,
     mut db: Db,
     Form(form): Form<PasskeyRevokeForm>,
-) -> AutumnResult<impl IntoResponse> {
+) -> AutumnResult<axum::response::Redirect> {
     // Validates the tracked session row (401s immediately if revoked).
     let current =
         crate::routes::auth::require_tracked_session(&session, &mut db, &state).await?;
@@ -10328,7 +10781,7 @@ pub async fn passkey_revoke(
     // after it.
     let user_id = current.id;
     let credential_id = form.id;
-    let revoke_other_sessions_in_txn = state.config().auth.sessions.revoke_on_credential_change;
+    let revoke_other_sessions_in_txn = state.config_arc().auth.sessions.revoke_on_credential_change;
     let current_token_digest = crate::routes::auth::session_token_digest(&session).await;
     (*db)
         .transaction::<_, diesel::result::Error, _>(async move |conn| {
@@ -10503,6 +10956,11 @@ older browsers.
 }
 
 /// Ensure `autumn-web` in `[dependencies]` has `features = ["webauthn"]`.
+///
+/// The `[dependencies.autumn_web]` underscore spelling is only treated as this
+/// dependency when the table body renames the package back with
+/// `package = "autumn-web"` — without that rename Cargo resolves the table to a
+/// different package literally named `autumn_web`, which must be left untouched.
 #[allow(clippy::too_many_lines)]
 fn ensure_autumn_web_webauthn_feature(toml: &str) -> String {
     const CRATE: &str = "autumn-web";
@@ -10596,7 +11054,24 @@ fn ensure_autumn_web_webauthn_feature(toml: &str) -> String {
             break;
         }
 
-        if trimmed == subtable_header || trimmed == subtable_header_underscore {
+        // Cargo does not normalize `-`/`_` in a dependency table key: unlike
+        // `[dependencies.autumn-web]`, `[dependencies.autumn_web]` names an
+        // unrelated package `autumn_web` unless its body renames it back with
+        // `package = "autumn-web"` (confirmed via `cargo metadata`). Require
+        // that declaration before treating the underscore form as a match, the
+        // same way `find_section_start_with_autumn_web_package` does.
+        let underscore_aliases_autumn_web = trimmed == subtable_header_underscore && {
+            let body_end = lines[i + 1..]
+                .iter()
+                .position(|l| l.trim_start().starts_with('['))
+                .map_or(lines.len(), |p| i + 1 + p);
+            lines[i + 1..body_end].iter().any(|l| {
+                let code = l.split_once('#').map_or(l.as_str(), |(before, _)| before);
+                declares_package(code, CRATE)
+            })
+        };
+
+        if trimmed == subtable_header || underscore_aliases_autumn_web {
             // Scan ahead within the subtable.
             let mut j = i + 1;
             let mut found_features = false;
@@ -10766,6 +11241,74 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// Generated request handlers must read config through `state.config_arc()`,
+    /// never `state.config()`.
+    ///
+    /// `config()` hands back an owned snapshot, which deep-clones every section
+    /// of `AutumnConfig` (~65 allocations) to read one field. In a handler that
+    /// is paid per request, and a handler reading two sections pays it twice —
+    /// which is how a downstream app measured whole-config clones at ~30% of its
+    /// per-request allocations. `config_arc()` clones the `Arc` instead, so the
+    /// same read is a refcount bump.
+    ///
+    /// The one legitimate `config()` in the emitted file is the boot-time
+    /// `remember_me_startup` hook: it runs once and hands `init_remember_pool` an
+    /// owned `RememberConfig`. This pins that exception to exactly one site, so a
+    /// `config()` re-introduced into any handler fails here rather than in a
+    /// downstream profile.
+    #[test]
+    fn generated_handlers_read_config_through_the_shared_arc() {
+        const STARTUP_HOOK: &str = "pub async fn remember_me_startup";
+
+        for (label, routes) in [
+            (
+                "plain",
+                render_routes_file("User", "user", "users", &[], false, false),
+            ),
+            (
+                "totp",
+                render_routes_file("User", "user", "users", &[], true, false),
+            ),
+            (
+                "magic-link",
+                render_routes_file("User", "user", "users", &[], false, true),
+            ),
+            (
+                "oauth",
+                render_routes_file(
+                    "User",
+                    "user",
+                    "users",
+                    &["github".to_owned()],
+                    false,
+                    false,
+                ),
+            ),
+        ] {
+            let hook_at = routes
+                .find(STARTUP_HOOK)
+                .unwrap_or_else(|| panic!("{label}: expected a {STARTUP_HOOK} definition"));
+            // The hook's own `config()` sits a few lines into its body; anything
+            // further out is a handler paying a deep clone per request.
+            let hook_body_end = hook_at + 600;
+
+            for (offset, _) in routes.match_indices("state.config()") {
+                assert!(
+                    (hook_at..hook_body_end).contains(&offset),
+                    "{label}: generated code calls state.config() outside the boot-time \
+                     {STARTUP_HOOK} hook (byte {offset}), which deep-clones every config \
+                     section on a request path — use state.config_arc() instead:\n{}",
+                    &routes[offset.saturating_sub(300)..(offset + 200).min(routes.len())]
+                );
+            }
+
+            assert!(
+                routes.contains("state.config_arc()"),
+                "{label}: generated handlers must read config through state.config_arc()"
+            );
+        }
+    }
+
     fn project_with_main() -> TempDir {
         let tmp = TempDir::new().unwrap();
         fs::write(
@@ -10774,16 +11317,38 @@ mod tests {
         )
         .unwrap();
         fs::create_dir_all(tmp.path().join("src")).unwrap();
-        fs::write(
-            tmp.path().join("src/main.rs"),
-            "use autumn_web::prelude::*;\n\n\
-             #[autumn_web::main]\n\
-             async fn main() {\n\
-             \x20   autumn_web::app().routes(routes![]).run().await;\n\
-             }\n",
-        )
-        .unwrap();
+        fs::write(tmp.path().join("src/main.rs"), main_with_layout()).unwrap();
         tmp
+    }
+
+    /// A `src/main.rs` exposing a shared 4-arg
+    /// `pub fn layout(title, current_path, flash, content)` — what `autumn new`
+    /// emits and what the auth generator's views render through
+    /// (`crate::layout`, issue #1353). The auth preflight requires this.
+    fn main_with_layout() -> &'static str {
+        "use autumn_web::prelude::*;\n\n\
+         pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {\n\
+         \x20   let _ = (current_path, flash);\n\
+         \x20   maud::html! {\n\
+         \x20       title { (title) }\n\
+         \x20       (content)\n\
+         \x20   }\n\
+         }\n\n\
+         #[autumn_web::main]\n\
+         async fn main() {\n\
+         \x20   autumn_web::app().routes(routes![]).run().await;\n\
+         }\n"
+    }
+
+    /// A `src/main.rs` with no shared `pub fn layout` — used to exercise the
+    /// actionable error the auth generator raises when the target app has no
+    /// shared layout for its HTML views to render through (issue #1353).
+    fn main_without_layout() -> &'static str {
+        "use autumn_web::prelude::*;\n\n\
+         #[autumn_web::main]\n\
+         async fn main() {\n\
+         \x20   autumn_web::app().routes(routes![]).run().await;\n\
+         }\n"
     }
 
     /// A Cargo.toml matching what `autumn new`'s own template ships
@@ -10804,6 +11369,449 @@ mod tests {
     // deleted, and every shared-file edit recorded via `plan.push_revert(...)`
     // is undone. These tests assert the round trip is byte-identical for the
     // base scaffold plus each optional feature flag.
+
+    /// The scaffolded `docs/guide/authentication.md` hands the operator
+    /// copy-paste SQL, so it must be in the app's own dialect too (issue
+    /// #1927) — the same rule `render_sessions_docs_file` and
+    /// `render_oauth_docs_file` already follow.
+    #[test]
+    fn authentication_docs_sql_is_backend_aware() {
+        use autumn_web::config::DatabaseBackend;
+
+        let pg = render_docs_file(DatabaseBackend::Postgres, "User", true, true);
+        let sqlite = render_docs_file(DatabaseBackend::Sqlite, "User", true, true);
+
+        // Postgres output is unchanged by the fork: each retrofit block verbatim.
+        assert!(
+            pg.contains(
+                "ALTER TABLE {table}\n  \
+                 ADD COLUMN IF NOT EXISTS failed_attempts INT NOT NULL DEFAULT 0,\n  \
+                 ADD COLUMN IF NOT EXISTS locked_at TIMESTAMP NULL;"
+            ),
+            "{pg}"
+        );
+        assert!(
+            pg.contains(
+                "ALTER TABLE {table}\n  \
+                 DROP COLUMN IF EXISTS failed_attempts,\n  \
+                 DROP COLUMN IF EXISTS locked_at;"
+            ),
+            "{pg}"
+        );
+        assert!(
+            pg.contains(
+                "ALTER TABLE {table}\n  \
+                 ADD COLUMN IF NOT EXISTS confirm_token_digest TEXT NULL,\n  \
+                 ADD COLUMN IF NOT EXISTS confirm_token_expires_at TIMESTAMP NULL,\n  \
+                 ADD COLUMN IF NOT EXISTS email_confirmed_at TIMESTAMP NULL,\n  \
+                 ADD COLUMN IF NOT EXISTS pending_email TEXT NULL;"
+            ),
+            "{pg}"
+        );
+        assert!(
+            pg.contains(
+                "UPDATE {table} SET email_confirmed_at = NOW() WHERE email_confirmed_at IS NULL;"
+            ),
+            "{pg}"
+        );
+        assert!(pg.contains("email_confirmed_at = NOW()"), "{pg}");
+
+        // SQLite has none of those: no `IF NOT EXISTS` on ADD COLUMN, one
+        // column per `ALTER TABLE`, and `CURRENT_TIMESTAMP` for the clock.
+        for leak in [
+            "IF NOT EXISTS",
+            "IF EXISTS",
+            "NOW()",
+            "TIMESTAMP NULL",
+            "INT NOT NULL",
+        ] {
+            assert!(
+                !sqlite.contains(leak),
+                "SQLite authentication.md leaked Postgres-only `{leak}`:\n{sqlite}"
+            );
+        }
+        assert!(
+            sqlite.contains(
+                "ALTER TABLE {table} ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0;"
+            ),
+            "{sqlite}"
+        );
+        assert!(
+            sqlite.contains("ALTER TABLE {table} ADD COLUMN locked_at TEXT NULL;"),
+            "{sqlite}"
+        );
+        assert!(
+            sqlite.contains("email_confirmed_at = CURRENT_TIMESTAMP"),
+            "{sqlite}"
+        );
+    }
+
+    /// Backend-aware DDL (issue #1927): `generate auth` on a `SQLite` app now
+    /// scaffolds its migrations in `SQLite` dialect (`INTEGER PRIMARY KEY
+    /// AUTOINCREMENT`, `DEFAULT CURRENT_TIMESTAMP`) instead of being rejected —
+    /// covering the users table AND the DB-backed sessions table (issue #1908) —
+    /// and no Postgres-only `BIGSERIAL` / `BIGINT` / `NOW()` leaks into the
+    /// `SQLite` migration.
+    #[test]
+    fn plan_auth_emits_sqlite_ddl_including_sessions() {
+        let tmp = project_with_main();
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"sqlite://app.db\"\n",
+        )
+        .unwrap();
+        // `--totp`/`--magic-link` cover the recovery-code + magic-link-token
+        // tables too, so every hand-written auth DDL string is exercised.
+        plan_auth_full_ex2(
+            tmp.path(),
+            "User",
+            "20260508000000",
+            &AuthOAuthOptions {
+                providers: Vec::new(),
+            },
+            true,  // totp
+            false, // passkeys
+            true,  // magic_link
+        )
+        .expect("generate auth must scaffold on a SQLite app")
+        .execute(Flags::default())
+        .unwrap();
+        assert!(tmp.path().join("src/models/user.rs").exists());
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260508000000_create_users/up.sql"),
+        )
+        .unwrap();
+        // Every auto-increment id uses the SQLite spelling.
+        assert!(
+            up.contains("id INTEGER PRIMARY KEY AUTOINCREMENT"),
+            "SQLite up.sql must use INTEGER PRIMARY KEY AUTOINCREMENT: {up}"
+        );
+        // The DB-backed sessions table (#1908) is created in SQLite dialect.
+        assert!(
+            up.contains("CREATE TABLE user_sessions (")
+                && up.contains("last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+            "user_sessions must be SQLite-dialect: {up}"
+        );
+        // The recovery-code (--totp) and magic-link (--magic-link) tables too.
+        assert!(
+            up.contains("CREATE TABLE recovery_codes (")
+                && up.contains("CREATE TABLE magic_link_tokens ("),
+            "totp + magic-link tables must be scaffolded: {up}"
+        );
+        // Foreign keys and timestamp columns are SQLite-typed.
+        assert!(
+            up.contains("user_id INTEGER NOT NULL REFERENCES users(id)"),
+            "FK columns must be INTEGER on SQLite: {up}"
+        );
+        assert!(
+            up.contains("created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+            "created_at must default to CURRENT_TIMESTAMP on SQLite: {up}"
+        );
+        for leak in ["BIGSERIAL", "BIGINT", "NOW()"] {
+            assert!(
+                !up.contains(leak),
+                "SQLite up.sql leaked Postgres-only `{leak}`: {up}"
+            );
+        }
+    }
+
+    /// Collect every generated `.rs` file under `root`, recursively.
+    fn generated_rust_files(root: &Path) -> Vec<(std::path::PathBuf, String)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push((path.clone(), fs::read_to_string(&path).unwrap()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Scaffold the full auth surface into a project whose configured backend
+    /// is `url`, and return every generated `.rs` file.
+    fn auth_scaffold_rust_files(url: &str) -> Vec<(std::path::PathBuf, String)> {
+        let tmp = project_with_main();
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            format!("[database]\nprimary_url = \"{url}\"\n"),
+        )
+        .unwrap();
+        plan_auth_full_ex2(
+            tmp.path(),
+            "User",
+            "20260508000000",
+            &AuthOAuthOptions {
+                providers: Vec::new(),
+            },
+            true, // totp
+            true, // passkeys
+            true, // magic_link
+        )
+        .expect("generate auth must scaffold")
+        .execute(Flags::default())
+        .unwrap();
+        generated_rust_files(&tmp.path().join("src"))
+    }
+
+    /// DB-backed sessions store on `SQLite` (issue #1908): the generated
+    /// session/remember store must bound its connections by the backend-agnostic
+    /// `::autumn_web::RuntimeBackend` alias, never a hard-coded `diesel::pg::Pg`.
+    /// A `pg::Pg` bound does not accept the `SQLite` `RuntimeConnection`, so the
+    /// scaffolded app would not compile on a `SQLite` target.
+    #[test]
+    fn auth_store_connection_bounds_are_backend_agnostic() {
+        for url in ["sqlite://app.db", "postgres://localhost/app"] {
+            let files = auth_scaffold_rust_files(url);
+            for (path, body) in &files {
+                // The whole path, not just the connection bound: a regression
+                // could reintroduce Postgres as `SelectableHelper<diesel::pg::Pg>`
+                // or `check_for_backend(diesel::pg::Pg)`. The auth surface emits
+                // no legitimate `Pg` reference, so absence is the right bar.
+                assert!(
+                    !body.contains("diesel::pg::Pg"),
+                    "{} hard-codes the Postgres backend ({url})",
+                    path.display()
+                );
+            }
+            let session_model = files
+                .iter()
+                .find(|(p, _)| p.ends_with("user_session.rs"))
+                .expect("the sessions store model must be generated");
+            assert!(
+                session_model
+                    .1
+                    .contains("Backend = ::autumn_web::RuntimeBackend"),
+                "the sessions store must bind RuntimeBackend ({url}): {}",
+                session_model.1
+            );
+        }
+    }
+
+    /// The scaffolded session-management guide hands the operator SQL for the
+    /// sessions table. It must be in the app's own dialect (issue #1908):
+    /// Postgres keeps `NOW() - INTERVAL`, `SQLite` gets `datetime('now', …)`.
+    #[test]
+    fn sessions_doc_sql_matches_the_app_backend() {
+        let pg = render_sessions_docs_file(
+            autumn_web::config::DatabaseBackend::Postgres,
+            "User",
+            "user",
+            "users",
+        );
+        assert!(
+            pg.contains("last_seen_at < NOW() - INTERVAL '90 days'"),
+            "Postgres retention SQL must be unchanged: {pg}"
+        );
+        assert!(
+            pg.contains("id BIGSERIAL PRIMARY KEY")
+                && pg.contains("last_seen_at TIMESTAMP NOT NULL DEFAULT NOW()"),
+            "Postgres migration-path DDL must be unchanged: {pg}"
+        );
+
+        let sqlite = render_sessions_docs_file(
+            autumn_web::config::DatabaseBackend::Sqlite,
+            "User",
+            "user",
+            "users",
+        );
+        assert!(
+            sqlite.contains("last_seen_at < datetime('now', '-90 days')"),
+            "SQLite retention SQL must use datetime(): {sqlite}"
+        );
+        assert!(
+            sqlite.contains("id INTEGER PRIMARY KEY AUTOINCREMENT")
+                && sqlite.contains("last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP")
+                && sqlite.contains("user_id INTEGER NOT NULL REFERENCES users(id)"),
+            "SQLite migration-path DDL must be SQLite dialect: {sqlite}"
+        );
+        for leak in ["BIGSERIAL", "BIGINT", "NOW()"] {
+            assert!(
+                !sqlite.contains(leak),
+                "SQLite sessions guide leaked Postgres-only `{leak}`: {sqlite}"
+            );
+        }
+    }
+
+    /// Regression guard: on a Postgres app (the default) the auth migration
+    /// stays byte-for-byte the historical Postgres DDL.
+    #[test]
+    fn plan_auth_emits_postgres_ddl_by_default() {
+        let tmp = project_with_main();
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"postgres://localhost/app\"\n",
+        )
+        .unwrap();
+        plan_auth(tmp.path(), "User", "20260508000000")
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260508000000_create_users/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("id BIGSERIAL PRIMARY KEY"),
+            "Postgres up.sql must keep BIGSERIAL PRIMARY KEY: {up}"
+        );
+        assert!(
+            up.contains("CREATE TABLE user_sessions (")
+                && up.contains("last_seen_at TIMESTAMP NOT NULL DEFAULT NOW()"),
+            "Postgres user_sessions must keep TIMESTAMP DEFAULT NOW(): {up}"
+        );
+        assert!(
+            up.contains("user_id BIGINT NOT NULL REFERENCES users(id)"),
+            "Postgres FK columns must stay BIGINT: {up}"
+        );
+    }
+
+    /// DB-backed sessions store on `SQLite` (issue #1908): the generated
+    /// `routes/auth.rs` types its connection pools against the backend-agnostic
+    /// `::autumn_web::RuntimeConnection` alias (which resolves to `AsyncPgConnection`
+    /// on Postgres and the `SQLite` connection under the `sqlite` feature), never a
+    /// hard-coded `diesel_async::AsyncPgConnection`, so the generated app compiles
+    /// on whichever backend it selected.
+    #[test]
+    fn generated_session_pool_uses_runtime_connection_not_pg() {
+        // magic-link on/off both emit the remember-me middleware pool sites.
+        for magic_link in [false, true] {
+            let routes = render_routes_file("User", "user", "users", &[], false, magic_link);
+            assert!(
+                routes.contains("deadpool::Pool<::autumn_web::RuntimeConnection>"),
+                "session pool must be typed against RuntimeConnection (magic_link={magic_link}): {routes}"
+            );
+            assert!(
+                !routes.contains("Pool<diesel_async::AsyncPgConnection>"),
+                "session pool must not hard-code AsyncPgConnection (magic_link={magic_link})"
+            );
+        }
+    }
+
+    /// The `--oauth` (`oauth_identities`) and `--passkeys`
+    /// (`webauthn_credentials`) migrations are backend-aware too (issue #1927):
+    /// `SQLite` dialect on a `SQLite` app, historical Postgres DDL otherwise.
+    #[test]
+    fn oauth_and_passkey_migrations_are_backend_aware() {
+        use autumn_web::config::DatabaseBackend;
+
+        for (render, table) in [
+            (
+                render_oauth_migration_up as fn(DatabaseBackend, &str) -> String,
+                "oauth_identities",
+            ),
+            (render_passkey_migration_up, "webauthn_credentials"),
+        ] {
+            let sqlite = render(DatabaseBackend::Sqlite, "users");
+            assert!(
+                sqlite.contains("id INTEGER PRIMARY KEY AUTOINCREMENT")
+                    && sqlite.contains("user_id INTEGER NOT NULL REFERENCES users(id)")
+                    && sqlite.contains("created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+                "{table} SQLite DDL must use SQLite dialect: {sqlite}"
+            );
+            for leak in ["BIGSERIAL", "BIGINT", "NOW()"] {
+                assert!(
+                    !sqlite.contains(leak),
+                    "{table} SQLite DDL leaked `{leak}`: {sqlite}"
+                );
+            }
+            let pg = render(DatabaseBackend::Postgres, "users");
+            assert!(
+                pg.contains("id BIGSERIAL PRIMARY KEY")
+                    && pg.contains("user_id BIGINT NOT NULL REFERENCES users(id)")
+                    && pg.contains("created_at TIMESTAMP NOT NULL DEFAULT NOW()"),
+                "{table} Postgres DDL must stay historical: {pg}"
+            );
+        }
+    }
+
+    /// The scaffolded OAuth guide documents the schema of the migration the same
+    /// run writes, so it must be in the same dialect (issue #1908) — the drift
+    /// `render_sessions_table_ddl` removed for the sessions guide.
+    #[test]
+    fn oauth_doc_schema_matches_the_app_backend() {
+        use autumn_web::config::DatabaseBackend;
+
+        let providers = vec!["github".to_owned()];
+
+        let pg = render_oauth_docs_file(DatabaseBackend::Postgres, &providers, "users");
+        assert!(
+            pg.contains("id         BIGSERIAL PRIMARY KEY,")
+                && pg
+                    .contains("user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,")
+                && pg.contains("created_at TIMESTAMP NOT NULL DEFAULT NOW(),"),
+            "the Postgres OAuth guide must be unchanged: {pg}"
+        );
+
+        let sqlite = render_oauth_docs_file(DatabaseBackend::Sqlite, &providers, "users");
+        assert!(
+            sqlite.contains("id         INTEGER PRIMARY KEY AUTOINCREMENT,")
+                && sqlite.contains(
+                    "user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
+                )
+                && sqlite.contains("created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"),
+            "the SQLite OAuth guide must be SQLite dialect: {sqlite}"
+        );
+        for leak in ["BIGSERIAL", "BIGINT", "NOW()"] {
+            assert!(
+                !sqlite.contains(leak),
+                "the SQLite OAuth guide leaked Postgres-only `{leak}`: {sqlite}"
+            );
+        }
+    }
+
+    /// A Postgres app (the default) is not rejected — `generate auth` still
+    /// plans its files.
+    #[test]
+    fn plan_auth_not_rejected_on_postgres_app() {
+        let tmp = project_with_main();
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"postgres://localhost/app\"\n",
+        )
+        .unwrap();
+        assert!(plan_auth(tmp.path(), "User", "20260508000000").is_ok());
+    }
+
+    /// `autumn destroy auth` recomputes this same plan via the `for_revert`
+    /// builder before [`Plan::revert`], so it must build a revert plan on a
+    /// `SQLite` app (the `for_revert` flag still suppresses the generate-only
+    /// shared-layout preflight — issue #1927 made the migrations `SQLite`-valid, so
+    /// generate no longer rejects, but the preflight-suppression path must stay
+    /// exercised).
+    #[test]
+    fn plan_auth_for_revert_not_rejected_on_sqlite_app() {
+        let tmp = project_with_main();
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"sqlite://app.db\"\n",
+        )
+        .unwrap();
+        let oauth = AuthOAuthOptions {
+            providers: Vec::new(),
+        };
+        // The destroy/revert plan builder must still produce a plan to revert.
+        assert!(
+            plan_auth_full_ex2_for_revert(
+                tmp.path(),
+                "User",
+                "20260508000000",
+                &oauth,
+                false,
+                false,
+                false,
+            )
+            .is_ok(),
+            "destroy auth must build its revert plan on a SQLite app"
+        );
+    }
 
     #[test]
     fn generate_then_destroy_base_auth_round_trips_to_original_project_state() {
@@ -11392,8 +12400,9 @@ mod tests {
         let body = magic_link_verify_body(&routes);
         // Reads the same [auth.lockout] config the password-login path uses.
         assert!(
-            body.contains("let lockout_cfg = state.config().auth.lockout;"),
-            "verify must read [auth.lockout] config for the lock recheck: {body}"
+            body.contains("let lockout_cfg = &config.auth.lockout;")
+                && body.contains("let config = state.config_arc();"),
+            "verify must read [auth.lockout] through the shared config handle: {body}"
         );
         // TOCTOU-safe: the recheck must NOT trust the stale in-memory `user` row
         // SELECTed earlier — it must re-read `locked_at` at the DB. The stale
@@ -11440,8 +12449,9 @@ mod tests {
         let routes = render_routes_file("User", "user", "users", &[], true, true);
         let body = magic_link_verify_body(&routes);
         assert!(
-            body.contains("let lockout_cfg = state.config().auth.lockout;"),
-            "totp variant must read [auth.lockout] config for the lock recheck: {body}"
+            body.contains("let lockout_cfg = &config.auth.lockout;")
+                && body.contains("let config = state.config_arc();"),
+            "totp variant must read [auth.lockout] through the shared config handle: {body}"
         );
         assert!(
             !body.contains("if let Some(locked_at) = user.locked_at {"),
@@ -11700,10 +12710,11 @@ mod tests {
     fn magic_link_ttl_is_config_sourced_with_15_minute_default() {
         let tmp = project_with_main();
         let routes = magic_link_routes(tmp.path());
-        // TTL is now sourced from autumn.toml via state.config(), not a const.
+        // TTL is sourced from autumn.toml via the shared config handle, not a const.
         assert!(
-            routes.contains("state.config().auth.magic_link.ttl_minutes"),
-            "TTL must be sourced from state.config().auth.magic_link: {routes}"
+            routes.contains("let ttl_minutes = config.auth.magic_link.ttl_minutes;")
+                && routes.contains("let config = state.config_arc();"),
+            "TTL must be sourced from auth.magic_link via config_arc: {routes}"
         );
         // The documented default (15) and the ≤ 15-minute guidance must survive
         // the move to config so operators keep the tight-window recommendation.
@@ -11713,8 +12724,9 @@ mod tests {
         );
         // The per-email cooldown is likewise config-sourced.
         assert!(
-            routes.contains("state.config().auth.magic_link.email_cooldown_secs"),
-            "per-email cooldown must be sourced from state.config().auth.magic_link: {routes}"
+            routes
+                .contains("let email_cooldown_secs = config.auth.magic_link.email_cooldown_secs;"),
+            "per-email cooldown must be sourced from auth.magic_link: {routes}"
         );
     }
 
@@ -12386,6 +13398,149 @@ mod tests {
         );
     }
 
+    /// #2152: a failed remember-chain delete must fail the logout, not be
+    /// swallowed. The remember cookie is a long-lived bearer credential; if
+    /// the delete fails silently, the cookie clears client-side but the chain
+    /// still authenticates on the server, while the response tells the user
+    /// they signed out.
+    #[test]
+    fn logout_propagates_remember_chain_revocation_failure() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+
+        let sig_start = routes
+            .find("async fn revoke_remember_from_cookie")
+            .expect("revoke_remember_from_cookie must be defined");
+        let sig_end = sig_start
+            + routes[sig_start..]
+                .find('{')
+                .expect("function signature must have a body");
+        let signature = &routes[sig_start..sig_end];
+        assert!(
+            signature.contains("-> autumn_web::AutumnResult<()>")
+                || signature.contains("-> AutumnResult<()>"),
+            "revoke_remember_from_cookie must return a Result so a failed \
+             delete can fail the logout, not `()`: {signature}"
+        );
+
+        let logout_pos = routes
+            .find("pub async fn logout(")
+            .expect("logout handler missing");
+        let after = &routes[logout_pos..];
+        let next_fn = after[1..]
+            .find("\npub async fn ")
+            .map_or(after.len(), |p| p + 1);
+        let logout_body = &after[..next_fn];
+        assert!(
+            logout_body
+                .contains("revoke_remember_from_cookie(&mut db, remember_cfg, &headers).await"),
+            "logout must call revoke_remember_from_cookie and keep its result \
+             to propagate later, not discard it: {logout_body}"
+        );
+    }
+
+    /// #2152 follow-up: the session is the primary credential, so logout must
+    /// invalidate it (`clear` + `rotate_id`) even when the remember-chain
+    /// delete fails. Propagating that failure with `?` BEFORE invalidating
+    /// the session would let a transient DB error on the remember-chain
+    /// delete leave the pre-logout session cookie live — worse than the bug
+    /// this was meant to fix, since the session is more sensitive than the
+    /// remember cookie.
+    #[test]
+    fn logout_invalidates_session_before_propagating_remember_chain_failure() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+
+        let logout_pos = routes
+            .find("pub async fn logout(")
+            .expect("logout handler missing");
+        let after = &routes[logout_pos..];
+        let next_fn = after[1..]
+            .find("\npub async fn ")
+            .map_or(after.len(), |p| p + 1);
+        let logout_body = &after[..next_fn];
+
+        let revoke_call_at = logout_body
+            .find("revoke_remember_from_cookie(&mut db, remember_cfg, &headers).await")
+            .expect("logout must call revoke_remember_from_cookie");
+        assert!(
+            !logout_body[revoke_call_at..]
+                .starts_with("revoke_remember_from_cookie(&mut db, remember_cfg, &headers).await?"),
+            "the revoke call must not short-circuit the handler with `?` \
+             directly — that skips session invalidation on failure: {logout_body}"
+        );
+
+        let clear_at = logout_body
+            .find("session.clear()")
+            .expect("logout must clear the session");
+        let rotate_at = logout_body
+            .find("session.rotate_id()")
+            .expect("logout must rotate the session id");
+        assert!(
+            clear_at > revoke_call_at && rotate_at > revoke_call_at,
+            "logout must invalidate the session after calling \
+             revoke_remember_from_cookie: {logout_body}"
+        );
+
+        let propagate_at = logout_body
+            .find("if let Err(")
+            .filter(|&p| p > rotate_at)
+            .expect(
+                "logout must branch on the remember-chain revocation result \
+                 AFTER the session is invalidated",
+            );
+        assert!(propagate_at > clear_at && propagate_at > rotate_at);
+    }
+
+    /// #2811 review finding: on a failed remember-chain delete, `logout` must
+    /// still clear the remember cookie in the error response. Otherwise the
+    /// browser keeps presenting a still-valid remember cookie, and once the
+    /// database recovers `remember_me` silently re-establishes a session on
+    /// the user's very next request — undoing the logout entirely.
+    #[test]
+    fn logout_clears_remember_cookie_even_on_revocation_failure() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+
+        let logout_pos = routes
+            .find("pub async fn logout(")
+            .expect("logout handler missing");
+        let after = &routes[logout_pos..];
+        let next_fn = after[1..]
+            .find("\npub async fn ")
+            .map_or(after.len(), |p| p + 1);
+        let logout_body = &after[..next_fn];
+
+        // The error branch must build its own response and attach the clear
+        // cookie rather than bailing out with a bare `revoke_result?;` that
+        // hands back the framework's default error response untouched.
+        assert!(
+            !logout_body.contains("revoke_result?;"),
+            "a bare `revoke_result?;` skips attaching the remember-clear \
+             cookie to the error response: {logout_body}"
+        );
+        assert!(
+            logout_body.contains("if let Err(") && logout_body.contains("revoke_result"),
+            "logout must branch on revoke_result to attach the clear cookie \
+             to the error response: {logout_body}"
+        );
+
+        let clear_cookie_calls = logout_body
+            .matches("append_set_cookie(&mut response, &build_remember_clear_cookie(remember_cfg))")
+            .count();
+        assert!(
+            clear_cookie_calls >= 2,
+            "logout must clear the remember cookie on BOTH the success path \
+             and the revocation-failure error path: {logout_body}"
+        );
+    }
+
     #[test]
     fn routes_file_emits_flash_messages() {
         let tmp = project_with_main();
@@ -12405,14 +13560,177 @@ mod tests {
             routes.contains("flash.info(\"Account created"),
             "signup must set a flash: {routes}"
         );
-        // The redirect-target pages render pending flashes in their layout.
+        // Issue #1353/#1240: the redirect-target pages render pending flashes
+        // through the shared, accessible `flash_messages()` helper threaded into
+        // the layout's 3rd argument — NOT the older in-content `flash.render()`.
         assert!(
-            routes.contains("flash.render().await"),
-            "auth pages must render pending flashes: {routes}"
+            !routes.contains("flash.render().await"),
+            "auth pages must not use the old in-content flash.render() path: {routes}"
+        );
+        assert!(
+            routes.contains("flash_messages(&flash.consume().await)"),
+            "auth pages must render pending flashes via flash_messages(): {routes}"
         );
         assert!(
             routes.contains("pub async fn login_form(flash: Flash"),
             "login_form must take the Flash extractor to render notices: {routes}"
+        );
+    }
+
+    /// Issue #1353: every auth view renders through the application's shared
+    /// `crate::layout(title, current_path, flash, content)` (4 args) rather than
+    /// a private per-file `fn layout(title, content)` stub. The private stub —
+    /// and its bare DOCTYPE shell — must be gone, and representative pages must
+    /// call `crate::layout` with a per-page `current_path` and the flash arg.
+    #[test]
+    fn auth_views_render_through_shared_layout() {
+        let routes = render_routes_file("User", "user", "users", &[], false, false);
+        // The private layout stub is gone.
+        assert!(
+            !routes.contains("fn layout(title: &str, content: Markup)"),
+            "the private 2-arg layout stub must be removed: {routes}"
+        );
+        // Views render through the shared 4-arg layout.
+        assert!(
+            routes.contains("crate::layout("),
+            "auth views must render through crate::layout: {routes}"
+        );
+        assert!(
+            !routes.contains(" layout(") || routes.contains("crate::layout("),
+            "no bare 2-arg layout() calls may remain: {routes}"
+        );
+        // Login renders through the shared layout with its own current_path and
+        // the flash threaded to the 3rd arg (mirrors scaffold's assertions).
+        assert!(
+            routes.contains(
+                "crate::layout(\"Log In\", \"/login\", flash_messages(&flash.consume().await),"
+            ),
+            "login_form must render through crate::layout with /login + flash: {routes}"
+        );
+        // The account page likewise threads its current_path + flash.
+        assert!(
+            routes.contains(
+                "crate::layout(\"Your Account\", \"/account\", flash_messages(&flash.consume().await),"
+            ),
+            "account must render through crate::layout with /account + flash: {routes}"
+        );
+        // A page that shows no flash still passes a per-page current_path and an
+        // empty flash markup as the 3rd arg.
+        assert!(
+            routes.contains("crate::layout(\"Sign Up\", \"/signup\", html! {},"),
+            "signup form must render through crate::layout with /signup: {routes}"
+        );
+    }
+
+    /// Issue #1353: the TOTP (`--totp`) and magic-link (`--magic-link`) views
+    /// also render through the shared `crate::layout`, with per-page paths.
+    #[test]
+    fn auth_totp_and_magic_link_views_render_through_shared_layout() {
+        let routes = render_routes_file("User", "user", "users", &[], true, true);
+        assert!(
+            !routes.contains("fn layout(title: &str, content: Markup)"),
+            "the private layout stub must be removed under --totp/--magic-link: {routes}"
+        );
+        assert!(
+            routes.contains(
+                "crate::layout(\"Two-Factor Verification\", \"/login/verify\", html! {},"
+            ),
+            "the TOTP verify page must render through crate::layout: {routes}"
+        );
+        assert!(
+            routes.contains(
+                "crate::layout(\"Confirm sign-in\", \"/login/magic/verify\", flash_messages(&flash.consume().await),"
+            ),
+            "the magic-link confirm page must thread flash through crate::layout: {routes}"
+        );
+    }
+
+    /// Issue #1353: `autumn generate auth` requires the target app to expose a
+    /// shared 4-arg `pub fn layout` (as `autumn new` emits) so its views can
+    /// render through `crate::layout`. When `src/main.rs` has no such layout —
+    /// e.g. an `autumn new --api` project — the generator fails early with an
+    /// actionable Config error rather than emitting routes that fail to compile.
+    /// Mirrors the scaffold generator's preflight (issue #1130).
+    #[test]
+    fn plan_auth_errors_when_main_rs_has_no_shared_layout() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/main.rs"), main_without_layout()).unwrap();
+        let err = plan_auth(tmp.path(), "User", "20260508000000").unwrap_err();
+        match err {
+            GenerateError::Config(msg) => {
+                assert!(
+                    msg.contains("pub fn layout") && msg.contains("autumn new"),
+                    "missing shared layout must yield the actionable error: {msg}"
+                );
+            }
+            other => panic!("expected an actionable Config error, got: {other:?}"),
+        }
+    }
+
+    /// Issue #1353: a genuinely absent `src/main.rs` surfaces the same
+    /// actionable shared-layout Config error (pointing at `autumn new`), not a
+    /// raw Io "missing" error.
+    #[test]
+    fn plan_auth_errors_when_main_rs_missing() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        let err = plan_auth(tmp.path(), "User", "20260508000000").unwrap_err();
+        match err {
+            GenerateError::Config(msg) => {
+                assert!(
+                    msg.contains("pub fn layout") && msg.contains("autumn new"),
+                    "absent main.rs must yield the actionable shared-layout error: {msg}"
+                );
+            }
+            other => panic!("expected an actionable Config error, got: {other:?}"),
+        }
+    }
+
+    /// Issue #1353 follow-up: `autumn destroy auth` recomputes the identical
+    /// plan before reverting it. The shared-layout preflight is a generate-time
+    /// guard only — it must NOT fire on the destroy/revert path, or cleanup
+    /// would hard-fail in a project whose shared `pub fn layout` is missing or
+    /// renamed (e.g. one scaffolded by an older CLI), stranding the generated
+    /// files. The revert-only plan builder must therefore succeed even when
+    /// `src/main.rs` exposes no shared 4-arg layout.
+    #[test]
+    fn plan_auth_for_revert_succeeds_without_shared_layout() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        // A project with NO shared `pub fn layout` — the exact input the
+        // generate-time preflight rejects.
+        fs::write(tmp.path().join("src/main.rs"), main_without_layout()).unwrap();
+        let oauth = AuthOAuthOptions {
+            providers: Vec::new(),
+        };
+        // The revert builder must not consult the shared layout at all.
+        let plan = plan_auth_full_ex2_for_revert(
+            tmp.path(),
+            "User",
+            "20260508000000",
+            &oauth,
+            false,
+            false,
+            false,
+        )
+        .expect("destroy auth must build its revert plan without a shared layout");
+        // Sanity: it produced the auth routes file a normal auth plan would, so
+        // `Plan::revert` has something to remove.
+        assert!(
+            find_plan_content_for_path(&plan, &tmp.path().join("src/routes/auth.rs")).is_some(),
+            "revert plan should still include the auth routes it will remove"
+        );
+
+        // And the generate path over the SAME project still fails fast — the
+        // guard is bypassed only for revert, never weakened for generation.
+        let err = plan_auth(tmp.path(), "User", "20260508000000").unwrap_err();
+        assert!(
+            matches!(err, GenerateError::Config(ref msg) if msg.contains("pub fn layout")),
+            "generate path must still reject a missing shared layout: {err:?}"
         );
     }
 
@@ -12831,7 +14149,7 @@ mod tests {
         let routes = render_routes_file("User", "user", "users", &[], false, false);
         let body = handler_body(&routes, "change_password");
         assert!(
-            body.contains("state.config().auth.sessions.revoke_on_credential_change"),
+            body.contains("state.config_arc().auth.sessions.revoke_on_credential_change"),
             "change_password must read the revoke_on_credential_change opt-out"
         );
         // The OTHER-session delete is gated on the captured flag.
@@ -13211,6 +14529,122 @@ mod tests {
             out.matches("\"mail\"").count(),
             1,
             "must not duplicate feature"
+        );
+    }
+
+    /// Cargo does not normalize `-`/`_` in a dependency table key: `[dependencies.autumn_web]`
+    /// names an unrelated package `autumn_web` unless its body renames it back with
+    /// `package = "autumn-web"` (`cargo metadata` on a manifest with
+    /// `[dependencies.async_trait]` and no `package` key: "no matching package found ...
+    /// perhaps you meant: async-trait" — it does not fall back to the hyphenated name).
+    /// Every fixture below therefore carries that `package` line, matching how `autumn
+    /// new`/`cargo add --rename` would actually produce this form.
+    ///
+    /// `ensure_autumn_web_oauth2_feature` and `_webauthn_feature` both check
+    /// `[dependencies.autumn_web]` via a `subtable_header_underscore` variable, and —
+    /// like `ensure_autumn_web_mail_feature` before the rename-gate fix — neither
+    /// verified the `package` rename, so they too would incorrectly match (and
+    /// mutate) an unrelated `autumn_web` dependency that isn't actually this
+    /// framework. The rename gate below (`cargo_toml_*_feature_ignores_unrenamed_`
+    /// `underscore_subtable`) pins that fix for both copies, the same gate
+    /// #2752's `mail` copy carries.
+    #[test]
+    fn cargo_toml_gets_oauth2_feature_subtable_underscore_form() {
+        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\npackage = \"autumn-web\"\n";
+        let out = ensure_autumn_web_oauth2_feature(input);
+        assert!(
+            out.contains("features = [\"oauth2\"]"),
+            "oauth2 feature missing for underscore subtable form: {out}"
+        );
+    }
+
+    #[test]
+    fn cargo_toml_gets_webauthn_feature_subtable_underscore_form() {
+        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\npackage = \"autumn-web\"\n";
+        let out = ensure_autumn_web_webauthn_feature(input);
+        assert!(
+            out.contains("features = [\"webauthn\"]"),
+            "webauthn feature missing for underscore subtable form: {out}"
+        );
+    }
+
+    /// Missed-fix regression: `ensure_autumn_web_mail_feature` must recognize a
+    /// properly `package`-renamed `[dependencies.autumn_web]` the same way its
+    /// `oauth2`/`webauthn` siblings do (see
+    /// `cargo_toml_gets_oauth2_feature_subtable_underscore_form` above). Before this
+    /// fix the function silently returned the TOML unmodified for this form.
+    #[test]
+    fn cargo_toml_gets_mail_feature_subtable_underscore_form() {
+        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\npackage = \"autumn-web\"\n";
+        let out = ensure_autumn_web_mail_feature(input);
+        assert!(
+            out.contains("features = [\"mail\"]"),
+            "mail feature missing for underscore subtable form: {out}"
+        );
+    }
+
+    /// Negative case for the fix above: `[dependencies.autumn_web]` with no `package`
+    /// rename names a real (if unlikely) dependency on a crate literally called
+    /// `autumn_web` — not this framework. `ensure_autumn_web_mail_feature` must leave
+    /// it untouched rather than injecting `mail` into an unrelated dependency's
+    /// features.
+    #[test]
+    fn cargo_toml_mail_feature_ignores_unrenamed_underscore_subtable() {
+        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\n";
+        let out = ensure_autumn_web_mail_feature(input);
+        assert_eq!(
+            out, input,
+            "must not treat an unrenamed `autumn_web` dependency as autumn-web: {out}"
+        );
+    }
+
+    /// Soundness regression (#2753): an unrenamed `[dependencies.autumn_web]`
+    /// names a crate literally called `autumn_web`, not this framework. Both
+    /// `ensure_autumn_web_oauth2_feature` and
+    /// `ensure_autumn_web_webauthn_feature` must leave it untouched rather than
+    /// injecting their feature into an unrelated dependency's feature list —
+    /// the same gate `ensure_autumn_web_mail_feature` gained in #2752.
+    #[test]
+    fn cargo_toml_oauth2_feature_ignores_unrenamed_underscore_subtable() {
+        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\n";
+        let out = ensure_autumn_web_oauth2_feature(input);
+        assert_eq!(
+            out, input,
+            "must not treat an unrenamed `autumn_web` dependency as autumn-web: {out}"
+        );
+    }
+
+    #[test]
+    fn cargo_toml_webauthn_feature_ignores_unrenamed_underscore_subtable() {
+        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\n";
+        let out = ensure_autumn_web_webauthn_feature(input);
+        assert_eq!(
+            out, input,
+            "must not treat an unrenamed `autumn_web` dependency as autumn-web: {out}"
+        );
+    }
+
+    /// The rename gate must accept TOML-quoted `package` keys (Codex review on
+    /// #2771): `"package" = "autumn-web"` is valid TOML that Cargo treats as
+    /// the same key, and this form was patched before the gate was added, so
+    /// rejecting it would leave generated routes uncompilable.
+    #[test]
+    fn cargo_toml_oauth2_feature_accepts_quoted_package_key_underscore_subtable() {
+        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\n\"package\" = \"autumn-web\"\n";
+        let out = ensure_autumn_web_oauth2_feature(input);
+        assert!(
+            out.contains("features = [\"oauth2\"]"),
+            "oauth2 feature missing for quoted-key rename form: {out}"
+        );
+    }
+
+    #[test]
+    fn cargo_toml_webauthn_feature_accepts_quoted_package_key_underscore_subtable() {
+        let input = "[dependencies.autumn_web]\nversion = \"0.3\"\n'package' = 'autumn-web'\n";
+        let out = ensure_autumn_web_webauthn_feature(input);
+        assert!(
+            out.contains("features = [\"webauthn\"]"),
+            "webauthn feature missing for quoted-key rename form: {out}"
         );
     }
 
@@ -14010,7 +15444,12 @@ mod tests {
         // disambiguation + email-change flow), so the documented "adoption path"
         // migration for existing apps must add that column in up.sql and drop it in
         // down.sql — otherwise the regenerated app queries a missing column.
-        let docs = render_docs_file("User", false, false);
+        let docs = render_docs_file(
+            autumn_web::config::DatabaseBackend::Postgres,
+            "User",
+            false,
+            false,
+        );
         let up_marker = "-- migrations/<timestamp>_add_email_confirmation_to_{table}/up.sql";
         let down_marker = "-- migrations/<timestamp>_add_email_confirmation_to_{table}/down.sql";
         let up_pos = docs.find(up_marker).expect("adoption up.sql block present");
@@ -15112,8 +16551,9 @@ mod tests {
             "passkeys.rs must define redirect_to: {routes}"
         );
         assert!(
-            routes.contains("impl IntoResponse"),
-            "redirect_to must return impl IntoResponse: {routes}"
+            routes.contains("fn redirect_to(url: &str) -> axum::response::Redirect"),
+            "redirect_to must return a concrete axum::response::Redirect \
+             (impl Trait is illegal nested in AutumnResult<_>): {routes}"
         );
     }
 
@@ -15292,6 +16732,130 @@ mod tests {
             routes.contains("lockout")
                 && (routes.contains("enabled") || routes.contains("threshold")),
             "routes must respect lockout enabled/threshold config for opt-out: {routes}"
+        );
+    }
+
+    /// #2500: the lock-stamping `UPDATE ... SET locked_at = now()` must never be
+    /// unconditional. A concurrent successful login can reset `failed_attempts`
+    /// to 0 and clear `locked_at` in the gap between the failed request's own
+    /// increment and its lock stamp; without a fresh DB-level guard the stamp
+    /// re-locks the account out from under the login that already succeeded.
+    /// Both the `login` and `reauth` handlers duplicate this block, so both
+    /// must carry the guard.
+    #[test]
+    fn routes_file_guards_lock_stamp_against_concurrent_reset() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+
+        let guarded_stamp_occurrences = routes
+            .matches("failed_attempts.ge(lockout_cfg.threshold)")
+            .count();
+        assert_eq!(
+            guarded_stamp_occurrences, 2,
+            "both the login and reauth lock-stamp UPDATEs must filter on \
+             failed_attempts.ge(lockout_cfg.threshold) so a concurrent successful \
+             login's reset cannot be clobbered by a stale-threshold re-lock \
+             (found {guarded_stamp_occurrences}): {routes}"
+        );
+
+        // `locked_at.is_null()` also appears, unrelated, in the pre-existing
+        // success-path reset guard (`locked_at.is_null().or(locked_at.le(...)))`),
+        // so a bare substring count can't tell the lock-stamp guard apart from
+        // that unrelated clause and would stay green even if the lock-stamp
+        // UPDATE's own `.filter(locked_at.is_null())` were dropped. Anchor on
+        // `locked_at.eq(Some(now))` instead — the lock-stamp `.set(...)` call,
+        // which appears exactly once per handler (login, reauth) — and require
+        // both guard filters to appear immediately before each one.
+        let stamp_occurrences = routes.matches("locked_at.eq(Some(now))").count();
+        assert_eq!(
+            stamp_occurrences, 2,
+            "expected exactly one lock-stamp UPDATE in each of login and reauth \
+             (found {stamp_occurrences}): {routes}"
+        );
+        let mut search_from = 0;
+        for i in 0..stamp_occurrences {
+            let stamp_at = routes[search_from..]
+                .find("locked_at.eq(Some(now))")
+                .map(|pos| search_from + pos)
+                .unwrap();
+            let window_start = stamp_at.saturating_sub(400);
+            let preceding = &routes[window_start..stamp_at];
+            assert!(
+                preceding.contains("failed_attempts.ge(lockout_cfg.threshold)")
+                    && preceding.contains("locked_at.is_null()"),
+                "lock-stamp UPDATE #{} must be guarded by both \
+                 failed_attempts.ge(lockout_cfg.threshold) and locked_at.is_null() \
+                 immediately before the `locked_at.eq(Some(now))` write, so it never \
+                 re-stamps (and extends the cool-off of) an account another request \
+                 already locked, nor clobbers a concurrent successful reset: {routes}",
+                i + 1
+            );
+            search_from = stamp_at + "locked_at.eq(Some(now))".len();
+        }
+    }
+
+    /// #2500: the `account_locked` telemetry event must only fire when this
+    /// request's own write actually applied the lock. If a concurrent
+    /// successful login won the race (see the guard tested above), the
+    /// lock-stamp UPDATE affects zero rows and no lock ever took effect, so
+    /// logging `account_locked` would be a false positive.
+    #[test]
+    fn routes_file_gates_lockout_telemetry_on_rows_actually_locked() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+
+        let login_block_start = routes
+            .find("Failed to lock account")
+            .expect("login handler must attempt to lock the account");
+        let telemetry_start = routes[login_block_start..]
+            .find("account_locked")
+            .expect("account_locked telemetry must follow the lock-stamp UPDATE");
+        let between = &routes[login_block_start..login_block_start + telemetry_start];
+        assert!(
+            between.contains("locked_rows") && between.contains("if locked_rows > 0"),
+            "telemetry must be gated behind a check that the lock-stamp UPDATE \
+             actually affected a row (`if locked_rows > 0`), not fired \
+             unconditionally after attempting the write: {routes}"
+        );
+    }
+
+    /// #2152: the `account_locked` digest salt must come from the app's
+    /// configured signing secret, not an ad hoc env var chain. A deployment
+    /// that sets `AUTUMN_SECURITY__SIGNING_SECRET` (the documented signing
+    /// secret) — and nothing else — must not silently fall back to the
+    /// public constant salt, which lets anyone holding the logs invert the
+    /// digest back to an account id.
+    #[test]
+    fn account_locked_digest_salts_from_the_signing_secret() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+
+        let digest_start = routes
+            .find("let account_id_digest")
+            .expect("login handler must compute account_id_digest");
+        let digest_end = digest_start
+            + routes[digest_start..]
+                .find("hex::encode")
+                .expect("account_id_digest must hex-encode the hash");
+        let digest_block = &routes[digest_start..digest_end];
+
+        assert!(
+            digest_block.contains("signing_secret"),
+            "account_locked digest salt must derive from \
+             config.security.signing_secret: {digest_block}"
+        );
+        assert!(
+            !digest_block.contains("SECRET_KEY_BASE")
+                && !digest_block.contains("AUTUMN_ADMIN_SECRET"),
+            "account_locked digest salt must not read SECRET_KEY_BASE or \
+             AUTUMN_ADMIN_SECRET — AUTUMN_SECURITY__SIGNING_SECRET is the \
+             documented signing secret and must be consulted instead: {digest_block}"
         );
     }
 
