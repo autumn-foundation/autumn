@@ -2603,10 +2603,10 @@ async fn serve_sim_host(
         .method(request.method.clone())
         .uri(target);
     if !request.extra_headers.contains_key(reqwest::header::HOST) {
-        let authority = match url.port() {
-            Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
-            None => url.host_str().unwrap_or_default().to_owned(),
-        };
+        let host = url.host_str().unwrap_or_default();
+        let authority = url
+            .port()
+            .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"));
         builder = builder.header(reqwest::header::HOST, authority);
     }
     for (name, value) in &request.extra_headers {
