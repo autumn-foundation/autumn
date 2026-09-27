@@ -47,9 +47,29 @@ config files:
 AUTUMN_CORS__ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com
 ```
 
-That is the whole common case. The default methods and headers already cover a
-JSON API: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`, with
-`Content-Type` and `Authorization` accepted on the request.
+That covers **reads**. The default methods already include the mutating verbs —
+`GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS` — and the default
+`allowed_headers` are `Content-Type` and `Authorization`.
+
+**A mutating cross-origin request needs one more header under `prod`.** The `prod`
+profile turns CSRF on, and the CSRF layer reads its token from a request header
+(`security.csrf.token_header`, default `X-CSRF-Token`) — a header the browser will
+refuse to send, because it is not in `allowed_headers`, so the preflight fails
+before your `POST` is ever attempted:
+
+```toml
+[cors]
+allowed_origins = ["https://app.example.com"]
+allowed_headers = ["Content-Type", "Authorization", "X-CSRF-Token"]
+```
+
+Listing it here does not exempt the request from CSRF — it only lets the browser
+send the token. The alternative, for an API authenticated by a bearer token rather
+than a cookie, is to exempt its paths from CSRF with
+`security.csrf.exempt_paths`; see
+[Forms, Validation and Normalization](forms.md). Safe methods (`GET`, `HEAD`,
+`OPTIONS`, `TRACE`) are exempt either way, which is why a read-only integration
+never meets this.
 
 ## Allowed origins, and the empty default
 
@@ -116,6 +136,18 @@ allow_credentials = true
    [session]
    same_site = "None"
    ```
+
+   **This gets you reads, not writes.** Autumn's built-in CSRF protection issues
+   its own `autumn-csrf` cookie with `SameSite=Lax` fixed in code — there is no
+   setting for it — so a genuinely cross-site browser client never receives that
+   cookie, and a mutating request is rejected with `403` however correctly it
+   sends the token header. `session.same_site = "None"` does not change this.
+
+   So cross-site **and** cookie-authenticated **and** mutating is not a
+   combination the built-in stack supports. Pick one of the two shapes that work:
+   a same-site deployment (subdomains of one domain, one scheme), or an API
+   authenticated by a bearer token with its paths in
+   `security.csrf.exempt_paths`.
 
    Browsers honor `None` only on a `Secure` cookie, and `session.secure` is
    already `true` by default, so there is nothing to flip. `Secure` is a separate
