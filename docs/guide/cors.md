@@ -97,11 +97,20 @@ Origins are matched exactly, scheme and port included. `https://example.com`
 does not cover `https://www.example.com`, `http://example.com`, or
 `https://example.com:8443`; list each one you actually serve.
 
-## CORS with credentials (cookies and `Authorization`)
+## CORS with cookies and credentials
 
-`allow_credentials = true` makes Autumn send
-`Access-Control-Allow-Credentials: true` — the server's half of letting a
-cross-origin caller use cookies:
+**First, the case that does not need this section.** If your cross-origin client
+authenticates by setting an `Authorization: Bearer …` header itself, that is an
+ordinary request header, not a credential in the CORS sense: it needs only to be
+in `allowed_headers` — where `Authorization` already is by default — and
+`allow_credentials` has nothing to do with it. Leave it `false`. Turning it on for
+a bearer-token client gains nothing and costs the wildcard origin, which the
+validation below rejects in combination with credentials.
+
+"Credentials" here means the things a browser attaches *ambiently* — cookies
+above all. `allow_credentials = true` makes Autumn send
+`Access-Control-Allow-Credentials: true`, the server's half of letting a
+cross-origin caller use them:
 
 ```toml
 [cors]
@@ -208,9 +217,13 @@ header like `X-Request-Id` is not in the default `allowed_headers` and has to be
 added.
 
 `max_age_secs` (default `86400`, 24 hours) is how long the browser may cache a
-successful preflight, so it is not re-sent before every call. Lower it while
-debugging an allowlist, because a cached preflight keeps answering with the old
-policy.
+successful preflight, so it is not re-sent before every call. That cache is why an
+allowlist fix can appear not to work: the browser is still answering from the
+preflight it cached under the old policy, and **lowering `max_age_secs` does not
+evict an entry it already holds** — the new value applies only to the next
+preflight it actually sends. To retest a change now, clear the browser's CORS
+cache or use a fresh profile or private window. Lowering the value is worth doing
+*before* a debugging session, not during one.
 
 [simple]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS#simple_requests
 
