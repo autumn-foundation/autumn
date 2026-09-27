@@ -1,7 +1,7 @@
 ### Documentation
 
 - **cors:** the guide now documents the `[cors]` section, on a page of its own
-  ([CORS and Cross-Origin Requests](../docs/guide/cors.md)). `allowed_methods`,
+  ([CORS and Cross-Origin Requests](docs/guide/cors.md)). `allowed_methods`,
   `allowed_headers` and `allow_credentials` appeared in `docs/guide/` zero
   times, `allowed_origins` only in prose on two pages answering a different
   question, and the 162-entry guide index never said "CORS" — so the only
