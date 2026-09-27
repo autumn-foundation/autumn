@@ -396,9 +396,12 @@ mod sim_monotonic_clock;
 mod sim_rate_limit_clock;
 mod sim_retry_storm;
 mod sim_scheduled_ticks;
+mod sim_sla;
+mod sim_sla_replicas;
 mod sim_strict_wall_clock;
 mod sim_test_smoke;
 mod sim_testapp_jobs;
+mod sla_obligation_macro;
 mod sqlite_ci_coverage;
 #[cfg(feature = "db")]
 mod sqlite_replication;
