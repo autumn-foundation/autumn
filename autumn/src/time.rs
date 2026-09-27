@@ -722,9 +722,13 @@ mod tests {
     #[test]
     fn clock_unix_duration_exact_epoch_with_nanos() {
         // Test exact epoch with some nanos to ensure the true branch logic is exercised
-        let epoch_with_nanos = Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap() + chrono::Duration::nanoseconds(100);
+        let epoch_with_nanos =
+            Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap() + chrono::Duration::nanoseconds(100);
         let clock = FixedClock::at(epoch_with_nanos);
-        assert_eq!(clock_unix_duration(&clock), std::time::Duration::from_nanos(100));
+        assert_eq!(
+            clock_unix_duration(&clock),
+            std::time::Duration::from_nanos(100)
+        );
     }
 
     #[test]

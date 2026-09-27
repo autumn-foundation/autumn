@@ -777,6 +777,7 @@ mod tests {
     fn int_range_boundary() {
         assert_eq!(int_range(5, 5), 5);
         assert_eq!(int_range(10, 5), 10);
+    }
 
     /// Integer digits of a [`Decimal`] — digits left of the decimal point.
     fn int_digits(value: Decimal) -> u32 {
