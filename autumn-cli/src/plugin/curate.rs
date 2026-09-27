@@ -403,13 +403,24 @@ pub fn apply_inspect(
             listing.name, listing.artifact_sha256
         ));
     }
+    // The delta is the report's own claim. Compare the authority it reports
+    // with what the listing recorded, and refuse a delta that hides growth.
+    let widened = widened_authority(listing, report);
+    if !widened.is_empty() && !report.needs_consent() {
+        return Err(format!(
+            "the inspect report for `{}` grants more than the listing records ({}), but its \
+             `upgrade` delta says nothing is new. Re-run `autumn plugin inspect --against`",
+            listing.name,
+            widened.join(", ")
+        ));
+    }
     let mut failed = Vec::new();
     if !report.loads {
         failed.push("load".to_owned());
     }
     // `inspect --against` exits 1 when the artifact grows its authority. A
     // listing must not vouch for a grant nobody consented to.
-    if report.needs_consent() {
+    if report.needs_consent() || !widened.is_empty() {
         failed.push("upgrade-consent".to_owned());
     }
     failed.extend(
@@ -437,6 +448,53 @@ pub fn apply_inspect(
     }
     let failed = (!failed.is_empty()).then(|| failed.join(", "));
     Ok(transition(listing, failed.as_deref(), against, date))
+}
+
+/// Authority `report` has beyond what `listing` recorded: a capability, a
+/// scoped grant, or a quota or limit that is new or higher. Empty for a
+/// listing with no recorded artifact, whose first review is the PR itself.
+fn widened_authority(listing: &Listing, report: &InspectReport) -> Vec<String> {
+    fn added(label: &str, before: &[String], after: &[String], out: &mut Vec<String>) {
+        for item in after.iter().filter(|item| !before.contains(item)) {
+            out.push(format!("{label} {}", index::sanitize(item)));
+        }
+    }
+    fn raised<T: PartialOrd + Copy>(
+        label: &str,
+        before: &std::collections::BTreeMap<String, T>,
+        after: &std::collections::BTreeMap<String, T>,
+        out: &mut Vec<String>,
+    ) {
+        for (key, value) in after {
+            if before.get(key).is_none_or(|old| value > old) {
+                out.push(format!("{label} {}", index::sanitize(key)));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    if listing.artifact_sha256.is_empty() {
+        return out;
+    }
+    let granted = &listing.grants;
+    added(
+        "capability",
+        &listing.capabilities,
+        &report.capabilities,
+        &mut out,
+    );
+    added("host", &granted.hosts, &report.grants.hosts, &mut out);
+    added("table", &granted.tables, &report.grants.tables, &mut out);
+    added(
+        "job type",
+        &granted.job_types,
+        &report.grants.job_types,
+        &mut out,
+    );
+    added("slot", &granted.slots, &report.grants.slots, &mut out);
+    raised("quota", &listing.quotas, &report.quotas, &mut out);
+    raised("limit", &listing.limits, &report.limits, &mut out);
+    out
 }
 
 /// Refresh an exempt listing after the install gate passed on `against`.
@@ -1056,9 +1114,52 @@ mod tests {
         l.name = "autumn-plugin-hello".to_owned();
         l.origin = ListingOrigin::Community;
         l.trust = index::Trust::Sandboxed;
-        l.capabilities = vec!["http-request".to_owned()];
+        // The consented authority: what `inspect(true)` reports.
+        let r = inspect(true);
+        l.capabilities.clone_from(&r.capabilities);
+        l.grants = index::Grants::from(&r.grants);
+        l.quotas.clone_from(&r.quotas);
+        l.limits.clone_from(&r.limits);
         l.artifact_sha256 = "00".repeat(32);
         l
+    }
+
+    /// A delta that says nothing is new, over a report that grants more
+    /// than the listing records, is refused. With a delta that admits it,
+    /// the listing is flagged and keeps the consented authority.
+    #[test]
+    fn widened_authority_is_checked_against_the_listing() {
+        let widen: [fn(&mut InspectReport); 4] = [
+            |r| r.capabilities.push("sql".to_owned()),
+            |r| r.grants.hosts.push("evil.example".to_owned()),
+            |r| *r.quotas.values_mut().next().unwrap() += 1,
+            |r| *r.limits.get_mut("fuel").unwrap() += 1,
+        ];
+        for grow in widen {
+            let mut r = inspect(true);
+            grow(&mut r);
+            let before = sandboxed();
+            let mut l = before.clone();
+            let err = apply_inspect(&mut l, &r, "0.7.0", "2026-10-01").unwrap_err();
+            assert!(
+                err.contains("grants more than the listing records"),
+                "{err}"
+            );
+            assert_eq!(l, before);
+
+            r.upgrade = Some(delta(&["sql"]));
+            let t = apply_inspect(&mut l, &r, "0.7.0", "2026-10-01").expect("apply");
+            assert_eq!(t, Transition::Flagged);
+            assert_eq!(l.quotas, before.quotas);
+            assert_eq!(l.limits, before.limits);
+            assert_eq!(l.grants, before.grants);
+            assert_eq!(l.capabilities, before.capabilities);
+        }
+        // Lower ceilings are less authority, not more.
+        let mut r = inspect(true);
+        *r.limits.get_mut("fuel").unwrap() -= 1;
+        let t = apply_inspect(&mut sandboxed(), &r, "0.7.0", "2026-10-01").expect("apply");
+        assert_eq!(t, Transition::Listed);
     }
 
     /// A complete `ConsentDelta`, with `added` capabilities.
@@ -1218,7 +1319,9 @@ mod tests {
     /// AC 6: the scoped grants are recorded, not only capability names.
     #[test]
     fn an_inspect_pass_records_the_scoped_grants() {
+        // A first recording: no consented artifact to compare with.
         let mut l = sandboxed();
+        l.artifact_sha256.clear();
         let mut r = inspect(true);
         r.grants.hosts = vec!["api.example.com".to_owned()];
         r.grants.tables = vec!["notes".to_owned()];
@@ -1254,7 +1357,9 @@ mod tests {
     /// A raised quota is authority: the approved ceilings are recorded.
     #[test]
     fn an_inspect_pass_records_the_quotas() {
+        // A first recording: no consented artifact to compare with.
         let mut l = sandboxed();
+        l.artifact_sha256.clear();
         let mut r = inspect(true);
         r.quotas.insert("kv_reads".to_owned(), 500);
         apply_inspect(&mut l, &r, "0.7.0", "2026-10-01").expect("apply");
@@ -1338,6 +1443,8 @@ mod tests {
             .get("autumn-plugin-hello")
             .unwrap()
             .clone();
+        // A first recording: no consented artifact to compare with.
+        l.artifact_sha256.clear();
         let mut r = inspect(true);
         r.grants.hosts = vec!["api.example.com".to_owned()];
         r.quotas.insert("kv_reads".to_owned(), 500);

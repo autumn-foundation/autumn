@@ -113,7 +113,9 @@ quotas and the artifact digest from the artifact. For a new version of a listed 
 run `inspect` with `--against <recorded>.autumn-plugin`, the artifact whose
 `artifact_sha256` the listing records. `record` refuses a new artifact without
 that baseline, or with another one. If the new version asks for more authority,
-`record` flags the listing and keeps the old artifact.
+`record` flags the listing and keeps the old artifact. `record` also compares
+the report's capabilities, grants, quotas and limits with the recorded ones,
+and refuses a report whose delta hides an increase.
 
 The job uploads the `plugin-index-reports` artifact. It holds one report per
 listing and `index.toml`: the index with the reports already recorded.
