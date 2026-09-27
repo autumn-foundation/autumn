@@ -1,0 +1,7 @@
+error[E0080]: evaluation panicked: agent authority: `draft` enqueues the job `wire_transfer`, which grant `RefundDrafter` does not allow.
+
+              Add `wire_transfer` to the grant's `jobs: [...]`, or move the effect out of the agent-operable handler. See docs/guide/agent-authority.md.
+  --> tests/compile-fail/agent_authority_job_not_listed.rs:26:5
+   |
+26 |     job::enqueue("wire_transfer", ()).await
+   |     ^^^ evaluation of `_` failed here

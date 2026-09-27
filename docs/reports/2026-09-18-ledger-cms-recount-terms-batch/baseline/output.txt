@@ -1,0 +1,621 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling cfg-if v1.0.4
+   Compiling libc v0.2.189
+   Compiling typenum v1.20.1
+   Compiling version_check v0.9.5
+   Compiling smallvec v1.15.2
+   Compiling serde_core v1.0.229
+   Compiling bytes v1.12.1
+   Compiling syn v2.0.119
+   Compiling syn v3.0.3
+   Compiling getrandom v0.2.17
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling rand_core v0.6.4
+   Compiling generic-array v0.14.7
+   Compiling pin-project-lite v0.2.17
+   Compiling subtle v2.6.1
+   Compiling parking_lot_core v0.9.12
+   Compiling scopeguard v1.2.0
+   Compiling lock_api v0.4.14
+   Compiling parking_lot v0.12.5
+   Compiling log v0.4.34
+   Compiling futures-core v0.3.34
+   Compiling const-oid v0.9.6
+   Compiling errno v0.3.14
+   Compiling serde v1.0.229
+   Compiling once_cell v1.21.4
+   Compiling signal-hook-registry v1.4.8
+   Compiling mio v1.2.2
+   Compiling socket2 v0.6.5
+   Compiling futures-sink v0.3.34
+   Compiling http v1.5.0
+   Compiling shlex v2.0.1
+   Compiling slab v0.4.12
+   Compiling find-msvc-tools v0.1.11
+   Compiling cc v1.4.4
+   Compiling futures-channel v0.3.34
+   Compiling zeroize_derive v1.5.0
+   Compiling tracing-core v0.1.36
+   Compiling serde_derive v1.0.229
+   Compiling zeroize v1.9.0
+   Compiling tokio-macros v2.7.2
+   Compiling futures-macro v0.3.34
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling digest v0.10.7
+   Compiling tokio v1.53.1
+   Compiling futures-task v0.3.34
+   Compiling zmij v1.0.23
+   Compiling futures-io v0.3.34
+   Compiling futures-util v0.3.34
+   Compiling percent-encoding v2.3.2
+   Compiling tracing-attributes v0.1.31
+   Compiling synstructure v0.13.2
+   Compiling autocfg v1.5.1
+   Compiling libm v0.2.16
+   Compiling ident_case v1.0.1
+   Compiling strsim v0.11.1
+   Compiling httparse v1.10.1
+   Compiling num-traits v0.2.19
+   Compiling tracing v0.1.44
+   Compiling cpufeatures v0.2.17
+   Compiling zerofrom-derive v0.1.7
+   Compiling equivalent v1.0.2
+   Compiling zerocopy v0.8.56
+   Compiling yoke-derive v0.8.2
+   Compiling zerofrom v0.1.8
+   Compiling foldhash v0.2.0
+   Compiling base64 v0.22.1
+   Compiling stable_deref_trait v1.2.1
+   Compiling serde_json v1.0.151
+   Compiling allocator-api2 v0.2.21
+   Compiling yoke v0.8.3
+   Compiling tokio-util v0.7.19
+   Compiling hashbrown v0.17.1
+   Compiling http-body v1.1.0
+   Compiling zerovec-derive v0.11.6
+   Compiling tower-service v0.3.3
+   Compiling zerovec v0.11.8
+   Compiling indexmap v2.14.2
+   Compiling displaydoc v0.2.7
+   Compiling fnv v1.0.7
+   Compiling getrandom v0.3.4
+   Compiling atomic-waker v1.1.2
+   Compiling bitflags v2.13.1
+   Compiling base64ct v1.8.3
+   Compiling try-lock v0.2.5
+   Compiling rand_core v0.10.1
+   Compiling httpdate v1.0.3
+   Compiling getrandom v0.4.3
+   Compiling pem-rfc7468 v0.7.0
+   Compiling want v0.3.1
+   Compiling h2 v0.4.18
+   Compiling tinystr v0.8.4
+   Compiling form_urlencoded v1.2.2
+   Compiling der_derive v0.7.3
+   Compiling flagset v0.4.7
+   Compiling writeable v0.6.4
+   Compiling ppv-lite86 v0.2.21
+   Compiling litemap v0.8.3
+   Compiling tower-layer v0.3.3
+   Compiling icu_locale_core v2.3.0
+   Compiling rand_core v0.9.5
+   Compiling der v0.7.10
+   Compiling zerotrie v0.2.5
+   Compiling potential_utf v0.1.6
+   Compiling http-body-util v0.1.5
+   Compiling ring v0.17.14
+   Compiling sync_wrapper v1.0.2
+   Compiling hybrid-array v0.4.14
+   Compiling thiserror v2.0.20
+   Compiling ipnet v2.12.1
+   Compiling spin v0.9.9
+   Compiling icu_properties_data v2.3.0
+   Compiling icu_normalizer_data v2.3.0
+   Compiling utf8_iter v1.0.4
+   Compiling either v1.18.0
+   Compiling icu_collections v2.3.0
+   Compiling spki v0.7.3
+   Compiling icu_provider v2.3.1
+   Compiling rand_chacha v0.9.0
+   Compiling rustls-pki-types v1.15.1
+   Compiling thiserror-impl v2.0.20
+   Compiling siphasher v1.0.3
+   Compiling rand v0.9.5
+   Compiling hyper v1.11.0
+   Compiling sha1 v0.10.7
+   Compiling untrusted v0.9.0
+   Compiling data-encoding v2.11.1
+   Compiling mime v0.3.17
+   Compiling icu_normalizer v2.3.0
+   Compiling icu_properties v2.3.0
+   Compiling crypto-common v0.2.2
+   Compiling hyper-util v0.1.20
+   Compiling tower v0.5.3
+   Compiling rustls v0.23.45
+   Compiling idna_adapter v1.2.2
+   Compiling rustls-webpki v0.103.15
+   Compiling pkcs8 v0.10.2
+   Compiling aho-corasick v1.1.5
+   Compiling byteorder v1.5.0
+   Compiling cpufeatures v0.3.0
+   Compiling regex-syntax v0.8.11
+   Compiling anyhow v1.0.104
+   Compiling idna v1.1.0
+   Compiling num-integer v0.1.47
+   Compiling async-trait v0.1.92
+   Compiling multer v3.1.0
+   Compiling regex-automata v0.4.18
+   Compiling pkg-config v0.3.34
+   Compiling cmov v0.5.4
+   Compiling ryu v1.0.23
+   Compiling serde_urlencoded v0.7.1
+   Compiling phf_shared v0.13.1
+   Compiling ctutils v0.4.2
+   Compiling url v2.5.8
+   Compiling chacha20 v0.10.2
+   Compiling tungstenite v0.29.0
+   Compiling axum-core v0.5.6
+   Compiling itertools v0.14.0
+   Compiling block-buffer v0.12.1
+   Compiling encoding_rs v0.8.35
+   Compiling fastrand v2.5.0
+   Compiling simd-adler32 v0.3.10
+   Compiling heck v0.5.0
+   Compiling const-oid v0.10.2
+   Compiling digest v0.11.3
+   Compiling prost-derive v0.14.4
+   Compiling phf_generator v0.13.1
+   Compiling tokio-tungstenite v0.29.0
+   Compiling rand v0.10.2
+   Compiling tokio-stream v0.1.19
+   Compiling darling_core v0.23.0
+   Compiling hmac v0.12.1
+   Compiling pq-src v0.3.11+libpq-18.3
+   Compiling axum-macros v0.5.1
+   Compiling pin-project-internal v1.1.13
+   Compiling serde_path_to_error v0.1.20
+   Compiling base64 v0.23.1
+   Compiling matchit v0.8.4
+   Compiling crc32fast v1.5.1
+   Compiling winnow v1.0.4
+   Compiling tinyvec_macros v0.1.1
+   Compiling adler2 v2.0.1
+   Compiling tinyvec v1.12.0
+   Compiling axum v0.8.9
+   Compiling pin-project v1.1.13
+   Compiling darling_macro v0.23.0
+   Compiling toml_parser v1.1.3+spec-1.1.0
+   Compiling prost v0.14.4
+   Compiling phf v0.13.1
+   Compiling regex v1.13.1
+   Compiling num-iter v0.1.46
+   Compiling hyper-timeout v0.5.2
+   Compiling darling_core v0.21.3
+   Compiling darling_core v0.20.11
+   Compiling signature v2.2.0
+   Compiling ff v0.13.1
+   Compiling portable-atomic v1.15.0
+   Compiling base16ct v0.2.0
+   Compiling iana-time-zone v0.1.65
+   Compiling chrono v0.4.45
+   Compiling sec1 v0.7.3
+   Compiling group v0.13.0
+   Compiling darling_macro v0.21.3
+   Compiling darling_macro v0.20.11
+   Compiling tonic v0.14.6
+   Compiling darling v0.23.0
+   Compiling unicode-normalization v0.1.25
+   Compiling miniz_oxide v0.9.1
+   Compiling ureq-proto v0.6.1
+   Compiling hkdf v0.12.4
+   Compiling phf_codegen v0.13.1
+   Compiling string_cache_codegen v0.6.1
+   Compiling tokio-rustls v0.26.5
+   Compiling pq-sys v0.7.5
+   Compiling crypto-bigint v0.5.5
+   Compiling vcpkg v0.2.15
+   Compiling new_debug_unreachable v1.0.6
+   Compiling bollard-buildkit-proto v0.7.0
+   Compiling utf8-zero v0.8.1
+   Compiling unicode-properties v0.1.4
+   Compiling semver v1.0.28
+   Compiling unicode-bidi v0.3.18
+   Compiling rustix v1.1.4
+   Compiling alloc-no-stdlib v2.0.4
+   Compiling alloc-stdlib v0.2.4
+   Compiling stringprep v0.1.5
+   Compiling rustc_version v0.4.1
+   Compiling ureq v3.4.0
+   Compiling elliptic-curve v0.13.8
+   Compiling libsqlite3-sys v0.38.2
+   Compiling tonic-prost v0.14.6
+   Compiling web_atoms v0.2.6
+   Compiling flate2 v1.1.10
+   Compiling darling v0.20.11
+   Compiling darling v0.21.3
+   Compiling prost-types v0.14.4
+   Compiling hmac v0.13.0
+   Compiling md-5 v0.11.0
+   Compiling sha2 v0.11.0
+   Compiling num-bigint v0.4.8
+   Compiling webpki-roots v1.0.9
+   Compiling lazy_static v1.5.0
+   Compiling structmeta-derive v0.3.0
+   Compiling deranged v0.5.8
+   Compiling powerfmt v0.2.0
+   Compiling diesel_derives v2.3.9
+   Compiling num-conv v0.2.2
+   Compiling time-core v0.1.9
+   Compiling fallible-iterator v0.2.0
+   Compiling linux-raw-sys v0.12.1
+   Compiling crossbeam-utils v0.8.22
+   Compiling precomputed-hash v0.1.1
+   Compiling string_cache v0.9.0
+   Compiling postgres-protocol v0.6.12
+   Compiling time v0.3.55
+   Compiling structmeta v0.3.0
+   Compiling num-rational v0.4.2
+   Compiling hyper-rustls v0.27.9
+   Compiling dsl_auto_type v0.2.0
+   Compiling derive_builder_core v0.20.2
+   Compiling curve25519-dalek v4.1.3
+   Compiling brotli-decompressor v5.0.3
+   Compiling rfc6979 v0.4.0
+   Compiling serde_spanned v1.1.1
+   Compiling toml_datetime v0.7.5+spec-1.1.0
+   Compiling uuid v1.26.0
+   Compiling rand_chacha v0.3.1
+   Compiling num-complex v0.4.6
+   Compiling futures-executor v0.3.34
+   Compiling sha2 v0.10.9
+   Compiling inout v0.1.4
+   Compiling serde_repr v0.1.21
+   Compiling async-stream-impl v0.3.6
+   Compiling diesel_table_macro_syntax v0.3.0
+   Compiling proc-macro2-diagnostics v0.10.1
+   Compiling num-bigint-dig v0.8.6
+   Compiling unicase v2.9.0
+   Compiling winnow v0.7.15
+   Compiling hex v0.4.3
+   Compiling openssl-probe v0.2.1
+   Compiling rustls-native-certs v0.8.4
+   Compiling hyperlocal v0.9.1
+   Compiling mime_guess v2.0.5
+   Compiling async-stream v0.3.6
+   Compiling bollard-stubs v1.52.1-rc.29.1.3
+   Compiling toml v0.9.12+spec-1.1.0
+   Compiling cipher v0.4.4
+   Compiling num v0.4.3
+   Compiling futures v0.3.34
+   Compiling rand v0.8.7
+   Compiling brotli v8.0.4
+   Compiling ecdsa v0.16.9
+   Compiling derive_builder_macro v0.20.2
+   Compiling parse-display-derive v0.9.1
+   Compiling xattr v1.6.1
+   Compiling postgres-types v0.2.14
+   Compiling primeorder v0.13.6
+   Compiling tendril v0.5.1
+   Compiling serde_with_macros v3.22.0
+   Compiling strum_macros v0.27.2
+   Compiling tower-http v0.6.11
+   Compiling phf_shared v0.12.1
+   Compiling inout v0.2.2
+   Compiling chromiumoxide_types v0.9.1
+   Compiling universal-hash v0.5.1
+   Compiling curve25519-dalek-derive v0.1.1
+   Compiling whoami v2.1.3
+   Compiling proc-macro-error-attr3 v3.1.0
+   Compiling compression-core v0.4.32
+   Compiling utf-8 v0.7.6
+   Compiling toml_datetime v1.1.1+spec-1.1.0
+   Compiling crossbeam-epoch v0.9.20
+   Compiling rustc-hash v2.1.3
+   Compiling home v0.5.12
+   Compiling cfg_aliases v0.2.2
+   Compiling opaque-debug v0.3.1
+   Compiling chrono-tz v0.10.4
+   Compiling downcast-rs v2.0.2
+   Compiling dtoa v1.0.11
+   Compiling diesel v2.3.12
+   Compiling dtoa-short v0.3.5
+   Compiling chromiumoxide_pdl v0.9.1
+   Compiling polyval v0.6.2
+   Compiling nix v0.31.3
+   Compiling astral-tokio-tar v0.6.4
+   Compiling bollard v0.20.2
+   Compiling toml_edit v0.25.13+spec-1.1.0
+   Compiling strum v0.27.2
+   Compiling tungstenite v0.28.0
+   Compiling compression-codecs v0.4.38
+   Compiling proc-macro-error3 v3.1.0
+   Compiling tokio-postgres v0.7.18
+   Compiling phf v0.12.1
+   Compiling cipher v0.5.2
+   Compiling serde_with v3.22.0
+   Compiling parse-display v0.9.1
+   Compiling markup5ever v0.39.0
+   Compiling derive_builder v0.20.2
+   Compiling migrations_internals v2.3.0
+   Compiling ferroid v2.0.0
+   Compiling ed25519 v2.2.3
+   Compiling miniz_oxide v0.8.9
+   Compiling fdeflate v0.3.7
+   Compiling pkcs1 v0.7.5
+   Compiling docker_credential v1.4.0
+   Compiling deadpool-runtime v0.3.1
+   Compiling etcetera v0.11.0
+   Compiling rust_decimal v1.43.0
+   Compiling tokio-cron-scheduler v0.15.1
+   Compiling pxfm v0.1.30
+   Compiling zune-core v0.5.3
+   Compiling pulldown-cmark v0.13.4
+   Compiling quick-error v2.0.1
+   Compiling byteorder-lite v0.1.0
+   Compiling image-webp v0.2.4
+   Compiling zune-jpeg v0.5.15
+   Compiling testcontainers v0.27.3
+   Compiling moxcms v0.8.1
+   Compiling deadpool v0.13.1
+   Compiling rsa v0.9.10
+   Compiling png v0.18.1
+   Compiling ed25519-dalek v2.2.0
+   Compiling maud_macros v0.27.0
+   Compiling migrations_macros v2.3.0
+   Compiling croner v3.0.1
+   Compiling html5ever v0.39.0
+   Compiling blowfish v0.10.0
+   Compiling validator_derive v0.20.1
+   Compiling async-compression v0.4.43
+   Compiling async-tungstenite v0.32.1
+   Compiling proc-macro-crate v3.5.0
+   Compiling ghash v0.5.1
+   Compiling chromiumoxide_cdp v0.9.1
+   Compiling cssparser v0.37.0
+   Compiling reqwest v0.13.4
+   Compiling p384 v0.13.1
+   Compiling p256 v0.13.2
+   Compiling crossbeam-channel v0.5.16
+   Compiling aes v0.8.4
+   Compiling ctr v0.9.2
+   Compiling cfb v0.7.3
+   Compiling sharded-slab v0.1.7
+   Compiling matchers v0.2.0
+   Compiling x509-cert v0.2.5
+   Compiling tracing-serde v0.2.0
+   Compiling aead v0.5.2
+   Compiling tracing-log v0.2.0
+   Compiling num-derive v0.4.2
+   Compiling which v8.0.5
+   Compiling thread_local v1.1.10
+   Compiling nu-ansi-term v0.50.3
+   Compiling dunce v1.0.5
+   Compiling pulldown-cmark-escape v0.11.0
+   Compiling arrayvec v0.7.8
+   Compiling futures-timer v3.0.4
+   Compiling toml_writer v1.1.2+spec-1.1.0
+   Compiling maplit v1.0.2
+   Compiling tagptr v0.2.0
+   Compiling bytemuck v1.25.2
+   Compiling http-range-header v0.4.2
+   Compiling moka v0.12.16
+   Compiling image v0.25.10
+   Compiling tower-http v0.7.1
+   Compiling ammonia v4.1.4
+   Compiling toml v1.1.5+spec-1.1.0
+   Compiling tokio-postgres-rustls v0.13.0
+   Compiling tracing-subscriber v0.3.23
+   Compiling aes-gcm v0.10.3
+   Compiling infer v0.16.0
+   Compiling diesel-async v0.9.2
+   Compiling diesel_migrations v2.3.2
+   Compiling jsonwebtoken v10.4.0
+   Compiling autumn-macros v0.7.0 (/home/user/autumn/autumn-macros)
+   Compiling validator v0.20.0
+   Compiling bcrypt v0.19.3
+   Compiling maud v0.27.0
+   Compiling testcontainers-modules v0.15.0
+   Compiling reqwest v0.12.28
+   Compiling lru v0.18.4
+   Compiling secrecy v0.10.3
+   Compiling scoped-futures v0.1.4
+   Compiling inventory v0.3.24
+   Compiling cms v0.7.0 (/home/user/autumn/examples/cms)
+warning: cms@0.7.0: Tailwind CSS CLI not found — CSS will not be compiled. Run `autumn setup` or install tailwindcss manually.
+   Compiling chromiumoxide v0.9.1
+   Compiling autumn-web v0.7.0 (/home/user/autumn/autumn)
+   Compiling example-e2e v0.1.0 (/home/user/autumn/example-e2e)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4m 25s
+     Running tests/recount_terms_batch_profile.rs (target/debug/deps/recount_terms_batch_profile-152e41e0159ba48a)
+
+running 1 test
+test recount_terms_batch_profile ... 
+=== pg_stat_statements: tier small (previous=3, wanted=5, overlap=1, affected=7) ===
+calls=14     buffers=56       SELECT "terms"."id" FROM "terms" WHERE ("terms"."id" = $1) LIMIT $2 FOR UPDATE
+calls=8      buffers=0        SELECT $1
+calls=7      buffers=36       SELECT COUNT(*) FROM ("post_terms" INNER JOIN "posts" ON ("posts"."id" = "post_terms"."post_id")) WHERE ((("post_terms"."term_id" = $1) AND ("posts"."status" = $2)) AND ("posts"."post_type" = ANY($3)))
+calls=7      buffers=42       UPDATE "terms" SET "post_count" = $1 WHERE ("terms"."id" = $2)
+calls=6      buffers=24       SELECT 1 FROM ONLY "public"."posts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+calls=6      buffers=0        SET statement_timeout = 0
+calls=5      buffers=20       SELECT 1 FROM ONLY "public"."terms" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+calls=3      buffers=9        SELECT "terms"."id", "terms"."taxonomy", "terms"."name", "terms"."slug", "terms"."description", "terms"."parent_id", "terms"."post_count", "terms"."created_at" FROM "terms" WHERE ("terms"."id" = $1) LIMIT $2
+calls=2      buffers=0        SAVEPOINT diesel_savepoint_1
+calls=2      buffers=0        RELEASE SAVEPOINT diesel_savepoint_1
+calls=2      buffers=6        SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2
+calls=1      buffers=6        DELETE FROM "post_terms" WHERE ("post_terms"."post_id" = $1)
+calls=1      buffers=5        SELECT COUNT(*) FROM "posts" WHERE (((("posts"."slug" = $1) AND ("posts"."post_type" = ANY($2))) AND (("posts"."post_type" = $3) OR ("posts"."parent_id" IS NULL))) AND ("posts"."id" != $4))
+calls=1      buffers=11       SELECT "terms"."id" FROM "terms" WHERE (("terms"."taxonomy" = $1) AND ("terms"."id" = ANY($2)))
+calls=1      buffers=0        BEGIN
+calls=1      buffers=3        SELECT "post_terms"."term_id" FROM "post_terms" WHERE ("post_terms"."post_id" = $1)
+calls=1      buffers=31       UPDATE "posts" SET "title" = $1, "slug" = $2, "excerpt" = $3, "body" = $4, "status" = $5, "parent_id" = $6, "featured_media_id" = $7, "menu_order" = $8, "comment_status" = $9, "password" = $10, "sticky" = $11, "published_at" = $12, "lock_version" = $13, "updated_at" = $14 WHERE ("posts"."id" = $15) RETURNING "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at"
+calls=1      buffers=3        SELECT "post_terms"."id", "post_terms"."post_id", "post_terms"."term_id" FROM "post_terms" WHERE ("post_terms"."post_id" = $1)
+calls=1      buffers=2        DELETE FROM "revisions" WHERE (("revisions"."post_id" = $1) AND ("revisions"."id" != ALL($2)))
+calls=1      buffers=0        COMMIT
+calls=1      buffers=5        SELECT "revisions"."id" FROM "revisions" WHERE ("revisions"."post_id" = $1) ORDER BY "revisions"."created_at" DESC LIMIT $2
+calls=1      buffers=2        SELECT "users"."id", "users"."username", "users"."email", "users"."password_hash", "users"."display_name", "users"."role", "users"."bio", "users"."website", "users"."created_at", "users"."updated_at" FROM "users" WHERE ("users"."id" = $1) LIMIT $2
+calls=1      buffers=4        SELECT "posts"."id" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
+calls=1      buffers=4        SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
+calls=1      buffers=16       INSERT INTO "revisions" ("post_id", "title", "excerpt", "body", "status", "author_id", "summary") VALUES ($1, $2, $3, $4, $5, $6, $7)
+calls=1      buffers=110      INSERT INTO "post_terms" ("post_id", "term_id") VALUES ($1, $2), ($3, $4), ($5, $6), ($7, $8), ($9, $10) ON CONFLICT ("post_id", "term_id") DO NOTHING
+calls=1      buffers=2        SELECT "posts"."id" FROM "posts" WHERE ("posts"."parent_id" = ANY($1))
+calls=1      buffers=3        SELECT 1 FROM ONLY "public"."users" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+-- total: calls=79 buffers=400 -- single-row terms lock (lock_terms + recount_term pre-fix, lock_terms alone post-fix): 14 -- batched ANY() terms lock (this fix): 0 -- single-row count (recount_term pre-fix): 7 -- grouped batched count (this fix): 0 -- single-row update (recount_term pre-fix): 7 -- bulk UNNEST update (this fix): 0 --
+
+=== pg_stat_statements: tier medium (previous=10, wanted=20, overlap=3, affected=27) ===
+calls=54     buffers=216      SELECT "terms"."id" FROM "terms" WHERE ("terms"."id" = $1) LIMIT $2 FOR UPDATE
+calls=27     buffers=308      UPDATE "terms" SET "post_count" = $1 WHERE ("terms"."id" = $2)
+calls=27     buffers=141      SELECT COUNT(*) FROM ("post_terms" INNER JOIN "posts" ON ("posts"."id" = "post_terms"."post_id")) WHERE ((("post_terms"."term_id" = $1) AND ("posts"."status" = $2)) AND ("posts"."post_type" = ANY($3)))
+calls=21     buffers=84       SELECT 1 FROM ONLY "public"."posts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+calls=20     buffers=80       SELECT 1 FROM ONLY "public"."terms" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+calls=15     buffers=0        SELECT $1
+calls=13     buffers=0        SET statement_timeout = 0
+calls=10     buffers=30       SELECT "terms"."id", "terms"."taxonomy", "terms"."name", "terms"."slug", "terms"."description", "terms"."parent_id", "terms"."post_count", "terms"."created_at" FROM "terms" WHERE ("terms"."id" = $1) LIMIT $2
+calls=2      buffers=0        SAVEPOINT diesel_savepoint_1
+calls=2      buffers=0        RELEASE SAVEPOINT diesel_savepoint_1
+calls=2      buffers=6        SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2
+calls=1      buffers=13       DELETE FROM "post_terms" WHERE ("post_terms"."post_id" = $1)
+calls=1      buffers=5        SELECT COUNT(*) FROM "posts" WHERE (((("posts"."slug" = $1) AND ("posts"."post_type" = ANY($2))) AND (("posts"."post_type" = $3) OR ("posts"."parent_id" IS NULL))) AND ("posts"."id" != $4))
+calls=1      buffers=41       SELECT "terms"."id" FROM "terms" WHERE (("terms"."taxonomy" = $1) AND ("terms"."id" = ANY($2)))
+calls=1      buffers=0        BEGIN
+calls=1      buffers=3        SELECT "post_terms"."term_id" FROM "post_terms" WHERE ("post_terms"."post_id" = $1)
+calls=1      buffers=25       UPDATE "posts" SET "title" = $1, "slug" = $2, "excerpt" = $3, "body" = $4, "status" = $5, "parent_id" = $6, "featured_media_id" = $7, "menu_order" = $8, "comment_status" = $9, "password" = $10, "sticky" = $11, "published_at" = $12, "lock_version" = $13, "updated_at" = $14 WHERE ("posts"."id" = $15) RETURNING "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at"
+calls=1      buffers=3        SELECT "post_terms"."id", "post_terms"."post_id", "post_terms"."term_id" FROM "post_terms" WHERE ("post_terms"."post_id" = $1)
+calls=1      buffers=2        DELETE FROM "revisions" WHERE (("revisions"."post_id" = $1) AND ("revisions"."id" != ALL($2)))
+calls=1      buffers=0        COMMIT
+calls=1      buffers=2        SELECT "revisions"."id" FROM "revisions" WHERE ("revisions"."post_id" = $1) ORDER BY "revisions"."created_at" DESC LIMIT $2
+calls=1      buffers=2        SELECT "users"."id", "users"."username", "users"."email", "users"."password_hash", "users"."display_name", "users"."role", "users"."bio", "users"."website", "users"."created_at", "users"."updated_at" FROM "users" WHERE ("users"."id" = $1) LIMIT $2
+calls=1      buffers=4        SELECT "posts"."id" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
+calls=1      buffers=4        SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
+calls=1      buffers=14       INSERT INTO "revisions" ("post_id", "title", "excerpt", "body", "status", "author_id", "summary") VALUES ($1, $2, $3, $4, $5, $6, $7)
+calls=1      buffers=428      INSERT INTO "post_terms" ("post_id", "term_id") VALUES ($1, $2), ($3, $4), ($5, $6), ($7, $8), ($9, $10), ($11, $12), ($13, $14), ($15, $16), ($17, $18), ($19, $20), ($21, $22), ($23, $24), ($25, $26), ($27, $28), ($29, $30), ($31, $32), ($33, $34), ($35, $36), ($37, $38), ($39, $40) ON CONFLICT ("post_id", "term_id") DO NOTHING
+calls=1      buffers=2        SELECT "posts"."id" FROM "posts" WHERE ("posts"."parent_id" = ANY($1))
+calls=1      buffers=3        SELECT 1 FROM ONLY "public"."users" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+-- total: calls=210 buffers=1416 -- single-row terms lock (lock_terms + recount_term pre-fix, lock_terms alone post-fix): 54 -- batched ANY() terms lock (this fix): 0 -- single-row count (recount_term pre-fix): 27 -- grouped batched count (this fix): 0 -- single-row update (recount_term pre-fix): 27 -- bulk UNNEST update (this fix): 0 --
+
+=== pg_stat_statements: tier large (previous=25, wanted=50, overlap=10, affected=65) ===
+calls=130    buffers=520      SELECT "terms"."id" FROM "terms" WHERE ("terms"."id" = $1) LIMIT $2 FOR UPDATE
+calls=65     buffers=390      UPDATE "terms" SET "post_count" = $1 WHERE ("terms"."id" = $2)
+calls=65     buffers=345      SELECT COUNT(*) FROM ("post_terms" INNER JOIN "posts" ON ("posts"."id" = "post_terms"."post_id")) WHERE ((("post_terms"."term_id" = $1) AND ("posts"."status" = $2)) AND ("posts"."post_type" = ANY($3)))
+calls=51     buffers=204      SELECT 1 FROM ONLY "public"."posts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+calls=50     buffers=200      SELECT 1 FROM ONLY "public"."terms" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+calls=30     buffers=0        SELECT $1
+calls=28     buffers=0        SET statement_timeout = 0
+calls=25     buffers=100      SELECT "terms"."id", "terms"."taxonomy", "terms"."name", "terms"."slug", "terms"."description", "terms"."parent_id", "terms"."post_count", "terms"."created_at" FROM "terms" WHERE ("terms"."id" = $1) LIMIT $2
+calls=2      buffers=0        SAVEPOINT diesel_savepoint_1
+calls=2      buffers=0        RELEASE SAVEPOINT diesel_savepoint_1
+calls=2      buffers=6        SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2
+calls=1      buffers=28       DELETE FROM "post_terms" WHERE ("post_terms"."post_id" = $1)
+calls=1      buffers=5        SELECT COUNT(*) FROM "posts" WHERE (((("posts"."slug" = $1) AND ("posts"."post_type" = ANY($2))) AND (("posts"."post_type" = $3) OR ("posts"."parent_id" IS NULL))) AND ("posts"."id" != $4))
+calls=1      buffers=103      SELECT "terms"."id" FROM "terms" WHERE (("terms"."taxonomy" = $1) AND ("terms"."id" = ANY($2)))
+calls=1      buffers=0        BEGIN
+calls=1      buffers=3        SELECT "post_terms"."term_id" FROM "post_terms" WHERE ("post_terms"."post_id" = $1)
+calls=1      buffers=25       UPDATE "posts" SET "title" = $1, "slug" = $2, "excerpt" = $3, "body" = $4, "status" = $5, "parent_id" = $6, "featured_media_id" = $7, "menu_order" = $8, "comment_status" = $9, "password" = $10, "sticky" = $11, "published_at" = $12, "lock_version" = $13, "updated_at" = $14 WHERE ("posts"."id" = $15) RETURNING "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at"
+calls=1      buffers=3        SELECT "post_terms"."id", "post_terms"."post_id", "post_terms"."term_id" FROM "post_terms" WHERE ("post_terms"."post_id" = $1)
+calls=1      buffers=2        DELETE FROM "revisions" WHERE (("revisions"."post_id" = $1) AND ("revisions"."id" != ALL($2)))
+calls=1      buffers=0        COMMIT
+calls=1      buffers=2        SELECT "revisions"."id" FROM "revisions" WHERE ("revisions"."post_id" = $1) ORDER BY "revisions"."created_at" DESC LIMIT $2
+calls=1      buffers=2        SELECT "users"."id", "users"."username", "users"."email", "users"."password_hash", "users"."display_name", "users"."role", "users"."bio", "users"."website", "users"."created_at", "users"."updated_at" FROM "users" WHERE ("users"."id" = $1) LIMIT $2
+calls=1      buffers=4        SELECT "posts"."id" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
+calls=1      buffers=4        SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
+calls=1      buffers=14       INSERT INTO "revisions" ("post_id", "title", "excerpt", "body", "status", "author_id", "summary") VALUES ($1, $2, $3, $4, $5, $6, $7)
+calls=1      buffers=1070     INSERT INTO "post_terms" ("post_id", "term_id") VALUES ($1, $2), ($3, $4), ($5, $6), ($7, $8), ($9, $10), ($11, $12), ($13, $14), ($15, $16), ($17, $18), ($19, $20), ($21, $22), ($23, $24), ($25, $26), ($27, $28), ($29, $30), ($31, $32), ($33, $34), ($35, $36), ($37, $38), ($39, $40), ($41, $42), ($43, $44), ($45, $46), ($47, $48), ($49, $50), ($51, $52), ($53, $54), ($55, $56), ($57, $58), ($59, $60), ($61, $62), ($63, $64), ($65, $66), ($67, $68), ($69, $70), ($71, $72), ($73, $74), ($75, $76), ($77, $78), ($79, $80), ($81, $82), ($83, $84), ($85, $86), ($87, $88), ($89, $90), ($91, $92), ($93, $94), ($95, $96), ($97, $98), ($99, $100) ON CONFLICT ("post_id", "term_id") DO NOTHING
+calls=1      buffers=2        SELECT "posts"."id" FROM "posts" WHERE ("posts"."parent_id" = ANY($1))
+calls=1      buffers=3        SELECT 1 FROM ONLY "public"."users" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+-- total: calls=467 buffers=3035 -- single-row terms lock (lock_terms + recount_term pre-fix, lock_terms alone post-fix): 130 -- batched ANY() terms lock (this fix): 0 -- single-row count (recount_term pre-fix): 65 -- grouped batched count (this fix): 0 -- single-row update (recount_term pre-fix): 65 -- bulk UNNEST update (this fix): 0 --
+
+=== statement-count scaling across tiers ===
+tier       affected  total calls  total buffers   single-lock   any-lock   single-count   grouped-count   single-update   bulk-update
+small             7           79            400            14          0              7               0               7             0
+medium           27          210           1416            54          0             27               0              27             0
+large            65          467           3035           130          0             65               0              65             0
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): single-row lock shape (recount_term pre-fix, one call per id, unbatched) ===
+SELECT "terms"."id" FROM "terms" WHERE "terms"."id" = 1 FOR UPDATE
+LockRows  (cost=0.28..8.31 rows=1 width=14) (actual time=0.054..0.055 rows=1 loops=1)
+  Output: id, ctid
+  Buffers: shared hit=7
+  ->  Index Scan using terms_pkey on public.terms  (cost=0.28..8.30 rows=1 width=14) (actual time=0.047..0.048 rows=1 loops=1)
+        Output: id, ctid
+        Index Cond: (terms.id = 1)
+        Buffers: shared hit=6
+Query Identifier: 5244836203064578844
+Planning Time: 0.042 ms
+Execution Time: 0.074 ms
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): batched ANY() lock shape (the fix: sort ascending, then lock — one call for the whole 65-id affected set, given to the planner pre-sorted DESCENDING to stress the ordering guarantee) ===
+SELECT "terms"."id" FROM "terms" WHERE "terms"."id" = ANY(ARRAY[5099,5098,5097,5096,5095,5094,5093,5092,5091,5090,5089,5088,5087,5086,5085,5084,5083,5082,5081,5080,5079,5078,5077,5076,5075,5074,5073,5072,5071,5070,5069,5068,5067,5066,5065,5064,5063,5062,5061,5060,5059,5058,5057,5056,5055,5054,5053,5052,5051,5050,5049,5048,5047,5046,5045,5044,5043,5042,5041,5040,5039,5038,5037,5036,5035]) ORDER BY "terms"."id" ASC FOR UPDATE
+LockRows  (cost=0.28..215.67 rows=65 width=14) (actual time=0.045..0.123 rows=65 loops=1)
+  Output: id, ctid
+  Buffers: shared hit=201
+  ->  Index Scan using terms_pkey on public.terms  (cost=0.28..215.02 rows=65 width=14) (actual time=0.038..0.094 rows=65 loops=1)
+        Output: id, ctid
+        Index Cond: (terms.id = ANY ('{5099,5098,5097,5096,5095,5094,5093,5092,5091,5090,5089,5088,5087,5086,5085,5084,5083,5082,5081,5080,5079,5078,5077,5076,5075,5074,5073,5072,5071,5070,5069,5068,5067,5066,5065,5064,5063,5062,5061,5060,5059,5058,5057,5056,5055,5054,5053,5052,5051,5050,5049,5048,5047,5046,5045,5044,5043,5042,5041,5040,5039,5038,5037,5036,5035}'::integer[]))
+        Buffers: shared hit=136
+Query Identifier: -7076713045939142718
+Planning:
+  Buffers: shared hit=3
+Planning Time: 0.113 ms
+Execution Time: 0.142 ms
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): single-term scalar count shape (recount_term pre-fix, one call per id) ===
+SELECT COUNT(*) FROM post_terms pt JOIN posts p ON p.id = pt.post_id WHERE pt.term_id = 5035 AND p.status = 'publish' AND p.post_type IN ('post', 'page')
+Aggregate  (cost=16.61..16.62 rows=1 width=8) (actual time=0.010..0.010 rows=1 loops=1)
+  Output: count(*)
+  Buffers: shared hit=2
+  ->  Nested Loop  (cost=0.56..16.61 rows=1 width=0) (actual time=0.008..0.008 rows=0 loops=1)
+        Inner Unique: true
+        Buffers: shared hit=2
+        ->  Index Scan using idx_post_terms_term on public.post_terms pt  (cost=0.28..8.30 rows=1 width=8) (actual time=0.008..0.008 rows=0 loops=1)
+              Output: pt.id, pt.post_id, pt.term_id
+              Index Cond: (pt.term_id = 5035)
+              Buffers: shared hit=2
+        ->  Index Scan using posts_pkey on public.posts p  (cost=0.28..8.30 rows=1 width=8) (never executed)
+              Output: p.id, p.post_type, p.title, p.slug, p.excerpt, p.body, p.status, p.author_id, p.parent_id, p.featured_media_id, p.menu_order, p.comment_status, p.password, p.sticky, p.comment_count, p.published_at, p.lock_version, p.created_at, p.updated_at, p.search_vector
+              Index Cond: (p.id = pt.post_id)
+              Filter: ((p.post_type = ANY ('{post,page}'::text[])) AND (p.status = 'publish'::text))
+Query Identifier: -4414865338407683125
+Planning:
+  Buffers: shared hit=13
+Planning Time: 0.306 ms
+Execution Time: 0.049 ms
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): grouped batched count shape (the fix: term_post_counts, one call for the whole set) ===
+SELECT pt.term_id, COUNT(*) FROM post_terms pt JOIN posts p ON p.id = pt.post_id WHERE pt.term_id = ANY(ARRAY[5099,5098,5097,5096,5095,5094,5093,5092,5091,5090,5089,5088,5087,5086,5085,5084,5083,5082,5081,5080,5079,5078,5077,5076,5075,5074,5073,5072,5071,5070,5069,5068,5067,5066,5065,5064,5063,5062,5061,5060,5059,5058,5057,5056,5055,5054,5053,5052,5051,5050,5049,5048,5047,5046,5045,5044,5043,5042,5041,5040,5039,5038,5037,5036,5035]) AND p.status = 'publish' AND p.post_type IN ('post', 'page') GROUP BY pt.term_id
+HashAggregate  (cost=223.16..224.04 rows=88 width=16) (actual time=0.752..0.758 rows=50 loops=1)
+  Output: pt.term_id, count(*)
+  Group Key: pt.term_id
+  Batches: 1  Memory Usage: 24kB
+  Buffers: shared hit=209
+  ->  Hash Join  (cost=103.84..222.72 rows=88 width=8) (actual time=0.738..0.743 rows=50 loops=1)
+        Output: pt.term_id
+        Hash Cond: (p.id = pt.post_id)
+        Buffers: shared hit=209
+        ->  Seq Scan on public.posts p  (cost=0.00..108.00 rows=2000 width=8) (actual time=0.005..0.524 rows=2003 loops=1)
+              Output: p.id, p.post_type, p.title, p.slug, p.excerpt, p.body, p.status, p.author_id, p.parent_id, p.featured_media_id, p.menu_order, p.comment_status, p.password, p.sticky, p.comment_count, p.published_at, p.lock_version, p.created_at, p.updated_at, p.search_vector
+              Filter: ((p.post_type = ANY ('{post,page}'::text[])) AND (p.status = 'publish'::text))
+              Buffers: shared hit=78
+        ->  Hash  (cost=102.74..102.74 rows=88 width=16) (actual time=0.055..0.055 rows=50 loops=1)
+              Output: pt.term_id, pt.post_id
+              Buckets: 1024  Batches: 1  Memory Usage: 11kB
+              Buffers: shared hit=131
+              ->  Bitmap Heap Scan on public.post_terms pt  (cost=74.71..102.74 rows=88 width=16) (actual time=0.036..0.040 rows=50 loops=1)
+                    Output: pt.term_id, pt.post_id
+                    Recheck Cond: (pt.term_id = ANY ('{5099,5098,5097,5096,5095,5094,5093,5092,5091,5090,5089,5088,5087,5086,5085,5084,5083,5082,5081,5080,5079,5078,5077,5076,5075,5074,5073,5072,5071,5070,5069,5068,5067,5066,5065,5064,5063,5062,5061,5060,5059,5058,5057,5056,5055,5054,5053,5052,5051,5050,5049,5048,5047,5046,5045,5044,5043,5042,5041,5040,5039,5038,5037,5036,5035}'::integer[]))
+                    Heap Blocks: exact=1
+                    Buffers: shared hit=131
+                    ->  Bitmap Index Scan on idx_post_terms_term  (cost=0.00..74.69 rows=88 width=0) (actual time=0.032..0.032 rows=50 loops=1)
+                          Index Cond: (pt.term_id = ANY ('{5099,5098,5097,5096,5095,5094,5093,5092,5091,5090,5089,5088,5087,5086,5085,5084,5083,5082,5081,5080,5079,5078,5077,5076,5075,5074,5073,5072,5071,5070,5069,5068,5067,5066,5065,5064,5063,5062,5061,5060,5059,5058,5057,5056,5055,5054,5053,5052,5051,5050,5049,5048,5047,5046,5045,5044,5043,5042,5041,5040,5039,5038,5037,5036,5035}'::integer[]))
+                          Buffers: shared hit=130
+Query Identifier: -6704154189606623960
+Planning:
+  Buffers: shared hit=13
+Planning Time: 0.330 ms
+Execution Time: 0.859 ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.45s
+

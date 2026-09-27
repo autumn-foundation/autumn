@@ -31,18 +31,34 @@ async fn index() -> Markup {
                 title { "Autumn · Literary boids" }
             }
             body {
-                h1 { "Literary boids" }
-                p {
-                    "Every glyph is a flocking agent that becomes the last character "
-                    "of Autumn's own source code it eats — O(N²) neighbor math every "
-                    "frame, running entirely client-side in WebAssembly."
+                // `<main>` wraps all of the page's content (both the
+                // server-rendered heading/paragraph and the mount point the
+                // Yew island later renders its canvas + controls into) as the
+                // very first thing in `<body>` — there is no nav/header
+                // before it, so a skip link would add a tab stop that
+                // bypasses nothing (the same reasoning `todo-app`/
+                // `media-room` established in #2483; `autumn check --a11y`'s
+                // `bypass` rule already exempts this shape).
+                main id="main-content" {
+                    h1 { "Literary boids" }
+                    p {
+                        "Every glyph is a flocking agent that becomes the last character "
+                        "of Autumn's own source code it eats — O(N²) neighbor math every "
+                        "frame, running entirely client-side in WebAssembly."
+                    }
+                    // Container mount point. The boot loader resolves this
+                    // element and passes it straight to mount(); the data-*
+                    // attributes carry the island name + initial boid count.
+                    // The Yew component renders its own <canvas> + controls
+                    // inside this <div> — see `examples/island-flock`'s
+                    // `Flock` component, which itself emits no landmark of
+                    // its own, so the island's content stays inside this
+                    // `<main>` both before and after it mounts.
+                    div id="flock" data-autumn-island="flock" data-count="120" {}
                 }
-                // Container mount point. The boot loader resolves this element
-                // and passes it straight to mount(); the data-* attributes carry
-                // the island name + initial boid count. The Yew component renders
-                // its own <canvas> + controls inside this <div>.
-                div id="flock" data-autumn-island="flock" data-count="120" {}
-                // External module (script-src 'self'); no inline script, no nonce.
+                // External module (script-src 'self'); no inline script, no
+                // nonce. Kept after `</main>` (rather than in `<head>`) so
+                // `<main>` stays the literal first child of `<body>`.
                 script type="module" src=(asset_url("islands/flock-boot.js")) defer {}
             }
         }
@@ -52,4 +68,43 @@ async fn index() -> Markup {
 #[autumn_web::main]
 async fn main() {
     autumn_web::app().routes(routes![index]).run().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::index;
+
+    /// Regression test for the a11y fix (`autumn check --a11y` `bypass`,
+    /// `landmark-one-main`): the page's content — including the island mount
+    /// point — is wrapped in a `<main>` landmark, and it is the first thing
+    /// in `<body>`, so no skip link is needed either (mirrors `todo-app`/
+    /// `media-room`, established in #2483).
+    #[tokio::test]
+    async fn index_wraps_content_in_a_main_landmark_first_in_body() {
+        let html = index().await.into_string();
+
+        assert!(
+            html.contains(r#"<main id="main-content">"#),
+            "missing <main> landmark: {html}"
+        );
+        let body_open = html.find("<body>").expect("has <body>") + "<body>".len();
+        let main_open = html.find("<main").expect("has <main>");
+        assert!(
+            !html[body_open..main_open].contains('<'),
+            "<main> must be the first element in <body> (nothing to skip \
+             past), so autumn check --a11y's bypass rule does not ask for a \
+             pointless skip link: {html}"
+        );
+        // The island mount point stays inside <main> both before and after
+        // the Yew component hydrates it (issue: the component itself emits
+        // no landmark of its own — see examples/island-flock/src/lib.rs).
+        let main_close = html.find("</main>").expect("has </main>");
+        let island_pos = html
+            .find(r#"data-autumn-island="flock""#)
+            .expect("has the island mount marker");
+        assert!(
+            (main_open..main_close).contains(&island_pos),
+            "island mount point must be inside <main>: {html}"
+        );
+    }
 }

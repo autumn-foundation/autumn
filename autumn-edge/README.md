@@ -10,10 +10,10 @@ compiles for **both** `x86_64` and `wasm32-wasip1`. It never links tokio, hyper,
 
 ```toml
 [dependencies]
-autumn-edge = "0.6.0"
+autumn-edge = "0.7.0"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-autumn-web = { version = "0.6.0", features = ["edge"] }
+autumn-web = { version = "0.7.0", features = ["edge"] }
 ```
 
 ## What is here

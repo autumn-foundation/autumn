@@ -1,0 +1,5 @@
+error: `#[agent_effect(..., reason = ...)]` takes a non-blank reason: it is the only record of why this site was declared rather than proved. See docs/guide/agent-authority.md.
+  --> tests/compile-fail/agent_authority_blank_effect_reason.rs:30:35
+   |
+30 |     #[agent_effect(none, reason = "   ")]
+   |                                   ^^^^^

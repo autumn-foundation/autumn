@@ -43,7 +43,7 @@ impl RedisStore {
             .clone()
             .filter(|url| !url.trim().is_empty())
             .ok_or(SessionBackendConfigError::MissingRedisUrl)?;
-        let client = redis::Client::open(url)
+        let client = crate::redis_tls::open_client(&url)
             .map_err(|error| SessionBackendConfigError::InvalidRedisUrl(error.to_string()))?;
         let connection =
             ConnectionManager::new_lazy_with_config(client, ConnectionManagerConfig::new())
@@ -167,7 +167,7 @@ mod tests {
     async fn redis_store_key_for() {
         let store = RedisStore {
             connection: ConnectionManager::new_lazy_with_config(
-                redis::Client::open("redis://127.0.0.1/").unwrap(),
+                crate::redis_tls::open_client("redis://127.0.0.1/").unwrap(),
                 ConnectionManagerConfig::new(),
             )
             .unwrap(),

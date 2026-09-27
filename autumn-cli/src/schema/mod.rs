@@ -262,7 +262,7 @@ fn resolve_default_models_path(project_root: &Path) -> Result<PathBuf, String> {
 /// file precedence, but returns `None` (not an error) when neither is present —
 /// so callers that must degrade gracefully on absence (the `migrate` snapshot
 /// refresh, `doctor`'s drift check) share one resolver instead of duplicating it.
-fn existing_models_path(project_root: &Path) -> Option<PathBuf> {
+pub fn existing_models_path(project_root: &Path) -> Option<PathBuf> {
     let dir = project_root.join("src").join("models");
     if dir.is_dir() {
         return Some(dir);
