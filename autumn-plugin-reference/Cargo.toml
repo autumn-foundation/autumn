@@ -1,0 +1,40 @@
+[package]
+name = "autumn-plugin-reference"
+description = "Pinned reference plugin: the compiled proof of Autumn's stable plugin API surface (issue #1601)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# Never published. This crate exists so that CI compiles the declared stable
+# plugin surface on every change to the framework; it has no downstream users.
+publish = false
+
+[dependencies]
+# Default features (which include `db`, `maud`, …) so this crate shares the
+# same autumn-web build as the rest of the workspace: the `plugin-contract` CI
+# job then reuses cached artifacts instead of compiling a second feature set.
+autumn-web = { path = "../autumn" }
+# `maud::html!` expands to ABSOLUTE `::maud::…` paths, so — unlike
+# `diesel_migrations`, which autumn re-exports for exactly this reason — a
+# re-export cannot satisfy it. A plugin installing an error-page renderer
+# through `AppBuilder::error_pages` needs its own `maud` at a matching major,
+# the same as `autumn-admin-plugin` does. Carried here so the reference plugin
+# proves that seam the way a real plugin has to reach it.
+maud = { workspace = true }
+
+[features]
+# `db` gates `AppBuilder::plugin_migrations` and `AppBuilder::with_pool_provider`,
+# two stable plugin surfaces. It is on by default so `cargo test -p
+# autumn-plugin-reference` — and the `plugin-contract` CI job — actually compile
+# every declared stable surface. Turning it off narrows what this crate proves.
+default = ["db"]
+db = ["autumn-web/db"]
+
+# Inherit the workspace lint profile, like every other first-party plugin crate.
+# That brings `clippy::pedantic`/`nursery` and the workspace `check-cfg` list —
+# and it already grandfathers `clippy::disallowed_methods` for the determinism
+# seam gate (autumn #1797) via `[workspace.lints.clippy]`, so no local table is
+# needed for that.
+[lints]
+workspace = true

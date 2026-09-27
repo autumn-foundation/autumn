@@ -64,4 +64,41 @@ mod tests {
             );
         }
     }
+
+    /// Issue #2354: the renamed widget classes must each have a rule in the
+    /// component stylesheet. The selector boundary check keeps `.autumn-card`
+    /// from passing on the strength of `.autumn-card__header` alone.
+    #[test]
+    fn renamed_widget_classes_are_backed_by_component_css() {
+        fn has_rule(css: &str, class: &str) -> bool {
+            let needle = format!(".{class}");
+            css.match_indices(&needle).any(|(i, _)| {
+                matches!(
+                    css[i + needle.len()..].chars().next(),
+                    Some('{' | ' ' | ',' | ':' | '\n' | '\t')
+                )
+            })
+        }
+
+        for class in [
+            "autumn-card",
+            "autumn-card__header",
+            "autumn-card__title",
+            "autumn-card__body",
+            "autumn-card__footer",
+            "autumn-stat-card",
+            "autumn-stat-card__label",
+            "autumn-stat-card__value",
+            "autumn-stat-card__link",
+            "autumn-search-empty",
+            "autumn-autocomplete-empty",
+            "autumn-alert__icon-svg",
+            "autumn-active",
+        ] {
+            assert!(
+                has_rule(WIDGETS_COMPONENT_CSS, class),
+                "widget emits .{class} but WIDGETS_COMPONENT_CSS has no rule for it"
+            );
+        }
+    }
 }

@@ -58,7 +58,8 @@ Outside a request (in a service, job, or scheduled task) use the module-level
 
 A listener is an async function over `(AppState, YourEvent)`. Declare it with
 `#[listener]`, in **its own file** — the `signup` handler above never changes when
-you add it:
+you add it. `Mailer` and `Mail` are behind the non-default `mail` feature
+(`features = ["mail"]`); see [Mail](mail.md).
 
 ```rust,ignore
 use autumn_web::prelude::*;
