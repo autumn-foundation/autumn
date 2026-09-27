@@ -3,12 +3,15 @@
 If a browser on `https://app.example.com` fetches your Autumn app on
 `https://api.example.com`, the browser — not Autumn — decides whether the
 JavaScript is allowed to read the response. It decides by looking for
-`Access-Control-*` headers. Autumn sends those headers when, and only when, you
-list the calling origin in `[cors]`.
+`Access-Control-*` headers, and Autumn sends those only when two things hold: the
+request's `Origin` is one you listed in `[cors]`, **and** the response passes
+through the CORS middleware. Each half has its own failure mode, and both are
+below.
 
-This page is the `[cors]` section: what each key does, what the defaults are,
-and the two combinations that fail. It assumes you already have a route that
-works when you `curl` it, and the problem is a browser on another origin.
+This page is the `[cors]` section: what each key does, which default a given build
+actually gets, and the interactions — CSRF above all — that leave a correct origin
+list still not enough. It assumes you already have a route that works when you
+`curl` it, and the problem is a browser on another origin.
 
 If you are calling your app from its own origin — a server-rendered page, an
 htmx fragment, a form post — you do not need CORS at all, and enabling it
