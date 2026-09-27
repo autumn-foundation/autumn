@@ -733,7 +733,7 @@ pub fn check_existing_pin(manifest: &str, crate_name: &str, pinned: &str) -> Res
 /// one that breaks an admission rule: its trust labels cannot be shown.
 ///
 /// Staleness is not checked here. A consumer on an older app is not stale.
-fn load_index() -> Result<index::Loaded, String> {
+pub fn load_index() -> Result<index::Loaded, String> {
     use std::fmt::Write as _;
 
     let loaded = index::load_from_env().map_err(|err| err.to_string())?;
@@ -1417,20 +1417,41 @@ pub struct ScaffoldPlugin {
 /// community crate) has no resolvable version.
 pub fn preflight_scaffold_plugins(
     names: &[String],
+    plugin_index: &index::PluginIndex,
     scaffold_autumn_web: Option<&str>,
     resolve_community_version: impl Fn(&str) -> Option<String>,
 ) -> Result<Vec<ScaffoldPlugin>, String> {
     let mut out: Vec<ScaffoldPlugin> = Vec::with_capacity(names.len());
     for name in names {
+        // The index decides first, as for `plugin add` (#1625): a listed name
+        // resolves to its listing, a sandboxed or flagged one is refused, and a
+        // listed community crate uses its verified pin.
+        let listed = match standing(plugin_index, name) {
+            Standing::Listed(listing) => Some(listing),
+            Standing::Delisted(_) | Standing::Unlisted => None,
+        };
+        let name = listed.map_or(name.as_str(), |l| l.name.as_str());
+        if let Some(listing) = listed {
+            if listing.trust == index::Trust::Sandboxed {
+                return Err(format!(
+                    "`{name}` is a sandboxed plugin; `--with` cannot wire it. Run \
+                     `autumn plugin add {name}` after the app exists for the manual steps \
+                     — no files were written"
+                ));
+            }
+            gate_listing(listing, scaffold_autumn_web)
+                .map_err(|err| err.replace("No files were changed.", "No files were written."))?;
+        }
         // `--with X --with X` is a typo, not a conflict: the second one names
         // the same install, and `plugin add` is idempotent regardless.
-        if out.iter().any(|already| &already.name == name) {
+        if out.iter().any(|already| already.name == name) {
             continue;
         }
         let resolved = resolve(name).map_err(|err| err.to_string())?;
-        let version = match &resolved {
-            Resolved::FirstParty(_) => first_party_version().to_owned(),
-            Resolved::Community(crate_name) => {
+        let version = match (&resolved, listed) {
+            (Resolved::FirstParty(_), _) => first_party_version().to_owned(),
+            (Resolved::Community(_), Some(listing)) => pinned_version(&listing.version),
+            (Resolved::Community(crate_name), None) => {
                 let version = resolve_community_version(crate_name).ok_or_else(|| {
                     format!(
                         "could not find `{crate_name}` on crates.io (or crates.io is unreachable) — no files were written"
@@ -1446,6 +1467,7 @@ pub fn preflight_scaffold_plugins(
                 version
             }
         };
+        let name = &name.to_owned();
         // A first-party plugin is released in lockstep with `autumn-web`, so
         // this can only fail if the scaffold ever stops pinning the CLI's own
         // series — which is exactly the regression worth catching before a
@@ -2519,10 +2541,56 @@ mod tests {
     /// The pin `autumn new`'s own template writes, as the preflight sees it.
     const PINNED: Option<&str> = Some(env!("CARGO_PKG_VERSION"));
 
+    fn panics_on_lookup(name: &str) -> Option<String> {
+        panic!("a listed crate must not be looked up on crates.io: {name}")
+    }
+
+    /// `autumn new --with` takes the same index decisions as `plugin add`: a
+    /// listed community crate uses its verified pin, with no crates.io lookup.
+    #[test]
+    fn scaffold_preflight_pins_a_listed_community_crate() {
+        let names = vec!["autumn_plugin_LIVE_feed".to_owned()];
+        let resolved = preflight_scaffold_plugins(
+            &names,
+            &index_with(listed_community()),
+            PINNED,
+            panics_on_lookup,
+        )
+        .unwrap();
+        assert_eq!(resolved[0].name, "autumn-plugin-live-feed");
+        assert_eq!(resolved[0].version, "=0.3.0");
+    }
+
+    #[test]
+    fn scaffold_preflight_refuses_a_flagged_listing() {
+        let names = vec!["autumn-plugin-live-feed".to_owned()];
+        let err = preflight_scaffold_plugins(
+            &names,
+            &index_with(flagged_on(RELEASE)),
+            PINNED,
+            panics_on_lookup,
+        )
+        .unwrap_err();
+        assert!(err.contains("re-verification"), "{err}");
+    }
+
+    #[test]
+    fn scaffold_preflight_refuses_a_sandboxed_listing() {
+        let mut listing = listed_community();
+        listing.trust = index::Trust::Sandboxed;
+        listing.capabilities = vec!["http-request".to_owned()];
+        let names = vec!["autumn-plugin-live-feed".to_owned()];
+        let err =
+            preflight_scaffold_plugins(&names, &index_with(listing), PINNED, panics_on_lookup)
+                .unwrap_err();
+        assert!(err.contains("sandboxed"), "{err}");
+    }
+
     #[test]
     fn scaffold_preflight_resolves_first_party_plugins_in_order() {
         let names = vec!["autumn-search".to_owned(), "autumn-admin-plugin".to_owned()];
-        let resolved = preflight_scaffold_plugins(&names, PINNED, no_community).unwrap();
+        let resolved =
+            preflight_scaffold_plugins(&names, &bundled(), PINNED, no_community).unwrap();
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].name, "autumn-search");
         assert_eq!(resolved[1].name, "autumn-admin-plugin");
@@ -2534,7 +2602,8 @@ mod tests {
     #[test]
     fn scaffold_preflight_deduplicates_repeated_names() {
         let names = vec!["autumn-search".to_owned(), "autumn-search".to_owned()];
-        let resolved = preflight_scaffold_plugins(&names, PINNED, no_community).unwrap();
+        let resolved =
+            preflight_scaffold_plugins(&names, &bundled(), PINNED, no_community).unwrap();
         assert_eq!(resolved.len(), 1);
     }
 
@@ -2542,7 +2611,7 @@ mod tests {
     #[test]
     fn scaffold_preflight_rejects_an_unknown_plugin() {
         let names = vec!["tokio".to_owned()];
-        let err = preflight_scaffold_plugins(&names, PINNED, no_community).unwrap_err();
+        let err = preflight_scaffold_plugins(&names, &bundled(), PINNED, no_community).unwrap_err();
         assert!(err.contains("tokio"), "{err}");
         assert!(err.contains("autumn plugin list"), "{err}");
     }
@@ -2551,7 +2620,8 @@ mod tests {
     #[test]
     fn scaffold_preflight_refuses_an_incompatible_series() {
         let names = vec!["autumn-admin-plugin".to_owned()];
-        let err = preflight_scaffold_plugins(&names, Some("0.1.0"), no_community).unwrap_err();
+        let err = preflight_scaffold_plugins(&names, &bundled(), Some("0.1.0"), no_community)
+            .unwrap_err();
         assert!(err.contains("0.1.0"), "{err}");
         assert!(err.contains(first_party_version()), "{err}");
     }
@@ -2561,7 +2631,7 @@ mod tests {
     #[test]
     fn scaffold_preflight_resolves_a_community_version() {
         let names = vec!["autumn-plugin-live-feed".to_owned()];
-        let resolved = preflight_scaffold_plugins(&names, PINNED, |name| {
+        let resolved = preflight_scaffold_plugins(&names, &bundled(), PINNED, |name| {
             (name == "autumn-plugin-live-feed").then(|| "0.3.1".to_owned())
         })
         .unwrap();
@@ -2572,7 +2642,7 @@ mod tests {
     #[test]
     fn scaffold_preflight_refuses_an_unresolvable_community_version() {
         let names = vec!["autumn-plugin-live-feed".to_owned()];
-        let err = preflight_scaffold_plugins(&names, PINNED, no_community).unwrap_err();
+        let err = preflight_scaffold_plugins(&names, &bundled(), PINNED, no_community).unwrap_err();
         assert!(err.contains("autumn-plugin-live-feed"), "{err}");
     }
 
@@ -2580,8 +2650,10 @@ mod tests {
     #[test]
     fn scaffold_preflight_refuses_an_implausible_community_version() {
         let names = vec!["autumn-plugin-live-feed".to_owned()];
-        let err = preflight_scaffold_plugins(&names, PINNED, |_| Some("\"; rm -rf /".to_owned()))
-            .unwrap_err();
+        let err = preflight_scaffold_plugins(&names, &bundled(), PINNED, |_| {
+            Some("\"; rm -rf /".to_owned())
+        })
+        .unwrap_err();
         assert!(err.to_lowercase().contains("version"), "{err}");
     }
 
@@ -2618,13 +2690,13 @@ mod tests {
     #[test]
     fn scaffold_preflight_without_a_known_pin_still_resolves_but_does_not_gate() {
         let names = vec!["autumn-admin-plugin".to_owned()];
-        let resolved = preflight_scaffold_plugins(&names, None, no_community).unwrap();
+        let resolved = preflight_scaffold_plugins(&names, &bundled(), None, no_community).unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].version, first_party_version());
 
         // An unknown name is still refused, because that IS knowable up front.
-        let err =
-            preflight_scaffold_plugins(&["tokio".to_owned()], None, no_community).unwrap_err();
+        let err = preflight_scaffold_plugins(&["tokio".to_owned()], &bundled(), None, no_community)
+            .unwrap_err();
         assert!(err.contains("autumn plugin list"), "{err}");
     }
 }

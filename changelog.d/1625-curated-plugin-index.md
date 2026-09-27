@@ -13,7 +13,8 @@
   a file. It installs a listed community crate at its verified version, pinned
   with `=`, also with `--offline`. It refuses a listing that failed
   re-verification. For a sandboxed listing it changes no file and exits 2.
-  `AUTUMN_PLUGIN_INDEX=<path>` selects another index file.
+  `AUTUMN_PLUGIN_INDEX=<path>` selects another index file. `autumn new
+  --with` takes the same index decisions before it writes a file.
 - **`autumn plugin index check` / `record` (#1625):** `check` is the listing
   gate: admission rules, and re-verification against the current release.
   `record` writes `plugin-check --format json` reports into listings. A pass

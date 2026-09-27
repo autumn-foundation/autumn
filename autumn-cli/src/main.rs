@@ -5870,12 +5870,24 @@ fn resolve_scaffold_plugins(
     if names.is_empty() {
         return Vec::new();
     }
+    let loaded = plugin::load_index().unwrap_or_else(|err| {
+        eprintln!("autumn new: {err}");
+        std::process::exit(1);
+    });
     match plugin::preflight_scaffold_plugins(
         names,
+        &loaded.index,
         scaffold_autumn_web,
         plugin::registry::latest_version,
     ) {
-        Ok(plugins) => plugins,
+        Ok(plugins) => {
+            // The trust review, before any file is written (#1625, AC 6).
+            for p in &plugins {
+                let standing = plugin::standing(&loaded.index, &p.name);
+                println!("{}", plugin::render_trust(&p.name, &standing));
+            }
+            plugins
+        }
         Err(err) => {
             eprintln!("autumn new: {err}");
             std::process::exit(1);

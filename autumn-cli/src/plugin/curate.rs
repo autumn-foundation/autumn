@@ -262,6 +262,29 @@ pub fn apply_inspect(
             ));
         }
     }
+    // `inspect` emits every quota and limit. A report missing one would
+    // erase the recorded ceilings, so it was not made by this `inspect`.
+    let quotas = autumn_web::plugin_sandbox::CapabilityQuotas::default().fields();
+    let limits = autumn_web::plugin_sandbox::ResourceLimits::default().fields();
+    let missing: Vec<String> = quotas
+        .iter()
+        .filter(|(key, _)| !report.quotas.contains_key(*key))
+        .map(|(key, _)| format!("quotas.{key}"))
+        .chain(
+            limits
+                .iter()
+                .filter(|(key, _)| !report.limits.contains_key(*key))
+                .map(|(key, _)| format!("limits.{key}")),
+        )
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "the inspect report for `{}` has no {}; use a report from this CLI's \
+             `autumn plugin inspect --format json`",
+            listing.name,
+            missing.join(", ")
+        ));
+    }
     // Replacing a recorded artifact needs a consent check against it. Without
     // `--against` the report has no delta, and new authority would pass.
     let replacing = !listing.artifact_sha256.is_empty()
@@ -908,9 +931,31 @@ mod tests {
             upgrade: Some(serde_json::json!({"added_capabilities": []})),
             upgrade_against: Some("00".repeat(32)),
             grants: index::Grants::default(),
-            quotas: std::collections::BTreeMap::new(),
-            limits: std::collections::BTreeMap::new(),
+            quotas: autumn_web::plugin_sandbox::CapabilityQuotas::default()
+                .fields()
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v))
+                .collect(),
+            limits: autumn_web::plugin_sandbox::ResourceLimits::default()
+                .fields()
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), u64::try_from(v).unwrap()))
+                .collect(),
         }
+    }
+
+    /// A report missing an authority map (older, truncated or hand-edited)
+    /// would erase the recorded ceilings. `inspect` always emits every key.
+    #[test]
+    fn an_inspect_report_missing_quotas_or_limits_is_refused() {
+        let mut r = inspect(true);
+        r.quotas.clear();
+        let err = apply_inspect(&mut sandboxed(), &r, "0.7.0", "2026-10-01").unwrap_err();
+        assert!(err.contains("quotas"), "{err}");
+        let mut r = inspect(true);
+        r.limits.remove("fuel");
+        let err = apply_inspect(&mut sandboxed(), &r, "0.7.0", "2026-10-01").unwrap_err();
+        assert!(err.contains("fuel"), "{err}");
     }
 
     /// A failed run keeps the last verified range, version and tier: the

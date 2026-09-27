@@ -302,6 +302,11 @@ Community `autumn-plugin-<name>` crates work here too, with the same
 dependency-only rule: the dependency is written, the mount is printed for you to
 paste.
 
+`--with` reads the [plugin index](#the-plugin-index) the same way `plugin add`
+does. It prints the trust review first. A listed community crate is pinned to
+its verified version with `=`. A flagged or sandboxed listing is refused before
+the scaffold writes a file.
+
 `--with` composes with `--starter`. One difference: a starter brings its own
 `Cargo.toml`, so its `autumn-web` pin is not knowable until the starter has been
 fetched. Names are still resolved before anything is written, but a starter

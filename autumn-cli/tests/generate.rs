@@ -9469,19 +9469,22 @@ fn mount_community(project_dir: &Path, name: &str) {
     fs::write(&main_path, mounted).unwrap();
 }
 
-/// Install `listing` through a one-listing index that is not flagged. The
-/// consumer gate refuses a flagged listing, but a flagged listing is exactly
-/// what must be re-tested, to relist or delist it.
+/// Install `listing` through a one-listing index that admits the release
+/// under test. The consumer gate refuses a flagged listing and one whose range
+/// stops before this release, but those are exactly the listings that must be
+/// re-tested, to relist, flag or delist them.
 fn add_unflagged(tmp: &Path, project: &Path, listing: &toml::Value) -> Result<(), String> {
     let name = listing["name"].as_str().unwrap();
+    let release = env!("CARGO_PKG_VERSION");
+    let series = autumn_web::plugin_contract::lockstep_range(release);
     let mut unflagged = listing.clone();
     let table = unflagged.as_table_mut().unwrap();
     table.insert("status".into(), "listed".into());
+    table.insert("autumn_web".into(), series.as_str().into());
     table.remove("note");
-    table["conformance"]
-        .as_table_mut()
-        .unwrap()
-        .insert("result".into(), "pass".into());
+    let conformance = table["conformance"].as_table_mut().unwrap();
+    conformance.insert("result".into(), "pass".into());
+    conformance.insert("autumn_web".into(), release.into());
     let mut one = toml::Table::new();
     one.insert("schema".into(), 1.into());
     one.insert("plugin".into(), toml::Value::Array(vec![unflagged]));
@@ -9499,6 +9502,22 @@ fn add_unflagged(tmp: &Path, project: &Path, listing: &toml::Value) -> Result<()
             "{name}: `plugin add` failed ({code:?}):\n{stdout}\n{stderr}"
         ))
     }
+}
+
+/// A failing `plugin-check`-shaped report for a run that never produced one,
+/// so `record` can still flag or delist the listing.
+fn failed_install_report(name: &str, message: &str, output: &str) -> serde_json::Value {
+    let lines: Vec<&str> = output.lines().collect();
+    let tail = &lines[lines.len().saturating_sub(20)..];
+    serde_json::json!({
+        "plugin_name": name,
+        "checks": [{
+            "name": "installability",
+            "status": "fail",
+            "message": message,
+            "diagnostics": tail,
+        }],
+    })
 }
 
 /// Run `autumn plugin-check --format json` with the listing's prefix and
@@ -9522,17 +9541,11 @@ fn plugin_check_report(project: &Path, listing: &toml::Value, target: &str) -> s
     let (stdout, stderr, _) =
         run_autumn_env_status(project, &args, &[("CARGO_TARGET_DIR", target)]);
     serde_json::from_str(&stdout).unwrap_or_else(|_| {
-        let lines: Vec<&str> = stderr.lines().collect();
-        let tail = &lines[lines.len().saturating_sub(20)..];
-        serde_json::json!({
-            "plugin_name": name,
-            "checks": [{
-                "name": "installability",
-                "status": "fail",
-                "message": "plugin-check gave no report: the app did not build or boot",
-                "diagnostics": tail,
-            }],
-        })
+        failed_install_report(
+            name,
+            "plugin-check gave no report: the app did not build or boot",
+            &stderr,
+        )
     })
 }
 
@@ -9615,6 +9628,16 @@ fn plugin_index_reverify_listings() {
         let (tmp, project) = fresh_project(&name.replace('-', "_"));
         patch_first_party(&project, &first_party);
         if let Err(failure) = add_unflagged(tmp.path(), &project, listing) {
+            // A failed install is a failed run: record it, so the listing is
+            // flagged or delisted rather than left as it was.
+            if recorded != "exempt"
+                && let Some(dir) = &reports
+            {
+                let path = dir.join(format!("{name}.json"));
+                let report = failed_install_report(name, "`plugin add` failed", &failure);
+                fs::write(&path, report.to_string()).unwrap();
+                written_reports.push(path);
+            }
             failures.push(failure);
             continue;
         }
