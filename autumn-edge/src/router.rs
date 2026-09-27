@@ -30,9 +30,20 @@ use crate::wire::{FALLTHROUGH_SENTINEL, FallthroughReason};
 /// authority on route-shape conflicts and panics on a duplicate. This is the
 /// same failure the origin router produces for the same route table, so a
 /// conflict is caught natively long before a capsule is built.
+///
+/// Also panics if any route's `method` is not `GET`. Wire version 1 is
+/// GET-only; `EdgeRoute` is normally built by the `#[edge]` macro, which
+/// always sets `GET`, but hand-construction is allowed, so this catches a
+/// route built with the wrong method before it reaches a capsule.
 pub fn build_edge_router(routes: Vec<EdgeRoute>) -> Router<()> {
     let mut lane: Router<EdgeState> = Router::new();
     for route in routes {
+        assert!(
+            route.method == http::Method::GET,
+            "edge route \"{}\" uses method {}, but wire version 1 serves GET only",
+            route.name,
+            route.method
+        );
         lane = lane.route(route.path, route.handler);
     }
     lane.fallback(unknown_route).with_state(EdgeState)
@@ -229,5 +240,29 @@ mod tests {
         assert_eq!(encode_needs(&[EdgeCapability::Kv]), "kv");
         assert_eq!(decode_needs(""), vec![]);
         assert_eq!(decode_needs("kv"), vec![EdgeCapability::Kv]);
+    }
+
+    #[test]
+    fn a_non_get_route_panics_and_names_the_route() {
+        let bad_route = EdgeRoute {
+            method: http::Method::POST,
+            path: "/submit",
+            handler: edge_get(stats),
+            name: "submit",
+            needs: &[],
+        };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = build_edge_router(vec![bad_route]);
+        }));
+
+        let error = result.expect_err("a non-GET route must panic");
+        let message = error
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| error.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+            .expect("panic payload is a string");
+        assert!(message.contains("submit"), "{message}");
+        assert!(message.contains("POST"), "{message}");
     }
 }

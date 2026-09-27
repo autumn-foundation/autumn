@@ -48,6 +48,123 @@ mod templates {
     pub const GCP_DEPLOY_WORKFLOW: &str = include_str!("templates/release/gcp-deploy.yml.tmpl");
 }
 
+/// First `autumn-cli` release that ships the issue #1615 supply-chain surface:
+/// the `autumn sbom` subcommand AND `autumn build --auditable`.
+///
+/// The generated Dockerfile `cargo install`s the CLI at
+/// `{{autumn_cli_version}}` — which renders THIS CLI's own version. Between a
+/// feature merging and the next release that is an ALREADY-PUBLISHED version
+/// predating the feature, so a scaffold generated from a source build in that
+/// window would invoke `autumn sbom` (no such subcommand) or `autumn build
+/// --auditable` (no such flag) and the image would not build at all.
+///
+/// `0.7.1` means "any release after 0.7.0", which is every future version, so
+/// this needs no maintenance when the next version number is chosen: the gated
+/// steps switch themselves on the moment a CLI that can satisfy them is what
+/// gets installed. Until then the scaffold still produces a working image —
+/// with the verified Tailwind download and, on the default (non-embed) path,
+/// an auditable binary, since `cargo auditable build` needs only the
+/// cargo-auditable crate and nothing from the autumn CLI.
+const SUPPLY_CHAIN_MIN_CLI_VERSION: &str = "0.7.1";
+
+/// Builder-stage step that writes the image's `CycloneDX` inventory.
+///
+/// A raw literal on purpose: these lines land verbatim in a generated
+/// Dockerfile, so any escaping cleverness here shows up as stray indentation
+/// in every scaffolded project.
+const SBOM_GENERATE_STEP: &str = r#"
+# Machine-readable inventory of everything compiled into this image, generated
+# from the very source tree that produced the binary above, resolving the same
+# features that build used and filtered to this builder's own target triple.
+# Without that filter the document lists target-specific dependencies for every
+# platform — the whole `windows-*` family — none of which can be in a Linux
+# image. Deliberately no `--locked`: a project whose Cargo.lock has drifted
+# still builds (its own build would have updated the lock anyway), and the SBOM
+# records what was actually resolved. Add `--locked` for the stricter posture.
+RUN autumn sbom{{sbom_features}} \
+    --filter-platform "$(rustc -vV | grep '^host:' | cut -d' ' -f2)" \
+    --output /app/sbom.cdx.json
+"#;
+
+/// Runtime-stage copy that carries the inventory into the shipped image.
+const SBOM_RUNTIME_COPY: &str = r"# Supply-chain inventory, at a fixed path so scanners and `docker cp` can find
+# it without knowing anything about autumn. The binary itself independently
+# carries the same list (see cargo-auditable above); docs/guide/supply-chain.md
+# shows how to cross-check the two.
+COPY --chown=autumn:autumn --from=builder /app/sbom.cdx.json /usr/share/autumn/sbom.cdx.json
+";
+
+/// Continuation of the runtime image's `LABEL` instruction, pointing a scanner
+/// at the in-image SBOM without any autumn-specific knowledge.
+const SBOM_LABELS: &str = concat!(
+    " \\\n      io.autumn.sbom.format=\"CycloneDX\"",
+    " \\\n      io.autumn.sbom.path=\"/usr/share/autumn/sbom.cdx.json\""
+);
+
+/// Keep or delete a `{{sbom_steps_begin}}` … `{{sbom_steps_end}}` region.
+///
+/// The generated deploy workflows extract and attest the SBOM baked into the
+/// image, which only exists when the pinned CLI could generate it (see
+/// [`SUPPLY_CHAIN_MIN_CLI_VERSION`]). Rather than duplicate each cloud's image
+/// expression and env block in Rust, the steps live in the template between
+/// markers and this either unwraps them or removes them wholesale.
+fn strip_sbom_block(rendered: &str, keep: bool) -> String {
+    // Most templates carry no markers; leave those byte-for-byte alone rather
+    // than round-tripping them through a line splitter that would normalise
+    // their trailing newline.
+    if !rendered.contains("{{sbom_steps_begin}}") {
+        return rendered.to_owned();
+    }
+    let mut out = String::with_capacity(rendered.len());
+    let mut inside = false;
+    for line in rendered.lines() {
+        let trimmed = line.trim();
+        if trimmed == "{{sbom_steps_begin}}" {
+            inside = true;
+            continue;
+        }
+        if trimmed == "{{sbom_steps_end}}" {
+            inside = false;
+            continue;
+        }
+        if inside && !keep {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Parse `x.y.z` (ignoring any `-pre`/`+build` suffix) for ordering.
+fn semver_triple(version: &str) -> Option<(u64, u64, u64)> {
+    let core = version.split(['-', '+']).next().filter(|s| !s.is_empty())?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// Whether a Dockerfile pinned to `cli_version` can run this release's
+/// supply-chain CLI surface.
+///
+/// An unparseable version is treated as capable: it is not a published
+/// crates.io release, so it is a local/source build, which by definition has
+/// whatever this CLI has.
+fn cli_supports_supply_chain_flags(cli_version: &str) -> bool {
+    match (
+        semver_triple(cli_version),
+        semver_triple(SUPPLY_CHAIN_MIN_CLI_VERSION),
+    ) {
+        (Some(have), Some(need)) => have >= need,
+        _ => true,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ReleaseError {
     #[error("'{0}' already exists — run with --force to overwrite")]
@@ -503,22 +620,88 @@ condition: service_completed_successfully\n    restart: unless-stopped\n";
 const WEB_ROLE_ENV: &str = "\n      AUTUMN_ROLE: web\n      AUTUMN_JOBS__BACKEND: postgres";
 
 fn render(template: &str, project_name: &str, embed: bool, split_workers: bool) -> String {
+    render_for_cli(
+        template,
+        project_name,
+        embed,
+        split_workers,
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+/// The Dockerfile/deploy-workflow renderer, with the pinned CLI version
+/// injectable so both sides of the [`cli_supports_supply_chain_flags`] gate are
+/// testable.
+fn render_for_cli(
+    template: &str,
+    project_name: &str,
+    embed: bool,
+    split_workers: bool,
+    cli_version: &str,
+) -> String {
+    // `--auditable` is a flag on the autumn CLI, so — unlike `cargo auditable build`
+    // on the default path, which needs only the cargo-auditable crate — it is subject
+    // to the same pin gate as `autumn sbom`: an older pinned CLI rejects the argument
+    // and the image fails to build. The explanatory comment is gated with it, so a
+    // generated Dockerfile never documents a flag it does not pass.
+    let (embed_auditable_note, embed_auditable) = if cli_supports_supply_chain_flags(cli_version) {
+        (
+            "# `--auditable` routes BOTH compile phases through `cargo auditable`, so the\n\
+                 # shipped binary carries its own dependency list.\n",
+            " --auditable",
+        )
+    } else {
+        ("", "")
+    };
+    let embed_build_step = format!(
+        "# Single-binary build: fingerprint static assets, then compile with the\n\
+         # embed-assets feature so the binary serves static/ (incl. the fingerprint\n\
+         # manifest) and i18n locales from itself — no sidecar directories. The app\n\
+         # opts in via `.embedded_static()` / `.embedded_locales()` (see src/main.rs).\n\
+         {embed_auditable_note}\
+         RUN autumn build --embed{embed_auditable}"
+    );
     let (build_step, static_copy) = if embed {
         (
-            "# Single-binary build: fingerprint static assets, then compile with the\n\
-             # embed-assets feature so the binary serves static/ (incl. the fingerprint\n\
-             # manifest) and i18n locales from itself — no sidecar directories. The app\n\
-             # opts in via `.embedded_static()` / `.embedded_locales()` (see src/main.rs).\n\
-             RUN autumn build --embed",
+            embed_build_step.as_str(),
             // Assets/locales are embedded; only migrations/ is staged below.
             "# Assets and locales are embedded in the binary (`autumn build --embed`);\n\
              # only migrations/ is staged, for the one-shot `autumn migrate` job.\n",
         )
     } else {
         (
-            "RUN cargo build --release",
+            "# `cargo auditable` embeds the resolved dependency list into the binary so it\n\
+             # can report its own crate versions with no source tree — see\n\
+             # docs/guide/supply-chain.md. Otherwise an ordinary release build.\n\
+             RUN cargo auditable build --release",
             "COPY --chown=autumn:autumn --from=builder /app/static /app/static\n",
         )
+    };
+    // The in-image SBOM needs `autumn sbom`, which only a CLI at or past
+    // `SUPPLY_CHAIN_MIN_CLI_VERSION` has. Emitting these steps against an older pin
+    // would make `docker build` fail outright, so they are omitted instead: the image
+    // is merely SBOM-less, not broken. The SBOM must resolve the same features the
+    // binary above was compiled with. The embed build turns on `embed-assets`, which
+    // pulls in optional dependencies, so resolving the default set would omit crates
+    // that are genuinely linked and make the documented sidecar-vs-binary cross-check
+    // report spurious binary-only entries.
+    let emits_sbom = cli_supports_supply_chain_flags(cli_version);
+    let sbom_generate_step = if emits_sbom {
+        SBOM_GENERATE_STEP.replace(
+            "{{sbom_features}}",
+            if embed {
+                " --features embed-assets"
+            } else {
+                ""
+            },
+        )
+    } else {
+        String::new()
+    };
+    let (sbom_runtime_copy, sbom_labels) = if emits_sbom {
+        (SBOM_RUNTIME_COPY, SBOM_LABELS)
+    } else {
+        ("", "")
     };
     // Split-topology placeholders exist only in the docker-compose template, so
     // these replacements are no-ops for the other files. Substitute them before
@@ -529,7 +712,7 @@ fn render(template: &str, project_name: &str, embed: bool, split_workers: bool) 
     } else {
         ("", "")
     };
-    template
+    let rendered = template
         .replace("{{worker_service}}", worker_service)
         .replace("{{app_role_env}}", web_role_env)
         .replace("{{project_name}}", project_name)
@@ -537,10 +720,14 @@ fn render(template: &str, project_name: &str, embed: bool, split_workers: bool) 
             "{{rust_version}}",
             option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
         )
-        .replace("{{autumn_cli_version}}", env!("CARGO_PKG_VERSION"))
+        .replace("{{autumn_cli_version}}", cli_version)
         .replace("{{diesel_cli_version}}", "2.3.8")
         .replace("{{build_step}}", build_step)
         .replace("{{static_copy}}", static_copy)
+        .replace("{{sbom_generate_step}}", &sbom_generate_step)
+        .replace("{{sbom_runtime_copy}}", sbom_runtime_copy)
+        .replace("{{sbom_labels}}", sbom_labels);
+    strip_sbom_block(&rendered, cli_supports_supply_chain_flags(cli_version))
 }
 
 fn planned_files(target: Target) -> Vec<(&'static str, &'static str)> {
@@ -736,15 +923,292 @@ mod tests {
         // The provenance ENV must precede the build step so the compile sees it.
         let env_pos = content.find("AUTUMN_BUILD_GIT_SHA=${AUTUMN_BUILD_GIT_SHA}");
         let build_pos = content.find("{{build_step}}").or_else(|| {
-            // `{{build_step}}` is already substituted; both variants run cargo.
+            // `{{build_step}}` is already substituted; both variants run cargo,
+            // now through `cargo auditable` so the binary carries its own
+            // dependency list (issue #1615).
             content
-                .find("cargo build --release")
-                .or_else(|| content.find("autumn build --embed"))
+                .find("RUN cargo auditable build --release")
+                .or_else(|| content.find("RUN autumn build --embed"))
         });
         assert!(
             matches!((env_pos, build_pos), (Some(e), Some(b)) if e < b),
             "provenance ENV must appear before the build step: {content}"
         );
+    }
+
+    #[test]
+    fn an_embed_build_does_not_pass_auditable_to_a_cli_that_lacks_it() {
+        // `--auditable` is a NEW flag on `autumn build`, so it is subject to
+        // exactly the same pin problem as `autumn sbom`: the embed branch
+        // invokes the crates.io CLI the image installed, and an older one
+        // rejects the argument outright. (The non-embed branch is unaffected —
+        // `cargo auditable build` needs only the cargo-auditable crate.)
+        let rendered = render_for_cli(
+            include_str!("templates/release/Dockerfile.tmpl"),
+            "my-app",
+            true,
+            false,
+            "0.7.0",
+        );
+        assert!(
+            rendered.contains("RUN autumn build --embed"),
+            "the embed build must still happen: {rendered}"
+        );
+        assert!(
+            !rendered.contains("--auditable"),
+            "a CLI pinned at 0.7.0 has no --auditable flag; passing it fails the \
+             build with an unknown argument:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_embed_build_passes_auditable_to_a_cli_that_has_it() {
+        let rendered = render_for_cli(
+            include_str!("templates/release/Dockerfile.tmpl"),
+            "my-app",
+            true,
+            false,
+            "0.7.1",
+        );
+        assert!(
+            rendered.contains("RUN autumn build --embed --auditable"),
+            "{rendered}"
+        );
+    }
+
+    /// The non-embed path never touches the autumn CLI for its build, so it is
+    /// auditable on every pin.
+    #[test]
+    fn a_non_embed_build_is_auditable_regardless_of_the_pin() {
+        for cli_version in ["0.7.0", "0.7.1"] {
+            let rendered = render_for_cli(
+                include_str!("templates/release/Dockerfile.tmpl"),
+                "my-app",
+                false,
+                false,
+                cli_version,
+            );
+            assert!(
+                rendered.contains("RUN cargo auditable build --release"),
+                "{cli_version}: {rendered}"
+            );
+        }
+    }
+
+    /// The rendered `RUN autumn sbom …` instruction as ONE logical command,
+    /// `\`-continuations joined. Assertions must be scoped to it: the
+    /// Dockerfile legitimately carries flags like `--features postgres`
+    /// elsewhere, and a whole-file substring check would read them as this
+    /// command's.
+    fn sbom_command(rendered: &str) -> String {
+        // Normalize first: `.gitattributes` says `* text=auto`, so on a Windows
+        // checkout this file's own raw string literals carry CRLF, and the
+        // `\`-continuation join below would silently no-op — leaving the
+        // assertions matching against a truncated one-line command.
+        rendered
+            .replace("\r\n", "\n")
+            .replace("\\\n", " ")
+            .lines()
+            .find(|l| l.trim_start().starts_with("RUN autumn sbom"))
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn a_cli_pin_that_predates_autumn_sbom_omits_the_sbom_steps() {
+        // The Dockerfile `cargo install`s the CLI at its own version. Between a
+        // merge and the next release that is an already-published version with
+        // no `sbom` subcommand — emitting the step anyway would make every
+        // `docker build` fail on an unrecognised subcommand.
+        let rendered = render_for_cli(
+            include_str!("templates/release/Dockerfile.tmpl"),
+            "my-app",
+            false,
+            false,
+            "0.7.0",
+        );
+        assert!(
+            !rendered.contains("autumn sbom"),
+            "must not call a subcommand the pinned CLI lacks:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("sbom.cdx.json"),
+            "and must not COPY a file that was never generated:\n{rendered}"
+        );
+        // The rest of the supply-chain posture does not depend on the CLI at
+        // all, so it stays on.
+        assert!(
+            rendered.contains("cargo auditable build --release"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("RUN autumn setup"), "{rendered}");
+    }
+
+    #[test]
+    fn a_cli_pin_that_ships_autumn_sbom_emits_the_sbom_steps() {
+        let rendered = render_for_cli(
+            include_str!("templates/release/Dockerfile.tmpl"),
+            "my-app",
+            false,
+            false,
+            "0.7.1",
+        );
+        assert!(
+            sbom_command(&rendered).contains("--output /app/sbom.cdx.json"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("/usr/share/autumn/sbom.cdx.json"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("io.autumn.sbom.path"), "{rendered}");
+    }
+
+    /// Generated Dockerfiles are read by humans. A `\`-continued Rust string
+    /// literal that loses its continuation silently indents every following
+    /// line of the block it renders — including instructions — which is how
+    /// this very block first shipped.
+    #[test]
+    fn the_rendered_dockerfile_has_no_stray_indentation() {
+        for cli_version in ["0.7.0", "0.7.1"] {
+            let rendered = render_for_cli(
+                include_str!("templates/release/Dockerfile.tmpl"),
+                "my-app",
+                false,
+                false,
+                cli_version,
+            );
+            for (n, line) in rendered.lines().enumerate() {
+                let leading = line.len() - line.trim_start().len();
+                let trimmed = line.trim_start();
+                if trimmed.starts_with('#') || trimmed.starts_with("COPY ") {
+                    assert_eq!(
+                        leading,
+                        0,
+                        "line {} of the {cli_version} render is indented: {line:?}",
+                        n + 1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_embed_build_sbom_resolves_the_features_it_was_built_with() {
+        // `embed-assets` pulls in optional dependencies; an SBOM resolved
+        // without it would omit crates the shipped binary genuinely links.
+        let embed = render_for_cli(
+            include_str!("templates/release/Dockerfile.tmpl"),
+            "my-app",
+            true,
+            false,
+            "0.7.1",
+        );
+        assert!(
+            sbom_command(&embed).contains("--features embed-assets"),
+            "{embed}"
+        );
+
+        let plain = render_for_cli(
+            include_str!("templates/release/Dockerfile.tmpl"),
+            "my-app",
+            false,
+            false,
+            "0.7.1",
+        );
+        // Scoped to the sbom command: the file legitimately contains
+        // `--features postgres` on the diesel_cli install.
+        assert!(
+            !sbom_command(&plain).contains("--features"),
+            "a non-embed build takes the default feature set: {plain}"
+        );
+    }
+
+    #[test]
+    fn the_supply_chain_gate_opens_for_every_future_version() {
+        // 0.7.1 is deliberately "anything after 0.7.0", so no future release
+        // number has to be predicted.
+        for v in ["0.7.1", "0.8.0", "0.10.0", "1.0.0", "2.3.4"] {
+            assert!(
+                cli_supports_supply_chain_flags(v),
+                "{v} should support the #1615 CLI surface"
+            );
+        }
+        for v in ["0.7.0", "0.6.0", "0.1.0"] {
+            assert!(
+                !cli_supports_supply_chain_flags(v),
+                "{v} predates autumn sbom"
+            );
+        }
+        // A pre-release sorts BEFORE its base version, so `0.7.0-dev` still
+        // predates the feature — the gate must not be fooled by the suffix.
+        assert!(!cli_supports_supply_chain_flags("0.7.0-dev"));
+        assert!(cli_supports_supply_chain_flags("0.8.0-rc.1"));
+        // A string cargo could never resolve is not a published release at
+        // all; nothing is gained by degrading, and the pin would fail first.
+        assert!(cli_supports_supply_chain_flags("not-a-version"));
+    }
+
+    #[test]
+    fn a_gated_deploy_workflow_drops_only_the_sbom_steps() {
+        let with = render_for_cli(
+            include_str!("templates/release/gcp-deploy.yml.tmpl"),
+            "my-app",
+            false,
+            false,
+            "0.7.1",
+        );
+        let without = render_for_cli(
+            include_str!("templates/release/gcp-deploy.yml.tmpl"),
+            "my-app",
+            false,
+            false,
+            "0.7.0",
+        );
+        assert!(with.contains("actions/attest-sbom"), "{with}");
+        assert!(!without.contains("actions/attest-sbom"), "{without}");
+        // The image provenance attestation needs nothing from the autumn CLI,
+        // so it is present either way.
+        for rendered in [&with, &without] {
+            assert!(
+                rendered.contains("actions/attest-build-provenance"),
+                "{rendered}"
+            );
+        }
+        assert!(
+            !with.contains("{{sbom_steps_") && !without.contains("{{sbom_steps_"),
+            "the markers must never reach a generated file"
+        );
+    }
+
+    /// The posture manifest attestation (issue #1624) rides the same keyless
+    /// pipeline as the image and SBOM attestations, needs nothing from the
+    /// autumn CLI, and so survives a CLI pin too old for `autumn sbom`.
+    #[test]
+    fn every_deploy_workflow_attests_the_security_posture_manifest() {
+        for template in [
+            include_str!("templates/release/gcp-deploy.yml.tmpl"),
+            include_str!("templates/release/aws-deploy.yml.tmpl"),
+            include_str!("templates/release/azure-deploy.yml.tmpl"),
+        ] {
+            for cli_version in ["0.7.1", "0.7.0"] {
+                let rendered = render_for_cli(template, "my-app", false, false, cli_version);
+                assert!(
+                    rendered.contains("Attest the security posture manifest"),
+                    "posture attestation missing for CLI {cli_version}:\n{rendered}"
+                );
+                assert!(
+                    rendered.contains("subject-path: security-posture.json"),
+                    "the attested subject must be the committed manifest:\n{rendered}"
+                );
+                assert!(
+                    rendered.contains("hashFiles('security-posture.json') != ''"),
+                    "an app with no committed manifest must not fail its deploy:\n{rendered}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -815,11 +1279,11 @@ mod tests {
         init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
         assert!(
-            content.contains("RUN cargo build --release"),
+            content.contains("RUN cargo auditable build --release"),
             "non-embed project must use the disk-based build: {content}"
         );
         assert!(
-            !content.contains("autumn build --embed"),
+            !content.contains("RUN autumn build --embed"),
             "non-embed project must not require the embed-assets feature"
         );
         assert!(
@@ -924,6 +1388,136 @@ mod tests {
             content.contains("/health"),
             "HEALTHCHECK must probe the /health actuator endpoint"
         );
+    }
+
+    /// Extract the generated `HEALTHCHECK`'s shell command (everything after
+    /// `CMD`), with the Dockerfile line continuations left intact — `sh`
+    /// accepts them verbatim, so the string can be executed as-is.
+    fn healthcheck_command(dockerfile: &str) -> String {
+        let mut lines = dockerfile
+            .lines()
+            .skip_while(|line| !line.starts_with("HEALTHCHECK"));
+        let mut instruction = String::new();
+        for line in &mut lines {
+            instruction.push_str(line);
+            instruction.push('\n');
+            if !line.trim_end().ends_with('\\') {
+                break;
+            }
+        }
+        let cmd_at = instruction
+            .find("CMD ")
+            .unwrap_or_else(|| panic!("HEALTHCHECK has no CMD: {instruction}"));
+        instruction[cmd_at + 4..].to_owned()
+    }
+
+    /// Issue #1603 AC6: an image whose app terminates TLS itself
+    /// (`[server.tls]`) answers `/health` over **HTTPS**, so a HEALTHCHECK
+    /// hardcoded to `http://` marks that container permanently unhealthy —
+    /// and in compose, `depends_on: condition: service_healthy` never
+    /// releases. The probe URL must therefore be overridable at runtime.
+    #[test]
+    fn dockerfile_healthcheck_url_is_overridable_for_direct_tls() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
+        let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
+        let healthcheck = healthcheck_command(&content);
+        assert!(
+            healthcheck.contains("AUTUMN_HEALTHCHECK_URL"),
+            "HEALTHCHECK must honor $AUTUMN_HEALTHCHECK_URL so an HTTPS-terminating \
+             image can be probed over https://, got: {healthcheck}"
+        );
+        assert!(
+            healthcheck.contains("http://localhost:3000/health"),
+            "the default probe URL must stay today's plain-HTTP one, got: {healthcheck}"
+        );
+        assert!(
+            healthcheck.contains("AUTUMN_HEALTHCHECK_INSECURE"),
+            "an HTTPS-terminating image needs a way to skip verification on its own \
+             loopback probe, got: {healthcheck}"
+        );
+    }
+
+    /// The probe skips certificate verification only when the operator says so
+    /// with `AUTUMN_HEALTHCHECK_INSECURE`, never by inferring it from the URL:
+    /// `user@host`, `#fragment` and lookalike hostnames all yield URLs that
+    /// read as loopback but that curl resolves elsewhere, so a URL parser here
+    /// silently turns verification off for a remote endpoint.
+    ///
+    /// Runs the generated command under `sh` with `curl` stubbed out, so this
+    /// asserts the shell's real behavior rather than the template's text.
+    #[cfg(unix)]
+    #[test]
+    fn dockerfile_healthcheck_skips_verification_only_on_explicit_opt_in() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
+        let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
+        let healthcheck = healthcheck_command(&content);
+
+        // `curl` becomes a shell function that echoes its arguments to stderr
+        // (stdout is redirected to /dev/null by the probe itself).
+        let harness = format!("curl() {{ printf '%s\\n' \"$*\" >&2; }}\n{healthcheck}");
+
+        // (url, insecure env, expect --insecure, expect this URL to be probed)
+        let cases: [(Option<&str>, Option<&str>, bool); 7] = [
+            // Default: today's plain-HTTP probe, verification on.
+            (None, None, false),
+            // An https URL alone is NOT enough — fail safe, not fail open.
+            (Some("https://localhost:3000/health"), None, false),
+            // The documented direct-TLS pairing.
+            (Some("https://localhost:3000/health"), Some("1"), true),
+            // Any non-empty value opts in; the value itself is not parsed.
+            (Some("https://localhost:3000/health"), Some("true"), true),
+            // An empty value is not an opt-in.
+            (Some("https://localhost:3000/health"), Some(""), false),
+            // URLs that a parser would have mistaken for loopback stay verified
+            // unless the operator opted in — curl resolves both remotely.
+            (
+                Some("https://localhost:3000@remote.example/health"),
+                None,
+                false,
+            ),
+            (
+                Some("https://remote.example#@localhost/health"),
+                None,
+                false,
+            ),
+        ];
+
+        for (url, insecure, expect_insecure) in cases {
+            let mut command = std::process::Command::new("sh");
+            command.arg("-c").arg(&harness);
+            command.env_remove("AUTUMN_HEALTHCHECK_URL");
+            command.env_remove("AUTUMN_HEALTHCHECK_INSECURE");
+            if let Some(url) = url {
+                command.env("AUTUMN_HEALTHCHECK_URL", url);
+            }
+            if let Some(insecure) = insecure {
+                command.env("AUTUMN_HEALTHCHECK_INSECURE", insecure);
+            }
+            let output = command.output().expect("run the probe under sh");
+            let invocation = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                output.status.success(),
+                "the probe should exit 0 for {url:?}/{insecure:?}, got {:?}: {invocation}",
+                output.status
+            );
+            assert_eq!(
+                invocation.contains("--insecure"),
+                expect_insecure,
+                "certificate verification for url={url:?} insecure={insecure:?} must {} be \
+                 skipped; curl was called as: {invocation}",
+                if expect_insecure { "" } else { "NOT" }
+            );
+            // The probe must hit the URL it was given, verbatim.
+            let expected_url = url.unwrap_or("http://localhost:3000/health");
+            assert!(
+                invocation.contains(expected_url),
+                "the probe must request {expected_url}; curl was called as: {invocation}"
+            );
+        }
     }
 
     #[test]
@@ -1978,16 +2572,15 @@ previous_secrets = []
 
     #[test]
     fn main_tf_sanitized_locals_fall_back_when_input_sanitizes_to_nothing_or_a_digit() {
-        // A Cargo package name made entirely of characters sanitization
-        // strips (e.g. the legal-but-unusual name "_") sanitizes to an
-        // empty string, which would otherwise produce a Postgres server
-        // name starting with "-" (the "${app_name_alnum}-pg-..." pattern),
-        // an empty Postgres database name, and violate resource types that
-        // require a letter-led name (Key Vault) rather than just
-        // alphanumeric (ACR). Both base locals must fall back to a fixed
-        // alphabetic prefix whenever sanitization leaves nothing, or
-        // leaves a value not starting with a letter (a leading digit
-        // survives sanitization but several consumers don't accept it).
+        // A Cargo package name made entirely of characters sanitization strips — the
+        // legal but unusual name "_" — sanitizes to an empty string. That would produce
+        // a Postgres server name starting with "-" (the `${app_name_alnum}-pg-...`
+        // pattern), an empty Postgres database name, and a violation of resource types
+        // requiring a letter-led name, such as Key Vault, rather than merely
+        // alphanumeric, such as ACR. Both base locals must fall back to a fixed
+        // alphabetic prefix whenever sanitization leaves nothing, or leaves a value not
+        // starting with a letter — a leading digit survives sanitization, and several
+        // consumers reject it.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2285,6 +2878,36 @@ previous_secrets = []
     }
 
     #[test]
+    fn azure_container_apps_defaults_to_zero_replicas_for_bootstrap_safety() {
+        // The initial Terraform-managed app revision uses a public placeholder image
+        // solely because Container Apps requires an image before the user's ACR has
+        // one. Keep it scaled to zero by default so that placeholder is not started
+        // with production secret refs or the app's Key Vault-capable identity.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+
+        let variables_tf = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        let min_replicas_block = variables_tf
+            .split("variable \"min_replicas\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("variables.tf must declare min_replicas");
+        assert!(
+            min_replicas_block.contains("default     = 0")
+                || min_replicas_block.contains("default = 0"),
+            "min_replicas must default to 0 so the public bootstrap image is not run \
+             with production secrets before the first real deploy: {variables_tf}"
+        );
+
+        let tfvars = fs::read_to_string(dir.join("terraform.tfvars.example")).unwrap();
+        assert!(
+            tfvars.contains("min_replicas        = 0") || tfvars.contains("min_replicas = 0"),
+            "terraform.tfvars.example must preserve the safe bootstrap default: {tfvars}"
+        );
+    }
+
+    #[test]
     fn variables_tf_marks_secret_inputs_sensitive_with_no_default() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
@@ -2577,15 +3200,13 @@ previous_secrets = []
 
     #[test]
     fn azure_workflow_updates_migration_job_image_before_starting_it() {
-        // `az containerapp job start --image ...` sends an execution-TEMPLATE
-        // OVERRIDE, which Azure treats as a full replacement, not a merge —
-        // an override containing only --image drops the Terraform-configured
-        // `command` (autumn migrate) and the AUTUMN_DATABASE__PRIMARY_URL
-        // secret env, so the execution would run the container's default
-        // command with no DB URL instead of applying migrations. The image
-        // must instead be persisted onto the job's stored template via
-        // `job update --image` BEFORE a bare `job start` (no --image) runs
-        // that complete, up-to-date template.
+        // `az containerapp job start --image ...` sends an execution-template override,
+        // which Azure treats as a full replacement rather than a merge. An override
+        // containing only `--image` drops the Terraform-configured `command` (autumn
+        // migrate) and the `AUTUMN_DATABASE__PRIMARY_URL` secret env, so the execution
+        // would run the container's default command with no DB URL instead of applying
+        // migrations. The image must instead be persisted onto the job's stored template
+        // via `job update --image` before a bare `job start` runs that complete template.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2824,19 +3445,17 @@ previous_secrets = []
 
     #[test]
     fn azure_workflow_image_tag_is_unique_per_execution() {
-        // Two workflow_dispatch runs on the same branch would otherwise
-        // compute the identical tag despite different commits — the commit
-        // SHA guards against that. But re-running workflow_dispatch on the
-        // same branch, or clicking "Re-run jobs" on an existing run, reuses
-        // the identical ref AND commit while still producing a genuinely
-        // different build (a fresh AUTUMN_BUILD_TIMESTAMP, possibly
-        // different base-image bytes) — so the tag must also include
-        // GITHUB_RUN_ID (unique per trigger) and GITHUB_RUN_ATTEMPT
-        // (disambiguates re-runs of that same trigger) to be unique per
-        // actual execution, not just per commit. Re-pushing bytes under a
-        // tag Azure already has configured on the Container App isn't
-        // guaranteed to register as a revision-scope change, so the old
-        // binary could keep serving against a newly migrated schema.
+        // Two workflow_dispatch runs on the same branch would otherwise compute the
+        // identical tag despite different commits, which the commit SHA guards against.
+        // But re-running workflow_dispatch on the same branch, or clicking "Re-run jobs"
+        // on an existing run, reuses the identical ref and commit while still producing a
+        // genuinely different build — a fresh `AUTUMN_BUILD_TIMESTAMP`, possibly
+        // different base-image bytes. So the tag must also include `GITHUB_RUN_ID`,
+        // unique per trigger, and `GITHUB_RUN_ATTEMPT`, which disambiguates re-runs of
+        // that trigger, to be unique per execution rather than per commit. Re-pushing
+        // bytes under a tag Azure already has configured on the Container App is not
+        // guaranteed to register as a revision-scope change, so the old binary could keep
+        // serving against a newly migrated schema.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -3649,10 +4268,79 @@ previous_secrets = []
             "the App Runner service must start from the bootstrap placeholder image: {service_block}"
         );
         assert!(
-            service_block
-                .contains("ignore_changes = [source_configuration, instance_configuration, health_check_configuration]"),
+            service_block.contains(
+                "ignore_changes = [source_configuration, instance_configuration[0].instance_role_arn, health_check_configuration]"
+            ),
             "the App Runner service must ignore source_configuration drift once CI/the manual \
              walkthrough deploys the real image: {service_block}"
+        );
+    }
+
+    #[test]
+    fn aws_app_runner_instance_sizing_vars_stay_terraform_managed_after_cutover() {
+        // Issue #2256: the cutover call (docs/guide/deployment.md) only
+        // ever sets instance_role_arn, never cpu/memory. Ignoring the whole
+        // instance_configuration block — not just the role field — used to
+        // suppress a later `terraform apply` from resizing the service
+        // even after an operator changed var.instance_cpu/instance_memory.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let service_block = content
+            .split("resource \"aws_apprunner_service\" \"this\"")
+            .nth(1)
+            .expect("main.tf must declare the App Runner service");
+        let lifecycle_block = service_block
+            .split("lifecycle {")
+            .nth(1)
+            .expect("the App Runner service must declare a lifecycle block");
+        assert!(
+            lifecycle_block.contains("ignore_changes = [source_configuration, instance_configuration[0].instance_role_arn, health_check_configuration]"),
+            "only instance_role_arn must be ignored within instance_configuration, so \
+             var.instance_cpu/var.instance_memory changes still reach AWS on \
+             `terraform apply`: {lifecycle_block}"
+        );
+        assert!(
+            !lifecycle_block.contains("instance_configuration,")
+                && !lifecycle_block.contains("instance_configuration]"),
+            "instance_configuration must not be ignored as a whole block — that would \
+             also suppress cpu/memory resizing: {lifecycle_block}"
+        );
+    }
+
+    #[test]
+    fn aws_app_runner_instance_sizing_vars_are_declared_and_wired() {
+        // Guards the other half of issue #2256's fix: a narrowed
+        // `ignore_changes` is worthless if instance_cpu/instance_memory
+        // stop being declared or wired into instance_configuration.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+
+        let variables = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        assert!(
+            variables.contains("variable \"instance_cpu\""),
+            "variables.tf must declare instance_cpu: {variables}"
+        );
+        assert!(
+            variables.contains("variable \"instance_memory\""),
+            "variables.tf must declare instance_memory: {variables}"
+        );
+
+        let main_tf = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let instance_block = main_tf
+            .split("instance_configuration {")
+            .nth(1)
+            .and_then(|block| block.split('}').next())
+            .expect("service must declare instance_configuration");
+        assert!(
+            instance_block.contains("cpu                = var.instance_cpu"),
+            "instance_configuration must wire cpu from var.instance_cpu: {instance_block}"
+        );
+        assert!(
+            instance_block.contains("memory             = var.instance_memory"),
+            "instance_configuration must wire memory from var.instance_memory: {instance_block}"
         );
     }
 
@@ -3703,8 +4391,9 @@ previous_secrets = []
             .nth(1)
             .expect("main.tf must declare the App Runner service");
         assert!(
-            service_block
-                .contains("ignore_changes = [source_configuration, instance_configuration, health_check_configuration]"),
+            service_block.contains(
+                "ignore_changes = [source_configuration, instance_configuration[0].instance_role_arn, health_check_configuration]"
+            ),
             "the App Runner service must ignore health_check_configuration drift alongside \
              source_configuration: {service_block}"
         );
@@ -4182,6 +4871,62 @@ previous_secrets = []
         let workflow = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
         assert!(workflow.contains("--argjson SECRETS"));
         assert!(workflow.contains(".containerDefinitions[0].secrets = $SECRETS"));
+    }
+
+    #[test]
+    fn aws_ecs_migrate_task_carries_the_full_app_secret_set() {
+        // Issue #2255: CI (and the manual walkthrough) copy the "migrate"
+        // task definition's `secrets` onto the "app" task definition when
+        // registering the real image. A migrate task that only reads
+        // AUTUMN_DATABASE__PRIMARY_URL therefore strips the signing secret
+        // (and Redis URL) from every real app deploy. The migrate task must
+        // carry the SAME secret set as the app, not just what `autumn
+        // migrate` itself needs.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let migrate = content
+            .split("resource \"aws_ecs_task_definition\" \"migrate\"")
+            .nth(1)
+            .and_then(|block| block.split("\nresource").next())
+            .expect("main.tf must declare the migrate task definition");
+        assert!(
+            migrate.contains("secrets = local.container_secrets"),
+            "the migrate task must reuse the full app secret list, not a \
+             narrower hand-picked one: {migrate}"
+        );
+        assert!(
+            !migrate.contains("AUTUMN_DATABASE__PRIMARY_URL\", valueFrom"),
+            "the migrate task must not hardcode a partial secret list \
+             inline: {migrate}"
+        );
+
+        // The migrate task only reuses `local.container_secrets` — confirm
+        // that local itself carries all three secrets (database URL,
+        // signing secret, and the Redis URL gated by enable_redis_cache),
+        // so reuse alone is not enough if that local ever narrows.
+        let container_secrets_local = content
+            .split("container_secrets = concat(")
+            .nth(1)
+            .and_then(|block| block.split("secrets_manager_arns").next())
+            .expect("main.tf must declare local.container_secrets");
+        for secret in [
+            "AUTUMN_DATABASE__PRIMARY_URL",
+            "AUTUMN_SECURITY__SIGNING_SECRET",
+        ] {
+            assert!(
+                container_secrets_local.contains(secret),
+                "local.container_secrets must include {secret}: \
+                 {container_secrets_local}"
+            );
+        }
+        assert!(
+            container_secrets_local.contains("var.enable_redis_cache")
+                && container_secrets_local.contains("AUTUMN_CACHE__REDIS__URL"),
+            "local.container_secrets must include AUTUMN_CACHE__REDIS__URL, \
+             gated by enable_redis_cache: {container_secrets_local}"
+        );
     }
 
     #[test]
@@ -4801,15 +5546,13 @@ previous_secrets = []
 
     #[test]
     fn aws_workflow_strips_bootstrap_entrypoint_only_from_the_app_registration() {
-        // Terraform's bootstrap "app" task definition overrides
-        // entryPoint/command to make the placeholder nginx image satisfy
-        // the ALB health check (main.tf) — describe-task-definition would
-        // otherwise carry that override forward onto the REAL image, which
-        // has no nginx and runs as an unprivileged user, so the container
-        // would exit immediately instead of falling through to its own
-        // Dockerfile ENTRYPOINT/CMD. The "migrate" family's own `command`
-        // (autumn migrate) is intentional and permanent, so its
-        // registration step must NOT strip it.
+        // Terraform's bootstrap "app" task definition overrides entryPoint and command
+        // so the placeholder nginx image satisfies the ALB health check (main.tf).
+        // `describe-task-definition` would otherwise carry that override forward onto the
+        // real image, which has no nginx and runs as an unprivileged user, so the
+        // container would exit immediately instead of falling through to its own
+        // Dockerfile ENTRYPOINT/CMD. The "migrate" family's own `command` (autumn
+        // migrate) is intentional and permanent, so its registration step must not strip it.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
@@ -5087,18 +5830,15 @@ previous_secrets = []
 
     #[test]
     fn gcp_vpc_connector_name_respects_the_weighted_21_char_limit() {
-        // Serverless VPC Access connector names must stay under 21
-        // characters where EACH HYPHEN COUNTS AS TWO characters toward that
-        // limit (confirmed against Google's own docs: "must be less than
-        // 21 characters long, and ... hyphens (-) count as two
-        // characters") — an undocumented-in-the-Terraform-provider quirk
-        // distinct from the usual RFC 1035 label rule every other resource
-        // here follows. A 10-letter, hyphen-free base ("abcdefghij") plus
-        // the fixed "-connector" suffix already sits at the weighted
-        // boundary (10 + 2 + 9 = 21, i.e. rejected), so a naive raw
-        // character cap (this scaffold's previous 15-character cap) is far
-        // too permissive, and any cap that doesn't first strip hyphens
-        // from the base can blow the budget on hyphens alone.
+        // Serverless VPC Access connector names must stay under 21 characters, where
+        // each hyphen counts as two toward that limit. Google's own docs: "must be less
+        // than 21 characters long, and ... hyphens (-) count as two characters" — an
+        // undocumented-in-the-provider quirk distinct from the RFC 1035 label rule every
+        // other resource here follows. A 10-letter, hyphen-free base ("abcdefghij") plus
+        // the fixed "-connector" suffix already sits at the weighted boundary (10 + 2 + 9
+        // = 21, rejected), so a naive raw character cap — this scaffold's previous
+        // 15-character cap — is far too permissive, and any cap that does not first strip
+        // hyphens from the base can blow the budget on hyphens alone.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -5248,18 +5988,15 @@ previous_secrets = []
 
     #[test]
     fn gcp_main_tf_secret_refs_pin_the_created_version_not_latest() {
-        // Cloud Run resolves a secret_key_ref's version once, when a NEW
-        // revision is created — an already-running revision's already-
-        // running instances never re-read "latest". If the env block kept
-        // the literal string "latest", rotating database_admin_password/
-        // signing_secret via Terraform (which creates a new
-        // google_secret_manager_secret_version) wouldn't change anything
-        // Terraform sees as a diff in the Cloud Run service/job spec, so no
-        // new revision would roll out at all — leaving the whole fleet
-        // pinned to the OLD secret value while Cloud SQL had already
-        // started requiring the NEW password. Referencing the version
-        // resource's own `.version` attribute means a rotation IS a diff,
-        // and rolls out as a new revision.
+        // Cloud Run resolves a `secret_key_ref`'s version once, when a new revision is
+        // created; an already-running revision's instances never re-read "latest". If the
+        // env block kept the literal string "latest", rotating `database_admin_password`
+        // or `signing_secret` via Terraform — which creates a new
+        // `google_secret_manager_secret_version` — would change nothing Terraform sees as
+        // a diff in the Cloud Run service or job spec, so no new revision would roll out.
+        // The whole fleet would stay pinned to the old secret value while Cloud SQL had
+        // already started requiring the new password. Referencing the version resource's
+        // own `.version` attribute makes a rotation a diff, and rolls out a new revision.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -5285,18 +6022,15 @@ previous_secrets = []
 
     #[test]
     fn gcp_database_url_secret_version_waits_for_sql_user_password_update() {
-        // Unlike AWS RDS (master password lives on the DB instance
-        // resource itself, so referencing its .address here already
-        // creates an implicit ordering edge), Cloud SQL splits the
-        // instance and its user credentials into two independent
-        // resources: google_sql_database_instance.this (referenced for
-        // the private IP) and google_sql_user.this (which actually owns
-        // `password`). Without an explicit dependency, rotating
-        // database_admin_password gives Terraform no reason to apply the
-        // google_sql_user.this password update before this secret
-        // version — the Cloud Run revision this secret version triggers
-        // (via the pinned .version) could then start using the NEW
-        // password before Cloud SQL has actually accepted it.
+        // Unlike AWS RDS, where the master password lives on the DB instance resource
+        // itself and referencing its `.address` already creates an implicit ordering
+        // edge, Cloud SQL splits the instance and its user credentials into two
+        // independent resources: `google_sql_database_instance.this`, referenced for the
+        // private IP, and `google_sql_user.this`, which owns `password`. Without an
+        // explicit dependency, rotating `database_admin_password` gives Terraform no
+        // reason to apply the `google_sql_user.this` password update before this secret
+        // version — so the Cloud Run revision that version triggers, via the pinned
+        // `.version`, could start using the new password before Cloud SQL accepts it.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();

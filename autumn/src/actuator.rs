@@ -384,6 +384,17 @@ pub trait ProvideActuatorState {
     fn log_buffer(&self) -> Option<crate::log::capture::LogBuffer> {
         None
     }
+
+    /// Returns the shadow-mirroring handle, when this replica assembled a
+    /// mirror (`[shadow] enabled = true` with a reachable target configured).
+    ///
+    /// The default returns `None` — mirroring is off — and
+    /// `{prefix}/shadow` then reports a disabled mirror rather than 404ing, so
+    /// an operator turning the feature on can tell "not enabled here" apart
+    /// from "endpoint not mounted".
+    fn shadow(&self) -> Option<crate::shadow::ShadowHandle> {
+        None
+    }
 }
 
 // ── Shared types for AppState ──────────────────────────────────
@@ -804,6 +815,93 @@ struct QueueGaugeState {
     /// injected clock for exactly this reason, while the redis survey already
     /// stamps from that clock and passes its marks through unchanged.
     surveyed: Option<HashMap<String, (u64, Option<u64>)>>,
+    /// Postgres-backed jobs' own waiting mark, by job id, so an admin-cancel
+    /// (`JobRegistry::record_cancel_at_backend_offset`) can remove precisely
+    /// the mark it pushed instead of guessing which of several co-queued
+    /// marks belongs to it — a guess that can land on the wrong job when two
+    /// marks happen to sit at (or near) the same instant. `Self::record_pg_start`
+    /// removes a job's entry the moment its mark is popped from the waiting
+    /// queue (a non-terminal retry re-adds it with the retry's own mark), so
+    /// growth tracks live queue residency, not lifetime enqueue count.
+    /// Bounded by [`PG_MARKS_BY_JOB_ID_CAP`] regardless, as a backstop for
+    /// jobs enqueued but never claimed (a crashed worker, a queue with no
+    /// consumer) — without it those would still leak one entry each forever.
+    ///
+    /// Removed with [`indexmap::IndexMap::swap_remove_index`], not
+    /// `shift_remove_index`: this map's *physical* order is never read (each
+    /// [`PgMark`] carries its own [`PgMark::seq`] for that), so there is no
+    /// reason to pay `shift_remove_index`'s O(n) shift-every-later-entry cost
+    /// on every capacity eviction — under sustained enqueue-only load past
+    /// the cap, that is *every* subsequent enqueue.
+    pg_marks_by_job_id: indexmap::IndexMap<String, PgMark>,
+    /// Monotonic counter handing out each new [`PgMark`]'s [`PgMark::seq`].
+    pg_marks_next_seq: u64,
+    /// `seq` → id, mirroring [`Self::pg_marks_by_job_id`]'s keys in
+    /// insertion order. Eviction walks this ascending (oldest first) and
+    /// stops at the first entry that is actually due, rather than scanning
+    /// every entry in [`Self::pg_marks_by_job_id`] to find the *provably
+    /// oldest* due one: any due entry is an equally valid eviction target
+    /// (nothing here relies on evicting the single oldest of them), and an
+    /// older entry has had more time to become due, so this walk is O(1) in
+    /// the common case — a long-lived backlog past the cap keeps its oldest
+    /// entries genuinely overdue, not its newest ones. Only a workload where
+    /// no entry is ever due (every mark carries a far-future instant) still
+    /// walks every entry, matching the fallback's own already-O(n) oldest
+    /// lookup in that case.
+    pg_marks_seq_order: std::collections::BTreeMap<u64, String>,
+}
+
+/// Cap on [`QueueGaugeState::pg_marks_by_job_id`]. Comfortably above any
+/// realistic count of Postgres jobs sitting `enqueued` at once — enough that
+/// a job an operator wants to cancel is essentially always still tracked —
+/// while keeping the map's memory bounded no matter how large an unclaimed
+/// backlog grows.
+const PG_MARKS_BY_JOB_ID_CAP: usize = 10_000;
+
+/// Which clock a [`PgMark`]'s `ms` value is measured on.
+///
+/// `note_pg_job_mark`'s eviction used to compare every entry against both
+/// the registry's own clock and real time, requiring both to agree an entry
+/// was due before evicting it — safe against wrongly evicting a
+/// still-delayed entry, but it can also make eviction blind: a `FixedClock`/
+/// `TickingClock` registry clock that has drifted *behind* real time (not
+/// just ahead, the case that motivated the both-clocks check) makes every
+/// real-timeline mark compare as "not yet due" against the registry clock
+/// forever, however far in the real past it actually is, so eviction can
+/// never recognize any of them as safe to evict and falls back to
+/// oldest-inserted — which can just as easily be the one genuinely-delayed
+/// entry sitting first among thousands of already-claimed ones. Tagging each
+/// mark with the one clock that actually measures it (known unambiguously at
+/// insertion time: [`JobRegistry::record_pg_enqueue`] passes a real instant
+/// for an absolute/relative-delay enqueue, `None` — resolved from the
+/// registry's own [`JobRegistry::now_ms`] — for an immediate one) lets
+/// eviction judge each entry correctly instead of guessing from its
+/// magnitude against a clock that may not be its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PgMarkTimeline {
+    /// A real epoch-ms instant: an `enqueue_at`/`enqueue_in` mark, forwarded
+    /// unchanged or reconstructed via [`JobClient::due_origin`]'s real-time
+    /// reading — the same timeline Postgres's own `clock_timestamp()`
+    /// measures `run_at` against.
+    Real,
+    /// The registry's own (possibly injected/virtual) clock reading at
+    /// enqueue time — an immediate enqueue's mark.
+    Registry,
+}
+
+/// A [`QueueGaugeState::pg_marks_by_job_id`] entry: the raw waiting-queue
+/// mark plus which clock ([`PgMarkTimeline`]) it is measured on, so eviction
+/// can judge "due" against the one clock that actually applies to it.
+#[derive(Clone, Copy, Debug)]
+struct PgMark {
+    ms: u64,
+    timeline: PgMarkTimeline,
+    /// This entry's position in insertion order, from
+    /// [`QueueGaugeState::pg_marks_next_seq`] — capacity eviction's
+    /// "oldest" fallback reads this instead of the map's physical position,
+    /// so removal can use O(1) `swap_remove_index` instead of an
+    /// order-preserving (and so O(n)) shift.
+    seq: u64,
 }
 
 /// Rebase a surveyed age onto the registry's timeline.
@@ -1047,6 +1145,40 @@ impl JobRegistry {
         self.record_enqueue_at(name, ready_at_ms);
     }
 
+    /// [`Self::record_enqueue`]/[`Self::record_enqueue_scheduled`] for a
+    /// Postgres-backed job, additionally remembering the exact mark pushed
+    /// under `id` (`note_pg_job_mark`) for a later
+    /// [`Self::record_cancel_at_backend_offset`]'s exact lookup.
+    ///
+    /// `ready_at_ms` is `Some` for a scheduled enqueue (its mark, stamped
+    /// from whichever clock `timeline` names) or `None` for an immediate
+    /// one (always this registry's own clock, read once here rather than
+    /// inside [`Self::record_enqueue`] so the exact same value can be
+    /// remembered — `timeline` is ignored in this case).
+    ///
+    /// `timeline` must name the clock `ready_at_ms` was actually measured
+    /// on — the caller's job, not something this method can infer from
+    /// `ready_at_ms` being present. A Postgres retry mirroring the nack
+    /// UPDATE's `run_at = NOW() + backoff` locally, for instance, still
+    /// reads `state.clock()` (the registry's own, [`PgMarkTimeline::Registry`])
+    /// even though it always supplies `Some`, unlike an `enqueue_at`/
+    /// `enqueue_in` mark, which is real time ([`PgMarkTimeline::Real`]) —
+    /// `Some`-ness alone does not say which.
+    pub(crate) fn record_pg_enqueue(
+        &self,
+        name: &str,
+        id: &str,
+        ready_at_ms: Option<u64>,
+        timeline: PgMarkTimeline,
+    ) {
+        let (ready_at_ms, timeline) = ready_at_ms.map_or_else(
+            || (self.now_ms(), PgMarkTimeline::Registry),
+            |ms| (ms, timeline),
+        );
+        self.record_enqueue_at(name, ready_at_ms);
+        self.note_pg_job_mark(id, ready_at_ms, timeline);
+    }
+
     /// Shared enqueue bookkeeping: bump the per-name `queued` counter and push a
     /// per-queue waiting mark stamped with the job's ready-at time.
     fn record_enqueue_at(&self, name: &str, ready_at_ms: u64) {
@@ -1176,6 +1308,66 @@ impl JobRegistry {
         self.pop_waiting(name, true);
     }
 
+    /// [`Self::record_start`] for a Postgres-backed job, additionally
+    /// removing `id`'s own `pg_marks_by_job_id` entry — precisely, not via
+    /// the generic [`Self::pop_waiting`] plain `record_start` delegates to.
+    ///
+    /// `pop_waiting` does not know about job identity: it removes whichever
+    /// ready mark comes first in this queue's internal order, which is not
+    /// necessarily `id`'s own mark — Postgres can start a later-enqueued job
+    /// ahead of an older one this process still has concurrency-blocked.
+    /// Popping generically and then unconditionally forgetting `id`'s entry
+    /// would tear down `id`'s mapping even when its actual mark never left
+    /// the queue, while some other still-waiting job's mark vanished in its
+    /// place. Look up and remove `id`'s own mark first instead, falling back
+    /// to the generic pop (matching plain `record_start`) only when no exact
+    /// entry exists or it is already stale — the same stale-degrades-to-
+    /// fallback pattern [`Self::record_cancel_at_backend_offset`] uses — so a
+    /// cancel racing this start never finds a torn-down mapping for a mark
+    /// that in fact never left the queue. A non-terminal retry re-adds the
+    /// entry with the retry's own mark via [`Self::record_pg_enqueue`]; a
+    /// job that succeeds or terminally fails never needs it again.
+    pub(crate) fn record_pg_start(&self, name: &str, id: &str) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.queued = status.queued.saturating_sub(1);
+            status.in_flight = status.in_flight.saturating_add(1);
+        }
+        let exact_ms = self
+            .queues
+            .write()
+            .ok()
+            .and_then(|mut guard| {
+                let removed = guard.pg_marks_by_job_id.swap_remove(id)?;
+                guard.pg_marks_seq_order.remove(&removed.seq);
+                Some(removed)
+            })
+            .map(|mark| mark.ms);
+        let removed_exact = exact_ms.is_some_and(|exact_ms| self.pop_waiting_exact(name, exact_ms));
+        if !removed_exact {
+            self.pop_waiting(name, true);
+        }
+    }
+
+    /// Forget `id`'s `pg_marks_by_job_id` entry without touching any waiting
+    /// mark — for an enqueue attempt that [`Self::record_pg_enqueue`]
+    /// registered provisionally but that never became a real queued row: a
+    /// dedup coalesce into an existing unique job, a backend error, or an
+    /// interceptor that skipped the actual enqueue. That `id` will never be
+    /// looked up by an admin-cancel — no row was ever inserted under it — so
+    /// leaving the entry in place would only crowd out a genuinely
+    /// still-queued job's mapping under [`PG_MARKS_BY_JOB_ID_CAP`] for no
+    /// benefit. A no-op if `id` was never entered (a non-Postgres backend,
+    /// or an entry already removed).
+    pub(crate) fn forget_pg_job_mark(&self, id: &str) {
+        if let Ok(mut guard) = self.queues.write()
+            && let Some(removed) = guard.pg_marks_by_job_id.swap_remove(id)
+        {
+            guard.pg_marks_seq_order.remove(&removed.seq);
+        }
+    }
+
     /// Record that a queued job was canceled before execution.
     pub fn record_cancel(&self, name: &str) {
         if let Ok(mut guard) = self.inner.write()
@@ -1200,6 +1392,175 @@ impl JobRegistry {
         self.pop_waiting(name, false);
     }
 
+    /// Remember the exact per-queue waiting mark a Postgres-backed enqueue
+    /// pushed, keyed by job id, so a later [`Self::record_cancel_at_backend_offset`]
+    /// can remove precisely that mark instead of guessing which of several
+    /// co-queued marks belongs to it.
+    ///
+    /// Bounded by [`PG_MARKS_BY_JOB_ID_CAP`]: a job that falls out (or was
+    /// never entered — see that method's fallback) is not lost, it just
+    /// falls back to candidate-based matching there.
+    ///
+    /// This table is per-process, in-memory state — in a split web/worker
+    /// deployment, a web replica that only enqueues (`run_workers == false`,
+    /// see `start_postgres_runtime`) never calls [`Self::record_pg_start`],
+    /// so every entry it inserts would otherwise sit here until capacity
+    /// eviction, regardless of whether some other replica has long since
+    /// claimed and finished the job. Eviction therefore prefers an entry
+    /// that is already due: Postgres never hands a row to a claimer before
+    /// its own `run_at`, so an entry still in the future is *guaranteed* to
+    /// be a live, uncontested "enqueued but not yet claimable" mark, while
+    /// an already-due one may well have been claimed by this process or
+    /// another already.
+    ///
+    /// "Already due" has to be judged carefully: values in this table sit on
+    /// two different timelines depending on how they were enqueued — an
+    /// absolute (`enqueue_at`) or relative-delay (`enqueue_in`) mark is real
+    /// time (`JobClient::due_origin`'s Postgres convention), while an
+    /// immediate one is this registry's own (possibly injected/virtual)
+    /// clock (see [`Self::record_pg_enqueue`]). Each entry carries a
+    /// [`PgMarkTimeline`] tag saying which, fixed unambiguously at
+    /// insertion time, so eviction judges every mark against the one clock
+    /// that actually measures it instead of guessing from its magnitude —
+    /// comparing a mark against the *other*, irrelevant clock (or requiring
+    /// both to agree, an earlier version of this check) can misjudge it
+    /// whenever the registry clock diverges from wall time in either
+    /// direction: a `FixedClock`/`TickingClock` far ahead of real time can
+    /// make a genuinely-still-delayed real-time mark look "due" against the
+    /// registry clock alone, while one far *behind* real time can make an
+    /// already-claimed real-time mark look "not yet due" against the
+    /// registry clock forever, blinding eviction to every real-timeline
+    /// entry and leaving it to fall back on oldest-inserted regardless of
+    /// which entry that happens to be. Falling back to oldest-inserted
+    /// (matching this method's pre-existing behavior) still happens when no
+    /// entry's own clock calls it due.
+    pub(crate) fn note_pg_job_mark(&self, id: &str, ready_at_ms: u64, timeline: PgMarkTimeline) {
+        if let Ok(mut guard) = self.queues.write() {
+            if guard.pg_marks_by_job_id.len() >= PG_MARKS_BY_JOB_ID_CAP
+                && !guard.pg_marks_by_job_id.contains_key(id)
+            {
+                let registry_now = self.now_ms();
+                let real_now =
+                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(u64::MAX);
+                // Walk oldest-first (ascending `seq`) and stop at the first
+                // entry that is actually due; only when none is found (the
+                // loop runs to completion) fall back to the oldest entry
+                // overall (`pg_marks_seq_order`'s own first key). See
+                // `pg_marks_seq_order`'s doc comment for why this is not a
+                // full scan in the common case.
+                let evict_id = guard
+                    .pg_marks_seq_order
+                    .iter()
+                    .find_map(|(_, candidate_id)| {
+                        let mark = guard.pg_marks_by_job_id.get(candidate_id)?;
+                        let due = match mark.timeline {
+                            PgMarkTimeline::Real => mark.ms <= real_now,
+                            PgMarkTimeline::Registry => mark.ms <= registry_now,
+                        };
+                        due.then(|| candidate_id.clone())
+                    })
+                    .or_else(|| guard.pg_marks_seq_order.values().next().cloned());
+                if let Some(evict_id) = evict_id
+                    && let Some(evicted) = guard.pg_marks_by_job_id.swap_remove(&evict_id)
+                {
+                    guard.pg_marks_seq_order.remove(&evicted.seq);
+                }
+            }
+            let seq = guard.pg_marks_next_seq;
+            guard.pg_marks_next_seq = guard.pg_marks_next_seq.wrapping_add(1);
+            guard.pg_marks_seq_order.insert(seq, id.to_string());
+            guard.pg_marks_by_job_id.insert(
+                id.to_string(),
+                PgMark {
+                    ms: ready_at_ms,
+                    timeline,
+                    seq,
+                },
+            );
+        }
+    }
+
+    /// Record that an enqueued Postgres-backed job was canceled, given the
+    /// database's own measurement of its due time, and remove precisely the
+    /// waiting mark that job pushed.
+    ///
+    /// Looks up `id` in the exact-mark table `note_pg_job_mark` populated
+    /// at enqueue time first — this is unambiguous by
+    /// construction, immune to two co-queued marks coincidentally landing at
+    /// (or near) the same instant. Falls back to nearest-match over three
+    /// candidate timelines only when no exact entry exists (evicted for
+    /// capacity, or never recorded — the transactional `enqueue_on_conn`
+    /// path skips registry bookkeeping entirely, by design, until its
+    /// surrounding transaction commits):
+    ///
+    /// * an **absolute** enqueue (`enqueue_at`) stamps the registry mark with
+    ///   the caller's own instant verbatim, byte-identical to `absolute_ms`
+    ///   (Postgres's stored `run_at`, forwarded unchanged) — no clock read
+    ///   in between, so this candidate matches it exactly;
+    /// * a **relative-delay** enqueue (`enqueue_in`) stamps the mark from
+    ///   `JobClient::due_origin`'s real-time reading at enqueue time, so
+    ///   `real_reference_ms + offset_ms` (translating the database's
+    ///   `run_at - clock_timestamp()` onto that same real timeline)
+    ///   reconstructs it;
+    /// * an **immediate** enqueue stamps the mark from this registry's own
+    ///   injected clock (`record_enqueue`), so `self.now_ms() + offset_ms`
+    ///   reconstructs it instead.
+    ///
+    /// The fallback mirrors [`ready_at_from_age`]'s translate-onto-a-known-timeline
+    /// approach, tried against all three candidates: the nearest existing
+    /// mark to *any* candidate is removed, instead of deciding a
+    /// ready/scheduled category from the offset and asking this registry's
+    /// internal category search to find any mark sharing it, which is only
+    /// correct when every mark in the queue shares one timeline with the
+    /// offset. It can still, rarely, pick an unrelated co-queued job's mark
+    /// (the reason the exact lookup exists at all) — that mismatch corrects
+    /// itself at the next durable-backend survey tick.
+    ///
+    /// An exact entry can still, in principle, be stale — a caller that
+    /// pushes a waiting mark without going through `record_pg_start`/
+    /// `record_pg_enqueue`'s matched clear-then-reset pair (`Self::record_start`
+    /// itself, used directly by the local/redis backends, never touches
+    /// `pg_marks_by_job_id` at all) could leave an entry pointing at a value
+    /// no longer in the queue. The exact removal reports whether it actually
+    /// removed something, and this only trusts the exact lookup when it did
+    /// — a stale entry falls through to the same candidate fallback as no
+    /// entry at all, rather than silently leaving the job's real mark in
+    /// place.
+    pub fn record_cancel_at_backend_offset(
+        &self,
+        name: &str,
+        id: &str,
+        absolute_ms: Option<u64>,
+        real_reference_ms: u64,
+        offset_ms: i64,
+    ) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.queued = status.queued.saturating_sub(1);
+        }
+        let exact_ms = self
+            .queues
+            .write()
+            .ok()
+            .and_then(|mut guard| {
+                let removed = guard.pg_marks_by_job_id.swap_remove(id)?;
+                guard.pg_marks_seq_order.remove(&removed.seq);
+                Some(removed)
+            })
+            .map(|mark| mark.ms);
+        if let Some(exact_ms) = exact_ms
+            && self.pop_waiting_exact(name, exact_ms)
+        {
+            return;
+        }
+        let mut candidates: Vec<u64> = Vec::with_capacity(3);
+        candidates.extend(absolute_ms);
+        candidates.push(real_reference_ms.saturating_add_signed(offset_ms));
+        candidates.push(self.now_ms().saturating_add_signed(offset_ms));
+        self.pop_waiting_nearest(name, &candidates);
+    }
+
     /// Drop one waiting mark for this job's queue (its wait is over).
     ///
     /// `prefer_ready` picks which mark to remove when the queue holds a mix of
@@ -1221,6 +1582,101 @@ impl JobRegistry {
                 waiting.remove(idx);
             }
         }
+    }
+
+    /// Drop the waiting mark closest to any of `candidates`, each expressed
+    /// on whatever timeline the caller resolved it against. A queue with no
+    /// marks removes nothing — there is nothing to leak.
+    fn pop_waiting_nearest(&self, name: &str, candidates: &[u64]) {
+        let queue = self.queue_for(name);
+        if let Ok(mut guard) = self.queues.write()
+            && let Some(waiting) = guard.waiting.get_mut(&queue)
+        {
+            let idx = waiting
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, ready_at)| {
+                    candidates
+                        .iter()
+                        .map(|target| ready_at.abs_diff(*target))
+                        .min()
+                })
+                .map(|(idx, _)| idx);
+            if let Some(idx) = idx {
+                waiting.remove(idx);
+            }
+        }
+    }
+
+    /// Drop the waiting mark equal to `exact_ms`, returning whether one was
+    /// found. A no-op (returning `false`) when `exact_ms` is not present —
+    /// e.g. it is a stale entry pointing at a mark something else already
+    /// removed — so the caller can fall back to a heuristic guess rather
+    /// than silently leaving the job's real, current mark in place.
+    fn pop_waiting_exact(&self, name: &str, exact_ms: u64) -> bool {
+        let queue = self.queue_for(name);
+        if let Ok(mut guard) = self.queues.write()
+            && let Some(waiting) = guard.waiting.get_mut(&queue)
+            && let Some(idx) = waiting.iter().position(|mark| *mark == exact_ms)
+        {
+            waiting.remove(idx);
+            return true;
+        }
+        false
+    }
+
+    /// The raw waiting marks (epoch ms) for `name`'s queue, in push order.
+    ///
+    /// Test-only: asserting on this instead of [`Self::queue_snapshot`]'s
+    /// depth avoids that method's own `now_ms()`-relative bucketing, which a
+    /// test deliberately pinning the registry's clock far from a mark's
+    /// timeline would otherwise contaminate.
+    #[cfg(test)]
+    pub(crate) fn waiting_marks_for_test(&self, name: &str) -> Vec<u64> {
+        let queue = self.queue_for(name);
+        self.queues
+            .read()
+            .ok()
+            .and_then(|g| g.waiting.get(&queue).map(|w| w.iter().copied().collect()))
+            .unwrap_or_default()
+    }
+
+    /// The number of entries currently held in `pg_marks_by_job_id`.
+    /// Test-only: proves the bound in [`PG_MARKS_BY_JOB_ID_CAP`] actually
+    /// holds without exposing the table itself.
+    #[cfg(test)]
+    pub(crate) fn pg_marks_len_for_test(&self) -> usize {
+        self.queues.read().map_or(0, |g| g.pg_marks_by_job_id.len())
+    }
+
+    /// Whether `pg_marks_seq_order` currently mirrors `pg_marks_by_job_id`'s
+    /// keys exactly (same length, same ids) — the invariant every insert and
+    /// removal on that table must maintain. Test-only.
+    #[cfg(test)]
+    pub(crate) fn pg_marks_seq_order_is_consistent_for_test(&self) -> bool {
+        self.queues.read().is_ok_and(|g| {
+            g.pg_marks_seq_order.len() == g.pg_marks_by_job_id.len()
+                && g.pg_marks_seq_order
+                    .values()
+                    .all(|id| g.pg_marks_by_job_id.contains_key(id))
+        })
+    }
+
+    /// Whether `pg_marks_by_job_id` currently holds an entry for `id`.
+    /// Test-only.
+    #[cfg(test)]
+    pub(crate) fn pg_mark_contains_id_for_test(&self, id: &str) -> bool {
+        self.queues
+            .read()
+            .is_ok_and(|g| g.pg_marks_by_job_id.contains_key(id))
+    }
+
+    /// [`PG_MARKS_BY_JOB_ID_CAP`], for a test in another module (e.g.
+    /// `job.rs`) that needs to force capacity eviction without duplicating
+    /// the constant. Test-only.
+    #[cfg(test)]
+    pub(crate) const fn pg_marks_cap_for_test() -> usize {
+        PG_MARKS_BY_JOB_ID_CAP
     }
 
     /// Record a successful execution.
@@ -1454,6 +1910,7 @@ impl ConfigProperties {
         Self::track_telemetry_props(&mut props, config, &defaults, &profile_str);
         Self::track_health_props(&mut props, config, &defaults, &profile_str);
         Self::track_actuator_props(&mut props, config, &defaults, &profile_str);
+        Self::track_metrics_props(&mut props, config, &defaults, &profile_str);
         Self::track_session_props(&mut props, config, &defaults, &profile_str);
         Self::track_channels_props(&mut props, config, &defaults, &profile_str);
 
@@ -1715,6 +2172,35 @@ impl ConfigProperties {
             "actuator.prometheus",
             &config.actuator.prometheus.to_string(),
             &defaults.actuator.prometheus.to_string(),
+            profile_str,
+        );
+    }
+
+    fn track_metrics_props(
+        props: &mut HashMap<String, ConfigProperty>,
+        config: &crate::config::AutumnConfig,
+        defaults: &crate::config::AutumnConfig,
+        profile_str: &str,
+    ) {
+        Self::track_property(
+            props,
+            "metrics.max_series_per_metric",
+            &config.metrics.max_series_per_metric.to_string(),
+            &defaults.metrics.max_series_per_metric.to_string(),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "metrics.max_instruments",
+            &config.metrics.max_instruments.to_string(),
+            &defaults.metrics.max_instruments.to_string(),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "metrics.max_labels_per_series",
+            &config.metrics.max_labels_per_series.to_string(),
+            &defaults.metrics.max_labels_per_series.to_string(),
             profile_str,
         );
     }
@@ -2712,7 +3198,7 @@ pub(crate) const SERIES_DROPPED_FAMILY: &str = "autumn_metrics_series_dropped_to
 /// `emitted_families` set with it so a plugin [`MetricsSource`] cannot shadow a
 /// built-in family, and [`crate::metrics`] refuses to register an app metric
 /// under any of these names.
-pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 21] = [
+pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 23] = [
     "autumn_http_requests_total",
     "autumn_http_requests_active",
     "autumn_http_responses_total",
@@ -2740,6 +3226,8 @@ pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 21] = [
     "autumn_cache_read_through_stale_serves_total",
     "autumn_cache_fill_lock_acquires_total",
     "autumn_cache_fill_lock_contended_total",
+    crate::shadow::COMPARISONS_METRIC,
+    crate::shadow::DIVERGENCES_METRIC,
 ];
 
 /// Returns true if `s` is a valid Prometheus metric name (`[a-zA-Z_:][a-zA-Z0-9_:]*`).
@@ -3086,6 +3574,55 @@ fn write_builtin_cache_metrics(
     }
 }
 
+/// Render the shadow-mirroring families (issue #1653) into `out`.
+///
+/// Written as built-in families rather than through the [`crate::metrics`]
+/// facade because that facade reserves the `autumn_` namespace for exactly
+/// these — a framework family registered through it would be silently inert.
+///
+/// A replica with no mirror writes nothing at all, so the families stay absent
+/// from the scrape until an operator turns mirroring on. Route labels are
+/// bounded by the registry (see its `MAX_ROUTE_SERIES`), and both label values
+/// are escaped defensively: the route can come from an app's own route
+/// template.
+fn write_builtin_shadow_metrics(
+    out: &mut String,
+    version: &str,
+    snapshot: &crate::shadow::ShadowSnapshot,
+) {
+    use std::fmt::Write;
+
+    for (name, help, label_name, series) in [
+        (
+            crate::shadow::COMPARISONS_METRIC,
+            "Mirrored requests by route and comparison outcome",
+            "outcome",
+            &snapshot.comparisons_by_route,
+        ),
+        (
+            crate::shadow::DIVERGENCES_METRIC,
+            "Primary/shadow response divergences by route and kind",
+            "kind",
+            &snapshot.divergences_by_route,
+        ),
+    ] {
+        if series.is_empty() {
+            continue;
+        }
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} counter");
+        for entry in series {
+            let route = escape_prometheus_label_value(&entry.route);
+            let label = escape_prometheus_label_value(&entry.label);
+            let _ = writeln!(
+                out,
+                "{name}{{version=\"{version}\",route=\"{route}\",{label_name}=\"{label}\"}} {}",
+                entry.count
+            );
+        }
+    }
+}
+
 /// Render the app-defined [`crate::metrics`] facade instruments into `out`.
 ///
 /// Every family name written here is inserted into `emitted_families` —
@@ -3253,6 +3790,9 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
         &version,
         &crate::cache::read_through_metrics().snapshot(),
     );
+    if let Some(handle) = state.shadow() {
+        write_builtin_shadow_metrics(&mut out, &version, &handle.snapshot());
+    }
 
     // Name ownership, in precedence order: built-in families first, then the
     // app-metrics facade, then plugin-contributed sources — so neither the
@@ -3506,6 +4046,194 @@ pub(crate) async fn jobs_endpoint<S: ProvideActuatorState + Send + Sync + 'stati
     let jobs = state.job_registry().snapshot();
     let queues = state.job_registry().queue_snapshot();
     Json(serde_json::json!({ "jobs": jobs, "queues": queues }))
+}
+
+/// `GET <actuator-prefix>/derivations` -- maintained derived read models
+/// (issue #1769).
+///
+/// Reports every `#[derivation]` this binary declares: its definition hash, the
+/// hash and backfill state recorded in `_autumn_derivations`, and its current
+/// drift from the source of truth. `drift: 0` on every row is the healthy
+/// answer; a nonzero one names the derivation to recompute.
+///
+/// Sensitive-gated, like `/env` and `/graph`: the document names parent tables,
+/// child tables and the columns joining them.
+///
+/// Each drift figure is one aggregate over a parent table, so this is an
+/// operator endpoint rather than a monitoring one. Do not scrape it.
+///
+/// A process with no database pool answers `503` rather than `404`, so an
+/// operator can tell "this build has no such endpoint" apart from "this process
+/// has no database to report against".
+#[cfg(feature = "db")]
+pub(crate) async fn derivations_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> axum::response::Response {
+    // The control pool is one target among several: a shard-only deployment
+    // (`[[database.shards]]` with no control role, which the config accepts)
+    // has none, and its derivations live on the shards. Only a process with
+    // no database at all is a 503.
+    let mut report = Vec::new();
+    if let Some(pool) = state.pool() {
+        // The control target fails the same way a shard does: one error row,
+        // so a control pool that cannot be reached does not hide the shards
+        // that maintain the derivations. Only a process with no shards at all
+        // turns a control failure into the response's own status.
+        let statuses = match pool.get().await {
+            Ok(mut conn) => crate::derivation::derivation_status(&mut conn).await,
+            Err(error) => Err(crate::AutumnError::from(std::io::Error::other(
+                error.to_string(),
+            ))),
+        };
+        match statuses {
+            Ok(statuses) => report.extend(derivation_report("control", statuses)),
+            Err(error) if state.shards().is_some() => report.push(serde_json::json!({
+                "target": "control",
+                "error": "could not read derivation state",
+                "detail": error.to_string(),
+            })),
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "could not read derivation state",
+                        "target": "control",
+                        "detail": error.to_string(),
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    } else if state.shards().is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "no database pool is configured in this process",
+                "hint": "derivation state lives in the `_autumn_derivations` table, so \
+                         reporting it needs a database connection",
+            })),
+        )
+            .into_response();
+    }
+    // A sharded app maintains its derivations on every shard primary (that is
+    // where the tenant rows live, and where startup reconciles and sweeps), so
+    // the control database alone would report a clean slate while a shard sat
+    // pending or drifted. One shard that cannot answer is reported as such
+    // rather than hiding the rest.
+    if let Some(shards) = state.shards() {
+        for shard in shards.iter() {
+            let target = shard.name();
+            let statuses = match shard.primary_pool().get().await {
+                Ok(mut conn) => crate::derivation::derivation_status(&mut conn).await,
+                Err(error) => Err(crate::AutumnError::from(std::io::Error::other(
+                    error.to_string(),
+                ))),
+            };
+            match statuses {
+                Ok(statuses) => report.extend(derivation_report(target, statuses)),
+                Err(error) => report.push(serde_json::json!({
+                    "target": target,
+                    "error": "could not read derivation state",
+                    "detail": error.to_string(),
+                })),
+            }
+        }
+    }
+    (StatusCode::OK, Json(report)).into_response()
+}
+
+/// One database's derivation statuses as the endpoint's rows, each naming the
+/// `target` it was read from (`"control"`, or a shard's name).
+#[cfg(feature = "db")]
+fn derivation_report(
+    target: &str,
+    statuses: Vec<crate::derivation::DerivationStatus>,
+) -> Vec<serde_json::Value> {
+    statuses
+        .into_iter()
+        .map(|status| {
+            let mut row = serde_json::to_value(status).unwrap_or_else(
+                |error| serde_json::json!({ "error": format!("unserialisable status: {error}") }),
+            );
+            if let serde_json::Value::Object(ref mut map) = row {
+                map.insert(
+                    "target".to_owned(),
+                    serde_json::Value::String(target.to_owned()),
+                );
+            }
+            row
+        })
+        .collect()
+}
+
+/// `GET <actuator-prefix>/graph` -- the application's architecture graph
+/// (issue #1747).
+///
+/// This is the "retrievable from the running binary" surface: the graph is
+/// assembled from the binary's own link-time registrations at startup, so there
+/// is no side file to fetch and nothing that can be stale relative to the code
+/// that is actually running.
+///
+/// Sensitive-gated, like `/env` and `/configprops`. The document names every
+/// route, its auth requirement, and which table each one touches -- a map of
+/// exactly where an attacker would look first, so it is not a public surface.
+///
+/// A build that never installed a graph answers `503` with an explanation
+/// rather than `404`, so an operator can tell "this process has not published
+/// one" apart from "this build has no such endpoint".
+pub(crate) async fn graph_endpoint() -> axum::response::Response {
+    graph_response(crate::graph::served_json())
+}
+
+/// Render the `/actuator/graph` response for a given installed graph.
+///
+/// Split from the handler because the installed graph is a process-wide
+/// `OnceLock`: a test that installed one to exercise the "present" branch would
+/// decide the answer for every other test in the process. The branch is the
+/// behaviour worth testing, and it is testable here without that coupling.
+fn graph_response(graph: Option<&'static [u8]>) -> axum::response::Response {
+    graph.map_or_else(
+        || {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "no architecture graph is installed in this process",
+                    "hint": "the graph is published when the application router is built; a \
+                             process that serves requests without building one (a bare \
+                             `axum::Router` in a test, say) has none to report",
+                })),
+            )
+                .into_response()
+        },
+        |json| {
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                json,
+            )
+                .into_response()
+        },
+    )
+}
+
+/// `GET <actuator-prefix>/shadow` -- shadow-mirroring counters and the most
+/// recent primary-vs-shadow divergences (issue #1653).
+///
+/// Sensitive-gated, like `/tasks` and `/jobs`: the recorded samples are
+/// redacted excerpts of real production responses, so this is not a public
+/// surface. A replica with mirroring switched off answers with
+/// `{"enabled": false, ...}` rather than `404`, so an operator can tell
+/// "mirroring is off here" apart from "this build has no such endpoint".
+pub(crate) async fn shadow_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<crate::shadow::ShadowSnapshot> {
+    Json(
+        state
+            .shadow()
+            .map_or_else(crate::shadow::ShadowHandle::disabled_snapshot, |handle| {
+                handle.snapshot()
+            }),
+    )
 }
 
 #[cfg(feature = "http-client")]
@@ -3868,6 +4596,12 @@ pub(crate) fn actuator_endpoint_paths(
         paths.push(actuator_route_path(prefix, "/tasks"));
         paths.push(actuator_route_path(prefix, "/jobs"));
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
+        paths.push(actuator_route_path(prefix, "/shadow"));
+        paths.push(actuator_route_path(prefix, "/graph"));
+        #[cfg(feature = "db")]
+        {
+            paths.push(actuator_route_path(prefix, "/derivations"));
+        }
         #[cfg(feature = "system-info")]
         {
             paths.push(actuator_route_path(prefix, "/system"));
@@ -4012,7 +4746,22 @@ pub(crate) fn actuator_router_with_prefix<
             .route(
                 &actuator_route_path(prefix, "/ui/tasks"),
                 axum::routing::get(ui_tasks::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/shadow"),
+                axum::routing::get(shadow_endpoint::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/graph"),
+                axum::routing::get(graph_endpoint),
             );
+        #[cfg(feature = "db")]
+        {
+            router = router.route(
+                &actuator_route_path(prefix, "/derivations"),
+                axum::routing::get(derivations_endpoint::<S>),
+            );
+        }
         #[cfg(feature = "http-client")]
         {
             router = router
@@ -4299,6 +5048,503 @@ mod tests {
                 status.oldest_waiting_age_ms
             );
         }
+    }
+
+    /// When no exact mark was recorded for a job's id (the fallback path —
+    /// e.g. it was never noted, or was evicted from
+    /// [`JobRegistry::note_pg_job_mark`]'s bounded table), an admin-cancel
+    /// must still find the correct waiting mark whichever of three
+    /// timelines it lives on: an absolute `enqueue_at` mark (matched exactly
+    /// by `run_at`'s own value), a relative-delay `enqueue_in` mark (stamped
+    /// from real time via `due_origin()`, reconstructed from
+    /// `real_reference_ms + offset_ms`), or an immediate-enqueue mark
+    /// (stamped from this registry's own clock, reconstructed from
+    /// `self.now_ms() + offset_ms`) — regardless of what this registry's own
+    /// injected clock reads, since only the immediate case actually lives on
+    /// it.
+    ///
+    /// Mirrors `ready_at_from_age`'s translate-onto-a-known-timeline
+    /// approach, tried against all three candidates. A category decided on
+    /// the backend's clock and matched against marks judged on the
+    /// registry's own *separate* clock (`pop_waiting`) can disagree about a
+    /// boundary; trying each mark's own plausible timeline directly cannot.
+    #[test]
+    fn cancel_at_backend_offset_falls_back_to_the_nearest_of_its_three_timelines() {
+        use chrono::{TimeZone, Utc};
+
+        // An arbitrary "backend now" reference, unrelated to either pinned
+        // registry clock below — standing in for a Postgres `clock_timestamp()`
+        // reading, which a real cancel would supply.
+        const BACKEND_NOW_MS: u64 = 1_800_000_000_000;
+        // An arbitrary absolute due-at instant, far from every other value
+        // used here, standing in for an `enqueue_at(some_instant)` mark.
+        const ABSOLUTE_MARK_MS: u64 = 9_999_999_999_999;
+
+        for year in [1999, 2036] {
+            let epoch = Utc.with_ymd_and_hms(year, 6, 1, 12, 0, 0).unwrap();
+            let epoch_ms = u64::try_from(epoch.timestamp_millis()).unwrap();
+            let registry = JobRegistry::new()
+                .with_clock(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
+            registry.register_on_queue("immediate_job", "mail");
+            registry.register_on_queue("relative_job", "mail");
+            registry.register_on_queue("absolute_job", "mail");
+
+            // Three marks, three timelines — mirroring how the three enqueue
+            // shapes actually stamp a Postgres-backed job's registry mark.
+            // Pushed via the plain (non-`_pg_`) enqueue methods, so no exact
+            // mark is noted under any id: every cancel below must resolve
+            // through the candidate fallback, not the exact lookup. Asserted
+            // via `waiting_marks_for_test` rather than `queue_snapshot`'s
+            // depth: that method buckets marks against its own `now_ms()`
+            // (the registry's pinned clock here), which — unrelated to the
+            // fix under test — would itself misjudge a mark stamped on a
+            // wildly different timeline as "not yet ready".
+            registry.record_enqueue("immediate_job");
+            registry.record_enqueue_scheduled("relative_job", BACKEND_NOW_MS + 3_600_000);
+            registry.record_enqueue_scheduled("absolute_job", ABSOLUTE_MARK_MS);
+            assert_eq!(
+                registry.waiting_marks_for_test("immediate_job"),
+                vec![epoch_ms, BACKEND_NOW_MS + 3_600_000, ABSOLUTE_MARK_MS],
+                "all three marks pushed onto the shared queue"
+            );
+
+            // Cancel the relative-delay job: offset ~+1h from BACKEND_NOW_MS
+            // (real time). No `run_at` supplied (irrelevant to this branch).
+            // "no-exact-mark" is an unregistered id, forcing the fallback.
+            registry.record_cancel_at_backend_offset(
+                "relative_job",
+                "no-exact-mark",
+                None,
+                BACKEND_NOW_MS,
+                3_600_000,
+            );
+            assert_eq!(
+                registry.waiting_marks_for_test("immediate_job"),
+                vec![epoch_ms, ABSOLUTE_MARK_MS],
+                "canceling the relative-delay job (registry clock pinned to {year}) must \
+                 remove its own real-time mark and leave the other two intact"
+            );
+
+            // Cancel the immediate job: offset ~0, no `run_at`. The only
+            // candidate that can match is `self.now_ms() + 0` — this
+            // registry's own (pinned) clock.
+            registry.record_cancel_at_backend_offset(
+                "immediate_job",
+                "no-exact-mark",
+                None,
+                BACKEND_NOW_MS,
+                0,
+            );
+            assert_eq!(
+                registry.waiting_marks_for_test("immediate_job"),
+                vec![ABSOLUTE_MARK_MS],
+                "canceling the immediate job (registry clock pinned to {year}) must remove \
+                 its own registry-clock mark and leave the absolute mark intact"
+            );
+
+            // Cancel the absolute job: `run_at` supplied verbatim, matching
+            // ABSOLUTE_MARK_MS exactly regardless of the (irrelevant, and
+            // here deliberately wrong) offset/real-reference pair.
+            registry.record_cancel_at_backend_offset(
+                "absolute_job",
+                "no-exact-mark",
+                Some(ABSOLUTE_MARK_MS),
+                BACKEND_NOW_MS,
+                0,
+            );
+            assert_eq!(
+                registry.waiting_marks_for_test("immediate_job"),
+                Vec::<u64>::new(),
+                "canceling the absolute job (registry clock pinned to {year}) must remove \
+                 its own mark via the exact run_at match and drain the queue to zero"
+            );
+        }
+    }
+
+    /// A coincidental collision between two co-queued jobs' candidate
+    /// targets — one job's true mark landing exactly on a *different* job's
+    /// fallback candidate — must not make the wrong mark the "nearest" one.
+    ///
+    /// `record_pg_enqueue` remembers each job's own exact mark by id
+    /// (`note_pg_job_mark`), and `record_cancel_at_backend_offset` looks that
+    /// up before ever computing a candidate, so this can't happen for a job
+    /// enqueued that way: the exact lookup is unambiguous by construction,
+    /// unlike nearest-match over candidates that only approximate a mark's
+    /// true timeline.
+    #[test]
+    fn cancel_at_backend_offset_prefers_the_exact_mark_over_a_coincidental_candidate_collision() {
+        let registry = JobRegistry::new();
+        registry.register_on_queue("relative_job", "mail");
+        registry.register_on_queue("absolute_job", "mail");
+
+        // job-a's own real-time mark; job-b's own absolute mark, chosen so
+        // that job-a's *fallback* candidate (computed below) would land
+        // exactly on job-b's mark instead of job-a's own.
+        registry.record_pg_enqueue(
+            "relative_job",
+            "job-a-id",
+            Some(5_000),
+            PgMarkTimeline::Real,
+        );
+        registry.record_pg_enqueue(
+            "absolute_job",
+            "job-b-id",
+            Some(9_999),
+            PgMarkTimeline::Real,
+        );
+        assert_eq!(
+            registry.waiting_marks_for_test("relative_job"),
+            vec![5_000, 9_999],
+            "both marks pushed onto the shared queue"
+        );
+
+        // Cancel job-a: its offset/real-reference pair is deliberately
+        // chosen so the *fallback* candidate (9_999 + 0 = 9_999) collides
+        // exactly with job-b's mark, not job-a's own (5_000). Without the
+        // exact-by-id lookup, nearest-match would remove job-b's mark
+        // instead (distance 0 beats 5_000's distance of 4_999).
+        registry.record_cancel_at_backend_offset("relative_job", "job-a-id", None, 9_999, 0);
+        assert_eq!(
+            registry.waiting_marks_for_test("relative_job"),
+            vec![9_999],
+            "canceling job-a must remove its own exact mark (5_000), not job-b's mark that \
+             its fallback candidate coincidentally collides with"
+        );
+    }
+
+    /// `record_pg_start` removes a job's entry once it actually starts (see
+    /// below), but a job enqueued and never claimed at all — a crashed
+    /// worker, a queue with no consumer — never reaches that call, so
+    /// without a cap `note_pg_job_mark` would grow by one entry per such
+    /// enqueue for the lifetime of the process.
+    #[test]
+    fn note_pg_job_mark_is_bounded_so_uncancelled_jobs_cannot_leak_memory_forever() {
+        let registry = JobRegistry::new();
+        registry.register_on_queue("never_canceled", "mail");
+        for i in 0..(PG_MARKS_BY_JOB_ID_CAP + 5) {
+            registry.record_pg_enqueue(
+                "never_canceled",
+                &format!("job-{i}"),
+                Some(u64::try_from(i).unwrap()),
+                PgMarkTimeline::Real,
+            );
+        }
+        assert_eq!(
+            registry.pg_marks_len_for_test(),
+            PG_MARKS_BY_JOB_ID_CAP,
+            "the exact-mark table must never grow past its cap, even when every job it \
+             tracks is enqueued and never claimed at all"
+        );
+    }
+
+    /// Regression for the Codex P2 raised on commit 763da93: in a split
+    /// web/worker deployment, a web replica that only enqueues never calls
+    /// `record_pg_start` (it runs no worker loop at all), so every entry it
+    /// inserts sits here until capacity eviction regardless of whether some
+    /// other replica has long since claimed and finished the job. Plain
+    /// oldest-inserted-first eviction could just as easily pick an older job
+    /// that is still genuinely delayed — and therefore, by construction
+    /// (Postgres never hands out a row before its own `run_at`), definitely
+    /// NOT yet claimed by anyone, anywhere — over one that is already due
+    /// and plausibly claimed elsewhere already.
+    #[test]
+    fn note_pg_job_mark_eviction_protects_entries_still_in_the_future() {
+        let registry = JobRegistry::new();
+        registry.register_on_queue("mixed_cap", "mail");
+
+        let now = now_epoch_ms();
+        let far_future = now + 3_600_000; // an hour out: cannot possibly be claimed yet.
+
+        // Inserted first, so plain FIFO eviction would pick it first — but
+        // it is still genuinely delayed.
+        registry.record_pg_enqueue(
+            "mixed_cap",
+            "still-delayed",
+            Some(far_future),
+            PgMarkTimeline::Real,
+        );
+        for i in 0..(PG_MARKS_BY_JOB_ID_CAP - 1) {
+            registry.record_pg_enqueue(
+                "mixed_cap",
+                &format!("already-due-{i}"),
+                Some(0),
+                PgMarkTimeline::Real,
+            );
+        }
+        assert_eq!(registry.pg_marks_len_for_test(), PG_MARKS_BY_JOB_ID_CAP);
+
+        // One more enqueue forces an eviction.
+        registry.record_pg_enqueue("mixed_cap", "one-more", Some(0), PgMarkTimeline::Real);
+
+        assert_eq!(
+            registry.pg_marks_len_for_test(),
+            PG_MARKS_BY_JOB_ID_CAP,
+            "the cap must still hold"
+        );
+        assert!(
+            registry.pg_mark_contains_id_for_test("still-delayed"),
+            "an entry still in the future must never be evicted while an already-due \
+             entry is available to evict instead"
+        );
+        assert!(registry.pg_marks_seq_order_is_consistent_for_test());
+    }
+
+    /// Regression for the Codex P2 raised on commit a460209: comparing every
+    /// mark against a single clock misjudges the other kind whenever the
+    /// registry's own (possibly injected/virtual) clock and real time
+    /// disagree. Pins the registry's clock far in the future — as an app
+    /// injecting a `FixedClock`/`TickingClock` ahead of wall time would —
+    /// and confirms a genuinely-still-delayed real-time mark is never
+    /// mistaken for "due" just because it looks small next to the
+    /// registry's far-future reading. (Marks are now tagged with the one
+    /// clock that actually measures them — see [`PgMarkTimeline`] — rather
+    /// than judged against both; this still exercises the same scenario.)
+    #[test]
+    fn note_pg_job_mark_eviction_judges_a_real_timeline_mark_against_real_time_only() {
+        use chrono::{TimeZone, Utc};
+
+        let registry = JobRegistry::new().with_clock(std::sync::Arc::new(
+            crate::time::FixedClock::at(Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap()),
+        ));
+        registry.register_on_queue("skewed", "mail");
+
+        let real_now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+        // 5 real-world minutes out — genuinely not due yet — but a "small"
+        // number next to the registry's year-2100 reading, which is exactly
+        // what made the single-clock check call it due in error.
+        let genuinely_delayed = real_now + 300_000;
+
+        // Inserted first, so plain FIFO (and the single-clock check) would
+        // pick it first.
+        registry.record_pg_enqueue(
+            "skewed",
+            "still-delayed",
+            Some(genuinely_delayed),
+            PgMarkTimeline::Real,
+        );
+        for i in 0..(PG_MARKS_BY_JOB_ID_CAP - 1) {
+            // Genuinely due under both clocks (epoch 0 is in the past on any
+            // clock), so these are always legitimate eviction candidates.
+            registry.record_pg_enqueue(
+                "skewed",
+                &format!("filler-{i}"),
+                Some(0),
+                PgMarkTimeline::Real,
+            );
+        }
+        assert_eq!(registry.pg_marks_len_for_test(), PG_MARKS_BY_JOB_ID_CAP);
+
+        // One more enqueue forces an eviction.
+        registry.record_pg_enqueue("skewed", "one-more", Some(0), PgMarkTimeline::Real);
+
+        assert_eq!(
+            registry.pg_marks_len_for_test(),
+            PG_MARKS_BY_JOB_ID_CAP,
+            "the cap must still hold"
+        );
+        assert!(
+            registry.pg_mark_contains_id_for_test("still-delayed"),
+            "a mark that is not yet due in real time must never be evicted just because \
+             the registry's own (far-future) clock alone would call it due"
+        );
+        assert!(registry.pg_marks_seq_order_is_consistent_for_test());
+    }
+
+    /// Regression for the Codex P2 raised on commit d3e86d6: requiring both
+    /// clocks to agree an entry is due protects a still-delayed entry from
+    /// being evicted, but it can equally blind eviction to every genuinely
+    /// stale entry when the registry clock has drifted *behind* real time
+    /// (the mirror image of the far-future case above) — a real-timeline
+    /// mark (large real epoch ms) then never compares as `<=` a small,
+    /// stuck-in-the-past registry clock reading, however far in the real
+    /// past it actually is. Pins the registry's clock far in the past and
+    /// confirms a pile of already-claimed real-time marks are still
+    /// eviction candidates, protecting a genuinely-future one inserted
+    /// first — each entry is now judged only against the one clock
+    /// ([`PgMarkTimeline`]) that actually measures it.
+    #[test]
+    fn note_pg_job_mark_eviction_judges_a_real_timeline_mark_even_when_the_registry_clock_lags() {
+        use chrono::{TimeZone, Utc};
+
+        let registry = JobRegistry::new().with_clock(std::sync::Arc::new(
+            crate::time::FixedClock::at(Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap()),
+        ));
+        registry.register_on_queue("lagging", "mail");
+
+        let real_now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+        // An hour out in real time — genuinely not due yet — inserted
+        // first, so plain FIFO would evict it first.
+        let far_future = real_now + 3_600_000;
+
+        registry.record_pg_enqueue(
+            "lagging",
+            "still-delayed",
+            Some(far_future),
+            PgMarkTimeline::Real,
+        );
+        for i in 0..(PG_MARKS_BY_JOB_ID_CAP - 1) {
+            // Real-timeline marks already due in real time (epoch 0), but a
+            // registry clock stuck at year 2000 would never call these
+            // "due" if compared against it too.
+            registry.record_pg_enqueue(
+                "lagging",
+                &format!("filler-{i}"),
+                Some(0),
+                PgMarkTimeline::Real,
+            );
+        }
+        assert_eq!(registry.pg_marks_len_for_test(), PG_MARKS_BY_JOB_ID_CAP);
+
+        // One more enqueue forces an eviction.
+        registry.record_pg_enqueue("lagging", "one-more", Some(0), PgMarkTimeline::Real);
+
+        assert_eq!(
+            registry.pg_marks_len_for_test(),
+            PG_MARKS_BY_JOB_ID_CAP,
+            "the cap must still hold"
+        );
+        assert!(
+            registry.pg_mark_contains_id_for_test("still-delayed"),
+            "a genuinely-future real-timeline entry must never be evicted while an \
+             already-due real-timeline entry is available, even when the registry's own \
+             clock lags behind real time and would call every real-timeline mark 'not \
+             due' if it were consulted for them too"
+        );
+        assert!(registry.pg_marks_seq_order_is_consistent_for_test());
+    }
+
+    /// Regression for the Codex P2 raised on commit c0cbfd3: before
+    /// `record_pg_start` existed, an entry stuck around until evicted by
+    /// [`PG_MARKS_BY_JOB_ID_CAP`] regardless of whether its job had long
+    /// since started and completed, so a busy queue's finished jobs could
+    /// push out a still-genuinely-queued long-delay job's entry well before
+    /// the cap's raw count would suggest — degrading that cancel to the
+    /// (weaker) candidate-nearest-match fallback. `record_pg_start` removing
+    /// the entry the instant its mark is consumed means the table tracks
+    /// live queue residency instead of lifetime enqueue count: churning far
+    /// more jobs through start than the cap must never make the table grow
+    /// at all, since none of them are still waiting.
+    #[test]
+    fn record_pg_start_keeps_the_exact_mark_table_bounded_by_live_residency_not_lifetime_enqueues()
+    {
+        let registry = JobRegistry::new();
+        registry.register_on_queue("churn", "mail");
+        for i in 0..(PG_MARKS_BY_JOB_ID_CAP * 3) {
+            let id = format!("job-{i}");
+            registry.record_pg_enqueue(
+                "churn",
+                &id,
+                Some(u64::try_from(i).unwrap()),
+                PgMarkTimeline::Real,
+            );
+            registry.record_pg_start("churn", &id);
+        }
+        assert_eq!(
+            registry.pg_marks_len_for_test(),
+            0,
+            "a job whose mark was consumed by record_pg_start must not linger in the \
+             exact-mark table just because the cap has not been reached"
+        );
+        assert!(
+            registry.pg_marks_seq_order_is_consistent_for_test(),
+            "pg_marks_seq_order (the O(1)-eviction seq index) must mirror \
+             pg_marks_by_job_id exactly after a long run of inserts and removals, \
+             not just at a single snapshot"
+        );
+    }
+
+    /// Regression for the Codex P2 raised on commit 034e47a:
+    /// `record_start`'s generic `pop_waiting` removes whichever ready mark
+    /// comes first in the queue's internal order, not necessarily the mark
+    /// belonging to the job actually starting — Postgres can start a
+    /// later-enqueued job ahead of an older one this process still has
+    /// concurrency-blocked. The first cut of `record_pg_start` popped
+    /// generically and then unconditionally forgot the starting job's exact
+    /// entry regardless, which could tear down its mapping while its real
+    /// mark stayed in the queue and a different, still-waiting job's mark
+    /// vanished in its place.
+    #[test]
+    fn record_pg_start_removes_its_own_mark_even_when_an_older_job_is_still_first_in_queue() {
+        const OLDER_MARK: u64 = 1_000;
+        const NEWER_MARK: u64 = 2_000;
+
+        let registry = JobRegistry::new();
+        registry.register_on_queue("mixed", "work");
+
+        // job-a enqueued first (older, still queued/concurrency-blocked);
+        // job-b enqueued second but starts first.
+        registry.record_pg_enqueue("mixed", "job-a", Some(OLDER_MARK), PgMarkTimeline::Real);
+        registry.record_pg_enqueue("mixed", "job-b", Some(NEWER_MARK), PgMarkTimeline::Real);
+
+        registry.record_pg_start("mixed", "job-b");
+
+        assert_eq!(
+            registry.waiting_marks_for_test("mixed"),
+            vec![OLDER_MARK],
+            "starting job-b must remove its own mark, leaving job-a's still-queued \
+             mark untouched even though job-a's mark sits first in the queue"
+        );
+        assert_eq!(
+            registry.pg_marks_len_for_test(),
+            1,
+            "job-a's exact entry must survive; only job-b's own entry is removed"
+        );
+    }
+
+    /// A stale `pg_marks_by_job_id` entry must not swallow the cancel: if the
+    /// exact-looked-up value is no longer in the queue, the cancel has to
+    /// fall back to the candidate heuristic, not silently remove nothing.
+    ///
+    /// Simulates staleness via the plain `record_start` (which knows nothing
+    /// about `pg_marks_by_job_id`) rather than `record_pg_start` (which keeps
+    /// the entry in sync): a non-terminal retry then pushes a *new* mark
+    /// under the same job name without updating that entry either — so a
+    /// cancel racing a retry finds a value (`pop_waiting_exact`) that is no
+    /// longer in the queue at all.
+    #[test]
+    fn cancel_at_backend_offset_falls_back_when_the_exact_mark_is_stale() {
+        const MARK_A: u64 = 1_000;
+        const MARK_B: u64 = 2_000;
+
+        let registry = JobRegistry::new();
+        registry.register_on_queue("flaky_job", "mail");
+
+        // Original enqueue: pushes mark_a and notes it under "job-id".
+        registry.record_pg_enqueue("flaky_job", "job-id", Some(MARK_A), PgMarkTimeline::Real);
+
+        // The job starts: use plain `record_start` (not `record_pg_start`)
+        // to pop mark_a from the queue while deliberately leaving "job-id"'s
+        // exact entry in place, simulating a caller that pushed a waiting
+        // mark outside the `record_pg_start`/`record_pg_enqueue` pair — the
+        // one way an entry can still go stale — so this test exercises the
+        // fallback in isolation from that pair's own bookkeeping.
+        registry.record_start("flaky_job");
+        assert_eq!(
+            registry.waiting_marks_for_test("flaky_job"),
+            Vec::<u64>::new(),
+            "record_start must have popped mark_a"
+        );
+
+        // The job fails non-terminally and is requeued as a retry: a new
+        // mark is pushed under the same job name via the plain
+        // `record_enqueue_scheduled` primitive, without updating "job-id"'s
+        // exact entry — exercising the fallback directly, for whichever
+        // caller pushes a retry mark this way rather than through
+        // `record_pg_enqueue` (see `pg_retry_refreshes_the_exact_mark_so_a_racing_cancel_does_not_hit_a_coincidental_collision`
+        // in job.rs for the production retry-lifecycle path, which now does).
+        registry.record_enqueue_scheduled("flaky_job", MARK_B);
+
+        // Cancel "job-id": the exact lookup finds the stale mark_a, which
+        // `pop_waiting_exact` cannot find in the queue (only mark_b is
+        // there) — the fallback candidate (real_reference_ms + offset_ms)
+        // is set up to land exactly on mark_b.
+        registry.record_cancel_at_backend_offset("flaky_job", "job-id", None, MARK_B, 0);
+        assert_eq!(
+            registry.waiting_marks_for_test("flaky_job"),
+            Vec::<u64>::new(),
+            "the stale exact entry must not stop the cancel from removing the job's real, \
+             current mark (mark_b) via the candidate fallback"
+        );
     }
 
     #[test]
@@ -5418,6 +6664,227 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn actuator_graph_hidden_in_nonsensitive_mode() {
+        // The graph names every route, its auth requirement and the table it
+        // touches — a map of where to look first. It is sensitive-gated like
+        // `/env`, not public like `/health`.
+        let app = actuator_router(false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/graph")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn actuator_graph_path_is_listed_only_in_sensitive_mode() {
+        assert!(
+            actuator_endpoint_paths("/actuator", true, true)
+                .contains(&"/actuator/graph".to_owned())
+        );
+        assert!(
+            !actuator_endpoint_paths("/actuator", false, true)
+                .contains(&"/actuator/graph".to_owned()),
+            "the listing must match the mounts, or the startup barrier seeds a path \
+             that is not served"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn actuator_derivations_path_is_listed_only_in_sensitive_mode() {
+        // The listing seeds the startup barrier's allow-list, so a mount without
+        // a listed path is a route the barrier holds shut. The document names
+        // parent and child tables, so it is sensitive-gated like `/graph`.
+        assert!(
+            actuator_endpoint_paths("/actuator", true, true)
+                .contains(&"/actuator/derivations".to_owned())
+        );
+        assert!(
+            !actuator_endpoint_paths("/actuator", false, true)
+                .contains(&"/actuator/derivations".to_owned()),
+            "the listing must match the mounts, or the startup barrier seeds a path \
+             that is not served"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn actuator_derivations_hidden_in_nonsensitive_mode() {
+        let app = actuator_router(false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/derivations")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn actuator_derivations_200_body_is_an_array_of_status_objects() {
+        // The endpoint answers `Json(Vec<DerivationStatus>)`, so this pins the
+        // body an operator and a dashboard parse. The no-pool and hidden cases
+        // are covered below; this is the success shape, which needs no database.
+        let statuses = vec![
+            crate::derivation::DerivationStatus {
+                name: "posts.published_comment_count".to_owned(),
+                definition_hash: Some("a".repeat(64)),
+                stored_hash: Some("a".repeat(64)),
+                backfill_state: Some(crate::derivation::BackfillState::Complete),
+                checkpoint: Some(42),
+                backfilled_rows: 7,
+                updated_at: Some("2026-09-07 00:00:00+00".to_owned()),
+                drift: Some(0),
+                drift_error: None,
+            },
+            crate::derivation::DerivationStatus {
+                name: "posts.removed".to_owned(),
+                definition_hash: None,
+                stored_hash: Some("b".repeat(64)),
+                backfill_state: Some(crate::derivation::BackfillState::Unregistered),
+                checkpoint: None,
+                backfilled_rows: 0,
+                updated_at: None,
+                drift: None,
+                drift_error: Some("column does not exist".to_owned()),
+            },
+        ];
+        let body = serde_json::Value::Array(derivation_report("control", statuses));
+        let rows = body.as_array().expect("the body is a JSON array");
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(row["target"], "control", "every row names its database");
+        }
+        for row in rows {
+            let mut keys: Vec<&str> = row
+                .as_object()
+                .expect("each row is an object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec![
+                    "backfill_state",
+                    "backfilled_rows",
+                    "checkpoint",
+                    "definition_hash",
+                    "drift",
+                    "drift_error",
+                    "name",
+                    "stored_hash",
+                    "target",
+                    "updated_at",
+                ],
+                "{row}"
+            );
+        }
+        assert_eq!(rows[0]["backfill_state"], serde_json::json!("complete"));
+        assert_eq!(rows[0]["drift"], serde_json::json!(0));
+        // A state row this binary declares no derivation for: reported, with no
+        // definition hash and no drift figure.
+        assert_eq!(rows[1]["backfill_state"], serde_json::json!("unregistered"));
+        assert!(rows[1]["definition_hash"].is_null());
+        assert!(rows[1]["drift"].is_null());
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn actuator_derivations_reports_no_pool_as_unavailable() {
+        // 503, not 404: an operator has to be able to tell "this build has no
+        // such endpoint" from "this process has no database to report against".
+        let app = actuator_router(true).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/derivations")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn actuator_graph_serves_the_installed_graph_over_http() {
+        // The one test that proves the endpoint works end to end: install a
+        // graph, mount the real sensitive actuator router, and GET it. The
+        // `graph_response` unit tests below cannot catch a missing or misplaced
+        // `crate::graph::install` call — Codex round 1 found exactly that, with
+        // every unit test passing while a running app answered 503 forever.
+        //
+        // Sole installer in this test binary, on purpose: the installed graph
+        // is a process-wide `OnceLock`, so a second test installing its own
+        // would decide this one's answer. The install-site guard lives in
+        // `app::tests::graph_installed_before_every_router_build`.
+        crate::graph::install(crate::graph::manifest::build(&[], 0, &[], &[], &[], &[]));
+
+        let app = actuator_router(true).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/graph")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let decoded: crate::graph::manifest::ArchitectureGraph =
+            serde_json::from_slice(&body).expect("the endpoint must serve the graph document");
+        assert_eq!(
+            decoded.schema_version,
+            crate::graph::manifest::MANIFEST_SCHEMA_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn actuator_graph_serves_the_installed_graph() {
+        let graph = crate::graph::manifest::build(&[], 0, &[], &[], &[], &[]);
+        let json = serde_json::to_vec(&graph).expect("serialize");
+        let resp = graph_response(Some(json.leak()));
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let decoded: crate::graph::manifest::ArchitectureGraph =
+            serde_json::from_slice(&body).expect("the endpoint must serve the graph document");
+        assert_eq!(decoded, graph);
+    }
+
+    #[tokio::test]
+    async fn actuator_graph_explains_itself_when_none_is_installed() {
+        let resp = graph_response(None);
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a process with no graph must say so rather than 404, which would read as \
+             'this build has no such endpoint'"
+        );
+    }
+
+    #[tokio::test]
     async fn actuator_circuitbreakers_hidden_in_nonsensitive_mode() {
         let app = actuator_router(false).with_state(test_state());
         let resp = app
@@ -5485,6 +6952,14 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    // Postgres-only: the fixture gives one shard a DISTINCT replica_url, and
+    // both layers refuse that on SQLite — `database_backend_consistency` at
+    // config time, `reject_unusable_sqlite_replica` at topology build. The
+    // replica is the blocker: native sharding is Postgres-only too, but it is
+    // refused at BOOT rather than by the topology builder, so the shards alone
+    // would not fail here. Same treatment `db::`'s replica tests got, rather
+    // than a fixture swap that would assert a configuration production refuses.
+    #[cfg(not(feature = "sqlite"))]
     #[tokio::test]
     #[cfg(feature = "db")]
     async fn actuator_metrics_returns_per_shard_stats_when_sharded() {
@@ -5552,11 +7027,14 @@ mod tests {
         let mut state = test_state();
 
         // `RuntimeConnection` is `AsyncPgConnection` in the default build and a
-        // SQLite connection under `--features sqlite`; using the alias keeps this
-        // test compiling on both (it only exercises pool metrics, and is not run
-        // under the sqlite feature).
+        // SQLite connection under `--features sqlite`, and this test RUNS on
+        // both. It builds the manager directly rather than through
+        // `create_pool`, so nothing would refuse a target meant for the other
+        // backend — hence the target comes from `test_urls`, not a literal.
+        // Only pool metrics are exercised; deadpool is lazy, so no connection
+        // is opened.
         let manager = AsyncDieselConnectionManager::<crate::db::RuntimeConnection>::new(
-            "postgres://postgres:postgres@localhost:5432/postgres",
+            crate::test_urls::primary("actuator_metrics"),
         );
         let pool = Pool::builder(manager).build().unwrap();
 

@@ -109,10 +109,10 @@ out of the capsule:
 
 ```toml
 [dependencies]
-autumn-edge = "0.6"
+autumn-edge = "0.7"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-autumn-web = { version = "0.6", features = ["edge"] }
+autumn-web = { version = "0.7", features = ["edge"] }
 ```
 
 ### What an edge handler may use

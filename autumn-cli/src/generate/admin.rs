@@ -227,6 +227,7 @@ pub fn plan_admin_with_options(
     options.encrypted_deterministic.extend(det_deterministic);
 
     let fields = parse_fields(field_tokens)?;
+    reject_translatable_fields(&fields)?;
     // Issue #1340: the MODEL is the only source of truth for whether a column is
     // encrypted at rest — `#[encrypted]` is what puts the `serialize_as` wrapper
     // on the insert/update path. A `{encrypted}` DSL token here declares the same
@@ -327,6 +328,31 @@ pub fn plan_admin_with_options(
 /// # Errors
 /// Returns [`GenerateError`] when `project_root` isn't a valid project, or
 /// `name` fails validation.
+/// Refuse a `{translatable}` column (issue #1384), for the same reason
+/// `generate scaffold` does.
+///
+/// The admin emits a plain text control bound to the whole column and hands its
+/// string straight to `serde_json::from_value::<New{Model}>`. `Translated`
+/// deliberately refuses a bare string — accepting one would let a single-locale
+/// value replace the whole container — so every generated create and update
+/// would fail validation on a required field, and a value that *did* decode
+/// would wipe every other language. Editing translated content needs a
+/// per-locale editor, which is translation-workflow UI and out of scope here.
+fn reject_translatable_fields(fields: &[Field]) -> Result<(), GenerateError> {
+    let Some(field) = fields.iter().find(|f| f.is_translatable()) else {
+        return Ok(());
+    };
+    Err(GenerateError::Config(format!(
+        "a `{{translatable}}` field (`{}`) is not supported by `generate admin`: the generated \
+         admin binds one plain text control to the whole per-locale container, and `Translated` \
+         refuses a bare string — so create and update would fail validation, and a value that \
+         did decode would replace every other locale. Leave the column out of the admin field \
+         list, or write a per-locale editor: `record.available_locales(\"{}\")` and \
+         `record.set_{}(locale, value)` are generated for you.",
+        field.name, field.name, field.name
+    )))
+}
+
 pub fn plan_admin_destroy_fallback(project_root: &Path, name: &str) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     // Unlike `plan_admin_with_options`, this path has no model-file-exists
@@ -517,7 +543,13 @@ const fn admin_field_kind(field: &Field) -> &'static str {
         // maintains it on insert/delete/move) and excluded from the
         // generated `New*`/`Update*` structs entirely, so it is not
         // directly editable either way.
-        FieldKind::Bytea | FieldKind::Attachment | FieldKind::Position => "AdminFieldKind::Hidden",
+        // `commentable` (issue #1367) is hidden for the same reason as
+        // `position`: the framework maintains the comment counter inside each
+        // comment's own transaction, so an editable admin field would only
+        // ever let an operator desynchronise it from the comments table.
+        FieldKind::Bytea | FieldKind::Attachment | FieldKind::Position | FieldKind::Commentable => {
+            "AdminFieldKind::Hidden"
+        }
         // `json`/`jsonb` (issue #1341) uses the admin panel's existing
         // `AdminFieldKind::Json`: a monospace textarea whose submission is
         // coerced back to a real JSON value by `coerce_form_value` before the
@@ -595,6 +627,12 @@ fn is_update_writable(
         // excludes its own column) — referencing `new_row.<position_field>`
         // here would fail to compile.
         && !field.kind.is_position()
+        // Issue #1367: the same reasoning, one field kind over. The
+        // `#[commentable]` counter is emitted `#[default]`, so it is absent from
+        // `New{Model}`/`Update{Model}` too, and `Patch::Set(new_row.comment_count)`
+        // would not compile. Hiding the control (see the `FieldKind` arm above)
+        // was only half of it: the control and the write path have to agree.
+        && !field.kind.is_commentable()
         && !matches!(field.kind, FieldKind::Bytea)
         // Issue #1340: an at-rest encrypted column is not updatable through the
         // admin. The plugin renders its edit control disabled and WITHOUT a
@@ -813,6 +851,54 @@ impl AdminModel for {pascal_name}Admin {{
             }}
             Ok(())
         }})
+    }}
+
+    fn execute_action(
+        &self,
+        pool: &Pool<AsyncPgConnection>,
+        action: &str,
+        ids: Vec<i64>,
+    ) -> AdminFuture<'_, u64> {{
+        // `{pascal_name}Admin` never declares soft delete
+        // (`supports_soft_delete()` is the trait default, `false`), so
+        // `actions()` (autumn-admin-plugin's `traits.rs`) only ever offers
+        // `"delete"` -- the admin UI can't reach `"restore"` or `"purge"` for
+        // this model. Only `"delete"` needs the batched fast path below;
+        // `"restore"`, `"purge"`, and any other action name fall through to
+        // the shared `dispatch_restore_purge_or_unhandled` helper, which
+        // gives a direct or out-of-band call the same "does not support soft
+        // delete" (or "unhandled action") error the trait default always did.
+        if action == "delete" {{
+            let pool = pool.clone();
+            return Box::pin(async move {{
+                // One round trip for the whole selection instead of the
+                // trait default's one-`DELETE`-per-id loop (an operator
+                // selecting hundreds of rows in the admin list and clicking
+                // "Delete selected" otherwise costs hundreds of statements
+                // and pool checkouts for what is, on the wire, one
+                // predicate).
+                //
+                // The returned count is the number of rows the `DELETE`
+                // actually matched, not `ids.len()`: unlike `delete()`
+                // above, a missing id here is silently a no-op rather than
+                // an `AdminError::NotFound` that aborts the whole batch --
+                // the same "missing selection is a no-op" contract the
+                // scaffolded (`autumn generate scaffold`) bulk-delete route
+                // and this crate's own `TokenAdminModel`/
+                // `FeatureFlagAdminModel` overrides already use, and a
+                // strictly better-defined outcome than the loop this
+                // replaces, whose partial application on a missing id
+                // depended on where in the id list the miss fell.
+                let mut conn = pool.get().await.map_err(Self::pool_error)?;
+                let deleted = diesel::delete({plural}::table.filter({plural}::id.eq_any(&ids)))
+                    .execute(&mut conn)
+                    .await
+                    .map_err(Self::pool_error)?;
+                Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
+            }});
+        }}
+
+        dispatch_restore_purge_or_unhandled(self, pool, action, ids)
     }}
 }}
 "#
@@ -1443,6 +1529,27 @@ mod tests {
 
     // ── RED phase ──────────────────────────────────────────────────────────
 
+    /// #1384 (Codex round 4): the admin binds one plain text control to the
+    /// whole per-locale container and hands its string to
+    /// `serde_json::from_value::<New{Model}>`. `Translated` refuses a bare
+    /// string, so every generated create/update would fail validation — and a
+    /// value that did decode would replace every other locale.
+    #[test]
+    fn plan_admin_rejects_a_translatable_field() {
+        let model_source = "#[autumn_web::model]\n\
+            pub struct Post {\n\
+            \x20   #[id]\n\
+            \x20   pub id: i64,\n\
+            \x20   pub title: String,\n\
+            }\n";
+        let tmp = project_with_model_source("post", model_source);
+        let err = plan_admin(tmp.path(), "Post", &["title:String{translatable}".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("translatable"), "{err}");
+        assert!(err.contains("title"), "{err}");
+    }
+
     #[test]
     fn plan_admin_fails_when_not_in_project() {
         let tmp = TempDir::new().unwrap();
@@ -1735,6 +1842,35 @@ mod tests {
             !admin.contains("new_row.rank") && !admin.contains("rank: Patch::Set"),
             "a position field must never be referenced in the New/Update struct \
              construction, both of which exclude it:\n{admin}"
+        );
+        assert!(
+            admin.contains("title: Patch::Set(new_row.title)"),
+            "the ordinary field must still be writable:\n{admin}"
+        );
+    }
+
+    #[test]
+    fn commentable_counter_excluded_from_admin_update_body() {
+        // Issue #1367: the `comments:commentable` counter is emitted
+        // `#[default]`, so it is absent from `New{Model}`/`Update{Model}` just
+        // like `#[position]` — and `Patch::Set(new_row.comment_count)` would
+        // fail to compile. Hiding the edit control was only half the fix; the
+        // control and the write path have to agree.
+        let tmp = project_with_model("post");
+        let plan = plan_admin(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "comments:commentable".into()],
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
+        assert!(
+            !admin.contains("new_row.comment_count")
+                && !admin.contains("comment_count: Patch::Set"),
+            "the commentable counter must never be referenced in the New/Update \
+             struct construction:\n{admin}"
         );
         assert!(
             admin.contains("title: Patch::Set(new_row.title)"),
@@ -2383,24 +2519,10 @@ pub struct Account {
         assert!(plan_admin(tmp.path(), "Post", &["title:String".into()]).is_err());
 
         let fallback_plan = plan_admin_destroy_fallback(tmp.path(), "Post").unwrap();
-        // Without --force: content is unverifiable (the model is gone), so
-        // it's treated as diverged and left in place rather than guessed at.
-        let err = fallback_plan
-            .revert(Flags {
-                dry_run: false,
-                force: false,
-            })
-            .unwrap_err();
-        assert!(matches!(err, GenerateError::Diverged(_)));
-        assert!(tmp.path().join("src/admin/post.rs").exists());
-
-        let fallback_plan = plan_admin_destroy_fallback(tmp.path(), "Post").unwrap();
-        fallback_plan
-            .revert(Flags {
-                dry_run: false,
-                force: true,
-            })
-            .unwrap();
+        // The fallback plan cannot reproduce the content — it never read the
+        // model — but the digest `generate` recorded still proves these files
+        // are its own untouched output, so no --force is needed (issue #1835).
+        fallback_plan.revert(Flags::default()).unwrap();
         assert!(!tmp.path().join("src/admin/post.rs").exists());
         assert!(!tmp.path().join("tests/post_admin.rs").exists());
         assert!(
@@ -2409,6 +2531,54 @@ pub struct Account {
                 .contains("post"),
             "the mod declaration removal doesn't depend on the model and must succeed too"
         );
+    }
+
+    #[test]
+    fn destroy_admin_fallback_still_refuses_a_hand_edited_file() {
+        // The #1048 guard under the #1835 code path: the recorded digest makes
+        // the fallback plan usable, and an edit still has to break it.
+        let tmp = project_with_model("post");
+        let plan = plan_admin(tmp.path(), "Post", &["title:String".into()]).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        fs::remove_file(tmp.path().join("src/models/post.rs")).unwrap();
+        fs::write(tmp.path().join("src/admin/post.rs"), "// my own code\n").unwrap();
+
+        let err = plan_admin_destroy_fallback(tmp.path(), "Post")
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap_err();
+
+        assert!(matches!(err, GenerateError::Diverged(_)));
+        assert!(tmp.path().join("src/admin/post.rs").exists());
+    }
+
+    #[test]
+    fn destroy_admin_fallback_without_provenance_still_needs_force() {
+        // The pre-#1835 path, still taken by a project generated before the
+        // manifest existed: content is unverifiable (the model is gone and
+        // nothing was recorded), so it is treated as diverged and left alone.
+        let tmp = project_with_model("post");
+        let plan = plan_admin(tmp.path(), "Post", &["title:String".into()]).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        fs::remove_file(tmp.path().join("src/models/post.rs")).unwrap();
+        fs::remove_file(tmp.path().join(crate::generate::provenance::MANIFEST_PATH)).unwrap();
+
+        let err = plan_admin_destroy_fallback(tmp.path(), "Post")
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap_err();
+        assert!(matches!(err, GenerateError::Diverged(_)));
+        assert!(tmp.path().join("src/admin/post.rs").exists());
+
+        plan_admin_destroy_fallback(tmp.path(), "Post")
+            .unwrap()
+            .revert(Flags {
+                dry_run: false,
+                force: true,
+            })
+            .unwrap();
+        assert!(!tmp.path().join("src/admin/post.rs").exists());
+        assert!(!tmp.path().join("tests/post_admin.rs").exists());
     }
 
     #[test]

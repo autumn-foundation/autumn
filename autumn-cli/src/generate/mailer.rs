@@ -58,7 +58,7 @@ pub fn plan_mailer(
 /// Shared implementation of [`plan_mailer`]. The `_for_revert` flag is retained
 /// for `destroy`-path symmetry with the other generators, but the mailer
 /// generator no longer branches on it: the `--list-unsubscribe` suppression
-/// migration is now backend-aware (SQLite-dialect DDL under a `SQLite` app,
+/// migration is now backend-aware (`SQLite`-dialect DDL under a `SQLite` app,
 /// issue #1927), so there is no generate-only rejection left to suppress on the
 /// revert path.
 ///
@@ -311,7 +311,7 @@ CREATE TABLE mail_unsubscribes (
 );
 ";
 
-/// SQLite-dialect companion to [`UNSUBSCRIBE_MIGRATION_UP`] (issue #1927):
+/// `SQLite`-dialect companion to [`UNSUBSCRIBE_MIGRATION_UP`] (issue #1927):
 /// `INTEGER PRIMARY KEY AUTOINCREMENT` for the id and an ISO-8601 `TEXT` column
 /// defaulted to `CURRENT_TIMESTAMP` (`SQLite` has no `BIGSERIAL`, `TIMESTAMPTZ`,
 /// or `NOW()`). The `UNIQUE` constraint and column names are portable and
@@ -690,7 +690,7 @@ async fn main() {
 
     /// Finding F22: a plain `generate mailer` (no `--list-unsubscribe`) emits only
     /// Rust/template files and enables the `mail` feature — nothing
-    /// SQLite-incompatible — so it must SUCCEED on a `SQLite` app rather than
+    /// `SQLite`-incompatible — so it must SUCCEED on a `SQLite` app rather than
     /// being over-rejected by the unsubscribe-migration gate.
     #[test]
     fn plan_mailer_without_list_unsubscribe_succeeds_on_sqlite_app() {
@@ -735,7 +735,7 @@ async fn main() {
     /// `autumn destroy mailer` recomputes this same plan with `for_revert` before
     /// [`Plan::revert`], so it must build a revert plan on a `SQLite` app even for
     /// the `--list-unsubscribe` variant (issue #1927 made its generate path
-    /// SQLite-valid too, so this is now symmetric with the generate path).
+    /// `SQLite`-valid too, so this is now symmetric with the generate path).
     #[test]
     fn plan_mailer_ex_for_revert_not_rejected_on_sqlite_app() {
         let tmp = project_with_main(default_main());

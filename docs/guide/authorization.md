@@ -12,7 +12,7 @@ This guide covers:
 - The [`Policy`](#the-policy-trait) trait and `PolicyContext`.
 - [Scope queries](#scope-queries) for filtering list endpoints.
 - The [`#[authorize]`](#the-authorize-attribute-macro) attribute macro.
-- The [`#[repository(policy = ...)]`](#the-repository-policy-argument)
+- The [`#[repository(policy = ...)]`](#the-repository-policy--argument)
   argument that wires policies into auto-generated CRUD endpoints.
 - The [403-vs-404 decision](#403-vs-404).
 - [Common patterns](#common-patterns) (ownership, group membership,
@@ -69,7 +69,14 @@ autumn_web::app()
     .await;
 ```
 
-`PolicyContext` carries the resolved [`Session`](../api/session.md), the
+You do not have to write that pair by hand. `autumn generate policy Post` emits
+this `Policy` and its companion `Scope` for an existing model and registers both
+on the builder — owner-or-admin rules when the model has a `user_id`,
+`author_id`, or `owner_id` column, and a `SECURITY TODO`-marked authentication
+check when it does not. See
+[`autumn generate policy`](generators.md#autumn-generate-policy).
+
+`PolicyContext` carries the resolved [`Session`](authentication.md#the-session-api), the
 authenticated user id (when any), the active role set, and a clone of the
 database pool so policies can consult related rows. The trait is
 object-safe — apps can hold `Arc<dyn Policy<Post>>` and swap
@@ -319,7 +326,7 @@ empty.
 
 - [Authentication](./authentication.md) — how a request acquires the identity
   these policies are evaluated against: sessions, login, and `#[secured]`.
-- [Macro transparency: `#[authorize]`](./macro-transparency.md#authorize)
+- [Macro transparency: `#[authorize]`](./macro-transparency.md#authorizeaction-resource--type)
 - [Coming from other frameworks](./coming-from-other-frameworks.md) — maps
   Pundit, Bodyguard, `@PreAuthorize`, and `before_action` onto autumn's
   `Policy` + `#[authorize]`.

@@ -117,6 +117,38 @@ list with the class they will eventually carry. See
 `docs/guide/security-posture-manifest.md` for the provenance rubric that
 decides a dimension's class.
 
+## Posture diffs and the merge gate (unreleased — trunk-dev, issue #1624)
+
+`autumn routes audit` says what the surface *is*. `autumn routes posture` says
+what a change *did to it*:
+
+```bash
+# The pull-request gate. Exit 0 = clean or acknowledged, 1 = blocked,
+# 2 = the tool could not run.
+autumn routes posture diff --base base-posture.json --head security-posture.json
+
+# The digest a release records, and the deploy-time proof.
+autumn routes posture digest --manifest security-posture.json
+autumn routes posture verify --manifest security-posture.json \
+  --expect-digest <digest> --repo owner/repo
+```
+
+Only *widening* blocks: a new public or unclassified route, a classification
+downgraded, a role requirement dropped, a role added (roles are OR-ed, so one
+more admits more callers), a scope removed (scopes are AND-ed), an
+`#[authorize]` binding or policy check removed, CSRF enforcement lost, or a
+security header no longer emitted. Narrowing and neutral changes annotate and
+never block, a security header's *value* changing is reported but never
+blocked, and a handler rename or a moved file produces no finding at all.
+
+A widening is acknowledged with one pull-request comment carrying the digest
+the report prints — `/ack-posture <digest> <reason>` — which stays valid across
+unrelated pushes and stops matching the moment something new widens. That is
+also the only escape hatch for a false positive: nothing disables the gate.
+
+`autumn new` scaffolds `.github/workflows/posture-gate.yml`; existing apps
+adopt it with `autumn upgrade --apply`. See `docs/guide/posture-gate.md`.
+
 ## Comparing expected vs actual routes
 
 When the user is debugging a 404, compare the route table with the requested

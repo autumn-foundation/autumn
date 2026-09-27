@@ -96,6 +96,9 @@ REQUEST_PATH_MODULES=(
   autumn/src/inbound_mail.rs:inbound-mail
   autumn/src/channels.rs:ws
   autumn/src/job.rs:default
+  # The durable SQLite job backend (#1907): a submodule of the gated job.rs,
+  # listed on its own because its enforcing clippy lane is the sqlite one.
+  autumn/src/job/sqlite.rs:sqlite
   autumn/src/job_tracking.rs:default
   autumn/src/session.rs:default
   autumn/src/session_redis.rs:redis
@@ -120,17 +123,56 @@ REQUEST_PATH_MODULES=(
   autumn/src/capsule/wire.rs:db
   autumn/src/capsule/record_db.rs:db
   autumn/src/capsule/clock.rs:reporting
+  autumn/src/capsule/entropy.rs:reporting
+  autumn/src/capsule/effects.rs:reporting
   autumn/src/capsule/persist.rs:reporting
   autumn/src/capsule/redact.rs:reporting
   autumn/src/capsule/schema.rs:reporting
   autumn/src/search.rs:db
+  # Money and the double-entry ledger (#1837). A posting runs in a request
+  # handler, and a panic there is a half-written charge.
+  autumn/src/money/mod.rs:default
+  autumn/src/money/ledger.rs:db
   autumn/src/cluster/mod.rs:default
   autumn/src/cluster/counter.rs:default
   autumn/src/cluster/membership.rs:default
   autumn/src/cluster/wire.rs:default
   autumn/src/cluster/transport.rs:default
   autumn/src/cluster/node.rs:default
+  autumn/src/shadow/diff.rs:default
+  autumn/src/shadow/sample.rs:default
+  autumn/src/shadow/transport.rs:default
+  autumn/src/shadow/layer.rs:default
+  autumn/src/shadow/registry.rs:default
+  autumn/src/plugin_sandbox/host.rs:plugin-sandbox
+  autumn/src/plugin_sandbox/wire.rs:plugin-sandbox
+  autumn/src/plugin_sandbox/plugin.rs:plugin-sandbox
+  autumn/src/plugin_sandbox/capability/mod.rs:plugin-sandbox
+  autumn/src/plugin_sandbox/grants.rs:plugin-sandbox
+  autumn/src/plugin_sandbox/slots.rs:plugin-sandbox
   autumn-search/src/lib.rs:default
+  autumn/src/replication/wal.rs:db
+  autumn/src/replication/segment.rs:db
+  autumn/src/replication/destination.rs:db
+  autumn/src/replication/sqlite.rs:db
+  autumn/src/replication/restore.rs:db
+  autumn/src/replication/engine.rs:db
+  autumn/src/replication/status.rs:db
+  autumn/src/replication/s3.rs:http-client
+  autumn/src/sigv4.rs:default
+  autumn/src/constela/mod.rs:constela
+  autumn/src/constela/ast.rs:constela
+  autumn/src/constela/error.rs:constela
+  autumn/src/constela/parse.rs:constela
+  autumn/src/constela/policy.rs:constela
+  autumn/src/constela/eval.rs:constela
+  autumn/src/constela/validate.rs:constela
+  autumn/src/constela/render.rs:constela
+  autumn/src/constela/dispatch.rs:constela
+  autumn-billing/src/money.rs:default
+  autumn-billing/src/reconcile.rs:default
+  autumn-billing/src/gate.rs:default
+  autumn-billing/src/routes.rs:default
 )
 
 # The manifest may grow, never shrink. Deleting a gated module is a deliberate
@@ -138,7 +180,7 @@ REQUEST_PATH_MODULES=(
 # cannot quietly shrink the gate's surface. It tracks the manifest's length, so
 # it moves with every addition too — otherwise a one-entry revert would shrink
 # the manifest back under the floor while the gate still passed.
-MODULE_COUNT_FLOOR=45
+MODULE_COUNT_FLOOR=80
 
 # Gated modules whose feature is KNOWINGLY not enabled by any enforcing CI clippy
 # lane, as `<path>:<feature>`. Their headers are real but unenforced: the deny
@@ -151,18 +193,10 @@ MODULE_COUNT_FLOOR=45
 # reachable. Adding an entry is a deliberate, reviewable act; the honest default
 # for a request-path module is to be linted.
 #
-#   middleware/trace_context.rs (#[cfg(feature = "telemetry-otlp")],
-#   autumn/src/middleware/mod.rs:32) — telemetry-otlp pulls prost/tonic, whose
-#   build scripts need `protoc`, which the `lint` runner does not install (see
-#   the docs.rs note at autumn/Cargo.toml:385 and the explicit protoc steps in
-#   feature-combinations.yml / publish-gate.yml). Adding the feature to the
-#   gated-features clippy step therefore also means adding a protoc install step
-#   to the `lint` job. Verified locally with protoc present that
-#   `cargo clippy -p autumn-web --features telemetry-otlp --lib -- -D warnings`
-#   is already clean, so the burn-down is a workflow change, not a code change.
-FEATURE_LINT_EXEMPT=(
-  autumn/src/middleware/trace_context.rs:telemetry-otlp
-)
+#   Empty. The last entry — middleware/trace_context.rs behind `telemetry-otlp`
+#   — was retired by the `sqlite,telemetry-otlp` clippy lane the sqlite-runtime
+#   job gained with issue #1907, which installs protoc and enforces the feature.
+FEATURE_LINT_EXEMPT=()
 
 # What the checks below actually read; the self-test points it at its own list.
 # Guarded expansion so an emptied list is safe under `set -u` on bash < 4.4.
@@ -174,7 +208,7 @@ GATE_FEATURE_EXEMPT=(${FEATURE_LINT_EXEMPT[@]+"${FEATURE_LINT_EXEMPT[@]}"})
 # path is a hole, so the sibling framework crates are swept too. `autumn-cli`
 # (an operator tool) and `autumn-macros` (compile-time proc-macro internals) are
 # deliberately EXEMPT and absent here.
-SCAN_DIRS="autumn/src,autumn-search/src,autumn-admin-plugin/src,autumn-media-plugin/src,autumn-storage-s3/src,autumn-cache-redis/src"
+SCAN_DIRS="autumn/src,autumn-search/src,autumn-admin-plugin/src,autumn-media-plugin/src,autumn-storage-s3/src,autumn-cache-redis/src,autumn-billing/src"
 
 # Read-only inputs for the feature-reachability check.
 CI_WORKFLOW=".github/workflows/ci.yml"
