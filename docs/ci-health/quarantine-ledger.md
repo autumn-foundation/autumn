@@ -2515,3 +2515,67 @@ opened here 2026-09-21 (n=1, mechanism unconfirmed) and **closed the same
 week** — see its entry under "Closed entries" above for the full diagnosis,
 measured fix, and verification; not repeated here.
 
+### `Windows Tier 1 journey`: `autumn setup` fails "✗ Failed to read cargo metadata" against a freshly-scaffolded app
+
+- **New, 2026-09-27. n=2 organic, identical signature, ~32h apart, on two
+  unrelated branches.** Run 108204416273 (`vesper/bugbash-2288-commentable-author-name`,
+  2026-09-25T18:52:29Z) and run 108534929493 (`vesper/bugbash-2415-multipart-type-case`,
+  2026-09-27T02:41:46Z) both fail the `Windows Tier 1 journey` job's `autumn
+  setup` step against the scaffolded `tier1_app`, immediately after the
+  preceding `autumn doctor` step completed normally (29 passed/4 warned/1
+  failed — only the expected pre-setup `tailwind_binary` warning). Identical
+  output both times: `✗ Failed to read cargo metadata`, then the PowerShell
+  wrapper's `if ($LASTEXITCODE -ne 0) { throw "autumn setup failed with
+  $LASTEXITCODE" }` step throws `autumn setup failed with 1`. Neither
+  triggering branch's own diff touches Windows-specific code, `autumn setup`,
+  or `autumn-cli`'s cargo-metadata helpers — both are unrelated feature
+  branches (a `commentable` author-name fix, a multipart type-case fix).
+- **Mechanism: unconfirmed — this is itself the finding.** `autumn setup`
+  (via `autumn-cli/src/build.rs:875`'s `read_cargo_metadata`, and the near-
+  identical helpers at `autumn-cli/src/routes.rs:280`/`autumn-cli/src/dev.rs:1916`)
+  ran `cargo metadata --format-version=1 --no-deps`, got a non-zero exit, and
+  the CI log shows only the helper's own generic `"✗ Failed to read cargo
+  metadata"` — **`cargo`'s own stderr was never captured or printed**, so
+  neither occurrence's actual cause (network/index-fetch failure resolving
+  the scaffolded app's fresh `Cargo.toml`, a disk/permission issue on the
+  Windows runner, a stale/inconsistent lockfile, or something else) is
+  visible in either run's log. This is the same class of gap the ledger
+  already flagged once before for this exact job (2026-09-22 update to the
+  `live_upgrade` entry's neighbor list: `claude/intelligent-wright-vvhnue`'s
+  `Windows Tier 1 journey` failure, whose logs 404'd and were "not
+  investigated further" — a different proximate cause, but the same
+  "Windows Tier 1 journey failed and nobody could see why" shape) — except
+  this time the log is readable and the helper itself, not log retention, is
+  what's hiding the cause.
+- **Test-vs-product: not yet renderable — the missing stderr is exactly what
+  a verdict needs.** `cargo metadata` failing against a scaffold this job
+  generates fresh every run could be a real product defect (something the
+  scaffolded `autumn.toml`/`Cargo.toml` template produces that `cargo`
+  rejects only intermittently, e.g. under Windows path-length or antivirus-
+  lock contention) or pure CI/runner infrastructure (a transient crates.io-
+  index fetch failure, disk pressure) — the two are indistinguishable from
+  the generic message alone, and guessing which is exactly the folklore this
+  role's own rules ban ("CI is flaky" is not a mechanism).
+- **Treatment, this pass: an observability fix, not a flake fix — the
+  distinction this role's own gate exists to enforce.** No rerun campaign, no
+  tolerance change, no retry. `read_cargo_metadata`/`find_binary_in_profile`/
+  `cargo_metadata` (`build.rs`, `routes.rs`, `dev.rs`) now print
+  `String::from_utf8_lossy(&output.stderr)` alongside the existing message
+  before exiting, so the next occurrence's actual `cargo` error lands in the
+  CI log instead of being discarded. `try_cargo_metadata`
+  (`dev.rs:1933`, the deliberately-silent best-effort path used by lifecycle
+  commands like `autumn serve stop`) is untouched — printing there would
+  defeat its own documented purpose of staying quiet on a broken manifest.
+  Verified with `cargo check -p autumn-cli`, `cargo fmt -p autumn-cli --
+  --check`, and `cargo clippy -p autumn-cli --all-targets -- -D warnings`,
+  all clean; no Windows runner available in this sandbox to reproduce the
+  original failure directly.
+- **Status**: open, n=2, mechanism unconfirmed. Not quarantined — `Windows
+  Tier 1 journey` keeps running on every PR unchanged; this only changes
+  what the next failure's log shows. Revisit once a third occurrence lands
+  with the new stderr output captured, or after ~2 weeks with zero repeats.
+- **Linked issue/PR**: none filed separately yet — the observability fix
+  lands directly in this ledger's own tracking PR, per this repo's
+  established convention for a diagnosability gap found mid-triage.
+- **Skip mechanism**: none — this is a tracked signature, not a quarantine.
+
