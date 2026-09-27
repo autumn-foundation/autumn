@@ -3745,10 +3745,13 @@ failed after `migrate` but before its cutover and tore its own candidate down �
 `no host is serving the new release, but the migration that already ran was NOT
 rolled back …`. A rollout that died BEFORE its migration (a failed host
 preparation or upload) prints none of them. **A failed SINGLE-host deploy prints
-no summary and so warns about none of this** (known gap, #2276) — if a user's
-one-host `deploy up` failed, tell them to check `autumn migrate status` before
-assuming nothing was applied. That now includes a failed FIRST deploy, which
-migrates before it starts the release.
+no summary, but its error gets one more line** when it failed after `migrate` and
+before the cutover (#2276): a redeploy → `the migration that already ran was NOT
+rolled back — the binaries went back and the schema did not …`; a FIRST deploy →
+`… nothing is serving and the schema has moved …` (re-running `deploy up` is
+the fix).
+The same rules as the fleet notes pick the line, so a failure before `migrate`
+or after the cutover adds none.
 `--only <HOST>` (repeatable, `up` and `rollback`) is a repair lever
 that warns about a mixed fleet; `--no-rollback` halts and freezes instead.
 `--only` narrowed to ONE host takes the single-host path: `deploy rollback --only

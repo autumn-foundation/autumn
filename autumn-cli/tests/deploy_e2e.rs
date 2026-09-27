@@ -767,6 +767,12 @@ fn deploy_e2e_full_lifecycle() {
         !out.status.success(),
         "forced-failure deploy should exit non-zero (readiness gate must time out)"
     );
+    // #2276: `migrate` ran before the gate failed, so the error names the schema.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("the migration that already ran was NOT rolled back"),
+        "a single-host rollback after `migrate` must name the schema:\n{stderr}"
+    );
     assert_eq!(
         failures, 0,
         "old release should keep serving through the failed attempt: {failures}/{total} dropped"
