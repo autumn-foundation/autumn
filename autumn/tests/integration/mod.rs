@@ -391,6 +391,7 @@ mod sim_deterministic_ids;
 mod sim_drain_stall;
 mod sim_fault_plan;
 mod sim_fault_plan_pg;
+mod sim_interleave;
 mod sim_job_clock;
 mod sim_liveness_watchdog;
 mod sim_llm_stub;

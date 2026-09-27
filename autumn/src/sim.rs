@@ -136,6 +136,10 @@ pub mod crash;
 // registry API live here.
 pub mod assert;
 
+// The interleaving shuffler (issue #2967): seeded poll order for
+// `Sim::interleave` and seeded yields for `Sim::spawn`.
+mod shuffle;
+
 pub use assert::{
     SometimesRegistry, assert_all_sometimes_satisfied, reset_sometimes_registry,
     sometimes_snapshot, sometimes_unsatisfied,
@@ -223,6 +227,11 @@ pub struct Sim {
     /// advance/drain futures `Send` (a `Cell`/`RefCell` field would break both).
     strict_budget: Option<std::time::Duration>,
 
+    /// How many shuffler calls ([`interleave`](Sim::interleave),
+    /// [`spawn`](Sim::spawn)) this sim made. Each call draws its own seeded
+    /// stream from the seed and this count. Atomic so `&self` stays `Sync`.
+    shuffle_calls: std::sync::atomic::AtomicU64,
+
     /// How many times [`mount`](Sim::mount) has run. The first mount seeds the
     /// app's entropy from [`seed`](Sim::seed); each restart derives a new seed
     /// from it, so a restarted process does not replay the crashed one's ids.
@@ -254,6 +263,7 @@ impl Sim {
             chaos_state: None,
             app: SimApp::default(),
             strict_budget: None,
+            shuffle_calls: std::sync::atomic::AtomicU64::new(0),
             mounts: 0,
         }
     }
@@ -438,6 +448,43 @@ impl Sim {
     pub fn crash_and_restart(&mut self, app: crate::test::TestApp) -> &crate::test::TestClient {
         self.kill();
         self.restart(app)
+    }
+
+    /// Run `ops` concurrently and poll them in a seeded order (issue #2967).
+    ///
+    /// Each round polls the pending ops in an order drawn from the seed, and
+    /// can hold one back for a round. So ops that share state (a lock, a row, a
+    /// counter) meet in a different order per seed, and the same seed replays
+    /// the same order. Outputs keep the input order.
+    ///
+    /// ```rust,ignore
+    /// let client = sim.client();
+    /// let ops = vec![client.post("/a").send(), client.post("/b").send()];
+    /// let responses = sim.interleave(ops).await;
+    /// ```
+    pub async fn interleave<F: std::future::Future>(&self, ops: Vec<F>) -> Vec<F::Output> {
+        shuffle::Interleave::new(ops, self.next_shuffle_stream()).await
+    }
+
+    /// Spawn `op` on the sim runtime with seeded yields (issue #2967).
+    ///
+    /// Before a poll, the task can yield from the seeded stream, which moves
+    /// it behind the other ready tasks. Tasks spawned this way therefore run
+    /// in a seed-driven order. Tasks the framework spawns keep tokio's order.
+    pub fn spawn<F>(&self, op: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        tokio::spawn(shuffle::Shuffled::new(op, self.next_shuffle_stream()))
+    }
+
+    /// The seeded stream for the next shuffler call.
+    fn next_shuffle_stream(&self) -> Arc<dyn Entropy> {
+        let call = self
+            .shuffle_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        shuffle::stream(self.seed, call)
     }
 
     /// The seed-derived [`CrashSchedule`] for this simulation.
