@@ -823,6 +823,18 @@ pub(crate) fn append_framework_routes(
         for (path, handler) in [
             (crate::stories::STORIES_PATH, "story_gallery_index"),
             ("/_stories/{slug}", "story_gallery_story"),
+            // Live demo backends for the Active search / Autocomplete /
+            // Infinite feed stories (review follow-up — route-dump
+            // consumers couldn't see these three without an entry here).
+            ("/_stories/demo/search", "story_gallery_demo_search"),
+            (
+                "/_stories/demo/tags/search",
+                "story_gallery_demo_tag_search",
+            ),
+            (
+                "/_stories/demo/posts/feed",
+                "story_gallery_demo_infinite_feed",
+            ),
         ] {
             infos.push(RouteInfo::framework_get(path.to_owned(), handler));
         }
@@ -1909,6 +1921,20 @@ mod tests {
             paths.contains(&"/_stories/{slug}"),
             "enabled stories must list the detail route: {paths:?}"
         );
+        // Review follow-up: the Active search / Autocomplete / Infinite feed
+        // stories' live demo backends must be listed too, or route-dump
+        // consumers can't see them and the OpenAPI/MCP collision preflight
+        // (`collect_framework_get_paths` in router.rs) can't reserve them.
+        for demo_path in [
+            "/_stories/demo/search",
+            "/_stories/demo/tags/search",
+            "/_stories/demo/posts/feed",
+        ] {
+            assert!(
+                paths.contains(&demo_path),
+                "enabled stories must list the demo route {demo_path}: {paths:?}"
+            );
+        }
 
         let default_config = AutumnConfig::default();
         let mut infos = Vec::new();

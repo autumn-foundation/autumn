@@ -1708,9 +1708,15 @@ InboundMailRouter::new().handler(handle_support_handler_info())
 
 Recipient matching: `to = "address@example.com"` (exact),
 `to = "replies+{token}@app.example"` (plus-address; token via
-`InboundEmail::plus_token()`), or `to = "prefix+*"` (local-part prefix).
-`processing = "sync" | "background"` (default `"background"`). See
-[Mail](./mail.md).
+`InboundEmail::plus_token()`), or `to = "prefix*"` (local-part prefix).
+`processing = "sync" | "background"` (default `"background"`).
+
+This page shows what the macro expands to. For the subsystem it plugs into —
+the provider endpoints, the router, and what `background` costs you when a
+handler fails — see
+[Receiving Mail](./mail.md#receiving-mail-inbound-email), and
+[the recipient pattern table](./mail.md#routing-a-message-to-a-handler) for the
+full matching rules.
 
 ---
 
