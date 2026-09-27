@@ -13,7 +13,7 @@ use autumn_web::app::ApiVersion;
 use chrono::TimeZone;
 
 #[autumn_web::main]
-async fn main() -> Result<(), autumn_web::Error> {
+async fn main() {
     let app = autumn_web::app()
         // Register API v1: Deprecated on 2026-06-01, Sunset on 2026-12-01
         .api_version(ApiVersion {
@@ -137,7 +137,7 @@ This command builds your project, queries the route table, and audits all routes
 
 ## 6. OpenAPI Integration
 
-When using the `openapi` feature, Autumn automatically syncs route version metadata with your generated OpenAPI documentation:
+When using the `openapi` feature, Autumn automatically syncs route version metadata with your generated OpenAPI documentation (see the [OpenAPI guide](openapi.md) for the rest of what the spec derives from your handlers):
 
 1. **Tag Grouping**: Operations are automatically tagged with their API version name (e.g. `v1`, `v2`), making them easy to group and navigate.
 2. **Deprecation Gating**: Any operation whose API version is past its `deprecated_at` date is marked as `"deprecated": true` in the spec.

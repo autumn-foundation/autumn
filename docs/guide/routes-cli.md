@@ -176,6 +176,9 @@ documentation for those routes.
 
 ## See also
 
+- [Route Auth Coverage — the Default-Deny Posture Model](route-auth-coverage.md)
+  — the `audit` subcommand: default-deny classification, the three route
+  kinds (`gated`, `public`, `framework`), and CI wiring.
 - [Security Posture Manifest — Provenance Classes](security-posture-manifest.md)
   — how `autumn routes audit` tags each manifest dimension as `provable`,
   `declared`, or `runtime-only`.
