@@ -13,7 +13,7 @@ use autumn_web::job;
 use autumn_web::prelude::*;
 use autumn_web::sla::{
     BusinessCalendar, BusinessDuration, MemoryObligationStore, Obligation, ObligationRecord,
-    ObligationStore, Sla, SlaBreach, SlaPlugin, StoreFuture,
+    ObligationStore, Sla, SlaBreach, SlaError, SlaPlugin, StoreFuture,
 };
 use autumn_web::test::{TestApp, TestClient};
 use autumn_web::time::TickingClock;
@@ -29,6 +29,7 @@ struct RacingStore {
     barrier: Arc<Barrier>,
     gets: Arc<AtomicUsize>,
     claims: Arc<AtomicUsize>,
+    fail_mark_met: Arc<AtomicBool>,
 }
 
 impl RacingStore {
@@ -39,12 +40,13 @@ impl RacingStore {
             barrier: Arc::new(Barrier::new(2)),
             gets: Arc::default(),
             claims: Arc::default(),
+            fail_mark_met: Arc::default(),
         }
     }
 }
 
 impl ObligationStore for RacingStore {
-    fn insert(&self, record: ObligationRecord) -> StoreFuture<'_, ObligationRecord> {
+    fn insert(&self, record: ObligationRecord) -> StoreFuture<'_, (ObligationRecord, bool)> {
         self.inner.insert(record)
     }
 
@@ -64,6 +66,9 @@ impl ObligationStore for RacingStore {
     }
 
     fn mark_met<'a>(&'a self, key: &'a str, at: DateTime<Utc>) -> StoreFuture<'a, bool> {
+        if self.fail_mark_met.load(Ordering::SeqCst) {
+            return Box::pin(std::future::ready(Err(SlaError::Store("down".to_owned()))));
+        }
         self.inner.mark_met(key, at)
     }
 
@@ -166,6 +171,38 @@ async fn sim_sla_two_replicas_escalate_once() {
     assert_eq!(*fired.lock().unwrap(), ["first_response/ticket:1"]);
     let status = sla_b.get(&obligation.key()).await.unwrap().unwrap();
     assert!(status.escalated_at.is_some());
+
+    job::clear_global_job_client();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sim_sla_track_rolls_back_only_the_record_it_made() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let clock = TickingClock::starting_at(start);
+    let store = RacingStore::new();
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    let app = replica(&clock, &store, &fired);
+    let sla = Sla::from_state(app.state()).unwrap();
+    store.fail_mark_met.store(true, Ordering::SeqCst);
+
+    // A new record, then `mark_met` fails: the record goes away.
+    let fresh = Obligation::new("first_response", "ticket:1")
+        .within(BusinessDuration::hours(2))
+        .calendar("support")
+        .met_at(start);
+    assert!(sla.track(&fresh).await.is_err());
+    assert!(sla.get(&fresh.key()).await.unwrap().is_none());
+
+    // A record that another call made stays.
+    let shared = Obligation::new("first_response", "ticket:2")
+        .within(BusinessDuration::hours(2))
+        .calendar("support");
+    sla.track(&shared).await.unwrap();
+    assert!(sla.track(&shared.clone().met_at(start)).await.is_err());
+    assert!(sla.get(&shared.key()).await.unwrap().is_some());
 
     job::clear_global_job_client();
 }

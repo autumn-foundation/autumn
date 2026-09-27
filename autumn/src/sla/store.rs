@@ -40,8 +40,9 @@ impl ObligationRecord {
 /// `UPDATE … SET escalated_at = $3 WHERE key = $1 AND escalated_at IS NULL
 /// AND (met_at IS NULL OR met_at > $2)`.
 pub trait ObligationStore: Send + Sync + 'static {
-    /// Add `record` if its key is new. Return the stored record.
-    fn insert(&self, record: ObligationRecord) -> StoreFuture<'_, ObligationRecord>;
+    /// Add `record` if its key is new. Return the stored record, and `true`
+    /// if this call created it. The check and the write must be atomic.
+    fn insert(&self, record: ObligationRecord) -> StoreFuture<'_, (ObligationRecord, bool)>;
 
     /// Get the record for `key`.
     fn get<'a>(&'a self, key: &'a str) -> StoreFuture<'a, Option<ObligationRecord>>;
@@ -98,12 +99,12 @@ impl MemoryObligationStore {
 }
 
 impl ObligationStore for MemoryObligationStore {
-    fn insert(&self, record: ObligationRecord) -> StoreFuture<'_, ObligationRecord> {
-        self.with(|records| {
-            records
-                .entry(record.obligation.key())
-                .or_insert(record)
-                .clone()
+    fn insert(&self, record: ObligationRecord) -> StoreFuture<'_, (ObligationRecord, bool)> {
+        self.with(|records| match records.entry(record.obligation.key()) {
+            std::collections::btree_map::Entry::Occupied(entry) => (entry.get().clone(), false),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                (entry.insert(record).clone(), true)
+            }
         })
     }
 

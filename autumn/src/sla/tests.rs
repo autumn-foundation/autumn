@@ -496,8 +496,10 @@ fn record(start: DateTime<Utc>) -> ObligationRecord {
 #[tokio::test]
 async fn store_insert_keeps_the_first_record() {
     let store = MemoryObligationStore::new();
-    let first = store.insert(record(utc(2024, 1, 5, 15, 0))).await.unwrap();
-    let second = store.insert(record(utc(2024, 1, 8, 9, 0))).await.unwrap();
+    let (first, created) = store.insert(record(utc(2024, 1, 5, 15, 0))).await.unwrap();
+    assert!(created);
+    let (second, created) = store.insert(record(utc(2024, 1, 8, 9, 0))).await.unwrap();
+    assert!(!created, "the second insert does not own the record");
     assert_eq!(first, second);
     assert_eq!(store.list().await.unwrap().len(), 1);
 }

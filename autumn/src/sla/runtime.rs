@@ -264,8 +264,8 @@ impl Sla {
     ///
     /// # Errors
     ///
-    /// A new record is removed again when the check job cannot go on the
-    /// queue.
+    /// If this call made the record and a later step fails, it removes the
+    /// record again.
     ///
     /// # Errors
     ///
@@ -288,19 +288,30 @@ impl Sla {
             .met_at(None);
         let key = resolved.key();
         let store = &self.engine.store;
-        let existed = store.get(&key).await?.is_some();
-        let mut record = store.insert(ObligationRecord::new(resolved)).await?;
-        if let Some(met) = obligation.met()
-            && store.mark_met(&key, met).await?
-        {
-            record = store.get(&key).await?.unwrap_or(record);
-        }
-        let result = self.schedule(&key, &record, now).await;
-        if result.is_err() && !existed {
-            // Do not keep a new record that has no check job.
+        let (record, created) = store.insert(ObligationRecord::new(resolved)).await?;
+        let result = self.mark_and_schedule(&key, record, obligation, now).await;
+        if result.is_err() && created {
+            // Do not keep a record that this call made and could not schedule.
             store.remove(&key).await?;
         }
         result
+    }
+
+    /// Mark a stored record met, if `obligation` is met, then schedule it.
+    async fn mark_and_schedule(
+        &self,
+        key: &str,
+        mut record: ObligationRecord,
+        obligation: &Obligation,
+        now: DateTime<Utc>,
+    ) -> Result<ObligationStatus, SlaError> {
+        let store = &self.engine.store;
+        if let Some(met) = obligation.met()
+            && store.mark_met(key, met).await?
+        {
+            record = store.get(key).await?.unwrap_or(record);
+        }
+        self.schedule(key, &record, now).await
     }
 
     /// Put the check job of `record` on the queue, if it is still open.
