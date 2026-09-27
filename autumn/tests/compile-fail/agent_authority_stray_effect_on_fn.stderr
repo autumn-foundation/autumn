@@ -1,0 +1,5 @@
+error: `#[agent_effect(...)]` declares what one statement inside the handler does, not what the handler is allowed to do; the handler's envelope is the `#[agent_operable(grant = ...)]` grant. See docs/guide/agent-authority.md.
+  --> tests/compile-fail/agent_authority_stray_effect_on_fn.rs:34:1
+   |
+34 | #[agent_effect(writes(Refund), reason = "the whole handler writes")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

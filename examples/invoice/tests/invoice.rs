@@ -31,6 +31,23 @@ async fn detail_page_renders_html() {
         .assert_body_contains("Total: $42.00");
 }
 
+/// Regression test for the a11y fix (autumn check --a11y `html-has-lang`,
+/// `bypass`, `landmark-one-main`): the on-screen detail page is a full HTML
+/// document, not a bare fragment, so keyboard/screen-reader users get a
+/// language, a page title, and a `<main>` landmark to land on.
+#[tokio::test]
+async fn detail_page_has_a_document_shell() {
+    client()
+        .get("/invoices/42")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("<!DOCTYPE html>")
+        .assert_body_contains("<html lang=\"en\">")
+        .assert_body_contains("<title>Invoice #42</title>")
+        .assert_body_contains("<main>");
+}
+
 #[tokio::test]
 async fn pdf_route_sets_pdf_headers_and_filename() {
     client()

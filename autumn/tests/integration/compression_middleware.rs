@@ -8,6 +8,7 @@
 //! - Compression is off by default (opt-in)
 
 use autumn_web::config::{AutumnConfig, CompressionConfig};
+use autumn_web::error::AutumnError;
 use autumn_web::test::TestApp;
 use autumn_web::{get, routes};
 use axum::http::header;
@@ -58,6 +59,17 @@ async fn zip_handler() -> impl IntoResponse {
         [(header::CONTENT_TYPE, "application/zip")],
         b"PK\x03\x04fake-zip-content-for-testing-purposes-only-padded".as_slice(),
     )
+}
+
+/// A large-enough-to-compress error response, rebuilt by `ProblemDetailsFilter`
+/// (`ExceptionFilterLayer`) rather than returned as-is by the handler.
+#[get("/error")]
+async fn error_handler() -> Result<String, AutumnError> {
+    Err(AutumnError::not_found_msg(
+        "Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod \
+         tempor incididunt ut labore et dolore magna aliqua — this resource \
+         does not exist",
+    ))
 }
 
 #[get("/pre-encoded")]
@@ -255,6 +267,57 @@ async fn archive_content_type_not_compressed() {
         resp.header("content-encoding"),
         None,
         "application/zip must not be compressed by the framework"
+    );
+}
+
+/// Regression test for issue #2371: response compression must stay OUTER to
+/// the exception-filter chain (`ExceptionFilterLayer` / `ProblemDetailsFilter`
+/// inside `apply_middleware`'s `outer_stack`), so a filter-rebuilt error body
+/// (here, a `404` normalized to a JSON Problem Details document) is
+/// compressed like any other response rather than inheriting a stale
+/// `Content-Encoding` from a compression pass that already ran on the
+/// handler's PRE-rebuild body. If compression were ever moved inner to the
+/// exception filter, this response would carry `Content-Encoding: gzip` on a
+/// body the filter rebuilt AFTER compression ran — plain bytes under a gzip
+/// label — and a client gunzipping it would get garbage or a decode error,
+/// which is exactly what this test's gzip round trip would catch.
+#[tokio::test]
+async fn compressed_error_response_gzip_decodes_to_the_rebuilt_body() {
+    let app = TestApp::new()
+        .routes(routes![error_handler])
+        .config(compression_enabled_config())
+        .build();
+
+    let resp = app
+        .get("/error")
+        .header("accept-encoding", "gzip")
+        .send()
+        .await;
+
+    assert_eq!(resp.status.as_u16(), 404);
+    assert_eq!(
+        resp.header("content-encoding"),
+        Some("gzip"),
+        "the exception-filter-rebuilt error body must still be compressed \
+         like any other response"
+    );
+
+    let decoded = {
+        use std::io::Read as _;
+        let mut gz = flate2::read::GzDecoder::new(resp.body.as_slice());
+        let mut out = String::new();
+        gz.read_to_string(&mut out).expect(
+            "Content-Encoding: gzip must decode as valid gzip -- a body that \
+             is actually plain, uncompressed bytes under a stale gzip header \
+             means compression ran BEFORE the exception filter rebuilt the \
+             response, not after",
+        );
+        out
+    };
+    assert!(
+        decoded.contains("does not exist"),
+        "decoded body should be the exception filter's rebuilt JSON Problem \
+         Details document, got: {decoded}"
     );
 }
 

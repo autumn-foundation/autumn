@@ -18,7 +18,7 @@
 //! allowlist sanitizer — see [`render_user_content_html`](crate::markdown::render_user_content_html) and
 //! [`docs/guide/rich-text.md`] for the exact guarantee.
 //!
-//! [`docs/guide/rich-text.md`]: https://github.com/autumn-foundation/autumn/blob/main/docs/guide/rich-text.md
+//! [`docs/guide/rich-text.md`]: https://github.com/autumn-foundation/autumn/blob/trunk/docs/guide/rich-text.md
 //!
 //! ## Quick start
 //!
@@ -53,6 +53,12 @@
 //!     }))
 //! }
 //! ```
+//!
+//! Heading anchors are unique per document: a heading repeated within a page
+//! keeps the plain slug on its first occurrence (`#example`) and later ones are
+//! suffixed (`#example-1`), so every entry in the
+//! [`RenderedMarkdown`](crate::markdown::RenderedMarkdown) table of contents
+//! links to its own heading.
 //!
 //! ### 3. Wire up static pre-rendering
 //!
