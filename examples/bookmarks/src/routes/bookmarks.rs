@@ -75,6 +75,12 @@ fn layout(title: &str, content: Markup) -> Markup {
 
             }
             body class="bg-gray-50 min-h-screen" {
+                a href="#main-content"
+                  class="skip-link sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 \
+                         focus:z-50 focus:px-4 focus:py-2 focus:bg-white focus:text-gray-900 \
+                         focus:border focus:border-gray-300 focus:rounded focus:shadow" {
+                    "Skip to main content"
+                }
                 nav class="bg-indigo-600 text-white p-4" {
                     div class="max-w-3xl mx-auto flex justify-between items-center" {
                         a href="/bookmarks" class="text-xl font-bold" { "Bookmarks" }
@@ -84,7 +90,7 @@ fn layout(title: &str, content: Markup) -> Markup {
                         }
                     }
                 }
-                main class="max-w-3xl mx-auto p-6" { (content) }
+                main id="main-content" class="max-w-3xl mx-auto p-6" { (content) }
             }
         }
     }
@@ -134,6 +140,9 @@ fn bookmark_columns() -> Vec<Column<'static, Bookmark>> {
 }
 
 #[get("/bookmarks")]
+// One finder, and a page of rows rendered from it. The build fails if a future
+// edit adds a per-row lookup inside the table's column closures (#1667).
+#[query_budget(1)]
 pub async fn index(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
     let rows = repo.find_all().await?;
     let search_config = autumn_web::widgets::ActiveSearchConfig::new(
@@ -290,7 +299,17 @@ const ACTIVITY_WINDOW_DAYS: i64 = 30;
 ///
 /// See `docs/guide/aggregates.md` for the walkthrough behind this route.
 #[get("/bookmarks/stats")]
+// Two grouped aggregates, each a single `GROUP BY` in the database. The
+// builder methods that shape them (`order_by_aggregate_desc`, `limit`,
+// `bucket`, `filter_range`) issue nothing, so the ceiling is 2 (#1667).
+#[query_budget(2)]
 pub async fn stats(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
+    // Time the two aggregates with the metrics facade. The guard records on
+    // drop, so a `?` on either query below is covered too; it is bound to a
+    // named variable because `let _ = ...` would drop it immediately and
+    // record a duration of roughly zero. See `docs/guide/metrics.md`.
+    let stats_timing = crate::metrics::time_stats_query();
+
     // Top tags by bookmark count, largest first: `COUNT(*) GROUP BY tag`
     // ordered on the aggregate and capped — the whole top-N runs in the DB.
     let by_tag: Vec<(String, i64)> = repo
@@ -312,6 +331,11 @@ pub async fn stats(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
         .await?;
     // The database groups in no defined order; sort into a chronological series.
     per_day.sort_by_key(|(day, _)| *day);
+
+    // Resolve the guard here rather than letting it drop at the end of the
+    // handler, so the histogram measures the aggregate queries and not the
+    // markup rendering that follows.
+    stats_timing.stop();
 
     Ok(layout(
         "Stats",
@@ -486,6 +510,11 @@ pub async fn create(
 ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {
     let changeset = form.into_changeset();
     if !changeset.is_valid() {
+        // App-metrics facade (#1378): one line at the call site, no type to
+        // define and nothing registered with `AppBuilder`. Both outcomes are
+        // counted so `rate(bookmarks_created_total{outcome="rejected"}[5m])`
+        // can alert on a form that suddenly stops validating.
+        crate::metrics::record_created(crate::metrics::outcome::REJECTED);
         return Ok((
             StatusCode::UNPROCESSABLE_ENTITY,
             new_bookmark_form(&changeset),
@@ -499,6 +528,7 @@ pub async fn create(
         tag: data.tag,
     };
     repo.save(&new).await?;
+    crate::metrics::record_created(crate::metrics::outcome::CREATED);
     Ok(Redirect::to("/bookmarks").into_response())
 }
 
@@ -573,14 +603,17 @@ pub async fn update(
 
 // ── Active search handler ─────────────────────────────────────────────────────
 
-#[derive(serde::Deserialize)]
+// `OpenApiSchema` so the exported spec advertises `q` as a real query
+// parameter instead of the opaque `{"type":"object"}` placeholder a
+// derive-less `Query<T>` type falls back to (issue #802).
+#[derive(serde::Deserialize, autumn_web::openapi::OpenApiSchema)]
 pub struct SearchQuery {
     #[serde(default)]
     pub q: String,
 }
 
 /// Escape LIKE/ILIKE wildcards so user input is treated as literal characters.
-/// PostgreSQL's default escape character is `\`, so `%` → `\%`, `_` → `\_`.
+/// `PostgreSQL`'s default escape character is `\`, so `%` → `\%`, `_` → `\_`.
 fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")

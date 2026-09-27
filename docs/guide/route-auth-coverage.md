@@ -201,6 +201,9 @@ provable this way.
 
 ## See also
 
+- [The Security Posture Gate](posture-gate.md) — diffing this manifest across
+  commits, blocking a pull request that widens the surface until a human
+  acknowledges it, and verifying the signed manifest at deploy time.
 - [`autumn routes` — Route Inspection CLI](routes-cli.md) — the base
   listing command `audit` builds on.
 - [Security Posture Manifest — Provenance Classes](security-posture-manifest.md)

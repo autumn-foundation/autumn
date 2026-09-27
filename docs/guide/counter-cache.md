@@ -29,13 +29,17 @@ That is the whole feature. `PgCommentRepository`'s `save`, `update`,
 `posts.comment_count` **inside the same transaction as the row mutation**, with a
 single atomic `UPDATE posts SET comment_count = comment_count + $1 WHERE id = $2`.
 
-> A complete runnable version lives in
-> [`examples/reddit-clone`](../../examples/reddit-clone): `Comment` carries
-> `#[belongs_to(Post, counter_cache)]` in
-> [`src/models.rs`](../../examples/reddit-clone/src/models.rs). The framework's
-> own [`autumn/tests/integration/model_counter_cache.rs`](../../autumn/tests/integration/model_counter_cache.rs)
+> The framework's own
+> [`autumn/tests/integration/model_counter_cache.rs`](../../autumn/tests/integration/model_counter_cache.rs)
 > is the canonical evidence — including 50 simultaneous comments on one post —
 > and is the suite CI's ignored-test sweep runs on every push.
+>
+> `examples/reddit-clone` used to carry the worked example here, on a
+> `Comment` model that `belongs_to` a `Post`. Comments there are now a
+> *polymorphic* association (#1367), which keeps `posts.comment_count` current
+> through this very mechanism but declares it with `#[commentable]` rather than
+> `#[belongs_to(..., counter_cache)]` — see
+> [Threaded Comments on Anything](commentable.md).
 
 ## The attribute
 
@@ -191,6 +195,16 @@ transaction, can opt into the same maintenance instead of hand-rolling `count +
 1`:
 
 ```rust,ignore
+// Before the write: on a table with a leg onto itself this takes the lock
+// every generated mutation takes before its first row lock; elsewhere it
+// issues nothing. A raw insert that skipped it could hold its new row while
+// a generated mutation holds the lock and waits for that row.
+autumn_web::repository::counter_cache_serialize_self_referential(
+    conn,
+    Comment::counter_caches(),
+)
+.await?;
+
 let comment_id: i64 = diesel::insert_into(comments::table)
     .values(/* … */)
     .returning(comments::id)
@@ -242,9 +256,9 @@ is raw SQL) but not readable from Rust.
   compile time: the association's foreign key names a column on the join table,
   not on the child, so the increment would read a column that does not exist. Map
   the join table as its own model and put `counter_cache` on its `belongs_to`.
-- **Flat counts.** There is no conditional/filtered counter (Rails'
-  `counter_cache` has none either). Count only `published` children by giving
-  them their own model or maintaining that column yourself.
+- **Flat counts.** `counter_cache` itself counts every live child, with no
+  predicate and no weight. To count only `published` children, or to sum a
+  field over them, declare a [`#[derivation]`](derivations.md) instead.
 - **One column per (parent table, column).** Two counter-cached legs resolving
   onto the same parent column are a compile error — they would both move it and
   double-count. Two legs to *different* parent tables may share a column name.
@@ -341,8 +355,21 @@ collapsing a mixed-tenant batch behind one arbitrary witness would either sweep
 cross-tenant children into the increment or drop legitimate ones. Tenant-scoped
 associations therefore trade the folding optimization for exactness.
 
+## Filtered and weighted counts
+
+`counter_cache` counts every live child. For a count restricted by a predicate,
+or a weighted `sum(field)` over the qualifying rows, declare a
+[`#[derivation]`](derivations.md) on the child instead:
+`#[derivation(Post, column = "published_comment_count", filter = published)]`.
+It is maintained by the same mutation paths and the same transaction contract
+described above, and it adds a content-addressed definition hash, a resumable
+backfill and `/actuator/derivations` for state and drift. See
+[Maintained Derived Read Models](derivations.md).
+
 ## See also
 
+- [Maintained Derived Read Models](derivations.md) — `#[derivation]`, the
+  filtered and weighted superset of this attribute.
 - [`#[votable]`](votable.md) — the aggregate-column sibling, for signed
   vote scores and unary like counts over a reaction edge table.
 - [Repositories](repositories.md) — `dependent`, `soft_delete`, hooks.

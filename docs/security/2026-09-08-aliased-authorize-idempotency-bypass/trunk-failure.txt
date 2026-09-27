@@ -1,0 +1,83 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.78s
+     Running tests/integration_tests.rs (target/debug/deps/integration_tests-c7ea7897a2974d3d)
+
+running 1 test
+
+thread 'integration::authorization_integration::idempotent_replay_bypasses_aliased_authorize_policy_changes' (8959) panicked at autumn/tests/integration/authorization_integration.rs:495:5:
+assertion `left == right` failed: cached idempotency replay must not skip the current #[authorize] policy check, even when #[authorize] is imported under an alias
+  left: 200
+ right: 403
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/panicking.rs:434:23
+   3: core::panicking::assert_failed
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/panicking.rs:394:5
+   4: {async_block#0}
+             at ./tests/integration/authorization_integration.rs:495:5
+   5: poll<&mut dyn core::future::future::Future<Output=()>>
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/future/future.rs:133:9
+   6: poll<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/future/future.rs:133:9
+   7: {closure#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:830:70
+   8: with_budget<core::task::poll::Poll<()>, tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure#0}::{closure#0}::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/coop/mod.rs:167:5
+   9: budget<core::task::poll::Poll<()>, tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure#0}::{closure#0}::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/task/coop/mod.rs:133:5
+  10: {closure#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:830:25
+  11: tokio::runtime::scheduler::current_thread::Context::enter
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:488:19
+  12: {closure#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:829:44
+  13: tokio::runtime::scheduler::current_thread::CoreGuard::enter::{{closure}}
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:906:68
+  14: tokio::runtime::context::scoped::Scoped<T>::set
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context/scoped.rs:40:9
+  15: tokio::runtime::context::set_scheduler::{{closure}}
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context.rs:187:38
+  16: try_with<tokio::runtime::context::Context, tokio::runtime::context::set_scheduler::{closure_env#0}<(alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<()>), tokio::runtime::scheduler::current_thread::{impl#9}::enter::{closure_env#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>>, core::option::Option<()>>>, (alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<()>)>
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/thread/local.rs:513:12
+  17: std::thread::local::LocalKey<T>::with
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/thread/local.rs:477:20
+  18: tokio::runtime::context::set_scheduler
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context.rs:187:17
+  19: tokio::runtime::scheduler::current_thread::CoreGuard::enter
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:906:27
+  20: tokio::runtime::scheduler::current_thread::CoreGuard::block_on
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:817:24
+  21: {closure#0}<core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:218:33
+  22: tokio::runtime::context::runtime::enter_runtime
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/context/runtime.rs:65:16
+  23: block_on<core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/current_thread/mod.rs:206:9
+  24: tokio::runtime::runtime::Runtime::block_on_inner
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/runtime.rs:374:52
+  25: block_on<core::pin::Pin<&mut dyn core::future::future::Future<Output=()>>>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/runtime.rs:343:18
+  26: idempotent_replay_bypasses_aliased_authorize_policy_changes
+             at ./tests/integration/authorization_integration.rs:501:60
+  27: integration_tests::integration::authorization_integration::idempotent_replay_bypasses_aliased_authorize_policy_changes::{{closure}}
+             at ./tests/integration/authorization_integration.rs:472:71
+  28: core::ops::function::FnOnce::call_once
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/ops/function.rs:250:5
+  29: core::ops::function::FnOnce::call_once
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test integration::authorization_integration::idempotent_replay_bypasses_aliased_authorize_policy_changes ... FAILED
+
+failures:
+
+failures:
+    integration::authorization_integration::idempotent_replay_bypasses_aliased_authorize_policy_changes
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1889 filtered out; finished in 0.27s
+
+error: test failed, to rerun pass `-p autumn-web --test integration_tests`
+
+[exited with code 0]
