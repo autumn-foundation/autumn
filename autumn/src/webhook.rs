@@ -1718,6 +1718,8 @@ mod tests {
 
         let err2 = verify_timestamp(1_614_556_800 - 301, received_at, 300).unwrap_err();
         assert!(matches!(err2, WebhookVerifyError::StaleTimestamp));
+    }
+}
 
 /// Direct coverage for [`WebhookReplayCleanupService`] and its future's state
 /// machine (issue #2214).
