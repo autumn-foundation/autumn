@@ -672,25 +672,27 @@ pub enum SearchSubcommands {
 pub enum PluginSubcommands {
     /// List installable plugins with the version compatible with this app.
     ///
-    /// Covers every first-party plugin plus community crates discoverable on
-    /// crates.io through the documented `autumn-plugin-<name>` convention.
+    /// Reads the curated plugin index first (trust, tier, conformance), then
+    /// crates.io `autumn-plugin-<name>` crates, marked unlisted. Set
+    /// `AUTUMN_PLUGIN_INDEX=<path>` to read another index file.
     List {
         /// Emit JSON instead of a table.
         #[arg(long)]
         json: bool,
-        /// Do not query crates.io; list the first-party catalog only.
+        /// Do not query crates.io; list the plugin index only.
         #[arg(long)]
         offline: bool,
     },
-    /// Add a plugin: dependency, builder-chain mount, and post-install steps.
+    /// Add a plugin: trust review, dependency, builder-chain mount, and
+    /// post-install steps.
     Add {
         /// Plugin crate name, e.g. `autumn-admin-plugin`.
         name: String,
         /// Print what would change without writing anything.
         #[arg(long)]
         dry_run: bool,
-        /// Do not query crates.io. First-party plugins install normally;
-        /// a community crate cannot have its version resolved and is refused.
+        /// Do not query crates.io. Listed plugins install normally; an
+        /// unlisted crate cannot have its version resolved and is refused.
         #[arg(long)]
         offline: bool,
     },
@@ -785,6 +787,113 @@ pub enum PluginSubcommands {
         #[arg(long, value_name = "ARTIFACT")]
         against: Option<String>,
     },
+
+    /// Maintain the curated plugin index (issue #1625).
+    ///
+    /// `check` is the gate a listing must pass. `record` writes an
+    /// `autumn plugin-check --format json` report into a listing. See
+    /// autumn-cli/plugin-index/README.md.
+    Index {
+        /// The index subcommand to run.
+        #[command(subcommand)]
+        action: IndexSubcommands,
+    },
+}
+
+/// Subcommands for `autumn plugin index`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum IndexSubcommands {
+    /// Check the index: admission rules, and re-verification against a
+    /// release. Exits 1 on any finding.
+    ///
+    /// Examples:
+    ///   autumn plugin index check --index autumn-cli/plugin-index/index.toml
+    ///   autumn plugin index check --against 0.8.0 --format json
+    #[command(verbatim_doc_comment)]
+    Check {
+        /// The index file. Default: `AUTUMN_PLUGIN_INDEX`, else the copy in
+        /// this CLI.
+        #[arg(long, value_name = "FILE")]
+        index: Option<String>,
+        /// The `autumn-web` release to check against. Default: this CLI's.
+        #[arg(long, value_name = "VERSION")]
+        against: Option<String>,
+        /// Output format: `text` (default) or `json`.
+        #[arg(long, default_value = "text", value_name = "FORMAT")]
+        format: String,
+    },
+    /// Write conformance results into the index file.
+    ///
+    /// A pass lists the plugin. A fail flags it incompatible. A second fail
+    /// on a later release delists it. Writes nothing if any step fails.
+    ///
+    /// Examples:
+    ///   autumn plugin index record --index autumn-cli/plugin-index/index.toml \
+    ///       --report admin.json --report search.json --exempt autumn-storage-s3
+    #[command(verbatim_doc_comment)]
+    Record {
+        /// The index file to update.
+        #[arg(long, value_name = "FILE")]
+        index: String,
+        /// An `autumn plugin-check --format json` report (repeatable).
+        #[arg(long = "report", value_name = "FILE")]
+        reports: Vec<String>,
+        /// An exempt listing whose install gate passed (repeatable).
+        #[arg(long, value_name = "NAME")]
+        exempt: Vec<String>,
+        /// The `autumn-web` release the runs used. Default: this CLI's.
+        #[arg(long, value_name = "VERSION")]
+        against: Option<String>,
+        /// The run date, `YYYY-MM-DD`. Default: today.
+        #[arg(long, value_name = "DATE")]
+        date: Option<String>,
+    },
+}
+
+/// Run `autumn plugin index <action>`. Returns the exit code.
+fn run_plugin_index(action: IndexSubcommands) -> i32 {
+    let release = env!("CARGO_PKG_VERSION");
+    match action {
+        IndexSubcommands::Check {
+            index,
+            against,
+            format,
+        } => {
+            let json = match format.as_str() {
+                "text" => false,
+                "json" => true,
+                other => {
+                    eprintln!(
+                        "autumn plugin index check: unknown format '{other}'; expected 'text' or 'json'"
+                    );
+                    return 1;
+                }
+            };
+            plugin::curate::run_check(&plugin::curate::CheckOptions {
+                index: index.as_deref().map(std::path::Path::new),
+                against: against.as_deref().unwrap_or(release),
+                json,
+            })
+        }
+        IndexSubcommands::Record {
+            index,
+            reports,
+            exempt,
+            against,
+            date,
+        } => {
+            let reports: Vec<std::path::PathBuf> =
+                reports.iter().map(std::path::PathBuf::from).collect();
+            let today = chrono::Local::now().date_naive().to_string();
+            plugin::curate::run_record(&plugin::curate::RecordOptions {
+                index: std::path::Path::new(&index),
+                reports: &reports,
+                exempt: &exempt,
+                against: against.as_deref().unwrap_or(release),
+                date: date.as_deref().unwrap_or(&today),
+            })
+        }
+    }
 }
 
 /// Subcommands for `autumn jobs`.
@@ -1804,10 +1913,12 @@ enum Commands {
 
     /// Discover, install, package and review Autumn plugins.
     ///
-    /// `list` shows every installable plugin with the version compatible with
-    /// this app (querying crates.io for community crates unless `--offline`);
-    /// `add` writes the dependency, mounts the plugin in the
-    /// `autumn_web::app()` builder chain, and prints the post-install steps.
+    /// `list` reads the curated plugin index first: each listing shows its
+    /// trust class, API tier and last conformance result. Then it queries
+    /// crates.io (unless `--offline`) and marks those results unlisted.
+    /// `add` prints the trust review, writes the dependency, mounts the plugin
+    /// in the `autumn_web::app()` builder chain, and prints the post-install
+    /// steps. `index` checks and updates the index (maintainers).
     ///
     /// `package` and `inspect` are the capability-sandboxed lane: a sandboxed
     /// plugin runs as a `wasm32-wasip1` module inside a deny-by-default
@@ -1827,6 +1938,7 @@ enum Commands {
     ///   autumn plugin package --manifest plugin.toml --module hello.wasm \
     ///       --out hello.autumn-plugin
     ///   autumn plugin inspect hello.autumn-plugin
+    ///   autumn plugin index check
     #[command(verbatim_doc_comment)]
     Plugin {
         /// The plugin subcommand to run.
@@ -5477,6 +5589,7 @@ fn run_command(command: Commands) {
                     );
                     0
                 }
+                PluginSubcommands::Index { action } => run_plugin_index(action),
             };
             if code != 0 {
                 std::process::exit(code);
@@ -9624,6 +9737,86 @@ mod tests {
                 assert_eq!(format, "json");
             }
             _ => panic!("expected plugin inspect"),
+        }
+    }
+
+    // ── autumn plugin index (issue #1625) ──────────────────────────────────
+
+    #[test]
+    fn parse_plugin_index_check() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin",
+            "index",
+            "check",
+            "--index",
+            "i.toml",
+            "--against",
+            "0.8.0",
+            "--format",
+            "json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Plugin {
+                action:
+                    PluginSubcommands::Index {
+                        action:
+                            IndexSubcommands::Check {
+                                index,
+                                against,
+                                format,
+                            },
+                    },
+            } => {
+                assert_eq!(index.as_deref(), Some("i.toml"));
+                assert_eq!(against.as_deref(), Some("0.8.0"));
+                assert_eq!(format, "json");
+            }
+            _ => panic!("expected plugin index check"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_index_record_takes_repeated_reports() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin",
+            "index",
+            "record",
+            "--index",
+            "i.toml",
+            "--report",
+            "a.json",
+            "--report",
+            "b.json",
+            "--exempt",
+            "autumn-storage-s3",
+            "--date",
+            "2026-10-01",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Plugin {
+                action:
+                    PluginSubcommands::Index {
+                        action:
+                            IndexSubcommands::Record {
+                                index,
+                                reports,
+                                exempt,
+                                against,
+                                date,
+                            },
+                    },
+            } => {
+                assert_eq!(index, "i.toml");
+                assert_eq!(reports, ["a.json", "b.json"]);
+                assert_eq!(exempt, ["autumn-storage-s3"]);
+                assert_eq!(against, None);
+                assert_eq!(date.as_deref(), Some("2026-10-01"));
+            }
+            _ => panic!("expected plugin index record"),
         }
     }
 

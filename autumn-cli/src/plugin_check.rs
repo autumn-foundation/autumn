@@ -66,6 +66,10 @@ pub struct CheckResult {
 pub struct ConformanceReport {
     pub plugin_name: String,
     pub checks: Vec<CheckResult>,
+    /// The contract the plugin declared, when the binary dumped one. The
+    /// plugin index records its range and tier from this (issue #1625).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<PluginContract>,
 }
 
 impl ConformanceReport {
@@ -269,7 +273,16 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
         diagnostics: vec![],
     });
 
-    checks.push(check_route_attribution(opts.plugin_name, routes));
+    let declared = match opts.contracts {
+        ContractDump::Present(all) => find_declared(all, opts.plugin_name),
+        ContractDump::Absent | ContractDump::Malformed(_) => None,
+    };
+
+    checks.push(check_route_attribution(
+        opts.plugin_name,
+        routes,
+        declared.is_some(),
+    ));
 
     if let Some(prefix) = opts.expected_prefix {
         checks.push(check_route_prefix(opts.plugin_name, prefix, routes));
@@ -282,11 +295,6 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
         opts.sensitive_routes,
     ));
     checks.push(check_duplicate_registration(opts.plugin_name, routes));
-
-    let declared = match opts.contracts {
-        ContractDump::Present(all) => find_declared(all, opts.plugin_name),
-        ContractDump::Absent | ContractDump::Malformed(_) => None,
-    };
     checks.push(check_plugin_contract(
         opts.plugin_name,
         opts.contracts,
@@ -301,6 +309,7 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
     ConformanceReport {
         plugin_name: opts.plugin_name.to_owned(),
         checks,
+        contract: declared.cloned(),
     }
 }
 
@@ -591,9 +600,27 @@ fn check_experimental_surface(
 
 // ── Individual check helpers ───────────────────────────────────────────────
 
-fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> CheckResult {
+/// `registered` is true when the contract dump names this plugin. Then no
+/// routes means a plugin that mounts none (a cache, a search index), not a
+/// wrong `--plugin-name`, so the check skips instead of failing.
+fn check_route_attribution(
+    plugin_name: &str,
+    routes: &[RouteInfo],
+    registered: bool,
+) -> CheckResult {
     let expected = format!("plugin:{plugin_name}");
     let plugin_routes: Vec<&RouteInfo> = routes.iter().filter(|r| r.source == expected).collect();
+
+    if plugin_routes.is_empty() && registered {
+        return CheckResult {
+            name: "route-attribution".to_owned(),
+            status: CheckStatus::Skip,
+            message: format!(
+                "{plugin_name} is registered (its contract is in the dump) and contributes no routes"
+            ),
+            diagnostics: vec![],
+        };
+    }
 
     if plugin_routes.is_empty() {
         return CheckResult {
@@ -872,14 +899,14 @@ mod tests {
             make_route("GET", "/admin", "plugin:admin"),
             make_route("POST", "/admin/items", "plugin:admin"),
         ];
-        let result = check_route_attribution("admin", &routes);
+        let result = check_route_attribution("admin", &routes, false);
         assert_eq!(result.status, CheckStatus::Pass, "{}", result.message);
     }
 
     #[test]
     fn attribution_no_plugin_routes_fails() {
         let routes = vec![make_route("GET", "/posts", "user")];
-        let result = check_route_attribution("admin", &routes);
+        let result = check_route_attribution("admin", &routes, false);
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(
             result.message.contains("plugin:admin"),
@@ -894,7 +921,7 @@ mod tests {
             make_route("GET", "/admin", "plugin:admin"),
             make_route("GET", "/admin/items", "plugin:admin"),
         ];
-        let result = check_route_attribution("admin", &routes);
+        let result = check_route_attribution("admin", &routes, false);
         assert!(result.message.contains('2'), "{}", result.message);
     }
 
@@ -1125,6 +1152,7 @@ mod tests {
                     diagnostics: vec![],
                 },
             ],
+            contract: None,
         };
         assert!(report.passed());
     }
@@ -1139,6 +1167,7 @@ mod tests {
                 message: "fail".to_owned(),
                 diagnostics: vec![],
             }],
+            contract: None,
         };
         assert!(!report.passed());
     }
@@ -1148,6 +1177,7 @@ mod tests {
         let report = ConformanceReport {
             plugin_name: "autumn-admin-plugin".to_owned(),
             checks: vec![],
+            contract: None,
         };
         assert!(report.to_text_report().contains("autumn-admin-plugin"));
     }
@@ -1157,6 +1187,7 @@ mod tests {
         let report = ConformanceReport {
             plugin_name: "test".to_owned(),
             checks: vec![],
+            contract: None,
         };
         assert!(report.to_text_report().contains("PASS"));
     }
@@ -1171,6 +1202,7 @@ mod tests {
                 message: "fail".to_owned(),
                 diagnostics: vec![],
             }],
+            contract: None,
         };
         assert!(report.to_text_report().contains("FAIL"));
     }
@@ -1185,6 +1217,7 @@ mod tests {
                 message: "ok".to_owned(),
                 diagnostics: vec![],
             }],
+            contract: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1397,6 +1430,55 @@ mod contract_tests {
             .iter()
             .find(|c| c.name == name)
             .unwrap_or_else(|| panic!("no `{name}` check in report"))
+    }
+
+    // ── route-less plugins (issue #1625) ───────────────────────────────────
+
+    fn demo_contract() -> PluginContract {
+        PluginContract::new("autumn-plugin-demo").autumn_web("0.7")
+    }
+
+    /// A cache or search plugin mounts no routes. Its contract proves it is
+    /// registered under this name, so no routes is not a wrong name.
+    #[test]
+    fn a_registered_plugin_with_no_routes_skips_route_attribution() {
+        let dump = present(vec![demo_contract()]);
+        let report = build_report(&opts(&dump), &[]);
+        assert_eq!(find(&report, "route-attribution").status, CheckStatus::Skip);
+        assert!(report.passed(), "{}", report.to_text_report());
+    }
+
+    /// Without a matching contract, no routes still means a wrong name.
+    #[test]
+    fn an_unregistered_name_with_no_routes_still_fails_route_attribution() {
+        for dump in [
+            ContractDump::Absent,
+            present(vec![]),
+            present(vec![PluginContract::new("someone-else").autumn_web("0.7")]),
+        ] {
+            let report = build_report(&opts(&dump), &[]);
+            assert_eq!(
+                find(&report, "route-attribution").status,
+                CheckStatus::Fail,
+                "{dump:?}"
+            );
+        }
+    }
+
+    /// The plugin index records the range and tier from the report, so the
+    /// report carries the contract it checked.
+    #[test]
+    fn the_report_carries_the_declared_contract() {
+        let dump = present(vec![demo_contract()]);
+        let report = build_report(&opts(&dump), &[route()]);
+        assert_eq!(report.contract, Some(demo_contract()));
+        let json = serde_json::to_value(&report).expect("json");
+        assert_eq!(json["contract"]["autumn_web"], "0.7");
+
+        let report = build_report(&opts(&ContractDump::Absent), &[route()]);
+        assert_eq!(report.contract, None);
+        let json = serde_json::to_value(&report).expect("json");
+        assert!(json.get("contract").is_none(), "{json}");
     }
 
     // ── parsing the dump ───────────────────────────────────────────────────

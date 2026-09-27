@@ -1900,10 +1900,20 @@ autumn plugin add autumn-admin-plugin   # dependency + mount + next steps
 autumn plugin add autumn-cache-redis --dry-run
 ```
 
-`list` covers the six first-party crates (`autumn-admin-plugin`,
+`list` reads the curated plugin index first (issue #1625), then crates.io.
+The index lists the six first-party crates (`autumn-admin-plugin`,
 `autumn-billing`, `autumn-cache-redis`, `autumn-media-plugin`, `autumn-search`,
-`autumn-storage-s3`) plus community crates found on crates.io under the
-documented `autumn-plugin-<name>` convention.
+`autumn-storage-s3`) and reviewed community crates. Each listing shows its
+trust class (`full trust: native code`, or a sandboxed capability manifest),
+its #1601 tier (`[EXPERIMENTAL API]` when it uses experimental surface), and
+its last `autumn plugin-check` result. A crates.io `autumn-plugin-<name>`
+result with no listing is shown under "Unlisted" and marked
+`[unlisted: not verified]`. `add` prints the same trust review before it
+changes a file, installs a listed community crate at its verified version
+(so `--offline` works), refuses a listing flagged by re-verification, and
+refuses to wire a sandboxed listing (exit 2, manual steps). Advise users to
+prefer a listed plugin; an unlisted one has no verified range or conformance.
+Authors submit a listing by pull request: `autumn-cli/plugin-index/README.md`.
 
 Four behaviours worth knowing before advising on it:
 

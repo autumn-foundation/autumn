@@ -324,6 +324,24 @@ pushed code — the workspace `[patch.crates-io]` override means no other CI job
 sees the published `autumn-web`), so a red push run means new users are broken
 today, not that the commit is bad.
 
+## Plugin Index Re-verification
+
+Each release re-verifies the [plugin index](plugins.md#the-plugin-index)
+(issue #1625). After the version bump, `autumn plugin index check` fails and
+so does the `autumn-cli` unit test that runs it: every listing was verified on
+the old release.
+
+- [ ] Run the re-verification and keep the reports:
+  `PLUGIN_INDEX_REPORTS=<dir> cargo test -p autumn-cli --test generate plugin_index_reverify_listings -- --ignored --exact`
+- [ ] Record them:
+  `cargo run -p autumn-cli -- plugin index record --index autumn-cli/plugin-index/index.toml --report <dir>/*.json --exempt autumn-storage-s3`
+- [ ] `cargo run -p autumn-cli -- plugin index check --index autumn-cli/plugin-index/index.toml` passes.
+- [ ] Commit `autumn-cli/plugin-index/index.toml` with the release.
+
+A listing that fails is flagged `incompatible`; a second fail on a later
+release delists it. See
+[`autumn-cli/plugin-index/README.md`](../autumn-cli/plugin-index/README.md).
+
 ## Migration Guide Gate
 
 Autumn ships every 2–4 weeks and, pre-1.0, most releases can break existing

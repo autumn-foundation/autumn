@@ -199,7 +199,7 @@ pub fn supported_range(version: &str) -> String {
 /// (`doctor::check_version_compat` strips operators instead. It is comparing
 /// two *concrete* versions for a diagnostic, where a false warning costs
 /// nothing; here a false negative blocks a command outright.)
-fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
+pub fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
     let version = version.trim();
     if version.contains(['<', '>', ',', '*', '|']) {
         return None;

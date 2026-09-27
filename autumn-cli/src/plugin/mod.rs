@@ -9,6 +9,8 @@
 //! command.
 
 pub mod catalog;
+pub mod curate;
+pub mod index;
 pub mod install;
 pub mod registry;
 pub mod remove;
@@ -41,6 +43,8 @@ pub struct ListRow {
     pub origin: Origin,
     /// Whether that version works with this app's `autumn-web`.
     pub compat: Compat,
+    /// The index listing. `None` for an unlisted crate: not verified.
+    pub listing: Option<index::Listing>,
 }
 
 /// Options for `autumn plugin list`.
@@ -118,6 +122,10 @@ pub const fn first_party_version() -> &'static str {
 
 /// Build the rows `autumn plugin list` renders.
 ///
+/// Index listings come first, in index order (issue #1625). Then any
+/// first-party crate the index does not list, then crates.io results the
+/// index does not list. Rows without a listing are unlisted: not verified.
+///
 /// `app_version` is the app's `autumn-web` requirement, or `None` when the
 /// command is run outside a project — in which case nothing can be said about
 /// compatibility, so every row is [`Compat::Unknown`] rather than optimistically
@@ -125,30 +133,73 @@ pub const fn first_party_version() -> &'static str {
 #[must_use]
 pub fn list_rows(
     app_version: Option<&str>,
+    plugin_index: &index::PluginIndex,
     community: &[registry::CommunityPlugin],
 ) -> Vec<ListRow> {
     let version = first_party_version();
-    let compat = app_version.map_or(Compat::Unknown, |app| install::check_compat(app, version));
-    let mut rows: Vec<ListRow> = catalog::FIRST_PARTY
-        .iter()
-        .map(|entry| ListRow {
-            crate_name: entry.crate_name.to_owned(),
-            version: version.to_owned(),
-            summary: entry.summary.to_owned(),
-            origin: Origin::FirstParty,
-            compat,
+    let lockstep = app_version.map_or(Compat::Unknown, |app| install::check_compat(app, version));
+    let mut rows: Vec<ListRow> = plugin_index
+        .visible()
+        .map(|listing| {
+            let (origin, version, compat) = match listing.origin {
+                // Lockstep: the CLI version is the one to install. A failed
+                // re-verification still wins over the series match.
+                index::ListingOrigin::FirstParty => {
+                    let flagged = listing.status == index::Status::Incompatible
+                        && app_version
+                            .is_some_and(|app| listing.compat(app) == Compat::Incompatible);
+                    let compat = if flagged {
+                        Compat::Incompatible
+                    } else {
+                        lockstep
+                    };
+                    (Origin::FirstParty, version.to_owned(), compat)
+                }
+                index::ListingOrigin::Community => (
+                    Origin::Community,
+                    listing.version.clone(),
+                    app_version.map_or(Compat::Unknown, |app| listing.compat(app)),
+                ),
+            };
+            ListRow {
+                crate_name: listing.name.clone(),
+                version,
+                summary: listing.description.clone(),
+                origin,
+                compat,
+                listing: Some(listing.clone()),
+            }
         })
         .collect();
-    rows.extend(community.iter().map(|found| ListRow {
-        crate_name: found.crate_name.clone(),
-        version: found.version.clone(),
-        summary: found.summary.clone(),
-        origin: Origin::Community,
-        // A community crate's supported `autumn-web` range is not in the
-        // crates.io search response, and issue #1606 rules out a registry that
-        // would carry it. Reported unknown rather than guessed.
-        compat: Compat::Unknown,
-    }));
+
+    let listed = |rows: &[ListRow], name: &str| rows.iter().any(|row| row.crate_name == name);
+    for entry in catalog::FIRST_PARTY {
+        if !listed(&rows, entry.crate_name) {
+            rows.push(ListRow {
+                crate_name: entry.crate_name.to_owned(),
+                version: version.to_owned(),
+                summary: entry.summary.to_owned(),
+                origin: Origin::FirstParty,
+                compat: lockstep,
+                listing: None,
+            });
+        }
+    }
+    for found in community {
+        if listed(&rows, &found.crate_name) {
+            continue;
+        }
+        rows.push(ListRow {
+            crate_name: found.crate_name.clone(),
+            version: found.version.clone(),
+            summary: found.summary.clone(),
+            origin: Origin::Community,
+            // The crates.io search response has no `autumn-web` range, so
+            // an unlisted crate is reported unknown rather than guessed.
+            compat: Compat::Unknown,
+            listing: None,
+        });
+    }
     rows
 }
 
@@ -186,11 +237,17 @@ pub fn render_list(rows: &[ListRow], app_version: Option<&str>, note: Option<&st
         .max()
         .unwrap_or(0);
 
-    for (origin, heading) in [
-        (Origin::FirstParty, "First-party"),
-        (Origin::Community, "Community (crates.io `autumn-plugin-*`)"),
+    for (listed, heading) in [
+        (true, "Listed in the Autumn plugin index"),
+        (
+            false,
+            "Unlisted (crates.io `autumn-plugin-*` search, not verified)",
+        ),
     ] {
-        let group: Vec<&ListRow> = rows.iter().filter(|row| row.origin == origin).collect();
+        let group: Vec<&ListRow> = rows
+            .iter()
+            .filter(|row| row.listing.is_some() == listed)
+            .collect();
         if group.is_empty() {
             continue;
         }
@@ -198,23 +255,18 @@ pub fn render_list(rows: &[ListRow], app_version: Option<&str>, note: Option<&st
         for row in group {
             let _ = writeln!(
                 out,
-                "  {name:<name_width$}  {version:<version_width$}  {summary}{compat}",
+                "  {name:<name_width$}  {version:<version_width$}  {summary}{flags}",
                 name = row.crate_name,
                 version = row.version,
                 summary = elide(&row.summary, SUMMARY_WIDTH),
-                compat = match row.compat {
-                    // Name the series that WOULD work, rather than only saying
-                    // this one will not: on an older app the bare word
-                    // "incompatible" leaves the reader with no next step.
-                    Compat::Incompatible => format!(
-                        "  [needs autumn-web {}]",
-                        install::supported_range(&row.version)
-                    ),
-                    Compat::Unknown if row.origin == Origin::FirstParty =>
-                        "  [compatibility unknown]".to_owned(),
-                    Compat::Compatible | Compat::Unknown => String::new(),
-                },
+                flags = row_flags(row, app_version),
             );
+            if let Some(listing) = &row.listing {
+                let _ = writeln!(out, "      {}", listing_facts(row.origin, listing));
+                if !listing.note.is_empty() {
+                    let _ = writeln!(out, "      note: {}", listing.note);
+                }
+            }
         }
         out.push('\n');
     }
@@ -224,6 +276,84 @@ pub fn render_list(rows: &[ListRow], app_version: Option<&str>, note: Option<&st
     }
     let _ = write!(out, "Install one with `autumn plugin add <name>`.");
     out
+}
+
+/// The bracketed flags after a row's summary.
+fn row_flags(row: &ListRow, app_version: Option<&str>) -> String {
+    use std::fmt::Write as _;
+
+    let listing = row.listing.as_ref();
+    let flagged = listing.is_some_and(|l| l.status == index::Status::Incompatible);
+    let mut flags = String::new();
+    match row.compat {
+        Compat::Incompatible if flagged => {
+            flags.push_str("  [incompatible: failed re-verification]");
+        }
+        // Name the series that WOULD work, rather than only saying this one
+        // will not: on an older app the bare word "incompatible" leaves the
+        // reader with no next step.
+        Compat::Incompatible => {
+            let range = match listing {
+                Some(l) if row.origin == Origin::Community => l.autumn_web.clone(),
+                _ => install::supported_range(&row.version),
+            };
+            let _ = write!(flags, "  [needs autumn-web {range}]");
+        }
+        Compat::Unknown if row.origin == Origin::FirstParty => {
+            flags.push_str("  [compatibility unknown]");
+        }
+        Compat::Compatible | Compat::Unknown => {}
+    }
+    match listing {
+        None => flags.push_str("  [unlisted: not verified]"),
+        Some(l) => {
+            if l.tier == index::Tier::Experimental {
+                flags.push_str("  [EXPERIMENTAL API]");
+            }
+            if let Some(app) = app_version
+                && !flagged
+                && !l.verified_for(app)
+            {
+                let _ = write!(flags, "  [not verified on autumn-web {app}]");
+            }
+        }
+    }
+    flags
+}
+
+/// The facts line under a listed row: origin, trust, tier, conformance.
+fn listing_facts(origin: Origin, listing: &index::Listing) -> String {
+    let origin = match origin {
+        Origin::FirstParty => "first-party",
+        Origin::Community => "community",
+    };
+    format!(
+        "{origin} · {} · {} · {}",
+        listing.trust_label(),
+        tier_text(listing),
+        conformance_text(listing)
+    )
+}
+
+/// `stable API`, or `experimental API: <surfaces>`.
+fn tier_text(listing: &index::Listing) -> String {
+    match listing.tier {
+        index::Tier::Stable => "stable API".to_owned(),
+        index::Tier::Experimental => format!(
+            "experimental API: {}",
+            listing.experimental_surfaces.join(", ")
+        ),
+    }
+}
+
+/// The last conformance run, in words.
+fn conformance_text(listing: &index::Listing) -> String {
+    let run = &listing.conformance;
+    match run.result {
+        index::CheckOutcome::Pass => format!("plugin-check pass on autumn-web {}", run.autumn_web),
+        index::CheckOutcome::Fail => format!("plugin-check FAIL on autumn-web {}", run.autumn_web),
+        index::CheckOutcome::Exempt => format!("plugin-check exempt: {}", run.reason),
+    }
 }
 
 /// Shorten `text` to `width` display columns, marking the cut with `…`.
@@ -255,6 +385,25 @@ pub fn render_list_json(rows: &[ListRow], app_version: Option<&str>) -> String {
                     Compat::Incompatible => serde_json::Value::Bool(false),
                     Compat::Unknown => serde_json::Value::Null,
                 },
+                "listed": row.listing.is_some(),
+                "verified": row
+                    .listing
+                    .as_ref()
+                    .is_some_and(|l| l.status == index::Status::Listed),
+                "status": row.listing.as_ref().map(|l| l.status),
+                "autumn_web_range": row.listing.as_ref().map(|l| l.autumn_web.clone()),
+                "tier": row.listing.as_ref().map(|l| l.tier),
+                "experimental_surfaces": row
+                    .listing
+                    .as_ref()
+                    .map(|l| l.experimental_surfaces.clone()),
+                "trust": row.listing.as_ref().map(|l| serde_json::json!({
+                    "kind": l.trust,
+                    "label": l.trust_label(),
+                    "capabilities": l.capabilities,
+                })),
+                "conformance": row.listing.as_ref().map(|l| &l.conformance),
+                "note": row.listing.as_ref().map(|l| l.note.clone()),
             })
         })
         .collect();
@@ -365,6 +514,174 @@ pub fn resolve(name: &str) -> Result<Resolved, PluginError> {
     Err(PluginError::UnknownPlugin(name.to_owned()))
 }
 
+/// What the index says about a name `plugin add` was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing<'a> {
+    /// Listed or flagged: the index vouches for (or warns about) it.
+    Listed(&'a index::Listing),
+    /// Once listed, now removed. Treated as unlisted.
+    Delisted(&'a index::Listing),
+    /// Not in the index. Nothing about it is verified.
+    Unlisted,
+}
+
+/// Look `name` up in the index.
+#[must_use]
+pub fn standing<'a>(plugin_index: &'a index::PluginIndex, name: &str) -> Standing<'a> {
+    match plugin_index.get(name) {
+        Some(listing) if listing.status == index::Status::Delisted => Standing::Delisted(listing),
+        Some(listing) => Standing::Listed(listing),
+        None => Standing::Unlisted,
+    }
+}
+
+/// The trust review `plugin add` prints before it changes any file
+/// (issue #1625, AC 6).
+#[must_use]
+pub fn render_trust(name: &str, standing: &Standing<'_>) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let listing = match standing {
+        Standing::Listed(listing) => listing,
+        Standing::Delisted(listing) => {
+            let _ = writeln!(out, "Trust review for {name}:");
+            let _ = writeln!(
+                out,
+                "  UNLISTED: {name} was removed from the Autumn plugin index: {}",
+                listing.note
+            );
+            append_unlisted_warning(&mut out);
+            return out;
+        }
+        Standing::Unlisted => {
+            let _ = writeln!(out, "Trust review for {name}:");
+            let _ = writeln!(out, "  UNLISTED: {name} is not in the Autumn plugin index.");
+            append_unlisted_warning(&mut out);
+            return out;
+        }
+    };
+    let _ = writeln!(out, "Trust review for {name} (Autumn plugin index):");
+    let _ = writeln!(out, "  trust:       {}", listing.trust_label());
+    if listing.trust == index::Trust::Native {
+        let _ = writeln!(
+            out,
+            "               it gets the whole AppBuilder: config, credentials, network, database"
+        );
+    }
+    let tier = tier_text(listing);
+    if listing.tier == index::Tier::Experimental {
+        let _ = writeln!(
+            out,
+            "  API tier:    EXPERIMENTAL — {tier}; it can break in any autumn-web release"
+        );
+    } else {
+        let _ = writeln!(out, "  API tier:    {tier}");
+    }
+    let _ = writeln!(
+        out,
+        "  conformance: {} ({})",
+        conformance_text(listing),
+        listing.conformance.checked
+    );
+    let _ = writeln!(out, "  supports:    autumn-web {}", listing.autumn_web);
+    if !listing.note.is_empty() {
+        let _ = writeln!(out, "  note:        {}", listing.note);
+    }
+    out
+}
+
+/// The warning for a crate the index does not vouch for.
+fn append_unlisted_warning(out: &mut String) {
+    out.push_str(
+        "  It is not verified: no conformance run, no declared autumn-web range, no tier.\n  \
+         Read its source before you install it.\n",
+    );
+    out.push_str("  trust:       ");
+    out.push_str(index::FULL_TRUST_LABEL);
+    out.push_str(" (a crates.io crate gets the whole AppBuilder)\n");
+}
+
+/// Refuse a listing that must not be installed into an app on `app`.
+///
+/// # Errors
+///
+/// A message that names the reason, when the listing failed
+/// re-verification on this series or its range excludes the app.
+pub fn gate_listing(listing: &index::Listing, app: Option<&str>) -> Result<(), String> {
+    let Some(app) = app else {
+        return Ok(());
+    };
+    if listing.compat(app) != Compat::Incompatible {
+        return Ok(());
+    }
+    if listing.status == index::Status::Incompatible {
+        return Err(format!(
+            "`{}` failed re-verification on autumn-web {} and this app uses autumn-web {app}: {}. \
+             No files were changed.",
+            listing.name, listing.conformance.autumn_web, listing.note
+        ));
+    }
+    // A first-party listing is lockstep; `install::plan_add` gives the
+    // series diagnostic for it.
+    if listing.origin == index::ListingOrigin::FirstParty {
+        return Ok(());
+    }
+    Err(format!(
+        "`{}` {} supports autumn-web {}, but this app uses autumn-web {app}. No files were changed.",
+        listing.name, listing.version, listing.autumn_web
+    ))
+}
+
+/// The manual steps for a sandboxed listing. `plugin add` writes no file for
+/// one: its artifact is not a crate dependency.
+#[must_use]
+pub fn render_sandboxed_steps(listing: &index::Listing) -> String {
+    format!(
+        "\nNo files were changed: `{name}` is a sandboxed plugin. It ships as a\n\
+         `.autumn-plugin` artifact, not as a crate dependency.\n\n\
+         1. Get the artifact from {repository}.\n\
+         2. Review it: `autumn plugin inspect <file>.autumn-plugin`. Compare the\n   \
+            capabilities with the index: {capabilities}.\n\
+         3. Mount it: `SandboxedPlugin::from_file(Path::new(\"plugins/<file>.autumn-plugin\"))`.\n\n\
+         See docs/guide/sandboxed-plugins.md.",
+        name = listing.name,
+        repository = listing.repository,
+        capabilities = listing.capabilities.join(", "),
+    )
+}
+
+/// Load the index ([`index::OVERRIDE_ENV`] or the bundled copy) and refuse
+/// one that breaks an admission rule: its trust labels cannot be shown.
+///
+/// Staleness is not checked here. A consumer on an older app is not stale.
+fn load_index() -> Result<index::Loaded, String> {
+    use std::fmt::Write as _;
+
+    let loaded = index::load_from_env().map_err(|err| err.to_string())?;
+    let findings = index::validate(&loaded.index);
+    if findings.is_empty() {
+        return Ok(loaded);
+    }
+    let mut message = format!(
+        "the plugin index at {} breaks {} admission rule(s):",
+        source_label(&loaded.source),
+        findings.len()
+    );
+    for finding in findings {
+        let _ = write!(message, "\n  {}: {}", finding.plugin, finding.message);
+    }
+    Err(message)
+}
+
+/// Where the index came from, for messages.
+fn source_label(source: &index::Source) -> String {
+    match source {
+        index::Source::Bundled => "the bundled copy".to_owned(),
+        index::Source::Override(path) => path.display().to_string(),
+    }
+}
+
 /// The app's `autumn-web` version, or `None` when it cannot be determined.
 fn app_version(root: &Path) -> Option<String> {
     match install::app_autumn_web(root) {
@@ -381,7 +698,7 @@ pub fn run_list(opts: &ListOptions<'_>) -> i32 {
         (
             Vec::new(),
             Some(
-                "--offline: crates.io was not queried, so no community plugins are listed."
+                "--offline: crates.io was not queried, so unlisted crates are not shown."
                     .to_owned(),
             ),
         )
@@ -390,15 +707,23 @@ pub fn run_list(opts: &ListOptions<'_>) -> i32 {
             || {
                 (
                     Vec::new(),
-                    Some(
-                        "could not reach crates.io, so no community plugins are listed.".to_owned(),
-                    ),
+                    Some("could not reach crates.io, so unlisted crates are not shown.".to_owned()),
                 )
             },
             |found| (found, None),
         )
     };
-    let rows = list_rows(app.as_deref(), &community);
+    let loaded = match load_index() {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!("autumn plugin list: {err}");
+            return 1;
+        }
+    };
+    if let index::Source::Override(path) = &loaded.source {
+        eprintln!("Using the plugin index at {}.", path.display());
+    }
+    let rows = list_rows(app.as_deref(), &loaded.index, &community);
     if opts.json {
         println!("{}", render_list_json(&rows, app.as_deref()));
     } else {
@@ -417,10 +742,42 @@ pub fn run_add(opts: &AddOptions<'_>) -> i32 {
             return 1;
         }
     };
+    let loaded = match load_index() {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!("autumn plugin add: {err}");
+            return 1;
+        }
+    };
+    let standing = standing(&loaded.index, opts.name);
 
-    let outcome = match &resolved {
-        Resolved::FirstParty(entry) => install::plan_add(opts.root, entry, first_party_version()),
-        Resolved::Community(crate_name) => {
+    // The trust review comes first: before any gate, plan or write (AC 6).
+    println!("{}", render_trust(opts.name, &standing));
+    if let Standing::Listed(listing) = standing {
+        if let Err(err) = gate_listing(listing, app_version(opts.root).as_deref()) {
+            eprintln!("autumn plugin add: {err}");
+            return 1;
+        }
+        if listing.trust == index::Trust::Sandboxed {
+            eprintln!("{}", render_sandboxed_steps(listing));
+            return MANUAL_FALLBACK_EXIT_CODE;
+        }
+    }
+
+    let listed_version = match standing {
+        Standing::Listed(listing) => Some(listing.version.as_str()),
+        Standing::Delisted(_) | Standing::Unlisted => None,
+    };
+    let outcome = match (&resolved, listed_version) {
+        (Resolved::FirstParty(entry), _) => {
+            install::plan_add(opts.root, entry, first_party_version())
+        }
+        // A listed crate installs the version the index verified. No
+        // crates.io lookup, so this works with `--offline`.
+        (Resolved::Community(crate_name), Some(version)) => {
+            install::plan_add_community(opts.root, crate_name, version)
+        }
+        (Resolved::Community(crate_name), None) => {
             if opts.offline {
                 eprintln!(
                     "autumn plugin add: --offline cannot resolve a version for the community crate `{crate_name}`; drop --offline or add the dependency by hand."
@@ -1077,6 +1434,332 @@ mod tests {
     use super::*;
     use registry::CommunityPlugin;
 
+    fn bundled() -> index::PluginIndex {
+        index::parse(index::BUNDLED).expect("bundled index")
+    }
+
+    /// The bundled index plus one listed community plugin.
+    fn index_with(listing: index::Listing) -> index::PluginIndex {
+        let mut plugin_index = bundled();
+        plugin_index.plugins.push(listing);
+        plugin_index
+    }
+
+    fn listed_community() -> index::Listing {
+        let mut listing = bundled()
+            .get("autumn-admin-plugin")
+            .expect("admin listing")
+            .clone();
+        listing.name = "autumn-plugin-live-feed".to_owned();
+        listing.description = "Live feeds (listed)".to_owned();
+        listing.origin = index::ListingOrigin::Community;
+        listing.version = "0.3.0".to_owned();
+        listing
+    }
+
+    fn row<'a>(rows: &'a [ListRow], name: &str) -> &'a ListRow {
+        rows.iter()
+            .find(|r| r.crate_name == name)
+            .unwrap_or_else(|| panic!("{name} missing from {rows:?}"))
+    }
+
+    // ── `plugin list` against the index (issue #1625) ───────────────────
+
+    /// AC 1 + AC 6: every first-party row carries its listing, so trust,
+    /// tier and conformance are known at discovery time.
+    #[test]
+    fn first_party_rows_carry_their_index_listing() {
+        let rows = list_rows(Some("0.7.0"), &bundled(), &[]);
+        for entry in catalog::FIRST_PARTY {
+            let listing = row(&rows, entry.crate_name)
+                .listing
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} has no listing", entry.crate_name));
+            assert_eq!(listing.trust_label(), index::FULL_TRUST_LABEL);
+        }
+    }
+
+    /// AC 2: a listed community crate resolves from the index: its version
+    /// and range come from the listing, not from a crates.io guess.
+    #[test]
+    fn a_listed_community_crate_resolves_from_the_index() {
+        let rows = list_rows(Some("0.7.0"), &index_with(listed_community()), &community());
+        let feed = row(&rows, "autumn-plugin-live-feed");
+        assert!(feed.listing.is_some());
+        assert_eq!(feed.version, "0.3.0");
+        assert_eq!(feed.summary, "Live feeds (listed)");
+        assert_eq!(feed.compat, Compat::Compatible);
+        let count = rows
+            .iter()
+            .filter(|r| r.crate_name == "autumn-plugin-live-feed")
+            .count();
+        assert_eq!(count, 1, "listed and searched rows must merge");
+    }
+
+    /// AC 2: a crates.io result with no listing is kept, but unlisted.
+    #[test]
+    fn a_crates_io_result_without_a_listing_is_unlisted() {
+        let rows = list_rows(Some("0.7.0"), &bundled(), &community());
+        assert!(row(&rows, "autumn-plugin-live-feed").listing.is_none());
+    }
+
+    /// AC 2: the fallback is visibly marked in the table.
+    #[test]
+    fn the_table_marks_unlisted_rows_as_unverified() {
+        let out = render_list(
+            &list_rows(Some("0.7.0"), &bundled(), &community()),
+            Some("0.7.0"),
+            None,
+        );
+        assert!(out.contains("Unlisted"), "{out}");
+        assert!(out.contains("[unlisted: not verified]"), "{out}");
+        let feed = out
+            .lines()
+            .find(|l| l.contains("autumn-plugin-live-feed"))
+            .expect("feed line");
+        assert!(feed.contains("[unlisted: not verified]"), "{feed}");
+    }
+
+    /// AC 1 + AC 6: the table shows trust, tier and conformance per listing.
+    #[test]
+    fn the_table_shows_trust_tier_and_conformance_for_listings() {
+        let out = render_list(
+            &list_rows(Some("0.7.0"), &bundled(), &[]),
+            Some("0.7.0"),
+            None,
+        );
+        assert!(out.contains(index::FULL_TRUST_LABEL), "{out}");
+        assert!(out.contains("stable API"), "{out}");
+        assert!(
+            out.contains("plugin-check pass on autumn-web 0.7.0"),
+            "{out}"
+        );
+        assert!(out.contains("plugin-check exempt"), "{out}");
+    }
+
+    /// AC 5: a listing on experimental surface is marked on its own line.
+    #[test]
+    fn the_table_marks_experimental_listings() {
+        let mut listing = listed_community();
+        let surface = autumn_web::plugin_contract::experimental_surface_names()
+            .next()
+            .expect("an experimental surface")
+            .to_owned();
+        listing.tier = index::Tier::Experimental;
+        listing.experimental_surfaces = vec![surface.clone()];
+        let out = render_list(
+            &list_rows(Some("0.7.0"), &index_with(listing), &[]),
+            Some("0.7.0"),
+            None,
+        );
+        let feed = out
+            .lines()
+            .find(|l| l.contains("autumn-plugin-live-feed"))
+            .expect("feed line");
+        assert!(feed.contains("[EXPERIMENTAL API]"), "{feed}");
+        assert!(
+            out.contains(&format!("experimental API: {surface}")),
+            "{out}"
+        );
+    }
+
+    /// AC 4: a flagged listing is shown as incompatible, with the note.
+    #[test]
+    fn the_table_flags_a_listing_that_failed_re_verification() {
+        let mut listing = listed_community();
+        listing.status = index::Status::Incompatible;
+        listing.conformance.result = index::CheckOutcome::Fail;
+        listing.note = "route-collision on autumn-web 0.7.0".to_owned();
+        let rows = list_rows(Some("0.7.0"), &index_with(listing), &[]);
+        assert_eq!(
+            row(&rows, "autumn-plugin-live-feed").compat,
+            Compat::Incompatible
+        );
+        let out = render_list(&rows, Some("0.7.0"), None);
+        assert!(
+            out.contains("[incompatible: failed re-verification]"),
+            "{out}"
+        );
+        assert!(out.contains("route-collision on autumn-web 0.7.0"), "{out}");
+    }
+
+    /// AC 4: a delisted plugin is not shown as listed. If crates.io still
+    /// has it, it is shown unlisted.
+    #[test]
+    fn a_delisted_plugin_falls_back_to_unlisted() {
+        let mut listing = listed_community();
+        listing.status = index::Status::Delisted;
+        listing.conformance.result = index::CheckOutcome::Fail;
+        listing.note = "failed on two releases".to_owned();
+        let rows = list_rows(Some("0.7.0"), &index_with(listing.clone()), &[]);
+        assert!(
+            rows.iter()
+                .all(|r| r.crate_name != "autumn-plugin-live-feed")
+        );
+        let rows = list_rows(Some("0.7.0"), &index_with(listing), &community());
+        assert!(row(&rows, "autumn-plugin-live-feed").listing.is_none());
+    }
+
+    /// AC 4: a listing not verified on the app's series says so.
+    #[test]
+    fn the_table_says_when_a_listing_is_not_verified_on_this_app() {
+        let mut listing = listed_community();
+        listing.autumn_web = ">=0.7".to_owned();
+        let out = render_list(
+            &list_rows(Some("0.8.0"), &index_with(listing), &[]),
+            Some("0.8.0"),
+            None,
+        );
+        let feed = out
+            .lines()
+            .find(|l| l.contains("autumn-plugin-live-feed"))
+            .expect("feed line");
+        assert!(
+            feed.contains("[not verified on autumn-web 0.8.0]"),
+            "{feed}"
+        );
+    }
+
+    /// AC 1 + AC 2: the JSON carries the same trust facts.
+    #[test]
+    fn json_carries_the_listing_facts() {
+        let json = render_list_json(
+            &list_rows(Some("0.7.0"), &bundled(), &community()),
+            Some("0.7.0"),
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let plugins = value["plugins"].as_array().expect("plugins");
+        let admin = plugins
+            .iter()
+            .find(|p| p["name"] == "autumn-admin-plugin")
+            .expect("admin");
+        assert_eq!(admin["listed"], true);
+        assert_eq!(admin["trust"]["kind"], "native");
+        assert_eq!(admin["trust"]["label"], index::FULL_TRUST_LABEL);
+        assert_eq!(admin["tier"], "stable");
+        assert_eq!(admin["status"], "listed");
+        assert_eq!(admin["conformance"]["result"], "pass");
+        assert_eq!(admin["autumn_web_range"], "0.7");
+        let feed = plugins
+            .iter()
+            .find(|p| p["name"] == "autumn-plugin-live-feed")
+            .expect("feed");
+        assert_eq!(feed["listed"], false);
+        assert_eq!(feed["verified"], false);
+        assert!(feed["trust"].is_null());
+    }
+
+    // ── `plugin add` trust surface (issue #1625) ────────────────────────
+
+    #[test]
+    fn standing_distinguishes_listed_delisted_and_unlisted() {
+        let plugin_index = bundled();
+        assert!(matches!(
+            standing(&plugin_index, "autumn-admin-plugin"),
+            Standing::Listed(_)
+        ));
+        assert_eq!(
+            standing(&plugin_index, "autumn-plugin-x"),
+            Standing::Unlisted
+        );
+        let mut gone = listed_community();
+        gone.status = index::Status::Delisted;
+        let plugin_index = index_with(gone);
+        assert!(matches!(
+            standing(&plugin_index, "autumn-plugin-live-feed"),
+            Standing::Delisted(_)
+        ));
+    }
+
+    /// AC 6: the full-trust label, tier and conformance are shown.
+    #[test]
+    fn the_trust_review_for_a_listing_names_every_fact() {
+        let plugin_index = bundled();
+        let out = render_trust(
+            "autumn-admin-plugin",
+            &standing(&plugin_index, "autumn-admin-plugin"),
+        );
+        assert!(out.contains(index::FULL_TRUST_LABEL), "{out}");
+        assert!(out.contains("stable API"), "{out}");
+        assert!(out.contains("plugin-check pass on autumn-web"), "{out}");
+        assert!(out.contains("autumn-web 0.7"), "{out}");
+    }
+
+    /// AC 2 + AC 6: an unlisted crate is marked unverified before install.
+    #[test]
+    fn the_trust_review_for_an_unlisted_crate_says_unverified() {
+        let out = render_trust("autumn-plugin-x", &Standing::Unlisted);
+        assert!(out.contains("UNLISTED"), "{out}");
+        assert!(out.contains("not verified"), "{out}");
+        assert!(out.contains(index::FULL_TRUST_LABEL), "{out}");
+    }
+
+    #[test]
+    fn the_trust_review_for_a_delisted_crate_gives_the_reason() {
+        let mut gone = listed_community();
+        gone.status = index::Status::Delisted;
+        gone.note = "failed plugin-check on two releases".to_owned();
+        let out = render_trust("autumn-plugin-live-feed", &Standing::Delisted(&gone));
+        assert!(out.contains("UNLISTED"), "{out}");
+        assert!(out.contains("failed plugin-check on two releases"), "{out}");
+    }
+
+    /// AC 6: a sandboxed listing shows its capability manifest.
+    #[test]
+    fn the_trust_review_for_a_sandboxed_listing_shows_capabilities() {
+        let mut listing = listed_community();
+        listing.trust = index::Trust::Sandboxed;
+        listing.capabilities = vec!["http-request".to_owned(), "kv".to_owned()];
+        let out = render_trust("autumn-plugin-live-feed", &Standing::Listed(&listing));
+        assert!(out.contains("http-request, kv"), "{out}");
+        assert!(!out.contains(index::FULL_TRUST_LABEL), "{out}");
+    }
+
+    #[test]
+    fn the_trust_review_marks_experimental_api() {
+        let mut listing = listed_community();
+        listing.tier = index::Tier::Experimental;
+        listing.experimental_surfaces = vec!["x".to_owned()];
+        let out = render_trust("autumn-plugin-live-feed", &Standing::Listed(&listing));
+        assert!(out.contains("EXPERIMENTAL"), "{out}");
+    }
+
+    /// AC 4: a flagged listing is refused on the failed series.
+    #[test]
+    fn the_gate_refuses_a_flagged_listing() {
+        let mut listing = listed_community();
+        listing.status = index::Status::Incompatible;
+        listing.conformance.result = index::CheckOutcome::Fail;
+        listing.note = "route-collision".to_owned();
+        let err = gate_listing(&listing, Some("0.7.0")).unwrap_err();
+        assert!(err.contains("re-verification"), "{err}");
+        assert!(err.contains("route-collision"), "{err}");
+    }
+
+    #[test]
+    fn the_gate_refuses_a_range_that_excludes_the_app() {
+        let err = gate_listing(&listed_community(), Some("0.6.0")).unwrap_err();
+        assert!(err.contains("0.6.0"), "{err}");
+        assert!(err.contains("0.7"), "{err}");
+    }
+
+    #[test]
+    fn the_gate_passes_a_compatible_or_unknown_app() {
+        assert!(gate_listing(&listed_community(), Some("0.7.0")).is_ok());
+        assert!(gate_listing(&listed_community(), None).is_ok());
+    }
+
+    #[test]
+    fn the_sandboxed_steps_point_at_inspect_and_from_file() {
+        let mut listing = listed_community();
+        listing.trust = index::Trust::Sandboxed;
+        listing.capabilities = vec!["http-request".to_owned()];
+        let out = render_sandboxed_steps(&listing);
+        assert!(out.contains("autumn plugin inspect"), "{out}");
+        assert!(out.contains("SandboxedPlugin::from_file"), "{out}");
+        assert!(out.contains("No files were changed"), "{out}");
+    }
+
     fn community() -> Vec<CommunityPlugin> {
         vec![CommunityPlugin {
             crate_name: "autumn-plugin-live-feed".to_owned(),
@@ -1112,7 +1795,7 @@ mod tests {
     /// app's `autumn-web` — for first-party *and* community crates.
     #[test]
     fn rows_cover_first_party_and_community() {
-        let rows = list_rows(Some("0.7.0"), &community());
+        let rows = list_rows(Some("0.7.0"), &bundled(), &community());
         assert!(
             rows.iter()
                 .filter(|r| r.origin == Origin::FirstParty)
@@ -1130,7 +1813,7 @@ mod tests {
 
     #[test]
     fn first_party_rows_carry_a_summary_and_a_version() {
-        for row in list_rows(Some("0.7.0"), &[])
+        for row in list_rows(Some("0.7.0"), &bundled(), &[])
             .iter()
             .filter(|r| r.origin == Origin::FirstParty)
         {
@@ -1145,7 +1828,7 @@ mod tests {
     /// offering a version that will be refused at `add` time.
     #[test]
     fn rows_mark_incompatibility_against_an_older_app() {
-        let rows = list_rows(Some("0.5.0"), &[]);
+        let rows = list_rows(Some("0.5.0"), &bundled(), &[]);
         assert!(
             rows.iter()
                 .filter(|r| r.origin == Origin::FirstParty)
@@ -1158,7 +1841,7 @@ mod tests {
     /// listing still renders, marked unknown.
     #[test]
     fn rows_outside_a_project_are_unknown_not_incompatible() {
-        let rows = list_rows(None, &[]);
+        let rows = list_rows(None, &bundled(), &[]);
         assert!(
             rows.iter()
                 .filter(|r| r.origin == Origin::FirstParty)
@@ -1171,7 +1854,7 @@ mod tests {
     /// API, so it is reported as unknown rather than guessed.
     #[test]
     fn community_rows_have_unknown_compatibility() {
-        let rows = list_rows(Some("0.7.0"), &community());
+        let rows = list_rows(Some("0.7.0"), &bundled(), &community());
         let feed = rows
             .iter()
             .find(|r| r.crate_name == "autumn-plugin-live-feed")
@@ -1181,7 +1864,11 @@ mod tests {
 
     #[test]
     fn the_table_shows_name_version_and_description() {
-        let out = render_list(&list_rows(Some("0.7.0"), &community()), Some("0.7.0"), None);
+        let out = render_list(
+            &list_rows(Some("0.7.0"), &bundled(), &community()),
+            Some("0.7.0"),
+            None,
+        );
         assert!(out.contains("autumn-admin-plugin"), "{out}");
         assert!(out.contains("autumn-plugin-live-feed"), "{out}");
         assert!(out.contains("Live feeds for autumn-web"), "{out}");
@@ -1191,7 +1878,11 @@ mod tests {
 
     #[test]
     fn the_table_flags_incompatible_rows() {
-        let out = render_list(&list_rows(Some("0.5.0"), &[]), Some("0.5.0"), None);
+        let out = render_list(
+            &list_rows(Some("0.5.0"), &bundled(), &[]),
+            Some("0.5.0"),
+            None,
+        );
         // Naming the series that would work is the actionable half.
         assert!(out.contains("needs autumn-web 0.7"), "{out}");
     }
@@ -1199,7 +1890,7 @@ mod tests {
     #[test]
     fn a_note_is_rendered_when_crates_io_could_not_be_reached() {
         let out = render_list(
-            &list_rows(Some("0.7.0"), &[]),
+            &list_rows(Some("0.7.0"), &bundled(), &[]),
             Some("0.7.0"),
             Some("offline"),
         );
@@ -1208,7 +1899,10 @@ mod tests {
 
     #[test]
     fn json_output_is_machine_readable() {
-        let json = render_list_json(&list_rows(Some("0.7.0"), &community()), Some("0.7.0"));
+        let json = render_list_json(
+            &list_rows(Some("0.7.0"), &bundled(), &community()),
+            Some("0.7.0"),
+        );
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(value["autumn_web"], "0.7.0");
         let plugins = value["plugins"].as_array().expect("plugins array");

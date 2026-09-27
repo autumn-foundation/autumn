@@ -9098,6 +9098,421 @@ fn plugin_add_rejects_an_unknown_crate() {
     assert!(stderr.contains("autumn plugin list"), "{stderr}");
 }
 
+// ── The curated plugin index (issue #1625) ─────────────────────────────────
+
+/// Run `autumn` with env overrides and return stdout, stderr and the code.
+fn run_autumn_env_status(
+    dir: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> (String, String, Option<i32>) {
+    let output = Command::new(env!("CARGO_BIN_EXE_autumn"))
+        .args(args)
+        .current_dir(dir)
+        .envs(envs.iter().copied())
+        .output()
+        .expect("failed to run autumn");
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.code(),
+    )
+}
+
+/// One community listing for a fixture index.
+fn index_listing(name: &str, extra: &str, status: &str, result: &str) -> String {
+    format!(
+        "[[plugin]]\nname = \"{name}\"\ndescription = \"{name} for tests\"\n\
+         origin = \"community\"\nrepository = \"https://example.com/{name}\"\n\
+         version = \"0.3.0\"\nautumn_web = \"{series}\"\nstatus = \"{status}\"\n{extra}\n\
+         [plugin.conformance]\nresult = \"{result}\"\nautumn_web = \"{release}\"\n\
+         checked = \"2026-09-27\"\n\n",
+        series = env!("CARGO_PKG_VERSION")
+            .rsplit_once('.')
+            .map_or(env!("CARGO_PKG_VERSION"), |(series, _)| series),
+        release = env!("CARGO_PKG_VERSION"),
+    )
+}
+
+/// A fixture index: one experimental listing, one flagged, one sandboxed.
+fn write_fixture_index(dir: &Path) -> std::path::PathBuf {
+    let surface = autumn_web::plugin_contract::experimental_surface_names()
+        .next()
+        .expect("an experimental surface");
+    let mut src = String::from("schema = 1\n\n");
+    src.push_str(&index_listing(
+        "autumn-plugin-live-feed",
+        &format!(
+            "tier = \"experimental\"\nexperimental_surfaces = [\"{surface}\"]\ntrust = \"native\""
+        ),
+        "listed",
+        "pass",
+    ));
+    src.push_str(&index_listing(
+        "autumn-plugin-broken",
+        "tier = \"stable\"\ntrust = \"native\"\nnote = \"route-collision on re-verification\"",
+        "incompatible",
+        "fail",
+    ));
+    src.push_str(&index_listing(
+        "autumn-plugin-hello",
+        "tier = \"stable\"\ntrust = \"sandboxed\"\ncapabilities = [\"http-request\", \"kv\"]",
+        "listed",
+        "pass",
+    ));
+    let path = dir.join("fixture-index.toml");
+    fs::write(&path, src).unwrap();
+    path
+}
+
+/// AC 1 + AC 6: `plugin list` shows each listing's trust class, tier and
+/// conformance result at discovery time.
+#[test]
+fn plugin_list_shows_the_index_trust_facts() {
+    let (_tmp, project) = fresh_project("plugin-index-list");
+    let (stdout, _) = run_autumn(&project, &["plugin", "list", "--offline"]);
+    assert!(
+        stdout.contains("Listed in the Autumn plugin index"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("full trust: native code"), "{stdout}");
+    assert!(stdout.contains("stable API"), "{stdout}");
+    assert!(
+        stdout.contains("plugin-check pass on autumn-web"),
+        "{stdout}"
+    );
+    for plugin in FIRST_PARTY_PLUGINS {
+        assert!(stdout.contains(plugin), "{plugin} missing from:\n{stdout}");
+    }
+}
+
+/// AC 2 + AC 4 + AC 5: listings from an index file: experimental and
+/// flagged listings are marked, a sandboxed one shows its capabilities.
+#[test]
+fn plugin_list_marks_experimental_flagged_and_sandboxed_listings() {
+    let (tmp, project) = fresh_project("plugin-index-list-fixture");
+    let index = write_fixture_index(tmp.path());
+    let index = index.to_str().unwrap();
+    let (stdout, stderr, code) = run_autumn_env_status(
+        &project,
+        &["plugin", "list", "--offline"],
+        &[("AUTUMN_PLUGIN_INDEX", index)],
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let line = |name: &str| {
+        stdout
+            .lines()
+            .find(|l| l.contains(name))
+            .unwrap_or_else(|| panic!("{name} missing from:\n{stdout}"))
+            .to_owned()
+    };
+    assert!(
+        line("autumn-plugin-live-feed").contains("[EXPERIMENTAL API]"),
+        "{stdout}"
+    );
+    assert!(
+        line("autumn-plugin-broken").contains("[incompatible: failed re-verification]"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("sandboxed: capability manifest grants http-request, kv"),
+        "{stdout}"
+    );
+    // The fixture does not list the first-party crates, so they fall back
+    // to unlisted and are marked.
+    assert!(
+        line("autumn-admin-plugin").contains("[unlisted: not verified]"),
+        "{stdout}"
+    );
+}
+
+/// AC 6: the trust review is printed before any file is modified.
+#[test]
+fn plugin_add_prints_the_trust_review_before_any_edit() {
+    let (_tmp, project) = fresh_project("plugin-index-add-order");
+    let (stdout, _) = run_autumn(
+        &project,
+        &[
+            "plugin",
+            "add",
+            "autumn-admin-plugin",
+            "--dry-run",
+            "--offline",
+        ],
+    );
+    let review = stdout
+        .find("Trust review for autumn-admin-plugin")
+        .expect(&stdout);
+    let plan = stdout.find("Dry run").expect(&stdout);
+    assert!(review < plan, "{stdout}");
+    assert!(stdout.contains("full trust: native code"), "{stdout}");
+
+    let (stdout, _) = run_autumn(
+        &project,
+        &["plugin", "add", "autumn-admin-plugin", "--offline"],
+    );
+    let review = stdout.find("Trust review").expect(&stdout);
+    let installed = stdout.find("Installed autumn-admin-plugin").expect(&stdout);
+    assert!(review < installed, "{stdout}");
+}
+
+/// AC 2: a listed community plugin resolves from the index: its verified
+/// version is written, with no crates.io lookup (so `--offline` works).
+#[test]
+fn plugin_add_installs_a_listed_community_plugin_at_its_verified_version() {
+    let (tmp, project) = fresh_project("plugin-index-add-listed");
+    let index = write_fixture_index(tmp.path());
+    let (stdout, stderr, code) = run_autumn_env_status(
+        &project,
+        &["plugin", "add", "autumn-plugin-live-feed", "--offline"],
+        &[("AUTUMN_PLUGIN_INDEX", index.to_str().unwrap())],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("(Autumn plugin index)"), "{stdout}");
+    assert!(stdout.contains("EXPERIMENTAL"), "{stdout}");
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo.contains("autumn-plugin-live-feed = \"0.3.0\""),
+        "{cargo}"
+    );
+}
+
+/// AC 4: a listing that failed re-verification is refused before any edit.
+#[test]
+fn plugin_add_refuses_a_flagged_listing_without_editing() {
+    let (tmp, project) = fresh_project("plugin-index-add-flagged");
+    let index = write_fixture_index(tmp.path());
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    let (stdout, stderr, code) = run_autumn_env_status(
+        &project,
+        &["plugin", "add", "autumn-plugin-broken", "--offline"],
+        &[("AUTUMN_PLUGIN_INDEX", index.to_str().unwrap())],
+    );
+    assert_eq!(code, Some(1), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("failed re-verification"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+}
+
+/// AC 6: a sandboxed listing shows its capabilities and changes no file.
+#[test]
+fn plugin_add_shows_a_sandboxed_manifest_and_changes_nothing() {
+    let (tmp, project) = fresh_project("plugin-index-add-sandboxed");
+    let index = write_fixture_index(tmp.path());
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    let main_before = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    let (stdout, stderr, code) = run_autumn_env_status(
+        &project,
+        &["plugin", "add", "autumn-plugin-hello", "--offline"],
+        &[("AUTUMN_PLUGIN_INDEX", index.to_str().unwrap())],
+    );
+    assert_eq!(code, Some(2), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("http-request, kv"), "{stdout}");
+    assert!(stderr.contains("autumn plugin inspect"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        main_before
+    );
+}
+
+/// AC 2: an unlisted crate is marked unverified before anything else.
+#[test]
+fn plugin_add_marks_an_unlisted_crate_before_anything_else() {
+    let (_tmp, project) = fresh_project("plugin-index-add-unlisted");
+    let (stdout, _stderr, code) = run_autumn_env_status(
+        &project,
+        &["plugin", "add", "autumn-plugin-nobody-listed", "--offline"],
+        &[],
+    );
+    // `--offline` cannot resolve an unlisted version, so it still refuses.
+    assert_eq!(code, Some(1));
+    assert!(stdout.contains("UNLISTED"), "{stdout}");
+    assert!(stdout.contains("not verified"), "{stdout}");
+}
+
+/// An index that breaks an admission rule is refused, not rendered.
+#[test]
+fn plugin_list_refuses_an_index_that_breaks_the_rules() {
+    let (tmp, project) = fresh_project("plugin-index-bad");
+    let path = tmp.path().join("bad-index.toml");
+    let bad = index_listing(
+        "autumn-plugin-liar",
+        "tier = \"stable\"\ntrust = \"native\"",
+        "listed",
+        "fail",
+    );
+    fs::write(&path, format!("schema = 1\n\n{bad}")).unwrap();
+    let (_stdout, stderr, code) = run_autumn_env_status(
+        &project,
+        &["plugin", "list", "--offline"],
+        &[("AUTUMN_PLUGIN_INDEX", path.to_str().unwrap())],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("admission rule"), "{stderr}");
+    assert!(stderr.contains("autumn-plugin-liar"), "{stderr}");
+}
+
+/// Repoint `autumn-web` and every first-party crate in `names` at this
+/// workspace.
+fn patch_first_party(project_dir: &Path, names: &[&str]) {
+    let cargo_toml_path = project_dir.join("Cargo.toml");
+    let mut content = fs::read_to_string(&cargo_toml_path).unwrap();
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    content.push_str("\n[patch.crates-io]\n");
+    for name in std::iter::once("autumn-web").chain(names.iter().copied()) {
+        let dir = if name == "autumn-web" { "autumn" } else { name };
+        writeln!(
+            content,
+            "{name} = {{ path = \"{}\" }}",
+            workspace_root
+                .join(dir)
+                .display()
+                .to_string()
+                .replace('\\', "/")
+        )
+        .unwrap();
+    }
+    fs::write(&cargo_toml_path, content).unwrap();
+}
+
+/// Mount a community plugin by the naming convention, as its README would.
+/// `plugin add` prints this line; it never writes it.
+fn mount_community(project_dir: &Path, name: &str) {
+    let module = name.replace('-', "_");
+    let plugin: String = name
+        .trim_start_matches("autumn-plugin-")
+        .split('-')
+        .map(|part| {
+            let mut chars = part.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_uppercase().chain(chars).collect()
+            })
+        })
+        .collect();
+    let main_path = project_dir.join("src/main.rs");
+    let main = fs::read_to_string(&main_path).unwrap();
+    let mounted = main.replacen(
+        "autumn_web::app()",
+        &format!("autumn_web::app()\n        .plugin({module}::{plugin}Plugin::new())"),
+        1,
+    );
+    assert_ne!(main, mounted, "no builder chain to mount {name} in");
+    fs::write(&main_path, mounted).unwrap();
+}
+
+/// Issue #1625, AC 4: re-verify every live listing in the bundled index.
+///
+/// For each listing: scaffold an app, `plugin add` it, then run
+/// `autumn plugin-check --format json` with the listing's prefix and
+/// sensitive routes. The result must match the recorded one. An exempt
+/// listing must `cargo check` instead. Reports go to `$PLUGIN_INDEX_REPORTS`
+/// when set, for `autumn plugin index record`.
+///
+/// Ignored by default (it compiles one app per listing). CI runs it in the
+/// `plugin-install` job of `.github/workflows/generator-conformance.yml`.
+#[test]
+#[ignore = "compiles one generated app per plugin index listing (slow)"]
+fn plugin_index_reverify_listings() {
+    let src =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin-index/index.toml"))
+            .unwrap();
+    let index: toml::Table = toml::from_str(&src).unwrap();
+    let listings = index["plugin"].as_array().expect("[[plugin]] listings");
+    let first_party: Vec<&str> = listings
+        .iter()
+        .filter(|l| l["origin"].as_str() == Some("first-party"))
+        .filter_map(|l| l["name"].as_str())
+        .collect();
+    let reports = std::env::var_os("PLUGIN_INDEX_REPORTS").map(std::path::PathBuf::from);
+    if let Some(dir) = &reports {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let shared_target = tempfile::tempdir().expect("shared target dir");
+    let target = shared_target.path().to_str().unwrap();
+    let mut failures = Vec::new();
+
+    for listing in listings {
+        let name = listing["name"].as_str().unwrap();
+        if listing["status"].as_str() == Some("delisted") {
+            continue;
+        }
+        let recorded = listing["conformance"]["result"].as_str().unwrap();
+        let (_tmp, project) = fresh_project(&name.replace('-', "_"));
+        patch_first_party(&project, &first_party);
+        run_autumn(&project, &["plugin", "add", name, "--offline"]);
+        if listing["origin"].as_str() == Some("community") {
+            mount_community(&project, name);
+        }
+
+        if recorded == "exempt" {
+            let check = Command::new("cargo")
+                .args(["check", "--all-targets"])
+                .current_dir(&project)
+                .env("CARGO_TARGET_DIR", target)
+                .output()
+                .expect("cargo check");
+            if !check.status.success() {
+                failures.push(format!(
+                    "{name}: exempt, but its install does not compile:\n{}",
+                    String::from_utf8_lossy(&check.stderr)
+                ));
+            }
+            continue;
+        }
+
+        let mut args = vec!["plugin-check", "--plugin-name", name, "--format", "json"];
+        if let Some(prefix) = listing.get("prefix").and_then(toml::Value::as_str) {
+            args.extend(["--prefix", prefix]);
+        }
+        for route in listing
+            .get("sensitive_routes")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str)
+        {
+            args.extend(["--sensitive-route", route]);
+        }
+        let (stdout, stderr, _) =
+            run_autumn_env_status(&project, &args, &[("CARGO_TARGET_DIR", target)]);
+        let Ok(report) = serde_json::from_str::<serde_json::Value>(&stdout) else {
+            failures.push(format!(
+                "{name}: no JSON report\nstdout: {stdout}\nstderr: {stderr}"
+            ));
+            continue;
+        };
+        if let Some(dir) = &reports {
+            fs::write(dir.join(format!("{name}.json")), &stdout).unwrap();
+        }
+        let passed = report["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .all(|c| c["status"] != "fail");
+        let expected = recorded == "pass";
+        if passed != expected {
+            failures.push(format!(
+                "{name}: the index records `{recorded}`, but plugin-check now says {}:\n{stdout}",
+                if passed { "pass" } else { "fail" }
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "plugin index re-verification failed. Record the new results with \
+         `autumn plugin index record` (see autumn-cli/plugin-index/README.md):\n\n{}",
+        failures.join("\n\n")
+    );
+}
+
 /// The Success Metric for issue #1606: `autumn plugin add` for **every**
 /// first-party plugin against a fresh `autumn new` scaffold, each of which
 /// must then `cargo check` green — the machine proof that the generated mount
