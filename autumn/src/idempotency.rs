@@ -22,12 +22,14 @@
 //!
 //! ```rust
 //! use axum::{routing::post, Router};
-//! use autumn_web::idempotency::IdempotencyLayer;
+//! use autumn_web::idempotency::{IdempotencyLayer, MemoryIdempotencyStore};
+//! use std::sync::Arc;
 //! use std::time::Duration;
 //!
-//! let layer = IdempotencyLayer::new(Duration::from_secs(3600));
+//! let store = Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(3600)));
+//! let layer = IdempotencyLayer::new(store);
 //!
-//! let app = Router::new()
+//! let app: Router = Router::new()
 //!     .route("/payments", post(|| async { "Payment processed" }))
 //!     .layer(layer);
 //! ```
