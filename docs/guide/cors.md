@@ -140,9 +140,13 @@ browser rules, which change on browser timelines. MDN's
 
 **One limit is Autumn's own, and worth knowing before you design around it.** The
 built-in CSRF protection issues its `autumn-csrf` cookie with `SameSite=Lax` fixed
-in code — `security.csrf` has no setting for it. A genuinely cross-site browser
-client therefore never receives that cookie, and a mutating request is rejected
-with `403` however correctly it sends the token. So cross-site **and**
+in code — `security.csrf` has no setting for it. `Lax` governs whether the browser
+**attaches** a stored cookie to a request, so on a cross-site mutating request the
+browser withholds it: the request arrives without the cookie half of the pair and
+is rejected with `403` however correctly it sends the token. Note that the cookie
+may well be sitting in the browser's storage while this happens — seeing
+`autumn-csrf` in devtools is not evidence the write should work, and that mismatch
+is the confusing part of this failure. So cross-site **and**
 cookie-authenticated **and** mutating is not a combination the built-in stack
 supports, and no `[cors]` or `[session]` value makes it one. The two shapes that
 do work: a same-site deployment (subdomains of one domain, one scheme), or an API
