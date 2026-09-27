@@ -1,0 +1,5 @@
+error: unknown aggregate `avg`; expected `sum` (signed up/down votes) or `count` (unary likes)
+  --> tests/compile-fail/model_votable_unknown_aggregate.rs:15:22
+   |
+15 | #[votable(by = User, aggregate = avg)]
+   |                      ^^^^^^^^^

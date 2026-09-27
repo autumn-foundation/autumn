@@ -49,6 +49,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -560,17 +562,56 @@ where
     }
 
     fn call(&mut self, mut req: Request<B>) -> Self::Future {
-        let identity = ResolvedClientIdentity {
-            addr: self.resolver.resolve_client_addr(&req),
-            host: self.resolver.resolve_client_host(&req),
-            scheme: self.resolver.resolve_client_scheme(&req),
-        };
-        req.extensions_mut().insert(identity);
+        // An identity already present was put there by in-process code —
+        // extensions never arrive off the wire — today only the capsule
+        // replay driver, restoring the resolution the failing request had.
+        // Honor it rather than re-resolving against a synthetic peer that
+        // would (correctly, but uselessly) distrust the recorded forwarded
+        // headers (issue #1598).
+        if req.extensions().get::<ResolvedClientIdentity>().is_none() {
+            let identity = ResolvedClientIdentity {
+                addr: self.resolver.resolve_client_addr(&req),
+                host: self.resolver.resolve_client_host(&req),
+                scheme: self.resolver.resolve_client_scheme(&req),
+            };
+            req.extensions_mut().insert(identity);
+        }
 
-        let mut inner = self.inner.clone();
-        std::mem::swap(&mut self.inner, &mut inner);
+        // A failure capsule records the *resolved* client identity, so replay
+        // can restore `ClientAddr`/`ClientHost`/`ClientScheme` without
+        // re-running trust evaluation against a peer socket it does not have
+        // (issue #1598).
+        //
+        // Recorded from the request's extensions rather than from the branch
+        // above, because the two are not the same instance. `App::run` wraps
+        // the finished router in an *outer* `TrustedProxiesLayer`, which
+        // resolves before the capture scope exists — so by the time this inner
+        // instance runs inside the scope, the identity is already present and
+        // the branch above is skipped. Recording only what this instance
+        // resolved would therefore leave every capsule written by the real
+        // server without a client identity, while the test harness (which has
+        // no outer layer) recorded one.
+        #[cfg(feature = "reporting")]
+        if let Some(scope) = crate::capsule::current_scope()
+            && let Some(identity) = req.extensions().get::<ResolvedClientIdentity>()
+        {
+            scope.set_client_identity(crate::capsule::CapturedClientIdentity {
+                addr: identity.addr,
+                host: identity.host.clone(),
+                scheme: identity.scheme.clone(),
+            });
+        }
 
-        Box::pin(inner.call(req))
+        // No `.await` happens in this middleware itself — everything above is
+        // synchronous prep on `req` — so the `Self::Future`'s `'static` bound
+        // is satisfied by `self.inner.call(req)` directly: no need to clone
+        // `self.inner` into an owned value first. `inner`'s previous
+        // clone-then-swap dance cloned `self.inner` (a
+        // `BoxCloneSyncService` at this point in the stack, whose `Clone`
+        // impl allocates a fresh box) on every request purely to satisfy a
+        // move that was never required, since nothing here captures `self`
+        // past this statement.
+        Box::pin(self.inner.call(req))
     }
 }
 

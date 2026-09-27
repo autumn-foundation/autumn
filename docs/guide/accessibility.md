@@ -333,7 +333,8 @@ violations. It runs entirely in Rust — no Node.js or browser dependency.
 # Check a running development server
 autumn check --a11y --url http://localhost:8080
 
-# Check pre-rendered HTML from a file or stdin
+# Check pre-rendered HTML. `--html` takes the markup itself, so the shell
+# reads the file — there is no file or stdin flag.
 autumn check --a11y --html "$(cat rendered.html)"
 
 # Only fail CI on Critical violations (Serious and Moderate are reported but
@@ -345,12 +346,21 @@ autumn check --a11y --url http://localhost:8080 --critical-only
 
 | Rule ID              | Severity | What it checks                                           |
 |----------------------|----------|----------------------------------------------------------|
-| `html-has-lang`      | Critical | `<html>` element has a non-empty `lang` attribute        |
+| `html-has-lang`      | Serious  | `<html>` element has a non-empty `lang` attribute        |
 | `bypass`             | Serious  | First focusable element is a skip link to `#main`        |
-| `landmark-one-main`  | Serious  | Page contains exactly one `<main>` element               |
+| `landmark-one-main`  | Moderate | Page contains exactly one `<main>` element               |
 | `image-alt`          | Critical | Every `<img>` has an `alt` attribute (may be empty)      |
 | `label`              | Critical | Every `<input>` (non-hidden) has an associated `<label>` |
-| `button-name`        | Serious  | Every `<button>` has discernible text or `aria-label`    |
+| `button-name`        | Critical | Every `<button>` has discernible text or `aria-label`    |
+
+The severity decides whether a finding stops the build, so it is worth reading
+off this table rather than assuming: **Critical** always fails, **Serious**
+fails unless you pass `--critical-only`, and **Moderate** is reported with a
+`⚠️` and never changes the exit code. `landmark-one-main` is the one to note —
+a missing or duplicated `<main>` is a warning, not a failure.
+
+`bypass` is skipped entirely when the main landmark is the first thing inside
+`<body>`: there is nothing before it to skip past, so no skip link is required.
 
 ### CI integration
 
@@ -365,26 +375,67 @@ pre-rendered snapshot:
     autumn check --a11y --url ${{ env.PREVIEW_URL }}
 ```
 
-Exit code 0 means no Critical or Serious violations. Exit code 1 means at
-least one violation was found (or `--critical-only` was set and a Critical
-violation exists).
+Exit code 0 means no Critical or Serious violations — a run whose only findings
+are Moderate reports them and still exits 0. Exit code 1 means at least one
+Critical or Serious violation was found, or, with `--critical-only`, at least
+one Critical.
 
-### Programmatic use
+### From a test
 
-`autumn-cli` exposes the checker as a library function for use in integration
-tests:
+`--html` takes markup on the command line, so a test can check a component
+without serving anything. **Pass it a whole document, not a bare fragment.**
+The checker audits a page: `html-has-lang`, `bypass` and `landmark-one-main`
+run on every input, so a naked `<form>` fails all three on the document it is
+missing rather than on anything wrong with the form.
+
+Wrapping the fragment in a three-tag shell is enough to put those rules at rest
+and leave the assertion about your markup. A `<main>` as the first thing in
+`<body>` satisfies `bypass` with no skip link — there is nothing before the
+landmark to skip:
 
 ```rust
-use autumn_cli::check::{A11yCheckOptions, run_a11y_check, print_report};
+use std::process::Command;
 
 #[test]
-fn homepage_is_accessible() {
-    let html = /* render your Markup to String */;
-    let opts = A11yCheckOptions { html: Some(html), url: None, critical_only: false };
-    let violations = run_a11y_check(&opts).expect("checker failed");
-    assert!(violations.is_empty(), "a11y violations: {violations:?}");
+fn comment_form_is_accessible() {
+    // Render your `Markup` to a String however your app does it.
+    let page = format!(
+        r#"<html lang="en"><body><main>{}</main></body></html>"#,
+        comment_form().into_string(),
+    );
+
+    let out = Command::new("autumn")
+        .args(["check", "--a11y", "--html", &page])
+        .output()
+        .expect("could not run `autumn` (on PATH? markup under the argv limit?)");
+
+    assert!(
+        out.status.success(),
+        "a11y violations:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+    );
 }
 ```
+
+The exit code is the assertion: 0 when no Critical or Serious violation was
+found, 1 otherwise, exactly as in CI above. Add `--critical-only` to let Serious
+violations pass as warnings.
+
+If your layout helper already emits the `<html>`/`<main>` shell, render through
+it instead of hand-rolling one — then the test covers the real page.
+
+**`--html` has a size ceiling, so use `--url` for whole pages.** The markup
+travels as one command-line argument, and the OS caps that: Linux rejects a
+single argument over ~128 KiB with `E2BIG`, and Windows caps the entire command
+line near 32 KiB. A full rendered page can cross either. Past the limit the
+checker never starts — `Command::output()` returns an `Err` before any audit
+runs, which is why the `expect` above does not claim a missing binary as the
+cause. For a whole page, serve it and point `--url` at it, as in the CI example
+above; keep `--html` for fragments, where the limit is not in reach.
+
+There is no library import for the checker. `autumn-cli` ships a binary and no
+`lib` target, so `use autumn_cli::…` does not resolve from another crate no
+matter how the path is spelled — run the command, as above.
 
 ---
 
@@ -440,6 +491,7 @@ Each primitive implements `maud::Render`, so it splices straight into an
 | `Link`       | 2.4.4 Link Purpose (In Context) / 4.1.2 Name, Role, Value  | link text is a required constructor argument     |
 | `MenuItem`   | 4.1.2 Name, Role, Value                                     | accessible name is a required constructor argument (renders `role="menuitem"`) |
 | `TextField`  | 1.3.1 Info and Relationships / 3.3.2 Labels / 4.1.2         | only a *labeled* field can be rendered (typestate) |
+| `RadioGroup` | 1.3.1 Info and Relationships / 3.3.2 Labels / 4.1.2         | only a *labeled* group can be rendered; each choice carries its own label |
 
 ```rust
 use autumn_web::a11y::{Button, Img, Link, MenuItem, TextField};
@@ -457,6 +509,32 @@ let page = html! {
     (MenuItem::new("Home").href("/"))                       // link-style menu item
 };
 ```
+
+`TextArea`, `Select` (with `SelectOption`), `Checkbox`, `FileField` and
+`RadioGroup` (with `RadioOption`) carry the same typestate obligation as
+`TextField`. A radio group needs **two** names — one per choice and one for the
+group — so both are required:
+
+```rust
+use autumn_web::a11y::{RadioGroup, RadioOption};
+
+let speed = RadioGroup::new("speed", RadioOption::new("standard", "Standard"))
+    .option(RadioOption::new("express", "Express"))   // each choice names itself
+    .checked_value("express")
+    .label("Shipping speed");                         // the group names itself
+```
+
+The first choice is a constructor argument, so a group of choices always has at
+least one. A visible group name renders `<fieldset><legend>`; `.aria_label(..)` /
+`.labelled_by(..)` render a `<div>` instead. Both carry `role="radiogroup"` —
+`<fieldset>` alone maps to role `group`, which does not support `aria-required`.
+Each choice gets an `id` that pairs it with its own `<label for=…>`, derived
+from the group name and the choice value. A `-` inside either is doubled, so
+group `a-b` choice `c` and group `a` choice `b-c` cannot collide. The same group
+rendered repeatedly — one per table row — shares its form name by design, so
+`.id_prefix(..)` supplies the discriminator. `aria-invalid` and any `hx-*` attributes
+land on each `<input>`, where assistive technology reads validity and htmx reads
+a value; `aria-describedby` and `aria-required` stay on the group.
 
 `Link::new` takes the visible link text as a required argument (an icon-only
 link routes its name to `aria-label` via `Link::icon`), and `MenuItem::new`
@@ -483,6 +561,10 @@ let _ = MenuItem::new();
 // error: no method named `render` found for `TextField<NoLabel>`
 //        — an unlabeled field cannot be turned into markup
 let _ = TextField::new("email").render();
+
+// error: no method named `render` found for `RadioGroup<NoLabel>`
+//        — a radio group with no group name cannot be turned into markup
+let _ = RadioGroup::new("speed", RadioOption::new("standard", "Standard")).render();
 ```
 
 **Fix** — supply the accessible name / attach a label:
@@ -492,6 +574,9 @@ let _ = Img::new("/logo.png", "Company logo");            // ✅ compiles
 let _ = Link::new("/about", "About us");                  // ✅ compiles
 let _ = MenuItem::new("Settings");                        // ✅ compiles
 let _ = TextField::new("email").label("Email").render();  // ✅ compiles
+let _ = RadioGroup::new("speed", RadioOption::new("standard", "Standard"))
+    .label("Shipping speed")                              // ✅ compiles
+    .render();
 ```
 
 **Green** — the build passes only once every primitive carries its accessible
@@ -511,9 +596,8 @@ cover those.
 
 ## `autumn a11y verify` (build-time raw-`html!` audit)
 
-The typed primitives above are the *compile-time proof*: code that uses `Img`,
-`Button`, `Link`, `MenuItem`, or `TextField` cannot ship without an accessible
-name, so it never needs re-checking. But a project can always drop down to raw
+The typed primitives above are the *compile-time proof*: code that uses them
+cannot ship without an accessible name, so it never needs re-checking. But a project can always drop down to raw
 `maud::html! { … }` markup, which bypasses the primitives entirely and the type
 system cannot see. `autumn a11y verify` is the net for that escape hatch.
 
@@ -537,6 +621,44 @@ Each finding carries the fix hint — the typed primitive that discharges the
 obligation at compile time (`Img::new(src, alt)`, `TextField::new(..).label(..)`,
 `Button::new(name)`, `Link::new(href, text)`).
 
+### Which route is broken
+
+A file and a line say where a defect is; a route says which page it breaks.
+`verify` reads the route attribute macros — `#[get]`, `#[post]`, `#[put]`,
+`#[patch]`, `#[delete]` and `#[static_get]`, path-qualified or not — out of the
+same token stream, indexes every function and the free functions
+it calls, then walks out from each handler to the markup it reaches. A finding
+in a shared partial names the routes that reach it:
+
+```
+    src/views/settings.rs:42: <img> [WCAG 1.1.1] Serious — raw <img> has no alt attribute
+        routes: GET /settings, POST /settings
+        hint: use autumn_web::a11y::Img::new(src, alt) / Img::decorative(src)
+```
+
+The walk is as conservative as the scanner. A call is followed only when the
+called name is defined **exactly once** across the scan — two functions sharing
+a name cannot be told apart from tokens, and guessing would blame a route that
+never renders the markup. A bare `name()` resolves only to a free item — a nested `fn` is visible just
+inside its own block, and an associated `fn` is reached through a receiver or a
+type-qualified path — so neither is a target. Four more call shapes are skipped
+outright: a method call
+(`page.sidebar()`), a type-qualified associated call (`Widget::new()` — Rust
+names types in `UpperCamelCase`, so `views::sidebar()` still resolves), a
+function passed by name rather than called (`.map(render_row)`), and a name
+bound inside the function — a parameter, a local, a closure argument — which
+shadows any free function that shares it. `#[cfg(test)]`
+items are skipped, and the `path` is the path **as declared**: mount-time
+prefixes (a `scope`, a nested router) are applied at runtime and are not
+resolved here.
+
+Attribution is therefore a lower bound. `status: "pass"` means no finding was
+attributed to that route, not that the page is proven clean — read it alongside
+the summary's `unrouted` count, which is how many findings no route reached. An
+unattributed finding is still a finding, and still fails the build: the exit
+code is computed from severities alone, so attribution reports and never
+gates.
+
 ### Usage
 
 ```bash
@@ -555,13 +677,24 @@ autumn a11y verify --strict
 
 ### `--format json` (conformance manifest)
 
-The JSON output is an array of findings keyed to WCAG success criteria plus a
-summary, suitable for archiving as a conformance manifest:
+The JSON output is a conformance manifest: per-route status, the findings with
+the routes each one breaks, a per-criterion rollup, and a summary.
 
 ```json
 {
   "files_scanned": 12,
   "html_blocks": 34,
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/profile",
+      "handler": "profile",
+      "file": "src/views/profile.rs",
+      "line": 18,
+      "findings": 1,
+      "status": "fail"
+    }
+  ],
   "findings": [
     {
       "file": "src/views/profile.rs",
@@ -571,12 +704,27 @@ summary, suitable for archiving as a conformance manifest:
       "wcag": "1.1.1",
       "severity": "Serious",
       "message": "raw <img> has no alt attribute",
-      "hint": "use autumn_web::a11y::Img::new(src, alt) / Img::decorative(src)"
+      "hint": "use autumn_web::a11y::Img::new(src, alt) / Img::decorative(src)",
+      "routes": ["GET /profile"]
     }
   ],
-  "summary": { "critical": 0, "serious": 1, "moderate": 0, "total": 1 }
+  "wcag": [
+    { "criterion": "1.1.1", "rules": ["image-alt"], "findings": 1 }
+  ],
+  "summary": {
+    "critical": 0, "serious": 1, "moderate": 0, "total": 1,
+    "routes": 1, "routes_failing": 1, "unrouted": 0
+  }
 }
 ```
+
+Three views of the same run: `routes` is the per-route conformance status
+(`pass` when no finding was attributed to the route), `findings` is the defect
+list with the routes each one breaks, and `wcag` rolls the findings up by
+success criterion — the multi-criterion rules are split, so `label` reports
+separately under 1.3.1, 3.3.2 and 4.1.2. A finding no route reaches carries an
+empty `routes` array and is counted in `summary.unrouted`. A clean run emits an
+empty `wcag` array and every route as `pass`.
 
 ### CI integration
 
@@ -616,6 +764,12 @@ infer.
 
 ## Further reading
 
+- [`examples/reddit-clone`](../../examples/reddit-clone) — the submit and edit
+  forms are built entirely from `a11y::TextField` / `TextArea` / `Select` /
+  `Button` / `Link`, with `aria-invalid` + `aria-describedby` error wiring
+  driven by the changeset
+- [Forms, validation and normalization](./forms.md) — where these primitives
+  meet `ChangesetForm`'s per-field errors
 - [WCAG 2.1 Quick Reference](https://www.w3.org/WAI/WCAG21/quickref/)
 - [APG Patterns (ARIA Authoring Practices Guide)](https://www.w3.org/WAI/ARIA/apg/patterns/)
 - [htmx accessibility notes](https://htmx.org/docs/#accessibility)
