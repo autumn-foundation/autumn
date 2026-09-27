@@ -304,6 +304,7 @@ dependencies = [
  "p256",
  "percent-encoding",
  "pin-project-lite",
+ "pq-src",
  "pq-sys",
  "rand 0.9.5",
  "rand_chacha 0.9.0",

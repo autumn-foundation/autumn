@@ -77,6 +77,7 @@ db = [
     "dep:diesel_migrations",
     "dep:libsqlite3-sys",
     "dep:pq-sys",
+    "dep:pq-src",
     "dep:scoped-futures",
     "dep:tokio-postgres",
     "dep:tokio-postgres-rustls",
@@ -323,6 +324,8 @@ bcrypt.workspace = true
 deadpool = { version = "0.13", default-features = false, features = ["managed", "rt_tokio_1"], optional = true }
 diesel = { workspace = true, optional = true }
 pq-sys = { workspace = true, optional = true }
+# Direct only to hold the version. See the workspace `Cargo.toml`.
+pq-src = { workspace = true, optional = true }
 diesel-async = { workspace = true, optional = true }
 diesel_migrations = { workspace = true, optional = true }
 scoped-futures = { version = "0.1.4", optional = true }
@@ -606,6 +609,17 @@ required-features = ["db"]
 name = "pdf_render"
 harness = false
 required-features = ["pdf"]
+
+# User-submitted rich-text workload for profilers, driving
+# `markdown::render_user_content_html` through the real pulldown-cmark parse +
+# `SafeEvents` filter + `ammonia` allowlist-sanitizer pipeline (issue #1255) —
+# the comment/post/wiki-body render path no other committed bench touches.
+# `required-features` since `markdown` is an opt-in feature, unlike most of
+# the other benches in this crate.
+[[bench]]
+name = "markdown_render"
+harness = false
+required-features = ["markdown"]
 
 # Signed-CSRF-cookie workload for profilers: drives real POST traffic through
 # `security::CsrfLayer` with HMAC signing active so the verification cost is
