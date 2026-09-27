@@ -111,3 +111,107 @@ fn green_fixture_passes_clean() {
         "GREEN fixture must produce zero findings; got {findings:?}",
     );
 }
+
+/// Parse a verify run's JSON report from stdout.
+fn json_report(out: &Output) -> serde_json::Value {
+    serde_json::from_slice(&out.stdout)
+        .expect("`a11y verify --format json` must emit parseable JSON on stdout")
+}
+
+/// Every RED defect is keyed to the route that serves it, including the ones in
+/// a helper the handler calls — the manifest answers "which page is broken?",
+/// not just "which line".
+#[test]
+fn red_fixture_findings_are_keyed_to_the_route() {
+    let out = run_verify(&fixture_dir("red"), &["--format", "json"]);
+    let report = json_report(&out);
+
+    let findings = report["findings"].as_array().expect("findings array");
+    assert!(!findings.is_empty(), "RED fixture must produce findings");
+    for finding in findings {
+        let routes: Vec<&str> = finding["routes"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            routes,
+            vec!["GET /settings"],
+            "every RED finding must name the route that renders it; got {finding}",
+        );
+    }
+
+    // Two routes are declared; only the one that reaches the defects fails.
+    let routes = report["routes"].as_array().expect("routes array");
+    assert_eq!(routes.len(), 2, "{routes:?}");
+    assert_eq!(routes[0]["path"], "/about");
+    assert_eq!(routes[0]["status"], "pass");
+    assert_eq!(routes[0]["findings"], 0);
+    assert_eq!(routes[1]["method"], "GET");
+    assert_eq!(routes[1]["path"], "/settings");
+    assert_eq!(routes[1]["handler"], "view");
+    assert_eq!(routes[1]["status"], "fail");
+    assert_eq!(routes[1]["findings"], findings.len());
+    assert_eq!(report["summary"]["routes"], 2);
+    assert_eq!(report["summary"]["routes_failing"], 1);
+    assert_eq!(report["summary"]["unrouted"], 0);
+}
+
+/// The RED manifest rolls its findings up by WCAG success criterion, so a
+/// conformance claim can be read off it directly.
+#[test]
+fn red_fixture_report_rolls_up_wcag_criteria() {
+    let out = run_verify(&fixture_dir("red"), &["--format", "json"]);
+    let report = json_report(&out);
+
+    // The RED fixture's numbers are fully determined, so pin the whole rollup:
+    // one alt-less image, two unlabeled controls, one nameless button.
+    let rollup: Vec<(String, u64, Vec<&str>)> = report["wcag"]
+        .as_array()
+        .expect("wcag array")
+        .iter()
+        .map(|c| {
+            (
+                c["criterion"].as_str().expect("criterion").to_owned(),
+                c["findings"].as_u64().expect("findings"),
+                c["rules"]
+                    .as_array()
+                    .expect("rules")
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rollup,
+        vec![
+            ("1.1.1".to_owned(), 1, vec!["image-alt"]),
+            ("1.3.1".to_owned(), 2, vec!["label"]),
+            ("3.3.2".to_owned(), 2, vec!["label"]),
+            ("4.1.2".to_owned(), 3, vec!["button-name", "label"]),
+        ],
+    );
+}
+
+/// The GREEN fixture serves the same route, now reported as conformant.
+#[test]
+fn green_fixture_route_is_listed_as_passing() {
+    let out = run_verify(&fixture_dir("green"), &["--format", "json"]);
+    let report = json_report(&out);
+
+    let routes = report["routes"].as_array().expect("routes array");
+    assert_eq!(routes.len(), 2, "{routes:?}");
+    for route in routes {
+        assert_eq!(route["status"], "pass", "{route}");
+        assert_eq!(route["findings"], 0, "{route}");
+    }
+    assert!(
+        report["wcag"].as_array().expect("wcag array").is_empty(),
+        "a clean run breaches no success criterion",
+    );
+}

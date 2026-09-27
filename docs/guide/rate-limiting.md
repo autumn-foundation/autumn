@@ -126,21 +126,22 @@ as an outer tower layer ahead of body extraction.
 
 ### Attribute ordering
 
-Place the route method attribute (`#[get]` / `#[post]` / …) *above*
-`#[throttle]` — method attribute outermost:
+`#[throttle]` may be written above or below the route method attribute
+(`#[get]` / `#[post]` / …):
 
 ```rust
-#[post("/login")]           // method attribute outermost
+#[post("/login")]
 #[throttle(limit = 5, per = "1m", key = "ip")]
 async fn login() -> Json<Session> { /* … */ }
 ```
 
-Both orders enforce throttling correctly (including idempotency-replay
-accounting). Only the method-attribute-outermost order, however, lets the route
-macro see the handler's real return type for OpenAPI response-schema generation.
-When `#[throttle]` expands first it rewrites the return type to `Response` (like
-the sibling `#[secured]` / `#[step_up]` / `#[authorize]` guards), so a `Json<T>`
-response schema would be dropped from the generated OpenAPI document.
+Both orders enforce throttling identically (including idempotency-replay
+accounting) and both produce the same OpenAPI response schema. When
+`#[throttle]` expands first it rewrites the return type to `Response` (like
+the sibling `#[secured]` / `#[step_up]` / `#[authorize]` guards), but the
+route macro recovers the original `Json<T>` return type from the guard's
+generated body, so response-schema generation does not depend on attribute
+order (#1677).
 
 ## Response shape
 
