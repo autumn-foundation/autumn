@@ -9,6 +9,7 @@
 //! supported `autumn-web` range, the last `autumn plugin-check` result, the
 //! trust class, and the #1601 stability tier.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -172,6 +173,10 @@ pub struct Listing {
     /// What each sandboxed capability is scoped to. Sandboxed only.
     #[serde(default, skip_serializing_if = "Grants::is_empty")]
     pub grants: Grants,
+    /// The per-request quotas the manifest declares, as `inspect` prints
+    /// them. Sandboxed only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub quotas: BTreeMap<String, u32>,
     /// The listing state.
     pub status: Status,
     /// Why the listing is not [`Status::Listed`]. Empty otherwise.
@@ -393,6 +398,22 @@ impl Listing {
                 if !scopes.is_empty() {
                     label.push_str("; scoped to ");
                     label.push_str(&scopes.join("; "));
+                }
+                // Defaults go unsaid; a changed ceiling is authority.
+                let defaults = autumn_web::plugin_sandbox::CapabilityQuotas::default();
+                let changed: Vec<String> = defaults
+                    .fields()
+                    .into_iter()
+                    .filter_map(|(key, default)| {
+                        self.quotas
+                            .get(key)
+                            .filter(|v| **v != default)
+                            .map(|v| format!("{key}={v}"))
+                    })
+                    .collect();
+                if !changed.is_empty() {
+                    label.push_str("; quotas ");
+                    label.push_str(&changed.join(", "));
                 }
                 label
             }
@@ -656,7 +677,16 @@ fn check_trust(listing: &Listing, out: &mut Vec<String>) {
         Trust::Native if !listing.grants.is_empty() => {
             out.push("`grants` is for a sandboxed listing only".to_owned());
         }
+        Trust::Native if !listing.quotas.is_empty() => {
+            out.push("`quotas` is for a sandboxed listing only".to_owned());
+        }
         Trust::Native | Trust::Sandboxed => {}
+    }
+    let known = autumn_web::plugin_sandbox::CapabilityQuotas::default().fields();
+    for key in listing.quotas.keys() {
+        if !known.iter().any(|(k, _)| k == key) {
+            out.push(format!("`{key}` is not a sandbox quota"));
+        }
     }
     for name in &listing.capabilities {
         if !SandboxCapability::ALL.iter().any(|c| c.as_str() == name) {
@@ -770,6 +800,7 @@ mod tests {
             capabilities: vec![],
             artifact_sha256: String::new(),
             grants: Grants::default(),
+            quotas: BTreeMap::new(),
             status: Status::Listed,
             note: String::new(),
             prefix: String::new(),
@@ -1120,6 +1151,47 @@ mod tests {
         listing.grants.hosts = vec!["api.example.com".to_owned()];
         assert!(
             listing.trust_label().contains("hosts api.example.com"),
+            "{}",
+            listing.trust_label()
+        );
+    }
+
+    /// Quotas: sandboxed only, and only names the sandbox enforces.
+    #[test]
+    fn quotas_are_validated() {
+        let mut native = community();
+        native.quotas.insert("kv_reads".to_owned(), 10);
+        let text = messages(&validate(&index_of(vec![native])));
+        assert!(text.contains("quotas"), "{text}");
+
+        let mut listing = community();
+        listing.trust = Trust::Sandboxed;
+        listing.capabilities = vec!["kv".to_owned()];
+        listing.artifact_sha256 = "ab".repeat(32);
+        listing.quotas.insert("warp_drives".to_owned(), 1);
+        let text = messages(&validate(&index_of(vec![listing])));
+        assert!(text.contains("warp_drives"), "{text}");
+    }
+
+    /// The label names quotas that differ from the sandbox default.
+    #[test]
+    fn a_sandboxed_label_names_its_non_default_quotas() {
+        let mut listing = community();
+        listing.trust = Trust::Sandboxed;
+        listing.capabilities = vec!["kv".to_owned()];
+        listing.quotas = autumn_web::plugin_sandbox::CapabilityQuotas::default()
+            .fields()
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect();
+        assert!(
+            !listing.trust_label().contains("quotas"),
+            "{}",
+            listing.trust_label()
+        );
+        listing.quotas.insert("kv_reads".to_owned(), 99_999);
+        assert!(
+            listing.trust_label().contains("kv_reads=99999"),
             "{}",
             listing.trust_label()
         );

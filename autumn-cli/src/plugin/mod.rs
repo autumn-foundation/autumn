@@ -1935,6 +1935,11 @@ mod tests {
                 "{alt}"
             );
         }
+        // A key renamed to another package compiles that package.
+        let renamed = "[dependencies]\nautumn-plugin-x = { package = \"other-crate\", version = \"=0.3.0\" }\n";
+        assert!(check_existing_pin(renamed, "autumn-plugin-x", "=0.3.0").is_err());
+        let same = "[dependencies]\nautumn-plugin-x = { package = \"autumn_plugin_x\", version = \"=0.3.0\" }\n";
+        assert!(check_existing_pin(same, "autumn-plugin-x", "=0.3.0").is_ok());
         let table =
             "[dependencies]\nautumn-plugin-x = { version = \"=0.3.0\", features = [\"a\"] }\n";
         assert!(check_existing_pin(table, "autumn-plugin-x", "=0.3.0").is_ok());

@@ -336,9 +336,9 @@ pub fn declared_dependency_version(manifest: &str, crate_name: &str) -> Option<S
     }
 }
 
-/// Whether `manifest` takes `crate_name` from somewhere other than
-/// crates.io: a `path`, `git` or `registry` key on its `[dependencies]`
-/// entry.
+/// Whether `manifest` takes `crate_name` from somewhere other than its
+/// crates.io release: a `path`, `git` or `registry` key on its
+/// `[dependencies]` entry, or a `package` key naming another crate.
 #[must_use]
 pub fn dependency_has_alternate_source(manifest: &str, crate_name: &str) -> bool {
     let Ok(table) = toml::from_str::<toml::Table>(manifest) else {
@@ -350,10 +350,20 @@ pub fn dependency_has_alternate_source(manifest: &str, crate_name: &str) -> bool
         .and_then(|deps| deps.get(crate_name))
         .and_then(toml::Value::as_table)
         .is_some_and(|entry| {
-            ["path", "git", "registry", "registry-index"]
-                .iter()
-                .any(|key| entry.contains_key(*key))
+            let renamed = entry
+                .get("package")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|package| canonical(package) != canonical(crate_name));
+            renamed
+                || ["path", "git", "registry", "registry-index"]
+                    .iter()
+                    .any(|key| entry.contains_key(*key))
         })
+}
+
+/// A crate name as crates.io compares it: case and `-`/`_` do not count.
+fn canonical(name: &str) -> String {
+    super::index::canonical(name)
 }
 
 /// Whether the app's `autumn-web` comes from a path or git checkout that no

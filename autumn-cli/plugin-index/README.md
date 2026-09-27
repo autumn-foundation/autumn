@@ -10,7 +10,7 @@ A listing tells a user four things before they install a plugin:
 |---|---|
 | `autumn_web` | The `autumn-web` versions the plugin supports. |
 | `[plugin.conformance]` | The last `autumn plugin-check` result, and the release it ran on. |
-| `trust` | `native` (full trust: native code), or `sandboxed` with its `capabilities`, `grants` and `artifact_sha256`. |
+| `trust` | `native` (full trust: native code), or `sandboxed` with its `capabilities`, `grants`, `quotas` and `artifact_sha256`. |
 | `tier` | `stable`, or `experimental` with the `experimental_surfaces` it uses. |
 
 ## Submit a plugin for listing
@@ -107,8 +107,8 @@ each week. It skips a sandboxed listing, because it cannot fetch the
 artifact. For a sandboxed listing, run
 `autumn plugin inspect <file>.autumn-plugin --format json > hello.json`, then
 `autumn plugin index record --inspect hello.json`. This copies the
-capabilities, the scoped grants (hosts, tables, job types, render slots) and
-the artifact digest from the artifact. For a new version of a listed artifact,
+capabilities, the scoped grants (hosts, tables, job types, render slots), the
+quotas and the artifact digest from the artifact. For a new version of a listed artifact,
 run `inspect` with `--against <old>.autumn-plugin`. `record` refuses a new
 artifact without that baseline. If the new version asks for more authority,
 `record` flags the listing and keeps the old artifact.

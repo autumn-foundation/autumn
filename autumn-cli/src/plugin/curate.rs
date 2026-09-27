@@ -192,6 +192,9 @@ pub struct InspectReport {
     /// What each granted capability is scoped to.
     #[serde(default)]
     pub grants: index::Grants,
+    /// The per-request quotas the manifest declares.
+    #[serde(default)]
+    pub quotas: std::collections::BTreeMap<String, u32>,
 }
 
 impl InspectReport {
@@ -294,6 +297,7 @@ pub fn apply_inspect(
         report.version.clone_into(&mut listing.version);
         listing.capabilities.clone_from(&report.capabilities);
         listing.grants.clone_from(&report.grants);
+        listing.quotas.clone_from(&report.quotas);
     }
     let failed = (!failed.is_empty()).then(|| failed.join(", "));
     Ok(transition(listing, failed.as_deref(), against, date))
@@ -389,6 +393,15 @@ pub fn write_listing(src: &str, listing: &Listing) -> Result<String, String> {
             }
         }
         table["grants"] = Item::Table(grants);
+    }
+    if listing.quotas.is_empty() {
+        table.remove("quotas");
+    } else {
+        let mut quotas = toml_edit::Table::new();
+        for (key, v) in &listing.quotas {
+            quotas[key.as_str()] = value(i64::from(*v));
+        }
+        table["quotas"] = Item::Table(quotas);
     }
     let run = &listing.conformance;
     let conformance = table
@@ -872,6 +885,7 @@ mod tests {
             // A baseline with nothing new: the new artifact asks for no more.
             upgrade: Some(serde_json::json!({"added_capabilities": []})),
             grants: index::Grants::default(),
+            quotas: std::collections::BTreeMap::new(),
         }
     }
 
@@ -939,6 +953,16 @@ mod tests {
         let mut r = inspect(true);
         r.conformance.plugin_name = "autumn-plugin-other".to_owned();
         assert!(apply_inspect(&mut sandboxed(), &r, "0.7.0", "2026-10-01").is_err());
+    }
+
+    /// A raised quota is authority: the approved ceilings are recorded.
+    #[test]
+    fn an_inspect_pass_records_the_quotas() {
+        let mut l = sandboxed();
+        let mut r = inspect(true);
+        r.quotas.insert("kv_reads".to_owned(), 500);
+        apply_inspect(&mut l, &r, "0.7.0", "2026-10-01").expect("apply");
+        assert_eq!(l.quotas.get("kv_reads"), Some(&500));
     }
 
     /// A failed inspect keeps the artifact that was consented to.
@@ -1018,7 +1042,10 @@ mod tests {
             .get("autumn-plugin-hello")
             .unwrap()
             .clone();
-        apply_inspect(&mut l, &inspect(true), "0.7.0", "2026-10-01").expect("apply");
+        let mut r = inspect(true);
+        r.grants.hosts = vec!["api.example.com".to_owned()];
+        r.quotas.insert("kv_reads".to_owned(), 500);
+        apply_inspect(&mut l, &r, "0.7.0", "2026-10-01").expect("apply");
         let out = write_listing(&src, &l).expect("write");
         let parsed = index::parse(&out).expect("parse");
         assert_eq!(parsed.get("autumn-plugin-hello"), Some(&l));
