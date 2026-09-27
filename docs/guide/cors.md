@@ -51,11 +51,13 @@ That covers **reads**. The default methods already include the mutating verbs �
 `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS` — and the default
 `allowed_headers` are `Content-Type` and `Authorization`.
 
-**A mutating cross-origin request needs one more header under `prod`.** The `prod`
-profile turns CSRF on, and the CSRF layer reads its token from a request header
-(`security.csrf.token_header`, default `X-CSRF-Token`) — a header the browser will
-refuse to send, because it is not in `allowed_headers`, so the preflight fails
-before your `POST` is ever attempted:
+**Mutating requests also meet CSRF under `prod`.** The `prod` profile turns CSRF
+on, so a cross-origin `POST`/`PUT`/`PATCH`/`DELETE` needs a valid token as well as
+an allowed origin. Whether `[cors]` needs anything depends on how the token
+travels: a client that sends it in a header needs that header
+(`security.csrf.token_header`, default `X-CSRF-Token`) added to
+`allowed_headers`, or the browser will not send it and the preflight fails before
+the request is attempted —
 
 ```toml
 [cors]
@@ -63,13 +65,14 @@ allowed_origins = ["https://app.example.com"]
 allowed_headers = ["Content-Type", "Authorization", "X-CSRF-Token"]
 ```
 
-Listing it here does not exempt the request from CSRF — it only lets the browser
-send the token. The alternative, for an API authenticated by a bearer token rather
-than a cookie, is to exempt its paths from CSRF with
-`security.csrf.exempt_paths`; see
-[Forms, Validation and Normalization](forms.md). Safe methods (`GET`, `HEAD`,
-`OPTIONS`, `TRACE`) are exempt either way, which is why a read-only integration
-never meets this.
+— while a form-encoded submission can carry the token in the form field instead
+and needs no change here. Listing the header permits the token; it does not exempt
+the request. Safe methods (`GET`, `HEAD`, `OPTIONS`, `TRACE`) never meet any of
+this, which is why a read-only integration does not.
+
+[Forms, Validation and Normalization](forms.md) owns the token mechanics,
+including `security.csrf.exempt_paths` for an API authenticated by a bearer token
+rather than a cookie.
 
 ## Allowed origins, and the empty default
 
@@ -97,80 +100,33 @@ does not cover `https://www.example.com`, `http://example.com`, or
 ## CORS with credentials (cookies and `Authorization`)
 
 `allow_credentials = true` makes Autumn send
-`Access-Control-Allow-Credentials: true`. **On its own that is not enough to get
-your session cookie onto a cross-origin request** — it is one of three
-independent conditions, and all three must hold:
+`Access-Control-Allow-Credentials: true` — the server's half of letting a
+cross-origin caller use cookies:
 
 ```toml
 [cors]
-allowed_origins = ["https://app.example.com"]   # 1. the server permits credentials
+allowed_origins = ["https://app.example.com"]
 allow_credentials = true
 ```
 
-2. **The caller must ask for them.** A cross-origin `fetch` sends no cookies
-   unless it opts in, and the default (`same-origin`) does not count as opting
-   in:
+**That header is necessary and not sufficient**, and the rest is not Autumn's to
+decide. The caller must request credentials (`credentials: "include"` on a
+`fetch`), and the browser must be willing to send the cookie at all, which turns
+on its `SameSite` attribute and on whether your two origins count as same-site —
+browser rules, which change on browser timelines. MDN's
+[SameSite cookies][samesite] is the reference to check your exact pair against;
+[Authentication](authentication.md) documents Autumn's session cookie, whose
+`session.same_site` defaults to `"Lax"`.
 
-   ```js
-   fetch("https://api.example.com/me", { credentials: "include" })
-   ```
-
-3. **The cookie must be sendable on a cross-*site* request.** Autumn's session
-   cookie defaults to `session.same_site = "Lax"`, and a `Lax` cookie is withheld
-   on a cross-site request — silently, with no error anywhere, so the request just
-   arrives unauthenticated.
-
-   Whether *your* pair counts as cross-site is a browser rule rather than an
-   Autumn one, and it is not the same question as cross-origin. Browsers compare
-   the **scheme together with the registrable domain**, so
-   `https://app.example.com` → `https://api.example.com` is same-site and needs
-   nothing here, while `http://app.example.com` → `https://api.example.com` is
-   cross-site despite the shared domain. Check your exact pair against MDN's
-   [SameSite cookies][samesite] rather than reasoning from the domain alone — this
-   page deliberately does not restate the classification rules, because they are
-   the browsers' to change.
-
-   When the pair is cross-site, the cookie needs:
-
-   ```toml
-   [session]
-   same_site = "None"
-   ```
-
-   **This gets you reads, not writes.** Autumn's built-in CSRF protection issues
-   its own `autumn-csrf` cookie with `SameSite=Lax` fixed in code — there is no
-   setting for it — so a genuinely cross-site browser client never receives that
-   cookie, and a mutating request is rejected with `403` however correctly it
-   sends the token header. `session.same_site = "None"` does not change this.
-
-   So cross-site **and** cookie-authenticated **and** mutating is not a
-   combination the built-in stack supports. Pick one of the two shapes that work:
-   a same-site deployment (subdomains of one domain, one scheme), or an API
-   authenticated by a bearer token with its paths in
-   `security.csrf.exempt_paths`.
-
-   Browsers honor `None` only on a `Secure` cookie, and `session.secure` is
-   already `true` by default, so there is nothing to flip. `Secure` is a separate
-   rule from `SameSite` and both apply: it constrains the channel the cookie is
-   **sent over**, so what has to be HTTPS is your app's own origin — the origin
-   the cookie belongs to — not the page that triggers the request. Browsers also
-   treat `http://localhost` as trustworthy and accept a `Secure` cookie there, so
-   local development needs no TLS for this.
-
-   The two rules together are why an HTTP front-end calling an HTTPS app is not a
-   shortcut: it satisfies `Secure` (the app's own origin is HTTPS) but is
-   cross-site under the scheme comparison, so it needs `same_site = "None"` as
-   well.
-
-   `SameSite=None` is a real loosening of CSRF protection, so prefer a same-site
-   deployment (two subdomains of one domain, one scheme) or a single origin behind
-   a reverse proxy over reaching for it. See
-   [Authentication](authentication.md) for the rest of the session cookie's
-   settings.
-
-If requests arrive unauthenticated with all three in place, check the request in
-devtools for a `Cookie` header: if the browser is not sending one, the problem is
-condition 2 or 3, not `[cors]`.
+**One limit is Autumn's own, and worth knowing before you design around it.** The
+built-in CSRF protection issues its `autumn-csrf` cookie with `SameSite=Lax` fixed
+in code — `security.csrf` has no setting for it. A genuinely cross-site browser
+client therefore never receives that cookie, and a mutating request is rejected
+with `403` however correctly it sends the token. So cross-site **and**
+cookie-authenticated **and** mutating is not a combination the built-in stack
+supports, and no `[cors]` or `[session]` value makes it one. The two shapes that
+do work: a same-site deployment (subdomains of one domain, one scheme), or an API
+authenticated by a bearer token with its paths in `security.csrf.exempt_paths`.
 
 [samesite]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie#samesitesamesite-value
 
@@ -198,6 +154,13 @@ With an allowlisted origin calling you, a normal response carries:
 | `Access-Control-Allow-Methods` | `allowed_methods` (preflight responses) |
 | `Access-Control-Allow-Headers` | `allowed_headers` (preflight responses) |
 | `Access-Control-Max-Age` | `max_age_secs` (preflight responses) |
+
+These come from the CORS middleware, so they reach responses that pass through it.
+One deployment does not: in a static-generation build, a cached `#[static_get]`
+hit is served straight from the manifest and never reaches the CORS layer, so a
+prerendered route fetched cross-origin still fails even with its origin
+allowlisted. Serving those responses cross-origin needs CORS from an outer custom
+layer, a reverse proxy, or the CDN in front.
 
 A missing `Access-Control-Allow-Origin` does **not** tell you which of two
 different problems you have, because both look identical in devtools: the layer
