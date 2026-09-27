@@ -35,30 +35,44 @@ decides `isError` from `!status.is_success()`, i.e. "not 2xx" — a narrower
 "is this 4xx or 5xx" check would have missed the `3xx` redirect branch and
 reported a stale-session step-up rejection as tool *success*, handing the
 handler's real response back to a caller who never freshly reauthenticated.
-`#[step_up]` also has two preconditions `#[secured]` does not: presence of a
+`#[step_up]` also has a precondition `#[secured]` does not: presence of a
 claim is not enough, it must additionally be *fresh* — worth pinning
-separately from a "logged in or not" boolean.
+separately from a "logged in or not" boolean, with a claim that is
+genuinely stale rather than merely absent.
 
 ## 🧪 Reproduction attempt → negative result
 
 Test: `autumn/tests/integration/mcp_step_up_guard.rs`:
 - `step_up_guard_rejects_an_mcp_tool_call_with_no_session`
 - `step_up_guard_rejects_an_mcp_tool_call_with_a_session_but_no_fresh_claim`
+- `step_up_guard_rejects_an_mcp_tool_call_with_a_stale_claim`
 - `step_up_guard_allows_an_mcp_tool_call_with_a_fresh_claim`
 
 ```
 cargo test -p autumn-web --test integration_tests --features mcp mcp_step_up_guard
 ```
 
-Result: **pass, all three** — no bypass. See `after.txt` for the full run.
-A caller with no session, and a caller with a session but no fresh
-`last_strong_auth_at` claim, both get `isError: true` with no trace of the
-handler's real response. A caller who freshly stamped the claim (the same
-primitive a reauth form submission calls) gets the real response, and the
-successful response carries no trace of the `/reauth` redirect branch
-either — confirming the JSON branch, not the HTML one, is what a
-`tools/call` (which sends `Accept: application/json` via `build_request`)
-actually exercises.
+Result: **pass, all four** — no bypass. See `after.txt` for the full run,
+including the Codex review round that caught two accuracy gaps in the first
+version of this test (below). A caller with no session, a caller with a
+session but no claim, and a caller with a claim that is present but older
+than the route's `max_age` (backdated 600s against the 300s default) all get
+`isError: true` with no trace of the handler's real response. A caller who
+freshly stamped the claim gets the real response.
+
+**Corrected during review** (both flagged by Codex on the PR, both real
+gaps, neither a security finding):
+1. The original "no fresh claim" test only exercised an *absent* claim, not
+   a genuinely stale one, so it didn't actually prove recency-checking —
+   fixed by adding `step_up_guard_rejects_an_mcp_tool_call_with_a_stale_claim`.
+2. The original write-up claimed `build_request` sends
+   `Accept: application/json`, so a rejected `tools/call` would exercise
+   `#[step_up]`'s JSON branch. That's wrong: `FORWARDED_HEADERS` doesn't
+   forward `Accept` at all (see Root cause below), so every MCP-dispatched
+   rejection actually takes the HTML `/reauth` redirect branch. The
+   negative result is unaffected — a `302` is exactly as correctly
+   classified as `isError: true` as a `401` — but the misleading
+   comment/assertion claiming JSON-branch coverage was removed.
 
 ## 🔎 Root cause of the fail-safe behavior
 
@@ -84,27 +98,46 @@ hand-rolled `4xx`/`5xx` range check — so it already correctly classifies
 `isError: true`. There is no narrower-than-2xx-vs-not check anywhere on this
 path that a `3xx` status could slip through.
 
+Which of those two rejection responses actually fires over MCP is not, in
+fact, under the caller's control: `mcp::build_request`'s `FORWARDED_HEADERS`
+list (`autumn/src/mcp.rs`) forwards `Accept-Language` but not `Accept`
+itself, so the dispatched request never carries an `Accept` header at all.
+`#[step_up]`'s `__wants_json` check reads a missing `Accept` as `false`, so
+every MCP `tools/call` against a `#[step_up]` handler takes the HTML
+`/reauth` redirect branch on rejection — never the JSON `401` branch. That
+does not weaken the negative result (both branches are non-2xx and both are
+therefore `isError: true`), but it does mean an agent driving a
+`#[step_up]`-guarded tool only ever sees an empty-bodied redirect's tool-error
+text, never the richer `application/problem+json` body. That is a
+response-quality gap, not a security one, would apply to *any*
+`Accept`-branching handler exposed over MCP (not specifically `#[step_up]`),
+and is out of scope for this negative-result test.
+
 ## 🩹 Fix
 
 None — no bug found. Regression test added at
 `autumn/tests/integration/mcp_step_up_guard.rs`, registered in
 `autumn/tests/integration/mod.rs` under `#[cfg(feature = "mcp")]`. The test
-pins the actual mechanism (no-session and stale-session rejection with no
-leaked body; fresh-claim success with the real response and no `/reauth`
-trace) so it fails loudly — not vacuously — if a future change to MCP
-dispatch, `#[step_up]`'s expansion, or the buffered-result status check ever
-reopens this path.
+pins the actual mechanism (no-session, no-claim, and stale-claim rejection
+with no leaked body; fresh-claim success with the real response) so it
+fails loudly — not vacuously — if a future change to MCP dispatch,
+`#[step_up]`'s expansion, or the buffered-result status check ever reopens
+this path.
 
 ## ✅ Verification
 
-- `cargo fmt --all -- --check` — clean (after one `cargo fmt --all` pass on
-  the new file to match the project's multi-line attribute style).
-- `cargo test -p autumn-web --test integration_tests --features mcp mcp_step_up_guard` — 3/3 pass (`after.txt`).
+- `cargo fmt --all -- --check` — clean.
+- `cargo test -p autumn-web --test integration_tests --features mcp mcp_step_up_guard` — 4/4 pass (`after.txt`).
 - `cargo clippy -p autumn-web --test integration_tests --features mcp -- -D warnings` — clean; no warnings attributed to the new file.
 - Re-attack: confirmed `buffered_tool_result` uses `StatusCode::is_success()`
   (a real 2xx check), not a hand-written 4xx/5xx range, so the `302`
   redirect branch specific to `#[step_up]` (which `#[secured]`/`#[throttle]`
   have no equivalent of) cannot slip through as a false success.
+- Codex review round: verified both flagged gaps directly against
+  `autumn-macros/src/step_up.rs` and `autumn/src/mcp.rs` rather than taking
+  them on faith, fixed both (added the stale-claim test; corrected the
+  false `Accept: application/json` claim), and re-ran the full suite green
+  (`after.txt`).
 
 ## 📡 Blast radius
 
