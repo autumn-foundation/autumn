@@ -17,6 +17,14 @@ If you are calling your app from its own origin — a server-rendered page, an
 htmx fragment, a form post — you do not need CORS at all, and enabling it
 changes nothing.
 
+**If the calling page is served by another Autumn app, check that app's CSP
+first.** `[cors]` governs the app being called; the caller's own
+`security.headers.content_security_policy` governs whether the browser will make
+the request at all, and Autumn's default includes `connect-src 'self'`. Under that
+default the `fetch` is blocked before any CORS request leaves the browser, so no
+`[cors]` value on the API can help. Widen `connect-src` on the **calling** app to
+include the API's origin.
+
 ## Quick start: enable CORS
 
 **Which default you get depends on the profile**, and the difference is the thing

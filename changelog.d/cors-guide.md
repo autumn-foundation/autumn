@@ -14,11 +14,13 @@
   `AUTUMN_ENV`/`AUTUMN_PROFILE`/`--profile` set that follows the build mode, so a
   debug binary is permissive and a release binary is closed. It also documents
   the `allow_credentials = true` + `allowed_origins = ["*"]` pair rejected at
-  config load, the preflight rules behind an `OPTIONS` failure, two interactions
+  config load, the preflight rules behind an `OPTIONS` failure, three interactions
   a reader otherwise meets as an unexplained failure — under `prod` a mutating
   cross-origin request that sends its CSRF token in a header needs that header in
   `allowed_headers` (a form-field or query token, and a CSRF-exempt path, do not),
-  and a cached `#[static_get]` hit never reaches the CORS layer — and one limit
+  a cached `#[static_get]` hit never reaches the CORS layer, and a caller served by
+  another Autumn app is blocked by that app's own default
+  `connect-src 'self'` before any CORS request is sent — and one limit
   with no configuration behind it: the built-in CSRF cookie is `SameSite=Lax` in
   code, so
   cross-site cookie-authenticated writes are not a shape the built-in stack
