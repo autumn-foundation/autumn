@@ -2236,6 +2236,36 @@ without also filling in the intake form above.
   2026-09-22T~10:1xZ — **14th** straight idle pass (now ~330.5 hours idle,
   past 13.75 days). Still needs a human sign-off for new macOS CI spend;
   not dispatched this pass for that reason.
+- **2026-09-23 update — 15th consecutive pass, harness still undispatched;
+  zero new hits on any of the three `live_upgrade` signatures.** Sampled
+  `ci.yml` `pull_request` runs from the 2026-09-22 report's own cutoff
+  (2026-09-22T06:24:50Z, exclusive) to 2026-09-23T07:37:08Z (~25.2h, one
+  no-filter `status=completed` query, `perPage=100`/page 1, span
+  2026-09-21T18:16:27Z–2026-09-23T07:37:08Z, fully covering the window with
+  margin) — 58 `pull_request` runs in-window: 27 success, 24 cancelled, 7
+  failure. All 7 triaged (full detail in the `sqlite_jobs_scheduler_e2e`
+  entry's own 2026-09-23 update below, not repeated here): one
+  `dependabot/github_actions/dtolnay/rust-toolchain-1.120.0` repeat of its
+  already-documented action-pin break; five ordinary branch-owned `Lint`/
+  `MSRV`/`Diesel migration version collisions` WIP failures across five
+  `vesper/bugbash-*` branches (2312, 2363, 2419, 2331, 2311 — see the
+  `sqlite_jobs_scheduler_e2e` entry's own update for the corrected
+  per-branch breakdown); and one genuine new organic
+  hit — but on `sqlite_jobs_scheduler_e2e`, not on any `live_upgrade`,
+  `cache_stampede`, or `sim_fault_plan` signature. None of the 7 match this
+  entry. **Coverage gap, flagged post-review (via a Codex review comment on
+  this update, after the next day's #2942 pass had already established the
+  same gap for its own sample): this "zero new hits" finding is scoped to
+  the 34 runs that resolved to `success`/`failure` and were actually
+  triaged, not a proven-exhaustive zero-hit finding across the full 58-run
+  window.** `ci.yml`'s `concurrency.cancel-in-progress: true` means a job
+  inside one of the 24 `cancelled`-overall runs could still have completed
+  with a failing test before the run itself was marked cancelled by a
+  superseding push; those runs' job-level logs were not inspected this
+  pass. `manual-macos-contention-check.yml`: still `total_count: 0`,
+  checked 2026-09-23T~07:5xZ — **15th** straight idle pass (now ~352.9
+  hours idle, past 14.7 days). Still needs a human sign-off for new macOS
+  CI spend; not dispatched this pass for that reason.
 - **2026-09-24 update — 15th consecutive pass, harness still undispatched;
   zero new hits on any of the three `live_upgrade` signatures.** Sampled
   `ci.yml` `pull_request` runs, page 1 of `list_workflow_runs`
@@ -2420,6 +2450,8 @@ without also filling in the intake form above.
 - **2026-09-22 update**: no repeat in the ~20.5h window sampled this pass
   (see the `live_upgrade` entry's 2026-09-22 dated update above for the
   window and method).
+- **2026-09-23 update**: no repeat in the ~25.2h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-23 dated update above for the
 - **2026-09-24 update**: no repeat in the ~37.85h window sampled this pass
   (see the `live_upgrade` entry's 2026-09-24 dated update above for the
   window and method).
@@ -2461,6 +2493,8 @@ without also filling in the intake form above.
 - **2026-09-22 update**: no repeat in the ~20.5h window sampled this pass
   (see the `live_upgrade` entry's 2026-09-22 dated update above for the
   window and method). Still n=1, still not campaigned.
+- **2026-09-23 update**: no repeat in the ~25.2h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-23 dated update above for the
 - **2026-09-24 update**: no repeat in the ~37.85h window sampled this pass
   (see the `live_upgrade` entry's 2026-09-24 dated update above for the
   window and method). Still n=1, still not campaigned.
