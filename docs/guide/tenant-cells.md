@@ -226,4 +226,4 @@ are counted honestly and released deterministically.
   but nothing re-reads `autumn.toml` at runtime to feed a new value, so the
   quota is effectively fixed for a process's lifetime. Wiring up a reload path
   is the remaining half of
-  [#1783](https://github.com/madmax983/autumn/issues/1783).
+  [#1783](https://github.com/autumn-foundation/autumn/issues/1783).

@@ -1,0 +1,18 @@
+[package]
+name = "mesh-storefront"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+autumn-web = { path = "../../autumn", default-features = false, features = ["http-client", "maud"] }
+maud = { version = "0.27", features = ["axum"] }
+mesh-catalog = { path = "../mesh-catalog" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# See the note in `examples/hello/Cargo.toml`: packages outside the workspace
+# lint table grandfather the determinism-seam lint themselves.
+[lints.clippy]
+disallowed_methods = "allow"
