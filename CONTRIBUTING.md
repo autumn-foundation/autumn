@@ -501,9 +501,15 @@ Two notes on the monotonic seam, because they are the parts that surprise people
   monotonicity for testability.
 
 When no clock is reachable at all — a constructor that runs before one is
-installed, a free function with no state argument — `time::monotonic_now()` is the
-sanctioned fallback. It is real time and never follows a simulation, so prefer
-threading a real handle whenever that is possible.
+installed, a free function with no state argument — use the ambient clock:
+`time::ambient_now()`, `ambient_monotonic()`, `ambient_instant()`,
+`ambient_system_time()` or `time::AmbientClock` (issue #2967). A `Sim` installs
+its virtual clock as its thread's ambient clock while it lives, so these follow
+the simulation; with no `Sim` on the thread they read the system clock. Measure
+an `ambient_instant()` with `ambient_instant().saturating_duration_since(start)`,
+never `start.elapsed()`: `Instant::elapsed` reads the OS clock, and clippy does not
+flag it. Prefer a real handle whenever one is in scope. `time::monotonic_now()`
+stays real time and never follows a simulation.
 
 ### What the gate covers
 
@@ -534,17 +540,15 @@ carrying the header above.
 
 **Honest scoping — the manifest is the *enforced* subset.** The modules listed in
 `GATED_MODULES` in `scripts/check-determinism-gate.sh` are the ones enforced
-today, not a claim that the rest of the crate is on-seam. `autumn/src` still
-contains roughly 150 ungated production call sites. The highest-value next batch
-is the code whose elapsed-time reads gate *control flow* or are observable in a
-response: `idempotency.rs` (replay-window TTLs — note its `IdempotencyEntry`
-exposes `expires_at: Instant` as a **public** field, so migrating it is a
-breaking change and needs a migration-guide entry), `circuit_breaker.rs`
-(open/half-open transitions), and the per-request `middleware/access_log.rs`,
-`middleware/metrics.rs`, and `middleware/server_timing.rs` timers. Then
-`webhook_outbound.rs`, `notifications.rs`, `storage/local.rs`, and the rest. The
-manifest grows monotonically and never shrinks (`MODULE_COUNT_FLOOR`); do not
-read a module's absence from it as a promise that it is on-seam.
+today. Since issue #2967 almost every `autumn/src` module with a production
+clock read is on the seam and gated. The rest keep a raw read on purpose (real
+browsers in `system_test.rs`, a real Postgres process in `managed_pg.rs`, the
+`strict_wall_clock` guard in `sim.rs`), or still mint ids with `Uuid::new_v4()`
+and so cannot take the header yet: `storage/local.rs`, `cache/read_through.rs`,
+`repository_commit_hooks.rs`, `mail.rs`, `test.rs`, `sync/store.rs`, `hooks.rs`
+and `channels.rs`. Their clock reads are migrated. The manifest grows
+monotonically and never shrinks (`MODULE_COUNT_FLOOR`); do not read a module's
+absence from it as a promise that it is on-seam.
 
 Known-open gaps, named rather than hidden:
 
@@ -552,13 +556,9 @@ Known-open gaps, named rather than hidden:
   threading a clock in would break the public API. Its `Instant::now()` carries a
   per-site `#[allow]` with that reason; the instant never escapes (only
   `elapsed_ms` does) and the framework has no caller of its own.
-- **`#[repository]`-generated writes.** The macro emits
-  `chrono::Utc::now()` for soft-delete and timestamp columns, and the generated
-  repository holds only a pool — no `AppState`, so no clock is reachable. The
-  expansion carries its own `#[allow(clippy::disallowed_methods, reason = "…")]`
-  so it never trips the lint in the *calling* crate, whose author did not write
-  it. That is a suppression, not a fix: a soft-deleted row's `deleted_at` is
-  still non-deterministic under simulation.
+- **`#[repository]`-generated writes** read `time::ambient_now()` (issue #2967).
+  The generated repository holds only a pool, so it cannot reach the app's
+  clock, but the ambient clock follows a running `Sim`.
 - **`app.rs`'s TLS `now_unix`** reads real wall time on purpose. Certificate
   validity is a fact about the real world; a simulation clock pinned to the sim
   epoch must not be able to declare a live certificate expired.

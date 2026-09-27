@@ -1818,7 +1818,7 @@ async fn recover_stale_repository_commit_hooks(pool: &RtPool, worker_id: &str) {
 fn sqlite_stale_claim_cutoff() -> chrono::DateTime<chrono::Utc> {
     let stale_after = chrono::Duration::from_std(HOOK_STALE_CLAIM_AFTER)
         .unwrap_or_else(|_| chrono::Duration::seconds(60));
-    chrono::Utc::now() - stale_after
+    crate::time::ambient_now() - stale_after
 }
 
 // ── `SQLite` claim / drain / nack (#1996 item 5) ───────────────────────────────
@@ -1839,7 +1839,7 @@ async fn sqlite_claim_next_repository_commit_hook(
     }
 
     let mut conn = pool.get().await.ok()?;
-    let now = sqlite_timestamp(chrono::Utc::now());
+    let now = sqlite_timestamp(crate::time::ambient_now());
     // The registered handler keys are internal Rust type-path strings (no
     // user input); inline them as an escaped `IN (...)` literal list so the raw
     // `sql_query` needs a fixed bind arity (`run_at <= ?` only). Single quotes
@@ -2012,7 +2012,7 @@ async fn sqlite_nack_repository_commit_hook_failure(
     if row.attempt < row.max_attempts {
         let delay_ms = retry_delay_ms(row.initial_backoff_ms, row.attempt);
         let run_at = sqlite_timestamp(
-            chrono::Utc::now()
+            crate::time::ambient_now()
                 + chrono::Duration::try_milliseconds(delay_ms)
                     .unwrap_or_else(chrono::Duration::zero),
         );

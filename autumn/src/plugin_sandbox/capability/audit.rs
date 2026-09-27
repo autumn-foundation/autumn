@@ -28,6 +28,14 @@
 //! to contain, in a place with different access rules — and an operator asking
 //! "what did it do" is asking about shape, not contents.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::{Mutex, PoisonError};
@@ -128,7 +136,7 @@ impl PluginActivityLog {
 
     /// Record everything one request's runtime gathered.
     pub fn ingest(&self, plugin: &str, events: impl IntoIterator<Item = CapabilityEvent>) {
-        let now = Instant::now();
+        let now = crate::time::ambient_instant();
         // What this ring evicts to make room, carried out of the critical
         // section rather than recorded inside it: the two locks are never held
         // at once, so neither orders the other and no future reader can
@@ -169,13 +177,13 @@ impl PluginActivityLog {
             return;
         }
         let mut ring = self.dropped.lock().unwrap_or_else(PoisonError::into_inner);
-        note_dropped(&mut ring, Instant::now(), plugin, dropped);
+        note_dropped(&mut ring, crate::time::ambient_instant(), plugin, dropped);
     }
 
     /// What `plugin` did within `window`.
     #[must_use]
     pub fn summary(&self, plugin: &str, window: Duration) -> ActivitySummary {
-        let cutoff = Instant::now();
+        let cutoff = crate::time::ambient_instant();
         let mut summary = ActivitySummary {
             plugin: plugin.to_owned(),
             window,

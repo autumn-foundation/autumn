@@ -23,8 +23,8 @@ msrv = "1.88.0"
 # `reason` strings are the error message a contributor sees, so each one names
 # the replacement rather than just saying no.
 disallowed-methods = [
-  { path = "std::time::Instant::now", reason = "measure elapsed time through the injected clock: state.monotonic(), the Clock extractor's .monotonic(), or clock.monotonic() on an Arc<dyn ClockSource>, then MonotonicInstant::saturating_duration_since. std::time::Instant is NOT virtualized by tokio's paused clock, so this reads the real machine clock even inside a #[sim_test]. For a deadline whose counterparty is tokio::time::sleep, use tokio::time::Instant. With no clock reachable at all, use autumn_web::time::monotonic_now(). (#1797)" },
-  { path = "chrono::Utc::now", reason = "read the injected wall clock: state.clock().now(), or the Clock extractor in a handler. (#1797)" },
-  { path = "std::time::SystemTime::now", reason = "use autumn_web::time::clock_unix_secs(clock) / clock_unix_duration(clock), which read the injected clock. (#1797)" },
+  { path = "std::time::Instant::now", reason = "measure elapsed time through the injected clock: state.monotonic(), the Clock extractor's .monotonic(), or clock.monotonic() on an Arc<dyn ClockSource>, then MonotonicInstant::saturating_duration_since. std::time::Instant is NOT virtualized by tokio's paused clock, so this reads the real machine clock even inside a #[sim_test]. For a deadline whose counterparty is tokio::time::sleep, use tokio::time::Instant. With no clock reachable at all, use autumn_web::time::ambient_instant() or ambient_monotonic(), which follow a running Sim (#2967). (#1797)" },
+  { path = "chrono::Utc::now", reason = "read the injected wall clock: state.clock().now(), or the Clock extractor in a handler. With no clock in scope, use autumn_web::time::ambient_now() (#2967). (#1797)" },
+  { path = "std::time::SystemTime::now", reason = "use autumn_web::time::clock_unix_secs(clock) / clock_unix_duration(clock), which read the injected clock. With no clock in scope, use autumn_web::time::ambient_system_time() (#2967). (#1797)" },
   { path = "uuid::Uuid::new_v4", reason = "mint ids through the injected entropy source: state.entropy().uuid_v4(), or the Rng extractor in a handler. (#1797)" },
 ]

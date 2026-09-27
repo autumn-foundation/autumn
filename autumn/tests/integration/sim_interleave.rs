@@ -26,8 +26,7 @@ async fn interleave_trace(sim: &Sim) -> Vec<(usize, u32)> {
     let ops = (0..4).map(|id| stepper(id, Arc::clone(&trace))).collect();
     let outputs = sim.interleave(ops).await;
     assert_eq!(outputs, vec![0, 1, 2, 3], "outputs keep the input order");
-    let steps = trace.lock().unwrap().clone();
-    steps
+    trace.lock().unwrap().clone()
 }
 
 async fn spawn_trace(sim: &Sim) -> Vec<(usize, u32)> {
@@ -38,8 +37,7 @@ async fn spawn_trace(sim: &Sim) -> Vec<(usize, u32)> {
     for (id, handle) in handles.into_iter().enumerate() {
         assert_eq!(handle.await.unwrap(), id);
     }
-    let steps = trace.lock().unwrap().clone();
-    steps
+    trace.lock().unwrap().clone()
 }
 
 #[sim_test]

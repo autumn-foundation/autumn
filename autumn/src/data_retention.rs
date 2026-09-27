@@ -23,6 +23,14 @@
 //!
 //! See `docs/guide/data-retention.md`.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -547,7 +555,7 @@ async fn run_one_dataset(
     dataset: RetentionDataset,
     dry_run: bool,
 ) -> RetentionDatasetReport {
-    let started = std::time::Instant::now();
+    let started = state.monotonic();
     let effective = effective_retention(config, dataset);
     // A provisional cutoff, so a dataset with no database still reports one.
     // The sweep path replaces it with the instant Postgres itself resolved —
@@ -555,7 +563,7 @@ async fn run_one_dataset(
     let cutoff = effective
         .window
         .and_then(|window| chrono::Duration::from_std(window).ok())
-        .map(|window| Utc::now() - window);
+        .map(|window| state.clock().now() - window);
 
     let mut report = RetentionDatasetReport {
         dataset: dataset.key().to_owned(),
@@ -575,7 +583,7 @@ async fn run_one_dataset(
 
     let (Some(window), Some(cutoff)) = (effective.window, cutoff) else {
         report.skipped = Some("no retention window configured".to_owned());
-        report.duration_ms = elapsed_ms(started);
+        report.duration_ms = elapsed_ms(state, started);
         return report;
     };
 
@@ -584,7 +592,7 @@ async fn run_one_dataset(
     let registry = state.extension::<GdprRegistry>();
     if let Some(reason) = legal_hold_for(dataset, registry.as_deref()) {
         report.skipped = Some(format!("legal hold: {reason}"));
-        report.duration_ms = elapsed_ms(started);
+        report.duration_ms = elapsed_ms(state, started);
         return report;
     }
 
@@ -618,7 +626,7 @@ async fn run_one_dataset(
         }
     }
 
-    report.duration_ms = elapsed_ms(started);
+    report.duration_ms = elapsed_ms(state, started);
     report
 }
 
@@ -660,8 +668,14 @@ fn backend_ttl_note(dataset: RetentionDataset, config: &AutumnConfig, window_sec
     note
 }
 
-fn elapsed_ms(started: std::time::Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+fn elapsed_ms(state: &AppState, started: crate::time::MonotonicInstant) -> u64 {
+    u64::try_from(
+        state
+            .monotonic()
+            .saturating_duration_since(started)
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 /// Prune abandoned custom-domain registrations and orphaned certificates

@@ -3498,7 +3498,7 @@ pub struct RequestBuilder {
     /// without a client (not reachable through the public API today).
     cookie_jar: Option<CookieJar>,
     /// The originating client's clock, used to evaluate `Expires` when folding
-    /// `Set-Cookie` back into the jar. `None` falls back to [`chrono::Utc::now`].
+    /// `Set-Cookie` back into the jar. `None` falls back to [`crate::time::ambient_now`].
     clock: Option<std::sync::Arc<dyn crate::time::ClockSource>>,
     /// Default N+1 detection threshold (`dev.inspector_n_plus_one_threshold`),
     /// propagated to the resulting [`TestResponse`] so
@@ -3608,7 +3608,7 @@ impl RequestBuilder {
             let now = self
                 .clock
                 .as_ref()
-                .map_or_else(chrono::Utc::now, |c| c.now());
+                .map_or_else(crate::time::ambient_now, |c| c.now());
             let cookie_header = {
                 let mut jar = jar.lock().expect("cookie jar mutex poisoned");
                 jar.retain(|_, cookie| cookie.expires_at.is_none_or(|t| t > now));
@@ -3701,7 +3701,7 @@ impl RequestBuilder {
             let now = self
                 .clock
                 .as_ref()
-                .map_or_else(chrono::Utc::now, |c| c.now());
+                .map_or_else(crate::time::ambient_now, |c| c.now());
             let mut jar = jar.lock().expect("cookie jar mutex poisoned");
             for (name, value) in &headers {
                 if name.eq_ignore_ascii_case("set-cookie") {

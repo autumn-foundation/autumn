@@ -16,6 +16,14 @@
 //! Exceeding one denies that call and records it. It does not fail the request:
 //! see the module header on why a denial is an answer.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -175,7 +183,7 @@ impl CapabilityRateLimiter {
                 .map(|_| {
                     Mutex::new(Bucket {
                         tokens: full,
-                        last: Instant::now(),
+                        last: crate::time::ambient_instant(),
                     })
                 })
                 .collect(),
@@ -221,7 +229,7 @@ impl CapabilityRateLimiter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let full = u64::from(self.per_second).saturating_mul(SCALE);
-        let now = Instant::now();
+        let now = crate::time::ambient_instant();
         let micros = u64::try_from(now.saturating_duration_since(bucket.last).as_micros())
             .unwrap_or(u64::MAX);
         // `as_micros` rather than `as_secs_f64`: the refill has to be monotone
