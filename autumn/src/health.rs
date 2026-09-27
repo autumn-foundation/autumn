@@ -58,9 +58,7 @@ mod tests {
     #[derive(Clone)]
     struct TestProbeState {
         #[cfg(feature = "db")]
-        pool: Option<
-            diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
-        >,
+        pool: Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>,
         profile: String,
         health_detailed: bool,
         probes: crate::probe::ProbeState,
@@ -82,7 +80,7 @@ mod tests {
         #[cfg(feature = "db")]
         fn pool(
             &self,
-        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
         {
             self.pool.as_ref()
         }
@@ -148,7 +146,7 @@ mod tests {
     #[tokio::test]
     async fn health_with_pool_returns_pool_status() -> Result<(), Box<dyn std::error::Error>> {
         let config = crate::config::DatabaseConfig {
-            url: Some("postgres://localhost/test".into()),
+            url: Some(crate::test_urls::primary("test")),
             pool_size: 5,
             ..Default::default()
         };

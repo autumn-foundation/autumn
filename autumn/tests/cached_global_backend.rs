@@ -91,7 +91,14 @@ fn cached_fn_reads_from_global_on_hit() {
     clear_global_cache();
 
     let global_moka = Arc::new(MokaCache::new(100, None));
-    let key = make_cache_key(concat!(module_path!(), "::double_a"), &(42_i32,));
+    // The generated key now folds in the ambient resolved tenant ahead of the
+    // named key parameters (Warden 2026-09-05, docs/security/2026-09-05-cached-tenant-key/):
+    // `None` here since these plain functions run outside any tenancy-resolved
+    // request context.
+    let key = make_cache_key(
+        concat!(module_path!(), "::double_a"),
+        &(Option::<String>::None, &(42_i32,)),
+    );
     // Store 999 under the key that double_a(42) would normally compute as 84.
     autumn_web::cache::insert(global_moka.as_ref(), &key, 999_i32);
     set_global_cache(global_moka);
@@ -115,8 +122,12 @@ fn cached_fn_writes_to_global_on_miss() {
     let (counting, inserts) = CountingCache::new();
     set_global_cache(Arc::new(counting.clone()) as Arc<dyn Cache>);
 
-    // Ensure the key is absent from the global before calling
-    let key = make_cache_key(concat!(module_path!(), "::double_b"), &(5_i32,));
+    // Ensure the key is absent from the global before calling. See the
+    // comment in `cached_fn_reads_from_global_on_hit` for why `None` leads.
+    let key = make_cache_key(
+        concat!(module_path!(), "::double_b"),
+        &(Option::<String>::None, &(5_i32,)),
+    );
     counting.inner.invalidate(&key);
 
     let result = double_b(5);

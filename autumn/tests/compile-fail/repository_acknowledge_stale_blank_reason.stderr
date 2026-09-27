@@ -1,0 +1,5 @@
+error: `acknowledge_stale` requires a non-empty reason: it is the only record of why this repository's writes are allowed to strand a cached read
+  --> tests/compile-fail/repository_acknowledge_stale_blank_reason.rs:20:55
+   |
+20 | #[autumn_web::repository(Article, acknowledge_stale = "")]
+   |                                                       ^^

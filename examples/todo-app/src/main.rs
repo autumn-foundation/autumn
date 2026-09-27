@@ -98,6 +98,10 @@ async fn main() {
             routes::todos::delete_todo,
             routes::todos::start_export,
             routes::api::issue_token,
+            // Content-negotiated resource (#2099): one handler serves HTML to a
+            // browser and JSON to an API client based on `Accept`. Mounted here
+            // (not under the `/api` bearer-token scope) so a browser reaches it.
+            routes::api::summary,
         ])
         // Tracked background job powering the async CSV export (#1373):
         // enqueue_tracked -> ctx.set_progress -> a polled download link.
