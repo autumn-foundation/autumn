@@ -419,9 +419,14 @@ impl Listing {
     }
 
     /// Whether a failed re-verification applies to an app on `app`: the
-    /// listing is flagged, and `app` is on the failed series or later.
+    /// listing is flagged, and `app` is on the failed series or later. A
+    /// flagged sandboxed listing applies to every app.
     #[must_use]
     pub fn flag_applies(&self, app: &str) -> bool {
+        // A sandboxed artifact is not tied to an `autumn-web` series.
+        if self.status == Status::Incompatible && self.trust == Trust::Sandboxed {
+            return true;
+        }
         self.status == Status::Incompatible
             && concrete(app)
                 .zip(concrete(&self.conformance.autumn_web))
@@ -1264,6 +1269,18 @@ mod tests {
         listing.conformance.autumn_web = "0.8.0-rc.1".to_owned();
         let text = messages(&staleness(&index_of(vec![listing]), "0.8.0-rc.1"));
         assert!(text.is_empty(), "{text}");
+    }
+
+    /// A sandboxed artifact is not tied to a series: its flag applies to
+    /// every app, so discovery agrees with the install gate.
+    #[test]
+    fn a_sandboxed_flag_applies_to_every_app() {
+        let mut listing = flagged();
+        listing.trust = Trust::Sandboxed;
+        listing.conformance.autumn_web = "0.9.0".to_owned();
+        listing.autumn_web = ">=0.1, <1".to_owned();
+        assert!(listing.flag_applies("0.2.0"));
+        assert_eq!(listing.compat("0.2.0"), Compat::Incompatible);
     }
 
     /// The flag applies from the failed series on, not to older apps.

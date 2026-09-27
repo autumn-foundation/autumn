@@ -52,10 +52,28 @@ pub fn apply_report(
     // Only a pass replaces them: a failed contract may not even parse, and
     // the listing keeps what was last verified.
     if let Some(contract) = report.contract.as_ref().filter(|_| report.passed()) {
+        // The pin is the version that was built and checked. A contract that
+        // reports another one is refused, never used to move the pin.
+        if let Some(version) = &contract.plugin_version
+            && listing.origin == ListingOrigin::Community
+            && version != &listing.version
+        {
+            return Err(format!(
+                "the report for `{}` says version {}, but the index verified {}. Change \
+                 `version` in the listing and re-run the check",
+                listing.name,
+                index::sanitize(version),
+                listing.version
+            ));
+        }
         if let Some(range) = &contract.autumn_web {
             listing.autumn_web.clone_from(range);
         }
-        if let Some(version) = &contract.plugin_version {
+        // A first-party crate is lockstep: it is built from this workspace,
+        // so its contract version is the release.
+        if let Some(version) = &contract.plugin_version
+            && listing.origin == ListingOrigin::FirstParty
+        {
             listing.version.clone_from(version);
         }
         listing
@@ -216,6 +234,24 @@ pub fn apply_inspect(
             index::sanitize(&report.name),
             listing.name
         ));
+    }
+    // `inspect` runs the route checks from `plugin-check` over the manifest.
+    // A report without them was not made by `inspect`.
+    if index::canonical(&report.conformance.plugin_name) != index::canonical(&listing.name) {
+        return Err(format!(
+            "the inspect report's conformance is for `{}`, not `{}`",
+            index::sanitize(&report.conformance.plugin_name),
+            listing.name
+        ));
+    }
+    for required in ["route-attribution", "route-prefix", "route-collision"] {
+        if !report.conformance.checks.iter().any(|c| c.name == required) {
+            return Err(format!(
+                "the inspect report for `{}` has no `{required}` check; use a report from \
+                 `autumn plugin inspect --format json`",
+                listing.name
+            ));
+        }
     }
     // Replacing a recorded artifact needs a consent check against it. Without
     // `--against` the report has no delta, and new authority would pass.
@@ -763,6 +799,23 @@ mod tests {
         assert_eq!(l.status, Status::Delisted);
     }
 
+    /// The pin is what was built. A contract that reports another version
+    /// does not move it.
+    #[test]
+    fn a_community_contract_version_must_match_the_pin() {
+        let mut l = listing("autumn-admin-plugin");
+        l.origin = ListingOrigin::Community;
+        l.name = "autumn-plugin-x".to_owned();
+        l.version = "0.3.0".to_owned();
+        let before = l.clone();
+        let mut contract = lockstep("autumn-plugin-x", "0.7.0");
+        contract.plugin_version = Some("0.4.0".to_owned());
+        let r = report("autumn-plugin-x", true, Some(contract));
+        let err = apply_report(&mut l, &r, "0.7.0", "2026-10-01").unwrap_err();
+        assert!(err.contains("0.4.0") && err.contains("0.3.0"), "{err}");
+        assert_eq!(l, before);
+    }
+
     /// A sandboxed listing is verified by `inspect`, never by plugin-check.
     #[test]
     fn a_plugin_check_report_for_a_sandboxed_listing_is_refused() {
@@ -809,7 +862,11 @@ mod tests {
             loads: pass,
             conformance: ConformanceReport {
                 plugin_name: "autumn-plugin-hello".to_owned(),
-                checks: vec![check("installability", CheckStatus::Pass)],
+                checks: vec![
+                    check("route-attribution", CheckStatus::Pass),
+                    check("route-prefix", CheckStatus::Pass),
+                    check("route-collision", CheckStatus::Pass),
+                ],
                 contract: None,
             },
             // A baseline with nothing new: the new artifact asks for no more.
@@ -868,6 +925,20 @@ mod tests {
         apply_inspect(&mut l, &r, "0.7.0", "2026-10-01").expect("apply");
         assert_eq!(l.grants.hosts, ["api.example.com"]);
         assert_eq!(l.grants.tables, ["notes"]);
+    }
+
+    /// An inspect report with no route checks, or checks for another plugin,
+    /// is not an `inspect` run.
+    #[test]
+    fn an_inspect_report_without_its_route_checks_is_refused() {
+        let mut r = inspect(true);
+        r.conformance.checks.clear();
+        let err = apply_inspect(&mut sandboxed(), &r, "0.7.0", "2026-10-01").unwrap_err();
+        assert!(err.contains("route-attribution"), "{err}");
+
+        let mut r = inspect(true);
+        r.conformance.plugin_name = "autumn-plugin-other".to_owned();
+        assert!(apply_inspect(&mut sandboxed(), &r, "0.7.0", "2026-10-01").is_err());
     }
 
     /// A failed inspect keeps the artifact that was consented to.
