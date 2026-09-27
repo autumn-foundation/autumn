@@ -174,6 +174,9 @@ pub struct Report {
     /// when no previous artifact was named.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upgrade_against: Option<String>,
+    /// The `autumn-web` whose sandbox `loads` was checked in: this CLI's. The
+    /// plugin index records a report only for this release (#1625).
+    pub autumn_web: String,
 }
 
 /// Authority the sandbox denies unconditionally in this version.
@@ -318,6 +321,7 @@ impl Report {
             consent: manifest.consent_summary(),
             upgrade: None,
             upgrade_against: None,
+            autumn_web: autumn_web::plugin_contract::AUTUMN_WEB_VERSION.to_owned(),
         }
     }
 
@@ -754,6 +758,10 @@ job_types = ["reindex"]
         // Resource limits are authority too (#1625): a reviewer diffs them.
         assert!(value["limits"]["fuel"].is_number());
         assert!(value["limits"]["max_concurrency"].is_number());
+        assert_eq!(
+            value["autumn_web"],
+            autumn_web::plugin_contract::AUTUMN_WEB_VERSION
+        );
     }
 
     #[test]

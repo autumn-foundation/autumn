@@ -271,15 +271,18 @@ pub fn sanitize(text: &str) -> String {
     out
 }
 
-/// Control, bidi, zero-width and line-separator characters.
+/// Control, bidi, zero-width and line-separator characters. `is_control`
+/// covers C0/C1 only; the bidi and format marks (U+061C, U+200E/F,
+/// U+202A–E, U+2066–9, U+206A–F) are listed.
 #[must_use]
 pub fn is_unsafe_char(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            '\u{200B}'..='\u{200F}'
+            '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
                 | '\u{2028}'..='\u{202E}'
-                | '\u{2060}'..='\u{2069}'
+                | '\u{2060}'..='\u{206F}'
                 | '\u{FEFF}'
         )
 }
@@ -1515,6 +1518,18 @@ mod tests {
     fn a_flag_from_an_older_release_must_be_resolved() {
         let text = messages(&staleness(&index_of(vec![flagged()]), "0.8.0"));
         assert!(text.contains("delist"), "{text}");
+    }
+
+    /// Every bidi and format mark that can reorder terminal text is unsafe.
+    #[test]
+    fn bidi_format_marks_are_unsafe() {
+        for c in [
+            '\u{061C}', '\u{200E}', '\u{202E}', '\u{2066}', '\u{2069}', '\u{206A}', '\u{206F}',
+        ] {
+            assert!(is_unsafe_char(c), "U+{:04X}", u32::from(c));
+            assert!(!sanitize(&format!("a{c}b")).contains(c));
+        }
+        assert!(!is_unsafe_char('é'));
     }
 
     #[test]

@@ -226,6 +226,9 @@ pub struct InspectReport {
     /// The per-request resource limits the manifest declares.
     #[serde(default)]
     pub limits: std::collections::BTreeMap<String, u64>,
+    /// The `autumn-web` whose sandbox the artifact was loaded in.
+    #[serde(default)]
+    pub autumn_web: Option<String>,
 }
 
 /// The `grants` object `inspect` emits. Every list is required: `inspect`
@@ -363,6 +366,26 @@ pub fn apply_inspect(
         ));
     }
     check_inspect_shape(listing, report)?;
+    // Recorded only for the release whose sandbox loaded it: automated
+    // re-verification skips sandboxed listings, so nothing else would catch
+    // a stale report.
+    match report.autumn_web.as_deref() {
+        Some(tested) if tested == against => {}
+        tested => {
+            return Err(format!(
+                "the inspect report for `{}` {}. Re-run `autumn plugin inspect --format json` \
+                 with the autumn {against} CLI",
+                listing.name,
+                tested.map_or_else(
+                    || "does not say which autumn-web loaded it".to_owned(),
+                    |v| format!(
+                        "was made on autumn-web {}, not {against}",
+                        index::sanitize(v)
+                    )
+                )
+            ));
+        }
+    }
     // Replacing a recorded artifact needs a consent check against it. Without
     // `--against` the report has no delta, and new authority would pass.
     let replacing = !listing.artifact_sha256.is_empty()
@@ -1046,6 +1069,19 @@ mod tests {
         value
     }
 
+    /// An inspect report is recorded only for the release whose sandbox
+    /// loaded it.
+    #[test]
+    fn an_inspect_report_must_name_the_release_it_loaded_in() {
+        let mut r = inspect(true);
+        r.autumn_web = Some("0.6.9".to_owned());
+        let err = apply_inspect(&mut sandboxed(), &r, "0.7.0", "2026-10-01").unwrap_err();
+        assert!(err.contains("autumn-web 0.6.9, not 0.7.0"), "{err}");
+        r.autumn_web = None;
+        let err = apply_inspect(&mut sandboxed(), &r, "0.7.0", "2026-10-01").unwrap_err();
+        assert!(err.contains("does not say"), "{err}");
+    }
+
     /// An empty or partial delta is not "nothing new": it is not a delta
     /// `inspect --against` wrote.
     #[test]
@@ -1085,6 +1121,7 @@ mod tests {
             upgrade: Some(delta(&[])),
             upgrade_against: Some("00".repeat(32)),
             grants: InspectGrants::default(),
+            autumn_web: Some("0.7.0".to_owned()),
             quotas: autumn_web::plugin_sandbox::CapabilityQuotas::default()
                 .fields()
                 .into_iter()
