@@ -1,0 +1,54 @@
+# cargo-deny configuration for the `island-flock` satellite workspace.
+#
+# `island-flock` is its own workspace root (wasm32-unknown-unknown-only, see
+# this crate's own `Cargo.toml` header) with its own `Cargo.lock`, so nothing
+# in the root `deny.toml` ever sees its dependency graph. It is not built by
+# any CI workflow (`build-island.sh` is a local/manual step — see
+# docs/guide/wasm-islands.md), but its output IS shipped: the compiled
+# `.wasm`/`.js` bundle is committed under `examples/flock/static/islands/`
+# and served by the `flock` example, which IS built and tested in CI. So this
+# graph gets the same advisory/source gate as every other graph Autumn ships,
+# via `scripts/check-advisories.sh` (issue #1600, #2565).
+#
+# Scope, deliberately narrower than the root policy: only `advisories` and
+# `sources` are gated here, matching `fuzz/deny.toml`'s reasoning — licenses
+# were not surveyed for a new class this pass and gating them is left for a
+# follow-up rather than decided here.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[advisories]
+unmaintained = "all"
+unsound = "all"
+yanked = "warn"
+ignore = [
+    # RUSTSEC-2024-0370 — proc-macro-error is unmaintained.
+    # UNREACHABLE: it is yew-macro's own proc-macro dependency (`cargo tree`
+    # marks it `(proc-macro)`), which runs only on the host compiler during
+    # the build and is never linked into the compiled wasm32-unknown-unknown
+    # output. Build-time toolchain exposure only, no safe upgrade exists.
+    # Review-by: 2026-10-01.
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error unmaintained; yew-macro's proc-macro dep only, never linked into the wasm output; no safe upgrade; review-by 2026-10-01" },
+    # RUSTSEC-2025-0141 — bincode 1.3.3 is unmaintained (maintainer team
+    # ceased development after a harassment incident; they consider 1.3.3
+    # complete, "not in need of any updates" — no CVE, no known exploit).
+    # island-flock's own source never references `gloo_worker` or `bincode`
+    # directly (`grep -rn gloo_worker src/` is empty); the dependency arrives
+    # solely through yew's internal `prokio`/`gloo` runtime plumbing
+    # (`cargo tree -i bincode` roots at `yew` itself, not this crate's code).
+    # REACHABILITY UNDETERMINED, not confirmed unreachable: whether that
+    # plumbing is dead-code-eliminated from the actual compiled
+    # `autumn_island_flock_bg.wasm` was not verified this pass (would need a
+    # symbol-table inspection of the built artifact). No safe upgrade exists
+    # per the advisory. Review-by: 2026-10-01, or the next time this crate's
+    # wasm output is rebuilt — that rebuild is the natural point to check
+    # whether bincode-referencing symbols actually survive into the binary.
+    { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained (governance, not a CVE); arrives via yew's own prokio/gloo-worker plumbing, not island-flock's source; reachability in the shipped wasm undetermined (not confirmed dead-code-eliminated); no safe upgrade; review-by 2026-10-01" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,9 @@
+error: `#[query_budget(1)]` is exceeded: a statically reachable path through this handler issues 2 database queries.
+
+       counted: `find_all`, `count`
+
+       Batch the extra lookups with `preload(...)`, raise the budget, or declare a call site with `#[query_cost(N)]` / `#[query_exempt(reason = ...)]`
+  --> tests/compile-fail/query_budget_over_budget.rs:20:10
+   |
+20 | async fn dashboard(repo: PgPostRepository) -> Result<usize, ()> {
+   |          ^^^^^^^^^

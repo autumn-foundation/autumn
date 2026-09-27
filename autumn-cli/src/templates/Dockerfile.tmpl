@@ -4,19 +4,41 @@ WORKDIR /app
 
 ARG TAILWIND_VERSION=v4.1.4
 
+# Tailwind CSS standalone CLI, checksum-verified. Two things matter here:
+#
+#   * The architecture is detected, not assumed — an arm64 build that pulled
+#     `linux-x64` would install a binary it cannot execute.
+#   * The binary is verified against the `sha256sums.txt` published with that
+#     Tailwind release, and the build FAILS on a mismatch. An unverified
+#     executable download into a build image is exactly the hole issue #1615
+#     closes; `autumn setup` does the same verification for the dev loop.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p target/autumn \
-    && curl -fsSL \
-        -o target/autumn/tailwindcss \
-        "https://github.com/tailwindlabs/tailwindcss/releases/download/${TAILWIND_VERSION}/tailwindcss-linux-x64" \
+    && arch="$(uname -m)" \
+    && case "$arch" in \
+         x86_64) asset="tailwindcss-linux-x64" ;; \
+         aarch64) asset="tailwindcss-linux-arm64" ;; \
+         *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+       esac \
+    && base="https://github.com/tailwindlabs/tailwindcss/releases/download/${TAILWIND_VERSION}" \
+    && curl -fsSL -o "target/autumn/$asset" "$base/$asset" \
+    && curl -fsSL -o target/autumn/sha256sums.txt "$base/sha256sums.txt" \
+    && (cd target/autumn \
+        && grep -E "[[:space:]][.]?/?${asset}\$" sha256sums.txt \
+             | sed "s|[.]/||" > expected.sha256 \
+        && test -s expected.sha256 \
+        && sha256sum -c expected.sha256) \
+    && mv "target/autumn/$asset" target/autumn/tailwindcss \
+    && rm -f target/autumn/sha256sums.txt target/autumn/expected.sha256 \
     && chmod +x target/autumn/tailwindcss
 
 COPY Cargo.toml autumn.toml build.rs tailwind.config.js ./
 COPY src ./src
 COPY static ./static
 COPY migrations ./migrations
+# __AUTUMN_I18N_BUILDER_COPY__
 
 # Git/build provenance passthrough. The build context excludes `/.git` (see
 # .dockerignore), so the generated build.rs cannot shell out to git here.
@@ -55,6 +77,7 @@ COPY --from=builder /app/target/release/{{project_name}} /usr/local/bin/{{projec
 COPY --from=builder /app/autumn.toml /app/autumn.toml
 COPY --from=builder /app/static /app/static
 COPY --from=builder /app/migrations /app/migrations
+# __AUTUMN_I18N_RUNTIME_COPY__
 
 ENV AUTUMN_PROFILE=prod
 EXPOSE 3000

@@ -26,6 +26,37 @@ pub enum MediaError {
     )]
     PartialS3Credentials,
 
+    /// The S3 backend was selected without an explicit `public_base_url`, and
+    /// the configured endpoint is not Tigris — so the
+    /// `https://{bucket}.t3.tigrisfiles.io/…` public-base convention does not
+    /// apply. Deriving a public URL from an arbitrary private S3 endpoint is
+    /// unreliable, so a generic (non-Tigris) S3 backend must set
+    /// `media.storage.public_base_url` explicitly. `bucket` is a caller
+    /// configuration value (not a secret).
+    #[error(
+        "media.storage.public_base_url is required for a generic (non-Tigris) \
+         S3 backend (bucket `{bucket}`): set it to the bucket's public base URL"
+    )]
+    MissingPublicBaseUrl {
+        /// The S3 bucket configured without a resolvable public base.
+        bucket: String,
+    },
+
+    /// A caller-supplied storage key contained a dot-only (`.`/`..`) or empty
+    /// path segment.
+    ///
+    /// Percent-encoding such a segment is not enough: WHATWG URL parsers
+    /// normalize `%2E` back to `.`, so the advertised public URL could
+    /// path-normalize down to a *different* object than the one stored. The key
+    /// is refused at the storage boundary instead. `key` is a caller object key
+    /// (not a secret — it already appears in public URLs and the S3 error
+    /// variants).
+    #[error("invalid storage key `{key}`: path segments must not be `.`, `..`, or empty")]
+    InvalidKeySegment {
+        /// The offending caller-relative key.
+        key: String,
+    },
+
     /// A local file staged for persistence could not be read.
     #[error("failed to read local file `{path}`: {source}")]
     LocalRead {
@@ -113,10 +144,36 @@ pub enum MediaError {
         #[source]
         source: std::io::Error,
     },
+
+    /// A derived media artifact (e.g. a seek-preview `WebVTT` track) could not
+    /// be written to its staging path before persistence.
+    #[error("failed to write media artifact `{path}`: {source}")]
+    ArtifactWrite {
+        /// The artifact (or parent directory) path involved.
+        path: String,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The blocking encode task panicked or was cancelled before completing.
+    ///
+    /// The encode primitives run synchronously on a blocking thread
+    /// ([`tokio::task::spawn_blocking`]); a panic there surfaces here rather
+    /// than unwinding the async worker.
+    #[error("media encode task did not complete: {message}")]
+    EncodeTaskJoin {
+        /// The stringified join error.
+        message: String,
+    },
 }
 
 /// Maximum number of stderr bytes carried in [`MediaError::FfmpegNonZeroExit`].
-const STDERR_TAIL_MAX_BYTES: usize = 2048;
+///
+/// Also used by the encode primitives to bound the tail buffer they retain while
+/// streaming a child's stderr, so the transient in-memory buffer is capped at the
+/// same size this helper would ultimately surface.
+pub(crate) const STDERR_TAIL_MAX_BYTES: usize = 2048;
 
 /// Render the last ~2 KiB of an `FFmpeg` stderr stream as a `String`.
 ///
