@@ -292,6 +292,21 @@ fn a_window_that_opens_in_a_dst_gap_moves_forward() {
     assert_eq!(cal.working_time(start, end, ny), Duration::from_secs(1800));
 }
 
+#[test]
+fn a_long_run_of_dated_holidays_does_not_stop_the_scan() {
+    let start = date(2024, 1, 1);
+    let cal = (0..500)
+        .map(|n| start + chrono::Days::new(n))
+        .fold(office(), BusinessCalendar::holiday);
+    // Work resumes on Thursday 2025-05-15, after 500 days of holidays.
+    let due = cal.deadline(utc(2024, 1, 1, 9, 0), HOUR, Tz::UTC);
+    assert_eq!(due, Some(utc(2025, 5, 15, 10, 0)));
+    assert_eq!(
+        cal.working_time(utc(2024, 1, 1, 9, 0), due.unwrap(), Tz::UTC),
+        HOUR
+    );
+}
+
 // ── BusinessDuration ─────────────────────────────────────────────────────────
 
 #[test]

@@ -264,18 +264,23 @@ impl Sla {
     ///
     /// # Errors
     ///
+    /// A new record is removed again when the check job cannot go on the
+    /// queue.
+    ///
+    /// # Errors
+    ///
     /// Returns an error for a zero budget, an unknown calendar, an
     /// obligation with no deadline ([`SlaError::NoDeadline`]), a store
     /// failure, or no job runtime.
     pub async fn track(&self, obligation: &Obligation) -> Result<ObligationStatus, SlaError> {
-        if obligation.budget() == super::BusinessDuration::ZERO {
+        let now = self.now();
+        let calendar = self.calendar_of(obligation)?;
+        if obligation.budget().resolve(calendar).is_zero() {
             return Err(SlaError::InvalidDuration(format!(
-                "{}: the budget is zero; set it with Obligation::within",
+                "{}: the budget is zero working time; set it with Obligation::within",
                 obligation.key()
             )));
         }
-        let now = self.now();
-        let calendar = self.calendar_of(obligation)?;
         let resolved = obligation
             .clone()
             .zone(self.zone_of(obligation, calendar))
@@ -283,19 +288,34 @@ impl Sla {
             .met_at(None);
         let key = resolved.key();
         let store = &self.engine.store;
+        let existed = store.get(&key).await?.is_some();
         let mut record = store.insert(ObligationRecord::new(resolved)).await?;
         if let Some(met) = obligation.met()
             && store.mark_met(&key, met).await?
         {
             record = store.get(&key).await?.unwrap_or(record);
         }
-        let status = self.status_of(&record, now)?;
-        let Some(due) = status.due_at else {
+        let result = self.schedule(&key, &record, now).await;
+        if result.is_err() && !existed {
+            // Do not keep a new record that has no check job.
             store.remove(&key).await?;
-            return Err(SlaError::NoDeadline(key));
+        }
+        result
+    }
+
+    /// Put the check job of `record` on the queue, if it is still open.
+    async fn schedule(
+        &self,
+        key: &str,
+        record: &ObligationRecord,
+        now: DateTime<Utc>,
+    ) -> Result<ObligationStatus, SlaError> {
+        let status = self.status_of(record, now)?;
+        let Some(due) = status.due_at else {
+            return Err(SlaError::NoDeadline(key.to_owned()));
         };
         if status.escalated_at.is_none() && status.state != ObligationState::Met {
-            self.schedule_check(&key, due).await?;
+            self.schedule_check(key, due).await?;
         }
         Ok(status)
     }

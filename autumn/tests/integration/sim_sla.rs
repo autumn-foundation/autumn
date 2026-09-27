@@ -270,6 +270,37 @@ async fn sim_sla_zone_resolves_from_obligation_then_calendar_then_app(mut sim: S
     job::clear_global_job_client();
 }
 
+#[sim_test]
+async fn sim_sla_track_refuses_obligations_that_cannot_escalate(mut sim: Sim) {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let hours = "09:00-17:00".parse().unwrap();
+    let plugin = SlaPlugin::new()
+        .calendar(
+            "zero_day",
+            BusinessCalendar::weekdays(hours).business_day(Duration::ZERO),
+        )
+        .calendar("closed", BusinessCalendar::new());
+    sim.build(TestApp::new().plugin(plugin));
+    let sla = Sla::from_state(sim.client().state()).unwrap();
+
+    // Two days of a zero-length business day is zero working time.
+    let zero = Obligation::new("first_response", "ticket:1")
+        .within(BusinessDuration::days(2))
+        .calendar("zero_day");
+    assert!(sla.track(&zero).await.is_err());
+
+    // No working time: no deadline. The new record is not kept.
+    let closed = Obligation::new("first_response", "ticket:2")
+        .within(BusinessDuration::hours(1))
+        .calendar("closed");
+    assert!(sla.track(&closed).await.is_err());
+    assert!(sla.get(&closed.key()).await.unwrap().is_none());
+
+    job::clear_global_job_client();
+}
+
 // ── A quarter of a support desk ──────────────────────────────────────────────
 
 /// A support ticket. The obligation is declared on the model.

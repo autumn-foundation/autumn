@@ -18,7 +18,8 @@ const DAY_SECS: u32 = 86_400;
 /// The scan horizon: one hundred years of days.
 const SCAN_DAYS: usize = 36_525;
 
-/// Stop a scan after this many days in a row with no working time.
+/// Stop a scan after this many days in a row with no working time, after the
+/// last dated holiday.
 const MAX_IDLE_DAYS: usize = 400;
 
 /// Monday to Friday.
@@ -307,20 +308,23 @@ impl BusinessCalendar {
         } else {
             0
         };
+        // Dated holidays are finite. Count idle days only after the last
+        // one, so a long holiday run does not stop the scan.
+        let last_holiday = self.holidays.last().copied();
         let mut idle = 0_usize;
         local_date(from, zone)
             .iter_days()
             .take(days)
-            .map(move |date| self.intervals(date, zone))
-            .take_while(move |intervals| {
-                idle = if intervals.is_empty() {
-                    idle.saturating_add(1)
-                } else {
+            .map(move |date| (date, self.intervals(date, zone)))
+            .take_while(move |(date, intervals)| {
+                idle = if !intervals.is_empty() || last_holiday.is_some_and(|h| *date <= h) {
                     0
+                } else {
+                    idle.saturating_add(1)
                 };
                 idle <= MAX_IDLE_DAYS
             })
-            .flatten()
+            .flat_map(|(_, intervals)| intervals)
     }
 
     /// The working intervals of one local date, as UTC instants.
