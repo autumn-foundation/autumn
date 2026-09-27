@@ -10,6 +10,13 @@
 //!    set is configured, rather than falling through to a partial single-pool
 //!    count.
 //!
+//! §1741: the identical no-shard-set hole existed in the sibling read methods —
+//! `find_all`, `find_by_id`, `exists_by_id`, derived `find_by_*`, and the
+//! soft-delete readers `with_deleted` / `only_deleted`. Each fanned out only
+//! when a shard set was present and otherwise fell through to a single-pool
+//! query binding a NULL tenant predicate (a silent PARTIAL result). They now
+//! reject under `across_tenants()` with no shard set, matching the count guard.
+//!
 //! Both guards return before acquiring any database connection, so — like the
 //! read-routing test in `repository_find_in_batches.rs` — no live database is
 //! needed and these assertions run without Docker.
@@ -43,9 +50,54 @@ pub struct NoShardSetPost {
 }
 
 /// tenant_scoped so `across_tenants()` is generated; sharded so the cross-shard
-/// batch/count guards are emitted.
+/// batch/count guards are emitted. A derived `find_by_title` read exercises the
+/// derived `find_by_*` fan-out guard (#1741). A derived `find_by_tenant_id` with
+/// a BORROWED (`&str`) parameter exercises the `has_borrowed_param` branch of the
+/// derived-read guard (#1741 follow-up): it cannot fan out, but must still reject
+/// under `across_tenants()` with no shard set rather than returning a single-pool
+/// partial result.
 #[autumn_web::repository(NoShardSetPost, table = "no_shard_set_posts", tenant_scoped, sharded)]
-pub trait NoShardSetPostRepository {}
+pub trait NoShardSetPostRepository {
+    async fn find_by_title(&self, title: String) -> autumn_web::AutumnResult<Vec<NoShardSetPost>>;
+    async fn find_by_tenant_id(
+        &self,
+        tenant_id: &str,
+    ) -> autumn_web::AutumnResult<Vec<NoShardSetPost>>;
+}
+
+mod soft_schema {
+    autumn_web::reexports::diesel::table! {
+        soft_no_shard_set_posts (id) {
+            id -> Int8,
+            tenant_id -> Text,
+            title -> Text,
+            deleted_at -> Nullable<Timestamp>,
+        }
+    }
+}
+
+use soft_schema::soft_no_shard_set_posts;
+
+/// A model carrying `deleted_at` on a tenant-scoped, sharded table, so its
+/// repository can enable `soft_delete` and the `with_deleted` / `only_deleted`
+/// cross-shard readers are emitted (#1741).
+#[autumn_web::model(table = "soft_no_shard_set_posts")]
+pub struct SoftNoShardSetPost {
+    #[id]
+    pub id: i64,
+    pub tenant_id: String,
+    pub title: String,
+    pub deleted_at: Option<autumn_web::reexports::chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(
+    SoftNoShardSetPost,
+    table = "soft_no_shard_set_posts",
+    tenant_scoped,
+    sharded,
+    soft_delete
+)]
+pub trait SoftNoShardSetPostRepository {}
 
 fn make_pool() -> Pool<AsyncPgConnection> {
     let config = DatabaseConfig {
@@ -113,5 +165,141 @@ async fn count_across_tenants_without_shard_set_rejects() {
         err.to_string()
             .contains("cross-shard count requires a configured shard set"),
         "count guard must reject cross-shard count without a shard set, got: {err}"
+    );
+}
+
+/// §1741: `find_all().across_tenants()` on a no-shard-set repo must reject
+/// rather than silently returning a single-pool partial result.
+#[tokio::test]
+async fn find_all_across_tenants_without_shard_set_rejects() {
+    let pool = make_pool();
+    let repo = PgNoShardSetPostRepository::with_pool_untracked(pool).across_tenants();
+    assert!(repo.__autumn_shards.is_none());
+
+    let err = repo
+        .find_all()
+        .await
+        .expect_err("across_tenants find_all without a shard set must reject");
+    assert!(
+        err.to_string()
+            .contains("cross-shard find_all requires a configured shard set"),
+        "find_all guard must reject cross-shard read without a shard set, got: {err}"
+    );
+}
+
+/// §1741: `find_by_id().across_tenants()` on a no-shard-set repo must reject.
+#[tokio::test]
+async fn find_by_id_across_tenants_without_shard_set_rejects() {
+    let pool = make_pool();
+    let repo = PgNoShardSetPostRepository::with_pool_untracked(pool).across_tenants();
+    assert!(repo.__autumn_shards.is_none());
+
+    let err = repo
+        .find_by_id(1)
+        .await
+        .expect_err("across_tenants find_by_id without a shard set must reject");
+    assert!(
+        err.to_string()
+            .contains("cross-shard find_by_id requires a configured shard set"),
+        "find_by_id guard must reject cross-shard read without a shard set, got: {err}"
+    );
+}
+
+/// §1741: `exists_by_id().across_tenants()` on a no-shard-set repo must reject.
+#[tokio::test]
+async fn exists_by_id_across_tenants_without_shard_set_rejects() {
+    let pool = make_pool();
+    let repo = PgNoShardSetPostRepository::with_pool_untracked(pool).across_tenants();
+    assert!(repo.__autumn_shards.is_none());
+
+    let err = repo
+        .exists_by_id(1)
+        .await
+        .expect_err("across_tenants exists_by_id without a shard set must reject");
+    assert!(
+        err.to_string()
+            .contains("cross-shard exists_by_id requires a configured shard set"),
+        "exists_by_id guard must reject cross-shard read without a shard set, got: {err}"
+    );
+}
+
+/// §1741: a derived `find_by_*` read with `across_tenants()` on a no-shard-set
+/// repo must reject rather than fanning out or returning a partial result.
+#[tokio::test]
+async fn find_by_derived_across_tenants_without_shard_set_rejects() {
+    let pool = make_pool();
+    let repo = PgNoShardSetPostRepository::with_pool_untracked(pool).across_tenants();
+    assert!(repo.__autumn_shards.is_none());
+
+    let err = repo
+        .find_by_title("hello".to_owned())
+        .await
+        .expect_err("across_tenants find_by_title without a shard set must reject");
+    assert!(
+        err.to_string()
+            .contains("cross-shard find_by_title requires a configured shard set"),
+        "derived find_by_* guard must reject cross-shard read without a shard set, got: {err}"
+    );
+}
+
+/// §1741 follow-up: a derived `find_by_*` read whose parameter is BORROWED
+/// (`&str`) takes the `has_borrowed_param` branch, which cannot fan out. It must
+/// still REJECT under `across_tenants()` with no shard set — rather than falling
+/// through to a single-pool partial result — with the same "requires a
+/// configured shard set" rejection the owned-param branch and the count guard
+/// emit. The guard fires before any connection is acquired, so no live database
+/// is required.
+#[tokio::test]
+async fn find_by_borrowed_derived_across_tenants_without_shard_set_rejects() {
+    let pool = make_pool();
+    let repo = PgNoShardSetPostRepository::with_pool_untracked(pool).across_tenants();
+    assert!(repo.__autumn_shards.is_none());
+
+    let err = repo
+        .find_by_tenant_id("acme")
+        .await
+        .expect_err("across_tenants borrowed-param find_by_* without a shard set must reject");
+    assert!(
+        err.to_string()
+            .contains("cross-shard find_by_tenant_id requires a configured shard set"),
+        "borrowed-param derived find_by_* guard must reject cross-shard read without a shard set, got: {err}"
+    );
+}
+
+/// §1741: `with_deleted().across_tenants()` on a no-shard-set soft-delete repo
+/// must reject.
+#[tokio::test]
+async fn with_deleted_across_tenants_without_shard_set_rejects() {
+    let pool = make_pool();
+    let repo = PgSoftNoShardSetPostRepository::with_pool_untracked(pool).across_tenants();
+    assert!(repo.__autumn_shards.is_none());
+
+    let err = repo
+        .with_deleted()
+        .await
+        .expect_err("across_tenants with_deleted without a shard set must reject");
+    assert!(
+        err.to_string()
+            .contains("cross-shard with_deleted requires a configured shard set"),
+        "with_deleted guard must reject cross-shard read without a shard set, got: {err}"
+    );
+}
+
+/// §1741: `only_deleted().across_tenants()` on a no-shard-set soft-delete repo
+/// must reject.
+#[tokio::test]
+async fn only_deleted_across_tenants_without_shard_set_rejects() {
+    let pool = make_pool();
+    let repo = PgSoftNoShardSetPostRepository::with_pool_untracked(pool).across_tenants();
+    assert!(repo.__autumn_shards.is_none());
+
+    let err = repo
+        .only_deleted()
+        .await
+        .expect_err("across_tenants only_deleted without a shard set must reject");
+    assert!(
+        err.to_string()
+            .contains("cross-shard only_deleted requires a configured shard set"),
+        "only_deleted guard must reject cross-shard read without a shard set, got: {err}"
     );
 }

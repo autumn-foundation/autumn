@@ -1,7 +1,7 @@
 use diesel::prelude::{Insertable, Queryable, Selectable};
 use serde::Deserialize;
 
-use crate::schema::{projects, users};
+use crate::schema::{password_reset_tokens, projects, users};
 
 // ── User ────────────────────────────────────────────────────────────────────
 //
@@ -37,14 +37,18 @@ pub struct NewUser {
 // is omitted from the generated `NewProject` insert struct.
 
 /// A project belonging to a single tenant.
+///
+/// Keep the fields in the column order of `schema::projects`. The generated
+/// reads decode each row by position, so a different order puts the tenant id
+/// into `name` (issue #2854).
 #[autumn_web::model(table = "projects")]
 pub struct Project {
     #[id]
     pub id: i64,
-    #[validate(length(min = 1, max = 200))]
-    pub name: String,
     #[default]
     pub tenant_id: String,
+    #[validate(length(min = 1, max = 200))]
+    pub name: String,
     #[default]
     pub created_at: chrono::NaiveDateTime,
 }
@@ -54,4 +58,25 @@ pub struct Project {
 #[derive(Deserialize)]
 pub struct NewProjectForm {
     pub name: String,
+}
+
+// ── PasswordResetToken ───────────────────────────────────────────────────────
+//
+// A retention-sweeps demo (issue #1342): a reset token is only useful for
+// roughly a day, so nobody should have to hand-write a `#[scheduled]` job
+// and a batched DELETE to keep this table from growing forever. See the
+// `retention(after = "1d", basis = created_at)` on `PasswordResetTokenRepository`
+// in repositories.rs, and docs/guide/retention-sweeps.md.
+
+/// A single-use password-reset token.
+#[autumn_web::model(table = "password_reset_tokens")]
+pub struct PasswordResetToken {
+    #[id]
+    pub id: i64,
+    #[default]
+    pub tenant_id: String,
+    pub user_id: i64,
+    pub token_hash: String,
+    #[default]
+    pub created_at: chrono::NaiveDateTime,
 }

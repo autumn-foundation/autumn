@@ -270,6 +270,153 @@ async fn prometheus_exposes_requests_shed_total() {
     held.await.unwrap().assert_ok();
 }
 
+// ── The ceiling can be sourced from the committed capacity contract (#1733) ──
+
+static GATE_CONTRACT: LazyLock<Notify> = LazyLock::new(Notify::new);
+static ENTERED_CONTRACT: AtomicUsize = AtomicUsize::new(0);
+
+#[get("/block")]
+async fn block_contract() -> &'static str {
+    ENTERED_CONTRACT.fetch_add(1, Ordering::SeqCst);
+    GATE_CONTRACT.notified().await;
+    "released"
+}
+
+static GATE_STALE: LazyLock<Notify> = LazyLock::new(Notify::new);
+static ENTERED_STALE: AtomicUsize = AtomicUsize::new(0);
+
+#[get("/block")]
+async fn block_stale_contract() -> &'static str {
+    ENTERED_STALE.fetch_add(1, Ordering::SeqCst);
+    GATE_STALE.notified().await;
+    "released"
+}
+
+/// Write a contract licensing `admission_limit` on `host`, and return its path
+/// (with the temp dir that owns it, which the caller must keep alive).
+fn write_contract(
+    admission_limit: usize,
+    host: autumn_web::capacity::HostProfile,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    let routes = vec![autumn_web::capacity::RouteShape {
+        method: "GET".to_owned(),
+        path: "/block".to_owned(),
+        handler: "block".to_owned(),
+        shape: autumn_web::capacity::ResourceShape::ComputeBound,
+        pools: Vec::new(),
+    }];
+    let contract = autumn_web::capacity::CapacityContract {
+        version: autumn_web::capacity::CONTRACT_VERSION,
+        provenance: autumn_web::capacity::Provenance {
+            autumn_version: "0.7.0".to_owned(),
+            calibrated_at: "2026-09-01T00:00:00Z".to_owned(),
+            git_commit: None,
+            git_dirty: false,
+            route_graph_digest: autumn_web::capacity::route_graph_digest(&routes),
+        },
+        host,
+        envelope: autumn_web::capacity::Envelope {
+            sustained_rps: 1000.0,
+            p99_latency_ms: 5.0,
+            saturation_concurrency: admission_limit,
+            admission_limit,
+        },
+        calibration: autumn_web::capacity::Calibration::default(),
+        routes,
+    };
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join(autumn_web::capacity::CONTRACT_FILE_NAME);
+    std::fs::write(&path, contract.to_toml().expect("serialize contract")).expect("write contract");
+    (dir, path)
+}
+
+fn config_with_contract(path: &std::path::Path) -> AutumnConfig {
+    let mut config = AutumnConfig {
+        profile: Some("test".into()),
+        ..Default::default()
+    };
+    config.security.csrf.enabled = false;
+    // Deliberately NO `max_concurrent_requests`: the contract is the only
+    // source of the ceiling in this test.
+    config.server.capacity_contract = Some(path.display().to_string());
+    config
+}
+
+/// AC-4: with no hand-set `max_concurrent_requests`, the binary admits against
+/// the envelope its committed contract proved.
+#[tokio::test]
+async fn ceiling_is_sourced_from_the_committed_capacity_contract() {
+    let _guard = install_capture().1;
+    let (_dir, path) = write_contract(1, autumn_web::capacity::HostProfile::detect());
+
+    let client = Arc::new(
+        TestApp::new()
+            .config(config_with_contract(&path))
+            .routes(routes![block_contract])
+            .build(),
+    );
+
+    let held = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.get("/block").send().await })
+    };
+    wait_for_entered(&ENTERED_CONTRACT, 1).await;
+
+    // The contract licensed exactly one in-flight request; the second is shed.
+    // Bounded: were the ceiling ever *not* sourced from the contract, this
+    // request would be admitted and block on the gate forever, turning a
+    // regression into a hung CI job instead of a failing assertion.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        client.get("/block").send().await.assert_status(503);
+    })
+    .await
+    .expect("the second request must be shed, not admitted and left blocking");
+
+    GATE_CONTRACT.notify_waiters();
+    held.await.unwrap().assert_ok();
+}
+
+/// A contract measured on a *different* host class must never throttle this
+/// process: enforcing a laptop's envelope on a bigger box is a self-inflicted
+/// outage, so the runtime falls back to unlimited rather than to a ceiling.
+#[tokio::test]
+async fn a_contract_from_another_host_class_does_not_throttle_this_process() {
+    let _guard = install_capture().1;
+    let foreign = autumn_web::capacity::HostProfile {
+        logical_cpus: autumn_web::capacity::HostProfile::detect()
+            .logical_cpus
+            .saturating_add(64),
+        ..autumn_web::capacity::HostProfile::detect()
+    };
+    let (_dir, path) = write_contract(1, foreign);
+
+    let client = Arc::new(
+        TestApp::new()
+            .config(config_with_contract(&path))
+            .routes(routes![block_stale_contract])
+            .build(),
+    );
+
+    let held = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.get("/block").send().await })
+    };
+    wait_for_entered(&ENTERED_STALE, 1).await;
+
+    // No ceiling was licensed, so the second concurrent request is admitted
+    // (it blocks on the same gate) rather than shed.
+    let second = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.get("/block").send().await })
+    };
+    wait_for_entered(&ENTERED_STALE, 2).await;
+
+    GATE_STALE.notify_waiters();
+    held.await.unwrap().assert_ok();
+    second.await.unwrap().assert_ok();
+}
+
 #[tokio::test]
 async fn default_config_never_sheds() {
     // See install_capture's doc: every test needs a real subscriber.

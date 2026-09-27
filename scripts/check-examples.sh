@@ -3,7 +3,9 @@
 #
 # Checks that the examples catalog (EXAMPLES.md) is coherent with:
 #   1. Every directory under examples/ is cataloged.
-#   2. Every workspace examples/* member is cataloged as a supported example.
+#   2. Every workspace examples/* member is cataloged as supported (the default)
+#      or experimental (a member that carries its own dedicated proof instead of
+#      the supported fleet's Chromium smoke — see EXAMPLES.md).
 #   3. Every example in the README.md Examples table appears in the catalog.
 #   4. Each supported example has a README.md with the required quickstart sections.
 #
@@ -96,7 +98,7 @@ echo ""
 # ---------------------------------------------------------------------------
 # 2. Every workspace examples/* member must be cataloged as supported
 # ---------------------------------------------------------------------------
-echo "==> Checking workspace examples/* members are cataloged as supported"
+echo "==> Checking workspace examples/* members are cataloged (supported or experimental)"
 
 mapfile -t workspace_examples < <(
   # Extract only paths from the [workspace] members array, not from exclude or
@@ -114,12 +116,21 @@ mapfile -t workspace_examples < <(
     | sort
 )
 mapfile -t catalog_supported < <(catalog_names_by_tier "$CATALOG" "supported" | sort)
+mapfile -t catalog_experimental < <(catalog_names_by_tier "$CATALOG" "experimental" | sort)
 
 for member in "${workspace_examples[@]}"; do
   if printf '%s\n' "${catalog_supported[@]}" | grep -qx "$member"; then
     ok "  workspace member examples/$member is cataloged as supported"
+  elif printf '%s\n' "${catalog_experimental[@]}" | grep -qx "$member"; then
+    # An experimental member still compiles, lints and tests with the
+    # workspace — what it opts out of is the supported fleet's Chromium e2e
+    # smoke, the README table, and the Journey Map, because its proof is
+    # something else (a dedicated CI job). Anything with no entry at all, or
+    # one marked `excluded`, is still a failure: a member nobody cataloged is
+    # exactly the drift this gate exists to catch.
+    ok "  workspace member examples/$member is cataloged as experimental (exempt from the fleet e2e)"
   else
-    fail "  workspace member examples/$member is NOT cataloged as supported in $CATALOG"
+    fail "  workspace member examples/$member is NOT cataloged as supported or experimental in $CATALOG"
   fi
 done
 
