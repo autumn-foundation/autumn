@@ -1445,10 +1445,10 @@ fn room_route(method: &str, path: String, handler: &str) -> RouteInfo {
 #[cfg(test)]
 mod tests {
     use super::{
-        HeartbeatRequest, InMemoryRoomStore, LeaveRequest, MAX_REAPER_TTL_SECONDS,
-        ReapStats, Room, RoomError, RoomParticipant, RoomService, RoomStore, SessionToken,
-        bearer_token, clamp_reaper_ttl, room_participant_path, room_route_infos, room_router,
-        room_service, rooms_heartbeat, rooms_roster, validate_room_segment,
+        HeartbeatRequest, InMemoryRoomStore, LeaveRequest, MAX_REAPER_TTL_SECONDS, ReapStats, Room,
+        RoomError, RoomParticipant, RoomService, RoomStore, SessionToken, bearer_token,
+        clamp_reaper_ttl, room_participant_path, room_route_infos, room_router, room_service,
+        rooms_heartbeat, rooms_roster, validate_room_segment,
     };
     use crate::config::MediaMtxConfig;
     use crate::transport::MediaUrls;
