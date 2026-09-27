@@ -85,8 +85,9 @@ checked = "2026-09-27"
 - The status is `listed` and the last conformance run did not pass.
 - The tier does not agree with `experimental_surfaces`, or a surface is not a
   known experimental surface.
-- A `sandboxed` listing has no `capabilities`, names an unknown one, or has
-  no 64-hex `artifact_sha256`. A `native` listing has either field.
+- A `sandboxed` listing has no `capabilities`, names an unknown one, has no
+  64-hex `artifact_sha256`, or lacks any quota or limit `inspect` reports. A
+  `native` listing has any of these fields.
 - A text field holds a control, bidi or zero-width character.
 - The listing was not verified against the current release.
 

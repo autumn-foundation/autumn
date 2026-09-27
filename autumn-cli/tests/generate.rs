@@ -9154,12 +9154,25 @@ fn write_fixture_index(dir: &Path) -> std::path::PathBuf {
         "incompatible",
         "fail",
     ));
+    // A sandboxed listing carries every quota and limit `inspect` emits.
+    let quotas: Vec<String> = autumn_web::plugin_sandbox::CapabilityQuotas::default()
+        .fields()
+        .iter()
+        .map(|(k, v)| format!("{k} = {v}"))
+        .collect();
+    let limits: Vec<String> = autumn_web::plugin_sandbox::ResourceLimits::default()
+        .fields()
+        .iter()
+        .map(|(k, v)| format!("{k} = {v}"))
+        .collect();
     src.push_str(&index_listing(
         "autumn-plugin-hello",
         &format!(
             "tier = \"stable\"\ntrust = \"sandboxed\"\ncapabilities = [\"http-request\", \"kv\"]\n\
-             artifact_sha256 = \"{}\"",
-            "ab".repeat(32)
+             artifact_sha256 = \"{}\"\nquotas = {{ {} }}\nlimits = {{ {} }}",
+            "ab".repeat(32),
+            quotas.join(", "),
+            limits.join(", ")
         ),
         "listed",
         "pass",
@@ -9522,9 +9535,19 @@ fn failed_install_report(name: &str, message: &str, output: &str) -> serde_json:
 
 /// Whether `listing` is verified by its install compiling, not plugin-check:
 /// `exempt`, or a failure that kept its exemption `reason`.
+/// The same rule as `curate::require_exempt_class`: an empty `reason` on a
+/// normal listing does not skip plugin-check.
 fn is_exempt(listing: &toml::Value) -> bool {
-    listing["conformance"]["result"].as_str() == Some("exempt")
-        || listing["conformance"].get("reason").is_some()
+    let conformance = &listing["conformance"];
+    let reason = conformance
+        .get("reason")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|r| !r.trim().is_empty());
+    match conformance["result"].as_str() {
+        Some("exempt") => true,
+        Some("fail") => reason,
+        _ => false,
+    }
 }
 
 /// `cargo check` an exempt listing's install. `Err` carries cargo's stderr.

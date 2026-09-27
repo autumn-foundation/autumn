@@ -710,11 +710,30 @@ fn check_trust(listing: &Listing, out: &mut Vec<String>) {
             out.push(format!("`{key}` is not a sandbox quota"));
         }
     }
+    let sandboxed = listing.trust == Trust::Sandboxed;
+    // A sandboxed listing records the whole authority `inspect` reported:
+    // a missing ceiling would publish as unknown, not as approved.
+    let missing: Vec<&str> = known
+        .iter()
+        .filter(|(k, _)| sandboxed && !listing.quotas.contains_key(*k))
+        .map(|(k, _)| *k)
+        .collect();
+    if !missing.is_empty() {
+        out.push(format!("`quotas` is missing {}", missing.join(", ")));
+    }
     let known = autumn_web::plugin_sandbox::ResourceLimits::default().fields();
     for key in listing.limits.keys() {
         if !known.iter().any(|(k, _)| k == key) {
             out.push(format!("`{key}` is not a sandbox resource limit"));
         }
+    }
+    let missing: Vec<&str> = known
+        .iter()
+        .filter(|(k, _)| sandboxed && !listing.limits.contains_key(*k))
+        .map(|(k, _)| *k)
+        .collect();
+    if !missing.is_empty() {
+        out.push(format!("`limits` is missing {}", missing.join(", ")));
     }
     for name in &listing.capabilities {
         if !SandboxCapability::ALL.iter().any(|c| c.as_str() == name) {
@@ -1160,6 +1179,7 @@ mod tests {
 
         listing.capabilities = vec!["http-request".to_owned()];
         listing.artifact_sha256 = "ab".repeat(32);
+        let listing = with_full_sandbox_maps(listing);
         assert!(validate(&index_of(vec![listing])).is_empty());
     }
 
@@ -1183,6 +1203,39 @@ mod tests {
             "{}",
             listing.trust_label()
         );
+    }
+
+    /// A sandboxed listing with every quota and limit at its default.
+    fn with_full_sandbox_maps(mut listing: Listing) -> Listing {
+        listing.quotas = autumn_web::plugin_sandbox::CapabilityQuotas::default()
+            .fields()
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect();
+        listing.limits = autumn_web::plugin_sandbox::ResourceLimits::default()
+            .fields()
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), u64::try_from(v).unwrap()))
+            .collect();
+        listing
+    }
+
+    /// A sandboxed listing publishes its whole authority: a partial map
+    /// is refused.
+    #[test]
+    fn a_sandboxed_listing_needs_complete_quotas_and_limits() {
+        let mut listing = community();
+        listing.trust = Trust::Sandboxed;
+        listing.capabilities = vec!["kv".to_owned()];
+        listing.artifact_sha256 = "ab".repeat(32);
+        let text = messages(&validate(&index_of(vec![listing.clone()])));
+        assert!(text.contains("`quotas` is missing"), "{text}");
+        assert!(text.contains("`limits` is missing"), "{text}");
+        let mut full = with_full_sandbox_maps(listing);
+        assert!(validate(&index_of(vec![full.clone()])).is_empty());
+        full.limits.remove("fuel");
+        let text = messages(&validate(&index_of(vec![full])));
+        assert!(text.contains("fuel"), "{text}");
     }
 
     /// Quotas: sandboxed only, and only names the sandbox enforces.
