@@ -98,6 +98,26 @@ fn ttl_millis_for_redis(ttl: std::time::Duration) -> u64 {
     u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
+/// Escape Redis GLOB pattern metacharacters (`\`, `*`, `?`, `[`) in `s` so it
+/// matches only literally when used inside a `SCAN`/`KEYS` `MATCH` pattern.
+///
+/// `key_prefix` is an operator-supplied config value (`cache.redis.key_prefix`
+/// in `autumn.toml`), not attacker-controlled request input, but an operator
+/// prefix that happens to contain one of these characters (e.g. `tenant:*`)
+/// would otherwise be interpreted as a glob by [`RedisCache::clear`]'s `SCAN
+/// MATCH {prefix}:*`, letting `clear()` match — and delete — keys outside the
+/// namespace the prefix was meant to scope it to.
+fn escape_redis_glob(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(ch, '\\' | '*' | '?' | '[') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 impl RedisCache {
     /// Connect using an explicit URL and key prefix.
     ///
@@ -108,7 +128,13 @@ impl RedisCache {
         url: &str,
         key_prefix: impl Into<String>,
     ) -> Result<Self, RedisCacheError> {
-        let client = redis::Client::open(url)?;
+        // `open_client`, not `redis::Client::open`: it installs the
+        // process-wide rustls `CryptoProvider` that `redis`'s
+        // `tokio-rustls-comp` needs before a `rediss://` URL can be dialled,
+        // and it is the same guard every Redis client inside `autumn-web`
+        // goes through. Scoped to TLS schemes there, so a plain `redis://`
+        // connection never claims the process-wide default. See #2172.
+        let client = autumn_web::redis_tls::open_client(url)?;
         let manager = ConnectionManager::new(client).await?;
         Ok(Self {
             manager,
@@ -175,6 +201,56 @@ impl RedisCache {
                 }
             });
         });
+    }
+
+    /// Delete every key matching `pattern`, walking the keyspace with `SCAN`
+    /// rather than `KEYS` so a large keyspace never blocks the server.
+    ///
+    /// Shared by [`Cache::clear`] and [`Cache::invalidate_namespace`], which
+    /// differ only in how many segments of the key they pin.
+    ///
+    /// Returns whether the whole sweep succeeded. A `SCAN` error used to
+    /// degrade into "cursor 0, no keys" — indistinguishable from a finished
+    /// sweep — and a `DEL` error was dropped on the floor. That was survivable
+    /// while the only caller returned `()`; it is not survivable for
+    /// [`Cache::invalidate_namespace`], whose `bool` tells a caller whether
+    /// stale data may still be served. An error stops the walk and reports
+    /// `false`: a partial sweep is not a complete one.
+    fn scan_and_delete(&self, pattern: &str) -> bool {
+        let pattern = pattern.to_owned();
+        let mut conn = self.manager.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut cursor: u64 = 0;
+                loop {
+                    let scanned: Result<(u64, Vec<String>), _> = redis::cmd("SCAN")
+                        .arg(cursor)
+                        .arg("MATCH")
+                        .arg(&pattern)
+                        .arg("COUNT")
+                        .arg(100u32)
+                        .query_async(&mut conn)
+                        .await;
+                    let (next_cursor, keys) = match scanned {
+                        Ok(page) => page,
+                        Err(e) => {
+                            debug!(pattern, error = %e, "RedisCache: SCAN failed");
+                            return false;
+                        }
+                    };
+                    if !keys.is_empty()
+                        && let Err(e) = conn.del::<_, ()>(keys).await
+                    {
+                        debug!(pattern, error = %e, "RedisCache: DEL failed");
+                        return false;
+                    }
+                    cursor = next_cursor;
+                    if cursor == 0 {
+                        return true;
+                    }
+                }
+            })
+        })
     }
 }
 
@@ -253,34 +329,43 @@ impl Cache for RedisCache {
         debug!(key, "RedisCache: invalidated");
     }
 
+    fn invalidate_namespace(&self, namespace: &str) -> bool {
+        // The same SCAN sweep as `clear`, one segment narrower: cache keys are
+        // `{key_prefix}:{namespace}:{hash}`, so scoping the pattern to
+        // `{key_prefix}:{namespace}:*` drops exactly one cached read's entries
+        // and nothing else. This is what makes a declared invalidation edge
+        // (issue #1716) actually complete on a shared, cross-replica backend —
+        // the deployment shape where a per-process store cannot help.
+        //
+        // `namespace` is escaped for the same reason `key_prefix` is: it comes
+        // from `module_path!()`, but an unescaped `*` or `[` anywhere in a
+        // MATCH pattern would widen the sweep beyond the namespace it names.
+        //
+        // The sweep's success is the return value, not a side note: the caller
+        // uses it to decide whether stale data may still be served, so a Redis
+        // error must surface as `false` rather than as a silent "done".
+        let swept = self.scan_and_delete(&format!(
+            "{}:{}:*",
+            escape_redis_glob(&self.key_prefix),
+            escape_redis_glob(namespace)
+        ));
+        if !swept {
+            debug!(
+                namespace,
+                "RedisCache: namespace sweep failed, reporting incomplete"
+            );
+        }
+        swept
+    }
+
     fn clear(&self) {
         // Use SCAN instead of KEYS to avoid blocking the Redis server on large
         // keyspaces. SCAN is O(1) per call and processes the keyspace in batches.
-        let pattern = format!("{}:*", self.key_prefix);
-        let mut conn = self.manager.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let mut cursor: u64 = 0;
-                loop {
-                    let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-                        .arg(cursor)
-                        .arg("MATCH")
-                        .arg(&pattern)
-                        .arg("COUNT")
-                        .arg(100u32)
-                        .query_async(&mut conn)
-                        .await
-                        .unwrap_or((0, vec![]));
-                    if !keys.is_empty() {
-                        let _: Result<(), _> = conn.del(keys).await;
-                    }
-                    cursor = next_cursor;
-                    if cursor == 0 {
-                        break;
-                    }
-                }
-            });
-        });
+        //
+        // `clear` returns `()`, so a failure has nowhere to go and is logged by
+        // the sweep rather than reported — unchanged from before namespace
+        // invalidation existed.
+        let _ = self.scan_and_delete(&format!("{}:*", escape_redis_glob(&self.key_prefix)));
     }
 
     /// Acquires a cross-replica fill lock via `SET NX PX`. Redis errors are
@@ -366,6 +451,15 @@ impl Default for RedisCachePlugin {
 }
 
 impl autumn_web::plugin::Plugin for RedisCachePlugin {
+    /// This plugin ships in lockstep with `autumn-web` — see
+    /// [`lockstep_contract`](autumn_web::plugin_contract::lockstep_contract).
+    fn contract(&self) -> Option<autumn_web::plugin_contract::PluginContract> {
+        Some(autumn_web::plugin_contract::lockstep_contract(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ))
+    }
+
     fn build(self, app: autumn_web::app::AppBuilder) -> autumn_web::app::AppBuilder {
         app.on_startup(|state| async move {
             // Read the config the framework already stored as an extension.
@@ -400,6 +494,23 @@ mod tests {
     use testcontainers_modules::redis::Redis as RedisImage;
 
     #[test]
+    fn contract_declares_lockstep_with_own_crate() {
+        use autumn_web::plugin::Plugin;
+
+        let contract = RedisCachePlugin::new().contract().expect("a contract");
+        assert_eq!(contract.plugin, env!("CARGO_PKG_NAME"));
+        assert_eq!(
+            contract.plugin_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            contract.autumn_web.as_deref(),
+            Some(autumn_web::plugin_contract::lockstep_range(env!("CARGO_PKG_VERSION")).as_str())
+        );
+        assert!(contract.experimental_surfaces.is_empty());
+    }
+
+    #[test]
     fn redis_ttl_millis_preserves_subsecond_precision() {
         assert_eq!(
             ttl_millis_for_redis(std::time::Duration::from_millis(100)),
@@ -414,6 +525,119 @@ mod tests {
     #[test]
     fn redis_ttl_millis_never_uses_zero() {
         assert_eq!(ttl_millis_for_redis(std::time::Duration::ZERO), 1);
+    }
+
+    /// This crate must not build its own Redis client: `RedisCache::connect`
+    /// goes through `autumn_web::redis_tls::open_client`, which installs the
+    /// process-level rustls `CryptoProvider` a `rediss://` URL needs before
+    /// rustls is asked to resolve one (#2172). A second, hand-rolled install
+    /// here is exactly how one copy of this logic drifts from the other.
+    ///
+    /// Walks `src/` rather than scanning `lib.rs` alone: the crate is a
+    /// single file today, and a scan that silently stops covering the crate
+    /// the day a second module appears is the drift it exists to prevent.
+    #[test]
+    fn the_cache_never_builds_a_redis_client_outside_the_shared_tls_guard() {
+        // Split so the needles do not match this declaration.
+        let needles = [concat!("Client::", "open("), concat!("build_with", "_tls(")];
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rust_sources(&src, &mut files);
+        assert!(!files.is_empty(), "no sources under {}", src.display());
+        files.sort();
+
+        let mut offenders = Vec::new();
+        for file in files {
+            let source = std::fs::read_to_string(&file).expect("read source");
+            for (index, line) in source.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") || trimmed.starts_with('*') {
+                    continue;
+                }
+                if needles.iter().any(|needle| line.contains(needle)) {
+                    offenders.push(format!(
+                        "{}:{}: {}",
+                        file.strip_prefix(&src).unwrap_or(&file).display(),
+                        index + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "build Redis clients through `autumn_web::redis_tls::open_client`, \
+             not directly — a `rediss://` URL otherwise reaches rustls with no \
+             process-level CryptoProvider installed and panics (#2172):\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Recursively collect every `.rs` file under `dir`.
+    fn collect_rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                collect_rust_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The TLS classification itself is `autumn_web::redis_tls`'s contract;
+    /// this only pins that this crate is wired to the same one.
+    #[test]
+    fn the_shared_guard_classifies_the_tls_schemes_this_cache_is_deployed_on() {
+        assert!(autumn_web::redis_tls::url_needs_tls_crypto_provider(
+            "rediss://cache.redis.cache.windows.net:6380/"
+        ));
+        assert!(!autumn_web::redis_tls::url_needs_tls_crypto_provider(
+            "redis://127.0.0.1:6379/"
+        ));
+    }
+
+    #[test]
+    fn escape_redis_glob_leaves_plain_prefixes_unchanged() {
+        assert_eq!(escape_redis_glob("myapp:cache"), "myapp:cache");
+    }
+
+    #[test]
+    fn escape_redis_glob_escapes_scan_match_metacharacters() {
+        // Regression: `clear()` builds a SCAN MATCH pattern as
+        // "{key_prefix}:*". An unescaped operator-supplied prefix containing
+        // a glob metacharacter (e.g. "tenant:*") would let SCAN MATCH match
+        // — and clear() then delete — keys well outside that prefix's
+        // intended namespace.
+        assert_eq!(escape_redis_glob("tenant:*"), r"tenant:\*");
+        assert_eq!(escape_redis_glob("a?b"), r"a\?b");
+        assert_eq!(escape_redis_glob("[ab]"), r"\[ab]");
+        assert_eq!(escape_redis_glob(r"back\slash"), r"back\\slash");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rediss_scheme_is_usable_without_a_tls_cargo_feature_error() {
+        // The azure-container-apps release target's generated Redis Cache
+        // disables the non-TLS port (main.tf: non_ssl_port_enabled = false),
+        // so it only ever hands the app a `rediss://` URL. Without a TLS
+        // Cargo feature compiled in, `redis::Client::open` rejects that
+        // scheme immediately at URL-parse time (before any network I/O) with
+        // "can't connect with TLS, the feature is not enabled" — invisible
+        // until a real Azure deploy, since no local test exercised it. This
+        // needs no Docker/testcontainer TLS-capable Redis: with the
+        // tls-rustls feature compiled in (workspace Cargo.toml), parsing
+        // succeeds and the failure that follows (a closed loopback port) is
+        // a genuine network error instead.
+        let result = RedisCache::connect("rediss://127.0.0.1:1/", "test").await;
+        let Err(err) = result else {
+            panic!("connecting to a closed port must fail");
+        };
+        let message = err.to_string();
+        assert!(
+            !message.contains("feature is not enabled") && !message.contains("without the tls"),
+            "the `redis` crate must be built with a TLS feature (tokio-rustls-comp) \
+             so `rediss://` URLs actually connect: {message}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

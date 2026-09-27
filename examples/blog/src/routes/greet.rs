@@ -1,18 +1,26 @@
-//! Demonstrates the autumn-web i18n module end-to-end.
+//! Demonstrates the autumn-web i18n module end-to-end, including
+//! locale-prefixed routing and the path-preserving switcher (issue #1251).
 //!
 //! Loads its strings from `i18n/{en,es}.ftl` via the bundle registered in
-//! `main.rs` with `.i18n_auto()`. Browse to `/greet`, then click the
-//! language switcher (or append `?locale=es`) to see the same content in
-//! Spanish — `Locale` resolves the request locale, `t!()` performs the
-//! lookup, and the bundle handles fallback and missing-key warnings.
+//! `main.rs` with `.i18n_auto()`. With `[i18n] locale_prefix_enabled = true`
+//! in `autumn.toml`, this same handler serves `/en/greet` and `/es/greet`
+//! directly — `/greet` (bare) 308-redirects to whichever locale negotiation
+//! picks. `Locale` resolves the request locale (URL prefix first), `t!()`
+//! performs the lookup, and `locale_switcher()` renders the language links
+//! with zero hand-built `<a href>`s.
 
 use autumn_web::prelude::*;
 
 use super::posts::layout;
 
 #[get("/greet")]
-pub async fn greet(locale: Locale) -> Markup {
+pub async fn greet(locale: Locale, uri: autumn_web::reexports::http::Uri) -> Markup {
     let title = t!(locale, "greet.title");
+    let supported: &[String] = locale.bundle().map_or(&[], |b| b.supported_locales());
+    let path_and_query = match uri.query() {
+        Some(query) => format!("{}?{query}", uri.path()),
+        None => uri.path().to_owned(),
+    };
     let body = html! {
         article class="space-y-6" {
             header class="border-b border-stone-200 pb-4" {
@@ -25,22 +33,13 @@ pub async fn greet(locale: Locale) -> Markup {
                 (t!(locale, "greet.greeting", name = "Ada"))
             }
 
-            // Locale switcher — preserves the path, just swaps `?locale=`.
-            // Each link sets the cookie via the next request hitting the
-            // same handler with `?locale=xx`, so the choice persists across
-            // navigations.
+            // Locale switcher (issue #1251) — one call, preserves the
+            // current path and query; only the locale segment changes.
             div class="bg-amber-50 border border-amber-200 rounded-lg p-4 space-y-2" {
                 p class="text-sm text-amber-900 font-medium" {
                     (t!(locale, "nav.locale.label")) ":"
                 }
-                p class="text-sm text-amber-900" {
-                    a href="/greet?locale=en" class="underline mr-3" {
-                        (t!(locale, "nav.locale.en"))
-                    }
-                    a href="/greet?locale=es" class="underline" {
-                        (t!(locale, "nav.locale.es"))
-                    }
-                }
+                (locale_switcher(&path_and_query, locale.tag(), supported))
                 p class="text-xs text-amber-800 mt-2" {
                     (t!(locale, "greet.switcher_help"))
                 }
@@ -54,5 +53,5 @@ pub async fn greet(locale: Locale) -> Markup {
             }
         }
     };
-    layout(&locale, &title, body)
+    layout(&locale, Some(&path_and_query), &title, body)
 }

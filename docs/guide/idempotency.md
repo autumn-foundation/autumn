@@ -155,6 +155,14 @@ replay, apply `IdempotencyLayer::replay_through_inner()` inside the raw router
 and place `IdempotencyReplayLayer` in the route stack after the checks that must
 still run on replay.
 
+Cached responses are scoped to a principal. The storage key folds in the
+cookie-backed session (so one user's stored mutation is never replayed to
+another) and, when `[tenancy] enabled = true`, the tenant Autumn's tenancy
+middleware resolved for the request — so two tenants that pick the same
+`Idempotency-Key` for the same route never share a cached response. The tenant
+comes from the framework's own resolution rather than from the request header,
+so a genuine retry from the same tenant still replays.
+
 Manually constructed `Route` values passed to `AppBuilder::routes()` or
 `AppBuilder::scoped()` are also treated as unknown by default. Autumn records
 the first successful mutation, but cache hits fail closed with `409 Conflict`
