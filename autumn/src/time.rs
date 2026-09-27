@@ -606,6 +606,14 @@ pub fn ambient_instant() -> std::time::Instant {
     *MONOTONIC_ORIGIN + ambient_monotonic().since_origin()
 }
 
+/// The system monotonic clock as a [`std::time::Instant`], never a `Sim`'s.
+///
+/// For instants kept in process-global state, which outlives any `Sim`: a
+/// virtual instant stored there would later be compared with real time.
+pub(crate) fn system_instant() -> std::time::Instant {
+    *MONOTONIC_ORIGIN + SystemClock.monotonic().since_origin()
+}
+
 /// The ambient wall-clock time as a [`std::time::SystemTime`]. Replaces
 /// `SystemTime::now()` where no clock is in scope. See [`AmbientClock`].
 #[must_use]

@@ -114,6 +114,10 @@ pub enum CircuitBreakerError<E> {
 pub struct CircuitBreaker {
     name: String,
     pub(crate) inner: Arc<Mutex<CircuitBreakerInner>>,
+    /// Read the system clock, never a `Sim`'s. Set for breakers in the
+    /// process-global registry: they outlive any `Sim`, so a virtual instant
+    /// stored in one would later be compared with real time (issue #2967).
+    system_clock: bool,
 }
 
 pub(crate) struct CircuitBreakerInner {
@@ -177,6 +181,24 @@ impl CircuitBreaker {
                 half_open_in_flight: 0,
                 config,
             })),
+            system_clock: false,
+        }
+    }
+
+    /// A breaker on the system clock. See the `system_clock` field.
+    fn new_on_system_clock(name: impl Into<String>, config: CircuitBreakerPolicy) -> Self {
+        Self {
+            system_clock: true,
+            ..Self::new(name, config)
+        }
+    }
+
+    /// The current instant on this breaker's clock.
+    fn now(&self) -> Instant {
+        if self.system_clock {
+            crate::time::system_instant()
+        } else {
+            crate::time::ambient_instant()
         }
     }
 
@@ -196,7 +218,7 @@ impl CircuitBreaker {
 
     pub fn state(&self) -> CircuitState {
         let mut inner = self.lock_inner();
-        let now = crate::time::ambient_instant();
+        let now = self.now();
         if inner.state == CircuitState::Open {
             if let Some(until) = inner.open_until {
                 if now >= until {
@@ -225,14 +247,14 @@ impl CircuitBreaker {
     pub fn failure_ratio(&self) -> f64 {
         let mut inner = self.lock_inner();
         let window = inner.config.sample_window;
-        inner.clean_history(window, crate::time::ambient_instant());
+        inner.clean_history(window, self.now());
         inner.failure_ratio()
     }
 
     #[allow(clippy::significant_drop_tightening)]
     pub(crate) fn before_call(&self) -> Result<(), CircuitBreakerError<()>> {
         let mut inner = self.lock_inner();
-        let now = crate::time::ambient_instant();
+        let now = self.now();
 
         if inner.state == CircuitState::Open {
             if let Some(until) = inner.open_until {
@@ -263,7 +285,7 @@ impl CircuitBreaker {
 
     pub(crate) fn after_call(&self, success: bool) {
         let mut inner = self.lock_inner();
-        let now = crate::time::ambient_instant();
+        let now = self.now();
         let window = inner.config.sample_window;
         inner.clean_history(window, now);
 
@@ -374,12 +396,25 @@ impl Drop for CircuitBreakerGuard {
 
 pub struct CircuitBreakerRegistry {
     breakers: Mutex<HashMap<String, CircuitBreaker>>,
+    /// Create breakers on the system clock. True only for the process-global
+    /// registry.
+    system_clock: bool,
 }
 
 impl CircuitBreakerRegistry {
     pub fn new() -> Self {
         Self {
             breakers: Mutex::new(HashMap::new()),
+            system_clock: false,
+        }
+    }
+
+    /// Create a breaker for this registry's clock.
+    fn create(&self, name: &str, config: CircuitBreakerPolicy) -> CircuitBreaker {
+        if self.system_clock {
+            CircuitBreaker::new_on_system_clock(name, config)
+        } else {
+            CircuitBreaker::new(name, config)
         }
     }
 
@@ -396,7 +431,7 @@ impl CircuitBreakerRegistry {
         let mut breakers = self.lock_breakers();
         breakers
             .entry(name.to_owned())
-            .or_insert_with(|| CircuitBreaker::new(name, config))
+            .or_insert_with(|| self.create(name, config))
             .clone()
     }
 
@@ -410,7 +445,7 @@ impl CircuitBreakerRegistry {
             breaker.update_config(config);
             breaker.clone()
         } else {
-            let breaker = CircuitBreaker::new(name, config);
+            let breaker = self.create(name, config);
             breakers.insert(name.to_owned(), breaker.clone());
             breaker
         }
@@ -431,8 +466,13 @@ impl CircuitBreakerRegistry {
 
 static REGISTRY: std::sync::OnceLock<CircuitBreakerRegistry> = std::sync::OnceLock::new();
 
+/// The process-global registry. Its breakers read the system clock, because
+/// they outlive any `Sim` (issue #2967).
 pub fn global_registry() -> &'static CircuitBreakerRegistry {
-    REGISTRY.get_or_init(CircuitBreakerRegistry::new)
+    REGISTRY.get_or_init(|| CircuitBreakerRegistry {
+        system_clock: true,
+        ..CircuitBreakerRegistry::new()
+    })
 }
 
 pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
