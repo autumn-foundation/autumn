@@ -301,14 +301,14 @@ impl Chaos {
 }
 
 /// Clamp a probability into `[0.0, 1.0]`, mapping `NaN` to `0.0`.
-fn clamp_prob(p: f64) -> f64 {
+pub(crate) fn clamp_prob(p: f64) -> f64 {
     if p.is_nan() { 0.0 } else { p.clamp(0.0, 1.0) }
 }
 
 /// Map a raw `u64` draw to a uniform value in `[0, 1)`: take the top 53 bits and
 /// divide by 2^53 (the f64 mantissa width, so the quotient is exact).
 #[allow(clippy::cast_precision_loss)] // 53-bit mantissa: the shifted value fits f64 exactly
-fn unit_from_draw(draw: u64) -> f64 {
+pub(crate) fn unit_from_draw(draw: u64) -> f64 {
     (draw >> 11) as f64 / (1u64 << 53) as f64
 }
 

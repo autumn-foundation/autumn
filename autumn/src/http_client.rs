@@ -139,6 +139,10 @@ pub enum ClientError {
     /// alone for guarded automatic per-hop pinning — not both.
     #[error("{0}")]
     PinNotAllowedWithSsrfSafe(&'static str),
+    /// The simulated network ([`crate::sim::SimNet`], issue #2967) failed the
+    /// call: a drop, a partition, or a host it does not know.
+    #[error("simulated network: {0}")]
+    SimNetwork(String),
 }
 
 // ── Response ─────────────────────────────────────────────────────────────────
@@ -1124,6 +1128,9 @@ pub struct Client {
     mock: Option<Arc<MockRegistry>>,
     /// Resilience configuration for circuit breakers.
     resilience_config: Option<Arc<crate::config::ResilienceConfig>>,
+    /// When present (a sim with a `SimNet`), calls go through the simulated
+    /// network instead of the real one.
+    sim_net: Option<Arc<crate::sim::SimNet>>,
 }
 
 impl Client {
@@ -1159,6 +1166,7 @@ impl Client {
             },
             mock: None,
             resilience_config: None,
+            sim_net: None,
         }
     }
 
@@ -1199,6 +1207,7 @@ impl Client {
             },
             mock: None,
             resilience_config: None,
+            sim_net: None,
         }
     }
 
@@ -1214,6 +1223,7 @@ impl Client {
             retry_policy: RetryPolicy::default(),
             mock: None,
             resilience_config: None,
+            sim_net: None,
         }
     }
 
@@ -1280,6 +1290,7 @@ impl Client {
         if let Some(ext) = state.extension::<HttpMockRegistryExt>() {
             client = client.with_mock(ext.0.clone());
         }
+        client.sim_net = state.extension::<crate::sim::SimNet>();
 
         client
     }
@@ -1305,6 +1316,7 @@ impl Client {
             retry_policy: self.retry_policy.clone(),
             mock: self.mock.clone(),
             resilience_config: self.resilience_config.clone(),
+            sim_net: self.sim_net.clone(),
         }
     }
 
@@ -1319,6 +1331,7 @@ impl Client {
             retry_policy: self.retry_policy.clone(),
             mock: self.mock.clone(),
             resilience_config: self.resilience_config.clone(),
+            sim_net: self.sim_net.clone(),
         }
     }
 
@@ -1352,6 +1365,7 @@ impl Client {
             ssrf_safe: false,
             discard_response_body: false,
             breaker_scoped: false,
+            sim_net: self.sim_net.clone(),
         }
     }
 
@@ -1511,6 +1525,8 @@ pub struct RequestBuilder {
     /// the custom send path (`needs_custom_path()`). See
     /// [`RequestBuilder::breaker_scoped`].
     breaker_scoped: bool,
+    /// The simulated network, when the client came from a sim app state.
+    sim_net: Option<Arc<crate::sim::SimNet>>,
 }
 
 impl RequestBuilder {
@@ -1850,6 +1866,12 @@ impl RequestBuilder {
 
     /// [`send`](Self::send), minus the replay gate and the capture tee.
     async fn send_recorded(self) -> Result<Response, ClientError> {
+        // A sim network serves every send path, so nothing reaches the real
+        // network. Like mocks, it bypasses the process-global breaker.
+        if let Some(net) = self.sim_net.clone() {
+            return self.send_sim(&net).await;
+        }
+
         // Bypassing circuit breaker if a mock registry is present.
         if self.mock.is_some() {
             return self.send_inner(false).await;
@@ -1930,50 +1952,12 @@ impl RequestBuilder {
     async fn send_inner(self, suppress_retries: bool) -> Result<Response, ClientError> {
         // ── Mock short-circuit ──────────────────────────────────────────────
         if let Some(ref mock) = self.mock {
-            match mock.find_match(&self.method, &self.url, self.alias.as_deref()) {
-                Some(mock_resp) => {
-                    let status = reqwest::StatusCode::from_u16(mock_resp.status)
-                        .unwrap_or(reqwest::StatusCode::OK);
-                    let body_bytes = mock_resp
-                        .body
-                        .as_ref()
-                        .map(|v| serde_json::to_vec(v).unwrap_or_default())
-                        .unwrap_or_default();
-
-                    tracing::info!(
-                        http.method = %self.method,
-                        http.url = %self.url,
-                        http.status = mock_resp.status,
-                        "[mock] outbound request intercepted"
-                    );
-
-                    return Ok(Response {
-                        status,
-                        headers: HeaderMap::new(),
-                        body: Bytes::from(body_bytes),
-                        url: None,
-                    });
-                }
-                None => {
-                    // A mock registry is present but nothing matched — treat as
-                    // a test failure rather than falling through to the network.
-                    return Err(ClientError::NoMock(
-                        self.method.to_string(),
-                        self.url.clone(),
-                    ));
-                }
-            }
+            return self.mock_response(mock);
         }
 
         // ── Real network request with retries ───────────────────────────────
         let start = Instant::now();
-        let max_attempts = if suppress_retries {
-            1
-        } else if is_idempotent_method(&self.method) || !self.retry_policy.retry_idempotent_only {
-            self.retry_policy.max_retries.saturating_add(1)
-        } else {
-            1
-        };
+        let max_attempts = self.max_attempts(suppress_retries);
 
         for attempt in 0..max_attempts {
             if attempt > 0 {
@@ -2053,6 +2037,91 @@ impl RequestBuilder {
 
         // The retry loop always returns inside the last attempt; this is unreachable.
         unreachable!("retry loop exited without returning a result — this is a bug")
+    }
+
+    /// How many attempts the retry policy allows for this request.
+    fn max_attempts(&self, suppress_retries: bool) -> u32 {
+        if suppress_retries {
+            1
+        } else if is_idempotent_method(&self.method) || !self.retry_policy.retry_idempotent_only {
+            self.retry_policy.max_retries.saturating_add(1)
+        } else {
+            1
+        }
+    }
+
+    /// The canned response for this request from `mock`, or
+    /// [`ClientError::NoMock`].
+    fn mock_response(&self, mock: &MockRegistry) -> Result<Response, ClientError> {
+        let Some(mock_resp) = mock.find_match(&self.method, &self.url, self.alias.as_deref())
+        else {
+            // A mock registry is present but nothing matched — treat as a test
+            // failure rather than falling through to the network.
+            return Err(ClientError::NoMock(
+                self.method.to_string(),
+                self.url.clone(),
+            ));
+        };
+        let status =
+            reqwest::StatusCode::from_u16(mock_resp.status).unwrap_or(reqwest::StatusCode::OK);
+        let body_bytes = mock_resp
+            .body
+            .as_ref()
+            .map(|v| serde_json::to_vec(v).unwrap_or_default())
+            .unwrap_or_default();
+
+        tracing::info!(
+            http.method = %self.method,
+            http.url = %self.url,
+            http.status = mock_resp.status,
+            "[mock] outbound request intercepted"
+        );
+
+        Ok(Response {
+            status,
+            headers: HeaderMap::new(),
+            body: Bytes::from(body_bytes),
+            url: None,
+        })
+    }
+
+    /// Send through the simulated network (issue #2967), with the same
+    /// attempts and backoff as the real retry loop.
+    async fn send_sim(self, net: &crate::sim::SimNet) -> Result<Response, ClientError> {
+        let url = reqwest::Url::parse(&self.url)
+            .map_err(|error| ClientError::InvalidUrl(format!("{}: {error}", self.url)))?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| ClientError::InvalidUrl(format!("{}: no host", self.url)))?
+            .to_owned();
+        let max_attempts = self.max_attempts(false);
+        for attempt in 0..max_attempts {
+            if attempt > 0 {
+                let exp = (attempt - 1).min(10);
+                tokio::time::sleep(Duration::from_millis(100 * (1_u64 << exp))).await;
+            }
+            let last = attempt + 1 == max_attempts;
+            if let Err(fault) = net.transmit(&host).await {
+                if last {
+                    return Err(ClientError::SimNetwork(format!(
+                        "request to {host} {fault}"
+                    )));
+                }
+                continue;
+            }
+            let response = match (net.service(&host), self.mock.as_ref()) {
+                (Some(router), _) => serve_sim_host(router, &self, url.clone()).await?,
+                (None, Some(mock)) => self.mock_response(mock)?,
+                (None, None) => {
+                    return Err(ClientError::SimNetwork(format!("no sim host named {host}")));
+                }
+            };
+            if is_retryable_status(response.status.as_u16()) && !last {
+                continue;
+            }
+            return Ok(response);
+        }
+        unreachable!("the sim retry loop returns on its last attempt")
     }
 
     /// `true` when any security-hardening option requires the custom send path.
@@ -2460,6 +2529,42 @@ fn breaker_for_url(
 }
 
 // ── Custom send-path helpers (redirect / pin / SSRF-safe) ─────────────────────
+
+/// Serve one request from a simulated host's router (issue #2967).
+async fn serve_sim_host(
+    router: axum::Router,
+    request: &RequestBuilder,
+    url: reqwest::Url,
+) -> Result<Response, ClientError> {
+    let target = match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_owned(),
+    };
+    let mut builder = axum::http::Request::builder()
+        .method(request.method.clone())
+        .uri(target);
+    for (name, value) in &request.extra_headers {
+        builder = builder.header(name, value);
+    }
+    let body = request.body.clone().unwrap_or_default();
+    let http_request = builder
+        .body(axum::body::Body::from(body))
+        .map_err(|error| ClientError::SimNetwork(error.to_string()))?;
+    let response = tower::ServiceExt::oneshot(router, http_request)
+        .await
+        .unwrap_or_else(|never| match never {});
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .map_err(|error| ClientError::SimNetwork(error.to_string()))?;
+    Ok(Response {
+        status,
+        headers,
+        body,
+        url: Some(url),
+    })
+}
 
 /// Build a one-shot `reqwest::Client` for the custom send path, with the given
 /// redirect policy, per-request timeout, and optional DNS `resolve` override.

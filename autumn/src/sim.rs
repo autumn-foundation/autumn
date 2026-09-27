@@ -136,6 +136,20 @@ pub mod crash;
 // registry API live here.
 pub mod assert;
 
+// The simulated network (issue #2967): seeded latency, drops and partitions
+// for outbound `http_client::Client` calls, served by in-process hosts.
+#[cfg(feature = "http-client")]
+pub mod net;
+
+#[cfg(feature = "http-client")]
+pub use net::{NetEvent, NetFault, SimNet};
+
+// The shared demo scenario (issue #2967): one `Op` vocabulary for the
+// `sim-sweep` proptest sweep and the `sim_ops` cargo-fuzz target. Hidden,
+// unstable harness plumbing.
+#[doc(hidden)]
+pub mod scenario;
+
 // The interleaving shuffler (issue #2967): seeded poll order for
 // `Sim::interleave` and seeded yields for `Sim::spawn`.
 mod shuffle;
@@ -227,6 +241,10 @@ pub struct Sim {
     /// advance/drain futures `Send` (a `Cell`/`RefCell` field would break both).
     strict_budget: Option<std::time::Duration>,
 
+    /// The simulated network installed at each mount, if any.
+    #[cfg(feature = "http-client")]
+    net: Option<net::SimNet>,
+
     /// How many shuffler calls ([`interleave`](Sim::interleave),
     /// [`spawn`](Sim::spawn)) this sim made. Each call draws its own seeded
     /// stream from the seed and this count. Atomic so `&self` stays `Sync`.
@@ -263,6 +281,8 @@ impl Sim {
             chaos_state: None,
             app: SimApp::default(),
             strict_budget: None,
+            #[cfg(feature = "http-client")]
+            net: None,
             shuffle_calls: std::sync::atomic::AtomicU64::new(0),
             mounts: 0,
         }
@@ -283,6 +303,19 @@ impl Sim {
     /// ```
     pub fn chaos(&mut self, chaos: Chaos) -> &mut Self {
         self.chaos = chaos;
+        self
+    }
+
+    /// Route the app's outbound HTTP through a simulated network (issue
+    /// #2967).
+    ///
+    /// [`build`](Sim::build) installs `net` in the app, so the
+    /// [`crate::http_client::Client`] extractor sends through it: seeded
+    /// latency and drops, partitions, and in-process hosts. Keep a clone to
+    /// partition hosts and read [`SimNet::events`] later. See [`mod@net`].
+    #[cfg(feature = "http-client")]
+    pub fn net(&mut self, net: SimNet) -> &mut Self {
+        self.net = Some(net);
         self
     }
 
@@ -373,11 +406,19 @@ impl Sim {
     fn mount(&mut self, app: crate::test::TestApp) -> &crate::test::TestClient {
         // Seed the app's entropy unless the test injected its own source, so
         // framework-minted ids replay from the seed with no extra call.
-        let app = app.with_default_entropy(SeededEntropy::shared(mount_entropy_seed(
-            self.seed,
-            self.mounts,
-        )));
+        let mount_seed = mount_entropy_seed(self.seed, self.mounts);
+        let app = app.with_default_entropy(SeededEntropy::shared(mount_seed));
         self.mounts += 1;
+        // Install the simulated network, with a stream fresh for this mount.
+        #[cfg(feature = "http-client")]
+        let app = match &self.net {
+            Some(net) => {
+                net.reseed(mount_seed);
+                let net = net.clone();
+                app.state_initializer(move |state| state.insert_extension(net))
+            }
+            None => app,
+        };
         // When chaos is active, install its deterministic hooks (which also own
         // the clock so a skew wrapper can be applied); otherwise the build is
         // byte-for-byte the pre-W5 path — just the virtual clock.

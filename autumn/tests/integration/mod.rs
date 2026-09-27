@@ -396,6 +396,8 @@ mod sim_job_clock;
 mod sim_liveness_watchdog;
 mod sim_llm_stub;
 mod sim_monotonic_clock;
+#[cfg(feature = "http-client")]
+mod sim_net;
 mod sim_rate_limit_clock;
 mod sim_retry_storm;
 mod sim_scheduled_ticks;
