@@ -251,12 +251,27 @@ Both frameworks provide actuator endpoints out of the box:
 | `/actuator/metrics`      | `/actuator/metrics`            |
 | `/actuator/env`          | `/actuator/configprops`        |
 | `/actuator/loggers`      | `/actuator/loggers`            |
-| `/actuator/scheduledtasks` | `/actuator/scheduledtasks`   |
+| `/actuator/scheduledtasks` | `/actuator/tasks`              |
+
+<!-- route-surface-allow: /actuator/scheduledtasks — Spring Boot's name, shown
+     in the left column for comparison; Autumn's equivalent endpoint is
+     /actuator/tasks -->
+
+The last row is the one name that changes, and the body changes with it.
+Autumn serves scheduled tasks at `/actuator/tasks`, and its `scheduled_tasks`
+is an object **keyed by task name** rather than the per-trigger-type lists
+(`cron`, `fixedDelay`, `fixedRate`, `custom`) Spring groups its tasks into, so
+a monitoring parser ported from Spring needs adapting — see
+[Multi-Replica Scheduled Tasks](scheduled-multi-replica.md) for a full
+response body. Like `/actuator/jobs` it is mounted only when `[actuator]
+sensitive = true`, so a `404` there means the profile has not enabled it
+rather than that you have the path wrong.
 
 Like Spring Boot's `loggers` actuator endpoint, Autumn's logger levels reload
-live -- `LogLevels::set_logger_level(name, level)` flips a target's level at
-runtime (with `current_level()` / `logger_overrides()` to inspect), no restart
-required. And just as `/actuator/info` surfaces git/build info, Autumn's
+live: `PUT /actuator/loggers/{name}` changes the running `tracing` subscriber,
+no restart required — see [Change log levels at
+runtime](logging-pii.md#change-log-levels-at-runtime-without-a-restart) for the
+request and response shapes and the sensitive-mode requirement. And just as `/actuator/info` surfaces git/build info, Autumn's
 `/actuator/info` carries a `BuildProvenance` (git SHA plus build metadata) via
 `build_provenance()`.
 
@@ -663,6 +678,15 @@ spins up an isolated test DB and runs the suite like `rails test` /
 `rails db:test:prepare`, `autumn destroy` is the exact namesake of
 `rails destroy` for reverting a generator, and `autumn i18n check` gives you
 an i18n-tasks-style health report on missing and unused translation keys.
+
+`autumn console` is the closest thing to `rails console` (and Django's
+`manage.py shell`, Phoenix's `iex -S mix`) that Rust can honestly offer. There
+is no stable `eval` in the language, so instead of a line-by-line REPL it
+scaffolds `src/bin/playground.rs` — pre-wired with the same config, database
+URL, and pool your app resolves — and compiles and runs it on every
+invocation. You edit a real Rust file with real types and real autocompletion;
+the command owns the compile-and-run loop. See the
+[data playground guide](console.md).
 
 ---
 

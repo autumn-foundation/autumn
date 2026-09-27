@@ -1,0 +1,5 @@
+error: two counter-cached associations on `Message` both maintain `users.message_count`, so every insert would count twice. The column name defaults to `{snake(model)}_count`, which collides whenever two `belongs_to` legs point at the same parent — give at least one of them an explicit `counter_cache = "<column>"` (and a matching column on `users`)
+  --> tests/compile-fail/model_counter_cache_duplicate_column.rs:35:57
+   |
+35 | #[belongs_to(User, fk = recipient_id, name = recipient, counter_cache)]
+   |                                                         ^^^^^^^^^^^^^

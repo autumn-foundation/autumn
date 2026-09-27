@@ -28,28 +28,36 @@
 //! AUTUMN_SIM_SEED=0x9f3a cargo test -p my-crate deterministic
 //! ```
 //!
-//! # Scope (Wave 1)
+//! # What a `Sim` gives you
 //!
-//! W1 ships the **deterministic executor, the seed / replay / injection
-//! plumbing, and the public [`Sim`] skeleton** only. The handles hung off
-//! [`Sim`] ([`SimRng`], [`SimClock`], [`Chaos`], [`SimApp`]) are frozen,
-//! stability-minded placeholders whose behavior lands in later waves:
-//!
-//! - **W2** wires virtual-clock advancing / draining onto [`SimClock`] against
-//!   [`crate::time::ClockSource`], and mounts an app on [`SimApp`].
-//! - **W3** exposes deterministic id / `Uuid` generation through [`SimRng`] and
-//!   the [`crate::entropy::Rng`] extractor / [`crate::entropy::Entropy`] seam,
-//!   and routes the framework's high-value id sites through it. Bridge a seeded
-//!   source into a mounted app with [`Sim::seeded_entropy`].
-//! - **W5** turns [`Chaos`] into a public fault-injection builder.
+//! - **Virtual time.** [`Sim::build`] mounts a [`crate::test::TestApp`] with a
+//!   virtual clock. [`Sim::advance`] and [`Sim::advance_to`] step it together
+//!   with tokio's paused timer, so `#[job]` backoff and `#[scheduled]` ticks fire
+//!   in virtual time. [`Sim::run_to_idle`] drains jobs, due ticks and durable
+//!   commit hooks.
+//! - **Seeded identity.** [`Sim::rng`] ([`SimRng`]) draws deterministic values.
+//!   [`Sim::build`] seeds the app's [`crate::entropy::Entropy`] from the seed,
+//!   so framework-minted ids (jobs, request ids, idempotency keys, sessions)
+//!   replay too. [`Sim::seeded_entropy`] returns the same source.
+//! - **Faults.** [`Chaos`] ([`Sim::chaos`]) injects seed-sampled faults.
+//!   [`FaultPlan`] (#1680), attached with
+//!   [`crate::test::TestApp::with_fault_plan`], injects authored ones and
+//!   records a serializable [`FaultOutcome`]. [`Sim::kill`] and
+//!   [`Sim::restart`] model a process crash; `sim::llm` is a seeded LLM stub.
+//! - **Assertions and sweeps.** [`always!`](crate::always) and
+//!   [`sometimes!`](crate::sometimes) ([`mod@assert`]). Behind the
+//!   `sim-testing` feature, `sim::op` generates workloads (`Sim::gen_ops`,
+//!   `Sim::run_proptest` with shrinking) and `sim::sweep` runs one scenario
+//!   across many seeds (`sweep_proptest`, driven in CI by the `sim-sweep` bin).
+//! - **Deadlocks.** With `AUTUMN_SIM_LIVENESS_BUDGET_SECS` set, a `#[sim_test]`
+//!   whose tasks all park panics with its replay line instead of hanging. See
+//!   [`__with_liveness_budget`] for the limits.
 //!
 //! Everything here is designed to grow additively (builder-style) without
 //! breaking the frozen surface — hence the `#[non_exhaustive]` markers.
 
-// The placeholder handles are intentionally thin in W1; their methods and
-// docs fill in over later waves. These narrowly-scoped allows keep the
-// skeleton clean under the workspace's pedantic lint set without masking real
-// issues in the behavioral code that lands later.
+// Several thin accessors here could be `const fn`; they stay non-const so the
+// frozen public surface can grow a non-const body later without a break.
 #![allow(clippy::missing_const_for_fn)]
 
 use std::sync::Arc;
@@ -76,6 +84,41 @@ use crate::time::TickingClock;
 #[doc(hidden)]
 pub mod substrate;
 
+// The chaos lane (W5, issue #1797): deterministic fault injection wired into
+// `Sim::build`. Additive and opt-in — a default (empty) `Chaos` installs
+// nothing. See the module docs for the determinism contract.
+pub mod chaos;
+
+#[cfg(feature = "mail")]
+pub use chaos::MailFault;
+pub use chaos::{Chaos, ChaosEvent, ChaosHook};
+
+// The authored fault lane (issue #1680): `FaultPlan`, an ordinal-targeted,
+// seed-deterministic fault schedule installed through `TestApp::with_fault_plan`
+// (not through `Sim::chaos`), plus the serializable `FaultOutcome` a scenario
+// asserts on. Additive and opt-in — a `TestApp` with no plan is untouched. See
+// the module docs for the determinism contract and how it differs from `Chaos`.
+pub mod fault;
+
+pub use fault::{
+    FaultEffect, FaultLedger, FaultOutcome, FaultPlan, FinalState, FiredFault, PlannedFault,
+    ReportedError,
+};
+
+// The seeded LLM stub (W5.b, item 6, issue #1797): a deterministic fake
+// completion client — canned responses + a seeded fault/latency schedule — for
+// exercising agent retry/fallback paths under the virtual clock. Standalone and
+// additive; it does not route through the `Chaos` builder. See the module docs
+// for the determinism contract.
+pub mod llm;
+
+pub use llm::{LlmCall, LlmClient, LlmError, LlmRequest, LlmResponse, SeededLlm, SeededLlmBuilder};
+
+// The crash lane (W5.c item 7, issue #1797): a seed-derived crash schedule plus
+// the `Sim` kill/restart primitive for durable crash-recovery tests. Additive —
+// the schedule is a pure function of the seed and installs nothing at build.
+pub mod crash;
+
 // The W6 semantic core (issue #1797): the `always!` / `sometimes!` assertion
 // macros and the thread-local non-vacuity registry. Public (documented) module —
 // the macros are `#[macro_export]`ed at the crate root (`autumn_web::always` /
@@ -87,6 +130,30 @@ pub use assert::{
     SometimesRegistry, assert_all_sometimes_satisfied, reset_sometimes_registry,
     sometimes_snapshot, sometimes_unsatisfied,
 };
+pub use crash::{CrashPoint, CrashSchedule};
+
+// The W6 op-driver (PR2, issue #1797): `Sim::gen_ops`/`Sim::gen_ops_with` (deterministic,
+// non-shrinking generation) and `Sim::run_proptest` (the shrink-capable
+// runner-owning entrypoint). Behind the `sim-testing` feature because it needs
+// `proptest` as a library (not just dev) dependency — see `autumn/Cargo.toml`.
+#[cfg(feature = "sim-testing")]
+pub mod op;
+
+// The W6 seed-sweep runner (PR3, issue #1797): `sweep_proptest` runs
+// `Sim::run_proptest` sequentially across a batch of seeds, reporting the
+// first failing seed (if any), and folds `sometimes!` reachability — across
+// every proptest case in every seed — across the whole swept range so a
+// green sweep is provably non-vacuous. Sequential, not parallel: see
+// `sim::sweep`'s module docs for why a `body` that mounts a real app makes
+// OS-thread parallelism unsafe here. The `sim-sweep` `[[bin]]`
+// (`autumn/src/bin/sim_sweep.rs`) is its CI-facing driver. Same
+// `sim-testing` feature gate as `op` — it builds directly on
+// `Sim::run_proptest_with_case_hook`.
+#[cfg(feature = "sim-testing")]
+pub mod sweep;
+
+#[cfg(feature = "sim-testing")]
+pub use sweep::{SweepFailure, SweepOutcome, sweep_proptest};
 
 /// The fixed, deterministic epoch the simulation clock starts at:
 /// `2020-01-01T00:00:00Z`.
@@ -115,7 +182,7 @@ pub struct Sim {
     /// printed on panic does this for you).
     pub seed: u64,
 
-    /// Seeded deterministic RNG. Generation helpers land in W3.
+    /// Seeded deterministic RNG, reached through [`Sim::rng`].
     rng: SimRng,
 
     /// Virtual clock, started at the fixed sim epoch
@@ -123,9 +190,14 @@ pub struct Sim {
     /// tokio's paused timer.
     clock: SimClock,
 
-    /// Fault-injection configuration. Becomes a public builder in W5.
-    #[allow(dead_code)] // fault-injection behavior lands in W5
+    /// Fault-injection configuration installed at [`Sim::build`]. A default
+    /// (empty) [`Chaos`] is inactive and installs nothing.
     chaos: Chaos,
+
+    /// Shared chaos runtime state (decision stream + event log), populated by
+    /// [`Sim::build`] when [`chaos`](Self::chaos) is active. Read through
+    /// [`Sim::__chaos_events`].
+    chaos_state: Option<Arc<chaos::ChaosState>>,
 
     /// Built [`crate::test::TestClient`] handle, mounted by [`Sim::build`] on
     /// the paused runtime with the virtual clock installed.
@@ -140,6 +212,11 @@ pub struct Sim {
     /// interior mutability — that keeps `Sim: Sync` and the `&self`
     /// advance/drain futures `Send` (a `Cell`/`RefCell` field would break both).
     strict_budget: Option<std::time::Duration>,
+
+    /// How many times [`mount`](Sim::mount) has run. The first mount seeds the
+    /// app's entropy from [`seed`](Sim::seed); each restart derives a new seed
+    /// from it, so a restarted process does not replay the crashed one's ids.
+    mounts: u64,
 }
 
 impl Sim {
@@ -147,8 +224,8 @@ impl Sim {
     ///
     /// Infallible and cheap: it seeds the RNG and starts the virtual clock but
     /// does **not** boot a database or an app, so an empty
-    /// [`#[sim_test]`](crate::sim_test) runs with zero setup. App mounting
-    /// arrives in W2 via [`SimApp`].
+    /// [`#[sim_test]`](crate::sim_test) runs with zero setup. Mount an app with
+    /// [`build`](Sim::build).
     #[must_use]
     pub fn from_seed(seed: u64) -> Self {
         // Each seed run starts with a clean reachability registry, so the sweep
@@ -164,9 +241,29 @@ impl Sim {
             rng: SimRng::new(seed),
             clock: SimClock::new(TickingClock::starting_at(epoch)),
             chaos: Chaos::default(),
+            chaos_state: None,
             app: SimApp::default(),
             strict_budget: None,
+            mounts: 0,
         }
+    }
+
+    /// Configure deterministic fault injection for this simulation.
+    ///
+    /// The `chaos` builder's hooks (transient DB checkout errors, job duplicate
+    /// delivery, clock skew) are installed at [`build`](Sim::build) time, each
+    /// fault decision drawn from a dedicated seed-derived stream so the same
+    /// seed and configuration replay the same fault schedule. A default
+    /// [`Chaos`] is inactive and changes nothing.
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::sim::Chaos;
+    /// sim.chaos(Chaos::default().db_transient_errors(0.1).job_duplicate_delivery(0.2));
+    /// let client = sim.build(TestApp::new().routes(routes![touch]).jobs(jobs![work]));
+    /// ```
+    pub fn chaos(&mut self, chaos: Chaos) -> &mut Self {
+        self.chaos = chaos;
+        self
     }
 
     /// The seed this simulation was constructed from.
@@ -192,6 +289,11 @@ impl Sim {
     /// ready to inject into a mounted app via
     /// [`crate::state::AppState::with_entropy`].
     ///
+    /// [`build`](Self::build) already installs this source in the app it
+    /// mounts, unless the test passed its own with
+    /// [`crate::test::TestApp::with_entropy`]. Use this to seed state you build
+    /// yourself.
+    ///
     /// This is the bridge W3 provides for W2's app mounting: the app the
     /// simulation drives resolves the [`crate::entropy::Rng`] extractor and
     /// every framework-minted identifier (job ids, request ids, idempotency
@@ -215,12 +317,19 @@ impl Sim {
     /// the fixed sim epoch (`2020-01-01T00:00:00Z`) and moving only when
     /// [`Sim::advance`] steps it. The built app also starts the in-process job
     /// runtime (the in-memory backend), so [`run_to_idle`](Sim::run_to_idle)
-    /// can drain enqueued jobs deterministically.
+    /// can drain enqueued jobs deterministically, and starts its `#[scheduled]`
+    /// tasks, whose ticks fire as virtual time crosses their deadlines.
     ///
-    /// Configure `app` fully before handing it over — routes, jobs, and (in a
-    /// later wave) a sim database are attached to the [`crate::test::TestApp`]
-    /// prior to this call. Do **not** call [`crate::test::TestApp::with_clock`]
-    /// yourself; `build` owns the clock so time stays in lockstep.
+    /// Unless `app` already has an entropy source from
+    /// [`crate::test::TestApp::with_entropy`], `build` installs one seeded from
+    /// [`seed`](Sim::seed), so framework-minted ids replay from the seed. A
+    /// later mount through [`restart`](Sim::restart) derives a new seed from it,
+    /// so a restarted process does not repeat the crashed one's ids.
+    ///
+    /// Configure `app` fully before handing it over: routes, jobs, tasks and a
+    /// sim database are attached to the [`crate::test::TestApp`] before this
+    /// call. Do **not** call [`crate::test::TestApp::with_clock`] yourself;
+    /// `build` owns the clock so time stays in lockstep.
     ///
     /// The returned borrow is convenient for an immediate request; to interleave
     /// requests with [`advance`](Sim::advance) / [`run_to_idle`](Sim::run_to_idle)
@@ -231,9 +340,134 @@ impl Sim {
     /// client.get("/hello").send().await.assert_ok();
     /// ```
     pub fn build(&mut self, app: crate::test::TestApp) -> &crate::test::TestClient {
-        let client = app.with_clock(self.clock.ticking()).build();
+        self.mount(app)
+    }
+
+    /// Mount `app` on the paused runtime with the simulation's virtual clock (and
+    /// active chaos hooks) installed, replacing any previously-mounted client.
+    ///
+    /// Shared by [`build`](Self::build) and [`restart`](Self::restart) so the
+    /// initial mount and a post-crash restart go through byte-for-byte the same
+    /// path. When chaos is active this re-derives the chaos decision state from
+    /// the seed, so a restart's fault schedule replays deterministically.
+    fn mount(&mut self, app: crate::test::TestApp) -> &crate::test::TestClient {
+        // Seed the app's entropy unless the test injected its own source, so
+        // framework-minted ids replay from the seed with no extra call.
+        let app = app.with_default_entropy(SeededEntropy::shared(mount_entropy_seed(
+            self.seed,
+            self.mounts,
+        )));
+        self.mounts += 1;
+        // When chaos is active, install its deterministic hooks (which also own
+        // the clock so a skew wrapper can be applied); otherwise the build is
+        // byte-for-byte the pre-W5 path — just the virtual clock.
+        let app = if self.chaos.is_active() {
+            let state = chaos::ChaosState::new(self.seed, &self.chaos);
+            self.chaos_state = Some(Arc::clone(&state));
+            chaos::install(app, &self.chaos, self.seed, self.clock.ticking(), state)
+        } else {
+            app.with_clock(self.clock.ticking())
+        };
+        let client = app.build();
         self.app.client = Some(client);
         self.app.client()
+    }
+
+    /// Simulate a process crash: drop the mounted app so the in-process job
+    /// runtime's in-flight work is **cancelled without completing** (its
+    /// [`Drop`] cancels the runtime's shutdown token and clears the global job
+    /// client), ready for durable recovery on [`restart`](Self::restart).
+    ///
+    /// This is the kill half of the W5.c crash-recovery primitive (item 7). It
+    /// deliberately drops **only** the app/runtime, never the durable database:
+    /// the caller holds the sim's DB substrate (e.g. an
+    /// `SqliteSubstrate`) and its `pool()`, so every committed row — crucially
+    /// the durable `autumn_repository_commit_hooks` queue — survives the crash
+    /// and is still there when a fresh app is mounted on the same pool.
+    ///
+    /// A crash after [`build`](Self::build) has not run is a no-op.
+    ///
+    /// # Durability boundary (stated plainly)
+    ///
+    /// Under the `sqlite` sim substrate the app runs the **in-memory `local`
+    /// job backend**, which is **not durable** — a kill drops its mid-flight and
+    /// still-queued jobs by design, exactly as a real process crash would drop an
+    /// in-memory queue. Item 7's durable guarantee is therefore asserted against
+    /// the DB-backed repository commit-hook queue, **not** the local job queue;
+    /// the in-memory job queue's by-design loss is documented, never pretended
+    /// durable. See the [`crash`] module docs.
+    pub fn kill(&mut self) {
+        // Dropping the client runs `TestJobRuntime::drop` (shutdown.cancel() +
+        // clear_global_job_client()), modelling the process dying mid-flight.
+        self.app.client = None;
+        // A fresh process has no in-memory chaos decision log; a restart
+        // re-derives it deterministically from the seed.
+        self.chaos_state = None;
+    }
+
+    /// Restart after a [`kill`](Self::kill): mount a fresh `app` on the paused
+    /// runtime, modelling a process restart on the **same durable database**.
+    ///
+    /// The caller rebuilds the `TestApp` against the *same* substrate pool
+    /// (`TestApp::new()…with_db(substrate.pool())`), so the restarted app sees
+    /// every row the crashed process committed. Following the restart with
+    /// [`run_to_idle`](Self::run_to_idle) drains the durable repository
+    /// commit-hook queue, recovering and running any hook the crash left
+    /// un-drained (at-least-once / idempotent). Registering the app's hook
+    /// runners on the fresh app models a real app re-registering them on boot.
+    pub fn restart(&mut self, app: crate::test::TestApp) -> &crate::test::TestClient {
+        self.mount(app)
+    }
+
+    /// Kill the running app and immediately [`restart`](Self::restart) it on a
+    /// fresh `app` — the kill-then-restart convenience over
+    /// [`kill`](Self::kill) + [`restart`](Self::restart).
+    ///
+    /// The `app` must be rebuilt against the same durable substrate pool so the
+    /// restarted process recovers the crashed one's committed rows.
+    pub fn crash_and_restart(&mut self, app: crate::test::TestApp) -> &crate::test::TestClient {
+        self.kill();
+        self.restart(app)
+    }
+
+    /// The seed-derived [`CrashSchedule`] for this simulation.
+    ///
+    /// A pure function of the [`seed`](Self::seed): two same-seed sims return an
+    /// equal schedule (the W5.c determinism Definition-of-Done), while different
+    /// seeds overwhelmingly diverge. The representative realized crash point is
+    /// its [`CrashSchedule::first`]; see the [`crash`] module docs for the
+    /// representative-vs-general scope.
+    #[must_use]
+    pub fn crash_schedule(&self) -> CrashSchedule {
+        CrashSchedule::derive(self.seed, crash::DEFAULT_CRASH_SCHEDULE_LEN)
+    }
+
+    /// The representative, realized crash point for this simulation — the first
+    /// entry of the seed-derived [`crash_schedule`](Self::crash_schedule).
+    ///
+    /// `None` only if the schedule is empty (it never is under the default
+    /// length). Deterministic for a given seed.
+    #[must_use]
+    pub fn crash_point(&self) -> Option<CrashPoint> {
+        self.crash_schedule().first().cloned()
+    }
+
+    /// The recorded chaos fault schedule for this simulation.
+    ///
+    /// Returns one [`ChaosEvent`] per chaos-hook invocation, in the order the
+    /// hooks fired — the reproducible *fault schedule* the run produced. Empty
+    /// when chaos was inactive or [`build`](Sim::build) has not run.
+    ///
+    /// Unstable sim plumbing (hidden from the stable surface, like the module's
+    /// other `__`-prefixed hooks); the W5 Definition-of-Done test asserts two
+    /// same-seed runs return equal schedules.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __chaos_events(&self) -> Vec<ChaosEvent> {
+        self.chaos_state
+            .as_ref()
+            .map(|state| state.events())
+            .unwrap_or_default()
     }
 
     /// Borrow the [`crate::test::TestClient`] mounted by [`build`](Sim::build).
@@ -280,7 +514,7 @@ impl Sim {
     ///
     /// # Budget & the `AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS` override
     ///
-    /// The default budget is deliberately generous (100 ms) so ordinary CI
+    /// The default budget is deliberately generous (2000 ms) so ordinary CI
     /// scheduling jitter never trips it — the target is a *real* sleep (seconds),
     /// not sub-millisecond noise. Set the environment variable
     /// `AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS` (whole milliseconds) to override
@@ -376,6 +610,11 @@ impl Sim {
         // real elapsed against the budget before returning. `advance_to` routes
         // through here, so it inherits the guard for free.
         let guard_start = self.wall_clock_guard_start();
+        // Let every ready task take one step at the current instant before time
+        // moves. A task spawned since the last yield (a `#[scheduled]` loop that
+        // `build` started, a job worker) then registers its first timer at the
+        // instant it was started, not at the end of this advance.
+        tokio::task::yield_now().await;
         // Step the framework clock first so any task woken by the tokio timer
         // that reads the clock observes the already-advanced instant.
         self.clock.advance(duration);
@@ -585,6 +824,83 @@ impl Sim {
     }
 }
 
+/// The entropy seed for the `mount`-th app a simulation mounts.
+///
+/// Mount 0 uses `seed` itself, so the default equals
+/// `with_entropy(SeededEntropy::new(sim.seed))`. A later mount (a restart after
+/// [`Sim::kill`]) derives its seed from `seed` and the mount number: a real
+/// restarted process draws new ids, and this keeps them seed-driven.
+fn mount_entropy_seed(seed: u64, mount: u64) -> u64 {
+    if mount == 0 {
+        return seed;
+    }
+    let derived = SeededEntropy::new(seed).derive_uuid(format!("sim-mount-{mount}"));
+    let bytes: [u8; 8] = derived.as_bytes()[..8]
+        .try_into()
+        .expect("a uuid has 16 bytes");
+    u64::from_le_bytes(bytes)
+}
+
+/// The longest timer tokio accepts (about 2.2 years). A larger liveness
+/// budget is clamped to it.
+const MAX_LIVENESS_BUDGET: std::time::Duration = std::time::Duration::from_millis(68_719_476_734);
+
+/// Resolve the liveness budget from the raw `AUTUMN_SIM_LIVENESS_BUDGET_SECS`
+/// value. A positive whole number of seconds arms the watchdog. Unset, blank,
+/// `0` or unparseable leaves it off.
+fn parse_liveness_budget(raw: Option<&str>) -> Option<std::time::Duration> {
+    let secs = raw.map(str::trim)?.parse::<u64>().ok()?;
+    if secs == 0 {
+        return None;
+    }
+    Some(std::time::Duration::from_secs(secs).min(MAX_LIVENESS_BUDGET))
+}
+
+/// Run a `#[sim_test]` body under the liveness watchdog, when
+/// `AUTUMN_SIM_LIVENESS_BUDGET_SECS` arms it.
+///
+/// Hidden macro plumbing, like [`__seed_from_env`]. See
+/// [`__with_liveness_budget`] for what the watchdog detects.
+#[doc(hidden)]
+pub async fn __with_liveness_watchdog<F: std::future::Future>(seed: u64, body: F) -> F::Output {
+    let raw = std::env::var("AUTUMN_SIM_LIVENESS_BUDGET_SECS").ok();
+    __with_liveness_budget(seed, parse_liveness_budget(raw.as_deref()), body).await
+}
+
+/// Run `body`, and panic with a message that names `seed` when it is still
+/// running after `budget` of virtual time. `None` runs `body` with no watchdog.
+///
+/// A deadlock parks every task with no timer that could wake one, so without a
+/// watchdog the test hangs. The watchdog is itself a timer, so the paused
+/// runtime advances straight to it and the test fails at once; the
+/// `#[sim_test]` macro then prints the replay line.
+///
+/// Two limits. A busy loop that never parks keeps the runtime from advancing,
+/// so it is not detected. And the paused runtime also advances while a task
+/// waits on something outside it (a lock another thread holds, real I/O), so
+/// arm the watchdog only where sim tests run one at a time
+/// (`--test-threads=1`) and do no real I/O.
+#[doc(hidden)]
+pub async fn __with_liveness_budget<F: std::future::Future>(
+    seed: u64,
+    budget: Option<std::time::Duration>,
+    body: F,
+) -> F::Output {
+    let Some(budget) = budget else {
+        return body.await;
+    };
+    tokio::time::timeout(budget, body)
+        .await
+        .unwrap_or_else(|_elapsed| {
+            panic!(
+                "sim liveness: the test body did not finish within {budget:?} of virtual time \
+                 (seed=0x{seed:x}). Every task was parked with no timer to wake one, which is \
+                 a deadlock, or the body waited past the budget. Raise \
+                 AUTUMN_SIM_LIVENESS_BUDGET_SECS for a legitimately long run."
+            )
+        })
+}
+
 /// Upper bound on cooperative yield rounds [`Sim::run_to_idle`] performs before
 /// returning, so a misbehaving always-ready task can never hang the drain.
 /// Generous relative to the handful of hops a job takes from the queue through
@@ -594,13 +910,13 @@ const MAX_DRAIN_STEPS: usize = 1024;
 /// Default real wall-clock budget for the `strict_wall_clock` leak guard
 /// ([`Sim::strict_wall_clock`]).
 ///
-/// Deliberately generous (100 ms): the guard exists to catch a *real* blocking
+/// Deliberately generous (2000 ms): the guard exists to catch a *real* blocking
 /// sleep escaping the virtual timer (seconds of wall time), so the budget must
 /// sit far above ordinary current-thread scheduling jitter to avoid false
 /// positives on a slow/contended CI runner. A legitimate virtual advance — even
 /// jumping a day of virtual time — costs microseconds of real time, orders of
 /// magnitude under this.
-const DEFAULT_STRICT_WALL_CLOCK_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+const DEFAULT_STRICT_WALL_CLOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Resolve the effective `strict_wall_clock` budget: the
 /// `AUTUMN_SIM_STRICT_WALL_CLOCK_BUDGET_MS` environment override when it holds a
@@ -816,15 +1132,6 @@ impl SimClock {
     }
 }
 
-/// Fault-injection configuration for a simulation.
-///
-/// An empty placeholder in W1. W5 makes this a public, `#[non_exhaustive]`
-/// builder (e.g. `db_transient_errors`, `clock_skew`, …) that the executor
-/// consults to deterministically inject faults.
-#[non_exhaustive]
-#[derive(Default, Debug, Clone)]
-pub struct Chaos {}
-
 /// The built application handle for a simulation.
 ///
 /// Holds the [`crate::test::TestClient`] mounted by [`Sim::build`] on the paused
@@ -901,11 +1208,43 @@ pub fn __replay_line(seed: u64, pkg: &str, test: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        __replay_line, AdvancePlan, DEFAULT_STRICT_WALL_CLOCK_BUDGET, Sim, parse_seed,
-        parse_strict_budget_ms, plan_advance_to, resolve_local_to_utc, strict_budget_from_env_or,
+        __replay_line, AdvancePlan, DEFAULT_STRICT_WALL_CLOCK_BUDGET, MAX_LIVENESS_BUDGET, Sim,
+        mount_entropy_seed, parse_liveness_budget, parse_seed, parse_strict_budget_ms,
+        plan_advance_to, resolve_local_to_utc, strict_budget_from_env_or,
     };
     use chrono::{NaiveDate, TimeZone, Utc};
     use rand::RngCore;
+
+    #[test]
+    fn liveness_budget_is_off_unless_armed() {
+        assert_eq!(parse_liveness_budget(None), None);
+        assert_eq!(parse_liveness_budget(Some("")), None);
+        assert_eq!(parse_liveness_budget(Some("0")), None);
+        assert_eq!(parse_liveness_budget(Some("soon")), None);
+        assert_eq!(parse_liveness_budget(Some("-5")), None);
+    }
+
+    #[test]
+    fn liveness_budget_takes_seconds_and_clamps_to_the_tokio_maximum() {
+        assert_eq!(
+            parse_liveness_budget(Some(" 90 ")),
+            Some(std::time::Duration::from_secs(90))
+        );
+        assert_eq!(
+            parse_liveness_budget(Some("18446744073709551615")),
+            Some(MAX_LIVENESS_BUDGET)
+        );
+    }
+
+    #[test]
+    fn mount_entropy_seed_is_the_sim_seed_first_then_derived() {
+        assert_eq!(mount_entropy_seed(7, 0), 7);
+        let restart = mount_entropy_seed(7, 1);
+        assert_ne!(restart, 7, "a restart draws a new stream");
+        assert_eq!(restart, mount_entropy_seed(7, 1), "and it is deterministic");
+        assert_ne!(restart, mount_entropy_seed(7, 2));
+        assert_ne!(restart, mount_entropy_seed(8, 1));
+    }
 
     #[test]
     fn replay_line_zero_seed_is_exact() {

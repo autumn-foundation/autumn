@@ -1,0 +1,47 @@
+# ── 0.7.0 Feature: failure capsules ────────────────────────────────────────
+#
+# `AUTUMN_PROFILE=capsules cargo run -p reddit-clone` boots the app exactly as
+# the dev profile does, plus failure-capsule capture. Every failing request —
+# a caught handler panic or a 5xx, the same two events the error-reporting
+# pipeline observes — writes one JSON file that `autumn replay` can re-run
+# offline. See docs/guide/failure-capsules.md and the README walkthrough.
+#
+# Capture lives in its own profile rather than in `autumn-dev.toml` because it
+# is a deliberate decision, not a default: a capsule contains a real request
+# and (for a route that touches the database) real rows, written to your disk
+# so they can be replayed byte for byte. Treat `tmp/autumn-capsules` the way
+# you would treat a directory of production database dumps — it is gitignored
+# at the workspace root, and it must not be served.
+
+[database]
+url = "postgres://autumn:autumn@127.0.0.1:5433/reddit"
+# Auto-apply migrations at startup. Only `dev`/`development` do that by
+# convention, and `capsules` is a custom profile — without this an operator
+# would have to boot the dev profile once first just to get the schema in
+# place. `auto_migrate` is the profile-agnostic override for exactly this case.
+# It is right for a local debugging profile and wrong for a production fleet,
+# where an explicit `autumn migrate` job runs before any replica starts.
+auto_migrate = true
+
+[mail]
+transport = "file"
+
+[failure_capture]
+enabled = true
+# Project-relative, like Autumn's other runtime files. Gitignored.
+dir = "tmp/autumn-capsules"
+# Retention. Pruned oldest-first *before* each write, so an error storm cannot
+# fill a disk; only files matching the capsule name pattern are ever deleted.
+max_capsules = 20
+
+[log]
+# Redaction is name-matched by **equality** after normalization, not by prefix
+# or substring — so `authorization` and `cookie` are covered out of the box but
+# `x-api-key` and `x-auth-token` are not, and would be recorded verbatim. This
+# app's own inbound webhook signature header is in the same boat: it carries a
+# secret-derived MAC and nothing in the default list matches it.
+filter_parameters = [
+  "stripe-signature",
+  "x-api-key",
+  "x-auth-token",
+]
