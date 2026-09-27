@@ -9520,6 +9520,28 @@ fn failed_install_report(name: &str, message: &str, output: &str) -> serde_json:
     })
 }
 
+/// Whether `listing` is verified by its install compiling, not plugin-check:
+/// `exempt`, or a failure that kept its exemption `reason`.
+fn is_exempt(listing: &toml::Value) -> bool {
+    listing["conformance"]["result"].as_str() == Some("exempt")
+        || listing["conformance"].get("reason").is_some()
+}
+
+/// `cargo check` an exempt listing's install. `Err` carries cargo's stderr.
+fn check_exempt_install(project: &Path, target: &str) -> Result<(), String> {
+    let check = Command::new("cargo")
+        .args(["check", "--all-targets"])
+        .current_dir(project)
+        .env("CARGO_TARGET_DIR", target)
+        .output()
+        .expect("cargo check");
+    if check.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&check.stderr).into_owned())
+    }
+}
+
 /// Delete one checked app's own binaries from the shared target dir. The
 /// dependency artifacts stay, so the next listing still builds warm.
 fn remove_app_binaries(target: &Path, app: &str) {
@@ -9580,6 +9602,7 @@ fn write_proposed_index(
     src: &str,
     reports: &[std::path::PathBuf],
     exempt: &[String],
+    exempt_failed: &[String],
 ) -> Result<(), String> {
     let proposed = dir.join("index.toml");
     fs::write(&proposed, src).unwrap();
@@ -9596,6 +9619,9 @@ fn write_proposed_index(
     }
     for name in exempt {
         args.extend(["--exempt".to_owned(), name.clone()]);
+    }
+    for name in exempt_failed {
+        args.extend(["--exempt-failed".to_owned(), name.clone()]);
     }
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let (stdout, stderr, code) = run_autumn_env_status(dir, &args, &[]);
@@ -9638,6 +9664,7 @@ fn plugin_index_reverify_listings() {
     let mut failures = Vec::new();
     let mut written_reports = Vec::new();
     let mut exempt_ok = Vec::new();
+    let mut exempt_failed = Vec::new();
 
     for listing in listings {
         let name = listing["name"].as_str().unwrap();
@@ -9654,9 +9681,9 @@ fn plugin_index_reverify_listings() {
         if let Err(failure) = add_unflagged(tmp.path(), &project, listing) {
             // A failed install is a failed run: record it, so the listing is
             // flagged or delisted rather than left as it was.
-            if recorded != "exempt"
-                && let Some(dir) = &reports
-            {
+            if is_exempt(listing) {
+                exempt_failed.push(name.to_owned());
+            } else if let Some(dir) = &reports {
                 let path = dir.join(format!("{name}.json"));
                 let report = failed_install_report(name, "`plugin add` failed", &failure);
                 fs::write(&path, report.to_string()).unwrap();
@@ -9669,20 +9696,22 @@ fn plugin_index_reverify_listings() {
             mount_community(&project, name);
         }
 
-        if recorded == "exempt" {
-            let check = Command::new("cargo")
-                .args(["check", "--all-targets"])
-                .current_dir(&project)
-                .env("CARGO_TARGET_DIR", target)
-                .output()
-                .expect("cargo check");
-            if check.status.success() {
-                exempt_ok.push(name.to_owned());
-            } else {
-                failures.push(format!(
-                    "{name}: exempt, but its install does not compile:\n{}",
-                    String::from_utf8_lossy(&check.stderr)
-                ));
+        if is_exempt(listing) {
+            match check_exempt_install(&project, target) {
+                Ok(()) => {
+                    exempt_ok.push(name.to_owned());
+                    if recorded != "exempt" {
+                        failures.push(format!(
+                            "{name}: the index records `{recorded}`, but its install now compiles"
+                        ));
+                    }
+                }
+                Err(stderr) => {
+                    exempt_failed.push(name.to_owned());
+                    failures.push(format!(
+                        "{name}: exempt, but its install does not compile:\n{stderr}"
+                    ));
+                }
             }
             continue;
         }
@@ -9707,7 +9736,8 @@ fn plugin_index_reverify_listings() {
         }
     }
     if let Some(dir) = &reports
-        && let Err(failure) = write_proposed_index(dir, &src, &written_reports, &exempt_ok)
+        && let Err(failure) =
+            write_proposed_index(dir, &src, &written_reports, &exempt_ok, &exempt_failed)
     {
         failures.push(failure);
     }

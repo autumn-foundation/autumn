@@ -846,6 +846,10 @@ pub enum IndexSubcommands {
         /// An exempt listing whose install gate passed (repeatable).
         #[arg(long, value_name = "NAME")]
         exempt: Vec<String>,
+        /// An exempt listing whose install gate failed (repeatable). It is
+        /// flagged, or delisted on a second release; a later pass recovers it.
+        #[arg(long = "exempt-failed", value_name = "NAME")]
+        exempt_failed: Vec<String>,
         /// The `autumn-web` release the runs used. Default: this CLI's.
         #[arg(long, value_name = "VERSION")]
         against: Option<String>,
@@ -885,6 +889,7 @@ fn run_plugin_index(action: IndexSubcommands) -> i32 {
             reports,
             inspects,
             exempt,
+            exempt_failed,
             against,
             date,
         } => {
@@ -898,6 +903,7 @@ fn run_plugin_index(action: IndexSubcommands) -> i32 {
                 reports: &reports,
                 inspects: &inspects,
                 exempt: &exempt,
+                exempt_failed: &exempt_failed,
                 against: against.as_deref().unwrap_or(release),
                 date: date.as_deref().unwrap_or(&today),
             })
@@ -5874,20 +5880,27 @@ fn resolve_scaffold_plugins(
         eprintln!("autumn new: {err}");
         std::process::exit(1);
     });
+    // The trust review, before any file is written and before a refusal, so
+    // a refused listing still shows its facts (#1625, AC 6).
+    let mut shown: Vec<String> = Vec::new();
+    for name in names {
+        let standing = plugin::standing(&loaded.index, name);
+        let listed_name = match &standing {
+            plugin::Standing::Listed(l) | plugin::Standing::Delisted(l) => l.name.clone(),
+            plugin::Standing::Unlisted => name.clone(),
+        };
+        if !shown.contains(&listed_name) {
+            println!("{}", plugin::render_trust(&listed_name, &standing));
+            shown.push(listed_name);
+        }
+    }
     match plugin::preflight_scaffold_plugins(
         names,
         &loaded.index,
         scaffold_autumn_web,
         plugin::registry::latest_version,
     ) {
-        Ok(plugins) => {
-            // The trust review, before any file is written (#1625, AC 6).
-            for p in &plugins {
-                let standing = plugin::standing(&loaded.index, &p.name);
-                println!("{}", plugin::render_trust(&p.name, &standing));
-            }
-            plugins
-        }
+        Ok(plugins) => plugins,
         Err(err) => {
             eprintln!("autumn new: {err}");
             std::process::exit(1);

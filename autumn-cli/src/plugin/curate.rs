@@ -369,12 +369,10 @@ pub fn apply_inspect(
 ///
 /// When the listing is not exempt: a `Plugin` must bring a report.
 pub fn apply_exempt(listing: &mut Listing, against: &str, date: &str) -> Result<(), String> {
-    if listing.conformance.result != CheckOutcome::Exempt {
-        return Err(format!(
-            "`{}` is not exempt; record its `autumn plugin-check` report instead",
-            listing.name
-        ));
-    }
+    require_exempt_class(listing)?;
+    listing.conformance.result = CheckOutcome::Exempt;
+    listing.status = Status::Listed;
+    listing.note.clear();
     against.clone_into(&mut listing.conformance.autumn_web);
     date.clone_into(&mut listing.conformance.checked);
     // First-party crates are lockstep: the release is their version, and its
@@ -384,6 +382,40 @@ pub fn apply_exempt(listing: &mut Listing, against: &str, date: &str) -> Result<
         listing.autumn_web = autumn_web::plugin_contract::lockstep_range(against);
     }
     Ok(())
+}
+
+/// Record a failed install gate for an exempt listing: flag it, or delist it
+/// on a second release. The exemption stays, so a later pass recovers it.
+///
+/// # Errors
+///
+/// When the listing is not exempt.
+pub fn apply_exempt_failed(
+    listing: &mut Listing,
+    against: &str,
+    date: &str,
+) -> Result<Transition, String> {
+    require_exempt_class(listing)?;
+    let reason = std::mem::take(&mut listing.conformance.reason);
+    let t = transition(listing, Some("installability"), against, date);
+    listing.conformance.reason = reason;
+    Ok(t)
+}
+
+/// An exempt listing is verified by its install gate, not by plugin-check:
+/// its result is `exempt`, or a failure that kept its exemption `reason`.
+fn require_exempt_class(listing: &Listing) -> Result<(), String> {
+    let exempt = listing.conformance.result == CheckOutcome::Exempt
+        || (listing.conformance.result == CheckOutcome::Fail
+            && !listing.conformance.reason.trim().is_empty());
+    if exempt {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{}` is not exempt; record its `autumn plugin-check` report instead",
+            listing.name
+        ))
+    }
 }
 
 /// Write the fields `record` owns back into the index text, and keep every
@@ -582,6 +614,8 @@ pub struct RecordOptions<'a> {
     pub inspects: &'a [PathBuf],
     /// Exempt listings whose install gate passed.
     pub exempt: &'a [String],
+    /// Exempt listings whose install gate failed.
+    pub exempt_failed: &'a [String],
     /// The `autumn-web` release the runs used.
     pub against: &'a str,
     /// The run date, `YYYY-MM-DD`.
@@ -675,6 +709,19 @@ fn record(opts: &RecordOptions<'_>) -> Result<Vec<String>, String> {
         src = write_listing(&src, &listing)?;
         lines.push(format!(
             "{name}: exempt, refreshed for autumn-web {}",
+            opts.against
+        ));
+    }
+    for name in opts.exempt_failed {
+        let parsed = index::parse(&src).map_err(|e| e.to_string())?;
+        let mut listing = parsed
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("the index has no listing for `{}`", index::sanitize(name)))?;
+        let transition = apply_exempt_failed(&mut listing, opts.against, opts.date)?;
+        src = write_listing(&src, &listing)?;
+        lines.push(format!(
+            "{name}: exempt, {transition:?} on autumn-web {}",
             opts.against
         ));
     }
@@ -1200,6 +1247,44 @@ mod tests {
         assert_eq!(l.version, "0.8.0");
     }
 
+    /// A failed exempt check is recorded: flag, then delist on a later
+    /// release. The exemption (its `reason`) stays, so a later pass recovers.
+    #[test]
+    fn a_failed_exempt_check_flags_then_recovers() {
+        let mut l = listing("autumn-storage-s3");
+        let reason = l.conformance.reason.clone();
+        assert!(!reason.is_empty());
+        let t = apply_exempt_failed(&mut l, "0.8.0", "2026-10-01").expect("flag");
+        assert_eq!(t, Transition::Flagged);
+        assert_eq!(l.status, Status::Incompatible);
+        assert_eq!(l.conformance.result, CheckOutcome::Fail);
+        assert_eq!(l.conformance.reason, reason);
+        let one = |l: &Listing| index::PluginIndex {
+            schema: index::SCHEMA,
+            plugins: vec![l.clone()],
+        };
+        assert!(
+            index::validate(&one(&l)).is_empty(),
+            "{:?}",
+            index::validate(&one(&l))
+        );
+        // Recovery: the next passing compile relists it as exempt.
+        apply_exempt(&mut l, "0.8.0", "2026-10-02").expect("recover");
+        assert_eq!(l.status, Status::Listed);
+        assert_eq!(l.conformance.result, CheckOutcome::Exempt);
+        assert!(l.note.is_empty());
+        // Two failures on different releases delist it.
+        apply_exempt_failed(&mut l, "0.8.0", "2026-10-03").expect("flag");
+        let t = apply_exempt_failed(&mut l, "0.9.0", "2026-11-01").expect("delist");
+        assert_eq!(t, Transition::Delisted);
+    }
+
+    #[test]
+    fn a_plugin_listing_cannot_be_recorded_as_exempt_failed() {
+        let mut l = listing("autumn-admin-plugin");
+        assert!(apply_exempt_failed(&mut l, "0.8.0", "2026-10-01").is_err());
+    }
+
     #[test]
     fn a_plugin_listing_cannot_be_refreshed_as_exempt() {
         let mut l = listing("autumn-admin-plugin");
@@ -1304,6 +1389,7 @@ mod tests {
             inspects: &[],
             reports: &[report_path],
             exempt: &["autumn-storage-s3".to_owned()],
+            exempt_failed: &[],
             against: "0.7.0",
             date: "2026-10-01",
         });
@@ -1345,6 +1431,7 @@ mod tests {
             inspects: &[],
             reports: &[fail, pass],
             exempt: &[],
+            exempt_failed: &[],
             against: release,
             date: "2026-10-01",
         });
@@ -1370,6 +1457,7 @@ mod tests {
             inspects: &[],
             reports: &[open_range],
             exempt: &[],
+            exempt_failed: &[],
             against: "0.7.0",
             date: "2026-10-01",
         });
@@ -1409,6 +1497,7 @@ mod tests {
             inspects: &[],
             reports: &[],
             exempt: &["autumn-storage-s3".to_owned()],
+            exempt_failed: &[],
             against: "0.7.0",
             date: "tomorrow",
         });

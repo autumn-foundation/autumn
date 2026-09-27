@@ -129,6 +129,10 @@ On each `autumn-web` release, the maintainer does these steps:
      --report <dir>/*.json --exempt autumn-storage-s3
    ```
 
+   Use `--exempt-failed <name>` instead of `--exempt` when an exempt
+   listing's install does not compile. It follows the rules below, and keeps
+   the exemption, so a later `--exempt` relists it.
+
 3. Run `autumn plugin index check`, then commit the result with the release.
 
 Until step 2, `autumn plugin index check` fails: each listing was verified on
