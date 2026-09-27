@@ -60,16 +60,50 @@ does not cover `https://www.example.com`, `http://example.com`, or
 
 ## CORS with credentials (cookies and `Authorization`)
 
-By default Autumn sends no `Access-Control-Allow-Credentials` header, so the
-browser withholds cookies on cross-origin requests and will not expose the
-response to script if you send them anyway. If the calling origin needs to send
-your session cookie, opt in:
+`allow_credentials = true` makes Autumn send
+`Access-Control-Allow-Credentials: true`. **On its own that is not enough to get
+your session cookie onto a cross-origin request** — it is one of three
+independent conditions, and all three must hold:
 
 ```toml
 [cors]
-allowed_origins = ["https://app.example.com"]
+allowed_origins = ["https://app.example.com"]   # 1. the server permits credentials
 allow_credentials = true
 ```
+
+2. **The caller must ask for them.** A cross-origin `fetch` sends no cookies
+   unless it opts in, and the default (`same-origin`) does not count as opting
+   in:
+
+   ```js
+   fetch("https://api.example.com/me", { credentials: "include" })
+   ```
+
+3. **The cookie must be sendable cross-site.** Autumn's session cookie defaults
+   to `session.same_site = "Lax"`, and a `Lax` cookie is not sent on a
+   cross-site `fetch` at all — so this combination silently yields an
+   unauthenticated request even with the two above in place. A cross-site
+   session needs:
+
+   ```toml
+   [session]
+   same_site = "None"
+   ```
+
+   Browsers honor `None` only on a `Secure` cookie. `session.secure` is already
+   `true` by default, so there is nothing to flip — but it does mean both the app
+   and the calling page must be on HTTPS, which rules the combination out over
+   plain `http://localhost` unless you terminate TLS locally.
+
+   That is a real loosening of CSRF protection — `SameSite` is a defense you are
+   giving up — so prefer putting both the app and its front-end on one origin
+   (a reverse proxy, a path prefix) over reaching for `None`. See
+   [Authentication](authentication.md) for the rest of the session cookie's
+   settings.
+
+If requests arrive unauthenticated with all three in place, check the request in
+devtools for a `Cookie` header: if the browser is not sending one, the problem is
+condition 2 or 3, not `[cors]`.
 
 **`allow_credentials = true` and `allowed_origins = ["*"]` cannot be combined.**
 Browsers reject that pair outright per the Fetch standard, so Autumn rejects it
@@ -96,9 +130,21 @@ With an allowlisted origin calling you, a normal response carries:
 | `Access-Control-Allow-Headers` | `allowed_headers` (preflight responses) |
 | `Access-Control-Max-Age` | `max_age_secs` (preflight responses) |
 
-If you are reading devtools and `Access-Control-Allow-Origin` is absent
-entirely, the middleware is not installed — check `allowed_origins`, not the
-other keys.
+A missing `Access-Control-Allow-Origin` does **not** tell you which of two
+different problems you have, because both look identical in devtools: the layer
+may not be installed (`allowed_origins` is empty), or it may be installed and
+the request's `Origin` may simply not match any entry — an exact match on
+scheme, host and port, so a differing port or `http` vs `https` misses. Autumn
+distinguishes them for you in the startup log: when the layer is installed it
+logs `CORS enabled` with the origin list and the credentials flag, and the
+startup banner lists `CORS` among the active middleware. No such line means
+`allowed_origins` is empty; a line whose list does not contain the origin your
+browser is actually sending means the allowlist is the problem.
+
+A malformed entry is a third way to miss: an origin that will not parse as a
+header value is dropped with a `CORS: ignoring malformed allowed_origin`
+warning, and the rest of the list still applies — so a typo'd entry fails
+without failing the boot.
 
 ## CORS preflight requests
 
@@ -145,11 +191,20 @@ page does not touch.
 ## CORS and the `/mcp` endpoint
 
 The `/mcp` JSON-RPC endpoint reuses `cors.allowed_origins` for a second purpose:
-DNS-rebinding protection. A request whose `Origin` is not on the list gets a
-`403` before any parsing, while a request with **no** `Origin` header at all
-(curl, SDKs, server-side agents) is allowed through. So a browser-based MCP
-client needs its origin added here; an agent client needs no CORS configuration.
-[Model Context Protocol](mcp.md) has the details.
+DNS-rebinding protection. It accepts a request when any of these holds, and
+returns `403` before any parsing otherwise:
+
+- it carries **no `Origin` header** at all — curl, SDKs and server-side agents
+  are not subject to DNS rebinding, so an agent client needs no CORS
+  configuration;
+- its `Origin` is **the same origin as the request's own host**, and that host is
+  a trusted host. A browser MCP client served by the app itself is therefore
+  already allowed, without an `allowed_origins` entry;
+- its `Origin` is listed in `cors.allowed_origins` (or the list holds `"*"`).
+
+So it is specifically a **cross-origin** browser MCP client that needs its origin
+added here. [Model Context Protocol](mcp.md) has the details, including how the
+host is resolved behind a TLS-terminating proxy.
 
 ## S3 presigned uploads need a bucket CORS policy too
 
