@@ -295,6 +295,7 @@ impl Sim {
             ticking: clock.ticking(),
             tokio_origin: std::sync::OnceLock::new(),
             shadowed: std::sync::Mutex::new(std::time::Duration::ZERO),
+            own_advanced: std::sync::Mutex::new(std::time::Duration::ZERO),
         });
         let ambient_guard = crate::time::install_ambient(ambient_clock.clone());
         let shadow = ShadowGuard::enter(Arc::clone(&ambient_clock));
@@ -750,6 +751,7 @@ impl Sim {
         self.clock.advance(duration);
         // Advance tokio's paused timer wheel; this fires due timers and yields
         // so their tasks are polled before returning.
+        self.ambient.note_advance(duration);
         tokio::time::advance(duration).await;
         self.enforce_wall_clock_budget(guard_start);
     }
@@ -1374,14 +1376,42 @@ struct AmbientSimClock {
     /// clock is one per runtime, so an inner sim's `advance` also moves it;
     /// this keeps that time off this sim's timeline.
     shadowed: std::sync::Mutex<std::time::Duration>,
+    /// Total time this sim's own `Sim::advance` calls moved tokio's clock.
+    /// Time a sim advances is its own, even while a nested sim shadows it.
+    own_advanced: std::sync::Mutex<std::time::Duration>,
 }
 
 impl AmbientSimClock {
-    /// Take `[start, end)` of tokio time off this sim's timeline.
-    fn exclude(&self, start: tokio::time::Instant, end: tokio::time::Instant) {
+    /// Record an advance this sim made itself.
+    fn note_advance(&self, duration: std::time::Duration) {
+        let mut own = self
+            .own_advanced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *own = own.saturating_add(duration);
+    }
+
+    /// Total time this sim advanced itself.
+    fn own_advanced(&self) -> std::time::Duration {
+        *self
+            .own_advanced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Take `[start, end)` of tokio time off this sim's timeline, except the
+    /// `kept` part: time this sim advanced itself in that window.
+    fn exclude(
+        &self,
+        start: tokio::time::Instant,
+        end: tokio::time::Instant,
+        kept: std::time::Duration,
+    ) {
         // No elapsed read yet: start this sim's timeline after the gap.
         let origin = *self.tokio_origin.get_or_init(|| end);
-        let gap = end.saturating_duration_since(start.max(origin));
+        let gap = end
+            .saturating_duration_since(start.max(origin))
+            .saturating_sub(kept);
         let mut shadowed = self
             .shadowed
             .lock()
@@ -1400,8 +1430,13 @@ thread_local! {
 /// drop takes the tokio time it lived off the outer sim's timeline.
 struct ShadowGuard {
     own: Arc<AmbientSimClock>,
-    /// The sim this one shadows, and tokio's instant when this one started.
-    outer: Option<(Arc<AmbientSimClock>, tokio::time::Instant)>,
+    /// The sim this one shadows, tokio's instant when this one started, and
+    /// the outer sim's own advances at that instant.
+    outer: Option<(
+        Arc<AmbientSimClock>,
+        tokio::time::Instant,
+        std::time::Duration,
+    )>,
 }
 
 impl ShadowGuard {
@@ -1415,10 +1450,11 @@ impl ShadowGuard {
         let start = tokio::runtime::Handle::try_current()
             .ok()
             .map(|_| tokio::time::Instant::now());
-        Self {
-            own,
-            outer: outer.zip(start),
-        }
+        let outer = outer.zip(start).map(|(outer, start)| {
+            let advanced = outer.own_advanced();
+            (outer, start, advanced)
+        });
+        Self { own, outer }
     }
 }
 
@@ -1429,10 +1465,11 @@ impl Drop for ShadowGuard {
                 stack.retain(|clock| !Arc::ptr_eq(clock, &self.own));
             }
         });
-        if let Some((outer, start)) = self.outer.take()
+        if let Some((outer, start, advanced_at_start)) = self.outer.take()
             && tokio::runtime::Handle::try_current().is_ok()
         {
-            outer.exclude(start, tokio::time::Instant::now());
+            let kept = outer.own_advanced().saturating_sub(advanced_at_start);
+            outer.exclude(start, tokio::time::Instant::now(), kept);
         }
     }
 }

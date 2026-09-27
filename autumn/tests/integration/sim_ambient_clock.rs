@@ -94,3 +94,20 @@ async fn sim_ambient_clock_nested_sim_time_stays_off_the_outer_timeline(sim: Sim
     sim.advance(HOUR).await;
     assert_eq!(ambient_instant().saturating_duration_since(start), HOUR);
 }
+
+#[sim_test]
+async fn sim_ambient_clock_outer_advance_during_a_nested_sim_is_kept(sim: Sim) {
+    // The outer sim advances itself while an inner sim lives. That hour is the
+    // outer sim's own, so its wall and elapsed time stay in lockstep.
+    let start = ambient_instant();
+    let inner = Sim::from_seed(sim.seed.wrapping_add(1));
+    inner.advance(HOUR).await;
+    sim.advance(HOUR).await;
+    drop(inner);
+    assert_eq!(ambient_now(), sim_epoch() + chrono::Duration::hours(1));
+    assert_eq!(
+        ambient_instant().saturating_duration_since(start),
+        HOUR,
+        "only the outer sim's own hour is on its timeline"
+    );
+}
