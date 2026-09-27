@@ -16,6 +16,10 @@ RUNNER_COUNT="${RUNNER_COUNT:-6}"
 GH_OWNER="${GH_OWNER:-madmax983}"
 GH_REPO="${GH_REPO:-autumn}"
 RUNNER_VERSION="${RUNNER_VERSION:-}"   # empty => resolve the latest release at boot
+# Workflow-controlled runner-name prefix so the provisioner can verify THIS run's
+# runners by name (see provision-self-hosted-runner.yml). Empty => run-ephemeral.sh
+# falls back to hetzner-$(hostname).
+RUNNER_NAME_PREFIX="${RUNNER_NAME_PREFIX:-}"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
@@ -33,6 +37,54 @@ echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.
 apt-get update
 apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 systemctl enable --now docker
+
+# --- system-wide Rust toolchain -------------------------------------------
+# ci.yml's Test job sets Rust up with dtolnay/rust-toolchain, which installs
+# cargo/rustc into the RUNNER user's ~/.cargo/bin and only exports that dir via
+# $GITHUB_PATH for workflow *steps*. Subprocesses SPAWNED BY THE TESTS — e.g.
+# autumn-cli's `Command::new("cargo").args(["metadata", ...])` (src/dev.rs) and
+# `Command::new(rustc)` (src/new.rs) — resolve the binary via a plain PATH
+# lookup and do not reliably inherit that step-only PATH, and a test that
+# env_clear()s or overrides $HOME loses the $HOME/.cargo resolution entirely, so
+# those spawns fail with `Os { code: 2, kind: NotFound }`. Install the toolchain
+# system-wide in an absolute, HOME-independent location so every process (and
+# every child it spawns) can resolve cargo/rustc/rustup regardless of $HOME or a
+# reset environment.
+export RUSTUP_HOME=/opt/rust/rustup
+export CARGO_HOME=/opt/rust/cargo
+curl -fsSL https://sh.rustup.rs \
+  | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable \
+      --component rustfmt --component clippy
+# Record a system default toolchain under the absolute RUSTUP_HOME so a rustup
+# proxy invoked with a cleared/reset environment still resolves a toolchain.
+RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo /opt/rust/cargo/bin/rustup default stable
+# Belt-and-suspenders: symlink the proxies onto the exec search path. The
+# load-bearing target is /usr/bin: when a process spawns a command by name with
+# PATH unset/cleared (Command::env_clear()), glibc's execvp falls back to the
+# confstr _CS_PATH default of `/bin:/usr/bin` (verify: `getconf PATH`), which
+# does NOT include /usr/local/bin — so a link there alone would still NotFound
+# an env_clear'd `cargo`/`rustc` spawn. Linking into /usr/bin puts the proxies
+# on that default path (`env -i /usr/bin/cargo --version` succeeds). We also
+# link into /usr/local/bin, which is earlier in a normal PATH. /usr/bin/{cargo,
+# rustc,rustup} are free on this image (Rust is installed via rustup at /opt/rust,
+# not apt), so `ln -sf` clobbers no distro package.
+for b in cargo rustc rustup; do
+  ln -sf /opt/rust/cargo/bin/"${b}" /usr/local/bin/"${b}"
+  ln -sf /opt/rust/cargo/bin/"${b}" /usr/bin/"${b}"
+done
+# Login shells (and anything sourcing /etc/profile) also get the toolchain BIN
+# dir on PATH. Deliberately do NOT export RUSTUP_HOME/CARGO_HOME here: pointing
+# them at the read-only /opt/rust would break job-time toolchain/tool installs
+# (dtolnay/rust-toolchain, `cargo install cargo-fuzz`) for login-shell jobs too.
+# Left unset, they default to the runner user's writable ~/.rustup / ~/.cargo.
+cat > /etc/profile.d/rust.sh <<'PROFILE'
+export PATH="/opt/rust/cargo/bin:${PATH}"
+PROFILE
+chmod 0644 /etc/profile.d/rust.sh
+# Make the whole toolchain world-readable/traversable (done LAST so every file
+# rustup wrote is covered) so the unprivileged `runner` user — and the CI test
+# subprocesses running as it — can execute it.
+chmod -R a+rX /opt/rust
 
 # --- unprivileged runner user (needs sudo: ci.yml runs sudo apt-get / sudo rm) ---
 if ! id -u "${RUNNER_USER}" >/dev/null 2>&1; then
@@ -76,6 +128,7 @@ cat > /etc/autumn-runner/env <<EOF
 GH_OWNER=${GH_OWNER}
 GH_REPO=${GH_REPO}
 RUNNER_HOME=${RUNNER_HOME}
+RUNNER_NAME_PREFIX=${RUNNER_NAME_PREFIX}
 EOF
 chmod 0644 /etc/autumn-runner/env
 
@@ -104,10 +157,26 @@ sudo -u runner rm -f .runner .credentials .credentials_rsaparams 2>/dev/null || 
 sudo -u runner ./config.sh --unattended --replace \
   --url "https://github.com/${GH_OWNER}/${GH_REPO}" \
   --token "${reg_token}" \
-  --name "hetzner-$(hostname)-${slot}" \
+  --name "${RUNNER_NAME_PREFIX:-hetzner-$(hostname)}-${slot}" \
   --labels "self-hosted,hetzner,linux,x64" \
   --ephemeral
-exec sudo -u runner ./run.sh
+# The runner worker (Runner.Worker) is started via `sudo -u runner ./run.sh`,
+# and sudo's default env_reset resets PATH to secure_path — so the unit's
+# Environment=PATH never reaches the worker or the cargo/rustc it spawns. Set
+# PATH explicitly with `env` at the sudo boundary so run.sh, Runner.Worker, and
+# every spawned `cargo`/`rustc` subprocess resolve the system toolchain binaries
+# via /opt/rust/cargo/bin + the /usr/local/bin symlinks.
+#
+# Deliberately do NOT set RUSTUP_HOME/CARGO_HOME here: /opt/rust is root-owned
+# and read-only (a+rX), so pointing them there would make job-time installs
+# (dtolnay/rust-toolchain@nightly, `cargo install cargo-fuzz`) fail with
+# permission errors. Left unset, they default to the runner user's WRITABLE
+# ~/.rustup / ~/.cargo, where the job's own toolchain step installs; the rustup
+# proxy (found on PATH) then resolves that per-user toolchain. This mirrors
+# GitHub-hosted runners: system-discoverable binaries + a per-user writable home.
+exec sudo -u runner env \
+  PATH="/opt/rust/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  ./run.sh
 WRAP
 chmod 0755 "${RUNNER_HOME}/run-ephemeral.sh"
 
@@ -122,6 +191,16 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+# Put the system-wide Rust toolchain BIN dir (installed by bootstrap.sh at
+# /opt/rust) on the service PATH so the runner service, the Runner.Worker it
+# forks, `cargo`, AND every subprocess the tests spawn (autumn-cli's
+# `cargo metadata` / `rustc`) resolve cargo/rustc/rustup without depending on
+# $GITHUB_PATH or the runner user's $HOME (fixes the `Os NotFound` spawn
+# failures on the self-hosted runner). Deliberately do NOT set
+# RUSTUP_HOME/CARGO_HOME: /opt/rust is read-only, so pointing them there would
+# break job-time installs (dtolnay/rust-toolchain, cargo-fuzz). Left unset they
+# default to the runner user's writable ~/.rustup / ~/.cargo.
+Environment=PATH=/opt/rust/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/opt/autumn-runner/run-ephemeral.sh %i
 Restart=always
 RestartSec=5

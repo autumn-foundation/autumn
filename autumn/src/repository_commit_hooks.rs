@@ -1377,7 +1377,7 @@ fn spawn_repository_commit_hook_kick_worker(
 }
 
 #[cfg(not(feature = "sqlite"))]
-async fn drain_ready_repository_commit_hooks(pool: &PgPool, worker_id: &str, max_rows: usize) {
+pub async fn drain_ready_repository_commit_hooks(pool: &PgPool, worker_id: &str, max_rows: usize) {
     for _ in 0..max_rows {
         let Some(row) = pg_claim_next_repository_commit_hook(pool, worker_id).await else {
             break;
@@ -1464,7 +1464,10 @@ async fn run_repository_commit_hook_row_value(
 
     match result {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(error.to_string()),
+        // `message`, not `Display`: both nack paths persist this in
+        // `last_error`, so it must not move when `Display` gains the field
+        // list of a hook that returned a validation error.
+        Ok(Err(error)) => Err(error.message()),
         Err(panic) => Err(format_repository_commit_hook_panic(&*panic)),
     }
 }
@@ -1909,7 +1912,7 @@ async fn sqlite_claim_next_repository_commit_hook(
 /// scope) → ack/nack, one row at a time. Mirrors the Postgres
 /// `drain_ready_repository_commit_hooks` shape.
 #[cfg(feature = "sqlite")]
-async fn sqlite_drain_ready_repository_commit_hooks(
+pub async fn sqlite_drain_ready_repository_commit_hooks(
     pool: &RtPool,
     worker_id: &str,
     max_rows: usize,
@@ -2131,7 +2134,7 @@ fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
     )
 }
 
-fn repository_commit_hook_worker_id() -> String {
+pub fn repository_commit_hook_worker_id() -> String {
     format!("repository-hook-{}", uuid::Uuid::new_v4())
 }
 

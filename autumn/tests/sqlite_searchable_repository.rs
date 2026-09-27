@@ -673,7 +673,7 @@ async fn search_never_crosses_tenants_on_sqlite() {
 /// Codex P2 (#1910): when the tenant column is itself `#[searchable]`, the
 /// generated FTS5 table also carries a `tenant_id` column, so the base↔FTS JOIN
 /// exposes two `tenant_id` columns. Before the fix the unqualified
-/// `AND tenant_id = ?` made SQLite raise `ambiguous column name: tenant_id`
+/// `AND tenant_id = ?` made `SQLite` raise `ambiguous column name: tenant_id`
 /// (`.expect` below would panic). The macro now qualifies every base-table
 /// predicate as `"tenant_collision_notes"."tenant_id"` (and `.deleted_at`,
 /// the owner col, the selected/ordered `.id`), so search resolves cleanly AND

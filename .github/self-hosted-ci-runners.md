@@ -1,5 +1,11 @@
 # Self-hosted CI runners on Hetzner Cloud
 
+> **Status (2026-07-19): the Hetzner runner fleet has been decommissioned.** The
+> org GitHub plan now provides 500 concurrent hosted jobs, so the self-hosted
+> lane is no longer needed for capacity. The provisioning workflow and this
+> runbook remain in place as a dormant, opt-in capability that can be re-enabled
+> if hosted-runner capacity is ever exhausted again.
+
 Operator runbook for autumn's self-hosted GitHub Actions capacity.
 
 ## 1. Overview
@@ -66,7 +72,7 @@ close that hole. Do not weaken one without understanding the others.
   on the box.
 - **(d) Repo-scoped registration PAT, root-only.** `RUNNER_REG_PAT` is a
   fine-grained PAT scoped to **this repo only** with **Administration: Read and
-  write** — it can mint runner registration tokens for `madmax983/autumn` and
+  write** — it can mint runner registration tokens for `autumn-foundation/autumn` and
   nothing else, so its blast radius is this repo's runner registration. It is
   delivered to the VM **over SSH after boot** and stored `root:root 0600` at
   `/etc/autumn-runner/pat` — it is never placed in cloud user-data or the
@@ -120,21 +126,62 @@ and the slot would die after a single job.
 | Name | Kind | Status | Purpose |
 |------|------|--------|---------|
 | `HCLOUD_TOKEN` | Actions secret | already present (used by `deploy-real-vps.yml`) | Hetzner Cloud API token (Read & Write) — creates/deletes the VM and SSH keys. |
-| `RUNNER_REG_PAT` | Actions secret | **you must create it** | Fine-grained PAT scoped to `madmax983/autumn` with **Administration: Read and write**. Used **only** to mint short-lived runner *registration* tokens on the box — it never appears in user-data. |
+| `RUNNER_REG_PAT` | Actions secret | **you must create it** | Fine-grained PAT scoped to `autumn-foundation/autumn` with **Administration: Read and write**. Used **only** to mint short-lived runner *registration* tokens on the box — it never appears in user-data. |
 | `AUTUMN_SELF_HOSTED_HEAVY` | Actions **variable** | **you must set it to `1`** | The opt-in switch. Heavy trusted lanes route to self-hosted only while this equals `"1"`; unset/anything else ⇒ `ubuntu-latest`. |
 
 ### Create `RUNNER_REG_PAT`
 
 1. **Profile → Settings → Developer settings → Personal access tokens →
    Fine-grained tokens → Generate new token.**
-2. **Resource owner:** the account/org that owns `madmax983/autumn`.
-3. **Repository access → Only select repositories → `madmax983/autumn`.**
+2. **Resource owner:** the account/org that owns `autumn-foundation/autumn`.
+3. **Repository access → Only select repositories → `autumn-foundation/autumn`.**
 4. **Repository permissions → Administration → Read and write.** (Leave
    everything else at *No access*. Administration write is what allows minting
    runner registration tokens; nothing more is needed.)
 5. Set a short expiry and a calendar reminder to rotate it. Generate, copy.
 6. In the repo: **Settings → Secrets and variables → Actions → Secrets → New
    repository secret**, name `RUNNER_REG_PAT`, paste the token.
+
+#### `RUNNER_REG_PAT` requirements (the common silent-failure cause)
+
+Registration happens **inside the systemd unit on the VM** (`run-ephemeral.sh`
+POSTs `…/actions/runners/registration-token`, then `config.sh`), so a
+mis-scoped or expired PAT makes registration 403/404 and the slots crash-loop —
+without any error in the provision run. The PAT **must** be:
+
+- a **fine-grained** PAT whose **resource owner** is the account/org that owns
+  `autumn-foundation/autumn`;
+- granted **repository access** to `autumn-foundation/autumn`;
+- granted **Repository permissions → Administration: Read and write**;
+- **not expired**.
+
+Decisive manual check (prints `201` for a good PAT, `403`/`404` for a
+bad-scope/expired one):
+
+```sh
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
+  -H "Authorization: Bearer <PAT>" \
+  -H "Accept: application/vnd.github+json" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  https://api.github.com/repos/autumn-foundation/autumn/actions/runners/registration-token
+```
+
+The provisioner now runs this exact preflight before creating the VM (failing
+fast if it is not `201`) and, after enabling the units, **verifies at least one
+Online runner belonging to THIS provision** before the run succeeds — so a bad
+PAT surfaces in the run itself instead of hours later. Verification is
+**by runner name**: runners are named with the workflow-controlled prefix
+`hetzner-<server_name>-<slot>` (`RUNNER_NAME_PREFIX`, threaded through cloud-init
+into `run-ephemeral.sh`), and the verify step polls for an Online runner whose
+name starts with `hetzner-<server_name>-`. This is correct on both the fresh
+provision path (new Online names) and the **`--replace` reprovision** of the
+same-named server (the normal recovery path — `config.sh --replace` reconnects
+the same stable runner names/ids, still Online). An earlier id-diff against a
+pre-enable baseline false-*failed* that reprovision (the reconnected runner's id
+was already in the baseline, so it was wrongly excluded); name-based matching
+counts it. A stale runner from a *different* prior server has a different
+name-prefix and won't match; a stale same-name runner from a dead VM is Offline
+and is filtered out — so nothing can mask a failed new registration.
 
 ### Set `AUTUMN_SELF_HOSTED_HEAVY` (do this AFTER provisioning verifies)
 
@@ -155,6 +202,10 @@ and the slot would die after a single job.
      to also attach so you can SSH in for debugging. Leave blank if you don't
      need admin access (the provisioner always attaches its own throwaway key
      for setup, then deletes it).
+   - `force_replace` — **migration only**, default `false`. Permits the
+     cleanup-before-create step (§5.1) to delete a same-named server that
+     **lacks** the `managed-by=autumn-ci-provisioner` label. Needed exactly once
+     to replace the pre-label `autumn-ci-runner` VM; leave `false` afterward.
 3. Watch the run: it installs the `hcloud` CLI, creates the VM with
    `bootstrap.sh` as cloud-init user-data, waits for cloud-init to finish,
    delivers the PAT over SSH, and enables the `autumn-runner@1..N` units. The
@@ -164,6 +215,39 @@ and the slot would die after a single job.
    `self-hosted, hetzner, linux, x64`.
 5. **Flip the switch:** set the repo variable `AUTUMN_SELF_HOSTED_HEAVY = 1`
    (§4). The next CI run routes heavy trusted lanes to the box.
+
+### 5.1 Cleanup-before-create (labeled predecessor deletion)
+
+Hetzner enforces server-name uniqueness, so a **re-provision** of the same
+`server_name` would collide with the prior VM (and, if it somehow succeeded,
+leave the old box running and billing). To make re-provision idempotent, every
+server this workflow creates is stamped with the label
+`managed-by=autumn-ci-provisioner` (via `hcloud server create --label …`), and a
+cleanup step runs **before** "Create server" (after the PAT preflight and the
+hcloud CLI install):
+
+- **No same-named server exists** → nothing to do; proceed to create.
+- **A same-named server carries `managed-by=autumn-ci-provisioner`** → it is our
+  own predecessor, so it is **deleted automatically** before the new one is
+  created. This is the normal recovery/re-provision path.
+- **A same-named server exists but is NOT labeled** → the step **hard-fails**
+  (`exit 1`) and creates nothing, because it cannot prove the workflow created
+  that server — it could be an unrelated VM. Resolve by either deleting it
+  manually after review, or re-dispatching with **`force_replace=true`** (below).
+
+So the provisioner deletes only servers it can prove it created; it never touches
+an unlabeled/unrelated server on its own.
+
+#### One-time `force_replace=true` migration
+
+The **existing** `autumn-ci-runner` VM was created before the label existed, so
+it carries no `managed-by` label and the cleanup step would refuse to delete it.
+To adopt the new behavior, re-dispatch the provision workflow **once** with the
+`force_replace` input set to `true` (§5, step 2). That single run logs a
+`::warning::` and deletes the unlabeled same-named server, then creates a fresh,
+correctly-labeled replacement. Leave `force_replace` at its `false` default for
+every subsequent provision — once the box is labeled, ordinary re-provisions
+delete it automatically without the override.
 
 ## 6. Which lanes route
 
@@ -223,7 +307,12 @@ than failing; flip the variable to drain them onto hosted runners immediately.
 
 - **Delete the VM:** `hcloud server delete autumn-ci-runner` (use whatever
   `server_name` you provisioned with). This destroys all slots at once.
-- **Recreate:** re-run the **"Provision self-hosted runner"** workflow (§5).
+- **Recreate:** re-run the **"Provision self-hosted runner"** workflow (§5). You
+  no longer need to delete the old box by hand first: because provisioned servers
+  carry the `managed-by=autumn-ci-provisioner` label, the cleanup-before-create
+  step (§5.1) deletes the same-named labeled predecessor automatically. (The
+  one-time exception is the pre-label `autumn-ci-runner` VM — use
+  `force_replace=true` for that first migration; see §5.1.)
 - Ephemeral runners **auto-deregister** after each job, so a deleted box leaves
   no live registrations. Any **stale offline** entries left behind (e.g. from a
   hard-killed box) can be removed manually at **Settings → Actions → Runners**.

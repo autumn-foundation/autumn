@@ -2,6 +2,14 @@
 
 Autumn provides first-class, high-performance Full-Text Search (FTS) on **both** the Postgres and SQLite backends. Through declarative model-level annotations and automated CLI migration generators, Autumn configures a backend-appropriate search index — stored `tsvector` generated columns behind high-throughput `GIN` indexes on Postgres, external-content **FTS5** virtual tables on SQLite — and exposes the same typed, paginated, and relevance-ranked search interfaces directly on your repositories, so the same `#[searchable]` models and repository call sites work unchanged on either backend. Most of this guide illustrates the Postgres (`tsvector`/`tsquery`/`GIN`) path; the [SQLite FTS5](#6-sqlite-fts5) section below covers the SQLite equivalent.
 
+> **Looking for a search *subsystem*?** This guide covers the in-core FTS
+> primitives: "search this table." If you want an index that stays in sync with
+> the record lifecycle automatically, semantic / vector ("find similar")
+> retrieval, a pluggable engine, or a backfill command, see
+> [Search: keyword and vector](./search.md) (`autumn-search`). It subsumes
+> everything here as one backend rather than replacing it — the same
+> `#[searchable]` attribute drives both.
+
 ---
 
 ## FTS vs. External Search Engines

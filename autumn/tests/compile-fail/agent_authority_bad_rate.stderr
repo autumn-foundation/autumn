@@ -1,0 +1,12 @@
+error[E0080]: evaluation panicked: authority_grant!: `rate` must read `<count>/<unit>`, e.g. "10/min" -- the count is a positive integer and the unit is one of `s`, `sec`, `min`, `hour`, `day`. See docs/guide/agent-authority.md
+  --> tests/compile-fail/agent_authority_bad_rate.rs:5:1
+   |
+ 5 | / autumn_web::authority_grant! {
+ 6 | |     /// Draft-only refund authority for the support agent.
+ 7 | |     pub RefundDrafter {
+ 8 | |         writes: [Refund],
+...  |
+13 | | }
+   | |_^ evaluation of `_` failed here
+   |
+   = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `autumn_web::authority_grant` (in Nightly builds, run with -Z macro-backtrace for more info)

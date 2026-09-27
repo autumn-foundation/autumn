@@ -17,9 +17,16 @@
 //! All four compose without special wiring, demonstrating the widget lane
 //! (data_table, active_search, autocomplete_input, property_list).
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+use autumn_web::aggregate::DateBucket;
+use autumn_web::download::Download;
 use autumn_web::extract::{Form, Path};
 use autumn_web::form::Changeset;
 use autumn_web::prelude::*;
+use autumn_web::reexports::axum::response::Response;
+use autumn_web::reexports::http::HeaderMap;
 use autumn_web::widgets::{Column, DataTableConfig, data_table, property_list};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -68,6 +75,12 @@ fn layout(title: &str, content: Markup) -> Markup {
 
             }
             body class="bg-gray-50 min-h-screen" {
+                a href="#main-content"
+                  class="skip-link sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 \
+                         focus:z-50 focus:px-4 focus:py-2 focus:bg-white focus:text-gray-900 \
+                         focus:border focus:border-gray-300 focus:rounded focus:shadow" {
+                    "Skip to main content"
+                }
                 nav class="bg-indigo-600 text-white p-4" {
                     div class="max-w-3xl mx-auto flex justify-between items-center" {
                         a href="/bookmarks" class="text-xl font-bold" { "Bookmarks" }
@@ -77,7 +90,7 @@ fn layout(title: &str, content: Markup) -> Markup {
                         }
                     }
                 }
-                main class="max-w-3xl mx-auto p-6" { (content) }
+                main id="main-content" class="max-w-3xl mx-auto p-6" { (content) }
             }
         }
     }
@@ -127,6 +140,9 @@ fn bookmark_columns() -> Vec<Column<'static, Bookmark>> {
 }
 
 #[get("/bookmarks")]
+// One finder, and a page of rows rendered from it. The build fails if a future
+// edit adds a per-row lookup inside the table's column closures (#1667).
+#[query_budget(1)]
 pub async fn index(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
     let rows = repo.find_all().await?;
     let search_config = autumn_web::widgets::ActiveSearchConfig::new(
@@ -153,6 +169,14 @@ pub async fn index(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
                       class="border border-indigo-600 text-indigo-600 px-4 py-2 rounded hover:bg-indigo-50" {
                         "+ Add (wizard)"
                     }
+                    a href="/bookmarks/export.csv"
+                      class="border border-gray-300 text-gray-600 px-4 py-2 rounded hover:bg-gray-100" {
+                        "Export CSV"
+                    }
+                    a href="/bookmarks/stats"
+                      class="border border-gray-300 text-gray-600 px-4 py-2 rounded hover:bg-gray-100" {
+                        "Stats"
+                    }
                 }
             }
             // ── Active search widget ──────────────────────────────────────
@@ -166,6 +190,208 @@ pub async fn index(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
             // ── Results (initial table; swapped in by search partial) ─────
             div id="bookmark-search-results" role="status" aria-live="polite" aria-atomic="true" {
                 (data_table(&rows, &columns, &table_config))
+            }
+        },
+    ))
+}
+
+// ── CSV export (typed Download + Range) ───────────────────────────────────────
+
+/// CSV column schema for the export, exactly as `autumn generate scaffold`
+/// emits it (issue #1315).
+///
+/// `csv_columns` is the header row and `to_csv_record` the value row; the two
+/// must stay the same length and order, which is the contract `export_csv`
+/// writes against. RFC 4180 quoting — commas, embedded quotes, newlines — is
+/// the writer's job, so values are handed over raw.
+impl autumn_web::data::csv::CsvSchema for Bookmark {
+    fn csv_columns() -> &'static [&'static str] {
+        &["id", "url", "title", "tag", "alive", "created_at"]
+    }
+
+    fn to_csv_record(&self) -> Vec<String> {
+        vec![
+            self.id.to_string(),
+            csv_text_cell(self.url.clone()),
+            csv_text_cell(self.title.clone()),
+            csv_text_cell(self.tag.clone()),
+            self.alive.to_string(),
+            self.created_at.to_string(),
+        ]
+    }
+}
+
+/// Neutralize a spreadsheet formula in an exported text cell.
+///
+/// RFC 4180 governs commas, quotes and newlines and says nothing about
+/// formulas; Excel and LibreOffice evaluate a cell beginning `=`, `+`, `-`,
+/// `@`, TAB or CR even inside quotes. Prefixing an apostrophe makes the value
+/// literal text. Only text-backed columns need it — `alive` and `created_at`
+/// render from typed values.
+fn csv_text_cell(value: String) -> String {
+    if value.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        let mut guarded = String::with_capacity(value.len() + 1);
+        guarded.push('\'');
+        guarded.push_str(&value);
+        guarded
+    } else {
+        value
+    }
+}
+
+/// Render every bookmark as one RFC 4180 CSV document (header row + one row per
+/// bookmark), through the framework's streaming `export_csv` writer.
+fn bookmarks_csv(rows: Vec<Bookmark>) -> AutumnResult<Vec<u8>> {
+    let mut out = Vec::<u8>::new();
+    autumn_web::data::csv::export_csv(rows, &mut out)?;
+    Ok(out)
+}
+
+/// Export all bookmarks as a downloadable CSV file.
+///
+/// Builds a typed [`Download`] from in-memory bytes, names the file (which also
+/// sets `Content-Type: text/csv` from the `.csv` extension and
+/// `Content-Disposition: attachment`), and attaches a strong `ETag` derived
+/// from the content. Serving it through [`Download::into_response_ranged`] lets
+/// the response honour a request `Range` header: a byte range yields `206
+/// Partial Content` with `Content-Range` (a stale `If-Range` validator falls
+/// back to the full body), while a plain request gets the full `200` with
+/// `Accept-Ranges: bytes`.
+#[get("/bookmarks/export.csv")]
+pub async fn export_csv(repo: PgBookmarkRepository, headers: HeaderMap) -> AutumnResult<Response> {
+    let rows = repo.find_all().await?;
+    let csv = bookmarks_csv(rows)?;
+
+    // A strong validator so a client's `If-Range` can be honoured across a
+    // resumed/ranged transfer; it changes whenever the exported rows change.
+    let mut hasher = DefaultHasher::new();
+    csv.hash(&mut hasher);
+    let etag = ETag::strong(format!("{:016x}", hasher.finish()));
+
+    Ok(Download::from_bytes(csv)
+        .filename("bookmarks.csv")
+        .etag(etag)
+        .into_response_ranged(&headers)
+        .await)
+}
+
+// ── Stats roll-ups (grouped aggregate queries) ────────────────────────────────
+
+/// Number of most-popular tags shown on the stats page.
+const TOP_TAGS: i64 = 10;
+/// Trailing window (days) for the "added per day" time series.
+const ACTIVITY_WINDOW_DAYS: i64 = 30;
+
+/// Bookmark statistics driven entirely by grouped aggregate roll-ups.
+///
+/// Runs two `GROUP BY` queries through the generated aggregate builders on
+/// [`PgBookmarkRepository`] (no hand-written SQL, no in-memory folding):
+///
+/// - **Per tag** — `count_grouped_by_tag()` with
+///   [`order_by_aggregate_desc`](autumn_web::aggregate::GroupedAggregate::order_by_aggregate_desc)
+///   + [`limit`](autumn_web::aggregate::GroupedAggregate::limit) for the top-N
+///   tags by bookmark count.
+/// - **Added per day** — `count_grouped_by_created_at()` with
+///   [`bucket(DateBucket::Day)`](autumn_web::aggregate::GroupedAggregate::bucket)
+///   to roll the raw `created_at` timestamps into a daily time series, scoped to
+///   the trailing window with
+///   [`filter_range`](autumn_web::aggregate::GroupedAggregate::filter_range).
+///
+/// See `docs/guide/aggregates.md` for the walkthrough behind this route.
+#[get("/bookmarks/stats")]
+// Two grouped aggregates, each a single `GROUP BY` in the database. The
+// builder methods that shape them (`order_by_aggregate_desc`, `limit`,
+// `bucket`, `filter_range`) issue nothing, so the ceiling is 2 (#1667).
+#[query_budget(2)]
+pub async fn stats(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
+    // Time the two aggregates with the metrics facade. The guard records on
+    // drop, so a `?` on either query below is covered too; it is bound to a
+    // named variable because `let _ = ...` would drop it immediately and
+    // record a duration of roughly zero. See `docs/guide/metrics.md`.
+    let stats_timing = crate::metrics::time_stats_query();
+
+    // Top tags by bookmark count, largest first: `COUNT(*) GROUP BY tag`
+    // ordered on the aggregate and capped — the whole top-N runs in the DB.
+    let by_tag: Vec<(String, i64)> = repo
+        .count_grouped_by_tag()
+        .order_by_aggregate_desc()
+        .limit(TOP_TAGS)
+        .load()
+        .await?;
+
+    // Daily activity over the trailing window: bucket the raw `created_at`
+    // timestamps into days, keyed by each day's midnight.
+    let window_end = chrono::Utc::now().naive_utc();
+    let window_start = window_end - chrono::Duration::days(ACTIVITY_WINDOW_DAYS);
+    let mut per_day: Vec<(chrono::NaiveDateTime, i64)> = repo
+        .count_grouped_by_created_at()
+        .bucket(DateBucket::Day)
+        .filter_range(window_start, window_end)
+        .load()
+        .await?;
+    // The database groups in no defined order; sort into a chronological series.
+    per_day.sort_by_key(|(day, _)| *day);
+
+    // Resolve the guard here rather than letting it drop at the end of the
+    // handler, so the histogram measures the aggregate queries and not the
+    // markup rendering that follows.
+    stats_timing.stop();
+
+    Ok(layout(
+        "Stats",
+        html! {
+            div class="mb-6" {
+                a href="/bookmarks" class="text-sm text-indigo-600 hover:underline" { "Back to list" }
+                h1 class="text-2xl font-bold mt-2" { "Bookmark stats" }
+            }
+
+            section class="mb-8" {
+                h2 class="text-lg font-semibold mb-3" { "Top tags" }
+                @if by_tag.is_empty() {
+                    p class="text-gray-500" { "No bookmarks yet." }
+                } @else {
+                    table class="w-full text-left border border-gray-200 rounded overflow-hidden" {
+                        thead class="bg-gray-100 text-xs uppercase text-gray-600" {
+                            tr { th class="px-4 py-2" { "Tag" } th class="px-4 py-2 text-right" { "Bookmarks" } }
+                        }
+                        tbody {
+                            @for (tag, count) in &by_tag {
+                                tr class="border-t border-gray-100" {
+                                    td class="px-4 py-2" {
+                                        a href=(format!("/bookmarks/tag/{tag}"))
+                                          class="text-indigo-600 hover:underline" { (tag) }
+                                    }
+                                    td class="px-4 py-2 text-right tabular-nums" { (count) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            section {
+                h2 class="text-lg font-semibold mb-3" {
+                    "Added per day " span class="text-sm text-gray-500 font-normal" {
+                        "(last " (ACTIVITY_WINDOW_DAYS) " days)"
+                    }
+                }
+                @if per_day.is_empty() {
+                    p class="text-gray-500" { "No bookmarks added in this window." }
+                } @else {
+                    table class="w-full text-left border border-gray-200 rounded overflow-hidden" {
+                        thead class="bg-gray-100 text-xs uppercase text-gray-600" {
+                            tr { th class="px-4 py-2" { "Day" } th class="px-4 py-2 text-right" { "Added" } }
+                        }
+                        tbody {
+                            @for (day, count) in &per_day {
+                                tr class="border-t border-gray-100" {
+                                    td class="px-4 py-2 tabular-nums" { (day.format("%Y-%m-%d")) }
+                                    td class="px-4 py-2 text-right tabular-nums" { (count) }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         },
     ))
@@ -284,6 +510,11 @@ pub async fn create(
 ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {
     let changeset = form.into_changeset();
     if !changeset.is_valid() {
+        // App-metrics facade (#1378): one line at the call site, no type to
+        // define and nothing registered with `AppBuilder`. Both outcomes are
+        // counted so `rate(bookmarks_created_total{outcome="rejected"}[5m])`
+        // can alert on a form that suddenly stops validating.
+        crate::metrics::record_created(crate::metrics::outcome::REJECTED);
         return Ok((
             StatusCode::UNPROCESSABLE_ENTITY,
             new_bookmark_form(&changeset),
@@ -297,6 +528,7 @@ pub async fn create(
         tag: data.tag,
     };
     repo.save(&new).await?;
+    crate::metrics::record_created(crate::metrics::outcome::CREATED);
     Ok(Redirect::to("/bookmarks").into_response())
 }
 
@@ -371,14 +603,17 @@ pub async fn update(
 
 // ── Active search handler ─────────────────────────────────────────────────────
 
-#[derive(serde::Deserialize)]
+// `OpenApiSchema` so the exported spec advertises `q` as a real query
+// parameter instead of the opaque `{"type":"object"}` placeholder a
+// derive-less `Query<T>` type falls back to (issue #802).
+#[derive(serde::Deserialize, autumn_web::openapi::OpenApiSchema)]
 pub struct SearchQuery {
     #[serde(default)]
     pub q: String,
 }
 
 /// Escape LIKE/ILIKE wildcards so user input is treated as literal characters.
-/// PostgreSQL's default escape character is `\`, so `%` → `\%`, `_` → `\_`.
+/// `PostgreSQL`'s default escape character is `\`, so `%` → `\%`, `_` → `\_`.
 fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")

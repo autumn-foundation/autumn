@@ -1,8 +1,11 @@
 //! Tailwind CSS CLI download and verification for `autumn setup`.
 //!
-//! Downloads the correct platform-specific Tailwind CSS v4.1.0 standalone binary,
+//! Downloads the correct platform-specific Tailwind CSS standalone binary,
 //! verifies its SHA-256 checksum against the `sha256sums.txt` file published with
-//! each release, and installs it to `target/autumn/tailwindcss`.
+//! each release, and installs it to `<target-dir>/autumn/tailwindcss` (or
+//! `.exe` on Windows) — `<target-dir>` is `cargo metadata`'s
+//! `target_directory`, the same resolution `autumn dev` and the scaffold's
+//! generated `build.rs` use, so all three agree when `CARGO_TARGET_DIR` is set.
 
 use std::fs;
 use std::io::Write;
@@ -11,7 +14,14 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 /// Pinned Tailwind CSS release version.
-const TAILWIND_VERSION: &str = "v4.1.0";
+///
+/// This is now the single pin for BOTH surfaces: the dev loop (`autumn setup`)
+/// and the production image, whose generated Dockerfile calls `autumn setup`
+/// rather than curling the binary itself (issue #1615). Keep it in step with
+/// `TAILWIND_VERSION` in `templates/Dockerfile.tmpl`, which the `autumn new`
+/// image still pins directly — a `repo_hygiene`-style test would otherwise be
+/// the only thing standing between the two surfaces and a silent version skew.
+const TAILWIND_VERSION: &str = "v4.1.4";
 
 /// Base URL for Tailwind CSS release assets.
 const RELEASE_BASE_URL: &str = "https://github.com/tailwindlabs/tailwindcss/releases/download";
@@ -43,11 +53,16 @@ pub enum SetupError {
     /// Failed to parse `sha256sums.txt`.
     #[error("failed to parse checksum file: {0}")]
     ChecksumParse(String),
+
+    /// Could not resolve the Cargo target directory via `cargo metadata`.
+    #[error("could not resolve target directory: {0}")]
+    TargetDir(String),
 }
 
 /// Run the `autumn setup` subcommand.
 ///
-/// Downloads Tailwind CSS to `target/autumn/tailwindcss` (or `.exe` on Windows).
+/// Downloads Tailwind CSS to `<target-dir>/autumn/tailwindcss` (or `.exe` on
+/// Windows), honoring `CARGO_TARGET_DIR` via `cargo metadata`.
 /// If the binary already exists and `force` is false, exits early.
 pub fn run(force: bool) {
     if let Err(e) = execute(force) {
@@ -59,7 +74,7 @@ pub fn run(force: bool) {
 /// Inner implementation so tests can call this without `process::exit`.
 fn execute(force: bool) -> Result<(), SetupError> {
     let binary_name = detect_platform(std::env::consts::OS, std::env::consts::ARCH)?;
-    let install_dir = PathBuf::from("target/autumn");
+    let install_dir = target_autumn_dir()?;
     let dest = install_path(&install_dir);
 
     if !force && dest.exists() {
@@ -116,8 +131,23 @@ fn install_path(dir: &Path) -> PathBuf {
     }
 }
 
+/// The `autumn/` install directory, resolved the SAME way `autumn dev` (and
+/// the scaffold's generated `build.rs`) resolve it — via `cargo metadata`'s
+/// `target_directory` — rather than a `target`-relative literal.
+///
+/// Before this, `setup` wrote to `./target/autumn` unconditionally while
+/// `dev` looked in `$CARGO_TARGET_DIR/autumn` whenever that variable was set
+/// (common in CI, shared-cache setups, and workspaces): `setup` would
+/// "succeed" while writing the binary somewhere `dev` and the generated
+/// `build.rs` would never look, so the CSS rebuild silently never ran.
+fn target_autumn_dir() -> Result<PathBuf, SetupError> {
+    crate::dev::resolve_target_directory()
+        .map(|dir| dir.join("autumn"))
+        .map_err(SetupError::TargetDir)
+}
+
 fn fetch_expected_checksum(url: &str, binary_name: &str) -> Result<String, SetupError> {
-    let body = reqwest::blocking::get(url)?.error_for_status()?.text()?;
+    let body = crate::http::fetch_text(url)?;
     parse_checksum_file(&body, binary_name)
 }
 
@@ -327,6 +357,23 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  ./tailwindcss-
         } else {
             assert_eq!(path, PathBuf::from("target/autumn/tailwindcss"));
         }
+    }
+
+    #[test]
+    fn target_autumn_dir_agrees_with_dev_and_cargo_metadata() {
+        // `autumn dev`'s `find_tailwind_cli` and the scaffold's generated
+        // `build.rs` both resolve the install directory from the ACTUAL
+        // Cargo target directory (via `cargo metadata` / `OUT_DIR`), not a
+        // `target`-relative literal. Pinning that `setup` lands on the same
+        // `<target_dir>/autumn` — via the same `resolve_target_directory`
+        // helper `dev` uses — is what keeps the three from drifting apart
+        // again under `CARGO_TARGET_DIR` (issue #2457).
+        let dir = target_autumn_dir().expect("resolve target/autumn dir");
+        assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some("autumn"));
+        assert_eq!(
+            dir.parent(),
+            crate::dev::resolve_target_directory().ok().as_deref(),
+        );
     }
 
     #[test]

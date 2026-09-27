@@ -127,12 +127,36 @@ This is a **coordination** lock, not a durable mutual-exclusion queue:
 
 - **Not fair.** Postgres advisory locks are not FIFO; waiters are not served in
   arrival order.
-- **Not a lease.** There is no heartbeat/renewal. If the holder's connection
-  drops, the lock releases. For long-lived leader election, use the
-  [multi-replica scheduler](scheduled-multi-replica.md).
+- **Not a lease** on Postgres. There is no heartbeat/renewal; if the holder's
+  connection drops, the lock releases. For long-lived leader election, use the
+  [multi-replica scheduler](scheduled-multi-replica.md). (On SQLite it *is* a
+  lease — see below.)
 - **Not row-level.** For per-row contention use pessimistic `with_lock` or
   optimistic locking; this is a *named*, row-independent lock.
-- **Postgres only.** Advisory-lock semantics assume Postgres.
+
+## On SQLite
+
+The same API works under the `sqlite` cargo feature (issue #1907). SQLite has no
+`pg_advisory_lock`, so a named lock is a lease row in an `autumn_locks` table in
+the app's own database file. The runtime creates that table on first use.
+
+The contract a caller relies on is the same — one holder at a time, released on
+drop — with three differences:
+
+- **The scope is one host.** Processes sharing the database file contend; two
+  hosts do not. That is the SQLite tier, not this lock. See
+  [SQLite in production](sqlite-in-production.md).
+- **It is a lease, not a session.** A holder that dies frees the lock at the
+  lease expiry (`with_lease_ttl`, default 30s) rather than wedging it, and a
+  live holder renews in the background, so a long critical section is not
+  preempted.
+- **It is not re-entrant.** A Postgres session lock can be taken twice on one
+  connection; a second `try_lock` on the same name in the same process observes
+  `None`.
+
+`lock()` and `lock_timeout()` poll rather than waiting server-side, because
+there is no server-side wait to block in. Tune the interval with
+`with_poll_interval`.
 
 See [ADR 0010](../adr/0010-app-facing-distributed-lock.md) for the design
 rationale.
