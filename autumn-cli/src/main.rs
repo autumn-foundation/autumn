@@ -691,8 +691,8 @@ pub enum PluginSubcommands {
         /// Print what would change without writing anything.
         #[arg(long)]
         dry_run: bool,
-        /// Do not query crates.io. Listed plugins install normally; an
-        /// unlisted crate cannot have its version resolved and is refused.
+        /// Do not query crates.io. Listed plugins install. The command
+        /// refuses an unlisted crate, because it cannot find its version.
         #[arg(long)]
         offline: bool,
     },
@@ -835,9 +835,14 @@ pub enum IndexSubcommands {
         /// The index file to update.
         #[arg(long, value_name = "FILE")]
         index: String,
-        /// An `autumn plugin-check --format json` report (repeatable).
-        #[arg(long = "report", value_name = "FILE")]
+        /// `autumn plugin-check --format json` reports. Takes one or more
+        /// files, so `--report reports/*.json` works.
+        #[arg(long = "report", value_name = "FILE", num_args = 1..)]
         reports: Vec<String>,
+        /// `autumn plugin inspect --format json` reports, for sandboxed
+        /// listings. Takes one or more files.
+        #[arg(long = "inspect", value_name = "FILE", num_args = 1..)]
+        inspects: Vec<String>,
         /// An exempt listing whose install gate passed (repeatable).
         #[arg(long, value_name = "NAME")]
         exempt: Vec<String>,
@@ -878,16 +883,20 @@ fn run_plugin_index(action: IndexSubcommands) -> i32 {
         IndexSubcommands::Record {
             index,
             reports,
+            inspects,
             exempt,
             against,
             date,
         } => {
             let reports: Vec<std::path::PathBuf> =
                 reports.iter().map(std::path::PathBuf::from).collect();
+            let inspects: Vec<std::path::PathBuf> =
+                inspects.iter().map(std::path::PathBuf::from).collect();
             let today = chrono::Local::now().date_naive().to_string();
             plugin::curate::run_record(&plugin::curate::RecordOptions {
                 index: std::path::Path::new(&index),
                 reports: &reports,
+                inspects: &inspects,
                 exempt: &exempt,
                 against: against.as_deref().unwrap_or(release),
                 date: date.as_deref().unwrap_or(&today),
@@ -9807,6 +9816,7 @@ mod tests {
                                 exempt,
                                 against,
                                 date,
+                                ..
                             },
                     },
             } => {
@@ -9815,6 +9825,40 @@ mod tests {
                 assert_eq!(exempt, ["autumn-storage-s3"]);
                 assert_eq!(against, None);
                 assert_eq!(date.as_deref(), Some("2026-10-01"));
+            }
+            _ => panic!("expected plugin index record"),
+        }
+    }
+
+    /// The documented `--report <dir>/*.json` expands to several values.
+    #[test]
+    fn parse_plugin_index_record_takes_a_glob_of_reports() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin",
+            "index",
+            "record",
+            "--index",
+            "i.toml",
+            "--report",
+            "a.json",
+            "b.json",
+            "--exempt",
+            "autumn-storage-s3",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Plugin {
+                action:
+                    PluginSubcommands::Index {
+                        action:
+                            IndexSubcommands::Record {
+                                reports, exempt, ..
+                            },
+                    },
+            } => {
+                assert_eq!(reports, ["a.json", "b.json"]);
+                assert_eq!(exempt, ["autumn-storage-s3"]);
             }
             _ => panic!("expected plugin index record"),
         }

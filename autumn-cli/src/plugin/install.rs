@@ -659,7 +659,8 @@ pub fn plan_add_community(
     version: &str,
 ) -> Result<AddOutcome, PluginError> {
     app_autumn_web(root)?;
-    if !is_plausible_version(version) {
+    // `=` pins a listed crate to its verified version (issue #1625).
+    if !is_plausible_version(version.strip_prefix('=').unwrap_or(version)) {
         return Err(PluginError::ImplausibleVersion {
             crate_name: crate_name.to_owned(),
             version: version.to_owned(),
@@ -1279,6 +1280,25 @@ maud = { version = "0.27", features = ["axum"] }
                    #[autumn_web::main]\nasync fn main() {\n    \
                    main_loop().await;\n}\n";
         assert!(insert_mount(src, admin().mount).is_none());
+    }
+
+    /// A listed crate is pinned with `=`: a caret would let Cargo resolve a
+    /// later, unverified patch release (issue #1625).
+    #[test]
+    fn a_pinned_community_version_is_written_exactly() {
+        let tmp = fake_project(SCAFFOLD_MAIN, SCAFFOLD_CARGO);
+        let AddOutcome::DependencyOnly { plan, .. } =
+            plan_add_community(tmp.path(), "autumn-plugin-live-feed", "=0.3.1").unwrap()
+        else {
+            panic!("expected a dependency-only outcome");
+        };
+        plan.execute(crate::generate::Flags::default()).unwrap();
+        let after = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            after.contains("autumn-plugin-live-feed = \"=0.3.1\""),
+            "{after}"
+        );
+        assert!(plan_add_community(tmp.path(), "autumn-plugin-x", "=not").is_err());
     }
 
     /// A community crate never gets its mount written, so a re-run stays

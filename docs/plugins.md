@@ -123,7 +123,8 @@ autumn_web::app()
 The plugin index is a curated list of plugins in this repository:
 [`autumn-cli/plugin-index/index.toml`](../autumn-cli/plugin-index/index.toml).
 Maintainers review each listing in a pull request. The CLI embeds the file.
-crates.io stays the only place that hosts plugin code.
+The index holds no plugin code. A listing points at crates.io, or at the
+repository of a sandboxed plugin.
 
 Each listing records:
 
@@ -144,16 +145,17 @@ Listed in the Autumn plugin index:
   autumn-plugin-feed   0.3.0  Live feeds  [EXPERIMENTAL API]
       community · full trust: native code · experimental API: … · plugin-check pass on autumn-web 0.7.0
 
-Unlisted (crates.io `autumn-plugin-*` search, not verified):
+Unlisted (not in the plugin index, not verified):
   autumn-plugin-other  0.1.0  Something  [unlisted: not verified]
 ```
 
 `autumn plugin add` prints the same facts as a trust review **before** it
 changes a file. Then:
 
-- A listed community crate installs at the version the index verified. There
-  is no crates.io lookup, so `--offline` works.
-- A listing that failed re-verification is refused, with the reason.
+- A listed community crate installs at the version the index verified,
+  pinned with `=`. There is no crates.io lookup, so `--offline` works.
+- A listing that failed re-verification is refused, with the reason. It is
+  also refused when the app's `autumn-web` version is not a plain version.
 - A sandboxed listing is not wired. The command prints the review steps
   (`autumn plugin inspect`, `SandboxedPlugin::from_file`), changes no file,
   and exits 2.
@@ -168,11 +170,12 @@ Flags in `plugin list`:
 | `[not verified on autumn-web X]` | The last run was on another release series than your app. |
 | `[unlisted: not verified]` | A crates.io result with no listing. Nothing about it is verified. |
 
-The index is kept fresh. CI runs `autumn plugin-check` against every listing
-on each plugin or framework change, on each release bump, and each week. A
-listing that fails is flagged `incompatible`. A listing that fails on two
-releases is delisted. `autumn plugin index check` fails when a listing was not
-verified against the current release, so a release cannot ship a stale index.
+CI re-verifies each listing. It runs `autumn plugin-check` on each change to
+the index, to a first-party plugin or to the framework, on each release bump,
+and each week. A listing that fails is flagged `incompatible`. A listing that
+fails on two different releases is delisted. `autumn plugin index check`
+fails when a listing was not verified against the current release. So a
+release cannot ship a stale index.
 
 To use a different index file (a mirror, or a fork), set
 `AUTUMN_PLUGIN_INDEX=<path>`. The CLI refuses a file that breaks an admission
@@ -368,8 +371,8 @@ Native plugins are not deprecated by that lane and are not going anywhere.
 | Third-party (lives on crates.io) | `autumn-plugin-<name>` | `<Name>Plugin` |
 
 Third-party crates keep the `autumn-plugin-` prefix so the ecosystem
-is easy to search on crates.io. The search is only the fallback: a listing in
-the [plugin index](#the-plugin-index) is how users find a verified plugin. First-party crates reverse the order so
+is easy to search on crates.io. That search is only the fallback. Users find
+verified plugins in the [plugin index](#the-plugin-index). First-party crates reverse the order so
 they cluster with the crate they extend.
 
 The second row is what `autumn-storage-s3`, `autumn-cache-redis`, and
@@ -739,7 +742,7 @@ This checks:
 | Check | What it verifies |
 |-------|-----------------|
 | `installability` | Binary compiles and route manifest is produced |
-| `route-attribution` | Every plugin route carries `plugin:<your-name>` source. Skips when the plugin mounts no routes and its contract proves it is registered |
+| `route-attribution` | Every plugin route carries `plugin:<your-name>` source. Skips when the contract gives the registered name and no route carries it (a plugin with no routes) |
 | `route-prefix` | Every plugin route lives under the declared prefix |
 | `route-collision` | No two routes share (method, path); names the conflicting handlers and sources |
 | `sensitive-surfaces` | Routes with admin/debug/credential/operator/secret/metrics paths are declared with auth mechanisms |

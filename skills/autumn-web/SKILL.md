@@ -1909,10 +1909,11 @@ its #1601 tier (`[EXPERIMENTAL API]` when it uses experimental surface), and
 its last `autumn plugin-check` result. A crates.io `autumn-plugin-<name>`
 result with no listing is shown under "Unlisted" and marked
 `[unlisted: not verified]`. `add` prints the same trust review before it
-changes a file, installs a listed community crate at its verified version
-(so `--offline` works), refuses a listing flagged by re-verification, and
-refuses to wire a sandboxed listing (exit 2, manual steps). Advise users to
-prefer a listed plugin; an unlisted one has no verified range or conformance.
+changes a file. It installs a listed community crate at its verified version,
+pinned with `=`, so `--offline` works. It refuses a listing flagged by
+re-verification. For a sandboxed listing it changes no file and exits 2 with
+manual steps. Advise users to prefer a listed plugin. An unlisted one has no
+verified range and no conformance result.
 Authors submit a listing by pull request: `autumn-cli/plugin-index/README.md`.
 
 Four behaviours worth knowing before advising on it:

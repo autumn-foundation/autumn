@@ -33,12 +33,14 @@ pub fn apply_report(
     against: &str,
     date: &str,
 ) -> Result<Transition, String> {
-    if report.plugin_name != listing.name {
+    if index::canonical(&report.plugin_name) != index::canonical(&listing.name) {
         return Err(format!(
             "the report is for `{}`, not `{}`",
-            report.plugin_name, listing.name
+            index::sanitize(&report.plugin_name),
+            listing.name
         ));
     }
+    check_report_shape(report)?;
     // The contract is the machine-checked source of the range and the tier.
     if let Some(contract) = &report.contract {
         if let Some(range) = &contract.autumn_web {
@@ -57,36 +59,154 @@ pub fn apply_report(
         };
     }
 
-    let previous = std::mem::replace(&mut listing.conformance.autumn_web, against.to_owned());
-    date.clone_into(&mut listing.conformance.checked);
-    listing.conformance.reason.clear();
-
-    if report.passed() {
-        listing.conformance.result = CheckOutcome::Pass;
-        listing.status = Status::Listed;
-        listing.note.clear();
-        return Ok(Transition::Listed);
-    }
-
-    listing.conformance.result = CheckOutcome::Fail;
     let failed: Vec<&str> = report
         .checks
         .iter()
         .filter(|c| c.status == CheckStatus::Fail)
         .map(|c| c.name.as_str())
         .collect();
-    let failed = failed.join(", ");
+    let failed = (!report.passed()).then(|| failed.join(", "));
+    Ok(transition(listing, failed.as_deref(), against, date))
+}
+
+/// Record one run: `failed` is `None` for a pass, or the failed checks.
+fn transition(
+    listing: &mut Listing,
+    failed: Option<&str>,
+    against: &str,
+    date: &str,
+) -> Transition {
+    let previous = std::mem::replace(&mut listing.conformance.autumn_web, against.to_owned());
+    date.clone_into(&mut listing.conformance.checked);
+    listing.conformance.reason.clear();
+
+    let Some(failed) = failed else {
+        listing.conformance.result = CheckOutcome::Pass;
+        listing.status = Status::Listed;
+        listing.note.clear();
+        return Transition::Listed;
+    };
+
+    listing.conformance.result = CheckOutcome::Fail;
     let second_release = listing.status != Status::Listed && previous != against;
     if second_release {
         listing.status = Status::Delisted;
         listing.note =
-            format!("failed plugin-check on autumn-web {previous} and {against} ({failed})");
-        Ok(Transition::Delisted)
+            format!("failed re-verification on autumn-web {previous} and {against} ({failed})");
+        Transition::Delisted
+    } else if listing.status == Status::Delisted {
+        // A retry on the same release does not bring a delisted plugin back.
+        Transition::Delisted
     } else {
         listing.status = Status::Incompatible;
-        listing.note = format!("failed plugin-check on autumn-web {against} ({failed})");
-        Ok(Transition::Flagged)
+        listing.note = format!("failed re-verification on autumn-web {against} ({failed})");
+        Transition::Flagged
     }
+}
+
+/// The checks every `autumn plugin-check` report carries. A report without
+/// them was not made by `plugin-check`.
+const REQUIRED_CHECKS: [&str; 4] = [
+    "installability",
+    "route-attribution",
+    "plugin-contract",
+    "experimental-surface",
+];
+
+/// Refuse a report that `plugin-check` did not make, or a pass with no
+/// declared range (AC 3: a listing needs the #1601 contract).
+fn check_report_shape(report: &ConformanceReport) -> Result<(), String> {
+    let name = index::sanitize(&report.plugin_name);
+    // A failing report is always taken: it can only flag, never vouch.
+    if !report.passed() {
+        return Ok(());
+    }
+    for required in REQUIRED_CHECKS {
+        if !report.checks.iter().any(|c| c.name == required) {
+            return Err(format!(
+                "the report for `{name}` has no `{required}` check; use a report from \
+                 `autumn plugin-check --format json`"
+            ));
+        }
+    }
+    let contract_passed = report
+        .checks
+        .iter()
+        .any(|c| c.name == "plugin-contract" && c.status == CheckStatus::Pass);
+    let range = report.contract.as_ref().and_then(|c| c.autumn_web.as_ref());
+    if !contract_passed || range.is_none() {
+        return Err(format!(
+            "the report for `{name}` has no passing contract with an autumn-web range; \
+             implement `Plugin::contract`"
+        ));
+    }
+    Ok(())
+}
+
+/// The fields `record --inspect` reads from `autumn plugin inspect --format
+/// json`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct InspectReport {
+    /// The manifest name.
+    pub name: String,
+    /// The manifest version.
+    pub version: String,
+    /// The digest of the whole artifact.
+    pub artifact_sha256: Option<String>,
+    /// The capabilities the manifest asks for.
+    pub capabilities: Vec<String>,
+    /// Whether the module loads into the sandbox.
+    pub loads: bool,
+    /// The route-conformance report.
+    pub conformance: ConformanceReport,
+}
+
+/// Write an `autumn plugin inspect --format json` result into a sandboxed
+/// listing. The capabilities and digest come from the artifact, not a hand
+/// edit.
+///
+/// # Errors
+///
+/// When the listing is not sandboxed, or the report names another plugin.
+pub fn apply_inspect(
+    listing: &mut Listing,
+    report: &InspectReport,
+    against: &str,
+    date: &str,
+) -> Result<Transition, String> {
+    if listing.trust != index::Trust::Sandboxed {
+        return Err(format!(
+            "`{}` is not sandboxed; record its `autumn plugin-check` report instead",
+            listing.name
+        ));
+    }
+    if index::canonical(&report.name) != index::canonical(&listing.name) {
+        return Err(format!(
+            "the inspect report is for `{}`, not `{}`",
+            index::sanitize(&report.name),
+            listing.name
+        ));
+    }
+    let mut failed = Vec::new();
+    if !report.loads {
+        failed.push("load".to_owned());
+    }
+    failed.extend(
+        report
+            .conformance
+            .checks
+            .iter()
+            .filter(|c| c.status == CheckStatus::Fail)
+            .map(|c| c.name.clone()),
+    );
+    match &report.artifact_sha256 {
+        Some(digest) => digest.clone_into(&mut listing.artifact_sha256),
+        None => failed.push("artifact-digest".to_owned()),
+    }
+    report.version.clone_into(&mut listing.version);
+    listing.capabilities.clone_from(&report.capabilities);
+    let failed = (!failed.is_empty()).then(|| failed.join(", "));
+    Ok(transition(listing, failed.as_deref(), against, date))
 }
 
 /// Refresh an exempt listing after the install gate passed on `against`.
@@ -103,9 +223,11 @@ pub fn apply_exempt(listing: &mut Listing, against: &str, date: &str) -> Result<
     }
     against.clone_into(&mut listing.conformance.autumn_web);
     date.clone_into(&mut listing.conformance.checked);
-    // First-party crates are lockstep: the release is their version.
+    // First-party crates are lockstep: the release is their version, and its
+    // series is their range.
     if listing.origin == ListingOrigin::FirstParty {
         against.clone_into(&mut listing.version);
+        listing.autumn_web = autumn_web::plugin_contract::lockstep_range(against);
     }
     Ok(())
 }
@@ -156,6 +278,12 @@ pub fn write_listing(src: &str, listing: &Listing) -> Result<String, String> {
         table["experimental_surfaces"] =
             value(listing.experimental_surfaces.iter().collect::<Array>());
     }
+    if listing.capabilities.is_empty() {
+        table.remove("capabilities");
+    } else {
+        table["capabilities"] = value(listing.capabilities.iter().collect::<Array>());
+    }
+    set_or_remove(table, "artifact_sha256", &listing.artifact_sha256);
     let run = &listing.conformance;
     let conformance = table
         .get_mut("conformance")
@@ -182,7 +310,12 @@ pub fn render_findings(findings: &[index::Finding], source: &str, against: &str)
         if findings.len() == 1 { "" } else { "s" }
     );
     for finding in findings {
-        let _ = writeln!(out, "  {}: {}", finding.plugin, finding.message);
+        let _ = writeln!(
+            out,
+            "  {}: {}",
+            index::sanitize(&finding.plugin),
+            index::sanitize(&finding.message)
+        );
     }
     out.push_str(
         "\nRe-verify with `autumn plugin-check --format json`, then \
@@ -202,6 +335,26 @@ pub struct CheckOptions<'a> {
     pub json: bool,
 }
 
+/// The JSON document `check --format json` prints.
+#[must_use]
+pub fn check_json(loaded: &index::Loaded, against: &str) -> serde_json::Value {
+    let findings = index::check(&loaded.index, against);
+    serde_json::json!({
+        "index": source_label(&loaded.source),
+        "autumn_web": against,
+        "passed": findings.is_empty(),
+        "findings": findings,
+    })
+}
+
+/// Where the index came from, for output.
+fn source_label(source: &index::Source) -> String {
+    match source {
+        index::Source::Bundled => "(bundled)".to_owned(),
+        index::Source::Override(path) => path.display().to_string(),
+    }
+}
+
 /// Run `autumn plugin index check`. Returns the exit code.
 #[must_use]
 pub fn run_check(opts: &CheckOptions<'_>) -> i32 {
@@ -215,23 +368,15 @@ pub fn run_check(opts: &CheckOptions<'_>) -> i32 {
             return 1;
         }
     };
-    let source = match &loaded.source {
-        index::Source::Bundled => "(bundled)".to_owned(),
-        index::Source::Override(path) => path.display().to_string(),
-    };
     let findings = index::check(&loaded.index, opts.against);
     if opts.json {
-        let document = serde_json::json!({
-            "index": source,
-            "autumn_web": opts.against,
-            "passed": findings.is_empty(),
-            "findings": findings,
-        });
+        let document = check_json(&loaded, opts.against);
         println!(
             "{}",
             serde_json::to_string_pretty(&document).unwrap_or_else(|_| "{}".to_owned())
         );
     } else {
+        let source = source_label(&loaded.source);
         println!("{}", render_findings(&findings, &source, opts.against));
     }
     i32::from(!findings.is_empty())
@@ -244,6 +389,8 @@ pub struct RecordOptions<'a> {
     pub index: &'a Path,
     /// `autumn plugin-check --format json` reports.
     pub reports: &'a [PathBuf],
+    /// `autumn plugin inspect --format json` reports, for sandboxed listings.
+    pub inspects: &'a [PathBuf],
     /// Exempt listings whose install gate passed.
     pub exempt: &'a [String],
     /// The `autumn-web` release the runs used.
@@ -263,7 +410,10 @@ pub fn run_record(opts: &RecordOptions<'_>) -> i32 {
             0
         }
         Err(err) => {
-            eprintln!("autumn plugin index record: {err}. The index was not changed.");
+            eprintln!(
+                "autumn plugin index record: {}. The index was not changed.",
+                index::sanitize(&err)
+            );
             1
         }
     }
@@ -283,17 +433,20 @@ fn record(opts: &RecordOptions<'_>) -> Result<Vec<String>, String> {
     }
     let mut src = std::fs::read_to_string(opts.index)
         .map_err(|e| format!("{}: {e}", opts.index.display()))?;
-    let parsed = index::parse(&src).map_err(|e| e.to_string())?;
     let mut lines = Vec::new();
 
     for path in opts.reports {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let report: ConformanceReport = serde_json::from_str(&text)
             .map_err(|e| format!("{} is not a plugin-check JSON report: {e}", path.display()))?;
-        let mut listing = parsed
-            .get(&report.plugin_name)
-            .cloned()
-            .ok_or_else(|| format!("the index has no listing for `{}`", report.plugin_name))?;
+        // Parse the text as it stands now, so each report builds on the last.
+        let parsed = index::parse(&src).map_err(|e| e.to_string())?;
+        let mut listing = parsed.get(&report.plugin_name).cloned().ok_or_else(|| {
+            format!(
+                "the index has no listing for `{}`",
+                index::sanitize(&report.plugin_name)
+            )
+        })?;
         let transition = apply_report(&mut listing, &report, opts.against, opts.date)?;
         src = write_listing(&src, &listing)?;
         lines.push(format!(
@@ -301,11 +454,34 @@ fn record(opts: &RecordOptions<'_>) -> Result<Vec<String>, String> {
             listing.name, opts.against
         ));
     }
+    for path in opts.inspects {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let report: InspectReport = serde_json::from_str(&text).map_err(|e| {
+            format!(
+                "{} is not a plugin inspect JSON report: {e}",
+                path.display()
+            )
+        })?;
+        let parsed = index::parse(&src).map_err(|e| e.to_string())?;
+        let mut listing = parsed.get(&report.name).cloned().ok_or_else(|| {
+            format!(
+                "the index has no listing for `{}`",
+                index::sanitize(&report.name)
+            )
+        })?;
+        let transition = apply_inspect(&mut listing, &report, opts.against, opts.date)?;
+        src = write_listing(&src, &listing)?;
+        lines.push(format!(
+            "{}: {transition:?} on autumn-web {}",
+            listing.name, opts.against
+        ));
+    }
     for name in opts.exempt {
+        let parsed = index::parse(&src).map_err(|e| e.to_string())?;
         let mut listing = parsed
             .get(name)
             .cloned()
-            .ok_or_else(|| format!("the index has no listing for `{name}`"))?;
+            .ok_or_else(|| format!("the index has no listing for `{}`", index::sanitize(name)))?;
         apply_exempt(&mut listing, opts.against, opts.date)?;
         src = write_listing(&src, &listing)?;
         lines.push(format!(
@@ -356,6 +532,7 @@ mod tests {
             plugin_name: name.to_owned(),
             checks: vec![
                 check("installability", CheckStatus::Pass),
+                check("route-attribution", CheckStatus::Pass),
                 check(
                     "route-collision",
                     if pass {
@@ -364,6 +541,8 @@ mod tests {
                         CheckStatus::Fail
                     },
                 ),
+                check("plugin-contract", CheckStatus::Pass),
+                check("experimental-surface", CheckStatus::Pass),
             ],
             contract,
         }
@@ -448,7 +627,11 @@ mod tests {
         .expect("flag");
         apply_report(
             &mut l,
-            &report("autumn-admin-plugin", true, None),
+            &report(
+                "autumn-admin-plugin",
+                true,
+                Some(lockstep("autumn-admin-plugin", "0.8.0")),
+            ),
             "0.8.0",
             "2026-10-02",
         )
@@ -476,6 +659,40 @@ mod tests {
         assert_eq!(l.experimental_surfaces, [surface]);
     }
 
+    /// AC 3: a pass lists only with a declared range, from the contract.
+    #[test]
+    fn a_passing_report_without_a_contract_is_refused() {
+        let mut l = listing("autumn-admin-plugin");
+        let r = report("autumn-admin-plugin", true, None);
+        let err = apply_report(&mut l, &r, "0.7.0", "2026-10-01").unwrap_err();
+        assert!(err.contains("contract"), "{err}");
+    }
+
+    /// A hand-made report with no checks is not a plugin-check run.
+    #[test]
+    fn a_report_without_the_standard_checks_is_refused() {
+        let mut l = listing("autumn-admin-plugin");
+        let contract = Some(lockstep("autumn-admin-plugin", "0.7.0"));
+        let mut r = report("autumn-admin-plugin", true, contract);
+        r.checks.retain(|c| c.name != "plugin-contract");
+        let err = apply_report(&mut l, &r, "0.7.0", "2026-10-01").unwrap_err();
+        assert!(err.contains("plugin-contract"), "{err}");
+        r.checks.clear();
+        assert!(apply_report(&mut l, &r, "0.7.0", "2026-10-01").is_err());
+    }
+
+    /// A delisted listing stays delisted when a retry fails again.
+    #[test]
+    fn a_delisted_listing_stays_delisted_on_a_retry() {
+        let mut l = listing("autumn-admin-plugin");
+        let r = report("autumn-admin-plugin", false, None);
+        apply_report(&mut l, &r, "0.8.0", "2026-10-01").expect("flag");
+        apply_report(&mut l, &r, "0.9.0", "2026-11-01").expect("delist");
+        let t = apply_report(&mut l, &r, "0.9.0", "2026-11-02").expect("retry");
+        assert_eq!(t, Transition::Delisted);
+        assert_eq!(l.status, Status::Delisted);
+    }
+
     #[test]
     fn a_report_for_another_plugin_is_refused() {
         let mut l = listing("autumn-admin-plugin");
@@ -489,6 +706,85 @@ mod tests {
         assert!(err.contains("autumn-search"), "{err}");
     }
 
+    // ── apply_inspect ───────────────────────────────────────────────────
+
+    fn sandboxed() -> Listing {
+        let mut l = listing("autumn-admin-plugin");
+        l.name = "autumn-plugin-hello".to_owned();
+        l.origin = ListingOrigin::Community;
+        l.trust = index::Trust::Sandboxed;
+        l.capabilities = vec!["http-request".to_owned()];
+        l.artifact_sha256 = "00".repeat(32);
+        l
+    }
+
+    fn inspect(pass: bool) -> InspectReport {
+        InspectReport {
+            name: "autumn-plugin-hello".to_owned(),
+            version: "0.2.0".to_owned(),
+            artifact_sha256: Some("ab".repeat(32)),
+            capabilities: vec!["http-request".to_owned(), "kv".to_owned()],
+            loads: pass,
+            conformance: ConformanceReport {
+                plugin_name: "autumn-plugin-hello".to_owned(),
+                checks: vec![check("installability", CheckStatus::Pass)],
+                contract: None,
+            },
+        }
+    }
+
+    /// AC 1: a sandboxed listing's manifest comes from the artifact.
+    #[test]
+    fn an_inspect_pass_records_the_manifest_and_digest() {
+        let mut l = sandboxed();
+        let t = apply_inspect(&mut l, &inspect(true), "0.7.0", "2026-10-01").expect("apply");
+        assert_eq!(t, Transition::Listed);
+        assert_eq!(l.capabilities, ["http-request", "kv"]);
+        assert_eq!(l.artifact_sha256, "ab".repeat(32));
+        assert_eq!(l.version, "0.2.0");
+        assert_eq!(l.conformance.result, CheckOutcome::Pass);
+    }
+
+    #[test]
+    fn an_artifact_that_does_not_load_is_flagged() {
+        let mut l = sandboxed();
+        let t = apply_inspect(&mut l, &inspect(false), "0.7.0", "2026-10-01").expect("apply");
+        assert_eq!(t, Transition::Flagged);
+        assert!(l.note.contains("load"), "{}", l.note);
+    }
+
+    #[test]
+    fn inspect_is_refused_for_a_native_listing() {
+        let mut l = listing("autumn-admin-plugin");
+        let mut r = inspect(true);
+        r.name = "autumn-admin-plugin".to_owned();
+        let err = apply_inspect(&mut l, &r, "0.7.0", "2026-10-01").unwrap_err();
+        assert!(err.contains("sandboxed"), "{err}");
+    }
+
+    #[test]
+    fn write_listing_writes_capabilities_and_digest() {
+        let mut src = index::BUNDLED.to_owned();
+        src.push_str(
+            "\n[[plugin]]\nname = \"autumn-plugin-hello\"\ndescription = \"x\"\n\
+             origin = \"community\"\nrepository = \"https://example.com/x\"\n\
+             version = \"0.1.0\"\nautumn_web = \"0.7\"\ntier = \"stable\"\n\
+             trust = \"sandboxed\"\ncapabilities = [\"http-request\"]\n\
+             artifact_sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\n\
+             status = \"listed\"\n\n[plugin.conformance]\nresult = \"pass\"\n\
+             autumn_web = \"0.7.0\"\nchecked = \"2026-09-27\"\n",
+        );
+        let mut l = index::parse(&src)
+            .unwrap()
+            .get("autumn-plugin-hello")
+            .unwrap()
+            .clone();
+        apply_inspect(&mut l, &inspect(true), "0.7.0", "2026-10-01").expect("apply");
+        let out = write_listing(&src, &l).expect("write");
+        let parsed = index::parse(&out).expect("parse");
+        assert_eq!(parsed.get("autumn-plugin-hello"), Some(&l));
+    }
+
     // ── apply_exempt ────────────────────────────────────────────────────
 
     #[test]
@@ -496,6 +792,13 @@ mod tests {
         let mut l = listing("autumn-storage-s3");
         apply_exempt(&mut l, "0.8.0", "2026-10-01").expect("exempt");
         assert_eq!(l.conformance.autumn_web, "0.8.0");
+        // Lockstep: the range moves to the new series, or the gate fails.
+        assert_eq!(l.autumn_web, "0.8");
+        let one = index::PluginIndex {
+            schema: index::SCHEMA,
+            plugins: vec![l.clone()],
+        };
+        assert!(index::check(&one, "0.8.0").is_empty());
         assert_eq!(l.conformance.result, CheckOutcome::Exempt);
         assert_eq!(l.version, "0.8.0");
     }
@@ -547,7 +850,11 @@ mod tests {
         let flagged = write_listing(index::BUNDLED, &l).expect("write");
         apply_report(
             &mut l,
-            &report("autumn-admin-plugin", true, None),
+            &report(
+                "autumn-admin-plugin",
+                true,
+                Some(lockstep("autumn-admin-plugin", "0.7.0")),
+            ),
             "0.7.0",
             "2026-10-02",
         )
@@ -574,6 +881,12 @@ mod tests {
         let out = render_findings(&findings, "index.toml", "0.8.0");
         assert!(out.contains("1 finding"), "{out}");
         assert!(out.contains("autumn-plugin-x: last verified"), "{out}");
+        let hostile = vec![index::Finding {
+            plugin: "autumn-plugin-x\u{1b}]0;PWN\u{7}".to_owned(),
+            message: "`kv\u{1b}[2J` is not a sandbox capability".to_owned(),
+        }];
+        let out = render_findings(&hostile, "index.toml", "0.8.0");
+        assert!(!out.contains(['\u{1b}', '\u{7}']), "{out:?}");
         let clean = render_findings(&[], "index.toml", "0.8.0");
         assert!(clean.contains("passes"), "{clean}");
     }
@@ -591,6 +904,7 @@ mod tests {
 
         let code = run_record(&RecordOptions {
             index: &index_path,
+            inspects: &[],
             reports: &[report_path],
             exempt: &["autumn-storage-s3".to_owned()],
             against: "0.7.0",
@@ -605,6 +919,89 @@ mod tests {
         assert_eq!(s3.conformance.checked, "2026-10-01");
     }
 
+    fn write_report(dir: &Path, file: &str, r: &ConformanceReport) -> PathBuf {
+        let path = dir.join(file);
+        std::fs::write(&path, serde_json::to_string(r).expect("json")).expect("write");
+        path
+    }
+
+    /// Reports apply in order, each to the result of the one before.
+    #[test]
+    fn run_record_applies_two_reports_for_one_plugin_in_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let index_path = dir.path().join("index.toml");
+        std::fs::write(&index_path, index::BUNDLED).expect("write index");
+        let release = env!("CARGO_PKG_VERSION");
+        let fail = write_report(
+            dir.path(),
+            "fail.json",
+            &report("autumn-admin-plugin", false, None),
+        );
+        let ok = report(
+            "autumn-admin-plugin",
+            true,
+            Some(lockstep("autumn-admin-plugin", release)),
+        );
+        let pass = write_report(dir.path(), "pass.json", &ok);
+        let code = run_record(&RecordOptions {
+            index: &index_path,
+            inspects: &[],
+            reports: &[fail, pass],
+            exempt: &[],
+            against: release,
+            date: "2026-10-01",
+        });
+        assert_eq!(code, 0);
+        let written = index::parse(&std::fs::read_to_string(&index_path).unwrap()).unwrap();
+        let admin = written.get("autumn-admin-plugin").unwrap();
+        assert_eq!(admin.status, Status::Listed);
+        assert!(admin.note.is_empty(), "{}", admin.note);
+    }
+
+    /// A result that breaks an admission rule writes nothing.
+    #[test]
+    fn run_record_refuses_a_result_that_breaks_a_rule() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let index_path = dir.path().join("index.toml");
+        std::fs::write(&index_path, index::BUNDLED).expect("write index");
+        let mut contract = lockstep("autumn-admin-plugin", "0.7.0");
+        contract.autumn_web = Some(">=0.1".to_owned());
+        let r = report("autumn-admin-plugin", true, Some(contract));
+        let open_range = write_report(dir.path(), "open.json", &r);
+        let code = run_record(&RecordOptions {
+            index: &index_path,
+            inspects: &[],
+            reports: &[open_range],
+            exempt: &[],
+            against: "0.7.0",
+            date: "2026-10-01",
+        });
+        assert_eq!(code, 1);
+        assert_eq!(
+            std::fs::read_to_string(&index_path).unwrap(),
+            index::BUNDLED
+        );
+    }
+
+    #[test]
+    fn check_json_names_every_finding() {
+        let loaded = index::load(None).expect("bundled");
+        let value = check_json(&loaded, "99.0.0");
+        assert_eq!(value["passed"], false);
+        assert_eq!(value["autumn_web"], "99.0.0");
+        let findings = value["findings"].as_array().expect("findings");
+        assert!(!findings.is_empty());
+        assert!(
+            findings
+                .iter()
+                .all(|f| f["plugin"].is_string() && f["message"].is_string())
+        );
+        assert_eq!(
+            check_json(&loaded, env!("CARGO_PKG_VERSION"))["passed"],
+            true
+        );
+    }
+
     #[test]
     fn run_record_refuses_a_date_that_is_not_a_date() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -612,6 +1009,7 @@ mod tests {
         std::fs::write(&index_path, index::BUNDLED).expect("write index");
         let code = run_record(&RecordOptions {
             index: &index_path,
+            inspects: &[],
             reports: &[],
             exempt: &["autumn-storage-s3".to_owned()],
             against: "0.7.0",

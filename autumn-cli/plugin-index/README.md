@@ -10,7 +10,7 @@ A listing tells a user four things before they install a plugin:
 |---|---|
 | `autumn_web` | The `autumn-web` versions the plugin supports. |
 | `[plugin.conformance]` | The last `autumn plugin-check` result, and the release it ran on. |
-| `trust` | `native` (full trust: native code) or `sandboxed` (with `capabilities`). |
+| `trust` | `native` (full trust: native code), or `sandboxed` with its `capabilities` and `artifact_sha256`. |
 | `tier` | `stable`, or `experimental` with the `experimental_surfaces` it uses. |
 
 ## Submit a plugin for listing
@@ -26,10 +26,13 @@ You need a published `autumn-plugin-<name>` crate. Then do these steps.
 
    ```bash
    autumn plugin-check --plugin-name autumn-plugin-<name> --prefix /<name> \
+     --sensitive-route /<name>/admin:"Role: admin required" \
      --format json > autumn-plugin-<name>.json
    ```
 
-   All checks must pass or skip.
+   All checks must pass or skip. Give one `--sensitive-route` for each
+   admin, debug, credential, operator, secret or metrics route. CI uses the
+   same values from your listing.
 4. Add a `[[plugin]]` table to `index.toml`. Copy the shape below.
 5. Write the report into the listing:
 
@@ -46,7 +49,9 @@ You need a published `autumn-plugin-<name>` crate. Then do these steps.
    autumn plugin index check --index autumn-cli/plugin-index/index.toml
    ```
 
-7. Open a pull request. Attach the JSON report.
+7. Open a pull request. CI runs `autumn plugin-check` on your listing again.
+   The result must agree with the recorded one. A report you edit by hand
+   does not get past this step.
 
 ```toml
 [[plugin]]
@@ -73,38 +78,53 @@ checked = "2026-09-27"
 `autumn plugin index check` refuses a listing when:
 
 - The name does not start with `autumn-plugin-` (community listings).
-- `autumn_web` is not a Cargo version requirement.
+- Two listings name one crate. Case and `-`/`_` do not count, as on
+  crates.io.
+- `autumn_web` is not a Cargo version requirement, or it has no upper bound
+  (`*`, `>=0.6`).
 - The status is `listed` and the last conformance run did not pass.
 - The tier does not agree with `experimental_surfaces`, or a surface is not a
   known experimental surface.
-- A `sandboxed` listing has no `capabilities`, or names an unknown one. A
-  `native` listing names any.
-- A text field holds a control character.
+- A `sandboxed` listing has no `capabilities`, names an unknown one, or has
+  no 64-hex `artifact_sha256`. A `native` listing has either field.
+- A text field holds a control, bidi or zero-width character.
 - The listing was not verified against the current release.
 
-Only a first-party crate that is not a `Plugin` (for example
-`autumn-storage-s3`, a `BlobStore`) can be `exempt`. The `plugin-install` CI
-gate compiles its mount instead.
+`record` also refuses a passing report with no `plugin-contract` check or no
+declared range.
+
+Only a first-party crate that is not a `Plugin` can be `exempt`. An example is
+`autumn-storage-s3`, a `BlobStore`. The re-verification compiles its mount
+instead.
 
 ## Re-verification
 
 The `plugin_index_reverify_listings` test runs `autumn plugin-check` against
 every live listing. CI runs it in the `plugin-install` job of
-`.github/workflows/generator-conformance.yml`: on each change to a plugin or
-to `autumn-web`, on each release bump, and each week.
+`.github/workflows/generator-conformance.yml`. It runs on each change to this
+index, to a first-party plugin or to `autumn-web`, on each release bump, and
+each week. It skips a sandboxed listing, because it cannot fetch the
+artifact. For a sandboxed listing, run
+`autumn plugin inspect <file>.autumn-plugin --format json > hello.json`, then
+`autumn plugin index record --inspect hello.json`. This copies the
+capabilities and the artifact digest from the artifact.
+
+The job uploads the `plugin-index-reports` artifact. It holds one report per
+listing and `index.toml`: the index with the reports already recorded.
 
 On each `autumn-web` release, the maintainer does these steps:
 
-1. Run the test with `PLUGIN_INDEX_REPORTS=<dir>`. It writes one report per
-   listing.
-2. Record the reports:
+1. Get the artifact, or run the test locally with
+   `PLUGIN_INDEX_REPORTS=<dir>`.
+2. Copy its `index.toml` over `autumn-cli/plugin-index/index.toml`. To record
+   by hand instead:
 
    ```bash
    autumn plugin index record --index autumn-cli/plugin-index/index.toml \
      --report <dir>/*.json --exempt autumn-storage-s3
    ```
 
-3. Commit the result with the release.
+3. Run `autumn plugin index check`, then commit the result with the release.
 
 Until step 2, `autumn plugin index check` fails: each listing was verified on
 an older release. The CLI unit tests run the same gate, so a release cannot
@@ -116,8 +136,14 @@ ship a stale index.
 |---|---|---|
 | pass | any | `listed` |
 | fail | `listed` | `incompatible` |
-| fail | `incompatible` or `delisted`, on a later release | `delisted` |
+| fail | `incompatible`, same release (a retry) | `incompatible` |
+| fail | `incompatible`, a different release | `delisted` |
+| fail | `delisted` | `delisted` |
 
-`autumn plugin list` marks an `incompatible` listing, and `autumn plugin add`
-refuses it on the failed release and later. A `delisted` listing is not shown.
-If crates.io still has the crate, it shows as unlisted.
+`autumn plugin list` marks an `incompatible` listing. `autumn plugin add`
+refuses it on the failed series and later series, and when it cannot read the
+app's `autumn-web` version. A `delisted` listing is not shown. If crates.io
+still has the crate, it shows as unlisted.
+
+`autumn plugin add` pins a listed community crate to its verified version
+with `=`. A later patch release is not verified, so Cargo does not take it.

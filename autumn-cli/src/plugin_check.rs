@@ -281,7 +281,7 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
     checks.push(check_route_attribution(
         opts.plugin_name,
         routes,
-        declared.is_some(),
+        declared.and_then(|c| c.registered_as.as_deref()),
     ));
 
     if let Some(prefix) = opts.expected_prefix {
@@ -600,25 +600,44 @@ fn check_experimental_surface(
 
 // ── Individual check helpers ───────────────────────────────────────────────
 
-/// `registered` is true when the contract dump names this plugin. Then no
-/// routes means a plugin that mounts none (a cache, a search index), not a
-/// wrong `--plugin-name`, so the check skips instead of failing.
+/// `registered_as` is the `Plugin::name()` the contract dump gives for this
+/// plugin. Routes are attributed to that name. When no route carries it, the
+/// plugin mounts none (a cache, a search index): the check skips. When routes
+/// carry it but not `--plugin-name`, the check fails and names it, so the
+/// prefix and sensitive checks are never skipped without a word.
 fn check_route_attribution(
     plugin_name: &str,
     routes: &[RouteInfo],
-    registered: bool,
+    registered_as: Option<&str>,
 ) -> CheckResult {
     let expected = format!("plugin:{plugin_name}");
     let plugin_routes: Vec<&RouteInfo> = routes.iter().filter(|r| r.source == expected).collect();
 
-    if plugin_routes.is_empty() && registered {
-        return CheckResult {
-            name: "route-attribution".to_owned(),
-            status: CheckStatus::Skip,
-            message: format!(
-                "{plugin_name} is registered (its contract is in the dump) and contributes no routes"
-            ),
-            diagnostics: vec![],
+    if let (true, Some(registered)) = (plugin_routes.is_empty(), registered_as) {
+        let under_registered = routes
+            .iter()
+            .filter(|r| r.source == format!("plugin:{registered}"))
+            .count();
+        return if under_registered == 0 {
+            CheckResult {
+                name: "route-attribution".to_owned(),
+                status: CheckStatus::Skip,
+                message: format!(
+                    "{plugin_name} is registered as `{registered}` and contributes no routes"
+                ),
+                diagnostics: vec![],
+            }
+        } else {
+            CheckResult {
+                name: "route-attribution".to_owned(),
+                status: CheckStatus::Fail,
+                message: format!(
+                    "{under_registered} route(s) are attributed to plugin:{registered}, not \
+                     plugin:{plugin_name} — pass `--plugin-name {registered}`, or override \
+                     `Plugin::name`"
+                ),
+                diagnostics: vec![],
+            }
         };
     }
 
@@ -899,14 +918,14 @@ mod tests {
             make_route("GET", "/admin", "plugin:admin"),
             make_route("POST", "/admin/items", "plugin:admin"),
         ];
-        let result = check_route_attribution("admin", &routes, false);
+        let result = check_route_attribution("admin", &routes, None);
         assert_eq!(result.status, CheckStatus::Pass, "{}", result.message);
     }
 
     #[test]
     fn attribution_no_plugin_routes_fails() {
         let routes = vec![make_route("GET", "/posts", "user")];
-        let result = check_route_attribution("admin", &routes, false);
+        let result = check_route_attribution("admin", &routes, None);
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(
             result.message.contains("plugin:admin"),
@@ -921,7 +940,7 @@ mod tests {
             make_route("GET", "/admin", "plugin:admin"),
             make_route("GET", "/admin/items", "plugin:admin"),
         ];
-        let result = check_route_attribution("admin", &routes, false);
+        let result = check_route_attribution("admin", &routes, None);
         assert!(result.message.contains('2'), "{}", result.message);
     }
 
@@ -1435,7 +1454,9 @@ mod contract_tests {
     // ── route-less plugins (issue #1625) ───────────────────────────────────
 
     fn demo_contract() -> PluginContract {
-        PluginContract::new("autumn-plugin-demo").autumn_web("0.7")
+        let mut contract = PluginContract::new("autumn-plugin-demo").autumn_web("0.7");
+        contract.registered_as = Some("autumn-plugin-demo".to_owned());
+        contract
     }
 
     /// A cache or search plugin mounts no routes. Its contract proves it is
@@ -1446,6 +1467,36 @@ mod contract_tests {
         let report = build_report(&opts(&dump), &[]);
         assert_eq!(find(&report, "route-attribution").status, CheckStatus::Skip);
         assert!(report.passed(), "{}", report.to_text_report());
+    }
+
+    /// `--plugin-name` is the crate name, but routes are attributed to
+    /// `Plugin::name()`. When they differ and the plugin HAS routes, a skip
+    /// would leave prefix and sensitive checks unrun.
+    #[test]
+    fn routes_under_the_registered_name_are_not_skipped() {
+        let mut contract = demo_contract();
+        contract.registered_as = Some("demo_crate::DemoPlugin".to_owned());
+        let dump = present(vec![contract]);
+        let mut hidden = route();
+        hidden.source = "plugin:demo_crate::DemoPlugin".to_owned();
+        let report = build_report(&opts(&dump), &[hidden]);
+        let check = find(&report, "route-attribution");
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(
+            check.message.contains("demo_crate::DemoPlugin"),
+            "{}",
+            check.message
+        );
+    }
+
+    /// A contract with no registered name cannot prove the plugin has no
+    /// routes under some other name.
+    #[test]
+    fn a_contract_without_a_registered_name_does_not_skip() {
+        let mut contract = demo_contract();
+        contract.registered_as = None;
+        let report = build_report(&opts(&present(vec![contract])), &[]);
+        assert_eq!(find(&report, "route-attribution").status, CheckStatus::Fail);
     }
 
     /// Without a matching contract, no routes still means a wrong name.

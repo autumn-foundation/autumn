@@ -327,14 +327,17 @@ today, not that the commit is bad.
 ## Plugin Index Re-verification
 
 Each release re-verifies the [plugin index](plugins.md#the-plugin-index)
-(issue #1625). After the version bump, `autumn plugin index check` fails and
-so does the `autumn-cli` unit test that runs it: every listing was verified on
-the old release.
+(issue #1625). After the version bump, `autumn plugin index check` fails,
+because each listing was verified on the old release. Two `autumn-cli` unit
+tests run the same gate and also fail:
+`the_bundled_index_passes_the_gate_for_this_release` and
+`run_check_passes_the_bundled_index_on_this_release`.
 
 - [ ] Run the re-verification and keep the reports:
   `PLUGIN_INDEX_REPORTS=<dir> cargo test -p autumn-cli --test generate plugin_index_reverify_listings -- --ignored --exact`
-- [ ] Record them:
-  `cargo run -p autumn-cli -- plugin index record --index autumn-cli/plugin-index/index.toml --report <dir>/*.json --exempt autumn-storage-s3`
+  (or get the `plugin-index-reports` artifact from the `plugin-install` job).
+- [ ] Copy `<dir>/index.toml` over `autumn-cli/plugin-index/index.toml`. It
+  has the reports already recorded.
 - [ ] `cargo run -p autumn-cli -- plugin index check --index autumn-cli/plugin-index/index.toml` passes.
 - [ ] Commit `autumn-cli/plugin-index/index.toml` with the release.
 

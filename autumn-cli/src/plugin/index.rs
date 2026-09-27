@@ -77,7 +77,7 @@ pub enum Status {
     /// Failed re-verification. Shown with a flag; `add` refuses on the
     /// failed release.
     Incompatible,
-    /// Failed re-verification on two releases in sequence. Not shown.
+    /// Failed re-verification on two different releases. Not shown.
     Delisted,
 }
 
@@ -136,6 +136,10 @@ pub struct Listing {
     /// The manifest capabilities of a sandboxed plugin. Empty for native.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    /// The reviewed `.autumn-plugin` artifact digest, as
+    /// `autumn plugin inspect` prints it. Sandboxed only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub artifact_sha256: String,
     /// The listing state.
     pub status: Status,
     /// Why the listing is not [`Status::Listed`]. Empty otherwise.
@@ -207,6 +211,44 @@ pub fn parse(src: &str) -> Result<PluginIndex, IndexError> {
     toml::from_str(src).map_err(|e| IndexError::Toml(e.to_string()))
 }
 
+/// Largest index file the CLI reads.
+pub const MAX_INDEX_BYTES: u64 = 1024 * 1024;
+
+/// Escape characters that can drive or disguise terminal output.
+#[must_use]
+pub fn sanitize(text: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if is_unsafe_char(c) {
+            let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Control, bidi, zero-width and line-separator characters.
+#[must_use]
+pub fn is_unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
+
+/// The crates.io identity of a name: case and `-`/`_` do not count.
+#[must_use]
+pub fn canonical(name: &str) -> String {
+    name.to_ascii_lowercase().replace('_', "-")
+}
+
 /// Where a loaded index came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
@@ -238,12 +280,31 @@ pub fn load(path: Option<&Path>) -> Result<Loaded, IndexError> {
             source: Source::Bundled,
         });
     };
-    let src = std::fs::read_to_string(path)
-        .map_err(|e| IndexError::Io(format!("{}: {e}", path.display())))?;
+    let src = read_bounded(path)?;
     Ok(Loaded {
         index: parse(&src)?,
         source: Source::Override(path.to_path_buf()),
     })
+}
+
+/// Read a regular file of at most [`MAX_INDEX_BYTES`].
+fn read_bounded(path: &Path) -> Result<String, IndexError> {
+    use std::io::Read as _;
+
+    let io = |e: &dyn std::fmt::Display| IndexError::Io(format!("{}: {e}", path.display()));
+    let file = std::fs::File::open(path).map_err(|e| io(&e))?;
+    let meta = file.metadata().map_err(|e| io(&e))?;
+    if !meta.is_file() {
+        return Err(io(&"not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_INDEX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| io(&e))?;
+    if bytes.len() as u64 > MAX_INDEX_BYTES {
+        return Err(io(&format!("larger than {MAX_INDEX_BYTES} bytes")));
+    }
+    String::from_utf8(bytes).map_err(|_| io(&"not UTF-8"))
 }
 
 /// Load the index named by [`OVERRIDE_ENV`], or the bundled copy.
@@ -262,7 +323,10 @@ impl PluginIndex {
     /// The listing for `name`, in any state.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&Listing> {
-        self.plugins.iter().find(|listing| listing.name == name)
+        let name = canonical(name);
+        self.plugins
+            .iter()
+            .find(|listing| canonical(&listing.name) == name)
     }
 
     /// The listings `plugin list` shows: all but [`Status::Delisted`].
@@ -295,10 +359,7 @@ impl Listing {
         };
         // A flag wins over the declared range: the range is a claim, the
         // failed run is evidence.
-        if self.status == Status::Incompatible
-            && concrete(&self.conformance.autumn_web)
-                .is_some_and(|failed| app >= semver::Version::new(failed.major, failed.minor, 0))
-        {
+        if self.flag_applies(&app.to_string()) {
             return Compat::Incompatible;
         }
         match semver::VersionReq::parse(&self.autumn_web) {
@@ -306,6 +367,18 @@ impl Listing {
             Ok(_) => Compat::Incompatible,
             Err(_) => Compat::Unknown,
         }
+    }
+
+    /// Whether a failed re-verification applies to an app on `app`: the
+    /// listing is flagged, and `app` is on the failed series or later.
+    #[must_use]
+    pub fn flag_applies(&self, app: &str) -> bool {
+        self.status == Status::Incompatible
+            && concrete(app)
+                .zip(concrete(&self.conformance.autumn_web))
+                .is_some_and(|(app, failed)| {
+                    app >= semver::Version::new(failed.major, failed.minor, 0)
+                })
     }
 
     /// Whether the last conformance run covers the `autumn-web` series of
@@ -331,7 +404,7 @@ pub fn validate(index: &PluginIndex) -> Vec<Finding> {
                 message,
             });
         };
-        if !seen.insert(listing.name.as_str()) {
+        if !seen.insert(canonical(&listing.name)) {
             add("listed more than once".to_owned());
         }
         for message in admission_problems(listing) {
@@ -380,7 +453,7 @@ fn check_text(listing: &Listing, out: &mut Vec<String>) {
                 .map(|c| ("capabilities", c.as_str())),
         );
     for (field, value) in fields.into_iter().chain(lists) {
-        if value.chars().any(char::is_control) {
+        if value.chars().any(is_unsafe_char) {
             out.push(format!("`{field}` holds a control character"));
         }
     }
@@ -414,11 +487,19 @@ fn check_versions(listing: &Listing, out: &mut Vec<String>) {
             listing.version
         ));
     }
-    if semver::VersionReq::parse(&listing.autumn_web).is_err() {
-        out.push(format!(
+    match semver::VersionReq::parse(&listing.autumn_web) {
+        Err(_) => out.push(format!(
             "`autumn_web` {:?} is not a Cargo version requirement; declare the supported range",
             listing.autumn_web
-        ));
+        )),
+        // A range with no upper bound claims releases nobody has checked.
+        Ok(req) if req.matches(&semver::Version::new(u64::from(u32::MAX), 0, 0)) => {
+            out.push(format!(
+                "`autumn_web` {:?} has no upper bound; name the series you verified",
+                listing.autumn_web
+            ));
+        }
+        Ok(_) => {}
     }
     if semver::Version::parse(&listing.conformance.autumn_web).is_err() {
         out.push(format!(
@@ -494,6 +575,21 @@ fn check_trust(listing: &Listing, out: &mut Vec<String>) {
         }
         Trust::Native | Trust::Sandboxed => {}
     }
+    let digest = &listing.artifact_sha256;
+    match listing.trust {
+        Trust::Sandboxed
+            if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) =>
+        {
+            out.push(
+                "a sandboxed listing must record `artifact_sha256` from `autumn plugin inspect`"
+                    .to_owned(),
+            );
+        }
+        Trust::Native if !digest.is_empty() => {
+            out.push("`artifact_sha256` is for a sandboxed listing only".to_owned());
+        }
+        Trust::Native | Trust::Sandboxed => {}
+    }
     for name in &listing.capabilities {
         if !SandboxCapability::ALL.iter().any(|c| c.as_str() == name) {
             out.push(format!("`{name}` is not a sandbox capability"));
@@ -532,10 +628,18 @@ pub fn staleness(index: &PluginIndex, against: &str) -> Vec<Finding> {
                 "last verified against autumn-web {checked}; re-verify against {against}"
             ));
         }
+        // An RC of a series is that series, as `plugin_contract::evaluate`
+        // treats it: match with the prerelease stripped.
         let excluded = semver::VersionReq::parse(&listing.autumn_web)
             .ok()
             .zip(semver::Version::parse(against).ok())
-            .is_some_and(|(req, version)| !req.matches(&version));
+            .is_some_and(|(req, version)| {
+                !req.matches(&semver::Version::new(
+                    version.major,
+                    version.minor,
+                    version.patch,
+                ))
+            });
         if excluded {
             add(format!(
                 "its range `{}` excludes autumn-web {against}; flag it incompatible or widen \
@@ -596,6 +700,7 @@ mod tests {
             experimental_surfaces: vec![],
             trust: Trust::Native,
             capabilities: vec![],
+            artifact_sha256: String::new(),
             status: Status::Listed,
             note: String::new(),
             prefix: String::new(),
@@ -925,7 +1030,26 @@ mod tests {
         assert!(text.contains("root-shell"), "{text}");
 
         listing.capabilities = vec!["http-request".to_owned()];
+        listing.artifact_sha256 = "ab".repeat(32);
         assert!(validate(&index_of(vec![listing])).is_empty());
+    }
+
+    /// AC 6: the manifest shown is bound to reviewed bytes.
+    #[test]
+    fn a_sandboxed_listing_must_record_its_artifact_digest() {
+        let mut listing = community();
+        listing.trust = Trust::Sandboxed;
+        listing.capabilities = vec!["http-request".to_owned()];
+        let text = messages(&validate(&index_of(vec![listing.clone()])));
+        assert!(text.contains("artifact_sha256"), "{text}");
+        listing.artifact_sha256 = "not hex".to_owned();
+        let text = messages(&validate(&index_of(vec![listing])));
+        assert!(text.contains("artifact_sha256"), "{text}");
+
+        let mut native = community();
+        native.artifact_sha256 = "ab".repeat(32);
+        let text = messages(&validate(&index_of(vec![native])));
+        assert!(text.contains("artifact_sha256"), "{text}");
     }
 
     #[test]
@@ -953,6 +1077,66 @@ mod tests {
         listing.description = "safe\u{1b}[2Jevil".to_owned();
         let text = messages(&validate(&index_of(vec![listing])));
         assert!(text.contains("control"), "{text}");
+    }
+
+    /// Bidi, zero-width and line-separator characters can reorder or hide
+    /// text in a terminal. `char::is_control` does not catch them.
+    #[test]
+    fn bidi_and_invisible_characters_are_refused() {
+        for bad in ["\u{202E}", "\u{2066}", "\u{200B}", "\u{2028}", "\u{FEFF}"] {
+            let mut listing = community();
+            listing.note = format!("safe{bad}evil");
+            let text = messages(&validate(&index_of(vec![listing])));
+            assert!(text.contains("control"), "{bad:?}: {text}");
+        }
+    }
+
+    /// Finding text is printed. It must not carry an escape sequence even
+    /// when the listing does.
+    #[test]
+    fn sanitize_escapes_unsafe_characters() {
+        assert_eq!(sanitize("a\u{1b}[2Jb\u{202E}c"), "a\\u{1b}[2Jb\\u{202e}c");
+        assert_eq!(sanitize("plain text"), "plain text");
+    }
+
+    /// crates.io treats `-`/`_` and case as the same name.
+    #[test]
+    fn lookup_ignores_case_and_separator_variants() {
+        let index = index_of(vec![community()]);
+        assert!(index.get("autumn_plugin_AUDIT").is_some());
+        let mut twin = community();
+        twin.name = "autumn-plugin_audit".to_owned();
+        let text = messages(&validate(&index_of(vec![community(), twin])));
+        assert!(text.contains("more than once"), "{text}");
+    }
+
+    /// A range with no upper bound calls every future release compatible.
+    #[test]
+    fn a_range_without_an_upper_bound_is_refused() {
+        for open in ["*", ">=0.6"] {
+            let mut listing = community();
+            listing.autumn_web = open.to_owned();
+            let text = messages(&validate(&index_of(vec![listing])));
+            assert!(text.contains("upper bound"), "{open}: {text}");
+        }
+    }
+
+    #[test]
+    fn load_refuses_an_override_that_is_not_a_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = load(Some(dir.path())).unwrap_err();
+        assert!(matches!(err, IndexError::Io(_)), "{err:?}");
+    }
+
+    #[test]
+    fn load_refuses_an_oversized_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("big.toml");
+        let mut text = String::from("schema = 1\n");
+        text.push_str(&"#".repeat(usize::try_from(MAX_INDEX_BYTES).unwrap() + 1));
+        std::fs::write(&path, text).expect("write");
+        let err = load(Some(&path)).unwrap_err();
+        assert!(matches!(err, IndexError::Io(_)), "{err:?}");
     }
 
     #[test]
@@ -984,6 +1168,27 @@ mod tests {
         let index = index_of(vec![community()]);
         let text = messages(&staleness(&index, "0.7.1"));
         assert!(text.contains("re-verify"), "{text}");
+    }
+
+    /// An RC of a series is that series: `0.8` covers `0.8.0-rc.1`.
+    #[test]
+    fn a_prerelease_release_is_covered_by_its_series() {
+        let mut listing = community();
+        listing.autumn_web = "0.8".to_owned();
+        listing.conformance.autumn_web = "0.8.0-rc.1".to_owned();
+        let text = messages(&staleness(&index_of(vec![listing]), "0.8.0-rc.1"));
+        assert!(text.is_empty(), "{text}");
+    }
+
+    /// The flag applies from the failed series on, not to older apps.
+    #[test]
+    fn a_flag_applies_from_the_failed_series() {
+        let mut listing = flagged();
+        listing.conformance.autumn_web = "0.8.0".to_owned();
+        assert!(listing.flag_applies("0.8.2"));
+        assert!(listing.flag_applies("0.9.0"));
+        assert!(!listing.flag_applies("0.7.0"));
+        assert!(!community().flag_applies("0.8.0"));
     }
 
     #[test]
