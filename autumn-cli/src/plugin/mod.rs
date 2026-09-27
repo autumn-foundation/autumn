@@ -1407,6 +1407,9 @@ pub struct ScaffoldPlugin {
     pub resolved: Resolved,
     /// The version to install.
     pub version: String,
+    /// The index listing, when the name is listed. Gated again against the
+    /// scaffolded manifest: a `--starter` pin is not known at preflight.
+    pub listing: Option<index::Listing>,
 }
 
 /// Resolve and version-check every `--with` name.
@@ -1491,6 +1494,7 @@ pub fn preflight_scaffold_plugins(
             name: name.clone(),
             resolved,
             version,
+            listing: listed.cloned(),
         });
     }
     Ok(out)
@@ -1511,6 +1515,24 @@ pub fn preflight_scaffold_plugins(
 pub fn wire_scaffold_plugins(root: &Path, plugins: &[ScaffoldPlugin]) -> i32 {
     let mut worst = 0;
     for plugin in plugins {
+        // Gate a listing again, now that the manifest exists: a `--starter`
+        // pins its own `autumn-web`, and may already declare the crate.
+        if let (Resolved::Community(crate_name), Some(listing)) =
+            (&plugin.resolved, &plugin.listing)
+        {
+            let manifest =
+                std::fs::read_to_string(install::manifest_path(root)).unwrap_or_default();
+            let refused = gate_listing(listing, app_version(root).as_deref())
+                .and_then(|()| check_existing_pin(&manifest, crate_name, &plugin.version));
+            if let Err(err) = refused {
+                eprintln!(
+                    "\nautumn new: the app was created, but {} was not wired — {err}",
+                    plugin.name
+                );
+                worst = worst.max(MANUAL_FALLBACK_EXIT_CODE);
+                continue;
+            }
+        }
         let outcome = match &plugin.resolved {
             Resolved::FirstParty(entry) => install::plan_add(root, entry, &plugin.version),
             Resolved::Community(crate_name) => {
@@ -2584,6 +2606,58 @@ mod tests {
             preflight_scaffold_plugins(&names, &index_with(listing), PINNED, panics_on_lookup)
                 .unwrap_err();
         assert!(err.contains("sandboxed"), "{err}");
+    }
+
+    fn starter_project(cargo: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), cargo).unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/main.rs"),
+            "#[autumn_web::main]\nasync fn main() { autumn_web::app().run().await; }\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    fn listed_scaffold_plugin() -> ScaffoldPlugin {
+        let names = vec!["autumn-plugin-live-feed".to_owned()];
+        preflight_scaffold_plugins(
+            &names,
+            &index_with(listed_community()),
+            None,
+            panics_on_lookup,
+        )
+        .unwrap()
+        .remove(0)
+    }
+
+    /// A `--starter` pin is known only after the starter exists. The listing
+    /// is gated again against it before the dependency is added.
+    #[test]
+    fn wiring_regates_a_listing_against_the_starter_manifest() {
+        let cargo = "[package]\nname = \"s\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+                     [dependencies]\nautumn-web = \"0.0.1\"\n";
+        let tmp = starter_project(cargo);
+        let code = wire_scaffold_plugins(tmp.path(), &[listed_scaffold_plugin()]);
+        assert_ne!(code, 0);
+        let after = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert_eq!(after, cargo, "a refused listing writes nothing");
+    }
+
+    /// A starter that already declares the crate another way keeps
+    /// unreviewed code; the wiring refuses it.
+    #[test]
+    fn wiring_enforces_the_pin_against_starter_dependencies() {
+        let cargo = format!(
+            "[package]\nname = \"s\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+             [dependencies]\nautumn-web = \"{RELEASE}\"\nautumn-plugin-live-feed = \"0.4\"\n"
+        );
+        let tmp = starter_project(&cargo);
+        let code = wire_scaffold_plugins(tmp.path(), &[listed_scaffold_plugin()]);
+        assert_ne!(code, 0);
+        let after = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert_eq!(after, cargo);
     }
 
     #[test]

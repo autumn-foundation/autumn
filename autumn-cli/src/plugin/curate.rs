@@ -192,15 +192,40 @@ pub struct InspectReport {
     /// The artifact digest of the `--against` baseline.
     #[serde(default)]
     pub upgrade_against: Option<String>,
-    /// What each granted capability is scoped to.
-    #[serde(default)]
-    pub grants: index::Grants,
+    /// What each granted capability is scoped to. Required, as every other
+    /// authority field: a missing one would erase the recorded scopes.
+    pub grants: InspectGrants,
     /// The per-request quotas the manifest declares.
     #[serde(default)]
     pub quotas: std::collections::BTreeMap<String, u32>,
     /// The per-request resource limits the manifest declares.
     #[serde(default)]
     pub limits: std::collections::BTreeMap<String, u64>,
+}
+
+/// The `grants` object `inspect` emits. Every list is required: `inspect`
+/// always prints all four, empty or not.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct InspectGrants {
+    /// Hostnames `http-outbound` may call.
+    pub hosts: Vec<String>,
+    /// Logical tables `db` owns.
+    pub tables: Vec<String>,
+    /// Job types `jobs` may enqueue.
+    pub job_types: Vec<String>,
+    /// Render slots `render` may fill.
+    pub slots: Vec<String>,
+}
+
+impl From<&InspectGrants> for index::Grants {
+    fn from(g: &InspectGrants) -> Self {
+        Self {
+            hosts: g.hosts.clone(),
+            tables: g.tables.clone(),
+            job_types: g.job_types.clone(),
+            slots: g.slots.clone(),
+        }
+    }
 }
 
 impl InspectReport {
@@ -330,7 +355,7 @@ pub fn apply_inspect(
         digest.clone_into(&mut listing.artifact_sha256);
         report.version.clone_into(&mut listing.version);
         listing.capabilities.clone_from(&report.capabilities);
-        listing.grants.clone_from(&report.grants);
+        listing.grants = index::Grants::from(&report.grants);
         listing.quotas.clone_from(&report.quotas);
         listing.limits.clone_from(&report.limits);
     }
@@ -930,7 +955,7 @@ mod tests {
             // A baseline with nothing new: the new artifact asks for no more.
             upgrade: Some(serde_json::json!({"added_capabilities": []})),
             upgrade_against: Some("00".repeat(32)),
-            grants: index::Grants::default(),
+            grants: InspectGrants::default(),
             quotas: autumn_web::plugin_sandbox::CapabilityQuotas::default()
                 .fields()
                 .into_iter()
@@ -942,6 +967,25 @@ mod tests {
                 .map(|(k, v)| (k.to_owned(), u64::try_from(v).unwrap()))
                 .collect(),
         }
+    }
+
+    /// `grants` and each of its lists are required, not defaulted.
+    #[test]
+    fn an_inspect_report_without_grants_does_not_parse() {
+        let full = serde_json::json!({
+            "name": "autumn-plugin-hello", "version": "0.2.0",
+            "artifact_sha256": "ab".repeat(32), "capabilities": [], "loads": true,
+            "conformance": {"plugin_name": "autumn-plugin-hello", "checks": []},
+            "quotas": {}, "limits": {},
+            "grants": {"hosts": [], "tables": [], "job_types": [], "slots": []},
+        });
+        assert!(serde_json::from_value::<InspectReport>(full.clone()).is_ok());
+        let mut no_grants = full.clone();
+        no_grants.as_object_mut().unwrap().remove("grants");
+        assert!(serde_json::from_value::<InspectReport>(no_grants).is_err());
+        let mut no_hosts = full;
+        no_hosts["grants"].as_object_mut().unwrap().remove("hosts");
+        assert!(serde_json::from_value::<InspectReport>(no_hosts).is_err());
     }
 
     /// A report missing an authority map (older, truncated or hand-edited)
