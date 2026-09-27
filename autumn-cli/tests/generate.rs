@@ -9520,6 +9520,21 @@ fn failed_install_report(name: &str, message: &str, output: &str) -> serde_json:
     })
 }
 
+/// Delete one checked app's own binaries from the shared target dir. The
+/// dependency artifacts stay, so the next listing still builds warm.
+fn remove_app_binaries(target: &Path, app: &str) {
+    let debug = target.join("debug");
+    let _ = fs::remove_file(debug.join(app));
+    if let Ok(entries) = fs::read_dir(debug.join("deps")) {
+        for entry in entries.flatten() {
+            let file = entry.file_name();
+            if file.to_string_lossy().starts_with(&format!("{app}-")) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 /// Run `autumn plugin-check --format json` with the listing's prefix and
 /// sensitive routes. With no JSON (the app did not build or boot), return a
 /// failing report, so `record` can still flag it.
@@ -9538,8 +9553,17 @@ fn plugin_check_report(project: &Path, listing: &toml::Value, target: &str) -> s
     {
         args.extend(["--sensitive-route", route]);
     }
-    let (stdout, stderr, _) =
-        run_autumn_env_status(project, &args, &[("CARGO_TARGET_DIR", target)]);
+    // No debug info: five linked apps in one target dir otherwise outgrow a
+    // runner's disk (media alone pulls the AWS SDK). `plugin-check`'s cargo
+    // inherits the env.
+    let (stdout, stderr, _) = run_autumn_env_status(
+        project,
+        &args,
+        &[
+            ("CARGO_TARGET_DIR", target),
+            ("CARGO_PROFILE_DEV_DEBUG", "0"),
+        ],
+    );
     serde_json::from_str(&stdout).unwrap_or_else(|_| {
         failed_install_report(
             name,
@@ -9664,6 +9688,7 @@ fn plugin_index_reverify_listings() {
         }
 
         let report = plugin_check_report(&project, listing, target);
+        remove_app_binaries(Path::new(target), &name.replace('-', "_"));
         if let Some(dir) = &reports {
             let path = dir.join(format!("{name}.json"));
             fs::write(&path, report.to_string()).unwrap();

@@ -869,6 +869,7 @@ pub fn run_add(opts: &AddOptions<'_>) -> i32 {
         (Resolved::Community(crate_name), Some(version)) => {
             let manifest =
                 std::fs::read_to_string(install::manifest_path(opts.root)).unwrap_or_default();
+            let manifest = install::with_inherited_dependency(opts.root, &manifest, crate_name);
             if let Err(err) = check_existing_pin(&manifest, crate_name, &version) {
                 eprintln!("autumn plugin add: {err}");
                 return 1;
@@ -1522,6 +1523,7 @@ pub fn wire_scaffold_plugins(root: &Path, plugins: &[ScaffoldPlugin]) -> i32 {
         {
             let manifest =
                 std::fs::read_to_string(install::manifest_path(root)).unwrap_or_default();
+            let manifest = install::with_inherited_dependency(root, &manifest, crate_name);
             let refused = gate_listing(listing, app_version(root).as_deref())
                 .and_then(|()| check_existing_pin(&manifest, crate_name, &plugin.version));
             if let Err(err) = refused {
@@ -1979,6 +1981,33 @@ mod tests {
         let err = gate_listing(&listing, Some(RELEASE)).unwrap_err();
         assert!(err.contains(">=0.8, <0.10"), "{err}");
         assert!(!err.contains("re-verification"), "{err}");
+    }
+
+    /// A `{ workspace = true }` entry is checked against the workspace
+    /// root's `[workspace.dependencies]`, as Cargo resolves it.
+    #[test]
+    fn a_workspace_inherited_pin_is_resolved() {
+        let check = |root_dep: Option<&str>| {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut root = "[workspace]\nmembers = [\"app\"]\n".to_owned();
+            if let Some(dep) = root_dep {
+                root = root + "\n[workspace.dependencies]\nautumn-plugin-x = " + dep + "\n";
+            }
+            std::fs::write(tmp.path().join("Cargo.toml"), root).unwrap();
+            let app = tmp.path().join("app");
+            std::fs::create_dir_all(&app).unwrap();
+            let member = "[package]\nname = \"app\"\n\n[dependencies]\n\
+                          autumn-plugin-x = { workspace = true, features = [\"a\"] }\n";
+            std::fs::write(app.join("Cargo.toml"), member).unwrap();
+            let manifest = install::with_inherited_dependency(&app, member, "autumn-plugin-x");
+            check_existing_pin(&manifest, "autumn-plugin-x", "=0.3.0")
+        };
+        assert!(check(Some("\"=0.3.0\"")).is_ok());
+        assert!(check(Some("{ version = \"=0.3.0\" }")).is_ok());
+        assert!(check(Some("\"0.4\"")).is_err());
+        assert!(check(Some("{ path = \"../x\", version = \"=0.3.0\" }")).is_err());
+        // Not defined in the workspace: unresolvable, so refused.
+        assert!(check(None).is_err());
     }
 
     /// An existing requirement other than the verified pin is refused.

@@ -336,6 +336,45 @@ pub fn declared_dependency_version(manifest: &str, crate_name: &str) -> Option<S
     }
 }
 
+/// `manifest` with a `crate_name = { workspace = true }` entry replaced by the
+/// workspace root's `[workspace.dependencies]` entry, as Cargo resolves it.
+/// The root is the first ancestor of `root` (itself included) whose
+/// `Cargo.toml` has a `[workspace]` table. Unchanged when the entry is not
+/// inherited or cannot be resolved; the pin check then refuses it.
+#[must_use]
+pub fn with_inherited_dependency(root: &Path, manifest: &str, crate_name: &str) -> String {
+    let Ok(mut member) = manifest.parse::<toml_edit::DocumentMut>() else {
+        return manifest.to_owned();
+    };
+    let inherited = member
+        .get("dependencies")
+        .and_then(|deps| deps.get(crate_name))
+        .and_then(|entry| entry.get("workspace"))
+        .and_then(toml_edit::Item::as_bool)
+        == Some(true);
+    if !inherited {
+        return manifest.to_owned();
+    }
+    // Cargo's workspace root: the first ancestor with a `[workspace]` table.
+    let workspace_entry = root.ancestors().find_map(|dir| {
+        let text = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+        let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
+        let workspace = doc.get("workspace")?;
+        // The root is found; a missing entry there is final.
+        Some(
+            workspace
+                .get("dependencies")
+                .and_then(|deps| deps.get(crate_name))
+                .cloned(),
+        )
+    });
+    let Some(Some(entry)) = workspace_entry else {
+        return manifest.to_owned();
+    };
+    member["dependencies"][crate_name] = entry;
+    member.to_string()
+}
+
 /// The `[dependencies]` key that names `crate_name` as crates.io does:
 /// case and `-`/`_` do not count. `None` when no key does.
 #[must_use]
