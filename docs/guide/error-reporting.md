@@ -69,9 +69,23 @@ Every report carries enough context to locate the failure:
 | `route`        | The matched route template, e.g. `/users/{id}`.                    |
 | `method`       | The HTTP method, e.g. `GET`.                                       |
 | `panic`        | `Some(PanicInfo)` for caught panics: the payload + a backtrace.    |
+| `capsule`      | `Some(CapsuleRef)` when a [failure capsule](#the-replay-capsule) was written. |
 
 For panics, `panic.backtrace` is populated only when `RUST_BACKTRACE` is set
 (`RUST_BACKTRACE=1`), matching the standard library's backtrace gate.
+
+### The replay capsule
+
+With `[failure_capture] enabled = true`, the same panic or 5xx that produces
+this event also writes a **failure capsule**: one JSON file holding the redacted
+request, the database traffic it produced and the clock readings it took, which
+`autumn replay <capsule>` re-runs offline against your application. `capsule`
+carries its `id` and `path`, and the file is already on disk by the time your
+reporter is invoked — persistence runs first, ahead of the reporters and ahead
+of the `enabled`/`sample_rate` gate — so a reporter can attach the path, upload
+the file, or read it inline. It is `None` when capture is off or the write
+failed. A capsule holds real request data and real database rows; see the
+[Failure Capsules guide](./failure-capsules.md) before enabling it.
 
 ---
 
@@ -166,5 +180,7 @@ crate; users add it as a dependency and wire it with one
   HTML error pages.
 - [Middleware guide](./middleware.md) — the layer ordering and exception
   filters.
+- [Failure Capsules](./failure-capsules.md) — recording a failing request and
+  replaying it offline with `autumn replay`.
 
 [`LogReporter`]: https://docs.rs/autumn-web/latest/autumn_web/reporting/struct.LogReporter.html

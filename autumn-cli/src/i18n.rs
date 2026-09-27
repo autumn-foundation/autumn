@@ -206,7 +206,7 @@ pub fn scan_project(root: &Path) -> ScanResult {
     result
 }
 
-fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+pub fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -243,7 +243,7 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// translations live — are still found. A `syn`-`Visit` walk would stop at the
 /// outer `html!` invocation and never see the `t!` calls inside its token
 /// stream. A file that fails to tokenize is skipped silently.
-fn scan_source(src: &str, file: &str, result: &mut ScanResult) {
+pub fn scan_source(src: &str, file: &str, result: &mut ScanResult) {
     let Ok(stream) = TokenStream::from_str(src) else {
         return;
     };

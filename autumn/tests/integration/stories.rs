@@ -226,8 +226,10 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "avatar",
     "badge",
     "breadcrumb",
+    "bulk-actions",
     "card",
     "charts",
+    "comment-thread",
     "confirm-action",
     "data-table",
     "hero",
@@ -237,10 +239,12 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "nav-bar",
     "nav-link",
     "property-list",
+    "reaction-controls",
     "stat-card",
     "tabs",
     "toast",
     "transition-controls",
+    "translated-transition-controls",
 ];
 
 #[test]

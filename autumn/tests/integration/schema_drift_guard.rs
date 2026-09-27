@@ -304,6 +304,10 @@ fn deploy_child_keys_are_strictly_validated() {
         "deploy.service_name",
         "deploy.readiness_timeout_secs",
         "deploy.keep_releases",
+        // #1621: the fleet host list. Without this leaf a typo like
+        // `[deploy] hots = [...]` is silently ignored and the operator deploys to
+        // nothing (or, worse, to the stale single `host`).
+        "deploy.hosts",
     ] {
         assert!(
             leaves.contains(key),
@@ -318,6 +322,158 @@ fn deploy_child_keys_are_strictly_validated() {
     assert!(
         errors.iter().any(|(path, _)| path == "deploy.app_dr"),
         "a bogus [deploy] child key must be rejected by strict validation, got: {errors:?}"
+    );
+
+    // #1621: a near-miss of the new fleet key is flagged too — adding a list-typed
+    // leaf must not open a hole in the strict walk.
+    let hosts_typo =
+        AutumnConfig::validate_toml("[deploy]\nhots = [\"web-1.example.com\"]\n", &schema);
+    assert!(
+        hosts_typo.iter().any(|(path, _)| path == "deploy.hots"),
+        "a typo of the [deploy] hosts key must be rejected by strict validation, \
+         got: {hosts_typo:?}"
+    );
+    // ...while the correctly-spelled fleet list is accepted.
+    let hosts_ok =
+        AutumnConfig::validate_toml("[deploy]\nhosts = [\"web-1.example.com\"]\n", &schema);
+    assert!(
+        hosts_ok.is_empty(),
+        "[deploy] hosts must be accepted by strict validation, got: {hosts_ok:?}"
+    );
+}
+
+/// Regression guard for the `[cluster]` field ordering (issue #1762).
+///
+/// Same landmine as `deploy_child_keys_are_strictly_validated`: the strict
+/// unknown-key validator only descends into a config.rs-internal section
+/// declared *before* `database`, because `DatabaseConfig`'s `deserialize_with`
+/// duration field aborts the `SchemaDeserializer` walk. `[cluster]` carries a
+/// shared secret and a bind address — a silently-accepted typo there is a node
+/// that never joins, or joins something it should not. If someone moves
+/// `cluster` below `database`, its child keys vanish from the schema and this
+/// fails.
+#[test]
+fn cluster_child_keys_are_strictly_validated() {
+    let leaves = AutumnConfig::schema_leaf_paths();
+    for key in [
+        "cluster.enabled",
+        "cluster.secret",
+        "cluster.cluster_name",
+        "cluster.bind_addr",
+        "cluster.advertise_addr",
+        "cluster.seed_peers",
+        "cluster.node_id",
+        "cluster.push_interval_ms",
+        "cluster.suspicion_timeout_ms",
+    ] {
+        assert!(
+            leaves.contains(key),
+            "{key} must be a schema leaf so strict validation descends into [cluster]; \
+             if this fails, `cluster` was likely moved below `database` in AutumnConfig"
+        );
+    }
+
+    // End-to-end: the strict validator flags an unknown child key under [cluster].
+    let schema = AutumnConfig::get_schema_keys();
+    let errors =
+        AutumnConfig::validate_toml("[cluster]\nseed_peer = [\"127.0.0.1:7946\"]\n", &schema);
+    assert!(
+        errors.iter().any(|(path, _)| path == "cluster.seed_peer"),
+        "a bogus [cluster] child key must be rejected by strict validation, got: {errors:?}"
+    );
+}
+
+/// Regression guard for the `[metrics]` field ordering.
+///
+/// Same landmine as `deploy_child_keys_are_strictly_validated` and its
+/// siblings: strict unknown-key validation only descends into a section the
+/// `SchemaDeserializer` walk actually reaches, and `DatabaseConfig`'s
+/// `deserialize_with` duration field aborts that walk. A silently-accepted
+/// typo here is the worst shape this section has: the operator raised a cap
+/// *because* `autumn_metrics_series_dropped_total` was climbing, the app boots
+/// clean, and the cap they meant to raise is still at its default while the
+/// samples keep being dropped. If someone moves `metrics` below `database`,
+/// this fails.
+#[test]
+fn metrics_child_keys_are_strictly_validated() {
+    let leaves = AutumnConfig::schema_leaf_paths();
+    for key in [
+        "metrics.max_series_per_metric",
+        "metrics.max_instruments",
+        "metrics.max_labels_per_series",
+    ] {
+        assert!(
+            leaves.contains(key),
+            "{key} must be a schema leaf so strict validation descends into [metrics]; \
+             if this fails, `metrics` was likely moved below `database` in AutumnConfig"
+        );
+    }
+
+    let schema = AutumnConfig::get_schema_keys();
+    let errors = AutumnConfig::validate_toml("[metrics]\nmax_serie_per_metric = 500\n", &schema);
+    assert!(
+        errors
+            .iter()
+            .any(|(path, _)| path == "metrics.max_serie_per_metric"),
+        "a bogus [metrics] child key must be rejected by strict validation, got: {errors:?}"
+    );
+
+    let ok = AutumnConfig::validate_toml(
+        "[metrics]\nmax_series_per_metric = 500\nmax_instruments = 512\n\
+         max_labels_per_series = 12\n",
+        &schema,
+    );
+    assert!(
+        ok.is_empty(),
+        "a well-formed [metrics] section must be accepted, got: {ok:?}"
+    );
+}
+
+/// Regression guard for the `[shadow]` field ordering (issue #1653).
+///
+/// Same landmine as `deploy_child_keys_are_strictly_validated` and
+/// `cluster_child_keys_are_strictly_validated`: strict unknown-key validation
+/// only descends into a section the `SchemaDeserializer` walk actually reaches.
+/// A silently-accepted typo here is a mirror that never runs (`targt`), or one
+/// that mirrors far more traffic than the operator meant (`sample_rat` leaving
+/// the 1.0 default in place against production volume). If someone moves
+/// `shadow` below `database` and the walk stops reaching it, this fails.
+#[test]
+fn shadow_child_keys_are_strictly_validated() {
+    let leaves = AutumnConfig::schema_leaf_paths();
+    for key in [
+        "shadow.enabled",
+        "shadow.target",
+        "shadow.sample_rate",
+        "shadow.routes",
+        "shadow.timeout_ms",
+        "shadow.max_in_flight",
+        "shadow.max_body_bytes",
+        "shadow.max_records",
+        "shadow.max_sample_bytes",
+    ] {
+        assert!(
+            leaves.contains(key),
+            "{key} must be a schema leaf so strict validation descends into [shadow]; \
+             if this fails, `shadow` was likely moved below `database` in AutumnConfig"
+        );
+    }
+
+    let schema = AutumnConfig::get_schema_keys();
+    let errors =
+        AutumnConfig::validate_toml("[shadow]\ntargt = \"http://127.0.0.1:9091\"\n", &schema);
+    assert!(
+        errors.iter().any(|(path, _)| path == "shadow.targt"),
+        "a bogus [shadow] child key must be rejected by strict validation, got: {errors:?}"
+    );
+
+    let ok = AutumnConfig::validate_toml(
+        "[shadow]\nenabled = true\ntarget = \"http://127.0.0.1:9091\"\nsample_rate = 0.1\n",
+        &schema,
+    );
+    assert!(
+        ok.is_empty(),
+        "a well-formed [shadow] section must be accepted, got: {ok:?}"
     );
 }
 

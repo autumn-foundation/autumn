@@ -120,7 +120,11 @@ impl HashingEmbedder {
             let hash = hasher.finish();
             // Low bits pick the bucket; one further bit picks the sign, which
             // keeps unrelated tokens from all pushing in the same direction.
-            let bucket = usize::try_from(hash % self.dimensions as u64).unwrap_or(0);
+            // `checked_rem` covers a zero-dimension config: the vector is
+            // then empty and the `get_mut` below is a no-op either way.
+            let bucket =
+                usize::try_from(hash.checked_rem(self.dimensions as u64).unwrap_or_default())
+                    .unwrap_or(0);
             let sign = if (hash >> 63) & 1 == 1 { -1.0 } else { 1.0 };
             if let Some(slot) = vector.get_mut(bucket) {
                 *slot += sign;

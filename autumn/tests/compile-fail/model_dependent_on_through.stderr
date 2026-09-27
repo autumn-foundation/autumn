@@ -1,0 +1,5 @@
+error: `dependent`/`on_delete` cascade is not supported on a `through = <join_table>` (many-to-many) association: its foreign key names a column on the join table, not on the target model, so the cascade would delete/nullify the wrong rows — remove `dependent`/`on_delete`, or declare the cascade on a model that maps the join table directly
+  --> tests/compile-fail/model_dependent_on_through.rs:30:38
+   |
+30 | #[has_many(Tag, through = post_tags, dependent = destroy)]
+   |                                      ^^^^^^^^^

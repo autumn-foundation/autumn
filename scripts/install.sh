@@ -1,7 +1,7 @@
 #!/bin/sh
 # Autumn CLI installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/madmax983/autumn/trunk-dev/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/autumn-foundation/autumn/trunk-dev/scripts/install.sh | sh
 #
 # Downloads a prebuilt `autumn` binary from GitHub Releases, verifies its sha256
 # checksum, and installs it. Linux and macOS (x86_64 and aarch64) are supported.
@@ -11,10 +11,10 @@
 #   AUTUMN_VERSION      version tag to install, or "latest" (default: latest)
 #   AUTUMN_INSTALL_DIR  install directory (default: $HOME/.local/bin)
 #   AUTUMN_TARGET       force target triple (default: autodetected)
-#   AUTUMN_BASE_URL     release base URL (default: https://github.com/madmax983/autumn/releases)
+#   AUTUMN_BASE_URL     release base URL (default: https://github.com/autumn-foundation/autumn/releases)
 set -eu
 
-REPO_SLUG="madmax983/autumn"
+REPO_SLUG="autumn-foundation/autumn"
 DEFAULT_BASE_URL="https://github.com/${REPO_SLUG}/releases"
 
 VERSION="${AUTUMN_VERSION:-latest}"
@@ -50,7 +50,7 @@ Environment overrides (flags --version/--dir/--target mirror them):
   AUTUMN_VERSION      version tag to install, or "latest" (default: latest)
   AUTUMN_INSTALL_DIR  install directory (default: $HOME/.local/bin)
   AUTUMN_TARGET       force target triple (default: autodetected)
-  AUTUMN_BASE_URL     release base URL (default: https://github.com/madmax983/autumn/releases)
+  AUTUMN_BASE_URL     release base URL (default: https://github.com/autumn-foundation/autumn/releases)
 EOF
       exit 0 ;;
     *) err "unknown argument: $1 (try --help)" ;;

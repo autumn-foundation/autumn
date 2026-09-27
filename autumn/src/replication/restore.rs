@@ -1,0 +1,901 @@
+//! Point-in-time restore from a replica (issue #1628, phase 2).
+//!
+//! Two halves, both pure of the transport:
+//!
+//! * [`plan`] reads only the destination's **key listing** — generation ids and
+//!   segment names already carry their timestamps — and decides which generation
+//!   and which prefix of its segments reconstruct the database as of a chosen
+//!   instant. Nothing is downloaded to make that decision.
+//! * [`apply`] downloads exactly that and rebuilds the database **index by
+//!   index**: for each WAL index in the generation it reassembles a `db-wal`
+//!   beside the snapshot, lets `SQLite`'s own recovery fold it in, and moves to
+//!   the next — publishing the result only once the whole chain has replayed and
+//!   the database passes its integrity check.
+//!
+//! # Refusal, not best effort
+//!
+//! Handing `SQLite` a damaged WAL is the dangerous failure mode: recovery stops at
+//! the first frame that does not validate and reports success, so a silently
+//! truncated replica looks like a clean restore that is merely missing the last
+//! few minutes. Every check here therefore **refuses** rather than trims:
+//!
+//! * a generation without its `snapshot.json` commit marker is ignored (it was
+//!   interrupted mid-upload);
+//! * a missing or out-of-order segment sequence is an error, never a silent stop;
+//! * a segment whose `start_offset` does not continue the previous one, or whose
+//!   salt is not the generation's, is an error;
+//! * every payload's SHA-256 and length are verified before use;
+//! * the reassembled database must pass `PRAGMA integrity_check` **before** it is
+//!   moved into place.
+//!
+//! The same code path backs the periodic verifier, so "verified restorable" means
+//! literally that — a restore ran.
+
+// autumn-panic-gate: durability-critical module — production code path must be
+// panic-free. See CONTRIBUTING.md "Request-path panic gate". Justify exceptions
+// with #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
+
+use std::fmt;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+
+use chrono::{DateTime, Utc};
+
+use super::destination::{DestinationError, ReplicaDestination};
+use super::segment::{self, SegmentError, SegmentHeader, SnapshotMeta};
+use super::sqlite::{self, SqliteError};
+use super::wal;
+
+/// Why a restore could not be planned or applied.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum RestoreError {
+    /// The destination itself failed.
+    Destination(DestinationError),
+    /// No complete generation exists under the configured prefix.
+    NoReplica {
+        /// The key prefix that was searched.
+        root: String,
+    },
+    /// The requested instant predates every replicated generation.
+    TargetBeforeRetention {
+        /// The instant that was asked for.
+        target: DateTime<Utc>,
+        /// The oldest instant the replica can reconstruct.
+        oldest: DateTime<Utc>,
+    },
+    /// A segment is missing from the middle of a generation's sequence.
+    SegmentGap {
+        /// The generation.
+        generation: String,
+        /// The WAL index the gap is in.
+        expected_index: u32,
+        /// The sequence number that should have come next.
+        expected_seq: u64,
+        /// The index that was found there instead.
+        found_index: u32,
+        /// The sequence number that was found there instead.
+        found_seq: u64,
+    },
+    /// A segment does not start where the previous one ended.
+    /// The replica is missing the newest segments its own head records.
+    TruncatedTail {
+        /// Generation the gap is in.
+        generation: String,
+        /// Newest (index, seq) the generation's head claims was sent.
+        head: (u32, u64),
+        /// Newest (index, seq) actually present, if any.
+        found: Option<(u32, u64)>,
+    },
+    SegmentDiscontinuity {
+        /// The generation.
+        generation: String,
+        /// The offending segment.
+        seq: u64,
+        /// Byte offset the previous segment ended at.
+        expected_offset: u64,
+        /// Byte offset this segment claims to start at.
+        found_offset: u64,
+    },
+    /// A segment carries a salt that is not its generation's.
+    SaltMismatch {
+        /// The generation.
+        generation: String,
+        /// The offending segment.
+        seq: u64,
+    },
+    /// A payload failed its own framing/verification.
+    Segment(SegmentError),
+    /// The snapshot's bytes do not match the digest recorded when it was taken.
+    SnapshotDigest {
+        /// Bytes the metadata promised.
+        expected_len: u64,
+        /// Bytes actually recovered.
+        actual_len: u64,
+    },
+    /// The replica was written by a newer layout version.
+    UnsupportedVersion {
+        /// The version found on the destination.
+        version: u32,
+    },
+    /// Local I/O while staging or publishing the restore failed.
+    Io {
+        /// What was being attempted.
+        op: &'static str,
+        /// I/O detail.
+        detail: String,
+    },
+    /// `SQLite` refused the reassembled database.
+    Sqlite(SqliteError),
+}
+
+impl fmt::Display for RestoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Destination(e) => write!(f, "{e}"),
+            Self::NoReplica { root } => write!(
+                f,
+                "no complete replica generation was found under {root:?}.\n  \
+                 Check [replication] prefix/profile and that the app has been running \
+                 with replication enabled."
+            ),
+            Self::TargetBeforeRetention { target, oldest } => write!(
+                f,
+                "cannot restore to {target}: the oldest replicated state is {oldest}.\n  \
+                 Pick a later --timestamp, or raise [replication] retention_hours before \
+                 the window you need scrolls past."
+            ),
+            Self::SegmentGap {
+                generation,
+                expected_index,
+                expected_seq,
+                found_index,
+                found_seq,
+            } => write!(
+                f,
+                "replica generation {generation} is missing segment \
+                 {expected_index}/{expected_seq} (next present segment is \
+                 {found_index}/{found_seq}) — refusing to restore a replica with a \
+                 hole in it."
+            ),
+            Self::TruncatedTail {
+                generation,
+                head,
+                found,
+            } => write!(
+                f,
+                "replica generation {generation} is missing its newest segments: its head \
+                 records (index {}, seq {}) as sent, but the newest present is {}.\n  \
+                 A contiguous run that stops short of the head is a truncated replica, not \
+                 a complete one — refusing rather than restoring without those commits.",
+                head.0,
+                head.1,
+                found.map_or_else(
+                    || "nothing".to_owned(),
+                    |(i, q)| format!("(index {i}, seq {q})")
+                )
+            ),
+            Self::SegmentDiscontinuity {
+                generation,
+                seq,
+                expected_offset,
+                found_offset,
+            } => write!(
+                f,
+                "replica generation {generation} segment {seq} starts at WAL offset \
+                 {found_offset} but the previous segment ended at {expected_offset}."
+            ),
+            Self::SaltMismatch { generation, seq } => write!(
+                f,
+                "replica generation {generation} segment {seq} carries a salt from a \
+                 different WAL generation."
+            ),
+            Self::Segment(e) => write!(f, "{e}"),
+            Self::SnapshotDigest {
+                expected_len,
+                actual_len,
+            } => write!(
+                f,
+                "the replica snapshot failed verification (metadata promised \
+                 {expected_len} byte(s), recovered {actual_len})"
+            ),
+            Self::UnsupportedVersion { version } => write!(
+                f,
+                "the replica uses layout version {version}, newer than this build \
+                 understands ({}) — upgrade autumn before restoring.",
+                segment::LAYOUT_VERSION
+            ),
+            Self::Io { op, detail } => write!(f, "restore {op} failed: {detail}"),
+            Self::Sqlite(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for RestoreError {}
+
+impl From<DestinationError> for RestoreError {
+    fn from(e: DestinationError) -> Self {
+        Self::Destination(e)
+    }
+}
+
+impl From<SegmentError> for RestoreError {
+    fn from(e: SegmentError) -> Self {
+        Self::Segment(e)
+    }
+}
+
+impl From<SqliteError> for RestoreError {
+    fn from(e: SqliteError) -> Self {
+        Self::Sqlite(e)
+    }
+}
+
+impl RestoreError {
+    fn io(op: &'static str) -> impl Fn(std::io::Error) -> Self {
+        move |e| Self::Io {
+            op,
+            detail: e.to_string(),
+        }
+    }
+}
+
+/// One segment selected by [`plan`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedSegment {
+    /// Full destination key.
+    pub key: String,
+    /// WAL index inside the generation.
+    pub index: u32,
+    /// Position inside that index.
+    pub seq: u64,
+    /// When the segment was shipped.
+    pub created_at: DateTime<Utc>,
+}
+
+/// What a restore will download and reconstruct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestorePlan {
+    /// The generation the restore is built from.
+    pub generation: String,
+    /// When that generation's base snapshot was taken.
+    pub generation_started_at: DateTime<Utc>,
+    /// Key of the base snapshot.
+    pub snapshot_key: String,
+    /// Key of the snapshot's metadata / commit marker.
+    pub snapshot_meta_key: String,
+    /// The segments to replay, in order.
+    pub segments: Vec<PlannedSegment>,
+    /// The instant that was asked for (`None` = "the latest available").
+    pub requested: Option<DateTime<Utc>>,
+    /// The instant the restore will actually land on: the ship time of the last
+    /// replayed segment, or the snapshot time when none is replayed.
+    pub effective: DateTime<Utc>,
+}
+
+/// What a completed restore produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreOutcome {
+    /// The plan that was applied.
+    pub plan: RestorePlan,
+    /// Where the restored database was written.
+    pub output: PathBuf,
+    /// Bytes of the restored database file.
+    pub bytes: u64,
+    /// WAL frames replayed onto the snapshot.
+    pub frames_replayed: u64,
+}
+
+/// Convert epoch milliseconds to a UTC instant, clamping an unrepresentable
+/// value rather than failing a restore over a clock artifact.
+fn ms_to_utc(ms: i64) -> DateTime<Utc> {
+    DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::UNIX_EPOCH)
+}
+
+/// Refuse a latest restore whose chain stops short of the generation's head.
+///
+/// The chain walk in [`plan`] catches a hole in the middle — a later sequence
+/// exposes it — but a missing *tail* leaves a perfectly contiguous prefix, so a
+/// replica whose newest objects were lost (a lifecycle rule, a manual delete, a
+/// stale listing from an eventually-consistent endpoint) would restore
+/// "cleanly" without its newest commits, and periodic verification would agree.
+///
+/// Called only for a latest restore: a point-in-time restore stops short of the
+/// head by construction, which is the whole point of asking for one. A head that
+/// is absent (a replica written before this object existed) or older than what
+/// is present cannot fail the check — it can only under-claim.
+fn check_reaches_head(
+    destination: &dyn ReplicaDestination,
+    root: &str,
+    generation: &str,
+    segments: &[PlannedSegment],
+) -> Result<(), RestoreError> {
+    let head = match destination.get(&segment::head_key(root, generation)) {
+        Ok(bytes) => serde_json::from_slice::<segment::GenerationHead>(&bytes).ok(),
+        Err(e) if e.is_not_found() => return Ok(()),
+        Err(e) => return Err(RestoreError::from(e)),
+    };
+    let Some(head) = head else {
+        return Ok(());
+    };
+    let found = segments.last().map(|s| (s.index, s.seq));
+    if found.is_none_or(|f| f < (head.index, head.seq)) {
+        return Err(RestoreError::TruncatedTail {
+            generation: generation.to_owned(),
+            head: (head.index, head.seq),
+            found,
+        });
+    }
+    Ok(())
+}
+
+/// Decide what to restore, reading only the destination's key listing.
+///
+/// `target` is the instant to restore to; `None` means "the latest replicated
+/// state". A generation is a candidate only when its `snapshot.json` commit
+/// marker is present.
+///
+/// # Errors
+///
+/// See [`RestoreError`].
+pub fn plan(
+    destination: &dyn ReplicaDestination,
+    root: &str,
+    target: Option<DateTime<Utc>>,
+) -> Result<RestorePlan, RestoreError> {
+    let keys = destination.list(&segment::generations_prefix(root))?;
+
+    // A generation counts only once its snapshot metadata (written last) exists.
+    let mut complete: Vec<(String, i64)> = Vec::new();
+    for key in &keys {
+        if !key.ends_with(segment::SNAPSHOT_META_OBJECT) {
+            continue;
+        }
+        let Some(generation) = segment::generation_of_key(root, key) else {
+            continue;
+        };
+        let Some(info) = segment::parse_generation_id(&generation) else {
+            continue;
+        };
+        complete.push((generation, info.created_ms));
+    }
+    complete.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+    let Some((oldest_gen, oldest_ms)) = complete.first().cloned() else {
+        return Err(RestoreError::NoReplica {
+            root: root.to_owned(),
+        });
+    };
+    let _ = oldest_gen;
+
+    let target_ms = target.map_or(i64::MAX, |t| t.timestamp_millis());
+    let Some((generation, generation_ms)) = complete
+        .iter()
+        .rev()
+        .find(|(_, ms)| *ms <= target_ms)
+        .cloned()
+    else {
+        return Err(RestoreError::TargetBeforeRetention {
+            target: target.unwrap_or_else(Utc::now),
+            oldest: ms_to_utc(oldest_ms),
+        });
+    };
+
+    // Segment keys carry `seq` and ship time, so the selection needs no downloads.
+    let segment_keys = destination.list(&segment::segments_prefix(root, &generation))?;
+    let mut refs: Vec<(segment::SegmentRef, String)> = segment_keys
+        .into_iter()
+        .filter_map(|key| segment::parse_segment_key(&key).map(|r| (r, key)))
+        .collect();
+    // `SegmentRef` orders by (index, seq) — replication order.
+    refs.sort_by_key(|entry| entry.0);
+
+    let mut segments = Vec::new();
+    // `None` until the first segment is seen, so a replica whose entire index 0
+    // is missing cannot be mistaken for one that legitimately starts at index 1.
+    let mut expected_index: Option<u32> = None;
+    let mut expected_seq: u64 = 0;
+    for (reference, key) in refs {
+        if reference.created_ms > target_ms {
+            break;
+        }
+        // A checkpoint opens the next index and restarts `seq` at 0. Anything
+        // else — a skipped index, a skipped seq, a first segment that is not
+        // (0, 0) — is a hole, and a hole is refused rather than replayed up to
+        // it (reverse-brainstorm R6).
+        if expected_index != Some(reference.index) {
+            let opens_the_chain = expected_index
+                .map_or(reference.index == 0 && reference.seq == 0, |previous| {
+                    reference.index == previous.saturating_add(1) && reference.seq == 0
+                });
+            if !opens_the_chain {
+                return Err(RestoreError::SegmentGap {
+                    generation,
+                    expected_index: expected_index.unwrap_or(0),
+                    expected_seq,
+                    found_index: reference.index,
+                    found_seq: reference.seq,
+                });
+            }
+            expected_index = Some(reference.index);
+            expected_seq = 0;
+        }
+        if reference.seq != expected_seq {
+            return Err(RestoreError::SegmentGap {
+                generation,
+                expected_index: expected_index.unwrap_or(0),
+                expected_seq,
+                found_index: reference.index,
+                found_seq: reference.seq,
+            });
+        }
+        expected_seq = reference.seq.saturating_add(1);
+        segments.push(PlannedSegment {
+            key,
+            index: reference.index,
+            seq: reference.seq,
+            created_at: ms_to_utc(reference.created_ms),
+        });
+    }
+
+    if target.is_none() {
+        check_reaches_head(destination, root, &generation, &segments)?;
+    }
+
+    let generation_started_at = ms_to_utc(generation_ms);
+    let effective = segments
+        .last()
+        .map_or(generation_started_at, |s| s.created_at);
+
+    Ok(RestorePlan {
+        snapshot_key: segment::snapshot_key(root, &generation),
+        snapshot_meta_key: segment::snapshot_meta_key(root, &generation),
+        generation,
+        generation_started_at,
+        segments,
+        requested: target,
+        effective,
+    })
+}
+
+/// Download, verify and reconstruct the database described by `plan`, writing it
+/// to `output`.
+///
+/// The work happens in a sibling staging directory; `output` is only written
+/// once `SQLite` has replayed the WAL and passed `PRAGMA integrity_check`, so a
+/// failed restore never leaves a half-built database behind (and never
+/// overwrites a good one with a bad one).
+///
+/// # Errors
+///
+/// See [`RestoreError`].
+pub fn apply(
+    destination: &dyn ReplicaDestination,
+    plan: &RestorePlan,
+    output: &Path,
+) -> Result<RestoreOutcome, RestoreError> {
+    let staging = staging_dir(output);
+    // A leftover staging directory from an interrupted run must not be reused.
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(RestoreError::io("create staging directory"))?;
+
+    let result = build_in_staging(destination, plan, &staging);
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+    };
+
+    // `Path::parent` of a bare file name is `Some("")`, which `create_dir_all`
+    // rejects — a relative `--output app.db` must still work.
+    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(RestoreError::io("create output directory"))?;
+    }
+    // The staged database is checkpointed, so its sidecars carry nothing, and a
+    // stale one left next to the output would let SQLite recover an old WAL over
+    // the freshly restored file. They are moved aside rather than deleted:
+    // until the new database is actually in place they are still the *existing*
+    // database's newest commits, and a restore that fails must leave behind what
+    // it found rather than the wreckage of a half-finished publish.
+    let staged_db = staging.join("restored.db");
+    let displaced = match displace_sidecars(output) {
+        Ok(displaced) => displaced,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+    };
+    if let Err(e) = move_file(&staged_db, output) {
+        // The existing database is still the one on disk. Without its sidecars
+        // it would silently lose every commit not yet checkpointed into it.
+        restore_sidecars(&displaced);
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+    for (_, parked) in &displaced {
+        let _ = std::fs::remove_file(parked);
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+
+    let bytes = std::fs::metadata(output).map_or(outcome.bytes, |m| m.len());
+    Ok(RestoreOutcome {
+        output: output.to_path_buf(),
+        bytes,
+        ..outcome
+    })
+}
+
+/// Plan and apply in one step.
+///
+/// # Errors
+///
+/// See [`RestoreError`].
+pub fn restore(
+    destination: &dyn ReplicaDestination,
+    root: &str,
+    target: Option<DateTime<Utc>>,
+    output: &Path,
+) -> Result<RestoreOutcome, RestoreError> {
+    let plan = plan(destination, root, target)?;
+    apply(destination, &plan, output)
+}
+
+/// The staging directory a restore of `output` builds in.
+fn staging_dir(output: &Path) -> PathBuf {
+    let mut name = output.as_os_str().to_os_string();
+    name.push(".restore-staging");
+    PathBuf::from(name)
+}
+
+/// The path a displaced WAL sidecar is parked at while a restore publishes.
+fn displaced_path(sidecar: &Path) -> PathBuf {
+    let mut name = sidecar.as_os_str().to_os_string();
+    name.push(".displaced");
+    PathBuf::from(name)
+}
+
+/// Move `output`'s WAL sidecars aside, returning the `(sidecar, parked)` pairs
+/// that were moved so a failed publish can put them back.
+///
+/// They are parked beside the output rather than inside the staging directory,
+/// which can legitimately sit on another filesystem, so the rename never has to
+/// cross one.
+///
+/// A sidecar that exists but cannot be moved aborts the restore rather than
+/// being skipped: publishing would leave the new database beside a foreign WAL,
+/// and `SQLite` would then recover that WAL over the freshly restored file —
+/// losing the restore itself, not merely the sidecar. Only "there was nothing
+/// there" is allowed to pass silently.
+fn displace_sidecars(output: &Path) -> Result<Vec<(PathBuf, PathBuf)>, RestoreError> {
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for sidecar in [wal::wal_path(output), wal::shm_path(output)] {
+        let parked = displaced_path(&sidecar);
+        // A park left by an interrupted earlier run is not something to
+        // preserve, and `rename` refuses an existing *directory* as its
+        // destination on every platform. (It does replace an existing file,
+        // Windows included: `fs::rename` is documented as "replacing the
+        // original file if `to` already exists".)
+        if let Err(e) = std::fs::remove_file(&parked)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            restore_sidecars(&moved);
+            return Err(RestoreError::io("clear a stale displaced sidecar")(e));
+        }
+        match std::fs::rename(&sidecar, &parked) {
+            Ok(()) => moved.push((sidecar, parked)),
+            // The ordinary case: a cleanly closed database has no sidecars.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                restore_sidecars(&moved);
+                return Err(RestoreError::io("displace an existing WAL sidecar")(e));
+            }
+        }
+    }
+    Ok(moved)
+}
+
+/// Put displaced sidecars back beside the database they belong to.
+fn restore_sidecars(displaced: &[(PathBuf, PathBuf)]) {
+    for (sidecar, parked) in displaced {
+        let _ = std::fs::rename(parked, sidecar);
+    }
+}
+
+/// Move `from` onto `to`, atomically wherever the filesystem allows it.
+fn move_file(from: &Path, to: &Path) -> Result<(), RestoreError> {
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    // A rename across filesystems fails with EXDEV; the staging directory and
+    // the output can legitimately live on different mounts. Copying straight
+    // onto `to` would truncate the database already sitting there before
+    // writing a byte, so a copy that then hit a full disk or an I/O error would
+    // leave it destroyed — the very failure this path exists to avoid. Land the
+    // bytes beside the target first, then rename, which is atomic within the
+    // single filesystem they now share.
+    let mut name = to.as_os_str().to_os_string();
+    name.push(".incoming");
+    let incoming = PathBuf::from(name);
+    let _ = std::fs::remove_file(&incoming);
+    if let Err(e) = copy_and_sync(from, &incoming) {
+        let _ = std::fs::remove_file(&incoming);
+        return Err(e);
+    }
+    std::fs::rename(&incoming, to).map_err(RestoreError::io("publish restored database"))?;
+    std::fs::remove_file(from).map_err(RestoreError::io("clean up staging"))
+}
+
+/// Copy `from` to `to` and flush it, so the rename that follows publishes bytes
+/// that are actually on the disk.
+fn copy_and_sync(from: &Path, to: &Path) -> Result<(), RestoreError> {
+    std::fs::copy(from, to).map_err(RestoreError::io("publish restored database"))?;
+    let file = std::fs::File::open(to).map_err(RestoreError::io("publish restored database"))?;
+    file.sync_all()
+        .map_err(RestoreError::io("publish restored database"))
+}
+
+/// Reassemble and verify inside `staging`, returning everything but the final
+/// output path (which [`apply`] fills in after publishing).
+fn build_in_staging(
+    destination: &dyn ReplicaDestination,
+    plan: &RestorePlan,
+    staging: &Path,
+) -> Result<RestoreOutcome, RestoreError> {
+    let meta_bytes = destination.get(&plan.snapshot_meta_key)?;
+    let meta: SnapshotMeta = serde_json::from_slice(&meta_bytes).map_err(|e| RestoreError::Io {
+        op: "parse snapshot metadata",
+        detail: e.to_string(),
+    })?;
+    if meta.version != segment::LAYOUT_VERSION {
+        return Err(RestoreError::UnsupportedVersion {
+            version: meta.version,
+        });
+    }
+
+    // Snapshot: download the gzip stream, inflate it, and verify the bytes match
+    // the digest recorded when it was taken.
+    let compressed = staging.join("snapshot.db.gz");
+    destination.get_to_file(&plan.snapshot_key, &compressed)?;
+    let db_path = staging.join("restored.db");
+    let uncompressed_len = inflate_to(&compressed, &db_path, meta.uncompressed_len)?;
+    let _ = std::fs::remove_file(&compressed);
+    if uncompressed_len != meta.uncompressed_len {
+        return Err(RestoreError::SnapshotDigest {
+            expected_len: meta.uncompressed_len,
+            actual_len: uncompressed_len,
+        });
+    }
+    let digest = sha256_file(&db_path)?;
+    if digest != meta.sha256 {
+        return Err(RestoreError::SnapshotDigest {
+            expected_len: meta.uncompressed_len,
+            actual_len: uncompressed_len,
+        });
+    }
+
+    // WAL: replay index by index. Each index is one WAL salt sequence starting
+    // at offset 0, so its segments concatenate into a `-wal` beside the snapshot
+    // that SQLite recovers on its own; the index is then checkpointed in before
+    // the next one is staged, exactly reversing how the replicator produced them.
+    let wal_target = wal::wal_path(&db_path);
+    let mut frames_replayed: u64 = 0;
+    let mut current_index: Option<u32> = None;
+    let mut expected_offset: u64 = 0;
+    // A WAL index's salt is whatever its own segment 0 carries; every later
+    // segment in that index must agree, or frames from two WAL sequences have
+    // been mixed.
+    let mut expected_salt: Option<(u32, u32)> = None;
+    let mut staged: Option<std::fs::File> = None;
+    // The database size the current index's last commit recorded, used below to
+    // prove SQLite really replayed to the end of that index.
+    let mut index_db_pages: u32 = 0;
+    let mut index_page_size: u32 = 0;
+
+    let _ = std::fs::remove_file(&wal_target);
+    let _ = std::fs::remove_file(wal::shm_path(&db_path));
+
+    for planned in &plan.segments {
+        if current_index != Some(planned.index) {
+            if let Some(file) = staged.take() {
+                finish_wal(file)?;
+                fold_wal(&db_path, index_db_pages, index_page_size)?;
+            }
+            current_index = Some(planned.index);
+            expected_offset = 0;
+            expected_salt = None;
+            staged = Some(
+                std::fs::File::create(&wal_target).map_err(RestoreError::io("stage the WAL"))?,
+            );
+        }
+        let payload = destination.get(&planned.key)?;
+        let (header, raw) = segment::decode_segment(&payload)?;
+        // The payload must be the segment the key said it was.
+        if header.index != planned.index || header.seq != planned.seq {
+            return Err(RestoreError::SegmentGap {
+                generation: plan.generation.clone(),
+                expected_index: planned.index,
+                expected_seq: planned.seq,
+                found_index: header.index,
+                found_seq: header.seq,
+            });
+        }
+        check_continuity(
+            plan,
+            &mut expected_salt,
+            planned.seq,
+            &header,
+            expected_offset,
+        )?;
+        let Some(file) = staged.as_mut() else {
+            return Err(RestoreError::Io {
+                op: "stage the WAL",
+                detail: "no WAL index was open for this segment".to_owned(),
+            });
+        };
+        file.write_all(&raw)
+            .map_err(RestoreError::io("stage the WAL"))?;
+        expected_offset = header.end_offset;
+        index_db_pages = header.db_size_pages;
+        index_page_size = header.page_size;
+        frames_replayed = frames_replayed.saturating_add(header.frame_count);
+    }
+    if let Some(file) = staged.take() {
+        finish_wal(file)?;
+        fold_wal(&db_path, index_db_pages, index_page_size)?;
+    }
+
+    // Prove the result is a sound database BEFORE it is allowed anywhere near
+    // the output path.
+    let mut conn = sqlite::open(&db_path)?;
+    sqlite::integrity_check(&mut conn)?;
+    drop(conn);
+    let _ = std::fs::remove_file(wal::wal_path(&db_path));
+    let _ = std::fs::remove_file(wal::shm_path(&db_path));
+
+    let bytes = std::fs::metadata(&db_path)
+        .map_err(RestoreError::io("stat restored database"))?
+        .len();
+    Ok(RestoreOutcome {
+        plan: plan.clone(),
+        output: db_path,
+        bytes,
+        frames_replayed,
+    })
+}
+
+/// Flush a staged `-wal` to disk before `SQLite` is asked to recover it.
+fn finish_wal(file: std::fs::File) -> Result<(), RestoreError> {
+    file.sync_all().map_err(RestoreError::io("stage the WAL"))?;
+    drop(file);
+    Ok(())
+}
+
+/// Let `SQLite` recover the staged `-wal` into `db_path`, prove it replayed all
+/// of it, then clear the sidecars so the next index starts clean.
+///
+/// The proof matters. `SQLite`'s WAL recovery stops at the first frame that does
+/// not validate and still reports success, and `wal_checkpoint(TRUNCATE)` empties
+/// the `-wal` either way — so neither the pragma's result nor the file size can
+/// tell a full replay from a truncated one. What *can* is the database size the
+/// index's last commit frame recorded: every commit frame carries the page count
+/// as of that commit, so a file that many pages long means the last commit was
+/// applied.
+fn fold_wal(db_path: &Path, db_pages: u32, page_size: u32) -> Result<(), RestoreError> {
+    let mut conn = sqlite::open(db_path)?;
+    let outcome = sqlite::checkpoint_truncate(&mut conn, db_path)?;
+    drop(conn);
+    if outcome != sqlite::CheckpointOutcome::Truncated {
+        return Err(RestoreError::Io {
+            op: "replay the WAL",
+            detail: format!(
+                "SQLite did not fully checkpoint the reassembled WAL for {} — refusing a \
+                 partially replayed restore",
+                db_path.display()
+            ),
+        });
+    }
+    let expected = u64::from(db_pages).saturating_mul(u64::from(page_size));
+    if expected > 0 {
+        let actual = std::fs::metadata(db_path)
+            .map_err(RestoreError::io("stat the replayed database"))?
+            .len();
+        if actual != expected {
+            return Err(RestoreError::Io {
+                op: "replay the WAL",
+                detail: format!(
+                    "the replayed database is {actual} byte(s) but its last replicated commit \
+                     recorded {db_pages} page(s) of {page_size} ({expected} bytes) — SQLite \
+                     stopped short of the end of the WAL"
+                ),
+            });
+        }
+    }
+    let _ = std::fs::remove_file(wal::wal_path(db_path));
+    let _ = std::fs::remove_file(wal::shm_path(db_path));
+    Ok(())
+}
+
+/// Refuse a segment that does not continue the previous one or belongs to a
+/// different WAL generation.
+fn check_continuity(
+    plan: &RestorePlan,
+    expected_salt: &mut Option<(u32, u32)>,
+    seq: u64,
+    header: &SegmentHeader,
+    expected_offset: u64,
+) -> Result<(), RestoreError> {
+    if header.start_offset != expected_offset {
+        return Err(RestoreError::SegmentDiscontinuity {
+            generation: plan.generation.clone(),
+            seq,
+            expected_offset,
+            found_offset: header.start_offset,
+        });
+    }
+    let salt = (header.salt1, header.salt2);
+    match expected_salt {
+        Some(expected) if *expected != salt => {
+            return Err(RestoreError::SaltMismatch {
+                generation: plan.generation.clone(),
+                seq,
+            });
+        }
+        Some(_) => {}
+        None => *expected_salt = Some(salt),
+    }
+    Ok(())
+}
+
+/// Gunzip `source` into `target`, returning the number of bytes written.
+///
+/// The output is capped one byte past `expected_len`: the metadata already says
+/// how large the snapshot is, so a payload that inflates past it is a bomb or a
+/// corruption, and either way there is no reason to keep writing. Without the
+/// cap a ~1 MB crafted object could fill the restore host's filesystem — which,
+/// on a real restore, is the filesystem the database lives on.
+fn inflate_to(source: &Path, target: &Path, expected_len: u64) -> Result<u64, RestoreError> {
+    let input = std::fs::File::open(source).map_err(RestoreError::io("open snapshot"))?;
+    let decoder = flate2::read::GzDecoder::new(std::io::BufReader::new(input));
+    let mut decoder = std::io::Read::take(decoder, expected_len.saturating_add(1));
+    let mut output = std::fs::File::create(target).map_err(RestoreError::io("stage snapshot"))?;
+    let written =
+        std::io::copy(&mut decoder, &mut output).map_err(RestoreError::io("inflate snapshot"))?;
+    output
+        .sync_all()
+        .map_err(RestoreError::io("stage snapshot"))?;
+    Ok(written)
+}
+
+/// Streaming SHA-256 of a file, so a large snapshot is never buffered.
+fn sha256_file(path: &Path) -> Result<String, RestoreError> {
+    use sha2::{Digest as _, Sha256};
+    let mut file = std::fs::File::open(path).map_err(RestoreError::io("hash snapshot"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let read =
+            std::io::Read::read(&mut file, &mut buf).map_err(RestoreError::io("hash snapshot"))?;
+        if read == 0 {
+            break;
+        }
+        let chunk = buf.get(..read).unwrap_or(&[]);
+        hasher.update(chunk);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}

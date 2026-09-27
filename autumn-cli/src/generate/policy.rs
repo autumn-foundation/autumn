@@ -11,9 +11,14 @@
 //! - `src/main.rs` — `mod policies;` declaration plus `.policy::<...>(...)` and
 //!   `.scope::<...>(...)` wired into the app builder chain.
 //!
-//! When no owner column can be detected, `can_update`/`can_delete` and the
-//! scope default-deny with a `// TODO` marker so the developer fills in the
-//! real ownership rule — safe-by-default until then.
+//! When no owner column can be detected there is no ownership rule to emit,
+//! and the two halves diverge rather than both denying. `can_update`/
+//! `can_delete` fall back to `ctx.is_authenticated()` under a `// SECURITY
+//! TODO` marker — any signed-in user may update or delete any row — because
+//! default-denying them would 403 a freshly generated app on its own edit form
+//! (issue #1830). The scope, which nothing depends on to succeed, does deny:
+//! it returns no rows until its `// TODO` filter is written. Neither half is a
+//! finished rule; both are placeholders for a real per-record one.
 //!
 //! Requires the target model to already exist (`src/models/<snake>.rs`); run
 //! `autumn generate model <Pascal>` (or `scaffold`) first.
@@ -420,7 +425,7 @@ impl Scope<{pascal_name}> for {pascal_name}Scope {{
     fn list<'a>(
         &'a self,
         {scope_ctx_param}: &'a PolicyContext,
-        {scope_conn_param}: &'a mut diesel_async::AsyncPgConnection,
+        {scope_conn_param}: &'a mut autumn_web::RuntimeConnection,
     ) -> BoxFuture<'a, autumn_web::AutumnResult<Vec<{pascal_name}>>> {{
 {scope_body}    }}
 }}
@@ -646,13 +651,13 @@ async fn main() {
         assert!(main.contains("mod policies;"), "{main}");
         assert!(
             main.contains(
-                ".policy::<crate::models::post::Post, _>(crate::policies::post::PostPolicy::default())"
+                ".policy::<crate::models::post::Post, _>(crate::policies::post::PostPolicy)"
             ),
             "{main}"
         );
         assert!(
             main.contains(
-                ".scope::<crate::models::post::Post, _>(crate::policies::post::PostScope::default())"
+                ".scope::<crate::models::post::Post, _>(crate::policies::post::PostScope)"
             ),
             "{main}"
         );
@@ -681,15 +686,11 @@ async fn main() {
 
         let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
         assert!(
-            main.contains(
-                ".policy::<crate::models::Post, _>(crate::policies::post::PostPolicy::default())"
-            ),
+            main.contains(".policy::<crate::models::Post, _>(crate::policies::post::PostPolicy)"),
             "single-file layout policy registration must use crate::models::Post: {main}"
         );
         assert!(
-            main.contains(
-                ".scope::<crate::models::Post, _>(crate::policies::post::PostScope::default())"
-            ),
+            main.contains(".scope::<crate::models::Post, _>(crate::policies::post::PostScope)"),
             "single-file layout scope registration must use crate::models::Post: {main}"
         );
     }

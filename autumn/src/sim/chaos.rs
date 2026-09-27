@@ -32,6 +32,14 @@
 //! is unaffected. Chaos is opt-in via
 //! [`Sim::chaos`](crate::sim::Sim::chaos).
 //!
+//! # See also: naming a fault instead of drawing one
+//!
+//! `Chaos` authors a *rate*. When a test needs to name the exact effect that
+//! must fail — "the 3rd checkout", "the 2nd `send_invoice` execution" — and
+//! freeze it as a regression test, use the authored lane,
+//! [`FaultPlan`](crate::sim::FaultPlan) (issue #1680), which composes with an
+//! active `Chaos` rather than replacing it.
+//!
 //! # Scope (W5.0)
 //!
 //! This wave ships the scaffolding and the three base fault kinds. Richer
@@ -409,6 +417,20 @@ struct SkewClock {
 impl ClockSource for SkewClock {
     fn now(&self) -> DateTime<Utc> {
         self.inner.now() + self.offset
+    }
+
+    /// Forwarded to the wrapped clock **unskewed**.
+    ///
+    /// Clock skew is a *wall-clock* fault — it models a machine whose calendar
+    /// disagrees with reality — and a real monotonic clock is immune to exactly
+    /// that. Deriving the monotonic reading from the skewed wall instant would
+    /// let a future drifting/jittering skew corrupt every elapsed duration in
+    /// the sim (latencies, uptime, throttle windows), which is not the fault
+    /// being injected. Today's constant offset happens to cancel under
+    /// subtraction, so this forward is what keeps that an invariant rather than
+    /// a coincidence.
+    fn monotonic(&self) -> crate::time::MonotonicInstant {
+        self.inner.monotonic()
     }
 }
 

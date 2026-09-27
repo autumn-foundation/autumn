@@ -281,6 +281,55 @@ pub fn validate_unique_one_off_task_names(tasks: &[OneOffTaskInfo]) -> Result<()
     Ok(())
 }
 
+/// Validate that every scheduled task — hand-declared via `tasks![...]` and
+/// auto-collected (e.g. `#[repository(..., retention(...))]` sweeps, #1342)
+/// alike — has a unique name.
+///
+/// `retention::collect_retention_tasks()` only catches collisions among
+/// retention-generated names; it has no visibility into hand-declared
+/// `tasks![...]` entries. Without this check, an operator's own
+/// `#[scheduled]` task that happens to share a name with a generated one
+/// (or with another hand-declared task) silently spawns two competing
+/// loops: the scheduler's name-keyed task registry and fleet coordination
+/// both key on this name, so the two executions overwrite each other's
+/// actuator state.
+///
+/// # Errors
+///
+/// Returns a message naming the first duplicate task.
+pub fn validate_unique_scheduled_task_names(tasks: &[TaskInfo]) -> Result<(), String> {
+    validate_unique_task_names(tasks.iter().map(|task| task.name.as_str()))
+}
+
+/// As [`validate_unique_scheduled_task_names`], over names alone.
+///
+/// The check only ever read `TaskInfo::name`, and `TaskInfo` is not `Clone`, so
+/// a caller holding a borrowed list plus one extra task — the no-boot export,
+/// which must validate the same `[retention]`-merged list `run()` validates —
+/// could not build a `&[TaskInfo]` to pass. Taking names is what lets both run
+/// one definition instead of the second growing a copy that drifts (issue #802).
+///
+/// # Errors
+///
+/// Returns the operator-facing message when two tasks share a name.
+pub fn validate_unique_task_names<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            return Err(format!(
+                "duplicate scheduled task name '{name}': two tasks — hand-declared via \
+                 tasks![...], or auto-collected from a #[repository(..., retention(...))] \
+                 policy — registered the same name. The scheduler and fleet coordinator key \
+                 state by this name, so both would compete and overwrite each other's \
+                 actuator state. Rename one of them"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,6 +509,63 @@ mod tests {
             .expect_err("duplicate task names should be rejected");
 
         assert!(error.contains("duplicate task name 'cleanup'"));
+    }
+
+    #[test]
+    fn validate_unique_scheduled_task_names_rejects_duplicates() {
+        // Regression (#1342 review round 12): collect_retention_tasks()
+        // only catches collisions among retention-generated names, not a
+        // collision with a hand-declared `tasks![...]` entry (e.g. an
+        // operator's own #[scheduled] task that happens to be named
+        // `retention-sweep-<table>`). The merged list must be validated as
+        // a whole.
+        fn handler(_state: AppState) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        let tasks = vec![
+            TaskInfo {
+                name: "retention-sweep-posts".to_string(),
+                schedule: Schedule::FixedDelay(Duration::from_secs(3600)),
+                coordination: TaskCoordination::Fleet,
+                handler,
+            },
+            TaskInfo {
+                name: "retention-sweep-posts".to_string(),
+                schedule: Schedule::FixedDelay(Duration::from_secs(60)),
+                coordination: TaskCoordination::PerReplica,
+                handler,
+            },
+        ];
+
+        let error = validate_unique_scheduled_task_names(&tasks)
+            .expect_err("duplicate scheduled task names should be rejected");
+
+        assert!(error.contains("duplicate scheduled task name 'retention-sweep-posts'"));
+    }
+
+    #[test]
+    fn validate_unique_scheduled_task_names_accepts_distinct_names() {
+        fn handler(_state: AppState) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        let tasks = vec![
+            TaskInfo {
+                name: "retention-sweep-posts".to_string(),
+                schedule: Schedule::FixedDelay(Duration::from_secs(3600)),
+                coordination: TaskCoordination::Fleet,
+                handler,
+            },
+            TaskInfo {
+                name: "nightly-report".to_string(),
+                schedule: Schedule::FixedDelay(Duration::from_secs(3600)),
+                coordination: TaskCoordination::Fleet,
+                handler,
+            },
+        ];
+
+        assert!(validate_unique_scheduled_task_names(&tasks).is_ok());
     }
 }
 
