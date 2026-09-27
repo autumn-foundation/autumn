@@ -112,6 +112,7 @@ Looking for the API reference instead? That is
 - [Cookie Consent](cookie-consent.md) — the consent gate, the banner, and the withdraw flow
 - [Bot Protection and CAPTCHA](bot-protection.md) — keeping automated traffic off a form or route
 - [TLS and HTTPS](tls.md) — certificates, ACME, and terminating TLS
+- [CORS and Cross-Origin Requests](cors.md) — letting a browser on another origin read your responses
 - [Data Retention for Framework-Owned Data](data-retention.md) — bounding the tables Autumn itself creates
 - [Data-Retention Sweeps](retention-sweeps.md) — auto-purging your own tables on a schedule
 - [Data Scrubbing](data-scrubbing.md) — turning a production backup into an anonymized staging copy
