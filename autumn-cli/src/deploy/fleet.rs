@@ -952,6 +952,17 @@ fn state_table_lines(title: &str, rows: &[(&'static str, &str, String)]) -> Vec<
     lines
 }
 
+/// The `Fleet state:` row for a [`HostOutcome::LiveOnNew`] host. For
+/// `drain-old` it names the risk, not only the step (issue #2279).
+fn live_on_new_row(release_id: &str, failed_step: &str) -> String {
+    let risk = if failed_step == DRAIN_OLD_LABEL {
+        format!(": {OLD_SLOT_MAY_RUN_NOTE}")
+    } else {
+        String::new()
+    };
+    format!("serving {release_id} \u{2014} but `{failed_step}` failed AFTER the cutover{risk}")
+}
+
 /// The per-host state table printed at the END of every fleet rollout — success or
 /// halt (issue #1621, §8.2).
 ///
@@ -978,16 +989,7 @@ pub(crate) fn fleet_summary_lines(
             ),
             // Traffic already moved before the failure, so this host IS on the new
             // release — saying only "failed" would be the dangerous half-truth.
-            // #2279: name the risk, not only the step.
-            HostOutcome::LiveOnNew { failed_step } if *failed_step == DRAIN_OLD_LABEL => format!(
-                "serving {release_id} \u{2014} but `{failed_step}` failed AFTER the cutover: \
-                 {OLD_SLOT_MAY_RUN_NOTE}"
-            ),
-            HostOutcome::LiveOnNew { failed_step } => {
-                format!(
-                    "serving {release_id} \u{2014} but `{failed_step}` failed AFTER the cutover"
-                )
-            }
+            HostOutcome::LiveOnNew { failed_step } => live_on_new_row(release_id, failed_step),
             HostOutcome::AmbiguousMarkers => format!(
                 "serving {release_id} \u{2014} `{AMBIGUOUS_MARKERS_LABEL}` failed AFTER the \
                  cutover, so the release markers are mid-transaction and this host was NOT \
