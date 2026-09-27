@@ -263,7 +263,7 @@ let url = asset_url("css/autumn.css");
 ```
 
 If `static/.autumn-manifest.json` is absent (e.g. on a dev machine that never
-ran `autumn build --release`), `asset_url` falls back to the plain
+ran `autumn build`), `asset_url` falls back to the plain
 `/static/...` URL — so the app keeps running without any manual configuration.
 
 ## Inspecting routes with `autumn routes`

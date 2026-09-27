@@ -1,0 +1,5 @@
+error: terminal state `Delivered` cannot have an outgoing transition to `Reopened`
+  --> tests/compile-fail/lifecycle_terminal_source.rs:15:9
+   |
+15 |         Delivered -> Reopened,
+   |         ^^^^^^^^^

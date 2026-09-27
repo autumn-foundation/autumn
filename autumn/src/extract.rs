@@ -1,7 +1,13 @@
-//! Re-exports of Axum extractors for use in Autumn handlers.
+//! Autumn's request extractors.
 //!
-//! These are provided so users don't need `axum` as a direct dependency
-//! for the most common extractor types.
+//! See the [extractors guide](https://github.com/autumn-foundation/autumn/blob/trunk/docs/guide/extractors.md)
+//! for the full catalog, the ordering rules, and how to write your own.
+//!
+//! Most are thin wrappers over the Axum extractor of the same name, provided so
+//! users don't need `axum` as a direct dependency and so parse failures use
+//! Autumn's Problem Details error contract. [`Query`] is the exception: it
+//! decodes through [`crate::query_string`], which accepts sequences and nested
+//! structures the flat `serde_urlencoded` form cannot express.
 //!
 //! | Extractor | Purpose |
 //! |-----------|---------|
@@ -30,6 +36,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -103,9 +111,20 @@ where
     }
 }
 
+/// The one gated sink of the first compile-time data-classification slice
+/// (issue #1654).
+///
+/// [`JsonSink`](crate::classify::JsonSink) is blanket-implemented for every
+/// `Serialize` type, so an ordinary handler never notices the bound. What it
+/// excludes is exactly the set autumn withholds `Serialize` from: a `#[model]`
+/// carrying a `#[classified]` column. Releasing such a column at a declared
+/// declassification boundary yields a plain value again, and the released view
+/// serializes here like anything else.
+///
+/// See `docs/guide/data-classification.md`.
 impl<T> IntoResponse for Json<T>
 where
-    axum::Json<T>: IntoResponse,
+    T: crate::classify::JsonSink,
 {
     fn into_response(self) -> Response {
         axum::Json(self.0).into_response()
@@ -142,8 +161,34 @@ where
 
 /// Deserialize URL query string parameters.
 ///
-/// Wraps [`axum::extract::Query`] so query parse failures use Autumn's
-/// Problem Details error contract.
+/// Query parse failures use Autumn's Problem Details error contract.
+///
+/// # Sequences and nested structures
+///
+/// Decoding goes through [`query_string`](crate::query_string), a **superset**
+/// of the flat `serde_urlencoded` form: a query string of unique scalar keys
+/// decodes exactly as it always did, and on top of that
+///
+/// ```text
+/// tags=a&tags=b               // repeated key   → Vec<String>
+/// tags[]=a&tags[]=b           // append form    → Vec<String>
+/// tags[0]=a&tags[2]=c         // indexed form   → Vec<String> (gaps compacted)
+/// filter[status]=open         // nested object  → struct field
+/// items[0][sku]=A-1           // array of objects
+/// ```
+///
+/// are all accepted — a bracketed dialect whose `items[0][sku]` shape matches
+/// the repeated-row encoding [`nested_form`](crate::nested_form) renders,
+/// generalized to arbitrary objects, sequences and depths. It applies to the
+/// query string only: [`Form<T>`] still decodes request bodies through
+/// `serde_urlencoded`. See [`query_string`](crate::query_string) for the exact
+/// semantics — scalar coercion, duplicate-key rejection, shape conflicts, the
+/// depth cap, and what changed for `HashMap`-typed targets.
+///
+/// This also shapes MCP tool exposure (issue #1972): a `Query<T>` becomes the
+/// tool's `query` object property, and `tools/call` dispatch renders that
+/// object into this same wire format, so a tool advertising a sequence or a
+/// nested object round-trips back into the handler's typed struct.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Query<T>(pub T);
 
@@ -152,19 +197,23 @@ impl_extractor_deref!(Query);
 impl<S, T> FromRequestParts<S> for Query<T>
 where
     S: Send + Sync,
-    axum::extract::Query<T>:
-        FromRequestParts<S, Rejection = axum::extract::rejection::QueryRejection>,
+    T: serde::de::DeserializeOwned,
 {
     type Rejection = crate::AutumnError;
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
-        state: &S,
+        _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        axum::extract::Query::from_request_parts(parts, state)
-            .await
-            .map(|axum::extract::Query(value)| Self(value))
-            .map_err(|err| rejection_to_error(err.status(), err.body_text()))
+        let query = parts.uri.query().unwrap_or_default();
+        crate::query_string::from_query_str::<T>(query)
+            .map(Self)
+            .map_err(|err| {
+                rejection_to_error(
+                    http::StatusCode::BAD_REQUEST,
+                    format!("Failed to deserialize query string: {err}"),
+                )
+            })
     }
 }
 
@@ -207,16 +256,37 @@ impl Multipart {
         };
 
         // Only file parts carry uploadable content worth validating. Regular
-        // form fields often omit `Content-Type` and are never sniffed.
-        //
-        // We sniff whenever an allow-list is configured OR strict
-        // mismatch-rejection is enabled — either check needs the actual
-        // (magic-byte) content type rather than the spoofable client header.
+        // form fields omit a filename entirely and are never sniffed. A file
+        // part always carries a filename (`Some`), so we sniff whenever one is
+        // present AND an allow-list is configured OR strict mismatch-rejection
+        // is enabled — either check needs the actual (magic-byte) content type
+        // rather than the spoofable client header.
         let needs_sniff = field.file_name().is_some()
             && (!self.config.allowed_mime_types.is_empty()
                 || self.config.reject_on_content_type_mismatch);
 
+        // An optional/empty file input submits a part with `filename=""` and a
+        // 0-byte body. Only that genuinely-empty case is exempt from
+        // enforcement (see below); a `filename=""` part with a NON-empty body
+        // must still be sniffed and enforced, since callers can consume its
+        // bytes by field name. Capture the empty-filename flag now, before the
+        // body is consumed by the prefix-buffering loop, to avoid borrowing
+        // `field` after it has been read. On the sniff path this flag also
+        // drives the `file_name()` normalization: a genuinely-empty optional
+        // input surfaces as `None`, a non-empty-body empty-filename part as a
+        // file.
+        let filename_is_empty = field.file_name().is_some_and(str::is_empty);
+
         if !needs_sniff {
+            // Default path: no MIME policy, so no sniffing and no enforcement.
+            // Hand the field through with ZERO buffering — exactly as before
+            // #1873 — so a handler can reject or stream it without the whole
+            // part being pulled into memory first. `file_name()` normalization
+            // is scoped to the sniff path (below), where body emptiness is
+            // already observed from the bounded sniff prefix; here there is no
+            // classification happening, so the raw inner filename (`Some("")`
+            // for an empty-filename part) is surfaced unchanged. Default config
+            // was explicitly unaffected by #1873.
             return Ok(Some(MultipartField::new(
                 field,
                 self.config.max_file_size_bytes,
@@ -253,19 +323,28 @@ impl Multipart {
         let declared_essence = field.content_type().map(content_type_essence);
         let sniffed = sniff_content_type(&prefix);
 
-        // Enforce the allow-list (sniffed → markup-guard → declared fallback)
-        // and, when enabled, strict declared-vs-sniffed matching. See the
-        // helpers below for the exact rules.
-        if !self.config.allowed_mime_types.is_empty() {
-            enforce_upload_allow_list(
-                &self.config.allowed_mime_types,
-                &prefix,
-                declared_essence,
-                sniffed,
-            )?;
-        }
-        if self.config.reject_on_content_type_mismatch {
-            enforce_content_type_match(declared_essence, sniffed)?;
+        // A genuinely-empty optional file input (empty filename AND 0-byte
+        // body) carries no upload: skip enforcement so it passes through as a
+        // non-file/absent field instead of aborting the submit. Every other
+        // part with a filename — including `filename=""` with a non-empty body
+        // — is sniffed and enforced exactly as below, closing the bypass where
+        // a crafted empty filename could smuggle disallowed content.
+        let is_empty_file_input = filename_is_empty && prefix.is_empty();
+        if !is_empty_file_input {
+            // Enforce the allow-list (sniffed → markup-guard → declared
+            // fallback) and, when enabled, strict declared-vs-sniffed matching.
+            // See the helpers below for the exact rules.
+            if !self.config.allowed_mime_types.is_empty() {
+                enforce_upload_allow_list(
+                    &self.config.allowed_mime_types,
+                    &prefix,
+                    declared_essence,
+                    sniffed,
+                )?;
+            }
+            if self.config.reject_on_content_type_mismatch {
+                enforce_content_type_match(declared_essence, sniffed)?;
+            }
         }
 
         Ok(Some(MultipartField {
@@ -273,6 +352,7 @@ impl Multipart {
             max_file_size_bytes: self.config.max_file_size_bytes,
             prefix,
             sniffed_content_type: sniffed,
+            is_empty_optional_input: is_empty_file_input,
         }))
     }
 }
@@ -441,6 +521,16 @@ pub struct MultipartField<'a> {
     /// Sniffed (magic-byte) content type, if the leading bytes were recognized.
     /// `infer` returns a `&'static str`, so this stores the borrow directly.
     sniffed_content_type: Option<&'static str>,
+    /// Whether this part is a genuinely-empty optional file input: an empty
+    /// `filename=""` AND a 0-byte body. Set only on the sniff path (an
+    /// allow-list or strict-mismatch policy is configured), where body
+    /// emptiness is already observed from the bounded sniff prefix, and used by
+    /// [`file_name`](Self::file_name) to normalize such a part to `None` while
+    /// leaving an empty-filename part with a non-empty body classified as a
+    /// file (`Some("")`). Always `false` on the default (no-policy) path, which
+    /// streams through without buffering and performs no `file_name()`
+    /// normalization.
+    is_empty_optional_input: bool,
 }
 
 #[cfg(all(feature = "multipart", feature = "storage"))]
@@ -464,6 +554,7 @@ impl<'a> MultipartField<'a> {
             max_file_size_bytes,
             prefix: Vec::new(),
             sniffed_content_type: None,
+            is_empty_optional_input: false,
         }
     }
 
@@ -486,9 +577,39 @@ impl<'a> MultipartField<'a> {
     }
 
     /// Uploaded file name (if this field represents a file).
+    ///
+    /// Normalization applies on the SNIFF PATH ONLY — i.e. when an allow-list
+    /// or strict-mismatch policy is configured — and to exactly ONE case there:
+    /// an empty `filename=""` AND a 0-byte body is returned as `None`, because
+    /// an optional file input left blank submits such a part to represent an
+    /// absent file rather than a real upload (see issue #1873). Handlers that
+    /// distinguish uploads via `field.file_name().is_some()` therefore treat it
+    /// as "no file provided" instead of persisting a zero-byte file.
+    ///
+    /// On the sniff path every other part is returned unchanged, so this getter
+    /// agrees with the file/non-file classification `next_field` uses for
+    /// enforcement:
+    ///
+    /// - empty filename + NON-empty body → `Some("")` (it is a file: it is
+    ///   sniffed and enforced under an allow-list, so it is surfaced as one);
+    /// - non-empty filename → `Some("name")`.
+    ///
+    /// On the DEFAULT path (no MIME policy) no normalization occurs: the field
+    /// streams through unbuffered and the raw inner value is returned verbatim
+    /// (`Some("")` for an empty-filename part). Default config was explicitly
+    /// unaffected by #1873, and no enforcement/classification happens there, so
+    /// there is no inconsistency to resolve.
+    ///
+    /// The sniff-path decision is made in `next_field`, where body emptiness is
+    /// observable from the bounded prefix, and recorded on this field — this
+    /// getter cannot inspect the (lazily read) body itself.
     #[must_use]
     pub fn file_name(&self) -> Option<&str> {
-        self.inner.file_name()
+        if self.is_empty_optional_input {
+            None
+        } else {
+            self.inner.file_name()
+        }
     }
 
     /// Declared MIME type for this field.
@@ -544,7 +665,9 @@ impl<'a> MultipartField<'a> {
             .await
             .map_err(|err| multipart_error_to_error(&err))?
         {
-            read += chunk.len();
+            // Saturating: the very next check rejects anything over the cap,
+            // so a saturated total still fails closed instead of overflowing.
+            read = read.saturating_add(chunk.len());
             if read > self.max_file_size_bytes {
                 return Err(file_too_large_error(self.max_file_size_bytes));
             }
@@ -698,7 +821,7 @@ impl<'a> MultipartField<'a> {
         // Write any sniffed prefix bytes first so they are not lost, counting
         // them toward the per-file cap.
         if !self.prefix.is_empty() {
-            written += self.prefix.len();
+            written = written.saturating_add(self.prefix.len());
             if written > self.max_file_size_bytes {
                 drop(file);
                 let _ = tokio::fs::remove_file(path).await;
@@ -714,7 +837,9 @@ impl<'a> MultipartField<'a> {
             .await
             .map_err(|err| multipart_error_to_error(&err))?
         {
-            written += chunk.len();
+            // Saturating for the same reason as `bytes_limited`: a saturated
+            // running total is still over the cap, so the file is rejected.
+            written = written.saturating_add(chunk.len());
             if written > self.max_file_size_bytes {
                 drop(file);
                 let _ = tokio::fs::remove_file(path).await;

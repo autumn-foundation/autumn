@@ -11,9 +11,14 @@
 //! - `src/main.rs` — `mod policies;` declaration plus `.policy::<...>(...)` and
 //!   `.scope::<...>(...)` wired into the app builder chain.
 //!
-//! When no owner column can be detected, `can_update`/`can_delete` and the
-//! scope default-deny with a `// TODO` marker so the developer fills in the
-//! real ownership rule — safe-by-default until then.
+//! When no owner column can be detected there is no ownership rule to emit,
+//! and the two halves diverge rather than both denying. `can_update`/
+//! `can_delete` fall back to `ctx.is_authenticated()` under a `// SECURITY
+//! TODO` marker — any signed-in user may update or delete any row — because
+//! default-denying them would 403 a freshly generated app on its own edit form
+//! (issue #1830). The scope, which nothing depends on to succeed, does deny:
+//! it returns no rows until its `// TODO` filter is written. Neither half is a
+//! finished rule; both are placeholders for a real per-record one.
 //!
 //! Requires the target model to already exist (`src/models/<snake>.rs`); run
 //! `autumn generate model <Pascal>` (or `scaffold`) first.
@@ -28,7 +33,7 @@ use super::{GenerateError, ensure_project_root, read_or_empty};
 
 /// Compute the file actions for `autumn generate policy`.
 ///
-/// `for_destroy` selects the caller's [`super::ApplyMode`]: in generate mode the
+/// `for_destroy` selects the caller's `ApplyMode`: in generate mode the
 /// model-existence guard (AC5) fires when the target model is missing, but in
 /// destroy mode it is skipped so `autumn destroy policy` can still tear the
 /// policy down after the model was already destroyed (the plan's `revert` only
@@ -301,8 +306,10 @@ fn render_policy_file(
              //! generated, this is ordinary user code.\n\
              //!\n\
              //! No owner column (`user_id`/`author_id`/`owner_id`) was detected on this\n\
-             //! model, so `can_update`, `can_delete`, and the scope default-deny. Fill in\n\
-             //! the real ownership check where the `TODO` markers are.\n"
+             //! model, so `can_update`/`can_delete` authorize any authenticated user and\n\
+             //! the scope default-denies. This is a placeholder — replace the authenticated\n\
+             //! check with a real per-record ownership rule where the `SECURITY TODO`/`TODO`\n\
+             //! markers are before production.\n"
         )
     };
 
@@ -343,20 +350,29 @@ fn render_policy_file(
             )
         }
         None => (
+            // Issue #1830: no owner column was detected, so there is no per-record
+            // ownership rule to emit. Rather than default-deny (which would make a
+            // fresh scaffold 403 on every update/delete) or ship `#[secured]`-only
+            // handlers (which let ANY authenticated user mutate ANY row), authorize
+            // any authenticated user here — a no-regression over the prior behavior
+            // that routes the mutation through this ONE enforceable policy method
+            // for the developer to tighten.
             format!(
-                "    fn can_update<'a>(&'a self, _ctx: &'a PolicyContext, _{snake_name}: &'a {pascal_name}) -> BoxFuture<'a, bool> {{\n        \
-                 // TODO: no owner column detected — implement the ownership check.\n        \
-                 Box::pin(async {{ false }})\n    \
+                "    fn can_update<'a>(&'a self, ctx: &'a PolicyContext, _{snake_name}: &'a {pascal_name}) -> BoxFuture<'a, bool> {{\n        \
+                 // SECURITY TODO: this only checks authentication — replace with a real\n        \
+                 // per-record ownership rule before production.\n        \
+                 Box::pin(async move {{ ctx.is_authenticated() }})\n    \
                  }}\n\n    \
-                 fn can_delete<'a>(&'a self, _ctx: &'a PolicyContext, _{snake_name}: &'a {pascal_name}) -> BoxFuture<'a, bool> {{\n        \
-                 // TODO: no owner column detected — implement the ownership check.\n        \
-                 Box::pin(async {{ false }})\n    \
+                 fn can_delete<'a>(&'a self, ctx: &'a PolicyContext, _{snake_name}: &'a {pascal_name}) -> BoxFuture<'a, bool> {{\n        \
+                 // SECURITY TODO: this only checks authentication — replace with a real\n        \
+                 // per-record ownership rule before production.\n        \
+                 Box::pin(async move {{ ctx.is_authenticated() }})\n    \
                  }}\n"
             ),
             "        // TODO: no owner column detected — implement the scope filter.\n        \
              Box::pin(async { Ok(Vec::new()) })\n"
                 .to_owned(),
-            // `ctx`/`conn` are unused in the default-deny stub.
+            // `ctx`/`conn` are unused in the default-deny scope stub.
             "_ctx",
         ),
     };
@@ -409,7 +425,7 @@ impl Scope<{pascal_name}> for {pascal_name}Scope {{
     fn list<'a>(
         &'a self,
         {scope_ctx_param}: &'a PolicyContext,
-        {scope_conn_param}: &'a mut diesel_async::AsyncPgConnection,
+        {scope_conn_param}: &'a mut autumn_web::RuntimeConnection,
     ) -> BoxFuture<'a, autumn_web::AutumnResult<Vec<{pascal_name}>>> {{
 {scope_body}    }}
 }}
@@ -582,7 +598,11 @@ async fn main() {
     }
 
     #[test]
-    fn no_owner_column_default_denies_with_todo() {
+    fn no_owner_column_authorizes_authenticated_with_security_todo() {
+        // Issue #1830: the no-owner policy authorizes any authenticated user
+        // (a no-regression over `#[secured]`-only handlers) rather than
+        // default-denying, so a fresh scaffold never 403s on first use — with a
+        // loud SECURITY TODO steering the developer to a real ownership rule.
         let tmp = project_with_model("    pub title: String,\n    pub body: String,\n");
         plan_policy(tmp.path(), "Post", false)
             .unwrap()
@@ -590,10 +610,26 @@ async fn main() {
             .unwrap();
         let src = fs::read_to_string(tmp.path().join("src/policies/post.rs")).unwrap();
         assert!(
-            src.contains("// TODO: no owner column detected"),
-            "must carry TODO marker: {src}"
+            src.contains("// SECURITY TODO: this only checks authentication"),
+            "must carry the SECURITY TODO marker: {src}"
         );
-        assert!(src.contains("Box::pin(async { false })"), "{src}");
+        // can_update/can_delete authorize an authenticated user, not default-deny.
+        assert_eq!(
+            src.matches("Box::pin(async move { ctx.is_authenticated() })")
+                .count(),
+            // can_create + can_update + can_delete.
+            3,
+            "no-owner can_update/can_delete must authenticate-check like can_create: {src}"
+        );
+        assert!(
+            !src.contains("Box::pin(async { false })"),
+            "no-owner policy must no longer default-deny: {src}"
+        );
+        // The scope stays default-empty (no column to filter on).
+        assert!(
+            src.contains("// TODO: no owner column detected — implement the scope filter."),
+            "scope must keep its TODO marker: {src}"
+        );
         assert!(
             src.contains("//! No owner column"),
             "module doc must note the missing owner column: {src}"
@@ -615,13 +651,13 @@ async fn main() {
         assert!(main.contains("mod policies;"), "{main}");
         assert!(
             main.contains(
-                ".policy::<crate::models::post::Post, _>(crate::policies::post::PostPolicy::default())"
+                ".policy::<crate::models::post::Post, _>(crate::policies::post::PostPolicy)"
             ),
             "{main}"
         );
         assert!(
             main.contains(
-                ".scope::<crate::models::post::Post, _>(crate::policies::post::PostScope::default())"
+                ".scope::<crate::models::post::Post, _>(crate::policies::post::PostScope)"
             ),
             "{main}"
         );
@@ -650,15 +686,11 @@ async fn main() {
 
         let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
         assert!(
-            main.contains(
-                ".policy::<crate::models::Post, _>(crate::policies::post::PostPolicy::default())"
-            ),
+            main.contains(".policy::<crate::models::Post, _>(crate::policies::post::PostPolicy)"),
             "single-file layout policy registration must use crate::models::Post: {main}"
         );
         assert!(
-            main.contains(
-                ".scope::<crate::models::Post, _>(crate::policies::post::PostScope::default())"
-            ),
+            main.contains(".scope::<crate::models::Post, _>(crate::policies::post::PostScope)"),
             "single-file layout scope registration must use crate::models::Post: {main}"
         );
     }
