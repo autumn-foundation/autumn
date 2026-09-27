@@ -45,6 +45,14 @@
 //! }
 //! ```
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1956,7 +1964,7 @@ impl RequestBuilder {
         }
 
         // ── Real network request with retries ───────────────────────────────
-        let start = Instant::now();
+        let start = crate::time::ambient_instant();
         let max_attempts = self.max_attempts(suppress_retries);
 
         for attempt in 0..max_attempts {
@@ -2012,7 +2020,7 @@ impl RequestBuilder {
                             .await
                             .map_err(|e| ClientError::Request(e.without_url()))?
                     };
-                    let elapsed = start.elapsed();
+                    let elapsed = crate::time::ambient_instant().saturating_duration_since(start);
                     log_request(
                         self.method.as_str(),
                         &url_used,
@@ -2367,7 +2375,7 @@ impl RequestBuilder {
         timeout: Duration,
         is_half_open: bool,
     ) -> Result<Response, ClientError> {
-        let deadline = std::time::Instant::now() + timeout;
+        let deadline = crate::time::ambient_instant() + timeout;
         let (follow, max) = self.ssrf_redirect_plan();
         let original =
             url::Url::parse(&self.url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
@@ -2478,7 +2486,7 @@ fn deadline_remaining_or_timeout(
     deadline: std::time::Instant,
     current: &str,
 ) -> Result<Duration, ClientError> {
-    let now = std::time::Instant::now();
+    let now = crate::time::ambient_instant();
     if now >= deadline {
         return Err(ssrf_safe_deadline_error(current));
     }
@@ -2660,7 +2668,7 @@ async fn send_one(
     deadline: Option<Instant>,
     suppress_retries: bool,
 ) -> Result<Response, ClientError> {
-    let start = Instant::now();
+    let start = crate::time::ambient_instant();
     let max_attempts = if suppress_retries {
         1
     } else if is_idempotent_method(method) || !retry_policy.retry_idempotent_only {
@@ -2683,16 +2691,16 @@ async fn send_one(
 
     for attempt in 0..max_attempts {
         if attempt > 0 {
-            if deadline.is_some_and(|d| Instant::now() >= d) {
+            if deadline.is_some_and(|d| crate::time::ambient_instant() >= d) {
                 return Err(deadline_exceeded_err(&mut last_transient_err));
             }
             let exp = (attempt - 1).min(10);
             let mut delay = Duration::from_millis(100 * (1_u64 << exp));
             if let Some(d) = deadline {
-                delay = delay.min(d.saturating_duration_since(Instant::now()));
+                delay = delay.min(d.saturating_duration_since(crate::time::ambient_instant()));
             }
             tokio::time::sleep(delay).await;
-            if deadline.is_some_and(|d| Instant::now() >= d) {
+            if deadline.is_some_and(|d| crate::time::ambient_instant() >= d) {
                 return Err(deadline_exceeded_err(&mut last_transient_err));
             }
         }
@@ -2704,7 +2712,7 @@ async fn send_one(
         // into a hop's budget would still get the full original per-attempt
         // timeout rather than what's actually left before `deadline`.
         if let Some(d) = deadline {
-            req = req.timeout(d.saturating_duration_since(Instant::now()));
+            req = req.timeout(d.saturating_duration_since(crate::time::ambient_instant()));
         }
         req = inject_trace_context(req);
         for (name, value) in extra_headers {
@@ -2728,10 +2736,11 @@ async fn send_one(
                         sleep_delay = sleep_delay.min(req_timeout);
                     }
                     if let Some(d) = deadline {
-                        sleep_delay = sleep_delay.min(d.saturating_duration_since(Instant::now()));
+                        sleep_delay = sleep_delay
+                            .min(d.saturating_duration_since(crate::time::ambient_instant()));
                     }
                     tokio::time::sleep(sleep_delay).await;
-                    if deadline.is_none_or(|d| Instant::now() < d) {
+                    if deadline.is_none_or(|d| crate::time::ambient_instant() < d) {
                         continue;
                     }
                     // Deadline exceeded during (or because of) the
@@ -2742,7 +2751,7 @@ async fn send_one(
                 }
                 if is_retryable_status(status.as_u16())
                     && attempt + 1 < max_attempts
-                    && deadline.is_none_or(|d| Instant::now() < d)
+                    && deadline.is_none_or(|d| crate::time::ambient_instant() < d)
                 {
                     continue;
                 }
@@ -2759,7 +2768,7 @@ async fn send_one(
                     method.as_str(),
                     &url_used,
                     status.as_u16(),
-                    start.elapsed(),
+                    crate::time::ambient_instant().saturating_duration_since(start),
                     extra_headers,
                 );
                 return Ok(Response {
@@ -2995,7 +3004,7 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     }
     // HTTP-date format per RFC 9110 (e.g. "Tue, 01 Jan 2030 00:00:00 GMT").
     let dt = chrono::DateTime::parse_from_rfc2822(value).ok()?;
-    let now = chrono::Utc::now();
+    let now = crate::time::ambient_now();
     let future = dt.with_timezone(&chrono::Utc);
     let secs = u64::try_from((future - now).num_seconds().max(0)).unwrap_or(0);
     Some(Duration::from_secs(secs))

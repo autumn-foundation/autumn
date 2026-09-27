@@ -8,6 +8,13 @@
     clippy::cast_precision_loss,
     clippy::collapsible_if
 )]
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -189,7 +196,7 @@ impl CircuitBreaker {
 
     pub fn state(&self) -> CircuitState {
         let mut inner = self.lock_inner();
-        let now = Instant::now();
+        let now = crate::time::ambient_instant();
         if inner.state == CircuitState::Open {
             if let Some(until) = inner.open_until {
                 if now >= until {
@@ -218,14 +225,14 @@ impl CircuitBreaker {
     pub fn failure_ratio(&self) -> f64 {
         let mut inner = self.lock_inner();
         let window = inner.config.sample_window;
-        inner.clean_history(window, Instant::now());
+        inner.clean_history(window, crate::time::ambient_instant());
         inner.failure_ratio()
     }
 
     #[allow(clippy::significant_drop_tightening)]
     pub(crate) fn before_call(&self) -> Result<(), CircuitBreakerError<()>> {
         let mut inner = self.lock_inner();
-        let now = Instant::now();
+        let now = crate::time::ambient_instant();
 
         if inner.state == CircuitState::Open {
             if let Some(until) = inner.open_until {
@@ -256,7 +263,7 @@ impl CircuitBreaker {
 
     pub(crate) fn after_call(&self, success: bool) {
         let mut inner = self.lock_inner();
-        let now = Instant::now();
+        let now = crate::time::ambient_instant();
         let window = inner.config.sample_window;
         inner.clean_history(window, now);
 

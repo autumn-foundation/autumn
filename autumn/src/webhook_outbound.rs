@@ -5,6 +5,14 @@
 )]
 //! Outbound signed webhook delivery with retries, DLQ, and subscription management.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -413,7 +421,7 @@ impl WebhookOutboundManager {
                 continue;
             }
 
-            let log_id = uuid::Uuid::new_v4().to_string();
+            let log_id = state.entropy().uuid_v4().to_string();
             let log = WebhookDeliveryLog {
                 id: log_id.clone(),
                 subscription_id: sub.id.clone(),
@@ -427,7 +435,7 @@ impl WebhookOutboundManager {
                 max_attempts: 5,
                 is_dlq: false,
                 last_error: None,
-                timestamp: Utc::now(),
+                timestamp: state.clock().now(),
             };
 
             // Register the initial attempt in local storage
@@ -485,7 +493,7 @@ impl WebhookOutboundManager {
     ) -> AutumnError {
         log.is_dlq = true;
         log.last_error = Some(message.clone());
-        log.timestamp = Utc::now();
+        log.timestamp = crate::time::ambient_now();
 
         if let Err(e) = self.handler.replace_delivery_log(log).await {
             tracing::error!(
@@ -583,7 +591,7 @@ pub fn deliver_webhook_job(
         if sub.status == WebhookSubscriptionStatus::Disabled {
             tracing::info!(subscription_id = %sub.id, "Webhook subscription is disabled; skipping delivery");
             log.last_error = Some("Subscription is disabled".to_owned());
-            log.timestamp = Utc::now();
+            log.timestamp = state.clock().now();
             if is_replay {
                 log.is_dlq = true;
             }
@@ -594,7 +602,7 @@ pub fn deliver_webhook_job(
         if sub.status == WebhookSubscriptionStatus::Failed && !is_replay {
             tracing::info!(subscription_id = %sub.id, "Webhook subscription has failed; skipping delivery");
             log.last_error = Some("Subscription has failed due to consecutive errors".to_owned());
-            log.timestamp = Utc::now();
+            log.timestamp = state.clock().now();
             manager.store().log_delivery(log).await?;
             return Ok(());
         }
@@ -603,7 +611,7 @@ pub fn deliver_webhook_job(
         }
 
         // Stripe-style payload signing: t=<timestamp>,v1=<signature>
-        let timestamp = Utc::now().timestamp();
+        let timestamp = state.clock().now().timestamp();
         let signing_payload = format!("{timestamp}.{}", log.payload);
         let signature = crate::security::config::hmac_sha256_hex(
             sub.secret.as_bytes(),
@@ -615,7 +623,7 @@ pub fn deliver_webhook_job(
         request_headers.insert("Content-Type".to_owned(), "application/json".to_owned());
         request_headers.insert("Autumn-Signature".to_owned(), signature_header.clone());
 
-        let start = std::time::Instant::now();
+        let start = state.monotonic();
         // `target_url` is a subscriber-chosen destination, not one the app
         // itself picked — exactly the case `ssrf_safe()` exists for. Without
         // it this POST carries none of the private/link-local/loopback/cloud-
@@ -640,7 +648,13 @@ pub fn deliver_webhook_job(
             .text_body(log.payload.clone());
 
         let response = req.send().await;
-        let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let elapsed = u64::try_from(
+            state
+                .monotonic()
+                .saturating_duration_since(start)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
 
         tracing::debug!(
             log_id = %log.id,
@@ -649,7 +663,7 @@ pub fn deliver_webhook_job(
         );
 
         log.elapsed_ms = elapsed;
-        log.timestamp = Utc::now();
+        log.timestamp = state.clock().now();
         log.request_headers = request_headers;
 
         match response {
