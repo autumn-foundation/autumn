@@ -405,8 +405,8 @@ handlers in your codebase and run without a database -- they'll just return
 
 ## What Happens When CORS Is Misconfigured?
 
-If `cors.allowed_origins` is empty (the default), CORS middleware is not
-applied. No `Access-Control-*` headers are sent.
+If `cors.allowed_origins` is empty — the base default, and what `prod` leaves in
+place — CORS middleware is not applied. No `Access-Control-*` headers are sent.
 
 If origins are configured but a request comes from an unlisted origin, the
 browser blocks the response (Autumn sends the response, but without the
