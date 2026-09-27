@@ -48,6 +48,10 @@ diesel::table! {
 pub struct Note {
     #[id]
     pub id: i64,
+    // `#[validate(length(min = 1))]` is a declarative per-field validator that
+    // `Patch<String>` implements, so it is enforced on the generated `--api`
+    // update handler too (#1719); see `update_via_api_rejects_invalid_title`.
+    #[validate(length(min = 1))]
     pub title: String,
     pub author_id: i64,
 }
@@ -261,6 +265,61 @@ async fn ac_9b_admin_can_update_via_repository_endpoint() {
         .await
         .unwrap();
     assert_eq!(updated.title, "Edited by admin");
+}
+
+// #1719: the generated `--api` update handler must enforce the model's
+// declarative per-field validators and surface a 422 Problem Details field-error
+// map, exactly like the create/extractor path. Authorization passes (admin
+// session) so the request reaches validation.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn update_via_api_rejects_invalid_title() {
+    let (pool, _container) = setup_pool().await;
+    let note_id = seed_note(&pool, "Owner's note", 42).await;
+
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-admin", "999", Some("admin")).await;
+    let client = build_app(pool.clone(), store, ForbiddenResponse::default());
+
+    // Empty title violates `#[validate(length(min = 1))]` → 422 + field errors.
+    let bad = client
+        .put(&format!("/api/notes/{note_id}"))
+        .header("Cookie", "autumn.sid=sess-admin")
+        .header("accept", "application/json")
+        .json(&serde_json::json!({"title": ""}))
+        .send()
+        .await;
+
+    assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let json: serde_json::Value = bad.json();
+    assert_eq!(json["status"], 422);
+    assert_eq!(json["code"], "autumn.validation_failed");
+    let errors = json["errors"]
+        .as_array()
+        .expect("Problem Details must carry a field-error array");
+    assert!(
+        errors.iter().any(|e| e["field"] == "title"),
+        "expected a field-level error for `title`, got: {json}"
+    );
+
+    // A valid title round-trips to a successful update.
+    let good = client
+        .put(&format!("/api/notes/{note_id}"))
+        .header("Cookie", "autumn.sid=sess-admin")
+        .header("accept", "application/json")
+        .json(&serde_json::json!({"title": "A valid title"}))
+        .send()
+        .await;
+
+    assert_eq!(good.status, StatusCode::OK);
+
+    let mut conn = pool.get().await.unwrap();
+    let updated: Note = test_notes::table
+        .find(note_id)
+        .first(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(updated.title, "A valid title");
 }
 
 #[tokio::test]

@@ -1,0 +1,18 @@
+error: #[version_history(sensitive = [...])] is incompatible with ledgered = true: a ledgered entity's as-of reconstruction must be byte-for-byte identical to what a live query would have returned, and a redacted column cannot be reconstructed. Drop `ledgered = true` to keep redaction, or drop the `sensitive` list and keep the column out of the model (or behind at-rest encryption, which the ledger snapshots as ciphertext)
+  --> tests/compile-fail/repository_ledgered_sensitive_columns.rs:33:1
+   |
+33 | / #[autumn_web::repository(
+34 | |     LedgeredSensitiveNote,
+35 | |     table = "ledgered_sensitive_notes",
+36 | |     soft_delete,
+37 | |     ledgered = true
+38 | | )]
+   | |__^
+   |
+   = note: this error originates in the attribute macro `autumn_web::repository` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: cannot find attribute `version_history` in this scope
+  --> tests/compile-fail/repository_ledgered_sensitive_columns.rs:32:3
+   |
+32 | #[version_history(sensitive = ["secret"])]
+   |   ^^^^^^^^^^^^^^^
