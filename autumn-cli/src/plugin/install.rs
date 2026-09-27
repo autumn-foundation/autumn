@@ -376,38 +376,36 @@ pub fn with_inherited_dependency(root: &Path, manifest: &str, crate_name: &str) 
 }
 
 /// How `crate_name` is redirected away from its crates.io release by a
-/// `[patch.<source>]` or `[replace]` table, in the manifest at `root` or at
-/// the workspace root above it. `None` when nothing redirects it.
+/// `[patch]` or `[replace]` table. `None` when nothing redirects it.
 ///
-/// `.cargo/config.toml` source replacement is not read here.
+/// Cargo reads these from the manifest at `root` and each one above it up to
+/// the workspace root, and `[patch]` also from every `.cargo/config.toml`
+/// from `root` up, and from `$CARGO_HOME`. Only a patch for the crates.io
+/// source counts: `[patch."<git url>"]` overrides that source alone.
+/// `[source]` replacement (vendoring) is not read.
 #[must_use]
 pub fn patched_by(root: &Path, crate_name: &str) -> Option<String> {
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".cargo")));
+    patched_by_in(root, crate_name, cargo_home.as_deref())
+}
+
+/// [`patched_by`] with `$CARGO_HOME` given, so a test need not set it.
+fn patched_by_in(root: &Path, crate_name: &str, cargo_home: Option<&Path>) -> Option<String> {
     let want = canonical(crate_name);
+    let read = |path: &Path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+    };
     for dir in root.ancestors() {
-        let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
-            continue;
-        };
-        let Ok(table) = toml::from_str::<toml::Table>(&text) else {
-            continue;
-        };
         let manifest = dir.join("Cargo.toml");
-        if let Some(patch) = table.get("patch").and_then(toml::Value::as_table) {
-            for (source, entries) in patch {
-                // Cargo's `package` rename: `local = { package = "x", … }`
-                // patches `x`, whatever the key says.
-                let hit = entries.as_table().is_some_and(|e| {
-                    e.iter().any(|(key, entry)| {
-                        let package = entry
-                            .get("package")
-                            .and_then(toml::Value::as_str)
-                            .unwrap_or(key);
-                        canonical(package) == want
-                    })
-                });
-                if hit {
-                    return Some(format!("[patch.{source}] in {}", manifest.display()));
-                }
-            }
+        let Some(table) = read(&manifest) else {
+            continue;
+        };
+        if let Some(source) = crates_io_patch(&table, &want) {
+            return Some(format!("[patch.{source}] in {}", manifest.display()));
         }
         if let Some(replace) = table.get("replace").and_then(toml::Value::as_table) {
             let hit = replace
@@ -417,12 +415,57 @@ pub fn patched_by(root: &Path, crate_name: &str) -> Option<String> {
                 return Some(format!("[replace] in {}", manifest.display()));
             }
         }
-        // Cargo reads patches from the workspace root; stop there.
+        // Cargo reads manifest patches from the workspace root; stop there.
         if table.contains_key("workspace") {
             break;
         }
     }
+    let configs = root
+        .ancestors()
+        .map(|dir| dir.join(".cargo"))
+        .chain(cargo_home.map(Path::to_path_buf));
+    for dir in configs {
+        for file in ["config.toml", "config"] {
+            let path = dir.join(file);
+            if let Some(source) = read(&path).and_then(|table| crates_io_patch(&table, &want)) {
+                return Some(format!("[patch.{source}] in {}", path.display()));
+            }
+        }
+    }
     None
+}
+
+/// The `[patch.<source>]` key under which `table` patches the crates.io
+/// crate `want` (canonical). A `package` rename counts: `local = { package
+/// = "x", … }` patches `x`, whatever the key says.
+fn crates_io_patch(table: &toml::Table, want: &str) -> Option<String> {
+    let patch = table.get("patch")?.as_table()?;
+    patch
+        .iter()
+        .filter(|(source, _)| is_crates_io_source(source))
+        .find(|(_, entries)| {
+            entries.as_table().is_some_and(|e| {
+                e.iter().any(|(key, entry)| {
+                    let package = entry
+                        .get("package")
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or(key);
+                    canonical(package) == want
+                })
+            })
+        })
+        .map(|(source, _)| source.clone())
+}
+
+/// Whether a `[patch.<source>]` key names crates.io: its name, its git
+/// index, or its sparse index.
+fn is_crates_io_source(source: &str) -> bool {
+    matches!(
+        source.trim_end_matches('/'),
+        "crates-io"
+            | "https://github.com/rust-lang/crates.io-index"
+            | "sparse+https://index.crates.io"
+    )
 }
 
 /// The `[dependencies]` key that names `crate_name` as crates.io does:
@@ -938,6 +981,62 @@ pub fn manifest_path(root: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// Only a crates.io patch redirects a crates.io dependency.
+    #[test]
+    fn a_patch_for_another_source_is_not_a_redirect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("Cargo.toml");
+        write(
+            &manifest,
+            "[package]\nname = \"a\"\n\n[patch.\"https://github.com/acme/repo\"]\n\
+             autumn-plugin-x = { path = \"../x\" }\n",
+        );
+        assert_eq!(patched_by_in(tmp.path(), "autumn-plugin-x", None), None);
+        for source in [
+            "crates-io",
+            "\"https://github.com/rust-lang/crates.io-index\"",
+            "\"sparse+https://index.crates.io/\"",
+        ] {
+            write(
+                &manifest,
+                &format!(
+                    "[package]\nname = \"a\"\n\n[patch.{source}]\n\
+                     autumn-plugin-x = {{ path = \"../x\" }}\n"
+                ),
+            );
+            assert!(
+                patched_by_in(tmp.path(), "autumn-plugin-x", None).is_some(),
+                "{source}"
+            );
+        }
+    }
+
+    /// Cargo also reads `[patch]` from `.cargo/config.toml` above the app,
+    /// and from `$CARGO_HOME`.
+    #[test]
+    fn a_cargo_config_patch_is_a_redirect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("work").join("app");
+        write(&app.join("Cargo.toml"), "[package]\nname = \"a\"\n");
+        let patch = "[patch.crates-io]\nautumn_plugin_x = { path = \"../x\" }\n";
+        assert_eq!(patched_by_in(&app, "autumn-plugin-x", None), None);
+
+        write(&tmp.path().join("work/.cargo/config.toml"), patch);
+        let found = patched_by_in(&app, "autumn-plugin-x", None).unwrap();
+        assert!(found.contains("config.toml"), "{found}");
+        std::fs::remove_dir_all(tmp.path().join("work/.cargo")).unwrap();
+
+        let home = tmp.path().join("cargo-home");
+        write(&home.join("config.toml"), patch);
+        assert!(patched_by_in(&app, "autumn-plugin-x", Some(&home)).is_some());
+        assert_eq!(patched_by_in(&app, "autumn-plugin-y", Some(&home)), None);
+    }
     use crate::plugin::catalog;
 
     /// The `main.rs` an `autumn new` app ships with, reduced to the shape that

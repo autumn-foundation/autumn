@@ -156,8 +156,8 @@ changes a file. Then:
   pinned with `=`. There is no crates.io lookup, so `--offline` works. If
   `Cargo.toml` already names the crate at another requirement, from a path,
   git or other registry, or renamed to another package, the command refuses
-  and changes no file. It also refuses when a `[patch]` or `[replace]` table
-  redirects the crate. For a first-party plugin, a `[patch]` to a local
+  and changes no file. It also refuses when a crates.io `[patch]` (in a manifest or
+  a `.cargo/config.toml`) or a `[replace]` table redirects the crate. For a first-party plugin, a `[patch]` to a local
   checkout only prints a notice: the trust review covers the crates.io
   release.
 - A listing that failed re-verification is refused, with the reason. It is
