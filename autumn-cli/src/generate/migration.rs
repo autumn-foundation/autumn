@@ -160,10 +160,10 @@ pub fn plan_migration_with_options(
             // lock_version:String` would block the very escape hatch the other
             // error messages point at.
             super::model::validate_lock_version_field(&fields, &[])?;
-            // A field kind with no working diesel SQLite conversion (Uuid,
-            // Attachment, Decimal) would leak an uncompilable column into the
-            // generated SQLite app, so reject it here too — same guard as
-            // `generate model`/`scaffold` (AC #4, #1924).
+            // The same standing guard `generate model`/`scaffold` carries: a
+            // field kind with no working diesel SQLite conversion would leak an
+            // uncompilable column into the app. Every kind converts as of #1924
+            // (AC #4).
             if backend == autumn_web::config::DatabaseBackend::Sqlite {
                 super::reject_sqlite_unsupported_field_kinds(&fields)?;
             }
@@ -196,9 +196,29 @@ pub fn plan_migration_with_options(
             }
             let existing_schema =
                 std::fs::read_to_string(project_root.join("src/schema.rs")).unwrap_or_default();
+            // SQLite refuses `DROP COLUMN` while an index names the column.
+            // Recover the table's prior indexes so the up path drops them first
+            // (#1906). Postgres cascades the drop and needs none of this.
+            let prior_indexes = if backend == autumn_web::config::DatabaseBackend::Sqlite {
+                super::prior_index::scan_prior_indexes(&project_root.join("migrations"), table)
+            } else {
+                Vec::new()
+            };
             (
-                remove_columns_up_sql_for(backend, table, &fields, &existing_schema),
-                remove_columns_down_sql_for(backend, table, &fields, &existing_schema)?,
+                remove_columns_up_sql_for(
+                    backend,
+                    table,
+                    &fields,
+                    &existing_schema,
+                    &prior_indexes,
+                ),
+                remove_columns_down_sql_for(
+                    backend,
+                    table,
+                    &fields,
+                    &existing_schema,
+                    &prior_indexes,
+                )?,
             )
         }
         MigrationShape::EncryptColumns {
@@ -917,6 +937,90 @@ pub struct Post {
         });
     }
 
+    /// Issue #1906: a `Remove…From…` on `SQLite` must drop a PRE-EXISTING index
+    /// that names the removed column, not just the conventional
+    /// `idx_<table>_<col>` the generator itself would have created. `SQLite`
+    /// refuses `DROP COLUMN` while any index still references the column, so a
+    /// composite index from an earlier migration would otherwise break the
+    /// migration at apply time.
+    #[test]
+    fn remove_columns_migration_on_sqlite_drops_a_pre_existing_composite_index() {
+        with_no_db_env(|| {
+            let tmp = sqlite_project();
+            let earlier = tmp.path().join("migrations/20260101000000_create_posts");
+            fs::create_dir_all(&earlier).unwrap();
+            fs::write(
+                earlier.join("up.sql"),
+                "CREATE TABLE posts (id INTEGER PRIMARY KEY AUTOINCREMENT);\n\
+                 CREATE INDEX idx_posts_author_title ON posts (author_id, title);\n",
+            )
+            .unwrap();
+
+            let plan = plan_migration(
+                tmp.path(),
+                "RemoveTitleFromPosts",
+                &["title:Option<String>".into()],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+            let dir = tmp
+                .path()
+                .join("migrations/20260427000000_remove_title_from_posts");
+
+            let up = fs::read_to_string(dir.join("up.sql")).unwrap();
+            let drop_idx = up
+                .find("DROP INDEX IF EXISTS idx_posts_author_title;")
+                .unwrap_or_else(|| panic!("composite index not dropped: {up}"));
+            let drop_col = up
+                .find("ALTER TABLE posts DROP COLUMN title;")
+                .unwrap_or_else(|| panic!("column not dropped: {up}"));
+            assert!(drop_idx < drop_col, "index drop must come first: {up}");
+
+            // The rollback restores it, after the column is back.
+            let down = fs::read_to_string(dir.join("down.sql")).unwrap();
+            let add_col = down
+                .find("ALTER TABLE posts ADD COLUMN title")
+                .unwrap_or_else(|| panic!("column not re-added: {down}"));
+            let recreate = down
+                .find("CREATE INDEX idx_posts_author_title ON posts (author_id, title);")
+                .unwrap_or_else(|| panic!("index not re-created: {down}"));
+            assert!(add_col < recreate, "column must precede its index: {down}");
+        });
+    }
+
+    /// The same project shape on Postgres emits no explicit `DROP INDEX` — it
+    /// cascades the drop with the column, so the output is unchanged by #1906.
+    #[test]
+    fn remove_columns_migration_on_postgres_ignores_pre_existing_indexes() {
+        with_no_db_env(|| {
+            let tmp = project();
+            let earlier = tmp.path().join("migrations/20260101000000_create_posts");
+            fs::create_dir_all(&earlier).unwrap();
+            fs::write(
+                earlier.join("up.sql"),
+                "CREATE INDEX idx_posts_author_title ON posts (author_id, title);\n",
+            )
+            .unwrap();
+
+            let plan = plan_migration(
+                tmp.path(),
+                "RemoveTitleFromPosts",
+                &["title:Option<String>".into()],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+            let dir = tmp
+                .path()
+                .join("migrations/20260427000000_remove_title_from_posts");
+            let up = fs::read_to_string(dir.join("up.sql")).unwrap();
+            let down = fs::read_to_string(dir.join("down.sql")).unwrap();
+            assert!(!up.contains("DROP INDEX"), "Postgres up.sql: {up}");
+            assert!(!down.contains("idx_posts_author_title"), "down.sql: {down}");
+        });
+    }
+
     /// Regression guard: the same `Add…To…` on a Postgres app emits no explicit
     /// `DROP INDEX` in `down.sql` — Postgres cascades the index drop with the
     /// column, so the rollback stays byte-for-byte the historical output.
@@ -945,28 +1049,39 @@ pub struct Post {
         });
     }
 
-    /// A `SQLite` `Add…To…` / `Remove…From…` migration rejects field kinds that
-    /// still have no working diesel `SQLite` conversion (`Uuid`, `Decimal`,
-    /// `Enum`) at generate time, citing #1924 (issue #1614 AC #4). `DateTime` and
-    /// `Attachment` are accepted as of #1924 (see the `dsl`/`model` tests).
+    /// A `SQLite` `Add…To…` / `Remove…From…` migration now accepts every field
+    /// kind: #1924 gave `Uuid`, `Decimal` and `Enum` working `SQLite`
+    /// conversions, so the generate-time rejection no longer fires. All three
+    /// store `TEXT`.
+    ///
+    /// Nullable columns here, deliberately: `SQLite`'s own `ALTER TABLE ADD
+    /// COLUMN` rule still refuses a `NOT NULL` column with no default, which is
+    /// a separate gate (#1918) this test must not trip over.
     #[test]
-    fn column_migrations_on_sqlite_reject_unsupported_field_kinds_citing_1924() {
+    fn column_migrations_on_sqlite_accept_uuid_decimal_and_enum_after_1924() {
         with_no_db_env(|| {
-            for name in ["AddTokenToPosts", "RemoveTokenFromPosts"] {
-                let tmp = sqlite_project();
-                let err =
-                    plan_migration(tmp.path(), name, &["token:Uuid".into()], "20260427000000")
-                        .unwrap_err();
-                let msg = err.to_string();
-                assert!(
-                    matches!(err, GenerateError::Config(_)),
-                    "{name}: expected Config error, got: {err:?}"
-                );
-                assert!(msg.contains("1924"), "{name}: must cite #1924: {msg}");
-                assert!(
-                    msg.contains("uuid::Uuid"),
-                    "{name}: message must name the Rust type: {msg}"
-                );
+            for token in [
+                "token:Option<Uuid>",
+                "price:Option<decimal{10,2}>",
+                "status:Option<enum{draft,published}>",
+            ] {
+                for name in ["AddTokenToPosts", "RemoveTokenFromPosts"] {
+                    let tmp = sqlite_project();
+                    let plan = plan_migration(tmp.path(), name, &[token.into()], "20260427000000")
+                        .unwrap_or_else(|e| {
+                            panic!("{name} with `{token}` must plan on SQLite (#1924): {e}")
+                        });
+                    let up = sql_action(&plan, "up.sql");
+                    let down = sql_action(&plan, "down.sql");
+                    for sql in [&up, &down] {
+                        for leak in ["UUID", "NUMERIC"] {
+                            assert!(
+                                !sql.contains(leak),
+                                "{name}/{token}: SQLite SQL leaked `{leak}`: {sql}"
+                            );
+                        }
+                    }
+                }
             }
         });
     }

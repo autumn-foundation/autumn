@@ -426,8 +426,11 @@ async fn test_circuit_breaker_blanket_from_http_client() {
         .defaults
         .half_open_trial_count = Some(1);
 
+    // dev profile: a non-dev 503 redacts the raw circuit-breaker message
+    // (see ProblemDetailsFilter), which is exactly what this test asserts on.
     let client = TestApp::new()
         .config(config)
+        .profile("dev")
         .routes(routes![call_downstream_result])
         .build();
 
@@ -503,8 +506,11 @@ async fn test_circuit_breaker_blanket_from_smtp() {
         .defaults
         .half_open_trial_count = Some(1);
 
+    // dev profile: a non-dev 503 redacts the raw circuit-breaker message
+    // (see ProblemDetailsFilter), which is exactly what this test asserts on.
     let client = TestApp::new()
         .config(config)
+        .profile("dev")
         .routes(routes![send_mail_result])
         .build();
 

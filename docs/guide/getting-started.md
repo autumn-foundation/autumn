@@ -97,12 +97,24 @@ just built:
 cargo install --path autumn-cli
 ```
 
-Between releases the workspace can be ahead of the published crates, so a
-source-built CLI may scaffold projects pinning an `autumn-web` version that is
-not on crates.io yet. `autumn doctor`'s `version_compat` check reports the two
-versions side by side; if they disagree, either point the generated
-`Cargo.toml` at your checkout with a `[patch.crates-io]` override or install
-the published CLI instead.
+Between releases the workspace can be ahead of the published crates while the
+version number stays put — this project never bumps the version for feature
+work, only for a release. So `autumn new` pins whatever `autumn-web` version
+your source-built CLI was compiled with, and that number is normally already
+on crates.io; it is the *code* behind it that has moved on. That means
+`autumn doctor`'s `version_compat` check, which compares version strings, will
+print a reassuring `✅ version_compat — autumn-cli 0.7.0 matches autumn-web
+0.7.0` even when your checkout and the published crate have diverged — it has
+no way to see API drift that the version number doesn't carry.
+
+The real symptom is a `cargo build` failure right after `autumn new`, usually
+a plain type-mismatch error inside generated code that calls into
+`autumn_web::`. If you hit that, don't trust a green `version_compat` to rule
+out the version-skew explanation — either point the generated `Cargo.toml` at
+your checkout with a `[patch.crates-io]` override, or install the published
+CLI instead. If you're building from a checkout that's more than a few commits
+past the last release tag, applying the `[patch.crates-io]` override up front
+avoids the failure entirely.
 
 Either way you get the `autumn` binary. These are the commands you will touch in
 your first hour:
@@ -214,9 +226,9 @@ On a fresh project, before `autumn setup`, you will see something like:
 ✅ port_bindable — port 3000 is available
 ❌ tailwind_binary — target/autumn/tailwindcss not found
    hint: Run `autumn setup` to download the Tailwind CSS binary
-⚠️  signing_secret — using an ephemeral per-process signing secret (dev/test
-    only; sessions and signed URLs will not survive restarts or be shared
-    across replicas)
+⚠️  signing_secret — no signing secret configured (dev/test only): sessions and
+    CSRF tokens ride unsigned; local-storage signed URLs use an ephemeral
+    per-process key instead
    hint: Set AUTUMN_SECURITY__SIGNING_SECRET before deploying to production
 ⚠️  dotenv — `.env.example` is present but no `.env` exists
    hint: Copy `.env.example` to `.env` and fill in local values
@@ -1286,11 +1298,14 @@ so a `.env` file can never switch the active profile.
 
 ### Log format behavior
 
-| Format   | Behavior                                                 |
-|----------|----------------------------------------------------------|
-| `Auto`   | Pretty in development, JSON when the profile is production |
-| `Pretty` | Always human-readable, colorized                         |
-| `Json`   | Always structured JSON                                   |
+`Auto` renders pretty lines unless the profile is production, then JSON.
+`Pretty` and `Json` pin it either way. The profile usually decides this before
+`Auto` ever does: `dev` defaults to `Pretty` and `prod` to `Json` outright,
+which is why the same binary reads well on a laptop and parses in production
+without the config changing. The same goes for the level — `dev` defaults to
+`debug`, `prod` to `info`. [Logging](logging-pii.md#choose-the-log-format-pretty-or-json)
+is where the log settings are documented in full, including how to change a log
+level on a running process.
 
 ### Running without a database
 
@@ -1390,6 +1405,11 @@ async fn index() -> &'static str { "ok" }
 
 #[autumn_web::main]
 async fn main() {
+    // A generated app has no direct `axum` dependency (`autumn-web` pulls it
+    // in transitively) — go through `autumn_web::reexports::axum` rather
+    // than adding one just to spell this.
+    use autumn_web::reexports::axum;
+
     let graphql = axum::Router::<AppState>::new()
         .route("/graphql", axum::routing::get(|| async { "graphql endpoint" }));
 
@@ -1488,8 +1508,10 @@ See the [testing guide](testing.md) for `TestDb`, fixtures, and
 ## Before you deploy
 
 The generated app starts with local-safe defaults: in-memory sessions,
-in-process `#[scheduled]` tasks, an ephemeral signing secret, and a generic
-container Dockerfile. Before running multiple replicas you usually want to:
+in-process `#[scheduled]` tasks, no configured signing secret (see
+[signing secrets](signing-secrets.md) for what that does and does not sign),
+and a generic container Dockerfile. Before running multiple replicas you
+usually want to:
 
 1. Set `AUTUMN_ENV=prod`
 2. Set a durable `AUTUMN_SECURITY__SIGNING_SECRET` and a trusted-hosts list

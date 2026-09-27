@@ -148,11 +148,27 @@ mod fs_atomic;
 // not in scope (`-D rustdoc::broken_intra_doc_links` in `scripts/check-docs.sh`).
 // The module documents itself.
 pub mod classify;
+// A plain comment, not a doc comment: the module carries its own `//!` docs
+// and an outer `///` here would be merged with them.
 pub mod cluster;
+#[cfg(feature = "collab")]
+pub mod collab;
 pub mod config;
 pub mod consent;
+// Parse, validate and server-render Constela documents: the constrained JSON UI
+// language (https://github.com/yuuichieguchi/constela), for serving interfaces
+// a language model generated. Enable with the Cargo feature `constela`.
+//
+// A plain comment, not a doc comment, for the same reason `agent_authority` and
+// `classify` carry one: an outer `///` here is merged with the module's own
+// `//!` docs, and the whole block then resolves its intra-doc links in *this*
+// scope — where `policy`, `eval` and `Document` do not exist.
+pub mod confidential;
+#[cfg(feature = "constela")]
+pub mod constela;
 pub mod credentials;
 pub mod current;
+pub mod custom_domain;
 #[cfg(feature = "db")]
 pub mod db;
 pub(crate) mod db_url;
@@ -324,11 +340,13 @@ pub mod route_listing;
 /// [`state_migration!`](crate::state_migration) between shapes.
 pub mod upgrade;
 
-/// Inbound (server-side) TLS support (issue #1603).
+/// Inbound (server-side) TLS support (issues #1603 and #1640).
 ///
 /// Load and validate a certificate + key, build a reloadable rustls
-/// `ServerConfig`, and inspect leaf-certificate expiry. Gated behind the
-/// off-by-default `tls` feature.
+/// `ServerConfig`, inspect leaf-certificate expiry, and — through
+/// [`tls::client_auth`] — verify client certificates and hand the verified
+/// machine identity to handlers and policies. Gated behind the off-by-default
+/// `tls` feature.
 #[cfg(feature = "tls")]
 pub mod tls;
 
@@ -348,6 +366,10 @@ pub mod sharding;
 // entirely inside that module.
 #[cfg(feature = "db")]
 pub(crate) mod counter_cache;
+
+/// Maintained derived read models: `#[derivation]` (#1769).
+#[cfg(feature = "db")]
+pub mod derivation;
 
 // Threaded, polymorphic comments — autumn's fifth association kind (#1367).
 // Documented from inside the module: an outer `///` here would make rustdoc
@@ -400,9 +422,22 @@ pub mod read_your_writes;
 #[cfg(feature = "offline-sync")]
 pub mod sync;
 
+// Typed money and an append-only, double-entry money ledger (issue #1837).
+// Not to be confused with `ledger` below, which records the history of a
+// `#[repository]` row.
+//
+// A `//` comment, not `///`: an outer doc attribute here merges into the
+// module's own `//!` header and makes its unqualified intra-doc links resolve
+// in `lib.rs`'s scope instead of the module's. `Money`, `AnyMoney` and
+// `MoneyError` are deliberately not re-exported at the crate root — `Money` is
+// too plausible an application type name to take — so every one of those links
+// would break. Same reason as `data_retention` above.
+pub mod money;
+
 /// Bitemporal, tamper-evident record ledger for `#[repository]` writes.
 ///
-/// See [`ledger`] module documentation for the full API (issue #1699).
+/// See [`ledger`] module documentation for the full API (issue #1699). This
+/// records the history of a row. For money, see [`money`].
 pub mod ledger;
 // The data types a caller handles. The two *evidence* enums the verification
 // entry point takes — `LedgerLiveState` and `LedgerHighWaterState` — are
@@ -505,6 +540,7 @@ pub mod etag;
 pub mod http_client;
 #[cfg(feature = "http-client")]
 pub use http_client as http;
+
 #[cfg(feature = "flash")]
 pub mod flash;
 #[cfg(feature = "htmx")]
@@ -544,6 +580,11 @@ pub mod pdf;
 /// [`preload::Preloadable`] trait that generated code implements.
 pub mod preload;
 pub mod prelude;
+/// Build-checked typed contracts between two Autumn services (issue #1755).
+///
+/// See the [`wire`] module for the mechanism and `docs/guide/wire-contracts.md`
+/// for the guide.
+pub mod wire;
 // Declared bare, like `notifications`: the module carries its own `//!` docs,
 // and an outer doc comment here would make rustdoc resolve that whole
 // combined block in the CRATE-ROOT scope — where `WebPush`, `PushError` and
@@ -809,6 +850,16 @@ pub use db::Db;
 #[cfg(feature = "db")]
 pub use db::{IsolationLevel, TxOptions, savepoint};
 
+/// Lazy database connection extractor.
+///
+/// Use `LazyDb` instead of `Db` in a handler that also takes a body
+/// extractor (`Form`, `Json`, `Multipart`, ...). `Db` checks out a pooled
+/// connection before the body is read. `LazyDb` waits until the handler
+/// calls [`db::LazyDb::checkout`]. See [`db::LazyDb`] for the full contract
+/// and an example.
+#[cfg(feature = "db")]
+pub use db::LazyDb;
+
 /// The runtime database connection type (Postgres by default; `SQLite` under the
 /// `sqlite` feature). Named by generated `#[repository]`/`#[model]` code as
 /// `::autumn_web::RuntimeConnection`. See [`db::RuntimeConnection`].
@@ -1050,6 +1101,10 @@ pub use autumn_macros::sim_test;
 #[cfg(feature = "maud")]
 pub use autumn_macros::story;
 
+/// Annotate an OAuth2/OIDC callback handler.
+///
+/// Convenience alias for `#[get(...)]` with callback-focused naming.
+pub use autumn_macros::oauth2_callback;
 /// Derive Diesel and Serde traits for a database model struct.
 ///
 /// Applies `Queryable`, `Selectable`, `Insertable`, `Serialize`, and
@@ -1082,18 +1137,51 @@ pub use autumn_macros::story;
 ///     pub title: String,
 /// }
 /// ```
-#[cfg(feature = "db")]
-pub use autumn_macros::model;
-/// Annotate an OAuth2/OIDC callback handler.
 ///
-/// Convenience alias for `#[get(...)]` with callback-focused naming.
-pub use autumn_macros::oauth2_callback;
+/// # Maintained derived columns
+///
+/// `#[belongs_to(Post, counter_cache)]` maintains `posts.comment_count` from
+/// this model's repository. `#[derivation]` is its filtered and weighted
+/// superset (#1769): it maintains a `count` or a `sum(<field>)` over the child
+/// rows a filter accepts, on a column of the parent.
+///
+/// ```rust,ignore
+/// use autumn_web::model;
+///
+/// #[model(table = "comments")]
+/// #[belongs_to(Post, fk = post_id)]
+/// #[derivation(Post, column = "published_comment_count", filter = published)]
+/// #[derivation(Post, column = "visible_score", transform = sum(score),
+///              filter = published && score > 0)]
+/// pub struct Comment {
+///     #[id]
+///     pub id: i64,
+///     pub post_id: i64,
+///     pub published: bool,
+///     pub score: i64,
+/// }
+/// ```
+///
+/// Write it **below** `#[model]`, which consumes it. Both columns are
+/// maintained by every generated repository mutation, inside the same
+/// transaction as the row mutation, with atomic set-based SQL. The filter is
+/// lowered to a Rust predicate and to a SQL predicate from one declaration, so
+/// the two cannot disagree; it accepts `bool`, integer and `String` fields and
+/// their `Option` forms.
+///
+/// The parent column is the application's migration (`BIGINT NOT NULL DEFAULT
+/// 0`). Each derivation is content-addressed, so a changed definition enqueues a
+/// resumable backfill at startup. See the [`derivation`] module for the
+/// registry, backfill and status API, `GET /actuator/derivations` for state and
+/// drift, and `docs/guide/derivations.md` for the guide.
+#[cfg(feature = "db")]
+pub use autumn_macros_model::model;
 
 /// Derive a repository with CRUD operations and derived queries.
 ///
 /// See [`macro@repository`] for details.
 #[cfg(feature = "db")]
-pub use autumn_macros::repository;
+pub use autumn_macros_repository::repository;
 
 /// Define a service for cross-model orchestration and non-DB side effects.
 ///
@@ -1120,7 +1208,35 @@ pub use autumn_macros::repository;
 /// }
 /// ```
 #[cfg(feature = "db")]
-pub use autumn_macros::service;
+pub use autumn_macros_model::service;
+
+/// Mark a typed handler as a service endpoint (issue #1755).
+///
+/// **Experimental** — see `STABILITY.md`.
+///
+/// See the [`wire`] module for the mechanism and
+/// `docs/guide/wire-contracts.md` for the guide.
+pub use autumn_macros::endpoint;
+
+/// Check every service call in a function against the callee's contract
+/// (issue #1755).
+///
+/// **Experimental** — see `STABILITY.md`.
+pub use autumn_macros::contract_checked;
+
+/// Derive a type's serde-visible wire shape (issue #1755).
+///
+/// **Experimental** — see `STABILITY.md`.
+pub use autumn_macros::WireShape;
+
+/// Generate a typed client for another Autumn service's endpoints (issue #1755).
+///
+/// **Experimental** — see `STABILITY.md`.
+///
+/// The generated methods call through [`http_client::Client`], so this needs
+/// the `http-client` feature.
+#[cfg(feature = "http-client")]
+pub use autumn_macros::wire_client;
 
 /// Annotate an async function as a `PATCH` route handler.
 ///
@@ -1647,6 +1763,10 @@ pub use autumn_macros::edge_routes;
 /// `snake_case`) whose `Machine<S>` only exposes `to_<target>` methods for
 /// declared edges — firing an undeclared transition is a compile error.
 ///
+/// The declared graph is proven structurally sound at compile time: a state
+/// unreachable from `initial`, or a reachable non-terminal state with no path
+/// to a terminal, is a compile error naming the variant.
+///
 /// # Examples
 ///
 /// ```rust,ignore
@@ -1965,6 +2085,11 @@ pub mod reexports {
     pub use tokio;
     pub use tokio_util;
     pub use tracing;
+    /// Re-exported so `#[model]`'s generated schema can name the GENUINE
+    /// `uuid::Uuid` when checking a field's runtime type identity, instead of
+    /// matching a hand-written path prefix that any crate named `uuid` would
+    /// satisfy (issue #802).
+    pub use uuid;
     pub use validator;
 }
 

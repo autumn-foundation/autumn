@@ -819,15 +819,17 @@ fn strip_migrations(main_rs: &str) -> String {
     replace_anchor(&no_const, "\n        .migrations(MIGRATIONS)", "")
 }
 
-/// Default `autumn-web` features minus `db` — the DB-free daemon feature set.
-const DAEMON_NO_DB_FEATURES: &[&str] = &[
-    "maud",
-    "htmx",
-    "tailwind",
-    "cache-moka",
-    "http-client",
-    "reporting",
-];
+/// The DB-free daemon feature set (issue #2309): default `autumn-web`
+/// features minus `db`, `cache-moka`, and `http-client`.
+///
+/// The daemon starter has no cache. It makes no outbound HTTP call (no auth,
+/// no webhooks). `cache-moka` and `http-client` are unused for it. Both are
+/// dropped here, not just `db`. Dropping `http-client` also drops `reqwest`
+/// and its TLS stack from the build.
+///
+/// `reporting` stays on. It adds no extra dependency, and it drives the
+/// panic-catch middleware every app should keep by default.
+const DAEMON_NO_DB_FEATURES: &[&str] = &["maud", "htmx", "tailwind", "reporting"];
 
 /// Default `autumn-web` features minus the HTML view stack (`maud`/`htmx`/
 /// `tailwind`) — the JSON-first API (`--api`) feature set. Keeps `db` so
@@ -1676,8 +1678,16 @@ mod tests {
 
         let content = fs::read_to_string(tmp.path().join("css-watch-check/build.rs")).unwrap();
         assert!(content.contains("cargo:rerun-if-changed=static/css/input.css"));
-        assert!(content.contains("cargo:rerun-if-changed=target/autumn/tailwindcss"));
+        // The Tailwind binary's watch path is resolved at build time (issue
+        // #2457: a package-relative literal can never agree with wherever
+        // `CARGO_TARGET_DIR`/a target triple actually put it), not printed
+        // literally in the template — assert the resolution machinery is
+        // there instead of a path string that no longer appears verbatim.
+        assert!(content.contains("fn find_tailwind_cli"));
+        assert!(content.contains("fn candidate_target_dirs"));
+        assert!(content.contains("cargo:rerun-if-changed={}"));
         assert!(content.contains("cargo:rerun-if-env-changed=PATH"));
+        assert!(content.contains("cargo:rerun-if-env-changed=CARGO_TARGET_DIR"));
     }
 
     #[test]

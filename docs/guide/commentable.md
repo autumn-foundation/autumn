@@ -100,6 +100,33 @@ The row lock is doing a second job too. It is held from the probe until commit,
 so the counter `UPDATE` that follows can key on the parent id alone: no
 concurrent writer can re-tenant or delete the row underneath it.
 
+### Hard deletes (#2265)
+
+The write-path check stops an unknown parent from getting a comment. It does
+not clean up an existing parent's comments when that parent is later
+deleted. `commentable_id` has no `ON DELETE CASCADE` to fall back on.
+
+The scaffold writes one more thing: an `AFTER DELETE` trigger on the
+parent's own table. `autumn generate scaffold post … comments:commentable`
+adds this trigger to `post`'s own migration, next to the `CREATE TABLE`:
+
+```sql
+CREATE TRIGGER posts_delete_comments
+    AFTER DELETE ON posts
+    FOR EACH ROW
+    EXECUTE FUNCTION comments_delete_for_parent('Post');
+```
+
+This runs for **every** hard delete of a `posts` row: through the
+repository, a raw `DELETE`, or an admin tool. An ordinary soft delete does
+not fire it — the row is only marked deleted, not removed. `add_comment`'s
+own check already refuses a soft-deleted parent. A later `purge`, though,
+issues a real hard `DELETE`. It fires the trigger, and the parent's
+comments go with it.
+
+A hand-written `#[commentable]` model gets no trigger for free. Write your
+own trigger. Match it to the model's `type_name` and comments table.
+
 ## The repository helpers
 
 ```rust,ignore
@@ -321,6 +348,23 @@ through a `#[repository(…, tenant_scoped)]` repository, the parent is matched 
 is written or read. `across_tenants()` opts out; a `tenant_scoped` repository
 with no tenant context is an error. A model without the column emits no tenant
 predicate at all.
+
+**The column alone does not scope.** A `tenant_id` column with no
+`tenant_scoped` repository is treated as ordinary data: comments work with no
+tenant context, and never match on it. Scoping follows the repository's own
+opt-in, not the column's presence — a model can carry `tenant_id` for other
+reasons (denormalized reporting, a foreign import) without becoming
+tenant-scoped.
+
+## Soft-deleted parents
+
+`add_comment` and `comment_thread` refuse a soft-deleted parent with `404`
+(see "Why `commentable_id` has no foreign key" above) — but only when the
+parent's own repository opts into `#[repository(…, soft_delete)]`. A
+`deleted_at` column with no such repository is audit history, not a
+tombstone. The row stays commentable. The repository's own finders still
+return it. As with tenancy, the repository's opt-in decides — never the
+column's presence alone.
 
 ## What this deliberately does not do
 

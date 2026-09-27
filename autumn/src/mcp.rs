@@ -603,17 +603,6 @@ fn resolve_local_ref<'a>(root: &'a Value, node: &'a Value) -> &'a Value {
     node
 }
 
-/// True when `schema` is the opaque object placeholder the spec generator emits
-/// for a type with no real `OpenApiSchema` (`{"type":"object","title":…}` with
-/// no `properties`). A derived/registered object always carries a `properties`
-/// key (even if empty), so a legitimately field-less struct is not flagged.
-fn is_opaque_object(schema: &Value) -> bool {
-    schema.get("type").and_then(Value::as_str) == Some("object")
-        && schema
-            .as_object()
-            .is_none_or(|map| !map.contains_key("properties"))
-}
-
 /// Inspect a built `inputSchema` for the degradations in [`SchemaDegradation`].
 ///
 /// Pure and self-contained (no logging) so it is unit-testable; [`derive_tools`]
@@ -628,7 +617,7 @@ fn detect_schema_degradations(
 
     if has_body
         && let Some(body) = props.and_then(|p| p.get("body"))
-        && is_opaque_object(resolve_local_ref(input_schema, body))
+        && crate::openapi::is_opaque_object_schema(resolve_local_ref(input_schema, body))
     {
         out.push(SchemaDegradation::OpaqueBody);
     }
@@ -638,7 +627,7 @@ fn detect_schema_degradations(
     // advertised structure round-trips. Only a missing field-level schema is.
     if has_query
         && let Some(query) = props.and_then(|p| p.get("query"))
-        && is_opaque_object(resolve_local_ref(input_schema, query))
+        && crate::openapi::is_opaque_object_schema(resolve_local_ref(input_schema, query))
     {
         out.push(SchemaDegradation::OpaqueQuery);
     }
@@ -1108,6 +1097,10 @@ struct ReplayContext<'a> {
     headers: &'a HeaderMap,
     identity: Option<&'a crate::security::ResolvedClientIdentity>,
     peer: Option<std::net::SocketAddr>,
+    /// The verified mTLS client identity of the connection the `/mcp` envelope
+    /// arrived on (#1640), when there is one.
+    #[cfg(feature = "tls")]
+    client_cert: Option<std::sync::Arc<crate::tls::client_auth::ClientIdentity>>,
 }
 
 /// Reject an untrusted `Host`/`:authority` or a disallowed browser `Origin`
@@ -1186,10 +1179,18 @@ async fn serve_mcp(
     connect_info: Option<
         axum::extract::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     >,
+    // The verified mTLS client identity of this connection (#1640), stamped by
+    // `ClientIdentityLayer`. Read as an `Extension` for the same
+    // optional-friendly reason `connect_info` is.
+    #[cfg(feature = "tls")] client_cert: Option<
+        axum::extract::Extension<std::sync::Arc<crate::tls::client_auth::ClientIdentity>>,
+    >,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let identity = identity.as_ref().map(|ext| &ext.0);
+    #[cfg(feature = "tls")]
+    let client_cert = client_cert.map(|ext| ext.0);
 
     // Capture the request `Origin` (if any) so the actual JSON-RPC response can
     // carry the matching CORS grant, mirroring the `OPTIONS` preflight.
@@ -1219,6 +1220,8 @@ async fn serve_mcp(
         headers: &headers,
         identity,
         peer: connect_info.map(|ext| (ext.0).0),
+        #[cfg(feature = "tls")]
+        client_cert,
     };
 
     let mut response = match parsed {
@@ -2057,6 +2060,15 @@ fn apply_replay_extensions(
     }
     if let Some(peer) = ctx.peer {
         extensions.insert(axum::extract::ConnectInfo(peer));
+    }
+    // The verified client certificate of the envelope's own connection (#1640).
+    // The replay traverses the router's `RequireClientCert` layer, so without
+    // this a legitimately-certified caller would be refused on an mTLS-only
+    // tool — and `ClientCert` would disagree with the `PolicyContext`, which
+    // reads the ambient scope and therefore already sees it.
+    #[cfg(feature = "tls")]
+    if let Some(client_cert) = &ctx.client_cert {
+        extensions.insert(std::sync::Arc::clone(client_cert));
     }
     // When the `/mcp` envelope is itself rate-limited, this call was already
     // counted there; mark the replay envelope-counted so the framework-default

@@ -385,23 +385,52 @@ impl Node {
 /// A positional child's key: its ordering value plus the spelling that produced
 /// it.
 ///
-/// Ordering is by `position` first, so a sequence target sees ascending indices
-/// regardless of how they were written. `raw` breaks ties and is what a **map**
-/// target receives, so `counts[0]` and `counts[00]` stay two distinct keys
-/// rather than colliding on one — and neither is rewritten on the way through.
+/// Ordering is by `position` first. A sequence target then sees ascending
+/// indices, no matter how they were written. `tie` breaks ties. Use
+/// [`SeqKey::spelling`] to get the text a **map** target receives, so
+/// `counts[0]` and `counts[00]` stay two distinct keys and neither is
+/// rewritten on the way through.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct SeqKey {
     position: usize,
-    raw: String,
+    tie: SeqKeyTie,
+}
+
+/// The tie-break part of a [`SeqKey`], for two keys at the same `position`.
+///
+/// At equal `position`, `Explicit` sorts before `Appended`. An append then
+/// always comes after the explicit index it followed. This holds even when
+/// `position` has saturated at `usize::MAX` and cannot advance. Two appends
+/// cannot collide either: each stores the entry count at the time of its
+/// insert. This count goes up by one on every insert into the same node.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum SeqKeyTie {
+    /// `k[N]`. Keyed by the submitted spelling. `0` and `00` stay distinct.
+    /// Neither is rewritten.
+    Explicit(String),
+    /// `k[]`. Keyed by a per-node insert count, not by `position`.
+    /// Saturation cannot make two appends collide.
+    Appended(usize),
 }
 
 impl SeqKey {
-    /// A key for a position the caller did not spell out (the `k[]` append
-    /// form), rendered canonically.
-    fn synthesized(position: usize) -> Self {
+    /// A key for a position the caller did not spell out: the `k[]` append
+    /// form. Pass the current entry count as `append_seq`. This keeps
+    /// repeated appends distinct. It still works after `position` saturates.
+    const fn synthesized(position: usize, append_seq: usize) -> Self {
         Self {
             position,
-            raw: position.to_string(),
+            tie: SeqKeyTie::Appended(append_seq),
+        }
+    }
+
+    /// The spelling to give to a map target or an error path: the submitted
+    /// text for an explicit index, or the canonical decimal value for an
+    /// append.
+    fn spelling(&self) -> std::borrow::Cow<'_, str> {
+        match &self.tie {
+            SeqKeyTie::Explicit(raw) => std::borrow::Cow::Borrowed(raw.as_str()),
+            SeqKeyTie::Appended(_) => std::borrow::Cow::Owned(self.position.to_string()),
         }
     }
 }
@@ -487,7 +516,7 @@ fn insert(root: &mut BTreeMap<String, Node>, base: &str, segments: &[Segment<'_>
                     node = entries
                         .entry(SeqKey {
                             position: *index,
-                            raw: (*raw).to_owned(),
+                            tie: SeqKeyTie::Explicit((*raw).to_owned()),
                         })
                         .or_insert_with(|| empty_for(next));
                 }
@@ -500,17 +529,20 @@ fn insert(root: &mut BTreeMap<String, Node>, base: &str, segments: &[Segment<'_>
                     return poison(other, conflict(base, segments, position, "a sequence"));
                 }
             },
-            // `k[]` appends after the highest position seen so far, so repeated
-            // appends stay in submission order even when mixed with explicit
-            // indices.
+            // `k[]` appends after the highest position seen so far. This
+            // keeps repeated appends in submission order, even when mixed
+            // with explicit indices. `position` can saturate at
+            // `usize::MAX`. Then `saturating_add(1)` cannot advance it.
+            // `append_seq` still keeps two appends apart.
             Segment::Append => match node {
                 Node::Seq(entries) => {
                     let index = entries
                         .keys()
                         .next_back()
                         .map_or(0, |last| last.position.saturating_add(1));
+                    let append_seq = entries.len();
                     node = entries
-                        .entry(SeqKey::synthesized(index))
+                        .entry(SeqKey::synthesized(index, append_seq))
                         .or_insert_with(|| empty_for(next));
                 }
                 Node::Map(entries) => {
@@ -519,9 +551,19 @@ fn insert(root: &mut BTreeMap<String, Node>, base: &str, segments: &[Segment<'_>
                         .filter_map(|key| key.parse::<usize>().ok())
                         .max()
                         .map_or(0, |last| last.saturating_add(1));
-                    node = entries
-                        .entry(index.to_string())
-                        .or_insert_with(|| empty_for(next));
+                    // `index` can collide with an existing key. This can
+                    // happen only after a numeric key has saturated at
+                    // `usize::MAX`. Probe for a free key instead of reusing
+                    // one and silently merging two elements. At most
+                    // `entries.len()` candidates can already be taken, so
+                    // this loop always finds a free one.
+                    let mut key = index.to_string();
+                    let mut suffix = 0usize;
+                    while entries.contains_key(&key) {
+                        key = format!("{index}-{suffix}");
+                        suffix = suffix.saturating_add(1);
+                    }
+                    node = entries.entry(key).or_insert_with(|| empty_for(next));
                 }
                 other => {
                     return poison(other, conflict(base, segments, position, "a sequence"));
@@ -542,7 +584,7 @@ fn promote_to_map(node: &mut Node) {
     if let Node::Seq(entries) = node {
         let promoted = std::mem::take(entries)
             .into_iter()
-            .map(|(key, child)| (key.raw, child))
+            .map(|(key, child)| (key.spelling().into_owned(), child))
             .collect();
         *node = Node::Map(promoted);
     }
@@ -1088,9 +1130,9 @@ impl<'de> SeqAccess<'de> for NodeSeq<'_> {
         };
         seed.deserialize(NodeDeserializer { node })
             .map(Some)
-            // `raw` is the submitted spelling, so it gets the same bounding and
+            // The submitted spelling gets the same bounding and
             // control-character stripping every other request-derived segment does.
-            .map_err(|err| err.with_segment(sanitize_key(&key.raw)))
+            .map_err(|err| err.with_segment(sanitize_key(&key.spelling())))
     }
 
     fn size_hint(&self) -> Option<usize> {
@@ -1231,7 +1273,7 @@ impl<'de> MapAccess<'de> for IndexMap<'_> {
         self.value = Some(node);
         // The submitted spelling, so `counts[00]` reaches a map target as
         // `"00"` rather than as a re-rendered `"0"`.
-        self.key = key.raw.clone();
+        self.key = key.spelling().into_owned();
         seed.deserialize(ValueDeserializer { value: &self.key })
             .map(Some)
     }
@@ -1670,6 +1712,90 @@ mod tests {
             args("tags[]=a&tags[5]=b&tags[]=c").tags.unwrap(),
             vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
         );
+    }
+
+    #[test]
+    fn append_after_a_saturated_explicit_index_sorts_after_it() {
+        // The explicit index overflows to `usize::MAX`. So `saturating_add(1)`
+        // cannot move the append past it. The append must still keep
+        // submission order.
+        assert_eq!(
+            args("tags[99999999999999999999]=a&tags[]=b").tags.unwrap(),
+            vec!["a".to_owned(), "b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn append_after_an_index_spelled_exactly_usize_max_does_not_collide() {
+        // The explicit index is spelled as literally `usize::MAX`. This used
+        // to match the append key byte for byte. The two entries merged into
+        // one node instead of staying distinct.
+        assert_eq!(
+            args("tags[18446744073709551615]=a&tags[]=b").tags.unwrap(),
+            vec!["a".to_owned(), "b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn append_after_a_saturated_index_does_not_merge_nested_elements() {
+        // Same collision, one level deeper. Two outer elements must stay
+        // two. They must not collapse into one.
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Wrapper {
+            x: String,
+        }
+        #[derive(Debug, Deserialize)]
+        struct Nested {
+            tags: Vec<Wrapper>,
+        }
+
+        let out: Nested = from_query_str("tags[18446744073709551615][x]=first&tags[][x]=second")
+            .expect("decodes");
+        assert_eq!(
+            out.tags,
+            vec![
+                Wrapper {
+                    x: "first".to_owned()
+                },
+                Wrapper {
+                    x: "second".to_owned()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_explicit_index_always_sorts_before_an_append_at_the_same_position() {
+        // This ordering is load-bearing: it is what lets an append keep
+        // submission order after `position` saturates and can no longer
+        // move it forward. Assert it directly, not only through the
+        // end-to-end tests above.
+        assert!(SeqKeyTie::Explicit(String::new()) < SeqKeyTie::Appended(0));
+    }
+
+    #[test]
+    fn append_into_a_promoted_map_after_a_saturated_index_does_not_merge() {
+        // The same collision as above, on the `Node::Map` append path: a
+        // `Node::Seq` promoted to a map by a named key, then appended to
+        // after a saturated index.
+        #[derive(Debug, Deserialize)]
+        struct Dynamic {
+            filter: std::collections::HashMap<String, String>,
+        }
+
+        let out: Dynamic =
+            from_query_str("filter[18446744073709551615]=zero&filter[name]=value&filter[]=next")
+                .expect("decodes");
+        assert_eq!(
+            out.filter.len(),
+            3,
+            "the append must not merge into the saturated key: {out:?}"
+        );
+        assert_eq!(
+            out.filter.get("18446744073709551615").map(String::as_str),
+            Some("zero")
+        );
+        assert_eq!(out.filter.get("name").map(String::as_str), Some("value"));
     }
 
     #[test]

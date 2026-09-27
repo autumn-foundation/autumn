@@ -25,13 +25,14 @@
 //!
 //! # Ordering (write path)
 //!
-//! `#[model]` runs normalization at the head of the repository save flow, before
-//! the hooks (where `#[validate(...)]` and other user rejection logic run) and
-//! before the row is written. Normalizers apply left-to-right in the order
-//! written in the attribute.
+//! `#[model]` runs normalization at the head of the repository insert flow,
+//! before the model's `#[validate(...)]` rules, before the hooks, and before the
+//! row is written. Normalizers apply left-to-right in the order written in the
+//! attribute.
 //!
-//! **Insert** (`save` / `save_many`) normalizes the `New*` input, so validators
-//! *and the database* observe the canonical value.
+//! **Insert** (`save`, `save_many`, `save_many_skip_invalid`, and the create
+//! half of `find_or_create_by_*`) normalizes the `New*` input, so the model's
+//! rules *and the database* observe the canonical value (#2586).
 //!
 //! **Update is not symmetric with insert, and there are three cases, not two.**
 //!
@@ -99,9 +100,12 @@ pub fn strip_nul(s: &str) -> String {
 
 /// A type whose `#[normalize]` columns can be canonicalized in place.
 ///
-/// Implemented by `#[model]` for every generated `New*` insert struct and for
-/// the model itself. `normalize` applies each field's normalizer chain; it is a
-/// no-op for models with no `#[normalize]` columns.
+/// Implemented by `#[model]` for the model itself, and for every generated
+/// `New*` insert struct whose model declares `#[normalize]` columns (#2634:
+/// a `New*` with no normalized columns does not implement this, so the
+/// repository probe's no-clone fallback wins). `normalize` applies each
+/// field's normalizer chain; it is a no-op for models with no `#[normalize]`
+/// columns.
 pub trait Normalize {
     /// Canonicalize every `#[normalize]` field in place.
     fn normalize(&mut self);
@@ -147,10 +151,16 @@ pub fn normalize_lookup_value<M: NormalizedModel>(column: &str, value: &str) -> 
 /// Holds an immutable borrow of the caller's input. The specialized `Yes` impl
 /// (selected only when the concrete type is `Normalize + Clone`) clones and
 /// canonicalizes, returning the owned value; the `No` fallback returns the
-/// borrow untouched — so a model with no `#[normalize]` columns (or a
-/// hand-written `New*` that doesn't implement `Normalize`) pays no clone on the
-/// save path. The generated code unifies the two arms with `Borrow` (see
-/// `#[repository]` `save`/`save_many`).
+/// borrow untouched, paying no clone.
+///
+/// In practice only a **hand-written** `New*` reaches that fallback — plus, as
+/// of #2634, a `#[model]`-generated `New*` whose model declares no
+/// `#[normalize]` columns: the macro no longer emits the empty-bodied `impl
+/// Normalize` for those, so the `Yes` arm cannot win and the `No` arm hands
+/// back the caller's borrow with no clone. The generated code unifies the two
+/// arms with `Borrow` (see
+/// `#[repository]` `save`, `save_many`, `save_many_skip_invalid` and
+/// `find_or_create_by_*`).
 #[doc(hidden)]
 pub struct SpezNormalize<'a, T: ?Sized>(pub &'a T);
 

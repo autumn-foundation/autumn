@@ -174,6 +174,9 @@ fn acme_config(app: &AcmeApp, ca: &FakeCa, ca_root: Option<std::path::PathBuf>) 
         // HTTP-01: these tests are the #1608 path, untouched by #1620's DNS-01
         // addition. The wildcard/DNS-01 counterparts live in `acme_dns01`.
         dns: None,
+        // Tenant custom domains (#1635) are a separate suite
+        // (`custom_domain_issuance`); this path is the deployment's own cert.
+        custom_domains: None,
     }
 }
 

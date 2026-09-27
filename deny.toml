@@ -6,6 +6,11 @@
 # source registry will fail CI. `bans` (duplicate versions) is intentionally not
 # run in CI — see the [bans] note below.
 #
+# This is the ROOT workspace's graph only. `fuzz/` and `examples/island-flock/`
+# are each their own excluded workspace root with their own `Cargo.lock` and
+# their own narrower `deny.toml` (advisories + sources; see those files'
+# headers) — audited by `scripts/check-advisories.sh`'s `audit_satellite_graphs`.
+#
 # ── Handling a supply-chain check that fails CI ────────────────────────────
 # When the `supply-chain` job fails on a PR:
 #   1. Read the RUSTSEC id / license / source and the dependency path cargo-deny

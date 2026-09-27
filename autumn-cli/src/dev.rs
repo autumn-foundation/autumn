@@ -1740,8 +1740,14 @@ fn dev_ready_file_path() -> Option<&'static Path> {
     )
 )]
 fn child_reported_stop_budget(ready_file: &Path) -> Option<Duration> {
+    // Line ONE only. The readiness file carries the drain budget on line one and
+    // the app's bound address on line two (#1639); parsing the whole file would
+    // silently stop reporting a budget, and every rebuild would fall back to the
+    // CLI's own config guess — the guess this seam exists to avoid.
     let secs = std::fs::read_to_string(ready_file)
         .ok()?
+        .lines()
+        .next()?
         .trim()
         .parse::<u64>()
         .ok()?;
@@ -1888,12 +1894,23 @@ fn stop_child_cooperatively(
     outcome
 }
 
-fn resolve_target_directory() -> Result<PathBuf, String> {
+pub fn resolve_target_directory() -> Result<PathBuf, String> {
     let metadata = cargo_metadata();
     metadata["target_directory"]
         .as_str()
         .map(PathBuf::from)
         .ok_or_else(|| "missing target_directory in cargo metadata".to_owned())
+}
+
+/// Tolerant counterpart of [`resolve_target_directory`]: `None` instead of
+/// exiting when `cargo metadata` is unavailable or unreadable. Callers that
+/// must keep reporting (e.g. `autumn doctor`, which runs many independent
+/// checks) use this and fall back to a `target`-relative default rather than
+/// aborting the whole run over one unreadable manifest.
+pub fn try_resolve_target_directory() -> Option<PathBuf> {
+    try_cargo_metadata()?["target_directory"]
+        .as_str()
+        .map(PathBuf::from)
 }
 
 fn cargo_metadata() -> serde_json::Value {
@@ -2295,6 +2312,25 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let ready = tmp.path().join("dev-ready.state");
         std::fs::write(&ready, "300\n").unwrap();
+        assert_eq!(
+            child_reported_stop_budget(&ready),
+            Some(cooperative_stop_budget(300))
+        );
+    }
+
+    #[test]
+    fn the_budget_survives_the_readiness_file_gaining_an_address_line() {
+        // The runtime writes the budget on line one and its bound address on
+        // line two (#1639). Written by the runtime's OWN writer, so a future
+        // format change fails here rather than silently costing every Windows
+        // rebuild its drain budget and reintroducing the orphaned-cluster bug.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ready = tmp.path().join("dev-ready.state");
+        std::fs::write(
+            &ready,
+            autumn_web::app::serve_ready_payload(300, "tcp 127.0.0.1:3000"),
+        )
+        .unwrap();
         assert_eq!(
             child_reported_stop_budget(&ready),
             Some(cooperative_stop_budget(300))

@@ -530,49 +530,28 @@ pub trait AdminModel: Send + Sync + 'static {
         action: &str,
         ids: Vec<i64>,
     ) -> AdminFuture<'_, u64> {
-        // Default implementation: dispatch the built-in `"delete"`, `"restore"`,
-        // and `"purge"` actions. Any other action name returns an error so it
-        // doesn't silently no-op — overriders that declare custom actions must
-        // implement them here.
-        //
-        // We clone the pool (deadpool::Pool is Arc-backed, cheap) so the
-        // returned future only borrows from `&self` and avoids the
-        // lifetime mismatch between `&self` and `&pool` that would
-        // otherwise show up in the trait's elided `'_` return signature.
-        let action = action.to_owned();
-        let pool = pool.clone();
-        Box::pin(async move {
-            match action.as_str() {
-                "delete" => {
-                    let mut count: u64 = 0;
-                    for id in ids {
-                        self.delete(&pool, id).await?;
-                        count += 1;
-                    }
-                    Ok(count)
+        // Default implementation: dispatch the built-in `"delete"` action
+        // here; `"restore"`, `"purge"`, and anything else go through
+        // `dispatch_restore_purge_or_unhandled`, shared with models (e.g.
+        // `TokenAdminModel`, `FeatureFlagAdminModel`) that override this
+        // method to batch `"delete"` into one query but still need the same
+        // restore/purge/unhandled-action fallback.
+        if action == "delete" {
+            // Clone the pool (deadpool::Pool is Arc-backed, cheap) so the
+            // returned future only borrows from `&self` and avoids the
+            // lifetime mismatch between `&self` and `&pool` that would
+            // otherwise show up in the trait's elided `'_` return signature.
+            let pool = pool.clone();
+            return Box::pin(async move {
+                let mut count: u64 = 0;
+                for id in ids {
+                    self.delete(&pool, id).await?;
+                    count += 1;
                 }
-                "restore" => {
-                    let mut count: u64 = 0;
-                    for id in ids {
-                        self.restore(&pool, id).await?;
-                        count += 1;
-                    }
-                    Ok(count)
-                }
-                "purge" => {
-                    let mut count: u64 = 0;
-                    for id in ids {
-                        self.purge(&pool, id).await?;
-                        count += 1;
-                    }
-                    Ok(count)
-                }
-                other => Err(AdminError::Other(format!(
-                    "unhandled bulk action '{other}'; \
-                     override AdminModel::execute_action to support it"
-                ))),
-            }
-        })
+                Ok(count)
+            });
+        }
+        dispatch_restore_purge_or_unhandled(self, pool, action, ids)
     }
 
     /// Return a display string for a record (used in breadcrumbs, titles).
@@ -635,7 +614,13 @@ pub trait AdminModel: Send + Sync + 'static {
         self.fields()
             .into_iter()
             .filter(|f| {
-                !matches!(f.kind, AdminFieldKind::Password | AdminFieldKind::Hidden) && !f.encrypted
+                // #1771: a confidential column, and its blind-index companion,
+                // leave the database in a file built for sharing. The envelope
+                // and the token are both per-owner values, so an exported file
+                // is a portable correlation handle.
+                !matches!(f.kind, AdminFieldKind::Password | AdminFieldKind::Hidden)
+                    && !f.encrypted
+                    && !::autumn_web::confidential::is_confidential_column_name(f.name)
             })
             .map(|f| f.name)
             .collect()
@@ -724,6 +709,81 @@ pub trait AdminModel: Send + Sync + 'static {
             ))
         })
     }
+}
+
+/// Refuse a call on the `SQLite` backend, for a model that needs Postgres.
+///
+/// The three built-in models (`tokens`, `experiments`, `feature_flags`) read
+/// Postgres-only tables with Postgres-only SQL: `ILIKE`, `::type` casts,
+/// `NOW()` and writable CTEs. Since issue #2108 the crate COMPILES under
+/// `autumn-web/sqlite`, so registering one on `SQLite` is now a run-time
+/// mistake instead of a build error. Without this guard the operator sees a
+/// raw driver message such as `near "ILIKE": syntax error`.
+///
+/// Call it first in every method of a Postgres-only model. On Postgres it is a
+/// compile-time `Ok(())`: `backend_select!` drops the other arm.
+#[allow(
+    clippy::missing_const_for_fn,
+    clippy::unnecessary_wraps,
+    reason = "the Postgres arm is a trivial Ok(()); the SQLite arm formats an error"
+)]
+pub fn require_postgres(model: &str) -> Result<(), AdminError> {
+    ::autumn_web::backend_select! {
+        pg => {{
+            let _ = model;
+            Ok(())
+        }},
+        sqlite => {{
+            Err(AdminError::Other(format!(
+                "{model} needs the Postgres backend: it reads a Postgres-only table \
+                 with Postgres-only SQL. This app runs on SQLite. Register your own \
+                 AdminModel instead — see the autumn-admin-plugin README, \
+                 \"Database Backends\" (issue #2108)."
+            )))
+        }},
+    }
+}
+
+/// Dispatch the built-in `"restore"`/`"purge"` bulk actions and the fallback
+/// error for anything else.
+///
+/// Shared by `AdminModel::execute_action`'s default and by models (or
+/// generated `#[model]` admin adapters) that override it to special-case
+/// `"delete"` with a batched query — see `TokenAdminModel` and
+/// `FeatureFlagAdminModel` — so that fallthrough behaves identically without
+/// copying the loop.
+pub fn dispatch_restore_purge_or_unhandled<'a>(
+    model: &'a (impl AdminModel + ?Sized),
+    pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
+    action: &str,
+    ids: Vec<i64>,
+) -> AdminFuture<'a, u64> {
+    let action = action.to_owned();
+    let pool = pool.clone();
+    Box::pin(async move {
+        match action.as_str() {
+            "restore" => {
+                let mut count: u64 = 0;
+                for id in ids {
+                    model.restore(&pool, id).await?;
+                    count += 1;
+                }
+                Ok(count)
+            }
+            "purge" => {
+                let mut count: u64 = 0;
+                for id in ids {
+                    model.purge(&pool, id).await?;
+                    count += 1;
+                }
+                Ok(count)
+            }
+            other => Err(AdminError::Other(format!(
+                "unhandled bulk action '{other}'; \
+                 override AdminModel::execute_action to support it"
+            ))),
+        }
+    })
 }
 
 // ── VersionPage → AdminHistoryPage conversion ──────────────────────

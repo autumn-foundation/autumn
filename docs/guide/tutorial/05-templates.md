@@ -45,7 +45,15 @@ Expected project state with full Maud templates rendering database content.
 
 ---
 
-*Content coming in Sprint 12.*
+> **Not written yet.** This chapter's narrative doesn't exist yet. The Getting
+> Started guide's
+> ["Render HTML with Maud"](../getting-started.md#render-html-with-maud)
+> section covers the Maud syntax and layout pattern this chapter needs — but
+> its examples are generic (`/` and `/about`), not the todo list, detail, and
+> create-form templates this chapter's goal describes. For those, see the
+> actual, working templates in
+> [`examples/todo-app/src/routes/todos.rs`](../../../examples/todo-app/src/routes/todos.rs),
+> then continue to [Chapter 6 — Styling with Tailwind CSS](06-tailwind.md).
 
 ---
 

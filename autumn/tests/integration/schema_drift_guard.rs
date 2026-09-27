@@ -383,6 +383,52 @@ fn cluster_child_keys_are_strictly_validated() {
     );
 }
 
+/// Regression guard for the `[metrics]` field ordering.
+///
+/// Same landmine as `deploy_child_keys_are_strictly_validated` and its
+/// siblings: strict unknown-key validation only descends into a section the
+/// `SchemaDeserializer` walk actually reaches, and `DatabaseConfig`'s
+/// `deserialize_with` duration field aborts that walk. A silently-accepted
+/// typo here is the worst shape this section has: the operator raised a cap
+/// *because* `autumn_metrics_series_dropped_total` was climbing, the app boots
+/// clean, and the cap they meant to raise is still at its default while the
+/// samples keep being dropped. If someone moves `metrics` below `database`,
+/// this fails.
+#[test]
+fn metrics_child_keys_are_strictly_validated() {
+    let leaves = AutumnConfig::schema_leaf_paths();
+    for key in [
+        "metrics.max_series_per_metric",
+        "metrics.max_instruments",
+        "metrics.max_labels_per_series",
+    ] {
+        assert!(
+            leaves.contains(key),
+            "{key} must be a schema leaf so strict validation descends into [metrics]; \
+             if this fails, `metrics` was likely moved below `database` in AutumnConfig"
+        );
+    }
+
+    let schema = AutumnConfig::get_schema_keys();
+    let errors = AutumnConfig::validate_toml("[metrics]\nmax_serie_per_metric = 500\n", &schema);
+    assert!(
+        errors
+            .iter()
+            .any(|(path, _)| path == "metrics.max_serie_per_metric"),
+        "a bogus [metrics] child key must be rejected by strict validation, got: {errors:?}"
+    );
+
+    let ok = AutumnConfig::validate_toml(
+        "[metrics]\nmax_series_per_metric = 500\nmax_instruments = 512\n\
+         max_labels_per_series = 12\n",
+        &schema,
+    );
+    assert!(
+        ok.is_empty(),
+        "a well-formed [metrics] section must be accepted, got: {ok:?}"
+    );
+}
+
 /// Regression guard for the `[shadow]` field ordering (issue #1653).
 ///
 /// Same landmine as `deploy_child_keys_are_strictly_validated` and

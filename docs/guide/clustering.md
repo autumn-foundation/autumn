@@ -43,8 +43,11 @@ nodes and exactly one shared primitive.
 - **Not a replacement** for the Redis or Postgres backends behind sessions,
   jobs, channels, or the scheduler. It is an additional option that needs no
   datastore, not a substitute for one.
-- **Not tested past two nodes.** The protocol pushes full state to every known
-  peer on every interval; three or more nodes is out of scope for this slice.
+- **Tested at N=5 and N=10, not beyond.** Two throwaway Prospect assays (see
+  [Failure semantics](#failure-semantics)) found no divergence at 5 or 10
+  nodes under ideal single-host conditions. Nothing past N=10 has been
+  measured, every push still carries full state to every known peer, and
+  neither assay is a production guarantee.
 
 ## Enable it
 
@@ -780,18 +783,27 @@ member, exactly as with two. It is a `HealthOnly` indicator: it never gates
 node keeps serving its counter and its traffic, and a liveness probe must never
 be able to kill it for being alone.
 
-**Two nodes, with correctness evidence at five.** Every push carries the full
-document to every known peer, there are no indirect probes, and there is no
-quorum anywhere. That is a sound design at two nodes. A throwaway assay
-(`docs/reports/2026-09-04-prospect-cluster-scale-beyond-two-nodes.md`) ran a
-5-node, star-seeded cluster on one host through cold-start convergence,
-concurrent counter increments from every node, a clean departure, and a
-rejoin — 4/4 runs converged to correct, identical membership views and exact
-counter sums, no divergence. That is evidence the design does not fall over
-outright past two peers under ideal conditions; it is **not** a production
-guarantee. The assay never left one process, one host, or loopback
-networking; it tested only N=5, one churn cycle, and honest peers — it says
-nothing about real multi-host latency, packet loss or partition, N>5, or the
-all-to-all message volume's O(N²) growth. Treat larger fleets, real
-multi-host deployment, and partition tolerance as still future work, not as
-a supported configuration, until a follow-up assay closes those gaps.
+**Two nodes, with correctness evidence at five and at ten.** Every push
+carries the full document to every known peer, there are no indirect
+probes, and there is no quorum anywhere. That is a sound design at two
+nodes. Two throwaway assays scaled that up on one host, same protocol
+config each time: `docs/reports/2026-09-04-prospect-cluster-scale-beyond-two-nodes.md`
+(N=5, 4/4 clean runs) and `docs/reports/2026-09-05-prospect-cluster-scale-n10.md`
+(N=10 — double the first assay's N — 5/5 clean runs). Both took cold-start
+convergence, concurrent counter increments from every node, a clean
+departure, and a same-identity rejoin through to correct, identical
+membership views and exact counter sums every time, with no meaningful
+wall-clock growth between the two (every run in both assays lands in a
+~13-15.6s band, dominated by the test harness's own debounce window, not
+by slower convergence). That is evidence the design does not fall over
+outright as N doubles under ideal conditions; it is **not** a production
+guarantee, and it is **not** evidence the trend continues past N=10 — no
+assay has tried. Neither assay ever left one process, one host, or loopback
+networking; both tested only one churn cycle and honest peers — they say
+nothing about real multi-host latency, packet loss or partition, N>10, or
+the all-to-all message volume's O(N²) growth at a scale large enough for it
+to matter (a 10-member document stays several orders of magnitude under the
+64KB wire cap; the untested risk past N=10 is task/connection volume and
+bandwidth, not per-frame size). Treat larger fleets, real multi-host
+deployment, and partition tolerance as still future work, not as a
+supported configuration, until a follow-up assay closes those gaps.

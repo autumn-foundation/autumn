@@ -22,6 +22,10 @@
 //!   exec-hook implementations, the credential surface, and the bounded wait for
 //!   `_acme-challenge` TXT propagation. Present exactly when
 //!   `[server.tls.acme.dns]` is configured.
+//! - [`tenant_domains`] — per-tenant custom domains (issue #1635): the
+//!   one-certificate-per-hostname ACME issuer and the loop that verifies,
+//!   issues, renews and offboards every registered tenant domain. Present
+//!   exactly when `[server.tls.acme.custom_domains]` is enabled.
 //! - [`renewal`] — issuance, the renew-before-expiry decision
 //!   ([`needs_renewal`](renewal::needs_renewal)), the background renewal loop,
 //!   the self-signed placeholder used to bind `:443` before the first issuance,
@@ -53,6 +57,7 @@ pub mod challenge;
 pub mod dns;
 pub mod renewal;
 pub mod store;
+pub mod tenant_domains;
 
 use crate::config::AcmeDirectory;
 

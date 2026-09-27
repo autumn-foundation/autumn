@@ -71,7 +71,13 @@ given; `sharded` repositories are not supported yet (a sweep would only
 reach the shard it happens to be handed, silently skipping the rest), and
 neither is `dependent(...)` (a sweep mutates rows directly rather than
 through the cascade-aware delete path `dependent(...)` generates, so it
-could orphan children or ignore an `on_delete = restrict` rule).
+could orphan children or ignore an `on_delete = restrict` rule). Nor is
+`position(...)`. A sweep batches many rows into one DELETE/UPDATE
+statement. Each row's compaction trigger only sees its own pre-statement
+position. Sweeping several rows from the same scope in one statement can
+leave a gap in the ordered sequence. Age rows out of an ordered list
+yourself via `delete_many(ids)` (already single-row-chunked for
+`position(...)` tables) from a hand-written `#[scheduled]` sweep instead.
 
 ## `tenant_scoped` Repositories: Sweeps Are Cross-Tenant By Design
 
@@ -101,7 +107,8 @@ first — picking up where it left off on the next scheduled tick.
 The sweep is registered exactly like a `#[scheduled(coordination = "fleet")]`
 task, so it reuses the same [multi-replica coordination](scheduled-multi-replica.md)
 guarantee: under the `postgres` scheduler backend, only one replica executes
-a given sweep per tick, no matter how many replicas are running.
+a given sweep per tick, no matter how many replicas are running — and the
+`sqlite` backend gives the same guarantee across the processes on one host.
 
 The generated task name is `retention-sweep-<table>`, using the table name
 exactly as declared — e.g. a `Session` model backed by the `sessions` table

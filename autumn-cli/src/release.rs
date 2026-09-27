@@ -4268,10 +4268,79 @@ previous_secrets = []
             "the App Runner service must start from the bootstrap placeholder image: {service_block}"
         );
         assert!(
-            service_block
-                .contains("ignore_changes = [source_configuration, instance_configuration, health_check_configuration]"),
+            service_block.contains(
+                "ignore_changes = [source_configuration, instance_configuration[0].instance_role_arn, health_check_configuration]"
+            ),
             "the App Runner service must ignore source_configuration drift once CI/the manual \
              walkthrough deploys the real image: {service_block}"
+        );
+    }
+
+    #[test]
+    fn aws_app_runner_instance_sizing_vars_stay_terraform_managed_after_cutover() {
+        // Issue #2256: the cutover call (docs/guide/deployment.md) only
+        // ever sets instance_role_arn, never cpu/memory. Ignoring the whole
+        // instance_configuration block — not just the role field — used to
+        // suppress a later `terraform apply` from resizing the service
+        // even after an operator changed var.instance_cpu/instance_memory.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let service_block = content
+            .split("resource \"aws_apprunner_service\" \"this\"")
+            .nth(1)
+            .expect("main.tf must declare the App Runner service");
+        let lifecycle_block = service_block
+            .split("lifecycle {")
+            .nth(1)
+            .expect("the App Runner service must declare a lifecycle block");
+        assert!(
+            lifecycle_block.contains("ignore_changes = [source_configuration, instance_configuration[0].instance_role_arn, health_check_configuration]"),
+            "only instance_role_arn must be ignored within instance_configuration, so \
+             var.instance_cpu/var.instance_memory changes still reach AWS on \
+             `terraform apply`: {lifecycle_block}"
+        );
+        assert!(
+            !lifecycle_block.contains("instance_configuration,")
+                && !lifecycle_block.contains("instance_configuration]"),
+            "instance_configuration must not be ignored as a whole block — that would \
+             also suppress cpu/memory resizing: {lifecycle_block}"
+        );
+    }
+
+    #[test]
+    fn aws_app_runner_instance_sizing_vars_are_declared_and_wired() {
+        // Guards the other half of issue #2256's fix: a narrowed
+        // `ignore_changes` is worthless if instance_cpu/instance_memory
+        // stop being declared or wired into instance_configuration.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
+
+        let variables = fs::read_to_string(dir.join("variables.tf")).unwrap();
+        assert!(
+            variables.contains("variable \"instance_cpu\""),
+            "variables.tf must declare instance_cpu: {variables}"
+        );
+        assert!(
+            variables.contains("variable \"instance_memory\""),
+            "variables.tf must declare instance_memory: {variables}"
+        );
+
+        let main_tf = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let instance_block = main_tf
+            .split("instance_configuration {")
+            .nth(1)
+            .and_then(|block| block.split('}').next())
+            .expect("service must declare instance_configuration");
+        assert!(
+            instance_block.contains("cpu                = var.instance_cpu"),
+            "instance_configuration must wire cpu from var.instance_cpu: {instance_block}"
+        );
+        assert!(
+            instance_block.contains("memory             = var.instance_memory"),
+            "instance_configuration must wire memory from var.instance_memory: {instance_block}"
         );
     }
 
@@ -4322,8 +4391,9 @@ previous_secrets = []
             .nth(1)
             .expect("main.tf must declare the App Runner service");
         assert!(
-            service_block
-                .contains("ignore_changes = [source_configuration, instance_configuration, health_check_configuration]"),
+            service_block.contains(
+                "ignore_changes = [source_configuration, instance_configuration[0].instance_role_arn, health_check_configuration]"
+            ),
             "the App Runner service must ignore health_check_configuration drift alongside \
              source_configuration: {service_block}"
         );
@@ -4801,6 +4871,62 @@ previous_secrets = []
         let workflow = fs::read_to_string(dir.join(".github/workflows/aws-deploy.yml")).unwrap();
         assert!(workflow.contains("--argjson SECRETS"));
         assert!(workflow.contains(".containerDefinitions[0].secrets = $SECRETS"));
+    }
+
+    #[test]
+    fn aws_ecs_migrate_task_carries_the_full_app_secret_set() {
+        // Issue #2255: CI (and the manual walkthrough) copy the "migrate"
+        // task definition's `secrets` onto the "app" task definition when
+        // registering the real image. A migrate task that only reads
+        // AUTUMN_DATABASE__PRIMARY_URL therefore strips the signing secret
+        // (and Redis URL) from every real app deploy. The migrate task must
+        // carry the SAME secret set as the app, not just what `autumn
+        // migrate` itself needs.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let migrate = content
+            .split("resource \"aws_ecs_task_definition\" \"migrate\"")
+            .nth(1)
+            .and_then(|block| block.split("\nresource").next())
+            .expect("main.tf must declare the migrate task definition");
+        assert!(
+            migrate.contains("secrets = local.container_secrets"),
+            "the migrate task must reuse the full app secret list, not a \
+             narrower hand-picked one: {migrate}"
+        );
+        assert!(
+            !migrate.contains("AUTUMN_DATABASE__PRIMARY_URL\", valueFrom"),
+            "the migrate task must not hardcode a partial secret list \
+             inline: {migrate}"
+        );
+
+        // The migrate task only reuses `local.container_secrets` — confirm
+        // that local itself carries all three secrets (database URL,
+        // signing secret, and the Redis URL gated by enable_redis_cache),
+        // so reuse alone is not enough if that local ever narrows.
+        let container_secrets_local = content
+            .split("container_secrets = concat(")
+            .nth(1)
+            .and_then(|block| block.split("secrets_manager_arns").next())
+            .expect("main.tf must declare local.container_secrets");
+        for secret in [
+            "AUTUMN_DATABASE__PRIMARY_URL",
+            "AUTUMN_SECURITY__SIGNING_SECRET",
+        ] {
+            assert!(
+                container_secrets_local.contains(secret),
+                "local.container_secrets must include {secret}: \
+                 {container_secrets_local}"
+            );
+        }
+        assert!(
+            container_secrets_local.contains("var.enable_redis_cache")
+                && container_secrets_local.contains("AUTUMN_CACHE__REDIS__URL"),
+            "local.container_secrets must include AUTUMN_CACHE__REDIS__URL, \
+             gated by enable_redis_cache: {container_secrets_local}"
+        );
     }
 
     #[test]

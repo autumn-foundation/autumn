@@ -10,11 +10,18 @@
 examples/wiki/content/*.md text eol=lf
 autumn/src/**/*.md text eol=lf
 
-# The saas starter is embedded via include_dir! and compared byte-for-byte against
-# its rendered form in examples/saas; force LF on both so Windows autocrlf does not
-# introduce line-ending drift (mirrors the eol=lf rules above).
-autumn-cli/src/starters/saas/** text eol=lf
+# Every built-in starter is embedded via include_dir! and compared byte-for-byte
+# against its rendered form under examples/; force LF on both sides so Windows
+# autocrlf does not introduce line-ending drift (mirrors the eol=lf rules
+# above). The starters/ rule is deliberately whole-tree rather than per-starter:
+# that directory holds nothing but starter templates, and the drift gate is the
+# same for every one of them, so a new starter inherits the rule instead of
+# failing `Test (windows-latest)` on its first CI run — which is exactly what
+# `cms` did. The examples/ side stays per-directory, since examples/ holds
+# plenty of trees that are not starters.
+autumn-cli/src/starters/** text eol=lf
 examples/saas/** text eol=lf
+examples/cms/** text eol=lf
 
 # Golden snapshots are compared byte-for-byte against generator output
 # (which always emits LF); force LF so Windows autocrlf does not fail the

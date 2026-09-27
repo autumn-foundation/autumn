@@ -174,7 +174,8 @@ The README's `docker compose -f examples/todo-app/docker-compose.yml up -d` +
 - **`autumn routes -p todo-app` fails** with `has multiple binary targets (seed,
   todo-app)`. Add `--bin todo-app`.
 - **`/actuator/routes` does not exist** (404, HTML error page — it will break a
-  `jq` pipe). The route table comes from the CLI, not the actuator.
+  `jq` pipe). Use `autumn routes` for the table, or `/actuator/graph` over HTTP
+  — it carries each route's declared method.
 - **`GET /` is a 303** to `/todos`, so assert with `curl -L` or expect 303.
 - **`/api/*` returns 401 by default.** Mint a token at `POST /api/tokens` first.
   `/todos/summary` is deliberately mounted *outside* that scope and content-
@@ -194,6 +195,9 @@ The README's `docker compose -f examples/todo-app/docker-compose.yml up -d` +
   `!.claude/skills/**/*.sh` so this skill and driver are tracked while
   `.claude/settings.local.json` stays ignored. Don't undo those negations.
 
+<!-- route-surface-allow: /actuator/routes — named in order to warn that it
+     404s; the route table is `autumn routes` or /actuator/graph -->
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -208,3 +212,6 @@ The README's `docker compose -f examples/todo-app/docker-compose.yml up -d` +
 | `chromium: /Applications/Chromium.app/...: No such file or directory` | Broken Homebrew shim; use the Google Chrome binary (driver's default). |
 | Screenshot command hangs forever | Headless Chrome doesn't self-exit. Use `driver.sh shot`. |
 | Driver reports `unbound variable` | It runs under `set -u`; a `curl`/`jq` step returned empty. Check `target/autumn-run/<example>.log`. |
+
+<!-- route-surface-allow: /actuator/routes — named in order to warn that it
+     404s; the route table is `autumn routes` or /actuator/graph -->

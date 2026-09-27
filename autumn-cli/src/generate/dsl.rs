@@ -211,6 +211,29 @@ impl Field {
         }
     }
 
+    /// [`Field::rust_type`] for the target `backend` (issue #1924).
+    ///
+    /// Postgres is byte-for-byte [`Field::rust_type`]. On `SQLite`, `Uuid` and
+    /// `Decimal` render `autumn-web`'s `TEXT`-backed newtypes — see
+    /// [`FieldKind::rust_type_for`].
+    #[must_use]
+    pub fn rust_type_for(&self, backend: DatabaseBackend) -> String {
+        if backend == DatabaseBackend::Postgres {
+            return self.rust_type();
+        }
+        if self.constraints.translatable {
+            return TRANSLATED_RUST_TYPE.to_owned();
+        }
+        let inner = self
+            .enum_type_name()
+            .unwrap_or_else(|| self.kind.rust_type_for(backend).to_owned());
+        if self.nullable {
+            format!("Option<{inner}>")
+        } else {
+            inner
+        }
+    }
+
     /// Whether this column stores per-locale content (issue #1384) — declared
     /// with a `{translatable}` modifier, re-emitted as `#[translatable]`.
     #[must_use]
@@ -593,6 +616,28 @@ impl FieldKind {
         }
     }
 
+    /// [`FieldKind::rust_type`] for the target `backend` (issue #1924).
+    ///
+    /// Postgres is byte-for-byte [`FieldKind::rust_type`]. On `SQLite`, `Uuid`
+    /// and `Decimal` render `autumn-web`'s `TEXT`-backed newtypes instead of
+    /// `uuid::Uuid` / `rust_decimal::Decimal`: both wrapped types are foreign
+    /// to `autumn-web`, and diesel blanket-implements `AsExpression` for every
+    /// `Expression`, so no crate but `uuid` / `rust_decimal` itself can give
+    /// them a `SQLite` conversion. The newtypes are `Copy`, deref to the
+    /// wrapped type, convert with `From`/`Into`, and are `#[serde(transparent)]`,
+    /// so `Display`, `FromStr` and JSON match the wrapped type exactly.
+    #[must_use]
+    pub const fn rust_type_for(self, backend: DatabaseBackend) -> &'static str {
+        match backend {
+            DatabaseBackend::Postgres => self.rust_type(),
+            DatabaseBackend::Sqlite => match self {
+                Self::Uuid => SQLITE_UUID_RUST_TYPE,
+                Self::Decimal { .. } => SQLITE_DECIMAL_RUST_TYPE,
+                _ => self.rust_type(),
+            },
+        }
+    }
+
     /// Diesel `table!` schema type token.
     #[must_use]
     pub const fn schema_type(self) -> &'static str {
@@ -723,13 +768,11 @@ impl FieldKind {
     /// this workspace's `db` feature), storing plain-text JSON as `TEXT` — no
     /// `autumn-web` conversion code needed, unlike `Attachment`.
     ///
-    /// `Uuid`, `Decimal`, and `Enum` still list a nominal `Text` remapping here
-    /// for documentation completeness, but they are rejected at generate time
-    /// (see [`FieldKind::sqlite_has_diesel_conversion`]) — their Rust types are
-    /// foreign to `autumn-web`, so the orphan rule forbids adding the required
-    /// `Sqlite` conversions without a per-field `serialize_as`/`deserialize_as`
-    /// wrapper (tracked as follow-up work) — so this token never reaches a
-    /// generated `schema.rs`.
+    /// `Uuid`, `Decimal` and `Enum` map to `Text` (issue #1924). `Uuid` and
+    /// `Decimal` reach it through `autumn-web`'s `TEXT`-backed newtypes, which
+    /// [`FieldKind::rust_type_for`] renders in place of the foreign
+    /// `uuid::Uuid` / `rust_decimal::Decimal`; a generated `Enum` is local to
+    /// the app, so `render_enum_decl` emits its `Text`/`Sqlite` impls directly.
     #[must_use]
     #[allow(
         clippy::match_same_arms,
@@ -765,7 +808,7 @@ impl FieldKind {
     /// feature set (diesel `sqlite` + `chrono`, without `uuid`/`numeric`) —
     /// determined empirically (issue #1614 AC #4; conversions wired in #1924).
     ///
-    /// Now supported on `SQLite` (issue #1924):
+    /// Supported on `SQLite` (issue #1924):
     /// - `NaiveDateTime` via the core, ungated `Timestamp` sql-type.
     /// - `DateTime<Utc>` via diesel's `TimestamptzSqlite` sql-type — its
     ///   `sqlite`+`chrono` conversion resolves through the app's `autumn-web`
@@ -780,22 +823,40 @@ impl FieldKind {
     ///   obstacle at all — unlike `Uuid`/`Decimal` below, which are genuinely
     ///   blocked because neither diesel nor `autumn-web` provides the impl.
     ///
-    /// Still rejected (their Rust types are foreign to `autumn-web`, so the
-    /// orphan rule forbids `autumn-web` from adding a `Sqlite` `FromSql`/`ToSql`
-    /// directly, and diesel/`rust_decimal`'s built-in impls are Postgres-only):
-    /// - `Uuid` (`uuid::Uuid`) and `Decimal` (`rust_decimal::Decimal`) — these
-    ///   need a per-field `serialize_as`/`deserialize_as` wrapper threaded
-    ///   through the `#[model]` macro (including nullable columns), tracked as
-    ///   follow-up work under issue #1924.
-    /// - `Enum` fields render an enum whose only generated diesel conversion is
-    ///   `ToSql`/`FromSql<Text, diesel::pg::Pg>` (see `render_enum_decl`), i.e.
-    ///   Postgres-only, with no `Text`/`Sqlite` impl.
+    /// - `Uuid` and `Decimal` via `autumn-web`'s `TEXT`-backed newtypes, which
+    ///   [`FieldKind::rust_type_for`] renders in place of the foreign
+    ///   `uuid::Uuid` / `rust_decimal::Decimal`.
+    /// - `Enum` — the generated enum is local to the app, so `render_enum_decl`
+    ///   emits its `ToSql`/`FromSql<Text, Sqlite>` impls directly.
     ///
-    /// Rather than emit uncompilable code, the still-unsupported kinds are
-    /// rejected at generate time.
+    /// Every kind now converts, so nothing is rejected. The gate stays as the
+    /// decision a NEW kind must make: return `false` here rather than emit code
+    /// that cannot compile, and `reject_sqlite_unsupported_field_kinds` reports
+    /// it at generate time.
     #[must_use]
     pub const fn sqlite_has_diesel_conversion(self) -> bool {
-        !matches!(self, Self::Uuid | Self::Decimal { .. } | Self::Enum)
+        match self {
+            Self::String
+            | Self::Text
+            | Self::RichText
+            | Self::Slug
+            | Self::I32
+            | Self::I64
+            | Self::References
+            | Self::Position
+            | Self::Commentable
+            | Self::Bool
+            | Self::F32
+            | Self::F64
+            | Self::Uuid
+            | Self::NaiveDateTime
+            | Self::DateTime
+            | Self::Bytea
+            | Self::Attachment
+            | Self::Json
+            | Self::Enum
+            | Self::Decimal { .. } => true,
+        }
     }
 
     /// The diesel `table!` schema type token for the target `backend`
@@ -1057,12 +1118,21 @@ pub const SUPPORTED_TYPES: &str = "String, Text, richtext, i32, i64, bool, f32, 
 
 /// The DSL field kinds that map to a working diesel `SQLite` conversion
 /// (issue #1614 AC #4; #1924) — the complement of the kinds
-/// [`FieldKind::sqlite_has_diesel_conversion`] rejects (`Uuid`, `Decimal`,
-/// `Enum`). Used in the generate-time rejection message so the user knows which
-/// field kinds a `SQLite` app supports today.
+/// [`FieldKind::sqlite_has_diesel_conversion`] rejects. As of #1924 that
+/// complement is every kind, so this mirrors [`SUPPORTED_TYPES`]; it is still
+/// the message a future unconvertible kind would be reported against.
 pub const SQLITE_SUPPORTED_KINDS: &str = "String, Text, richtext, i32, i64, bool, f32, f64, \
-    NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, json (alias jsonb), references, \
-    slug{from:col}, position (optionally position{scope:col}), commentable, Option<…>, :unique";
+    Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, json (alias jsonb), references, \
+    enum{a,b,…}, decimal{precision,scale}, slug{from:col}, position (optionally \
+    position{scope:col}), commentable, Option<…>, :unique";
+
+/// The Rust type a `Uuid` field renders as on `SQLite` — `autumn-web`'s
+/// `TEXT`-backed newtype (issue #1924). See [`FieldKind::rust_type_for`].
+pub const SQLITE_UUID_RUST_TYPE: &str = "autumn_web::db::sqlite_types::SqliteUuid";
+
+/// The Rust type a `decimal{p,s}` field renders as on `SQLite` — `autumn-web`'s
+/// `TEXT`-backed newtype (issue #1924). See [`FieldKind::rust_type_for`].
+pub const SQLITE_DECIMAL_RUST_TYPE: &str = "autumn_web::db::sqlite_types::SqliteDecimal";
 
 /// Comma-separated list of supported Postgres column types (`udt_name`), for
 /// the `db pull` introspection error message.
@@ -2906,17 +2976,16 @@ mod tests {
         }
     }
 
-    /// After issue #1924, `Uuid`, `Decimal`, and `Enum` are the only kinds still
-    /// lacking a working diesel `SQLite` conversion (their Rust types are
-    /// foreign to `autumn-web` with Postgres-only impls; `Enum` renders only
-    /// `Pg` `ToSql`/`FromSql`). `DateTime<Utc>` (via `TimestamptzSqlite`) and
-    /// `Attachment` (via `autumn-web`'s local `Blob` `Text`/`Sqlite` impls) now
-    /// round-trip, alongside `NaiveDateTime` (core `Timestamp`).
+    /// Issue #1924 closes the last three gaps — `Uuid` and `Decimal` through
+    /// `autumn-web`'s `TEXT`-backed newtypes, `Enum` through the app-local
+    /// `Text`/`Sqlite` impls the model generator emits — so every DSL field
+    /// kind now has a working diesel `SQLite` conversion.
     #[test]
-    fn sqlite_has_diesel_conversion_rejects_only_uuid_decimal_enum() {
+    fn every_field_kind_has_a_sqlite_diesel_conversion() {
         for token in [
             "title:String",
             "body:Text",
+            "rich:richtext",
             "count:i32",
             "big:i64",
             "flag:bool",
@@ -2927,6 +2996,10 @@ mod tests {
             "cover:Attachment",
             "data:Bytea",
             "post:references",
+            "payload:json",
+            "token:Uuid",
+            "price:decimal{10,2}",
+            "status:enum{draft,published}",
         ] {
             assert!(
                 parse_field(token)
@@ -2936,19 +3009,43 @@ mod tests {
                 "`{token}` must be a SQLite-supported kind"
             );
         }
-        for token in [
-            "token:Uuid",
-            "price:decimal{10,2}",
-            "status:enum{draft,published}",
-        ] {
-            assert!(
-                !parse_field(token)
-                    .unwrap()
-                    .kind
-                    .sqlite_has_diesel_conversion(),
-                "`{token}` must have no working diesel SQLite conversion"
+    }
+
+    /// The two foreign types render `autumn-web`'s `SQLite` newtypes; every
+    /// other kind — and all of Postgres — is byte-for-byte unchanged (#1924).
+    #[test]
+    fn sqlite_rust_types_wrap_only_uuid_and_decimal() {
+        let cases = [
+            ("token:Uuid", SQLITE_UUID_RUST_TYPE.to_owned()),
+            ("price:decimal{10,2}", SQLITE_DECIMAL_RUST_TYPE.to_owned()),
+            (
+                "owner:Option<Uuid>",
+                format!("Option<{SQLITE_UUID_RUST_TYPE}>"),
+            ),
+            ("title:String", "String".to_owned()),
+            ("at:DateTime", "chrono::DateTime<chrono::Utc>".to_owned()),
+            (
+                "cover:Attachment",
+                "Option<autumn_web::storage::Blob>".to_owned(),
+            ),
+        ];
+        for (token, expected) in cases {
+            let f = parse_field(token).unwrap();
+            assert_eq!(
+                f.rust_type_for(DatabaseBackend::Sqlite),
+                expected,
+                "SQLite Rust type for `{token}`"
+            );
+            assert_eq!(
+                f.rust_type_for(DatabaseBackend::Postgres),
+                f.rust_type(),
+                "Postgres Rust type for `{token}` must be unchanged"
             );
         }
+        // An enum field keeps its generated type name on both backends — the
+        // enum is local to the app, so it needs no wrapper.
+        let e = parse_field("status:enum{draft,published}").unwrap();
+        assert_eq!(e.rust_type_for(DatabaseBackend::Sqlite), e.rust_type());
     }
 
     #[test]
@@ -5220,6 +5317,19 @@ mod schema_core_parity {
                 fk.sqlite_has_diesel_conversion(),
                 ct.sqlite_has_diesel_conversion(),
                 "sqlite diesel-conversion parity for {fk:?}"
+            );
+
+            // Rust `#[model]` type on SQLite — `Uuid`/`Decimal` render
+            // autumn-web's TEXT-backed newtypes (issue #1924).
+            assert_eq!(
+                fk.rust_type_for(DatabaseBackend::Sqlite),
+                ct.rust_type_for(Backend::Sqlite),
+                "sqlite rust_type parity for {fk:?}"
+            );
+            assert_eq!(
+                fk.rust_type_for(DatabaseBackend::Postgres),
+                ct.rust_type_for(Backend::Postgres),
+                "pg rust_type parity for {fk:?}"
             );
         }
     }

@@ -603,7 +603,10 @@ pub async fn update(
 
 // ── Active search handler ─────────────────────────────────────────────────────
 
-#[derive(serde::Deserialize)]
+// `OpenApiSchema` so the exported spec advertises `q` as a real query
+// parameter instead of the opaque `{"type":"object"}` placeholder a
+// derive-less `Query<T>` type falls back to (issue #802).
+#[derive(serde::Deserialize, autumn_web::openapi::OpenApiSchema)]
 pub struct SearchQuery {
     #[serde(default)]
     pub q: String,

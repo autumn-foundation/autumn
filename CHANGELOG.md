@@ -7,7 +7,2814 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A compensated first deploy now removes its stale proxy route (issue
+  #2270):** when a halted fleet rollout compensated a host's just-completed
+  FIRST deploy, the host was torn down but kamal-proxy kept a route pointing
+  at the now-stopped slot, so its public port answered `502` instead of
+  refusing the connection until the next deploy. `ProxyController` gained
+  `deregister_op` (`kamal-proxy remove`), probed the same way `deploy --help`
+  already is, so a drifted or renamed `remove` subcommand fails the deploy
+  closed before any cutover, never assumed present. The route is removed as
+  its own step, only after the app teardown fully succeeds, so a failure
+  there reports its own outcome (`CompensatedTeardownRouteFailed`) rather
+  than the misleading "still serving, roll it back" — a first deploy has no
+  previous release to roll back to.
+
+### Added
+
+- **💵 Money as a framework primitive: typed `Money<C>` and an enforced
+  double-entry ledger (issue #1837):** currency lived only in the view layer
+  (`format::number_to_currency` formats a bare `Decimal`), idempotency stopped
+  at the HTTP door (`idempotency.rs` is an `Idempotency-Key` middleware), and
+  there was no ledger at all — so every app that moved money hand-rolled one.
+  `autumn_web::money` adds the primitive, with **zero new dependencies**.
+  - `Money<C>` is an amount in one currency, held as an `i64` count of minor
+    units. The currency is a type parameter, so adding `Money<Usd>` to
+    `Money<Eur>` does not compile. There is **no `f64`** in the value or in any
+    operation on it, and a unit test reads the module source to keep it that
+    way. There are no `+`/`-` operators, because an operator cannot report an
+    overflow: `checked_add`, `checked_sub`, `checked_neg`, `checked_abs`,
+    `checked_mul` and `try_sum` each return `Result<_, MoneyError>`.
+  - `AnyMoney` is the same value with the currency carried as data, for a
+    ledger row whose currency is a `TEXT` column. It rejects what `Money<C>`
+    refuses to compile, with `MoneyError::CurrencyMismatch`.
+  - Rounding is never implicit. `Money::from_decimal` names one of `HalfUp`,
+    `HalfEven`, `HalfDown`, `TowardZero`, `AwayFromZero`, `Floor` or `Ceiling`;
+    `from_decimal_exact` refuses to round at all. `allocate` splits by weights
+    with the largest-remainder method, so the parts always sum back to the
+    whole — a dollar in three is 34/33/33, not 33/33/33 and a lost cent.
+  - 34 ISO 4217 currencies, covering 0, 2 and 3 minor digits.
+  - `autumn_web::money::ledger` is an append-only, double-entry store over
+    three `_autumn_money_*` tables. `post` refuses a transaction whose debits
+    do not equal its credits **before its first `INSERT`**, and also refuses
+    mixed currencies, a one-sided transaction, a zero line, a posting whose
+    currency the account does not hold, and a negative amount (the sign belongs
+    to the side, which keeps `i64::MIN` out of the ledger). It also refuses a
+    posting that would put an account's balance outside `i64`: the tables are
+    append-only, so such a balance could never be read back or repaired.
+  - **`post` must run inside a transaction.** A call on a bare connection is
+    refused with `LedgerError::NotInTransaction` rather than run weakly: the
+    account locks and the balance check only mean something inside one, and a
+    transaction row written without its postings could never be repaired.
+  - Posting twice posts once. Each transaction carries an idempotency key with
+    a `UNIQUE` index behind it; the second call returns
+    `PostOutcome::Replayed` carrying the first call's transaction. The key can
+    be one you already have (`IdempotencyKey::new`) or **derived from the
+    postings themselves** (`IdempotencyKey::derive`), which is what makes a
+    retry collapse with nothing for the caller to remember. The same key for
+    *different* money is a `KeyReuse` conflict, not a silent wrong replay —
+    a stored request hash over the normalized postings is what tells them
+    apart.
+  - `post` takes the connection, so it runs inside `Db::tx` with the
+    application rows the money justifies: they commit or roll back together,
+    and a rolled-back post frees its idempotency key again.
+  - Nothing is rewritten. A trigger on **both** backends aborts an `UPDATE` or
+    `DELETE` of a transaction or a posting, and a statement-level pair on
+    Postgres aborts a `TRUNCATE` (which row triggers do not see). On SQLite an
+    `INSERT OR REPLACE` is refused by `BEFORE INSERT` guards on the row keys.
+    They are guards rather than the `DELETE` triggers because SQLite skips
+    `DELETE` triggers for the row a `REPLACE` removes unless
+    `PRAGMA recursive_triggers` is on, and turning that on globally would
+    change the recursion semantics of every application trigger. One shape is
+    therefore **not** covered: a `REPLACE` that collides on the idempotency key
+    with a fresh row id, in a transaction that re-inserts the deleted id before
+    `COMMIT`. Like `DROP TABLE`, it needs deliberate multi-statement SQL against
+    framework-private tables; the triggers are a guard-rail against operational
+    accidents, not a boundary against arbitrary SQL.
+    `ledger::balance` sums an account's postings; `ledger::trial_balance`
+    makes the global zero-sum invariant queryable from a job or a health
+    check.
+  - A cancelled `post` never half-writes. The postings go in **before** the
+    transaction row they belong to, behind a `DEFERRABLE INITIALLY DEFERRED`
+    foreign key, so a future dropped between the two leaves the enclosing
+    transaction holding postings with no parent — and the database refuses that
+    commit. The other order could commit a transaction row with no postings,
+    which append-only tables could never repair. The ledger therefore ends up
+    with either nothing or one complete balanced transaction; which of the two
+    is not knowable from the cancellation alone, so a caller that races `post`
+    against a timeout settles it by posting the same idempotency key again.
+  - An account never changes currency. It is what `post` checks a posting
+    against, so a change would relabel every stored minor unit and let the next
+    posting in the new currency pass that check. A trigger on both backends
+    refuses it; `set_allow_negative` is unaffected.
+  - One configurable policy per account: `Account::disallow_negative()`. The
+    check reads the balance the posting *would* leave, before anything is
+    written. On Postgres the account rows are held with `SELECT ... FOR
+    UPDATE`, so two concurrent postings cannot both pass it; SQLite has no row
+    lock, so a SQLite app that posts concurrently must retry the transaction.
+  - `MoneyError` and `LedgerError` map to real statuses through `AutumnError` —
+    422 for a refused value or posting, 409 for a reused key, a refused
+    negative balance, or a key another transaction is posting right now.
+  - `Currency` is sealed. An outside implementation could declare an exponent
+    the minor-unit table has no row for and make every conversion wrong by
+    orders of magnitude.
+  - Proved in two tiers. `tests/sqlite_money_ledger.rs` is the golden suite and
+    runs Docker-free on every push; it includes the issue's fault-injection
+    metric — 64 logical charges, each submitted two to four times with a share
+    of the attempts aborted after the ledger wrote but before the enclosing
+    `Db::tx` commits, ending with exactly one balanced transaction per charge
+    and `sum(debits) == sum(credits)` globally. That exercises the rollback
+    path; the windows a *dropped* future opens are covered separately by the
+    two deferred-foreign-key tests, which put the database in exactly those
+    states and check what `COMMIT` does.
+    `tests/integration/money_ledger_postgres.rs` proves the Postgres fork and
+    the races only it can show: eight connections posting the same charge at
+    once collapse to one transaction, and two concurrent payouts from a float
+    that covers one leave exactly one. See `docs/guide/money.md`.
+- **Fleet deploy alerts on a halted rollout or drift (#2267, AC-6 of #1621):**
+  `autumn deploy up` now sends a `scheduled_task_failure` alert the moment a
+  rollout halts. `autumn deploy status --strict` sends one when it finds
+  drift. Both reuse the same `[alerts]` config and channels that `autumn
+  alert test` uses: PagerDuty, Slack, Discord, or a signed webhook. They do
+  not send email. Email needs a running mailer. Each alert's dedup key
+  includes the app name and the deploy profile, so two apps — or staging and
+  production — sharing one destination never fold into one incident.
+  Delivery is best-effort. A failed send never changes the command's exit
+  code. A plain `deploy status` (no `--strict`) never sends an alert.
+  Neither the drift model nor the `--json` contract changed. See
+  `docs/guide/fleet-deploys.md`.
+- **🤝 Collaborative fields: make any record collaboratively editable
+  (`#[collaborative]`, issue #1806):** autumn could broadcast changes
+  (`channels`), show who is online (`presence`) and reconcile offline writes
+  (`sync`), but concurrent edits to one field were resolved by
+  last-write-wins — `sync::resolver` compares `updated_at` and discards the
+  loser, so one of two people typing in the same box loses their characters.
+  There was no convergent-merge seam anywhere in the tree, which left
+  Notion/Figma-grade editing to an external service (Liveblocks, Yjs,
+  PartyKit). The new `collab` feature adds one.
+  - `autumn_web::collab::CollabText` is a text CRDT — a Replicated Growable
+    Array — implemented in-tree with **zero new dependencies**. Replicas that
+    hold the same operations render the same text in any delivery order; an
+    operation that arrives before the character it refers to waits in a buffer
+    instead of being dropped; applying one twice is a no-op, so a reconnect is
+    safe; and an edit anchors to a neighbouring character rather than an
+    index, so it lands where the author meant even when the document changed
+    in flight.
+  - `#[collaborative]` marks the field, mirroring `#[translatable]`: the
+    macro validates the type, refuses the markers that disagree with it,
+    registers the column (`CollaborativeColumnDescriptor`), and generates
+    `body_text()`, `body_insert(..)`, `body_remove(..)`, `body_set_text(..)`,
+    `body_merge(..)` plus the field-name-keyed `collaborative(..)` accessors.
+    Storage is a plain `TEXT` column holding JSON, through the same Diesel
+    codec `Translated` uses; a column that still holds prose decodes as a
+    seeded document, so promoting an existing field keeps its content.
+  - `CollabHub` hosts the live sessions on the seams that already exist:
+    operations fan out over a `Channels` topic, membership comes from
+    `Presence`, and cursors ride a `Cursor` message merged into the
+    participant list. `serve_socket` is the whole client protocol in one call
+    from a `#[ws]` handler. The hub bounds insert size, delete size and
+    document size, because it is a shared authority a single client could
+    otherwise grow without limit.
+  - `CollabResolver` replaces last-write-wins for collaborative fields in the
+    offline-sync engine, so an edit made offline merges on reconnect. Every
+    other column of the same row keeps the wrapped resolver's verdict, and a
+    delete on either side is still a row-level decision — merging would
+    resurrect a deleted row.
+  - Convergence is proven, not asserted: `sim_collab_convergence` exhausts
+    **all 720 interleavings** of a fixed six-operation set and checks every
+    one reaches byte-identical state, then property-tests randomized
+    interleavings across 2–5 replicas with zero dropped operations.
+  - `examples/collab-notes` runs the whole story with `cargo run -p
+    collab-notes` — no database, no container, no external service — and its
+    Chromium smoke drives **two browser pages** editing one field and asserts
+    they converge. See `docs/guide/collaboration.md`.
+  - Scope of this first slice: one CRDT type (text) and one field marker.
+    Lists, maps, counters and trees; rich text and a block model; undo/redo;
+    and `autumn generate model`'s `{collaborative}` DSL marker are all
+    follow-ups. The LWW default for non-collaborative fields is unchanged.
+
+### Fixed
+
+- **🌐 Custom domains reach the app in production (issue #2657):** a tenant
+  hostname is never in `[security.trusted_hosts] hosts` — that is the point of
+  the feature — and `TrustedHostPolicy::from_config` read only that list. So a
+  request for `app.clientco.com`, registered, verified, `active` and holding
+  its own certificate, got `400 Invalid Host header` before tenancy resolution
+  ran. Every part below the trusted-host layer was correct; nothing reached it.
+  The only workaround was `hosts = ["*"]`, which turns host validation off for
+  the whole deployment — "custom domains **or** Host-header protection, pick
+  one". The policy now asks the custom-domain registry about a host its static
+  rules do not match, and admits it only while the domain is servable
+  (`active`), which is the rule SNI already applies at the handshake: a
+  `pending_dns` registration is not a way past host validation. The registry is
+  read per request, not captured, because the app publishes it at bind time —
+  after the router is built — so a domain connected or offboarded while the app
+  runs takes effect with no restart. A deployment with no registry pays one
+  extension lookup on the path that was about to answer `400` anyway.
+  The acceptance test for this behaviour called the tenancy extractor
+  directly, so the middleware that rejected the request was never in the path;
+  the new test drives a **mounted router** through the whole stack, and
+  publishes the registry after the build, as production does.
+  `AppState::late_extensions` is the small seam that makes the late read
+  possible. `docs/guide/tls.md` and `docs/guide/deployment.md` now state the
+  interaction.
+
+- **🛣️ Onramp: stop treating `local-dev-quickstart`'s permanent drift as a
+  CI failure [no-plugin]:** nothing here is agent-facing — it's a
+  CI-workflow-only change plus a test split, not new framework surface
+  (`.github/workflows/quickstart-gate.yml`, `autumn-cli/tests/e2e.rs`). The
+  `local-dev-quickstart` job checks a source-built CLI's `autumn new`
+  against the *published* `autumn-web` — and has been red on every run
+  since it was added by #2459, because this repo's own policy (CLAUDE.md:
+  never bump the workspace version outside a deliberate release) guarantees
+  trunk-dev stays ahead of the last release indefinitely. Issue #2620
+  treated that as an incident ("broken for 26 straight CI runs, needs a
+  release") and recommended cutting one; the maintainer's call was that
+  trunk-dev being ahead of the crate release is permanent, not a
+  release-cadence gap to close. A permanent, by-design condition reported
+  as a build failure is exactly the kind of CI red that trains reviewers to
+  stop looking.
+  The job's single step used to run one test that both scaffolds (`autumn
+  new`) and builds the result — an initial fix wrapped the whole job in
+  `continue-on-error: true`, but a review caught that this would silently
+  tolerate a real regression in `autumn new` itself, not just the known
+  build-time drift (neither of the other two quickstart jobs pairs a
+  source-built CLI with the published crate, so nothing else would catch
+  that). Split instead: `autumn_new_succeeds_against_published_autumn_web`
+  is a new, fast test covering only the scaffold step, run in its own
+  hard-gated CI step with no tolerance — `autumn new` has no version pin to
+  drift against, so any failure there is always a real bug. The existing
+  `generated_project_compiles_against_published_autumn_web` (unchanged
+  assertions, now built on a shared `run_autumn_new_against_published`
+  helper) keeps the `cargo build` half, in its own step, and only *that*
+  step carries `continue-on-error: true`. The job still surfaces the exact
+  drifted call site in its log (and still goes fully green the moment a
+  release does catch up), but a run where the known drift fires no longer
+  fails the workflow, while an `autumn new` regression still would. No doc
+  change — the `[patch.crates-io]` workaround `docs/guide/getting-started.md`'s
+  "Local development" section already describes is unchanged and still
+  correct.
+- **🪝 Snag: `autumn_web::pdf` now warns when the 512-level nesting cap
+  drops content (#2801):** `Pdf::render`'s layout walker silently dropped
+  any HTML past 512 levels of tag nesting — no error, no log line —
+  contradicting the module docs' "degrades gracefully" promise. Each
+  render that hits the cap now logs one `tracing::warn!` at target
+  `autumn::pdf`, no matter how many nodes it drops, and the cap plus the
+  warning are documented in `autumn_web::pdf`'s new "Nesting depth limit"
+  section. No shipped example is affected today (`examples/invoice` never
+  nests this deep), but any caller who feeds it recursive content (a
+  comment thread, a nested reply tree) can now detect truncation instead
+  of shipping an incomplete PDF unnoticed.
+- **jobs:** a Postgres relative-delay enqueue (`enqueue_in` and its
+  transactional/after-commit siblings) no longer binds a Rust-computed
+  `chrono::Utc::now() + delay` into `run_at`. The database now computes it
+  (`clock_timestamp() + delay`), closing the last piece of #2111's
+  app-vs-database clock skew: an app host whose clock has drifted from the
+  database's no longer stamps the wrong deadline, and a transactional
+  enqueue (`enqueue_in_on_conn`) no longer measures the delay from when its
+  surrounding transaction happened to start. An explicit `enqueue_at`
+  instant is unaffected — it is inserted exactly as before. Also fixes an
+  unrelated, pre-existing bug the fix surfaced: the Postgres test suite's
+  own migration runner split each `up.sql` file on `;`, which cut a
+  migration's own comment in half wherever the comment contained a
+  semicolon, corrupting the next statement. It now runs each file through
+  `batch_execute` in one round trip. [no-plugin]
+
+- **Frame-forge the SQLite fork for the framework control-plane migrations
+  (issue #2699):** `autumn/migrations` — `FRAMEWORK_MIGRATIONS`, backing
+  api_tokens, the job queue, feature flags, experiments, the shard
+  directory, and the ledger — was Postgres-only DDL (`BIGSERIAL`, `JSONB`,
+  `TIMESTAMPTZ`, `NOW()`, `pg_notify` triggers) with no `_sqlite` sibling,
+  so a SQLite app that registered it could not apply it. Added
+  `autumn/migrations_sqlite`, the SQLite fork of all 21 migration
+  versions: tables already owned by their own SQLite bootstrap (the job
+  queue, job tracking) or moot under `sqlite_sharding_unsupported_guard`
+  (the shard directory and map) get a no-op shim, matching the existing
+  compatibility-shim convention; the rest translate the Postgres DDL
+  following the same rules the framework's three existing `_sqlite` forks
+  (`derivation_migrations_sqlite`, `repository_commit_hook_migrations_sqlite`,
+  `version_history_migrations_sqlite`) already use. `FRAMEWORK_MIGRATIONS`
+  is now backend-forked behind `#[cfg(feature = "sqlite")]` like those
+  three, and `run_pending_sqlite_with_framework_migrations` applies it
+  alongside them. `autumn-cli`'s `--features sqlite` build now refuses a
+  non-`sqlite://` target instead of silently applying its (now SQLite-only)
+  embedded framework migrations to it: `FRAMEWORK_MIGRATIONS` is chosen once,
+  at compile time, by that cargo feature, not per target at runtime.
+- **📖 Folio: make the `autumn token` lifecycle findable (retrieval "revoke
+  api token" 0 hits → 1):** the guide taught readers to *gate* a route on a
+  token scope — `#[secured(scopes = ["posts:write"])]`, on three pages — and
+  nowhere told them where the token comes from or how to take it back. All
+  four `autumn token` subcommands shipped (`issue` since 0.5.x, `list` /
+  `rotate` since 0.6.0), with good `--help` text and rustdoc, but `issue`
+  reached readers only through the agent skill tree and `list` / `rotate` /
+  `revoke` reached them nowhere: searching all 160 guide pages for "revoke
+  api token" returned **zero results**, and `issue_scoped_api_token` /
+  `IssueTokenSpec` appeared on none of them. A reader holding a leaked
+  credential had no path from the page that raised the question to the
+  command that answers it. This is a findability defect, not a coverage
+  one — the answer existed and was correct — so the fix is a crosslink at
+  the point the question arises rather than a new page: a section under
+  "Protecting routes" in `docs/guide/authentication.md` naming all four
+  commands and linking the Rust equivalents, and a pointer from
+  `docs/guide/mcp.md`, which uses `RequireApiToken` ten times and left the
+  reader with an `InMemoryApiTokenStore` and no way to mint a real token. The
+  worked block captures what `issue` and `rotate` print (they write the token to
+  stdout and the confirmation to stderr, so a `$(…)` capture gets the secret and
+  nothing else), and says plainly that `rotate` and `revoke` are alternatives
+  rather than steps: rotating already revokes the token passed to it, so a
+  following `revoke "$TOKEN"` would retire a dead token and strand the live
+  replacement with its secret lost. The Rust pointers name one helper per
+  subcommand — `issue_scoped_api_token`, `list_api_tokens`, `rotate_api_token`,
+  `revoke_api_token` — rather than omitting list and rotate and listing the
+  `IssueTokenSpec` data type as though it were an operation.
+
+  Found by running the docs corpus against the CLI surface in the direction
+  no existing gate runs: the eleven docs gates all ask "is what we wrote
+  still true?" (drift), and none asks "is what we shipped written down
+  anywhere?" (coverage), so a command can ship documented nowhere and the
+  whole tree stays green. That measurement found 26 of 194 command paths
+  absent from all 212 reader-facing pages; most were benign (13 `destroy`
+  subcommands covered by the rule `generators.md` states over the family,
+  one `#[command(hide = true)]` internal), and the `autumn token` family was
+  the defect worth fixing. A gate to hold that line is NOT included here —
+  see the note in the PR: a correct one has to reuse
+  `check-docs-cli.sh`'s `resolve()` rather than re-implement it, and that is
+  its own change.
+- **🧭 Wayfinder: redisplay the "create account to accept" form on a
+  rejected password in examples/teams (error-path 0/3 → 3/3, email
+  preserved):** `POST /invite/{token}/accept` — the join step of the
+  `teams` example's core register/invited → accept → join journey, and the
+  form every not-yet-registered invitee hits to create their account —
+  discarded the submitted invitation (and dropped the visitor onto a
+  generic `application/problem+json`/error-page dead end) on all three of
+  its recoverable failure modes: an empty password, a password over 128
+  characters, and one that fails the configured password policy. Each
+  reached a bare `Err(AutumnError::unprocessable_msg(...))`, the exact
+  anti-pattern already fixed on this same app's `/signup` form (Wayfinder,
+  prior PR) — but `routes::invitations::accept_invitation` lives in a
+  different module and was missed. The invited email is fixed
+  (`readonly`/`disabled`) in this one-field form, so nothing but the error
+  message needed to survive the round trip; the token itself is untouched
+  by a rejected attempt, so a corrected resubmission still succeeds.
+  `accept_signup_form` is now shared between `show_invitation`'s GET
+  render and the new `redisplay_accept_signup`, which each of the three
+  branches calls instead of returning `Err`, re-rendering at 422 with
+  `role="alert"`/`aria-invalid` wired the same way `/signup`'s redisplay
+  already is. `create_invitation`'s admin-facing "Send Invitation" form
+  (on `/members`) has the same underlying anti-pattern on its own two
+  failure modes (bad email, unknown role) but is a separate page/form —
+  deliberately left as a smaller, out-of-scope follow-up.
+- **🧭 Wayfinder: redisplay the admin post editor on failure in `examples/cms`
+  (error-path 0/5 → 5/5) [no-plugin]:** an error-path inventory of `cms`'s
+  admin content editor — `create`/`update` behind `/admin/content/{post_type}`,
+  `supported`-tier and the richest hand-written form in the example fleet
+  (title, slug, body, excerpt, status, scheduled date, taxonomies, featured
+  image, parent/order, comments/sticky/password) — found five recoverable
+  failure modes (a blank/whitespace title while publishing, going private, or
+  scheduling; a scheduled date in the past; no scheduled date at all; and —
+  folded in alongside #2790's own inventory of this same editor — a
+  scheduled date that daylight saving skips) each reached `AutumnError` via
+  `?` (the state machine's `can_publish` guard,
+  `normalize_post`'s direct-create check, `require_future_publish_date`) and
+  produced the generic `application/problem+json`/error-page response instead
+  of redisplaying the form: 0 of 5 failure modes were adjacent to cause,
+  persisted in place, said how to recover, or preserved the author's draft.
+  Same anti-pattern already fixed in `saas`/`teams`'s auth forms (#2530),
+  `reddit-clone`'s create-community form (#2665) and `blog`'s post editor
+  (#2687), on the example fleet's largest form yet to carry it. Fix:
+  `validate_submission` runs all five checks pre-flight, before any write,
+  and `create`/`update` redisplay the editor at 422 through a new
+  `EditorValues` (the submission's own values, not the database) and
+  `apply_submitted_taxonomies`/`ensure_submitted_choices_visible` (the
+  taxonomy/parent/featured-image picks the author made, re-added to their
+  bounded pickers the same way `EditorContext::load` already re-adds a post's
+  *persisted* ones), instead of the generic error page. `title`/`publish_at`
+  wire `aria-invalid`/`aria-describedby` to a `role="alert"` message; every
+  Tailwind class and control is unchanged. The hidden stale-edit
+  `lock_version` field now comes from the submission (`EditorValues::
+  lock_version`), not a fresh database read, so a submission that was already
+  stale when it hit a validation error stays stale through the redisplay
+  rather than laundering into a version the corrected resubmission would
+  silently pass. The deeper checks (`guard_deferred_transition`, the state
+  machine's `can_publish` guard, `normalize_post`'s own check) are untouched —
+  they remain the authority for the JSON API and importer. 9 new unit tests
+  (`editor_validation_tests`) and 4 new Docker-gated integration tests cover
+  the five failure modes, the stale-lock-version regression, and that a
+  rejected transition never partially applies.
+
+- **🛣️ Onramp: a route-attribute typo (`#[get()]`) no longer cascades through
+  `routes![]` into two extra "cannot find" errors, one of them naming an
+  internal macro symbol (errors 3→1):** a fresh-context audit of the README
+  quickstart (`docs/reports/echo-audit-run.md`) typo'd `#[get("/")]` as
+  `#[get()]` and, once the handler was registered the documented way
+  (`routes![handler]`), got the real "expected string literal" error plus
+  `error[E0425]: cannot find value `handler`` and `error[E0425]: cannot find
+  function `__autumn_route_info_handler`` — the handler had silently vanished
+  from the module, because `route_macro` returned bare `compile_error!`
+  tokens on an attribute-parse failure without re-emitting the annotated
+  function at all. `#[agent_operable]` and `#[query_budget]` already guarded
+  against exactly this; `route_macro` — the macro every `#[get]`/`#[post]`/
+  `#[put]`/`#[patch]`/`#[delete]` handler goes through — was the one
+  exception. `emit_with_attr_parse_error` now re-emits the handler plus a
+  stub `__autumn_route_info_*` companion alongside the diagnostic, handling
+  an already-expanded guard's leading gate items (`#[secured]`/`#[step_up]`/
+  `#[throttle]` stacked above the malformed attribute) and stripping the
+  route-macro-only `#[intercept(...)]`/`#[api_doc(...)]` markers so neither
+  adds its own "cannot find attribute" on top.
+
+- **the Cold-Start Onboarding Gate stops failing every scheduled run (#2309):**
+  the gate (issue #977) checks the no-DB `hello` app against a p95 60s / max
+  90s budget. It failed all 9+ scheduled runs since it was created.
+  The no-DB daemon starter (`autumn new --daemon`) no longer enables
+  `cache-moka` or `http-client` by default. The bare `hello` shape has no
+  cache and makes no outbound HTTP call. Both features were unused.
+  Dropping `http-client` also drops `reqwest` and its TLS stack from the
+  build. Measured on a local reproduction: a full cold build of the
+  scaffolded no-DB app drops from about 113s to about 98s.
+  The earlier `autumn-macros` `db` gate already landed. It dropped
+  `autumn-macros`'s own compile time from about 83.65s to about 5.3s.
+  Both fixes together still miss the original 60s/90s target. The reason:
+  `autumn-web`'s own hand-written source is now the largest single compile
+  unit, at roughly 43-55s, and no feature gates it.
+  `ChangeClass::ColdStartHello`'s budget in
+  `autumn-cli/src/dev_loop_bench.rs` is recalibrated to p95 130s / max 160s.
+  These numbers come from real CI runs: p50 about 108-117s, p95/max about
+  120-122s. They carry margin for runner noise. The gate now reflects
+  reality instead of failing on every run. See
+  `docs/guide/dev-loop-latency.md`'s new "Cold-start budget history" section
+  for the full timeline. Issue #2795 tracks lowering `autumn-web`'s own
+  compile time and tightening this budget
+  back toward the original target.
+- **🧭 Wayfinder: redisplay `examples/cms`'s post/page editor on a rejected
+  "Scheduled" submission (error-path 0/1 → 1/1, draft preserved):** an
+  error-path inventory of `cms`'s content editor — `/admin/content/{type}`
+  create and `/admin/content/{type}/{id}` update, the single
+  content-authoring flow this `supported`-tier example exists to
+  demonstrate — found the "Scheduled" status option (offered in the same
+  dropdown as "Draft"/"Published"/"Private" to any account with
+  `publish_posts`) had no client-side `required` on its paired publish-date
+  field, and no server-side redisplay either:
+  `content::require_future_publish_date`'s rejection (no date picked, or a
+  date already in the past) reached the handler's `?` and bounced straight
+  to a generic `application/problem+json` response, discarding the title,
+  body, excerpt and every other field the author had just typed. This is
+  not a crafted-request edge case — `require_future_publish_date`'s own doc
+  comment names the ordinary way an editor hits it: a published post moved
+  back to draft keeps its stored `published_at`, so re-selecting
+  "Scheduled" later without touching the (now past) date field produces
+  exactly this rejection on an otherwise unremarkable edit. Same anti-pattern
+  already fixed in `wiki`'s page forms (#2773), `blog`'s post editor (#2687)
+  and `reddit-clone`'s create-community form (#2665).
+  Fix: `PostForm::validate_fields(status, scheduled_for)` mirrors
+  `require_future_publish_date`'s exact rule — checked before that
+  function's own `?`, which stays in place underneath as the last line of
+  defense for the REST/importer paths — and returns a
+  `("publish_at", message)` pair on failure. Both `create` and `update` now
+  redisplay the editor (422, `aria-invalid`/`aria-describedby` wired to the
+  publish-date field, `role="alert"` message beside it) instead of
+  discarding the submission. `editor()` gained a `draft: Option<&PostForm>`
+  parameter so the redisplay carries the author's just-typed title, slug,
+  body, excerpt, status selection, publish-date text (round-tripped
+  verbatim, not reformatted — an unparseable or past entry is shown back
+  exactly as typed), password, sticky flag, comment toggle and menu order;
+  the taxonomy, parent and featured-image pickers still redisplay from the
+  stored row (empty on a rejected create) rather than from this submission,
+  since their "selected" state is resolved from the database in
+  `EditorContext::load` — a smaller, deliberately out-of-scope follow-up.
+  5 new unit tests (`examples/cms/src/routes/admin/posts.rs`'s
+  `post_form_tests`) cover `validate_fields` directly; 3 new Docker
+  integration tests (`examples/cms/tests/integration_test.rs`) cover the
+  create and update paths end-to-end: a missing date, a past date, and — on
+  update — that a rejected submission neither writes the edit nor loses it.
+
+- **`#[commentable]`'s write path (`add_comment`, `delete_comment`,
+  `recompute_comment_count`) stopped honoring a parent's `deleted_at` column
+  as audit-only data (#2263):** `#[commentable]` must hide a soft-deleted
+  parent only when that model's own `#[repository(..., soft_delete)]` opted
+  in — a `deleted_at` column with no such opt-in is ordinary audit history,
+  and `probe_parent` already resolves the real answer from the
+  `RepositoryFacts` registry (`commentable_model_for_spec` +
+  `model_soft_deletes`) rather than the column's presence. That registry
+  lookup matches the registered `#[commentable]` descriptor by **pointer
+  identity**, and all three write functions took an owned copy of the spec
+  (`let spec = *spec`) for their transaction closure — `CommentableSpec` is
+  `Copy`, so this compiled cleanly, but the copy lives at a new stack
+  address, so the identity check always missed and silently fell back to the
+  column-derived answer on every write. A parent with only an audit
+  `deleted_at` (no `soft_delete` repository) was wrongly `404`d by
+  `add_comment` and `delete_comment` the moment that column was ever
+  non-null, even though the repository's own finders kept returning the row.
+  `comment_thread`'s read path never copied the spec, so reads were already
+  unaffected. Fixed without changing these functions' public signatures:
+  each now resolves the soft-delete answer from `spec` **before** copying
+  it — while its identity still matches the registry — and passes the
+  resolved `bool` down explicitly, so `probe_parent` no longer re-derives it
+  from a spec that may already be a copy.
+  Tenant scoping was not affected: it resolves through the separate
+  `request_tenant`/`__autumn_m2m_tenant_scope` path before any copy
+  happens, and already correctly ignores a `tenant_id` column on a
+  non-`tenant_scoped` repository. Added regression coverage for both the
+  audit-`deleted_at` shape and the denormalized-`tenant_id` shape (router
+  and generated-trait level), plus the corresponding rule in
+  `docs/guide/commentable.md`.
+
+### Added
+
+- **🔒 `#[confidential]` — operator-blind fields sealed under a key the server
+  never holds (#1771).** `#[encrypted]` protects a column at rest under keys
+  *the operator holds*: it stops a stolen disk, not a rogue admin, a subpoena or
+  a leaked backup. A `#[confidential]` field removes the operator from the trust
+  boundary. The value is sealed client side with `autumn_web::confidential`:
+  AES-256-GCM under per-field keys derived from a client-held `RootKey` and a
+  length-prefixed table/column/owner scope. That scope, the envelope header and
+  an optional record id are the AEAD associated data, so an envelope copied into
+  another column, table or user no longer opens — and `FieldContext::for_record`
+  extends that to the row, which `FieldContext::new` deliberately leaves open
+  and the guide says so. The column is declared as the opaque `Sealed` type
+  rather than `String`, so the only value the server can bind is the envelope —
+  and the database, `autumn db backup` output, the access and error log, replay
+  capsules, record version history, the admin UI and its CSV export carry
+  ciphertext by construction rather than by scrubbing. Equality still works,
+  through a client-computed `BlindIndex` token in a `<field>_bidx` companion
+  column: a fixed-length keyed MAC that leaks neither the plaintext nor its
+  length, that an operator cannot recompute, and that compares in constant time.
+  Everything that would make the operator read, index, order or join the value
+  is a **build failure**: `#[searchable]`, `#[unique]`, `#[indexed]`,
+  `#[references]`, `#[normalize]`, `#[encrypted]`, `#[classified]`,
+  `#[translatable]`, a serde or Diesel column rename, the model's shard key, a
+  non-`Sealed` field type, and — across the macro boundary, through the column
+  list `#[model]` publishes — a derived `find_by_<field>`,
+  `find_or_create_by_<field>`, `cursor_key = <field>` or grouped aggregate in
+  `#[repository]`. The `Sealed` and `BlindIndex` field types are proven by a
+  generated type assertion, not only by name, so an app type that happens to
+  share a name cannot earn the guarantee. `RootKey` has no `Serialize`, no
+  `Display` and no byte accessor, is never built from configuration or the
+  credentials store, and zeroizes on drop along with the AES key schedule.
+  `docs/guide/confidential-fields.md` states the threat model — including what
+  sealing does *not* hide — and `confidential_threat_model` asserts in CI that
+  the guide and the code agree on the "cannot see" set, while
+  `confidential_red_team` stores and re-reads a value over authenticated HTTP,
+  then dumps the database, a backup artifact, the full log and a replay capsule
+  and proves zero plaintext in all four.
+
+- **`autumn-admin-plugin` builds under the `SQLite` backend, and an
+  application's own `AdminModel`s run there (#2108) [no-plugin].** A `SQLite`
+  app could not compile the admin plugin at all. Two Postgres-only diesel
+  constructs stopped it: the `Timestamptz` SQL type on five `QueryableByName`
+  rows and on the typed `ExperimentChange` model, and three `Array<BigInt>`
+  bulk binds. PR #2125 changed the connection type to `RuntimeConnection`. That
+  change did not remove these errors. This change removes them. Every timestamp
+  row now declares the portable `Timestamp` type with a `NaiveDateTime` field,
+  and the three batched bulk deletes sit in the `pg` arm of
+  `autumn_web::backend_select!`. `cargo clippy -p autumn-admin-plugin --features
+  autumn-web/sqlite --all-targets` is clean, and CI's `SQLite runtime` job gates
+  it. **No change to any SQL sent, or to any value read, on Postgres.** Postgres
+  sends `timestamp` and `timestamptz` in the same binary form: microseconds from
+  2000-01-01 UTC. A `Timestamp` read of a `timestamptz` column gives the same
+  instant. The new `experiment_admin_db` and `feature_flag_admin_db` suites
+  assert this on a non-UTC session, for `changed_at` and for `updated_at`. The
+  Postgres statement text does not change, so the one-statement result the
+  `*_bulk_delete_batch_profile` harnesses measure still holds; a new guard test
+  keeps the batched fragment of each statement. An app on either backend can now
+  register its own `AdminModel`s;
+  `autumn-admin-plugin/tests/custom_admin_model.rs` runs one test body on both,
+  from CI's `Test (Docker)` and `SQLite runtime` jobs. The three BUILT-IN models
+  (`tokens`, `experiments`, `feature_flags`) stay Postgres-only, because their
+  migrations use Postgres-only DDL and the tables do not exist on `SQLite`. On
+  `SQLite` each refuses every call with an error that names the model and points
+  at the README, instead of sending Postgres SQL to a `SQLite` driver — a
+  source guard keeps every method opening with that check, and a SQLite-lane
+  test drives all 23 of them. The
+  plugin README lists the four rules that keep an application model's SQL
+  portable.
+
+- **`scripts/check-docs-features.sh` — feature-gate documentation gate
+  [no-plugin].** Every reader-facing page that shows Rust reaching for an
+  `autumn_web` item behind a NON-DEFAULT Cargo feature must name that feature
+  on the page. Every docs gate before it read the corpus against a crate built
+  with every feature on, and `check-docs-symbols.sh` says
+  so deliberately: resolving against the default set "would report an item a
+  reader can absolutely use as missing". That reasoning is right, and it leaves
+  a hole the shape of its own premise — proving `autumn_web::pdf::Pdf` EXISTS
+  is not the reader's question. Theirs is whether it exists in *their* build,
+  and `autumn-web`'s default set is eight features (`maud`, `htmx`, `tailwind`,
+  `db`, `cache-moka`, `http-client`, `reporting`, `flash`) out of fifty. So a
+  page could open on `use autumn_web::pdf::Pdf;` with every path resolving,
+  every macro argument valid, every link live — and the reader who pastes it
+  into the project the quickstart just scaffolded gets `error[E0433]: failed to
+  resolve: could not find 'pdf' in 'autumn_web'`, a message about THEIR file
+  whose fix is a line in a file the page never showed them. Baseline: 78 gated
+  uses checked, **17 defects across 13 pages**. Three sat under a literal
+  "**You write:**" heading in `macro-transparency.md` (`#[ws]`, `#[mailer]`,
+  `#[inbound_mail]`); `cloud-native.md`'s was the WebSocket *drain contract*,
+  read by someone wiring a rolling deploy; and `pdf-downloads.md` pointed at
+  the missing line — "requires the `maud` feature; enabled together with `pdf`
+  in the quick start above", where the quick start above carried no
+  `Cargo.toml` at all. The tenth — `docs/guide/jobs.md:824`, a
+  `use autumn_web::data::csv::export_csv;` in the async-CSV-export walkthrough,
+  on a page that never names `csv` — is reachable only once a second path
+  segment is resolved: `pub mod data;` is unconditional, so the gate that reads
+  only the head segment drops the path entirely. All ten are fixed in the same
+  commit. Truth set is
+  parsed from `autumn/src/lib.rs`, `autumn/src/prelude.rs` and
+  `autumn/Cargo.toml`'s *transitively closed* default set — never a checked-in
+  snapshot — so moving an item behind a new feature moves the gate in the same
+  commit; only column-zero declarations count, which keeps `lib.rs`'s five
+  inline `pub mod … {` blocks and their 21 gated `pub use` lines out. A
+  `#[cfg(all(…))]` conjunction requires every conjunct, so each non-default one
+  is reported separately and `autumn_web::presence_stream` asks for `presence`
+  *and* `ws`; the attribute is read by parenthesis balance, since that item's
+  gate wraps across four lines, and `pub use autumn_edge as edge;` is read as
+  the module it is to a reader despite carrying no `::`. `any(…)` and `not(…)`
+  leave an item ungated — naming one alternative already satisfies the first,
+  and the second marks an item that exists when the feature is *off*, so
+  demanding it would tell a reader to enable the one flag that removes what
+  they came for. One level BELOW the crate root is resolved too, because a gate
+  under an unconditional module is invisible from the head segment and worst
+  when the head is default — `autumn_web::db::sqlite_types` needs `sqlite`
+  while `db` is on by default — and a fence inside a `>` callout is read like
+  any other. Naming an *implying* feature counts, walking the manifest's
+  implication graph rather than subtracting the default closure alone:
+  `presence = ["ws"]`, so a page pinning `features = ["presence"]` beside a
+  `presence_stream` snippet is complete, and demanding `ws` by name there would
+  be the gate telling an author to break a page that works. A gated
+  `#[macro_export] macro_rules!` in the crate root is recorded too — reachable
+  as neither a module nor a `pub use`, so `embed_static!()` and
+  `embed_locales!()` were invisible — and a `use autumn_web::{Mail, Mailer};`
+  group is read entry by entry, which ordinary use-tree syntax had slipped past.
+  Judged
+  A declaration also made with no feature requirement — a complementary
+  `not(…)` arm — removes its gated siblings in the same namespace, so
+  `db::RuntimeConnection` is not reported as needing `sqlite` when it exists in
+  a default build; per namespace, since `edge` is an ungated attribute macro
+  *and* a gated module re-export.
+  `#[cfg(any(test, feature = "X"))]` resolves to `X`, since `cfg(test)` never
+  holds for a dependency — a reader testing against autumn-web needs the
+  feature. A `--features` flag counts only when the command does not select
+  another package (`cargo install diesel_cli --features postgres` does not),
+  a local `[features]` row counts only when it forwards
+  (`ws = ["autumn-web/ws"]`), and a `features = […]` array only counts when it
+  is tied to an `autumn-web` dependency — in either TOML string form, and
+  including the `autumn_web = { package = "autumn-web", … }` rename Cargo
+  requires when the table key uses an underscore, and in a `dev-`/`build-`
+  dependency table as readily as a plain one; `-F` counts as `--features`: unqualified, any crate's array satisfied the gate, and the corpus
+  carries `axum = { version = "0.8", features = ["macros", "ws"] }`, which
+  enables axum's websockets and nothing of autumn-web's.
+  One level below the root resolves both gated MODULES and gated ITEMS, since
+  `pub mod openapi;` carries no `#[cfg]` while `openapi::Parameter` does.
+  Which macros are attributes and which are bang calls is read from
+  `autumn-macros`'s own `#[proc_macro]`/`#[proc_macro_attribute]` lines rather
+  than listed by hand, so `t!`, `mail_previews![…]` and `wire_client!` are
+  judged as the bang macros they are; a group hanging off a module segment
+  (`storage::{variant::{Transform}}`) resolves its inner child.
+  A bare type name is read inside a fence that writes
+  `use autumn_web::prelude::*;` — scoped to that glob and to names starting
+  uppercase — which is how four further defects surfaced, among them
+  `docs/guide/presence.md` telling readers to enable `ws` when the feature is
+  `presence` (`presence = ["ws"]` runs one way only, so an app on `ws` alone has
+  no `Presence` extractor at all). Judged
+  only inside ```` ```rust ```` fences, since a feature gate is a *compile*
+  failure: a capability table naming `autumn_web::pdf::Pdf` describes an
+  example, it does not hand anyone a line. Presence is gated, placement is not
+  — three pages name the feature only after the code that needs it (worst:
+  `tauri-mobile-offline-sync.md`, +221 lines) and that count is printed on
+  every run rather than enforced, because a page whose enabling line sits in a
+  later "Prerequisites" section is a legitimate shape. A construct a page must
+  SHOW rather than offer is waived beside the passage with a
+  `<!-- feature-gate-allow: … — reason -->` marker; the baseline needed none.
+  Registered in `check-docs-scope.sh`'s `SIBLINGS` in the same commit rather
+  than after its corpus had a chance to drift, for the reason #2709 exists.
+
+- **The docs symbol gate now covers every published crate, and rejects a path
+  into a crate with no library target:** `scripts/check-docs-symbols.sh`
+  scanned one prefix, `autumn_web::`, though it already modelled
+  `autumn_macros`, `autumn_edge` and `autumn_search` in order to follow
+  re-exports into them. Adopting a plugin is a `use autumn_billing::…` /
+  `use autumn_storage_s3::…` line in the reader's own file, and the
+  reader-facing corpus writes 67 such sibling-crate paths across 26 distinct
+  spellings — none of which was a passing check, because none was checked at
+  all. Resolution now seeds with the crate the path *names* rather than with
+  `autumn_web` unconditionally; that hardcoded root was wrong in both
+  directions, failing real sibling items and passing any sibling path that
+  collided with an `autumn_web` module. The gate also reports its own defect
+  class for a path into a crate that ships no `lib` target, which no rename
+  can fix: `autumn-cli` is `src/main.rs` and nothing else, so `pub` inside it
+  is visible only within the binary. That caught `docs/guide/accessibility.md`
+  offering `use autumn_cli::check::{A11yCheckOptions, run_a11y_check,
+  print_report};` — a real module and real `pub` items, in a crate `cargo add`
+  installs without complaint, with no library to import them from (the struct
+  literal beside it also named a `critical_only` field that
+  `A11yCheckOptions` does not have; it is a `print_report` parameter). That
+  section now documents `autumn check --a11y --html`, which is what the flag
+  exists for. The crate list is derived from the workspace and `publish =
+  false` is the test for reader-facing, so a new published library crate the
+  gate does not model fails it instead of going silently unaudited.
+  Paths audited 1,606 → 1,673; defects 3 → 0; corpus unchanged at 212 pages.
+
+- **Build-checked typed contracts between two Autumn services (#1755):** the day
+  a team carves the first service out of an Autumn monolith, the framework used
+  to go silent — `openapi.rs` and `mcp.rs` project a typed surface *outward*,
+  `http_client.rs` gives a raw outbound client, and nothing generated a
+  caller-side client from a callee's real handler signatures or checked that the
+  two still agreed. Four new pieces close that, with no IDL and no codegen step.
+  On the callee, `#[endpoint(service = "…")]` marks a typed handler: it reads
+  the request and response types straight off the signature (and the method and
+  path off the route attribute below it), emits a marker type implementing
+  `autumn_web::wire::Endpoint`, and writes the endpoint's JSON wire descriptor
+  under `target/autumn-contracts/`. `#[derive(WireShape)]` records a DTO's
+  serde-visible field shape in *both* directions. On the caller, `wire_client!`
+  generates the typed client from those markers — so every method's types are
+  the callee's own types — and `#[contract_checked]` reads each call site's
+  read-set (every response field the caller names, including inside a `html!` or
+  `format!` body) and write-set (every request field an inline literal sets) and
+  emits one `const _: () = assert!(…)` per field against the callee's own const
+  field table. A mismatch is a compile error at the call site naming the caller,
+  the endpoint and the field. Because the assertion is a cross-crate const fact,
+  rustc rebuilds the caller whenever the callee's table changes — nothing can go
+  stale. The check earns its keep on the breaks the type checker cannot see: a
+  `#[serde(skip_serializing)]` on a response field a caller reads, a
+  `#[serde(skip_deserializing)]` on a request field a caller sets, a required
+  request field the request type may keep off the wire
+  (`#[serde(skip_serializing_if)]`) that a call site does not set, and a route
+  path that stops taking the parameters a client declares — each of which
+  compiles today and fails in production. What it deliberately does NOT flag is
+  a plain `..Default::default()` request: both ends share the type, so
+  serialization emits every field and the body is complete. Against the seeded
+  mutation set in `scripts/wire-contract-sweep.py`, all 12 wire-breaking changes
+  turn `cargo build` red with a caller-named error and none of the 12 compatible
+  changes is rejected. Worked two-service example in `examples/mesh-catalog` and
+  `examples/mesh-storefront`; guide in `docs/guide/wire-contracts.md`. Entirely
+  new surface, so this is **non-breaking** — a glob-imported prelude name an app
+  already defines shadows the new one. First
+  slice: one workspace, synchronous request/response, JSON over HTTP — the
+  cross-version rolling-deploy proof is the next one.
+  <!-- migration-guide-gate: entirely new surface; "breaking" here describes the
+  wire-breaking changes the feature CATCHES, not a break in Autumn's own API -->
+- **Translatable rich-text editor chrome via `RichTextLabels` (#2227):**
+  `rich_text_area` and its five siblings in `autumn::form` hardcoded English
+  chrome: the toolbar's aria-label, its per-control names and syntax hints,
+  the hint under the editor, and the "Preview" heading. Callers had no way
+  to override this text. A new `RichTextLabels` builder carries all four
+  labels. A `_with_labels` sibling of each existing function
+  (`rich_text_area_with_labels`, `rich_text_area_htmx_with_labels`,
+  `rich_text_area_htmx_with_token_field_with_labels`, and the three
+  `required_*` counterparts) takes one. An app can now translate the
+  editor's chrome without touching the rest of the form. Additive and
+  backward-compatible: every existing function keeps rendering the default
+  English labels unchanged.
+- **`IntoChangeset::into_changeset_with` resolves a validation message by
+  field and code (#2227):** when a `#[validate(...)]` rule has no explicit
+  `message`, an unmessaged rule always produced the hardcoded English
+  `"validation failed: {code}"`. `into_changeset_with` takes a
+  `resolve: impl Fn(&str, &str) -> Option<String>` closure. `resolve` runs
+  first: return `Some(message)` to supply a translated message for a
+  `(field, code)` pair, or `None` to keep the default. An explicit `message`
+  on the validator attribute always wins; the resolver never sees it.
+  `into_changeset` is unchanged and keeps producing the same default
+  messages as before.
+- **Translatable state-transition controls via `TransitionLabels` (#2227):**
+  `autumn::widgets::transition_controls` built its group aria-label
+  (`"{field} transitions"`) and every button's `"Mark as {state}"` inside
+  itself, from positional arguments that carried no label seam. A new
+  `TransitionLabels` builder carries a group label plus `(target_state, label)`
+  overrides, and `transition_controls_with_labels` takes one. Additive and
+  backward-compatible: `transition_controls` renders exactly as before, and a
+  state with no override keeps its English default.
+- **`autumn generate scaffold --i18n` now translates the last three English
+  surfaces (#2227):** the flag used to warn about three gaps. A `richtext`
+  column's editor chrome, a `:states(…)` column's transition buttons, and
+  every inline `#[validate(...)]` message stayed English next to a
+  translated label. All three now go through the bundle. The rich-text
+  editor gets `common.richtext.toolbar` / `.hint` / `.preview` plus one key
+  per toolbar control (the Markdown syntax beside each name stays literal).
+  The transition controls get `<model>.field.<column>.transitions` and one
+  `<model>.field.<column>.transition.<state>` per distinct target state.
+  The `create`/`update` handlers build their changeset with
+  `into_changeset_with`, resolving each validator code through
+  `<model>.field.<column>.error.<code>`. Every English default is the exact
+  text the plain scaffold renders today, so an `en` app is unchanged, and
+  output without `--i18n` is byte-identical. One gap remains: the CSV
+  import report. `import_csv` runs its row handler per line, with no
+  request locale. `--import` with `--validate` under `--i18n` still shows
+  English messages there.
+- **Mutual TLS: client-certificate verification on the native listener (#1640):**
+  a new `[server.tls.client_auth]` section makes the app verify *who is calling*,
+  not just prove who it is. Point `ca_bundle_path` at a PEM bundle of client CAs
+  and the handshake requests and verifies a client certificate; `mode` is `off`
+  (the default), `optional` (requested, verified when presented) or `required`
+  (no certificate, no handshake). With the section absent the handshake is
+  byte-for-byte #1603's server-only TLS, and no new dependency is pulled in.
+  **Breaking:** three published types gain members — `TlsConfig` gains
+  `client_auth`, `TlsError` gains the variants that name a bad trust store (and
+  becomes `#[non_exhaustive]`, so the next one will not break you), and
+  `SecurityDump` gains `client_auth`. Only code that constructs one of those by
+  literal or matches `TlsError` exhaustively is affected, and each surfaces as a
+  compiler error, never a silent behaviour change. The HTTPS listener's
+  connect-info type also changes from `SocketAddr` to `TlsConnectInfo`, which a
+  framework layer immediately re-stamps, so `ConnectInfo<SocketAddr>`,
+  `ClientAddr`, trusted-proxy resolution and rate limiting are unchanged for
+  handlers. See [the migration guide](docs/migrations/next.md).
+  `required_paths` locks individual routes, so one process serves public and
+  mTLS-only routes; a request reaching one without a verified certificate gets
+  `403` and the standard JSON error envelope. `RequireClientCertLayer` does the
+  same for a sub-router in code. The verified identity — subject DN, issuer,
+  SANs, SHA-256 fingerprint, serial — reaches handlers through the `ClientCert` /
+  `OptionalClientCert` extractors and sits on the `PolicyContext` beside the
+  session user and token scopes, so an `#[authorize]` policy can decide on
+  machine identity (`ctx.client_has_san("URI:spiffe://…")`). The trust store and
+  an optional `crl_path` hot-reload by the same modification-time polling the
+  server certificate uses — its own loop, at its own
+  `[server.tls.client_auth] reload_interval_secs` — so a CA rotation — ship old+new in one bundle, later drop old
+  — needs no restart and drops no established connection. Every rejected
+  handshake is counted by reason (`tls_client_auth_rejected_total`) and
+  logged operator-side, rate-limited to one line per second per reason, while the
+  client sees only the standard TLS alert; startup fails fast, naming the path, on
+  a missing, unparseable or empty bundle or CRL. `autumn doctor` grades the
+  surface offline as `tls_client_auth`, and a route's mTLS requirement is a new
+  `mtls` dimension of the security-posture manifest (schema v4), so
+  `autumn routes posture diff` blocks on a route that silently drops it. Revocation is a
+  static CRL plus short-lived certificates; OCSP is not in this slice. A listener
+  with client auth active also disables TLS session resumption: rustls restores a
+  resumed connection's peer certificate from the stored session without re-running
+  the verifier, so a revoked client could otherwise reconnect until its session
+  expired. Server-only TLS keeps resumption untouched. See the
+  [TLS guide](docs/guide/tls.md#mutual-tls-verifying-client-certificates-servertlsclient_auth).
+- **Getting-started code snippets compiled in CI, not just eyeballed [no-plugin]:**
+  README.md's `## Example` and the four `rust,no_run` snippets in
+  `docs/guide/getting-started.md` (a CSRF form handler plus three
+  runtime-tuning examples) — the "first run" journey's flagship, most-copied
+  code — were never actually compiled by anything;
+  `scripts/check-docs-macro-args.sh` already named this gap directly ("the
+  markdown fences are not compiled by anything at all"). A fence can drift
+  out from under a signature change the same way the CLI scaffold template
+  drifted from `inject_consent_banner`'s widened `Option<&str>` parameter
+  (#2459, #2620) — silent to every existing docs-corpus gate, which check
+  that a name *resolves*, not that the call still typechecks. A new
+  `doc_getting_started_snippets_compile` test
+  (`autumn/tests/integration/compile_fail.rs`) extracts every
+  `rust,no_run` fence from those two files into a throwaway crate and
+  runs `cargo check` on it — real compilation against the in-tree crate,
+  with no server binary ever executed; a new tagged fence is picked up
+  automatically, no test edit required. All 5 fences currently in scope
+  compile clean — this is a harness, not a fix, so there is nothing else to
+  report.
+- **autumn-media: room participants can hold a seat with a heartbeat (#1974):**
+  `POST /api/media/rooms/{room_id}/heartbeat` refreshes a participant's liveness
+  and renews its advisory `token_expires_at` to `now + room_token_ttl_seconds`.
+  Previously the only liveness signal was a member-gated roster poll, so a client
+  that used its join response and its own peer connections — but never re-polled
+  — lost its seat to the idle reaper. The token value never rotates, so an
+  in-flight roster poll keeps working. Like the roster it is fail-closed: an
+  unknown room, unknown participant and wrong token are one indistinguishable
+  `404`, so a heartbeat is not a membership oracle. Both the in-memory and
+  DB-backed stores implement it; the DB store verifies the token in constant time
+  and then renews in one `UPDATE` that treats a concurrently-reaped seat as gone.
+  **Breaking:** `RoomStore` gains a required `heartbeat` method, so an
+  out-of-tree store must implement it — see the
+  [migration guide](docs/migrations/next.md).
+
+- **`autumn deploy` grades MediaMTX listener ports against the app's base URLs
+  (#1974):** a new pure-config preflight compares each `[media.mediamtx] *_port`
+  with the `*_base` URL that calls it. Customizing a port without updating its
+  base URL used to deploy cleanly and fail every request at runtime. Only a base
+  the operator set in TOML, on loopback, naming a port can block — a proxied or
+  CDN-fronted base publishes its own port and is skipped, and an unset base
+  (which the app may take from `AUTUMN_MEDIA__MEDIAMTX__*_BASE`) warns without
+  blocking, as an indirected `[media.ffmpeg] bin` does.
+- **`autumn-billing` plugin (#1190):** first-party subscription billing for
+  Stripe. One `.plugin(BillingPlugin::new().config(cfg).plans(&plans))` mounts
+  hosted checkout (`POST /billing/checkout`), the customer portal
+  (`POST /billing/portal`), a read-only `GET /billing/subscription`, and a
+  `POST /billing/webhook` receiver built on `SignedWebhook`. Provider events
+  are reconciled into a local mirror (`billing_customers`,
+  `billing_subscriptions`, `billing_invoices`) through an event ledger, so a
+  redelivered event applies once and out-of-order events converge (an older
+  event never overwrites newer state; a canceled subscription is terminal).
+  `Entitled<R: PlanRequirement>` and `Billing::require` gate handlers on
+  local state, default-deny. Failed payments open a durable dunning schedule
+  (`billing_dunning`) driven by a `#[job]`; the schedule row is the source of
+  truth, so the job survives a restart and re-arms on startup, and every step
+  notifies through the in-app notification store (#1148). `Money` holds
+  `i64` minor units and a `Currency`; read them with `minor()` and
+  `currency()`. An exact `Decimal` bridge; no floats.
+  The `BillingProvider` trait hides Stripe types so a second provider can
+  land later. New crate, additive only: non-breaking. A partial unique index keeps one mirrored
+  customer per user across racing checkouts, every dunning settle is a
+  compare-and-set, a provider transport error reschedules the same attempt
+  instead of failing the job, and a production profile refuses the in-memory
+  mirror unless `billing.allow_memory_store_in_production = true`.
+- **Native Windows daemon lifecycle and Windows Service registration (#1639):**
+  `autumn serve --daemon`, `stop`, `status` and `restart` now run natively on
+  Windows instead of failing fast with a WSL2 pointer, and the daemon lifecycle
+  moves from Tier 2 to Tier 1 in the platform-support policy. The contract is the
+  one Unix has: a single-instance guard, a readiness-gated start, a `serve.addr`
+  discovery file, and `status` exit codes 0/3. A Windows daemon binds its
+  configured `server.host`/`server.port` and reports the address it actually
+  bound back through the readiness file, which the CLI records as
+  `transport = "tcp"` — that report also fixes the address file on Unix for
+  `server.port = 0` and for a socket adopted during an in-place upgrade.
+  `autumn serve stop` on Windows requests a graceful drain through the
+  cooperative-shutdown file rather than force-killing, so in-flight requests
+  finish, `on_shutdown` hooks run and a managed Postgres child is stopped
+  cleanly; only once the daemon's recorded budget expires does it escalate, and
+  then it reaps the whole process tree. `stop` now also says which of those
+  happened, on both platforms — a force-kill after an overrun, or one that could
+  not ask at all, is no longer reported as a plain "stopped". A foreground server
+  drains on a console control event too (`CTRL_C` and `CTRL_BREAK` fully;
+  `CTRL_CLOSE`/`CTRL_LOGOFF`/`CTRL_SHUTDOWN` best-effort, since Windows tells
+  rather than asks). Two new commands, `autumn serve
+  install-service` and `autumn serve uninstall-service`, register the daemon as
+  a Windows service that starts at boot and restarts after a crash and remove it
+  again cleanly; the service hosts the same app the daemon does, so `status` and
+  `stop` keep working against it. Daemon state under `%LOCALAPPDATA%` is created
+  with an owner-only ACL (the owning user, `SYSTEM` and `Administrators`, with
+  inheritance broken), the Windows analog of the Unix `0700`/`0600` posture, and
+  the daemon refuses to start if it cannot be applied — including on a directory
+  another local user owns, since an owner can rewrite any ACL. Windows daemon
+  state moves from roaming `%APPDATA%` to `%LOCALAPPDATA%`, which is what the
+  guide always documented: a pidfile is machine-specific and a managed-Postgres
+  cluster must not be synced at logoff or land on a redirected network share. `autumn doctor` gains a
+  `daemon_service` check reporting whether a daemon or a registered service is
+  running for this project and what the service journey still needs. See
+  [the daemon guide](docs/guide/daemon.md#windows).
+- **cli/generate:** `autumn generate teams` is now **backend-aware on SQLite**
+  (#1927). It was refused at generate time because its migration was fixed
+  Postgres DDL; it now emits the organizations/memberships/invitations tables in
+  the app's own dialect — `INTEGER PRIMARY KEY AUTOINCREMENT`, `INTEGER`
+  user-id columns, and `TEXT ... DEFAULT CURRENT_TIMESTAMP` timestamps. The
+  portable parts are shared and unchanged: the `role`/`status` `CHECK` enums,
+  the `UNIQUE (tenant_id, user_id)` idempotency constraint, and the partial
+  `idx_invitations_pending_email` unique index. Everything else the generator
+  emits was already backend-neutral — `#[repository]` binds
+  `::autumn_web::RuntimeConnection`, and `src/teams/schema.rs` uses only
+  sql-types both diesel backends carry. Postgres SQL is unchanged.
+
+  Three things beyond the DDL were needed for the generated app to actually
+  build and boot on SQLite. Its route handlers took 19 pessimistic row locks
+  with `.for_update()`, which diesel implements for Postgres and MySQL only;
+  they now go through `::autumn_web::maybe_for_update!`, the framework's
+  existing seam, which is a plain read on SQLite (write-write correctness then
+  rests on SQLite's single-writer transaction, which fails closed with
+  `SQLITE_BUSY_SNAPSHOT` rather than losing an update). Its Cargo dependency
+  set was unconditionally Postgres — `diesel`/`diesel-async` on `"postgres"`
+  plus a direct `pq-sys`, and no `returning_clauses_for_sqlite_3_35`, which the
+  generated `.returning(...).get_result(conn)` inserts need on SQLite — and is
+  now selected per backend like `generate model`'s. And it never enabled
+  `autumn-web`'s own `sqlite` feature, without which `RuntimeConnection` stays
+  the Postgres connection and the app refuses its own `sqlite://` URL at boot.
+
+  This closes the generator audit #1927 asked for: `auth`,
+  `mailer --list-unsubscribe`, `teams` and `commentable` hand-write their
+  `CREATE TABLE` DDL, while `notifications` and `pwa` derive theirs through
+  `schema_edit`; all six are now covered by a guard that plans each against a
+  SQLite app, applies and rolls back every migration it emits on a real
+  in-memory SQLite, scans the SQL for Postgres-only spellings, and scans the
+  generated Rust for constructs SQLite has no diesel implementation for. Both
+  scans matter: SQLite accepts an unknown type name (so `id BIGSERIAL PRIMARY
+  KEY` applies cleanly and merely stops auto-incrementing), and applying SQL
+  cannot see a generated crate that would not compile. `counter_cache` was
+  audited and left alone: its
+  `ALTER TABLE ... ADD COLUMN ... BIGINT NOT NULL DEFAULT 0` / `DROP COLUMN` is
+  already portable, since SQLite gives `BIGINT` integer affinity and so reads
+  back without schema drift.
+- **cli/generate:** the scaffolded `docs/guide/authentication.md` is now
+  **backend-aware** (#1927). `generate auth` made its two sibling guides
+  dialect-aware under #1908 (`session-management.md`, the OAuth guide) but left
+  this one emitting unconditional Postgres SQL: two `ALTER TABLE ... ADD COLUMN
+  IF NOT EXISTS ...` retrofit blocks (lockout columns, email-confirmation
+  columns), their `DROP COLUMN IF EXISTS` rollbacks, and an
+  `email_confirmed_at = NOW()` backfill. SQLite rejects all of those outright —
+  `IF NOT EXISTS` is a syntax error on `ADD COLUMN`, only one column may be
+  added per statement, and there is no `NOW()` — so an operator copy-pasting
+  from the guide got a migration that would not apply. A SQLite app now gets one
+  `ALTER TABLE` per column, `TEXT` timestamps, and `CURRENT_TIMESTAMP`. Postgres
+  output is unchanged.
+- **deploy: a live-safe `server.port` change on an existing deployment (issue
+  #2073, Option C).** #2071 refused a redeploy that changed `server.port`
+  because the reboot-durability restart (#2070) could not move the proxy's
+  public listener safely mid-cutover. `autumn deploy` now supports it directly,
+  in four phases: stand the candidate up on a loopback port derived from the
+  OLD public port (so it never collides with the still-live release), flip
+  traffic to it, drain the old release, then rebind the proxy's public listener
+  to the NEW port. That last step is its own failure boundary — a failed rebind
+  rolls the proxy back to the OLD port, and the release stays live and
+  reachable there; retry the port change alone in a separate deploy. The rare
+  case where the rollback itself fails reports that the proxy's public bind is
+  now unknown and needs a human, rather than silently guessing. [no-plugin]
+
+- **SQLite backup, restore and deploy persistence (#1909):** `autumn db backup` /
+  `autumn db restore` now support a `sqlite://` target with no external tools.
+  The backup is SQLite's own `VACUUM INTO` — one transactional statement, so the
+  snapshot is a consistent point in time even while the app writes, and in WAL
+  mode it does not block the writer. The artifact is a real `control.sqlite`
+  database beside the usual `manifest.json`, which now records a per-target
+  `backend` field; an absent field means `postgres`, so every artifact written
+  before this release restores exactly as it did. `restore` verifies the artifact,
+  stages a verified copy beside the target, clears the target's `-wal`, `-shm`
+  and `-journal`, and renames the copy into place keeping the target's mode and
+  owner. Stop the app before restoring: a running process keeps open handles to
+  the old file. `--keep`, `--upload` and offsite restore are unchanged.
+  An artifact whose recorded backend disagrees with the configured database is
+  now refused up front instead of failing inside a driver. A `file:` database URL
+  is percent-decoded the way SQLite decodes a URI filename, so `file:app%20data.db`
+  resolves to the `app data.db` the app actually opens — this also corrects
+  `autumn db replica`, which shares the resolver. `pg_dump` is resolved
+  only when a Postgres target is in the run, so an all-SQLite app no longer needs
+  Postgres client tools to back up.
+  `autumn deploy` treats the SQLite data file as persistent state: a relative
+  `sqlite://app.db` is kept in `app_dir/shared/data` and linked into each release
+  — before the migration one-shot, and again on rollback — so a deploy, a
+  rollback and release retention can never lose or orphan it. An app deployed
+  before this lands keeps its file in the serving release; the next deploy stops
+  and prints the one-time move to make, rather than relocating a live database
+  (SQLite ties the `-wal` name to the resolved path, so a move under a running
+  app is not safe). The deploy never deletes a database file. A database
+  configured *inside*
+  the releases directory, an in-memory one, or a relative path that is not a
+  plain name is now refused at preflight by a new `sqlite_data_file` grader
+  rather than after the first cutover; the grader is emitted only for a SQLite
+  app, so a Postgres deploy's preflight report is unchanged. `autumn doctor`'s
+  `pg_client_tools` check on a SQLite app now passes on the merits instead of
+  deferring to a tracking issue.
+  The `link-data` step decides the whole state space at once rather than guard by
+  guard: it proceeds only when nothing occupies the release's data path or what
+  does is its own link to the shared file, so a legacy symlink pointing at a
+  different database is refused instead of silently swapped for the shared one,
+  even when both exist. A missing shared file is told apart from an unmounted
+  volume by a `shared/sqlite-data-adopted` marker — recorded by a step that runs
+  after the migration that creates the database, refreshed whenever a later
+  deploy sees the file, and kept outside any `shared/data` mount — so a volume that is away stops
+  the deploy instead of creating a fresh empty database beside the orphaned real
+  one. The printed one-time recoveries move every sidecar *before* the database,
+  each step gating the next, so a failed sidecar move leaves the refusal firing
+  and a retry resumes rather than stranding the WAL. Preflight also refuses a
+  relative database whose path is a file the deploy uploads into the release
+  directory (`sqlite://myapp`, `sqlite://autumn.toml`), which the upload would
+  otherwise truncate by writing through the data link; and a relative
+  `[deploy] app_dir`, which made the link target resolve beneath the release
+  directory. For an absolute operator-managed database, a new `check-data-dir`
+  step re-asks the containment question **on the host**, resolving the database
+  path itself — so both a symlinked `app_dir` and a database that is *itself* a
+  symlink into `releases/` are caught. The CLI cannot see either from here, and
+  release retention would have deleted the file. Inside the app directory only
+  `shared/data/` is the app's: the rest of `shared/` holds deploy state
+  (`autumn.env`, `live-slot`, `previous-release`, `proxy-options`, `last-deploy`),
+  and a database configured at one of those paths was overwritten by the deploy
+  step that writes it. A relative database is refused when a release payload is
+  its **leading path component**, not only when it is the whole path — `scp`
+  writes *into* `myapp` when a directory is there, so `sqlite://myapp/myapp` was
+  replaced by the uploaded binary. `autumn db restore` now holds its staging file
+  open and applies the target's mode and owner through that handle, so a symlink
+  swapped in at the predictable staging path after creation can no longer
+  redirect the `chmod`/`chown`; the name is re-checked against the handle's inode
+  before the copy is verified and again before it is published. `check-data-dir`
+  also creates `shared/data/` when an absolute database lives there — the
+  placement the guide recommends — since `prepare-dirs` creates only `shared/`
+  and SQLite cannot create a database whose parent directory is absent; a path
+  outside the app dir is verified but never created — and it applies the same
+  `sqlite-data-adopted` missing-volume guard first, so an absolute database in
+  `shared/data` whose mount is away stops the deploy rather than having its mount
+  point recreated and a fresh empty database created inside it. The marker now
+  covers both placements: keying it on the relative one alone left an absolute
+  database in the deploy's own namespace with no marker and no refusal.
+
+- **`cms` built-in starter and `examples/cms`: a WordPress-core-parity content
+  management system.** `autumn new <name> --starter cms` now scaffolds a
+  complete CMS, joining `saas` as the second curated built-in. The rendered
+  form is committed at `examples/cms/` and pinned to the starter byte-for-byte
+  by `embedded_cms_matches_example_cms`, so the two cannot diverge.
+
+  What it covers: posts, pages and custom post types over one `posts` table
+  keyed by `post_type`; hierarchical categories, flat tags and custom
+  taxonomies; the six WordPress post statuses as a `#[state_machine]` (so an
+  undeclared edge like `publish -> future` is refused rather than merely
+  discouraged); scheduled publishing on a real `#[scheduled]` timer rather than
+  wp-cron's visitor-triggered one; revisions with restore; a `BlobStore`-backed
+  media library with a server-side MIME allowlist; threaded comments with the
+  approved/pending/spam/trash moderation queue and guest commenters; the five
+  core roles and their capability matrix, derived from the stored role at check
+  time rather than copied into usermeta; menus, widgets and switchable themes;
+  a typed action/filter plugin API whose hook names are enum variants, so a
+  misspelled hook is a compile error; shortcodes; all five permalink structures;
+  Atom/RSS feeds site-wide and per-term; a permalink-aware sitemap; a REST API;
+  and idempotent JSON import/export.
+
+  Deliberately excluded, with reasons in the example's README: multisite (Autumn's
+  row-level tenancy is the better answer, see `examples/saas`), XML-RPC, the block
+  editor, pingbacks, and runtime plugin/theme installation.
+
+  The `new` skill now documents `--starter` at all, which it did not before:
+  the flag has been stable CLI surface since #993, but no skill or agent file
+  mentioned it, so an agent scaffolding a project would never offer either
+  archetype. It now carries a starter table, when to reach for each, the
+  `cms` starter's Postgres 12 requirement and first-account-owns-the-site
+  flow, and the provenance caveat for community starters.
+
+  Requires PostgreSQL 12+ — the full-text `search_vector` is a stored generated
+  column. The Docker suite covers the flows most likely to rot: draft
+  invisibility, the state machine refusing an undeclared edge, comment-counter
+  arithmetic across moderation transitions, contributor capability limits,
+  password protection across page/feed/API, permalink-structure changes not
+  404ing existing URLs, revision restore, export/import idempotence, and a CSRF
+  round trip.
+- **`LazyDb`, a lazy database connection extractor (#2264):** `Db` is a
+  `FromRequestParts` extractor. Axum runs it before the body extractor
+  (`Form`, `Json`, `Multipart`, ...) in the same handler. A handler that took
+  both held a pooled connection for as long as the client took to send its
+  body. A slow upload could pin `pool_size` connections and starve every
+  other request. `LazyDb` takes the same argument position but defers the
+  checkout. It records what the checkout will need at extraction time and
+  only takes a connection when the handler calls `LazyDb::checkout`, after
+  the body is already read. `#[commentable]`'s own `post_comment` handler now
+  uses it. Additive: existing `Db` handlers are unaffected.
+
+- **`scripts/check-docs-versions.sh` — release-line pin gate [no-plugin].**
+  Every `autumn-* = "<version>"` pin in the reader-facing corpus must name the
+  published release line. This is the eighth thing a reader copies off a page
+  and the one every other docs gate is implicitly relative to: a correct
+  `autumn_web::…` path against the wrong release line is still a build error.
+  It was gated in one place over eight pages —
+  `repo_hygiene::first_run_docs_match_current_release_line` holds a hand-listed
+  `FIRST_RUN_DOCS` array to the published pin — while the corpus is 212 pages
+  carrying 74 pins; that test is also existential rather than per-occurrence, so
+  a page carrying both a correct and a stale pin passed it. The CHANGELOG
+  records the class being swept by hand twice before (the `0.6.0` install-pin
+  alignment across five pages, and the getting-started rewrite that found a
+  guide "announcing the '0.4 release line' while pinning 0.6 commands"). Truth
+  set is README.md's quickstart pin — the same single source
+  `check-quickstart.sh` installs from — so a release bump moves the gate's
+  expectation by editing one line and cannot disagree with the first-run test
+  about what "current" means. Migration guides are held to their own version
+  instead, since a before-block is the page's whole purpose:
+  `docs/migrations/0.4.0.md` may pin 0.3 and 0.4, but not 0.5. A pin a page must
+  SHOW rather than offer is waived beside the passage with a
+  `<!-- version-pin-allow: … — reason -->` marker, so the waiver is deleted by
+  the commit that deletes the sentence; the corpus has one, the reproduced
+  plugin-contract panic text in `docs/plugins.md`. Baseline: 74 pins checked,
+  1 defect (the `skills/autumn-patterns/SKILL.md` pin under **Fixed**), 1
+  waived. Registered in `check-docs-scope.sh`'s `SIBLINGS` in the same commit
+  rather than after its corpus had a chance to drift — #2709 exists because the
+  gates each spelled their own "reader-facing" and three of them diverged, and a
+  fifth unwatched spelling is how that recurs.
+
 ### Changed
+
+- **`autumn-admin-plugin`: `experiments::ExperimentChange::changed_at` is now
+  `chrono::NaiveDateTime` (#2108) [no-plugin].** The field type decides the SQL
+  type the generated DSL binds, and `DateTime<Utc>` maps to the Postgres-only
+  `Timestamptz`, which stopped the crate compiling under `autumn-web/sqlite`.
+  **Breaking:** a downstream that names this public type sees three changes —
+  the field type itself, the `Serialize` output (now `"2024-01-15T12:34:56"`,
+  with no `Z`), and the derived OpenAPI schema (no `"format": "date-time"`).
+  Call `.and_utc()` to recover a `DateTime<Utc>`. The column stays
+  `timestamptz`, and the value does not move. See the
+  [migration guide](docs/migrations/next.md#admin-plugin-experimentchangechanged_at-is-now-naivedatetime).
+
+- **🪞 Echo: single `security::multipart_scan::scan_multipart_field` for the
+  CSRF and submit-token multipart scanners (instances 2→1) [no-plugin].**
+  `csrf.rs` and `submit_token.rs` each carried a byte-identical private
+  `find_bytes`/`scan_multipart_field` pair — a hand-rolled scan for a named
+  field's value in a buffered `multipart/form-data` body, needed because
+  reading ahead for the CSRF/submit token must not disturb the handler's own
+  `Multipart` extraction downstream. History showed this pair needs to stay
+  in lockstep: a Content-Type case-sensitivity bug was fixed in
+  `submit_token.rs` and, a day later, the identical bug had to be
+  independently rediscovered and fixed in `csrf.rs` ("Mirrors the
+  submit-token replay-guard fix"). Both functions now live once in the new
+  `pub(crate) mod multipart_scan`, called identically from both guards with
+  no adaptation at either call site. Characterization tests (committed
+  first, passing unchanged against the pre-merge duplicated code) now live
+  with the merged function; behavior is unchanged — internal-only, no public
+  API surface.
+
+- **Docs gate: the drift gates must now agree on which pages are reader-facing
+  [no-plugin].**
+  `scripts/check-docs-scope.sh` joins the docs-only CI job. The eight docs gates
+  each read "the reader-facing corpus", and four of them spell that set out
+  themselves as tuples of path prefixes; three carry a comment promising the
+  spellings are kept identical, "since a page covered by one gate and not the
+  other is how a page ends up with no owner." Nothing checked that, and they had
+  drifted. `.claude/skills/` — a second skill tree the agent machinery loads by
+  name, where `run-autumn` lives — had been added to `check-docs-routes.sh` and
+  to `check-docs-orphans.sh`'s entry surfaces and never to the other three, so
+  five of the eight gates read that tree and three did not. Its SKILL.md is
+  copy-and-run text end to end, and its `autumn seed --package`, `autumn routes
+  --bin`, `-p autumn-web`, `AUTUMN_SERVER__PORT` and `AUTUMN_DATABASE__URL` were
+  ungated for command, config-key and symbol drift alike — while the same file
+  already carried `route-surface-allow` waivers for the one gate that did read
+  it. `check-docs-cli.sh`, `check-docs-config.sh` and `check-docs-symbols.sh`
+  take the tree in this change, and all eight gates stay green over it. Review
+  of the gate found two further divergences of the same shape, both fixed here:
+  `check-docs-cli.sh` passed `*.md` to `git ls-files` where its siblings passed
+  `*.md` and `*.md.tmpl`, leaving `autumn-cli/src/templates/README.md.tmpl` —
+  the README `autumn new` writes into every scaffolded project, carrying a
+  reference table of `autumn dev`, `autumn migrate`, `autumn doctor`, `autumn
+  routes`, `autumn generate scaffold` and `autumn release init` — outside the
+  one gate that exists to check `autumn …` commands; and `check-docs-routes.sh`
+  read the `readme = "…"` page of every crate manifest, a crates.io landing page
+  being reader-facing by publication rather than by where it sits, while its
+  siblings did not, leaving the seven published plugin and subcrate READMEs
+  ungated for the 18 `autumn_web::…` occurrences and 3 `AUTUMN_*` variables they
+  carry. The three siblings' corpus goes 198→207, 199→207 and 199→207, with no
+  drift found in the pages newly covered. Each of the four gates gains a
+  `--corpus` mode that prints its own resolved corpus, and the new gate compares
+  those lists rather than re-deriving them: a corpus is widened in several
+  places at once — the `ls-files` globs, the scope tuples, the `.md.tmpl`
+  clause, the crate manifests — and a checker that models some of those rules
+  reports agreement over the rest, which is how the first version of it passed
+  two of these three. It therefore fails when a scope is edited rather than when
+  the pages that scope stopped covering finally rot, and a gate whose `--corpus`
+  fails or prints nothing is a failure rather than a skip. A difference between gates
+  is allowed but must be recorded in the script's `DECLARED_DIFFERENCES` table
+  with its reason — the rule that catches what a superset check cannot, namely
+  one gate widening alone while its siblings still agree with each other, which
+  is exactly how this drift passed unnoticed. A declaration is keyed by the
+  direction the difference runs in as well as its path, and states what each
+  side reads under that path as a claim checked against the tracked tree rather
+  than trusted — two ways a looser key let a note waive something it was never
+  written about. Keyed by path alone it waived its own opposite: dropping a
+  prefix from the routes gate is a loss of coverage, not the difference
+  described, and the lookup still matched. Keyed by path and direction it
+  survived on a replacement: the routes gate could stop reading the served
+  pages the note exists for and pick up some unrelated file under the same
+  prefix instead. The declarations are themselves checked before any corpus is
+  read — a prefix, a direction, a claim per side from a fixed vocabulary, and a
+  non-empty reason. The reason is enforced rather than conventional because the
+  gate's premise is that a difference gets written down, and nothing had been
+  reading it. One difference is declared today:
+  the routes gate reads all of `examples/` rather than only the `README.md`
+  under it, because `examples/wiki/content/` is embedded and served, an argument
+  about URLs that does not carry to commands or config keys. A declaration that
+  no longer describes a real difference is itself reported, so the table cannot
+  accumulate stale reasons.
+- **`autumn deploy` now creates the MediaMTX recordings directory it preflights
+  (#1974).** `deploy up` fail-closed on a missing `[media.mediamtx]
+  recordings_dir` while provisioning only created the config file's parent, so a
+  fresh host was blocked from the very step that would have created the
+  directory. Provisioning now creates both, the recordings root mode `0750`
+  (applied only to a directory it creates, so an existing one keeps the mode the
+  operator gave it). The preflight passes a directory that is absent under a
+  writable ancestor, reports "exists but not writable" and "ancestor is not
+  writable" apart, and still fails closed on anything it cannot verify —
+  including a dangling symlink or symlink loop, which the earlier `test -e` walk
+  stepped past as if the path were absent. An empty or relative `recordings_dir`
+  is now rejected outright: the probe, the `mkdir` and the daemon each resolved
+  it against a different directory. A `${...}` path is deferred to runtime.
+
+- **`MediaConfig::validate` rejects a generic S3 backend with no
+  `public_base_url` (#1974).** `MediaStorage::from_config` already enforced this
+  — only a Tigris endpoint has a derivable public base — so validation and
+  storage construction now agree instead of failing at first upload. An app
+  using a non-Tigris S3 backend without `public_base_url` and calling
+  `validate()?` at boot now fails there.
+
+- **Docs gate: Autumn macro arguments are checked against the macros.**
+  `scripts/check-docs-macro-args.sh` joins the docs-only CI job, gating the
+  seventh thing a reader copies off a page: the keyword arguments inside an
+  attribute macro (`#[secured]`, `#[job]`, `#[scheduled]`, `#[cached]`,
+  `#[model]`, `#[repository]` and 14 siblings). The links, commands,
+  `AUTUMN_*` variables, `autumn.toml` keys, `autumn_web::…` paths and
+  `/actuator/…` URLs were already gated; the surface the guide spends most of
+  its Rust on was not. It reads 215 markdown files (1,004 Rust fences) and 593
+  rustdoc sources (872 fences) — the rustdoc half matters because ```ignore
+  blocks ship to docs.rs and nothing compiles them. Bare and qualified call
+  sites (`#[autumn_web::model(…)]`) and multiline attributes are all read.
+  Accepted keys are read out of `autumn-macros/src/` on every run rather than
+  from a snapshot, so a renamed key lands in the same commit as the rename, and
+  extraction is scoped to each macro's own argument parser — located
+  structurally as the function taking `attr: TokenStream` but not
+  `item: TokenStream` — rather than to its whole source file, so `model.rs`'s
+  ~10k lines of codegen cannot bless `username` as a `#[model(…)]` key. Every
+  `#[proc_macro_attribute]` the crate exports is registered, checked against
+  `lib.rs` by the self-test; a macro whose grammar cannot be read is skipped
+  rather than reported against, and 30 of 33 are judged. Only an attribute's
+  own keys are judged — the identifier introducing a nested group included,
+  since a nested group such as `seo(…)` carries its own interior grammar — and both keyword arguments and bare flags (`#[job(unique)]`) are
+  checked while positional arguments are not. Carries `--list` and a 276-case
+  `--self-test`. The baseline run found five defects.
+
+- **Migration version gate: starter templates no longer collide with their
+  examples.** A built-in starter's `migrations/` tree is a byte-for-byte mirror
+  of its committed example and the two never coexist in one database, so
+  `scripts/check-migration-versions.sh` now exempts a starter/example pair from
+  the **uniqueness** check only — shape, real-time and precision still apply,
+  since a scaffolded project inherits the version verbatim. Previously the only
+  such pair (`saas`) passed by accident, because both sides happened to be
+  grandfathered in the baseline.
+
+- **Starter drift gate: one implementation for every starter.**
+  `embedded_saas_matches_example_saas` was a single hard-coded test body; it is
+  now `assert_starter_matches_example(starter, project_name)`, called by both
+  the `saas` and `cms` gates. No behavior change for `saas`.
+
+### Fixed
+
+- **The in-process TLS listener now advertises ALPN `[b"h2", b"http/1.1"]`
+  (#2321):** `build_server_config` never set `alpn_protocols`, so rustls
+  completed the handshake with no protocol selected and every browser —
+  every `[server.tls]` deployment, static-cert or ACME — silently fell back
+  to HTTP/1.1, losing multiplexing even though the serve path's
+  `hyper_util::server::conn::auto` already speaks h2 once a client sends the
+  preface. Both TLS modes funnel through `build_server_config_with_client_auth`,
+  which now sets the advertisement once, identically for the server-only and
+  client-auth arms. `h2` is listed first, then `http/1.1`, so ALPN-less and
+  http/1.1-only clients are unaffected. New regression tests pin the ALPN on
+  all three public entry points (`build_server_config`,
+  `build_server_config_with_resolver`, `build_server_config_with_client_auth`
+  with a real client verifier) so an accidental revert to no-ALPN fails the
+  suite. Not covered here: real-browser `wss://`/SSE/graceful-shutdown
+  behavior over h2 — the acceptance criteria ask for Chrome/Firefox
+  verification before the issue is closed, which needs a live listener, not
+  a unit test.
+- **🧭 Wayfinder: redisplay the "Add user" form on failure in `examples/cms`'s
+  admin Users screen (error-path 0/5 → 5/5, entered values preserved) [no-plugin]:**
+  an error-path inventory of `POST /admin/users` — the
+  account-creation half of `cms`'s user/role management screen, the `#[state_machine]`
+  post lifecycle example's "roles"/"moderate" journey (`supported`-tier per
+  EXAMPLES.md) — found all 5 of the handler's recoverable failure modes (a
+  password failing the configured policy, an invalid email, an email over the
+  length cap, an empty username, a username that is not already a slug) sent
+  the submission through `AutumnError::unprocessable_msg`'s generic
+  `application/problem+json`/error-page response, instead of redisplaying the
+  "Add user" card: 0 of 5 were adjacent to their cause, persisted in place,
+  said how to recover, or preserved the username/email/role the administrator
+  had already entered — a long session of account setup lost to a single
+  rejected password, with only a link back to the dashboard. Same anti-pattern
+  already fixed in `blog`'s post editor (#2687), `reddit-clone`'s
+  create-community form (#2665), `saas`/`teams`'s auth forms (#2530), and
+  `autumn-admin-plugin`'s generic form (#2422). Fix: `create` now catches
+  both the pre-check password-policy failure and any
+  `Err` `create_user_as` returns — a `normalize_new_user` rejection (422) or a
+  duplicate username/email (409/unique-violation) — and calls the new
+  `redisplay_add_user`, which re-renders the whole Users screen (table,
+  pagination, and the "Add user" card refilled with the submitted username,
+  email and role — never the password, same convention `/register` already
+  uses) at 422 with the failure message next to the card, announced via
+  `role="alert"`. `list` and `create` now share one `users_page` renderer
+  instead of duplicating the table/pagination markup. Any other failure (pool
+  outage, an unrelated 5xx) still propagates unchanged. No new dependency and
+  no redesign — same Tailwind classes, same fields, same layout. `Csrf` gains
+  a `#[cfg(test)]`-only `disabled()` constructor so this and future route
+  modules can unit-test markup that embeds `csrf.input()` without a live
+  request. Four new unit tests in `routes::admin::users::tests` cover value
+  preservation, the error being announced adjacent to the fields, the
+  no-error case rendering no alert, and the pre-fix `unprocessable_msg` status
+  (`cargo test -p cms --lib routes::admin::users`: 4 passed). `cargo clippy -p
+  cms --all-targets -- -D warnings` and `cargo fmt --all -- --check`: clean.
+  This environment had no Postgres/Docker available to boot a live server, so
+  — unlike the `blog`/`reddit-clone` fixes — the redisplay was verified
+  through the unit tests above rather than an end-to-end curl session; a
+  reviewer with a database should confirm a live rejected submission
+  end-to-end before merge.
+- **`unique_violation_field` on SQLite (#2698):** diesel boxes a `SQLite`
+  unique-constraint violation's error information as a bare `String`, whose
+  `constraint_name()` always returns `None` — there is no `SQLite`
+  equivalent of Postgres's named constraint. `unique_violation_field`
+  matched purely on `constraint_name()`, so every generated app's
+  friendly-conflict handling for a `--unique` column (`autumn generate
+  scaffold`, the teams starter's pending-invitation index) was unreachable
+  on `SQLite`: a real duplicate insert reached the blanket `500` instead of
+  the mapped message. It now falls back to parsing `SQLite`'s own message
+  text (e.g. `UNIQUE constraint failed: widgets.email`) to resolve the
+  violated column when no constraint name is reported. Postgres behavior
+  and the function's signature are unchanged.
+- **docs:** `skills/autumn-patterns/SKILL.md` pinned `autumn-web = { version =
+  "0.5", features = ["test-support"] }` in the `[dev-dependencies]` block of its
+  "Testing with TestApp and TestClient" section — the line a reader adds the
+  first time they write a test, two release lines behind the `autumn-web =
+  "0.7"` the same corpus pins in 47 other places. It entered the tree already
+  stale rather than rotting there, so no release-time sweep would have found it.
+  The pin does not fail as a version complaint: `autumn-web` pulls
+  `libsqlite3-sys`, which carries `links = "sqlite3"`, and Cargo permits one
+  package per `links` value in a graph, so `0.5` beside the app's `0.7` resolves
+  to `error: failed to select a version for libsqlite3-sys … links to the native
+  library sqlite3, but it conflicts with a previous package` — naming neither
+  `autumn-web` nor the page. Verified against crates.io in both directions: the
+  `0.5` pin exits 101 at resolve time, `0.7` resolves clean.
+
+- **🧭 Wayfinder: redisplay page create/edit forms on failure in
+  `examples/wiki` (error-path 0/2 → 2/2, draft preserved):** an error-path
+  inventory of `wiki`'s page create/edit forms — `/new` and
+  `/pages/{slug}/edit`, the only content-authoring flow in this
+  `supported`-tier example and the exact CRUD-with-a-state-machine pattern
+  the app exists to demonstrate — found both of `PageHooks`'s recoverable
+  publish-guard rejections sent the submission through
+  `AutumnError::bad_request_msg`'s generic `application/problem+json`
+  response via the handler's `?`, instead of redisplaying the form: 0 of 2
+  failure modes were adjacent to cause, persisted in place, said how to
+  recover, or preserved the author's draft. Both are reachable from the
+  real UI, not just the JSON API: the create form's `status` select offers
+  "Published" while its `body` textarea has no `required` attribute, so
+  selecting Published with an empty body trips
+  `PageHooks::before_create`'s `can_publish` guard; the edit form's `body`
+  has no `required` either, so clearing it on an already-published page
+  trips the identical guard in `PageHooks::before_update`. Either way the
+  author lost their typed title/body to a dead-end JSON response with no
+  way back into the form. This is the same anti-pattern already fixed in
+  `blog`'s post editor (#2687), `reddit-clone`'s create-community form
+  (#2665), and `saas`/`teams`'s auth forms (#2530).
+  Fix: `PageForm` gains `validate_fields(effective_status) ->
+  Vec<(&'static str, &'static str)>`, mirroring the exact rule the hooks
+  already enforce (a draft may be empty; publishing may not) so the
+  business rule isn't duplicated, just checked earlier. `create` passes the
+  submitted `status`; `update` passes the page's current stored status,
+  since the edit form never changes it. A non-empty result now renders the
+  same form template (`new_page_form/edit_page_form`, shared with the GET
+  routes so there is exactly one place each form's markup lives) with a 422,
+  `aria-invalid`/`aria-describedby` wired to the failing field, a
+  `role="alert"` message next to it, and the author's title/body intact —
+  the hooks' checks stay in place underneath as the last line of defense for
+  the JSON/repository path. 6 new unit tests
+  (`examples/wiki/src/routes/pages.rs`'s `page_form_tests`) cover: a draft
+  may be empty, publishing with a blank title/body is rejected with a
+  field-specific message, a fully populated publish has no errors, and a
+  rejected new-page/edit submission keeps the author's input and wires its
+  error to the right field.
+
+- **`cms` example — import no longer drops, nor later duplicates, a page that
+  shares a bare slug with an unrelated one (#2737):** a page's file identity
+  falls back to its bare slug when the file has no `path` for it — the
+  version-2/3 shape, and also a version-5 entry that simply omits `path`.
+  Two importer checks used that bare identity on its own and could match it
+  against the wrong page. The "shallowest first" sort counted only
+  `identity()`'s own slashes, so a page nested through `parent` alone (no
+  `path`) sorted as if it were top level and could run before its own parent
+  existed, landing at the top level by mistake. The `_import_source_slug`
+  marker recorded that same bare identity at creation time, not the row's
+  real position, so a later, unrelated import naming an accurate top-level
+  page with the same slug matched the marker and was silently skipped. Both
+  are fixed: the sort now walks the file's own parent references to find
+  each post's real depth, the plain slug match now also requires the
+  matched row's actual parent to agree with what the current file says the
+  parent should be, and the marker now records each row's identity
+  qualified by its parent's own *stable* identity — resolved through the
+  file's own declared structure, recursively, the same graph the sort
+  walks — rather than the bare slug alone or a parent's mutable, real-time
+  position. Two pages that only *look* alike keep separate markers; a later
+  re-import still recognizes a row regardless of an editor moving it, a
+  suffixed ancestor, an ancestor moved after import, or a multi-level
+  pathless chain where every ancestor is already settled from an earlier
+  run — so the fix does not trade the original data loss for a duplicate on
+  a later run. A pre-upgrade site's markers, recorded under the old, bare
+  scheme, are still recognized too. Resolving a completed ancestor's real id
+  now also goes through that same qualified marker, with a legacy fallback of
+  its own, rather than the bare identity alone, so importing an updated
+  backup that adds a new page to an otherwise unchanged, already-settled tree
+  — pre-upgrade or not — nests it under its real parent instead of leaving it
+  at the top level. A bare, legacy `parent` reference now also resolves
+  against a sibling that carries an explicit `path`, since both name a page
+  by its slug. A pre-upgrade site's old, bare markers are kept as a list
+  rather than collapsed to one, so two completed pages that happen to share
+  that same old marker are both still recognized on a later re-import, rather
+  than one of them getting duplicated. A genuinely top-level post's marker
+  key is now marked with a leading slash a legacy marker could never carry,
+  so a brand new top-level page can no longer be mistaken for a pre-upgrade
+  site's unrelated, already-completed nested one — the underlying *position*
+  a marker is built from stays undecorated and purely positional at every
+  recursive step, so a page imported once as a pathless legacy child and
+  later re-imported as one explicit `path` (what the CMS's own exporter
+  always writes) still resolve to the same position. Recursively resolving
+  an already-completed legacy parent's own expected parent is now bounded
+  the same way every other ancestry walk in this module is, so a
+  hand-edited file naming two pre-upgrade pages as each other's parent can
+  no longer hang the import. Picking among a pre-upgrade site's old, bare
+  marker candidates now checks every candidate's real parent before falling
+  back to an unfinished one, so two unfinished rows left by an interrupted
+  run under the same bare marker but different parents are no longer
+  conflated on retry. That fallback is now also restricted to a post that is
+  itself nested — a genuinely top-level post is never paired with somebody
+  else's unsettled nested row merely because it shares that row's old, bare
+  marker. A parent reference derived from an explicit `path` prefix — even a
+  single segment, when that parent is itself top-level — is now always
+  resolved by full identity rather than by the ambiguous, slug-keyed lookup
+  the legacy `parent` field alone needs, so it can no longer be confused
+  with an unrelated post sharing that same slug elsewhere in the file.
+- **`cms` example — import stopped losing a page nested under a moved,
+  external parent (#2763):** a follow-up to #2737. A pathless page's marker
+  qualified against a parent *outside* the file — pre-existing local
+  content the import does not itself declare — used to embed that parent's
+  current position. An editor moving the parent made the position stale, so
+  a later re-import computed a different marker and filed a duplicate. The
+  marker now anchors to the parent's row id instead, which does not change
+  when the parent moves. A bare, legacy `parent` reference to such a parent
+  is also now matched by slug alone, not by exact position, since a bare
+  reference never named one — matching it by position made it fail the
+  moment its target nested or moved. New test:
+  `re_importing_a_backup_recognizes_a_moved_external_parent`.
+- **edge:** a batch of P2/P3 follow-ups deferred from the edge capsule's
+  first slice (#1790/#2243), closing issue #2244:
+  - `EdgeHandler` now checks a sealed `EdgeExtract` whitelist (`Path`,
+    `Query`, `HeaderMap`, `EdgeCache`, and tuples of these) instead of the
+    open `Handler<_, EdgeState>` bound. The open bound let `Extension<T>`
+    (hidden behind a type alias) and the whole-`Request` extractor compile
+    as `#[edge]` handlers, passing locally against the origin and only
+    diverging at the edge — a silent gap the route macro's token-level
+    `Extension` scan could not see.
+  - `autumn-cli`'s edge-route scanner now evaluates `#[cfg(feature = "x")]`
+    (and `not`/`all`/`any` of it) against the crate's own default-feature
+    set, so a defaults-off route no longer forces a spurious WASI-target/
+    capsule-bin demand; and `edge_routes![]` registrations are matched by
+    full qualified path, so `users::show` no longer satisfies the
+    registered-check for an unrelated `admin::show`.
+  - `autumn doctor`'s edge checks now warn instead of silently passing from
+    a virtual workspace root, and resolve the edge-capsule binary from the
+    manifest (`[[bin]]`/`autobins`) instead of only the conventional path.
+  - `EdgeRoute.method` is now validated (wire version 1 is GET-only); a
+    header-multiplicity-only difference no longer produces an empty
+    conformance divergence detail; and the origin now strips the edge
+    lane's internal fallthrough-sentinel header from every response instead
+    of leaking it to a real client on a wiring bug.
+  - The `edge-conformance` CI job no longer compiles the wasm32-wasip1
+    capsule twice into two target-dir subtrees.
+- **`autumn generate auth`:** the `--mail` flag's `Cargo.toml` patcher now
+  recognizes a `[dependencies.autumn_web]` subtable that renames the package
+  back with `package = "autumn-web"` (Cargo's underscore-normalized table key
+  plus the explicit rename it requires — Cargo does not treat `-`/`_` as
+  interchangeable in a dependency table key on its own). Before this fix, a
+  project declaring `autumn-web` this way silently kept the `mail` feature
+  unset after `autumn generate auth --mail`, with no error — the generated
+  mail routes would then fail to compile.
+- **`autumn release init --target aws-app-runner`:** `main.tf`'s
+  `aws_apprunner_service` no longer ignores the whole `instance_configuration`
+  block (#2256). The cutover call in `docs/guide/deployment.md` sets only
+  `instance_role_arn` outside Terraform, but the old `ignore_changes` list
+  named the entire block, so a later change to `var.instance_cpu` or
+  `var.instance_memory` never reached AWS — `terraform apply` silently kept
+  the service at its old size. `ignore_changes` now targets
+  `instance_configuration[0].instance_role_arn` only, so cpu/memory resizing
+  works through Terraform again while the role stays cutover-managed.
+- **query strings:** an append (`tags[]=`) after an out-of-range explicit
+  index no longer sorts wrong or collides with it (#2253). `Segment::Index`
+  saturates an absurd index to `usize::MAX` for ordering only; an append
+  derived its position from `saturating_add(1)` on the current maximum, so
+  once that maximum was already `usize::MAX` the append could not advance
+  past it. Two symptoms followed: the append's canonical raw spelling then
+  lost a lexicographic tiebreak against the explicit spelling (wrong order),
+  and when the explicit index was spelled as literally `usize::MAX` the two
+  keys were byte-identical and merged into one node (a spurious duplicate-value
+  error for a scalar field, or a silent collapse of two elements into one for
+  a nested sequence). `SeqKey`'s tiebreak is now a `SeqKeyTie` enum —
+  `Explicit(raw)` or `Appended(insert_count)` — instead of a plain string, so
+  an append can never byte-match an explicit index, and two appends at a
+  saturated position stay distinct via their insert count. The same collision
+  also reached a `Node::Seq` promoted to a named object (mixing `k[N]=` with
+  `k[name]=`): an append there recomputed a decimal key that could byte-match
+  a saturated explicit key already in the map. That path now probes for a
+  free key instead of reusing one.
+- **testing:** every MinIO testcontainer (`autumn-cli`'s offsite-backup
+  suite, `autumn-web`'s `sqlite_replication_s3`, and the `reddit-clone`
+  example's avatar S3 test) now pulls from `quay.io/minio/minio` instead of
+  `testcontainers-modules` 0.15.0's hardcoded `docker.io/minio/minio`
+  default. MinIO Inc. pulled the `minio/minio` repository from Docker Hub in
+  2025 as part of a licensing change, so every one of these tests failed in
+  CI with a "pull access denied ... repository does not exist" error on the
+  pinned tag `RELEASE.2025-02-28T09-55-16Z` — not a flake, and not fixable
+  by retrying. `testcontainers-modules` 0.15.0 (the latest published
+  version) still hardcodes the dead Docker Hub image, so each call site now
+  overrides just the registry/owner via `ImageExt::with_name`; quay.io still
+  serves the exact same tag and digest, so no other behavior changes.
+- **auth:** confirmed, with new end-to-end tests, that stacking
+  `#[secured("admin")]` with `#[authorize(...)]` never emits two idempotency
+  replay guards in either attribute order (issue #2233). `#[secured]`'s
+  checks moved into a sibling `FromRequestParts` gate item well before this
+  investigation (issue #1668), so `should_own_replay`'s existing
+  `has_pending_authorize_attr`/`has_any_guard_gate_param` checks already
+  keep the two guards from double-claiming replay-serving — no scan or
+  runtime behavior needed to change. The new tests run real
+  `secured_macro`/`authorize_macro` output through both stacking orders and
+  assert exactly one `__AUTUMN_IDEMPOTENCY_REPLAY_GUARD` marker survives to
+  the final program, closing out the issue's suggested composition-test
+  coverage.
+- **repository:** `retention(...)` and `upsert_many` no longer bypass
+  `position(...)`'s single-row batching guard (#2240). A `#[repository(...,
+  position(...), retention(after = ...))]` sweep could batch several
+  same-scope rows into one DELETE/UPDATE statement — each row's compaction
+  trigger only sees its own pre-statement position, so a sweep could leave a
+  gap in the ordered sequence, the same root cause already fixed for
+  `delete_many`/`update_many` (#1358). `retention(...)` now rejects
+  `position(...)` at compile time (mirroring the existing `sharded`/
+  `dependent(...)` rejections) rather than risk corrupting the sequence.
+  Separately, `upsert_many`'s generated `INSERT ... ON CONFLICT DO UPDATE`
+  chunking could reassign several same-scope rows' `position` scope column
+  in one statement, hitting the identical race already fixed for
+  `update_many`'s scope reassignment. `upsert_many` now forces a chunk size
+  of 1 whenever the repository declares `position(...)`, matching
+  `delete_many`/`update_many`'s existing fix.
+- **ci:** confirmed the workspace and the SQLite-runtime lane pass
+  `cargo clippy -- -D warnings` clean on the runners' current stable
+  (rustc 1.98.1), on a cold cache (issue #2252). The four lint categories
+  the issue named were already fixed or grandfathered in earlier PRs, with
+  no link back to the issue — `unused_async_trait_impl` carries a scoped,
+  commented `[workspace.lints.clippy]` allow in the root `Cargo.toml`; the
+  other three carry local `#[allow(...)]` annotations with the same
+  rationale pattern. This closes the one open acceptance criterion: a
+  decision recorded on toolchain pinning. The lint lanes track `stable` on
+  purpose, to catch a new lint close to when it lands. The separate `msrv`
+  job keeps its own 1.88.0 pin for the compile floor.
+- **openapi:** a `Query<T>` whose `T` derives `OpenApiSchema` (directly, or via
+  `#[model]`) now documents one OpenAPI parameter per field of `T`, instead of
+  one opaque `style: form, explode: true` parameter for the whole struct
+  (issue #2251). Each field gets the `style` that actually matches how the
+  `query_string` decoder reads it: `form`/`explode` for a scalar or
+  scalar-array field (unchanged from before), `deepObject` for a nested-object
+  field (`?filter[status]=open`). An array-of-objects field
+  (`?items[0][sku]=A-1`) has no OpenAPI `style` to carry — that parameter now
+  names the bracketed encoding in its `description` instead of silently
+  mis-describing it. Each parameter's `required` also now reflects the real
+  field — a non-`Option` field can be `required: true` — where the old
+  whole-struct parameter was always `required: false`. A `Query<T>` whose `T`
+  does not derive `OpenApiSchema` is unaffected: its fields cannot be read, so
+  it keeps the previous whole-struct parameter with no spec churn. MCP
+  `tools/call` dispatch is unaffected either way — it already renders the
+  bracketed form directly.
+  **Breaking:** `openapi::Parameter` (public, not `#[non_exhaustive]`) carries
+  a new `description` field. It now derives `Default`, so end a struct-literal
+  built outside this crate with `..Default::default()` rather than listing
+  every field. See the [migration guide](docs/migrations/next.md#openapi-parameter-gains-a-description-field).
+- **`cms` starter: the WordPress-style `[[tag]]` escape no longer leaves a
+  stray trailing `]` in rendered content.** `shortcodes::expand` collapsed the
+  opening `[[` to `[` but never consumed the matching second `]` at the close,
+  so `[[gallery]]` rendered as `[gallery]]` on the live page and in the Atom
+  feed — silently, with no error anywhere in the authoring flow. A paired
+  escape now strips one bracket from each side (`[[tag]]` → `[tag]`), matching
+  the module's own "same syntax WordPress does" claim, and still suppresses
+  expansion of the inner shortcode (#2678).
+- **`autumn db scrub`:** the runtime-config tables are now classified as
+  payload carriers (#2366, item 1). `autumn_runtime_config_values.raw_value`
+  holds the live operator-set override for each key — which can be a secret —
+  and `autumn_runtime_config_changes` is the append-only audit log
+  (`old_value` / `new_value` / `actor`). Both carry the `autumn_` prefix, so
+  introspection excluded them from the classified universe and a successful
+  scrub left them verbatim without even warning. A scrub now warns when they
+  are present and empties them when the app opts in with `[framework] purge`.
+  (Items 2 and 3 — materialized-view refresh order through indirect
+  dependencies, and partition-key columns rewritten through the parent — are
+  still open.)
+- **aws-ecs:** the generated ECS "migrate" task definition now carries the
+  full app secret set (`AUTUMN_DATABASE__PRIMARY_URL`,
+  `AUTUMN_SECURITY__SIGNING_SECRET`, and `AUTUMN_CACHE__REDIS__URL` when
+  Redis is enabled) instead of just the database URL (#2255). CI
+  (`aws-deploy.yml`) and the manual walkthrough in
+  `docs/guide/deployment.md` both copy the migrate task's secrets onto the
+  "app" task definition when registering the real image, so a narrower
+  migrate secret list silently stripped the signing secret from every real
+  app deploy, and the app failed fast on startup.
+- **ci:** the `minio` testcontainer used by the offsite-backup, S3-replication,
+  and avatar-blob-store Docker-dependent tests now pulls from
+  `quay.io/minio/minio` instead of the default `minio/minio`. Docker Hub
+  started refusing anonymous pulls of `minio/minio` in 2025, so every
+  unauthenticated CI runner failed these tests with "pull access denied"
+  regardless of the change under test; `quay.io/minio/minio` mirrors the same
+  release tags and stays public.
+- **cli:** `autumn upgrade` bounds the two approximations behind its codemod
+  safety posture (issue #2234, follow-up to #2231). `0.6.0-repository-with-pool-untracked`
+  now ships as `review` rather than `auto`: it still rewrites every call site,
+  but flags each one, since receiver identification is textual and can be
+  fooled by a hand-written type or a `#[repository]` from another crate. A
+  hand-written type declared inside a function body no longer vouches
+  module-wide against a call elsewhere in the file — the same block-scope fix
+  already applied to generated repository types. `configured_target_dirs` now
+  asks `cargo metadata --no-deps` for the app's build-output directory
+  instead of hand-rolling Cargo's config resolution, falling back to the
+  hand-rolled walk when the subprocess is unavailable; vendor-directory and
+  nested-crate resolution are unchanged, since `cargo metadata` reports
+  neither.
+- **auth:** `api_token_error_response` now renders through the canonical
+  problem classification — the rendered status/problem type (including the
+  query-timeout reclassification) and the validation field map — instead of
+  rebuilding the body from `status()` alone. A `query_timeout` from an
+  `ApiTokenStore` previously rendered as `autumn.service_unavailable` and a
+  validation failure as `autumn.unprocessable_entity` with an empty `errors`
+  array; both now agree with `AutumnError::code()` and the standard response,
+  and the `AutumnErrorInfo` extension carries `details`/`problem_type` for
+  exception filters. Server-error `detail` is redacted in the body (the
+  store's message remains in `AutumnErrorInfo.message` for logging and
+  filters), matching the production exception-filter render (issue #2635).
+- **docs:** `strict_config` and a plugin-owned `[media]` table are no longer
+  documented as mutually exclusive (#1974). The deployment guide still carried
+  the pre-#2061/#2063 workaround telling operators to turn `strict_config` off.
+  Both paths accept the table now: the app declares the section via
+  `AppBuilder::config_section`, and `autumn deploy` accepts unknown top-level
+  roots opaque-with-a-warning while keeping every known section strict. Also
+  corrects the `[media.mediamtx] rtmp_port` docs, which said "RTMP/WHIP ingest" —
+  WHIP publishes on `webrtc_port`.
+- **jobs:** the Redis `/admin/jobs` enqueued tab now lists jobs parked on a
+  full concurrency slot (issue #1186). A parked job lives in the
+  `{prefix}:blocked` zset and is promoted back to its queue every ~100 ms, so
+  a list built from `LRANGE` alone showed it blinking in and out of the table
+  even though it was never lost. The enqueued page now reads the queues and
+  the blocked zset as one logical list: the total is `LLEN` per queue plus
+  `ZCARD blocked`, and paging spans the concatenation, queue ids first. Merged
+  rows carry a new `JobAdminRecord::blocked_on_concurrency` flag and the
+  dashboard marks them "waiting on a concurrency slot", so an operator can
+  tell a job waiting for a slot from one ready to claim. Cancel still works on
+  a parked row. Enforcement, promotion cadence, the `/actuator/jobs` gauges,
+  and the local/Postgres/SQLite backends are unchanged; those backends report
+  `blocked_on_concurrency: false`. The count includes parked jobs, so the
+  dashboard's Enqueued counter can read higher than `/actuator/jobs`'s
+  `queued` gauge by the parked count — the two are separate there, `queued`
+  plus `blocked_on_concurrency`.
+  **Breaking:** `JobAdminRecord` is public and not `#[non_exhaustive]`, so a
+  struct-literal construction of it — only a custom `JobAdminBackend` builds
+  one — needs the new field. It now derives `Default`, so end the literal with
+  `..Default::default()` and the next field will not break it; see
+  [the migration guide](docs/migrations/next.md#jobs-jobadminrecord-gains-a-blocked_on_concurrency-field).
+- **🧭 Wayfinder: redisplay the post editor on failure in `examples/blog`
+  (error-path 0/2 → 2/2, draft preserved) [no-plugin]:** an error-path
+  inventory of `blog`'s admin post editor — the create/edit HTML form behind
+  `/admin/new` and `/admin/{id}/edit`, `supported`-tier and the only
+  hand-written (non-admin-plugin) content-authoring flow in the example —
+  found both of `NewPost::validated`'s recoverable failure modes (an
+  empty/whitespace-only title, an empty/whitespace-only body) sent the
+  submission through `AutumnError::unprocessable_msg`'s generic
+  `application/problem+json`/error-page response via the handler's `?`,
+  instead of redisplaying the form: 0 of 2 failure modes were adjacent to
+  cause, persisted in place, said how to recover, or preserved the author's
+  draft — a post with a long body and a merely-forgotten title lost the whole
+  body to a dead end with a "Go to homepage" link. This is the same
+  anti-pattern already fixed in `saas`/`teams`'s auth forms (#2530) and
+  `reddit-clone`'s create-community form (#2665). Fix: `NewPost` gains
+  `validate_fields(&self) -> Vec<(&'static str, &'static str)>` (every
+  violation, not just the first) alongside the existing `validated()` —
+  left untouched, since it still backs the JSON API (`routes::api::create`)
+  and the admin-plugin backend (`admin.rs`), both of which already have their
+  own error-reporting conventions. `routes::posts::post_form` now renders
+  from `(&NewPost, &[(&str, &str)])` instead of `Option<&Post>`, wiring
+  `aria-invalid`/`aria-describedby` to a per-field `role="alert"` message and
+  keeping the exact Tailwind classes already in place (no redesign); `create`
+  and `update` share it with their own GET routes via `new_post_page`/
+  `edit_post_page`, so a rejected POST re-renders the same page at 422 with
+  every submitted field (including the untouched one) and the `published`
+  checkbox state intact, instead of losing them to the generic error page.
+  No new dependency: this is `Form<NewPost>` plus a plain `Vec` of field
+  errors, not `ChangesetForm`/`validator::Validate` — `blog` does not already
+  depend on `validator`, and adding it purely for this fix was out of scope.
+  Verified against a live server (`cargo build -p blog`, Postgres): a rejected
+  create (blank title/body, a custom slug, `published` checked) now returns
+  422 with both `aria-invalid="true"`, both messages, the custom slug and the
+  checked box preserved; a rejected update (blank title only) preserves the
+  untouched, still-valid body text and shows `aria-invalid="false"` on that
+  field. `autumn check --a11y` against both the GET form and the rendered 422
+  HTML: 0 violations before and after (the fix is the redisplay, not a11y).
+  Seven new unit tests in `routes::posts::post_form_tests` cover
+  `validate_fields`/`normalized` and the redisplay markup itself
+  (`cargo test -p blog --bin blog routes::posts`: 7 passed).
+- **CI:** the manual macOS contention workflow (`Manual macOS contention
+  check`) is dispatch-only, but GitHub records a failed run on every push —
+  the `plan` step then has no `inputs` to evaluate and exits 1 (issue
+  #2594). Both jobs are now guarded on `github.event_name ==
+  'workflow_dispatch'`, so push events skip cleanly instead of failing, and
+  the `macos-latest` steps can never be reached unasked (macOS minutes are
+  the most expensive in the account). Why a dispatch-only workflow is
+  evaluated on push at all — likely an org-level required-workflow
+  configuration — still wants a look in org settings; noted in the workflow
+  file.
+- **commit hooks:** an immediate after-hook failure now records the hook's
+  `AutumnError` via `message()` — the bare title, e.g. `"Validation failed"`
+  (issue #2596). All nine generated immediate-failure paths stringified the
+  error with `Display`, while the deferred commit-hook worker (migrated in
+  #2592) stores `message()`; for a validation error the two differ
+  (`"Validation failed: email: ..."` vs `"Validation failed"`), so the same
+  logical failure produced two different stored strings. Now they agree.
+- **`#[model]`:** no longer emits an empty-bodied `impl Normalize` for a
+  `New*` whose model declares no `#[normalize]` columns (issue #2634). The
+  repository probe's `Yes` arm used to win unconditionally, so `save`,
+  `save_many`, `save_many_skip_invalid` and `find_or_create_by_*` cloned
+  their payload — a full `Vec` copy of a bulk batch — to run a guaranteed
+  no-op normalization. The no-clone fallback arm now wins for unnormalized
+  models. The read-model `Normalize` impl and `NormalizedModel` are unchanged.
+- **build:** renamed colliding example binary targets so no two workspace
+  members produce the same output filename — `todo-app`'s `seed` is now
+  `todo-app-seed`, `bookmarks`' is `bookmarks-seed`, and the two auto-discovered
+  `migrate` bins are `bookmarks-distributed-migrate` /
+  `bookmarks-sharded-migrate`. Duplicate names caused intermittent
+  `LNK1104: cannot open file` failures on `Test (windows-latest)` when two
+  links overlapped (issue #2639). `autumn seed` now resolves the seed binary's
+  real target name from `cargo metadata` instead of hard-coding `--bin seed`,
+  and `scripts/check-example-bin-names.sh` gates the invariant in the future.
+- **docs:** the five doc sites that told readers to write
+  `#[secured(policy = "…")]` now use the form the macro parses,
+  `#[secured(scopes = ["…"])]`. `#[secured]` has never had a `policy` key — its
+  grammar is bare role literals and/or `scopes = ["…"]` — so a reader who
+  pasted the annotation onto their own handler got a build error quoting a
+  grammar they had copied in good faith. Two of the five were the rustdoc
+  module headers of `autumn/src/download.rs` and `autumn/src/range.rs`, which
+  land on docs.rs as the reference pages for `Download` and ranged responses;
+  the others were `docs/guide/downloads.md` (twice) and a `skills/` reference.
+  Both rustdoc fences are ```ignore and markdown fences are compiled by
+  nothing, so the spelling propagated from one file into four unchecked. The
+  ability names are corrected to the corpus's own scope convention
+  (`reports:read`, `media:watch`, matching `docs/guide/openapi.md` and
+  `docs/guide/authentication.md`), and `docs/guide/downloads.md` — which had no
+  outbound links at all — now links to the `#[secured]` reference, so a reader
+  who lands mid-task has somewhere to go.
+
+- **web:** the `application/problem+json` `errors` array no longer includes a
+  field whose validation entry carries zero messages — it now matches
+  `AutumnError`'s `Display`, which already skipped such a field (issue
+  #2587 follow-up). `AutumnError::validation(...)` takes a raw
+  `HashMap<String, Vec<String>>`, so an app that inserts a field
+  unconditionally but only pushes a message when it actually fails produced
+  a body like `{"field":"title","messages":[]}` — a client reading `errors`
+  saw a field named as failing with no reason given, while the same error's
+  logged `Display` output correctly omitted it. `errors` now filters
+  empty-message fields the same way `Display` does.
+- **Constela: parse, validate and server-render LLM-generated UI (`constela`
+  feature):** an app can now serve an interface a language model wrote, without
+  ever handing that model a code path. [Constela] is a constrained JSON UI
+  language — the model emits a *description*, not code, and there is no
+  expression form that calls a function, no attribute that holds script, and no
+  way to spell `eval`. `autumn_web::constela` parses a document, validates it,
+  and renders it to `maud::Markup` on the server.
+
+  The safety guarantee (`constela::policy`) is the UI-tree counterpart of the
+  user-submitted rich-text path's, with four independent controls: an
+  allowlisted tag set (every script-, style- and document-structure element
+  rejected), an allowlisted attribute set (every `on*` handler rejected first
+  and explicitly, `style` absent), an allowlisted URL scheme set checked after
+  stripping the whitespace and control characters a browser ignores — so
+  `java\tscript:` falls with the plain spelling — and every byte of
+  document-derived output routed through one of the renderer's two escape
+  functions, with tag and attribute names written only after clearing those
+  allowlists so they are fixed strings from a fixed set. Literal URLs
+  are checked at validation and **every computed URL is checked again at
+  render time**, where its value is finally known. Unlike the rich-text path,
+  `id` is not banned but *prefixed*: every element id a document writes, and
+  every attribute referencing one (`for`, `aria-labelledby`, …), is rewritten
+  with `RenderContext::id_prefix` — as is a same-document fragment link, so
+  `href="#x"` and `id="x"` stay a matched pair rather than the link escaping to
+  a host-page element of that name — so `<label for>` keeps working inside the
+  fragment while collision with — or clobbering of — a host-page id becomes
+  impossible. `target="_blank"` gets `rel="noopener noreferrer"` whether the
+  document asked or not.
+
+  Validation collects **every** violation rather than returning at the first,
+  and each carries a path into the submitted JSON plus a stable code;
+  `ConstelaError::to_json` renders the list as the repair prompt to hand back
+  to the generator, so a bad document converges in one round rather than six.
+  A `ConstelaError` surfaces as `422`, not `500`.
+
+  Interactivity runs on the server, over htmx: an event binding renders as
+  `data-constela-on-{event}` for the app to wire, and `Document::dispatch` runs
+  an action's pure state steps (`set`, `update`, `setPath`, `if`) against state
+  the app owns. Browser-side steps are **reported** as `Effect`s rather than
+  performed — running a model-authored `fetch` from inside the app would give a
+  prompt injection the app's own network position, which is SSRF by
+  construction. Dispatch **stops** at the first effect
+  (`Dispatched::suspended_at` names where): an effect can bind a `result` that
+  later steps read, the server has no value to bind, and running on would
+  evaluate those reads as `null` and commit the answer — a `fetch` followed by
+  `set data = var(res)` would write `null` over good data. Autumn ships no
+  Constela client runtime and generates no JavaScript.
+
+  Parse bounds (`Limits`: 512 KiB, depth 64, 20 000 nodes) are applied before
+  and around deserialization, so a document engineered to overflow the stack in
+  serde's recursive descent is rejected before it can; render bounds
+  (`RenderLimits`) separately cap the expansion of a small document against a
+  large runtime list, and a `setPath` step's path is capped at that same depth —
+  not because the walk over it would be deep (it is iterative) but because
+  `serde_json::Value` drops *recursively*, so a document that wrote two hundred
+  thousand levels down would overflow the stack whenever that state was next
+  freed, with no visible connection to the request that built it.
+  `RenderLimits::max_output_bytes` (4 MiB) is a separate budget from the node
+  and iteration counts because those do not imply it: one text node can emit as
+  much as `RenderContext::state` holds, so a large string rendered from a
+  5 000-iteration `each` is a few dozen nodes and gigabytes of markup. It spans
+  the body and every portal together, and also caps what a single expression may
+  *build* — `concat`/`array`/`obj`/`+` assemble a finished value inside the
+  evaluator before any of it reaches the output buffer. `max_depth` likewise
+  caps the shape of state on **every** mutation, not only `setPath`: state
+  persists between dispatches, so `set x = array(state x)` adds a level per
+  request until `serde_json::Value`'s recursive drop overflows the stack. Component
+  cycle detection is iterative for the mirror-image reason — components are
+  sibling map entries, so a chain thousands deep is shallow JSON that clears
+  every parse bound, and a recursive walk would overflow during *validation*.
+  All nine
+  modules are enrolled in the #1611 request-path panic gate, so an out-of-range
+  index or an unchecked add in this path is a build failure rather than a 500
+  someone can trigger with a crafted document.
+  Adds **no new dependencies** — `serde`, `serde_json` and `maud` are already
+  in the graph. See `docs/guide/constela.md`; the adversarial corpus is
+  `autumn/tests/integration/constela.rs`.
+
+  [Constela]: https://github.com/yuuichieguchi/constela
+
+- **Duplicate-name checker now enumerates auto-discovered bins and runs in an
+  enforced gate (#2690, #2691):** `scripts/check-example-bin-names.sh` — the
+  LNK1104 manifest gate from #2639 — returned early whenever a member declared
+  any explicit `[[bin]]`, on the false premise that an explicit `[[bin]]`
+  disables auto-discovery. It does not: unless `[package] autobins = false`,
+  cargo still builds `src/bin/*.rs` and `src/bin/*/main.rs` alongside the
+  explicit entries, so a member with one explicit bin could add a colliding
+  auto-discovered helper and the checker would report success (#2690). The
+  checker now enumerates both classes — honoring `autobins = false`, covering
+  the `src/bin/<name>/main.rs` form, and excluding only paths an explicit
+  `[[bin]]` actually claims (its `path`, or the default
+  `src/bin/<name>.rs`) — plus the package-named `src/main.rs` binary cargo
+  auto-discovers (a review finding: an explicit `[[bin]]` named like another
+  member's package would otherwise collide on the linker output undetected) —
+  and carries a synthetic `--self-test` (13 cases) that
+  the default invocation runs first, matching the other manifest gates. The
+  member enumeration also covers in-tree path dependencies cargo
+  auto-includes as workspace members even when `[workspace].members` does not
+  name them (honoring `[workspace].exclude`; a second review finding). The
+  checker was previously invoked by nothing — no workflow, no pre-push script,
+  no test — so a reintroduced duplicate would have passed every enforced check
+  (#2691): it now runs in the CI `lint` job and is mirrored in
+  `scripts/pre-push-check.sh` alongside the other manifest gates. No toolchain,
+  ~1 second.
+- **Removed dead `autumn/templates/build.rs.template` (#2694):** an
+  unreferenced leftover from before the Tailwind build script moved to
+  `autumn-cli/src/templates/build.rs.tmpl` (which is what `autumn new`
+  actually scaffolds via `include_str!`). Zero code references anywhere in
+  the tree — only historical sprint docs and old CHANGELOG entries mention
+  it. This covers the dead-code sub-item of #2694; the clone-class merge
+  across the nine example `build.rs` copies still needs a human call per
+  that issue. Note: `autumn/templates/static/` also appears unreferenced and
+  was left in place — flagging for a separate decision.
+- **SQLite decimal `CHECK` now enforces canonical form (#2636):** the
+  generated `CHECK` for `decimal{p,s}` `TEXT` columns on SQLite enforced the
+  text *shape* (digit budgets, one decimal literal) but not its
+  canonicality, so text written outside the wrapper — raw SQL, an import, a
+  hand-written migration — passed the constraint while being a spelling
+  `SqliteDecimal::to_sql` (`Decimal::normalize`) would never produce.
+  `INSERT INTO invoices (price) VALUES ('19.90')` succeeded, and the row was
+  then invisible to the equality lookup a generated `find_by_price` issues
+  for `'19.9'`; a `:unique` index would admit both spellings as distinct
+  while Rust equality says they are the same value. Three conditions added to
+  `sqlite_decimal_check` in `autumn-cli/src/generate/schema_edit.rs`: the
+  integer part is a lone `0` or starts `1`-`9` (rejects `007.5`, `0019`, and
+  the missing integer part in `.5`), a fractional part never ends in `0` and
+  a bare trailing `.` is rejected (`19.90`, `0.10`, `19.00` → `19`), and
+  negative zero is rejected (`-0`; `Decimal::normalize` converts -0 to 0, so
+  the wrapper never writes it). The existing
+  `sqlite_decimal_check_enforces_precision_scale_and_shape` test gains the
+  issue's reproduction matrix plus adversarial spellings. Note: this makes
+  the constraint stricter and interacts with #2598 — a table created or
+  rebuilt by `autumn schema diff` carries no `CHECK` at all today, and that
+  path should emit the same constraint when it lands.
+- **SSG/ISR:** the `Content-Type` equivalence check now decodes quoted-pairs
+  inside quoted MIME parameter values (RFC 9110 §5.6.4), so `boundary="a\b"`
+  and `boundary="ab"` compare equal. Previously a layer or proxy that merely
+  reserialized the header between `autumn build` and ISR regeneration —
+  changing `"a\b"` to `"ab"` or vice versa — made `regenerate_page` refuse
+  every refresh for that route (with an `error!` each cooldown) even though
+  the two spellings mean the same value (issue #2404).
+
+### Security
+
+- **The dev error overlay no longer falls back to `cfg!(debug_assertions)`
+  when `profile` is unset (🛡 Warden):** `apply_middleware`'s `is_dev` (the
+  flag that gates the HTML dev error badge — internal error messages, request
+  headers, cookies, and, when available, SQL query text and stack frames)
+  disagreed with the request inspector's own gate (`is_dev_profile`) about
+  what an absent profile means. The inspector already failed closed
+  (`None` is not dev); the error overlay instead fell back to
+  `cfg!(debug_assertions)`, so a debug build (an ordinary `cargo build`/
+  `cargo run` with no `--release`) running under a profile-less config served
+  the full overlay on every 5xx. `AutumnConfig::profile` is `Option<String>`
+  with no forced default, and a custom `ConfigLoader`
+  (`docs/guide/custom-subsystems.md` documents writing one) is not required
+  to set it — only the default `TomlEnvConfigLoader`'s `resolve_profile`
+  defaults an absent profile to `"dev"`. An app using a documented custom
+  loader whose backing file has no `profile` key got the dev overlay on a
+  debug-built deployment even though its author never opted into
+  `profile = "dev"`. Both gates now derive from one function,
+  `crate::config::profile_is_dev`, which fails closed on `None` with no
+  build-mode fallback; `route_listing.rs`'s inspector-route listing (used by
+  `autumn routes audit`) was converted to the same helper to remove the last
+  duplicate copy of this check. See
+  `docs/security/2026-09-11-profile-conditional-dev-overlay/`.
+
+- **The rate-limit bucket key for `key_strategy = "authenticated_principal"`
+  (and `#[throttle(key = "principal")]`) now folds in the ambient resolved
+  tenant (🛡 Warden):** the key was built as `principal:<id>` from whatever
+  identity value an app's login handler stored in the session
+  (`session.insert("user_id", user.id.to_string())`, the pattern
+  `docs/guide/authentication.md` documents), with no tenant consulted —
+  unlike every `tenant_scoped` repository operation, which resolves
+  `CURRENT_TENANT` automatically. That identity value is not guaranteed
+  unique across tenants: Autumn's own sharding guide documents that
+  per-tenant primary keys are shard-local `BIGSERIAL`s
+  (`docs/guide/sharding.md`), so the first user provisioned on two different
+  tenants' shards both land on `id = 1`. An app that turned on Autumn's
+  multi-tenancy (`[tenancy] enabled = true`) together with either documented
+  rate-limiting feature shared one token bucket across any two tenants whose
+  users' principal ids happened to coincide: an ordinary authenticated user
+  of tenant A exhausting their own bucket denied service (`429`) to an
+  unrelated tenant B user who had made zero requests of their own.
+  `Limiter::extract_key` and `#[throttle]`'s per-route guard now fold
+  `CURRENT_TENANT` into the bucket key (not into the value handed to
+  `with_tier_hook`, which still receives the bare principal id its
+  documented signature promises), tagging both the tenant-present and
+  tenant-absent cases so a caller with a self-chosen principal id can never
+  forge one into colliding with the other. **Compatibility note:**
+  upgrading resets any in-flight `authenticated_principal`/`principal`
+  bucket, tenancy-enabled or not — a one-time full-bucket refill, not a
+  correctness change. See `docs/security/2026-09-09-rate-limit-tenant-key/`.
+
+- **MCP `tools/call` dispatch now enforces `AppBuilder::layer(...)` custom
+  layers in SSG/ISR (`dist`) mode, closing an authn-bypass gap (🛡 Warden):**
+  the dispatch clone `tools/call` replays requests against is assembled
+  *before* `try_build_router_with_static_inner` reapplies the app's global
+  custom layers outside the static-first middleware, so a `dist` manifest
+  being present meant a `tools/call` replay skipped any check a custom layer
+  performed — even though the identical direct HTTP request was correctly
+  rejected by it. Apps gating an MCP-exposed route only with
+  `AppBuilder::layer(...)` (rather than the documented `.scoped(path,
+  RequireApiToken, routes![...])` pattern, a sub-router `.layer(...)`, or
+  `#[secured]`/session auth — none of which were affected) and running in
+  SSG/ISR mode were exposed. `try_build_router_with_static_inner` now hands
+  the router builder a clone of the same drained layer set to apply to the
+  MCP dispatch clone alone, restoring parity with the fully-dynamic path
+  without changing how the original set wraps the live-serving router (no
+  double-application, no ordering change for direct requests). See
+  `docs/security/2026-09-07-mcp-custom-layer-static-mode/`.
+
+- **authorize:** **Breaking:** `#[authorize]` reached through a
+  `use ... as ...` alias is now a compile error instead of a silent
+  stale-authorization gap (🛡 Warden).
+  `idempotency_guard::has_pending_authorize_attr` (used by
+  `#[secured]`/`#[step_up]`/`#[throttle]`'s pre-body gates to decide who
+  owns serving a cached idempotency replay) and `route::has_authorize_guard`
+  (used to decide whether the route macro keeps the standalone
+  `IdempotencyReplayLayer`) both detected `#[authorize]` by comparing an
+  attribute's last path segment against the literal string `"authorize"`. A
+  proc-macro attribute never sees the enclosing module's `use` declarations,
+  so `use ::autumn_web::authorize as authz;` defeated both checks even
+  though the identical `authorize_macro` still ran. With no
+  `#[secured]`/`#[step_up]`/`#[throttle]` also stacked, that let the
+  standalone `IdempotencyReplayLayer` serve a cached response as Tower
+  middleware, entirely before the handler (and `#[authorize]`'s in-body
+  policy re-check inside it) ever ran; with one of those gates stacked, the
+  gate wrongly claimed replay ownership for the same reason. Either way, an
+  attacker who legitimately obtained one cached response could replay the
+  same `Idempotency-Key` after their authorization was revoked (role
+  change, resource-ownership transfer, policy update) and keep receiving
+  the stale allow. A shape-based detection heuristic (parsing the
+  attribute's arguments through `#[authorize]`'s own grammar when the name
+  doesn't match) was tried and found unsafe in the *other* direction during
+  review: it misclassified an unrelated attribute sharing the same argument
+  shape as `#[authorize]`, which — with no real `#[authorize]` anywhere —
+  left nothing to serve a cached replay at all, silently breaking
+  `.idempotent()`'s dedup guarantee instead. No syntactic heuristic can
+  resolve the ambiguity safely in both directions (a proc macro cannot see
+  `use` aliases), so `autumn_macros::authorize::reject_if_ambiguous_authorize_shape`
+  now refuses to compile any attribute matching `#[authorize]`'s argument
+  grammar (`"action", resource = Type[, from = ident]`) under a different
+  name, wired into `#[secured]`/`#[step_up]`/`#[throttle]`/the route macros.
+  **Migration:** spell `#[authorize(...)]` by its real name at the call site
+  (no other Autumn macro's aliasing is affected); if the compile error fires
+  on an unrelated attribute that happens to share the same argument shape,
+  rename that attribute. See the
+  [migration guide](docs/migrations/next.md#authorize-aliased-authorize-and-ambiguous-attribute-shapes-are-now-a-compile-error)
+  and `docs/security/2026-09-08-aliased-authorize-idempotency-bypass/`.
+
+- **static_get:** **Breaking:** `#[feature_flag]` combined with
+  `#[static_get]` is now a compile error, in either attribute order (🛡
+  Warden). Found during review of the `#[authorize]` fix above: none of
+  `#[secured]`/`#[step_up]`/`#[throttle]`/`#[feature_flag]`'s pre-body
+  `FromRequestParts` gates run on a cached SSG/ISR hit, since the
+  static-first middleware serves it before the inner router — and the
+  handler along with it — is ever reached; the first three were already
+  rejected for exactly this reason, but `#[feature_flag]` never was. A
+  disabled feature flag on a `#[static_get]` route therefore never actually
+  hid the pre-rendered page: the cache would keep serving it regardless of
+  the flag's live value. **Migration:** use `AppBuilder::static_gate`
+  instead, which runs before a cache hit. See the
+  [migration guide](docs/migrations/next.md#static_get-feature_flag-is-now-a-compile-error)
+  and `docs/security/2026-09-08-aliased-authorize-idempotency-bypass/`.
+
+- **repository:** **Breaking:** `#[repository(api = "...", owner = column)]`
+  with no `policy = Type` is now a compile error (🛡 Warden). `owner =
+  <column>` only emits opt-in `list_scoped(owner_id, ..)` /
+  `search_page_scoped(owner_id, ..)` methods for a hand-written handler to
+  call with an explicit owner id — the auto-generated `api = "..."` CRUD
+  handlers (`_api_list`/`_api_get`/`_api_create`/`_api_update`/`_api_delete`)
+  never call them, and only `policy` actually gates the single-record
+  handlers (`policy_check_show`/`policy_check_update_pre`/
+  `policy_check_delete_pre` are generated purely from `has_policy`; there is
+  no `scope`-driven equivalent). Declared on its own next to `api = "..."`,
+  `owner` therefore compiled to a fully public REST API that read, at the
+  declaration site, like a per-owner-scoped one: `GET <api>` returned every
+  user's rows, and `GET`/`PUT`/`DELETE <api>/{id}` let any authenticated
+  caller read/overwrite/delete any other user's row by id, since
+  `find_by_id`/`update`/`delete_by_id` are not owner-filtered either.
+  `scope = Type` alone does not close this either — it only filters `GET
+  <api>`'s SQL query and has no effect on the single-record routes, which
+  stay fully open (an initial version of this fix wrongly accepted `scope`
+  as an alternative to `policy`; caught in review before merge).
+  **Migration:** add `policy = Type` (whose `can_show`/`can_update`/
+  `can_delete` can compare `ctx.user_id_i64()` against the owner column) —
+  keep `scope = Type` alongside it if you want the list endpoint's cheaper
+  SQL-level filter too — or drop `api = "..."` and call the generated
+  `list_scoped`/`search_page_scoped` methods from your own hand-written,
+  owner-checked routes instead. See the
+  [migration guide](docs/migrations/next.md#repository-owner--column-next-to-api---now-requires-policy)
+  and `docs/security/2026-09-13-repository-owner-api-bypass/`.
+
+### Performance
+
+- **new `pdf_render` profiling harness; negative result, no fix:** added
+  `autumn/benches/pdf_render.rs`, driving `Pdf::from_html`/`Pdf::render`
+  over a realistic 60-row multi-page invoice (the same shape
+  `examples/invoice`'s `invoice_pdf` handler renders) through the real HTML
+  parser (`pdf::html`) and layout walker/word-wrapper/PDF writer
+  (`pdf::layout`) — the framework's HTML-to-PDF export path had no
+  committed benchmark before this. `valgrind --tool=callgrind`/`dhat`
+  profiling found the top costs are inherent to PDF generation, not
+  autumn's own code: `miniz_oxide`'s DEFLATE compressor (14.1% of
+  instructions, via `printpdf`/`lopdf`'s stream compression), glibc
+  allocator internals (~30.5%), and PDF content-stream float formatting
+  (~10.6%, `printpdf`/`lopdf` serializing text positions/widths) dominate;
+  `printpdf::PdfSaveOptions::optimize` is the only compression toggle
+  exposed, and it also prunes unreferenced objects, so flipping it changes
+  every deployed app's output size/shape — a maintainer call, not an
+  unreviewed autonomous change. Autumn's own `pdf` module code (HTML
+  parsing, glyph-width lookup, word-wrap, the layout walker) is 5.1% of
+  instructions combined, with no single function above 1.35% — under the
+  5%-of-profile bar for chasing a specific target. One hypothesis was
+  measured directly: `layout::Writer::ops` (the per-page PDF-operation
+  buffer) resets to an empty, zero-capacity `Vec` on every page via
+  `mem::take`, so `draw_word`'s per-word pushes re-climb the same
+  doubling-growth curve from scratch on every page of a multi-page
+  document; seeding each new page's buffer with the just-flushed page's
+  length as a capacity hint (consecutive pages flow at similar
+  op-per-line density) measured instructions -1.39%, DHAT allocation
+  bytes -0.80%, blocks -0.07% on this harness — real, but under both the
+  5%-of-instructions and 10%-of-allocations impact floor, so the change
+  was reverted rather than shipped. The harness itself is the lasting
+  artifact, giving `Pdf::render` its first profiling coverage.
+- **🗃️ Ledger: batch `autumn-billing`'s dunning restart re-arm into one
+  round trip (insert calls N→1 per restart):** every process restart,
+  `dunning::rearm_pending` re-queues every open dunning retry row. It used
+  to call `JobClient::enqueue_due` once per row, awaited in sequence, so N
+  open rows cost N sequential `INSERT INTO autumn_jobs` round trips against
+  the pool a freshly-restarted process is about to serve live traffic
+  through — worst right when an upstream payment-provider outage has
+  already grown the backlog (issue #2748). `JobClient` gains
+  `enqueue_many_due` (`autumn/src/job.rs`): one batched
+  `INSERT ... SELECT ... FROM UNNEST(...)` statement for the whole item
+  list, still applying each row's own uniqueness dedup guard and
+  `ON CONFLICT (name, unique_key) DO NOTHING`, when the active backend and
+  job settings can't observe a difference — Postgres, no registered
+  `JobInterceptor`, no TTL uniqueness window. Any other case (an
+  interceptor, the local/redis backend, a TTL-windowed job) falls back to
+  one `enqueue_due` call per item, identical to today's behavior. Dunning's
+  retry job (`unique_by = "invoice_id"`, `unique_window = "pending"`) meets
+  all three conditions, so `dunning::rearm_rows` now calls
+  `enqueue_many_due` once per restart instead of looping a single-row
+  enqueue: the Docker-gated `dunning_rearm_pending_profile` harness (added
+  as a findings-only measurement in issue #2747) now asserts exactly one
+  `INSERT INTO autumn_jobs` call at every backlog tier (50/500/2,000 open
+  rows), not one call per row. The batch shares the single-row path's
+  `"job_queue"` circuit breaker (`JobClient::job_queue_breaker`, extracted
+  from `enqueue_durable`), so a Postgres outage trips the breaker and
+  fails the batch fast the same way it already did per row, rather than
+  bypassing that protection. `JobClient::enqueue_many_due`'s gating logic
+  is covered by a new unit test
+  (`can_batch_enqueue_only_when_postgres_uninterrupted_and_non_ttl`); no
+  other call site was changed.
+
+- **⚡ Bolt: `MemorySearchBackend::keyword_search` sorts only the requested
+  page instead of the whole match set (instructions -15.4%, DHAT bytes
+  -24.9%):** `keyword_search` (`autumn-search/src/memory.rs`) collected every
+  matching document into `hits`, ran a full `sort_hits` (stable `sort_by`)
+  over the entire match set, then handed the sorted `Vec` to `paginate`,
+  which only ever keeps one `size`-row page (20 rows in
+  `benches/keyword_search.rs`, the shape `SearchClient::search` exposes). An
+  AND query over a shared vocabulary routinely matches a large fraction of
+  the corpus — profiling the committed 5,000-document/2-field bench found
+  the sort (`quicksort`/`quicksort'2`) costing ~13.5% of the bench's own
+  instructions to serve a 20-row page out of matches numbering in the
+  thousands. `keyword_search` now computes the page's `offset + size` window
+  up front and calls a new `sort_top_k`, which uses
+  `select_nth_unstable_by` to partition the match set around the last
+  needed index in O(n), then runs the same canonical-order `sort_by` (now
+  `hit_order`, factored out of `sort_hits`) over only that prefix — falling
+  back to a full `sort_hits` when the requested window covers the whole
+  match set. `vector_search`'s own `sort_hits` + `truncate` is untouched:
+  this fix only changes what `keyword_search` measurably pays for, per its
+  committed benchmark.
+  Measured on `autumn-search/benches/keyword_search.rs` (2,000 queries):
+  `valgrind --tool=callgrind` instructions 23,551,537,844 → 19,919,821,513
+  (**-15.4%** overall, **-16.2%** on the per-query marginal after
+  subtracting the shared 0-iteration fixed cost); `valgrind --tool=dhat`
+  total allocated bytes 1,158,185,947 → 870,024,907 (**-24.9%**, block count
+  unchanged at ~18.45M — Rust's stable sort allocates a merge buffer sized
+  to the slice being sorted, so sorting ~20 elements instead of the whole
+  match set shrinks that buffer's size, not the number of allocations).
+  Behavior is unchanged: all 128 `autumn-search` lib tests pass unmodified,
+  including the pagination-total and tie-break-by-id cases.
+
+- **⚡ Bolt: cache the AES-256-GCM cipher on `DataKey` instead of rebuilding
+  it on every `encrypt`/`decrypt` call (instructions -25.5%):**
+  `KeyRing::encrypt`/`KeyRing::decrypt` (`autumn/src/encryption.rs`, the
+  `#[encrypted]` attribute-encryption read/write path) each called
+  `Aes256Gcm::new_from_slice(&data_key.key)` — running the AES-256 round-key
+  expansion — on every single call, even though a `KeyRing` is built once
+  at startup and its `DataKey`s are immutable for the life of the process.
+  `DataKey` now builds its `Aes256Gcm` cipher once, in `derive_data_key`,
+  and `encrypt`/`decrypt` reuse it. Measured on the committed
+  `autumn/benches/attribute_encryption.rs` harness (10,000-row mixed
+  plaintext/encrypted read workload): `valgrind --tool=callgrind`
+  instructions 110,539,489 → 82,350,474 (**-25.5%**), the AES key-init
+  functions (`Aes256Enc::new`/`KeyInit::new_from_slice`) that accounted for
+  ~9.8% of the pre-fix profile no longer appear. No change in allocation
+  count (`valgrind --tool=dhat`: 85,531 blocks / 4,376,259 bytes, both
+  before and after — the cipher never heap-allocated). Behavior is
+  unchanged: all 31 `encryption`/`push::encryption`/`push::service` unit
+  tests pass unmodified.
+
+- **🗃️ Ledger: batch `examples/cms`'s search/listing permalink resolution
+  (statements 16-80→0, buffers -42%..-80%):** `Repos::permalink`
+  (`examples/cms/src/routes/site.rs`) resolves a `page`-typed post's
+  permalink by walking its ancestor chain one row at a time via
+  `page_ancestry` — up to `MAX_PAGE_DEPTH` (8) sequential single-row
+  `find_by_id` round trips. Both `search()` and the shared `listing()`
+  helper (`examples/cms/src/routes/front.rs`) called it once per result, so
+  every `page`-typed hit in a results page paid its own full ancestor walk
+  on `/search`, an unauthenticated, unbounded-traffic public route — the
+  same defect shape already found and fixed for the nav menu
+  (`site::nav_for`/`content::posts_with_ancestors`), never applied to these
+  two call sites. A new `permalinks_for` helper batches both call sites the
+  same way `nav_for` already does: one `posts_with_ancestors` call resolves
+  every ancestor across the whole batch, and the existing pure
+  `site::permalink_from` builds each URL from that map with no further
+  database access (and no connection checkout at all when no result is
+  `page`-typed — the common case for `blog_index`/`term_archive`/
+  `author_archive`/`date_archive`, which only ever list `post_type = "post"`
+  results). Seeded from each post's own already-loaded `parent_id`, not the
+  post's own `id`: re-fetching the result rows themselves, as
+  `posts_with_ancestors` does for its `nav_for` caller, would race a
+  concurrent reparent between the listing query and this one, and disagree
+  with the already-loaded `parent_id` `ancestry_from` actually walks from —
+  caught in review before merge. Profiled through the real `/search` route
+  against a ~10,500-row fixture (10,000 flat posts, 500 background pages,
+  plus three "documentation section" tiers of 2/5/10 sibling leaf pages
+  sharing one 8-level ancestor chain): the unbatched single-row lookup
+  scaled exactly linearly with leaf count (16/40/80 calls) and dropped to
+  zero at every tier after the fix, with `posts`-table buffers for the
+  ancestor work down 42.1%/71.1%/80.0%. No behavior change: a new
+  equivalence test
+  (`search_resolves_hierarchical_page_permalinks_from_the_batched_lookup`)
+  covers two sibling leaves sharing one parent chain resolving their own
+  full nested paths, and the full existing 196-test Docker-gated suite
+  passes unchanged. See
+  `docs/reports/2026-09-13-ledger-cms-search-listing-permalink-ancestry-batch/`.
+
+- **🗃️ Ledger: batch `examples/cms`'s `import_terms` taxonomy lookups
+  (statements 2064-4128→3-69, reimport buffers -94.2%):**
+  `content::import_terms` — the handler behind `POST /admin/tools/import`
+  that restores a site-export JSON file's whole taxonomy — walked the
+  file's terms in two sequential per-row loops: a single-row existence
+  check before each insert, then a single-row child/parent re-lookup for
+  every term naming a parent, plus one `INSERT ... RETURNING` per new row.
+  A heavily-tagged blog's backup can carry thousands of terms, so the
+  round trips this call paid scaled with the file's term count rather than
+  with the site's registered-taxonomy count (`category`, `post_tag`, ...).
+  Now every `(taxonomy, slug)` the call needs — each draft's own identity
+  plus any parent it names — is collected up front and loaded with one
+  batched `taxonomy = $1 AND slug = ANY($2)` query per distinct taxonomy
+  (chunked at 1,000 slugs), new rows are created with one chunked
+  multi-row `INSERT ... RETURNING`, and the child/parent linking pass
+  reuses that same lookup map instead of re-querying. Profiled through the
+  real import route against a 5,000-row pre-existing `terms` fixture and a
+  2,000-term import file (an 8-top-level/4-children category tree plus
+  1,960 flat tags): a fresh restore drops from 4,128 to 69 statements
+  (23,098→19,119 buffers), and reimporting the same file — isolating the
+  pure-read half of the defect — drops from 2,064 to 3 statements
+  (6,224→363 buffers, -94.2%). No behavior change: the harness asserts
+  every child category resolves to its expected parent after the rewrite
+  and that reimporting the same file creates zero additional rows. See
+  `docs/reports/2026-09-14-ledger-cms-import-terms-batch/`.
+
+- **🗃️ Ledger: scope `autumn-billing`'s dunning-close lookup to one
+  subscription (buffers -97.8%):** `close_dunning_for`
+  (`autumn-billing/src/reconcile.rs`), the step a `subscription.deleted`/
+  canceled webhook takes to settle any open dunning schedule for the
+  subscription that just ended, called `BillingStore::open_dunning()` —
+  every `Pending`/`Running` row in the **entire** `billing_dunning` table,
+  system-wide — and filtered the returned `Vec` in Rust for the one
+  `subscription_id` it wanted. The only index on that table
+  (`billing_dunning_state_idx (state, next_attempt_at)`) has no leading
+  column on `subscription_id`, so every cancellation paid for a scan of the
+  whole open-dunning backlog regardless of which subscription was canceling.
+  `BillingStore` gains a required `open_dunning_for_subscription` method
+  (both `MemoryBillingStore` and `DbBillingStore` implement it; a new
+  migration adds a partial `billing_dunning_subscription_idx (subscription_id)
+  WHERE subscription_id IS NOT NULL`), and `close_dunning_for` now calls it
+  instead of filtering client-side. Profiled against a 20,000-subscription
+  fixture (4,000 open dunning rows, ~2,857 closed historical ones) driving
+  296 real `reconcile::apply` cancellations: the open-dunning read's share of
+  the workload's `pg_stat_statements` buffers falls from 73.8% (36,118
+  buffers) to 5.8% (809 buffers); `EXPLAIN` confirms the plan moves from a
+  `Seq Scan` reading every open row on every call to an `Index Scan` on the
+  new index reading only the canceling subscription's own rows. No
+  behavior change: every existing `autumn-billing` test (162 unit/contract
+  tests plus the Postgres-backed contract suite) passes unchanged, and a
+  new contract test (`open_dunning_for_subscription_is_scoped_and_filtered`)
+  covers the NULL-subscription and cross-subscription edge cases. See
+  `docs/reports/2026-09-11-ledger-dunning-close-scan-scoped/`.
+
+- **🗃️ Ledger: `autumn generate admin`'s bulk delete is now batched
+  generator-wide (statements N→1, buffers -41.5%):** three of this
+  framework's own bundled admin models (`TokenAdminModel`,
+  `FeatureFlagAdminModel`, `ExperimentAdminModel`) already got hand-written
+  `execute_action` overrides in prior Ledger PRs to close the
+  `AdminModel::execute_action` trait default's `for id in ids { self.delete(&pool,
+  id).await?; }` per-id loop — but every app's own `autumn generate admin`
+  output never got the same override, since the generator template
+  (`autumn-cli/src/generate/admin.rs`, `render_admin_file`) never emitted
+  one. Every generated admin panel's "Delete selected" bulk action therefore
+  cost one `DELETE ... WHERE id = $1` round trip per selected row, not per
+  click. The generator now also emits an `execute_action` override batching
+  the `"delete"` action into one `DELETE ... WHERE id = ANY($1)`, and
+  returns the number of rows actually removed rather than `ids.len()` — a
+  missing or duplicate id is now a safe no-op instead of aborting the whole
+  batch part-way through with `AdminError::NotFound` (the trait-default
+  loop's undocumented, order-dependent behavior; no existing test pinned
+  it). `autumn-admin-plugin` also now re-exports the shared
+  `dispatch_restore_purge_or_unhandled` helper so generated code can reach
+  the same restore/purge/unhandled-action fallback the framework's own
+  hand-written overrides use. Profiled end-to-end against a real generated
+  project (`autumn new` → `generate scaffold` → `generate admin`) driving a
+  50,000-row table through a 2,000-id bulk delete: `pg_stat_statements`
+  calls 2,000 → 1, buffers 9,683 → 5,667. Existing `generate admin`
+  generator tests and the full `autumn-admin-plugin` Docker suite pass
+  unchanged. See
+  `docs/reports/2026-09-10-ledger-admin-generator-bulk-delete-batch/`.
+
+- **🗃️ Ledger: batch the `dependent(on_delete = destroy)` leaf cascade
+  (statements 10002→3, buffers -77.6%):** the generated `Destroy` cascade
+  (`autumn-macros/src/repository.rs`) selected child ids in bulk but then
+  reloaded and deleted each one individually — two statements per row,
+  even when the child has no `hooks`, isn't `soft_delete`/`versioned`/
+  `position(...)`, and declares no `dependent(...)`/`#[has_many(dependent =
+  ...)]` of its own, so nothing in that configuration ever read the
+  reload. That exact configuration now routes through the same
+  `dependent_delete_all` runtime helper `on_delete = delete_all` already
+  uses (which already batches its optional counter-cache decrement),
+  guarded by a cheap runtime check for model-attribute grandchildren
+  invisible to the macro's own attributes. Every other configuration
+  (hooks, soft-delete, versioned, broadcasting, positioned, or any
+  grandchildren) is unaffected and keeps the exact prior per-row loop.
+  `dependent_delete_all` itself now always takes a locked, ascending-id
+  pre-lock before its bulk `DELETE` — closing a stale-reparent counter-cache
+  race and a cross-cascade deadlock window the original per-row loop never
+  had, wrapped in an outer `count(*)` so locking a huge fan-out costs O(1)
+  memory and network, not one row per child — which applies equally to the
+  pre-existing `delete_all` caller. Profiled against a 500-post/~23k-comment
+  fixture cascading a 5,000-comment delete: `pg_stat_statements` calls
+  10,002 → 3, buffers 45,583 → 10,192. Full existing `dependent`/`has_many`
+  suite (29 tests, including diamond-cascade and hook/soft-delete cases)
+  passes unchanged. See
+  `docs/reports/2026-09-08-ledger-dependent-destroy-leaf-batch/`.
+
+- **🗃️ Ledger: batch `examples/cms`'s `recount_terms` per-term loop
+  (statements 3N→3):** `content::recount_terms` — called from
+  `set_post_terms`'s editor save path, the scheduled-publish sweep, and the
+  delete-user cascade whenever more than one term needs its published-post
+  count rebuilt — looped its ids one at a time and called `recount_term`
+  per id, which itself issued three round trips (a single-row `FOR UPDATE`
+  lock, a single-term scalar `COUNT(*)`, a single-row `UPDATE`). N affected
+  terms cost 3N round trips through this function alone. Now it locks every
+  row up front in one batched, ascending-id-order `FOR UPDATE` (the same
+  guarantee `lock_terms` uses, needed here too since `recount_terms_for_post`
+  reaches this function without a prior `lock_terms` call), computes every
+  count in one call to the already-batched `term_post_counts` helper
+  (previously used only by read-path screens), and writes every count back
+  in one bulk `UPDATE ... FROM UNNEST(...)` instead of N single-row updates.
+  Profiled through the real editor "Update" route against a 5,000-term/
+  2,000-post fixture at three tiers of affected-term count: statements
+  79→61 (N=7), 210→132 (N=27), 467→275 (N=65) — this function's own
+  contribution drops from 3N to 3 at every tier. `cargo test -p cms` (99
+  tests) and the full Docker-gated integration suite (211 tests) pass
+  unchanged. See `docs/reports/2026-09-18-ledger-cms-recount-terms-batch/`.
+
+- **⚡ Bolt: `feed::escape` ASCII fast path (instructions -38.4%):** a new
+  `autumn/benches/feed_render.rs` profiling harness — rendering a realistic
+  30-entry Atom feed, the same `Feed::atom(...).entries(...)` shape
+  `examples/blog`'s `feed_xml` handler builds from real `Post` rows — showed
+  `feed::escape` accounting for ~72% of `Feed::render`'s instructions.
+  `escape` walked every character through `chars()` (a full UTF-8 decode
+  plus a 5-way match per character) even though real titles/bodies are
+  overwhelmingly plain ASCII text containing none of the five characters it
+  escapes. It now does one cheap byte scan first (`needs_escaping`): if the
+  string has no non-ASCII byte, none of `&<>"'`, and no stray ASCII control
+  byte, it returns the input unchanged instead of rebuilding it one `char`
+  at a time; any non-ASCII byte still falls through to the original
+  per-`char` path unconditionally, so `is_xml_char`'s
+  `U+FFFE`/`U+FFFF`-filtering is never bypassed. Behavior is unchanged — the
+  existing round-trip/no-raw-angle-bracket proptests pass without
+  modification, plus four new unit tests pin the fast/slow-path boundary.
+  Measured (`valgrind --tool=callgrind`/`dhat`, base-subtracted): instructions
+  620,067 → 381,893 per render (-38.4%); `escape`'s own share of the profile
+  72% → 54%; allocation bytes/blocks per render unchanged (both paths make
+  exactly one `String` allocation).
+- **⚡ Bolt: `hmac_sha256_hex` hex-encoding (instructions -4.66% end to end,
+  -26.8% of the function itself):** `autumn/benches/csrf_verify.rs` drives
+  the real `CsrfLayer`: a one-time mint before the measured loop, then a
+  `GET` plus two `POST`s per round that all verify the already-minted
+  cookie's HMAC (`CsrfLayer` validates the cookie signature on every
+  request, safe methods included, and additionally checks the submitted
+  token on the two `POST`s). This attributed `security::config::hmac_sha256_hex`
+  16.86% of the profile's instructions under `valgrind --tool=callgrind
+  --iterations 2000` (136,026,523 of that run's raw, un-base-subtracted
+  806,998,060 Ir total — `callgrind_annotate --inclusive=yes`'s own "% of
+  PROGRAM TOTALS"), most of it the real HMAC-SHA256 compression
+  (`sha2::sha256::compress256`, 10.42% of the same raw total — inherent
+  crypto work, not a target). The remaining hex-encoding tail walked the
+  32-byte MAC output one byte at a time with `write!(acc, "{b:02x}")`,
+  routing every byte through `core::fmt::write` → `Formatter::pad_integral`
+  → `LowerHex::fmt` instead of a direct nibble lookup — the only
+  hand-rolled byte-to-hex encoder in this crate; every other call site
+  (`ledger.rs`, `migrate.rs`, `sigv4.rs`, `auth/remember.rs`, ...) already
+  used `hex::encode` for the identical operation. Swapped to `hex::encode`.
+  Diffing `hmac_sha256_hex`'s own inclusive Ir directly against itself
+  isolates the fold's cost: 136,026,523 → 99,533,081 (-36,493,442 Ir,
+  -26.8% of the function's own cost). Measured end to end, base-subtracted
+  (an `--iterations 0` run isolates process-startup/warm-up cost,
+  subtracted before dividing by the 6,000 marginal requests a
+  2000-iteration run adds): instructions/request 132,954.8 → 126,764.3
+  (-4.66%); DHAT allocation blocks/bytes unchanged (both implementations
+  make exactly one `String` allocation, so this is an instruction-count
+  win, not an allocation one). Behavior is unchanged (same lowercase hex
+  output; all 59 existing `security::config` unit tests pass unmodified).
+  -4.66% end to end is real and deterministic under `callgrind`, not
+  wall-clock noise, even though a single narrowly-scoped fix inside a
+  framework-overhead-heavy request pipeline will rarely move the *whole*
+  benchmark's total past a flat percentage floor — the case for shipping
+  it is the function-level number plus zero behavior change and zero new
+  dependencies.
+- **⚡ Bolt: drop four needless `Service::clone()`s from the ingress
+  middleware fast paths (instructions -5.5%, allocation bytes -10.6%):**
+  `autumn/benches/request_pipeline.rs` (the committed ingress-pipeline
+  profiler, issue #2193) profiled under `valgrind --tool=dhat` showed
+  `TrustedProxiesService`, `MethodOverrideService`, `SubmitTokenService` and
+  `idempotency::IdempotencyReplayService` each allocating on effectively
+  every request — 2.7 MB of the run's 17.6 MB marginal allocation bytes —
+  from `tower::util::boxed_clone_sync::CloneService::clone_box`. Each of
+  these `call()`s did a `let mut inner = self.inner.clone(); std::mem::swap(
+  &mut self.inner, &mut inner);` before `Box::pin`-ing the result, a pattern
+  copied from sibling middlewares that genuinely need to move an owned `S`
+  into an `async move` block. These four don't: on their common-case path
+  (no CAPTCHA/replay/override/guard applicable — every GET, every non-form
+  POST) nothing runs between entry and the delegating call, so
+  `self.inner.call(req)` can be boxed directly with `&mut self.inner`,
+  never touching `Clone`. `self.inner` is, at this point in the stack, a
+  `BoxCloneSyncService` whose `Clone` impl allocates a fresh
+  `Box<dyn CloneService>` to duplicate the remaining downstream stack — the
+  exact cost issue #2214 already eliminated from four *other* middlewares by
+  converting their `from_fn` closures to named-future `Service`s; this
+  targets the same mechanism on the four `Service`s #2214 didn't touch
+  (`SubmitTokenService`/`IdempotencyReplayService` split their existing
+  branch structure so only the guarded/replay path still clones;
+  `TrustedProxiesService` and `MethodOverrideService`'s ineligible-request
+  branch never needed the clone at all). Behavior is unchanged: all 98
+  existing unit tests across the four modules and all 105 existing
+  CSRF/idempotency/submit-token/trusted-proxy/`ingress_named_futures`
+  integration tests pass unmodified. Independently corroborated by two
+  pre-existing gates neither of which this change touches:
+  `tests/config_alloc_gate.rs`'s exact in-process `allocation-counter`
+  measurement of a single `/ping` request through the production stack
+  (140 → 132 blocks, 27,982 → 25,022 bytes) and
+  `tests/integration/middleware_stack_depth.rs`'s clone-event probe (9 → 7
+  traversals, still inside its documented `6..=9` window — the same counter
+  #2214 introduced for exactly this class of fix). Measured end to end via
+  `request_pipeline.rs` (`valgrind --tool=callgrind`, base-subtracted,
+  mean of 3 runs each side to bound run-to-run hash-seed variance):
+  marginal instructions/3000-request run 289,823,338 → 273,790,211 (-5.53%);
+  via `valgrind --tool=dhat`: marginal allocation bytes 17,617,058 →
+  16,108,256 (-8.56%), blocks 90,507 → 86,307 (-4.64%).
+
+### Fixed
+
+- **openapi:** `#[model]` types no longer export as untyped blobs (issue #802).
+  The macro has always emitted `OpenApiSchema` impls for a model and its `New*` /
+  `Update*` companions, but never submitted the compile-time inventory
+  descriptor the spec and MCP back-fills actually resolve types through — so
+  nothing could *find* those impls, and every `#[repository(api = "…")]`
+  endpoint documented its own model as the generic
+  `{"type": "object", "title": "X"}` placeholder unless the app repeated each
+  one by hand through `OpenApiConfig::register_schema`. The `bookmarks`
+  example's entire REST surface was in that state. All three companions now
+  register themselves, so a model on the API boundary carries real fields with
+  no wiring, and a generated client sees a typed struct instead of `unknown` /
+  `serde_json::Value`. Apps that were registering models explicitly are
+  unaffected: an explicit `register_schema` is still seeded first and still wins.
+
+- **openapi:** an application type whose last path segment is `Option` or `Vec`
+  is no longer described as nullable or as an array (issue #802). Both macros
+  match those two wrappers on the type's **last path segment**, because a proc
+  macro sees only the tokens as written — so an app's own `domain::Option<T>` or
+  `domain::Vec<T>` (ordinary structs that merely spell that name) took the
+  nullable / array branch. A `#[model]` field of such a type was published as
+  `oneOf [T, null]` or `type: array` and, worse, dropped from `required`, so a
+  generated client could omit a field the server demands; an `#[api]` handler
+  returning `Json<domain::Option<T>>` documented the *inner* type it never
+  wraps. Nothing flagged it: no opaque component was emitted, so
+  `autumn openapi export --strict` passed while it happened. Both paths now
+  check the type's full runtime `type_name` before treating it as a `std`
+  wrapper — the same escape the scalar table already uses for its own
+  last-segment collisions — so a colliding type resolves to its registered
+  schema, or to an honest `$ref` that `--strict` reports as opaque. Genuine
+  `Option` / `Vec` are unchanged, requiredness included.
+
+- **openapi:** a handler that takes or returns `Json<serde_json::Value>` is
+  documented as arbitrary JSON rather than as an empty object (issue #802). The
+  route macro emitted an ordinary named `$ref` for it; nothing registers a
+  schema for that external type, so the back-fill resolved it to the opaque
+  `{"type":"object"}` placeholder — which misdescribes every array, scalar and
+  `null` such a handler legitimately carries, and made
+  `autumn openapi export --strict` fail on a handler that is behaving
+  correctly. The `#[model]` field path already special-cased this; the
+  route-level builder now does too, keyed on the same full `type_name`, so an
+  application's own type named `Value` still gets its ordinary `$ref`. The
+  optional form is deliberately *not* wrapped in `oneOf [.., null]`: the
+  unconstrained schema already admits `null`, and `oneOf` requires exactly one
+  branch to match, so wrapping it would reject the very `null` it permits.
+
+- **openapi:** `autumn openapi export` now runs the router's MCP checks too, so
+  it cannot certify a spec for an app that will not start (issue #802). The
+  preflight already ran four of the serving path's rules; an app mounting MCP at
+  a malformed path, or at one a user or `OpenAPI` route already owns, is
+  rejected by `build_router_pre_state` at startup but passed `--check`. The
+  mount-path rule is extracted from that function rather than copied, joining
+  the others, so there is still exactly one definition per rule.
+
+- **openapi:** `autumn openapi export` also runs the two preconditions `run()`
+  enforced itself, and applies the same builder overrides, before generating
+  (issue #802). The preflight mirrored `build_router_pre_state` faithfully, but
+  `run()` checks two more things outside it: an app with **no routes at all**
+  panics at startup, and a mutating `#[repository(api = "…")]` with no paired
+  `policy` refuses to start under a production profile. Either could export a
+  document `--check` would approve for an application that never reaches router
+  construction. Both now live in one `validate_pre_router_preconditions` the two
+  paths share, so a precondition added to the serving path is in the exporter by
+  construction rather than by remembering. Separately, the
+  `.mount_unsubscribe_endpoint()` builder flag — which decides whether
+  `/_autumn/unsubscribe` is claimed, and so what the collision checks see — is
+  now folded into the config before those checks on the export path too; it was
+  already copied at two `run_*` sites, and is now shared by all three.
+
+- **openapi:** `autumn openapi export` honors the `[openapi] enabled` profile
+  gate when checking mount paths (issue #802). With the endpoint disabled,
+  `run()` hands the router `None`, so it neither validates the `OpenAPI` mount
+  paths nor treats them as claimed `GET`s — an application route may
+  legitimately own `/openapi.json` under that profile. The exporter validated
+  them unconditionally and so *rejected* an application that starts perfectly
+  well: the same class of disagreement with the serving path as being too lax,
+  pointing the other way. All three mount-sensitive checks (path validation,
+  the `OpenAPI` collision scan, and the MCP one, which reserves those same
+  paths) now read one resolved value, so they cannot disagree about whether the
+  endpoint is mounted. The document itself is still exported either way — the
+  gate governs serving, not whether the contract can be written down.
+
+- **openapi:** the external-scalar identity check compares the real type path,
+  not a crate-name prefix (issue #802). `chrono`'s date/time types and
+  `uuid::Uuid` are matched by the macro on their last path segment, and a
+  runtime check then confirmed the identity really was external — but that check
+  was `starts_with("chrono::")`, which accepts *every* type in a crate that
+  happens to be named `chrono`. A downstream crate of that name defining its own
+  `DateTime` was inlined as a string even when serde writes an object, and no
+  opaque component was emitted, so `--strict` could not see it. Each scalar now
+  compares against `type_name` of the genuine type, reached through
+  `autumn_web::reexports` — so the check cannot drift if `chrono` moves a type
+  between internal modules, and cannot be satisfied by a namespace collision.
+  `DateTime<Tz>` compares the path before the `<`, so every zone still
+  qualifies. `uuid` joins the `reexports` module for this.
+
+- **openapi:** a field carrying `#[serde(skip_serializing_if = "…")]` is no
+  longer advertised as `required` (issue #802). That attribute means a response
+  may omit the field, so `required` is wrong for it whatever its type. The
+  standalone derive's audit already refuses the attribute on anything neither
+  `Option`-named nor defaulted — precisely because the survivors are
+  describable as optional — but it judged `Option`-ness by the last path
+  segment, so an application's own `domain::Option<T>` passed the audit and
+  then landed in `required` anyway once the emitter's identity guard recognised
+  the impostor, leaving a schema its own responses could violate. The decision
+  now keys on the attribute rather than the type, which is exactly what a proc
+  macro can see.
+
+- **openapi:** `autumn openapi export` verifies deferred `.policy::<R, _>(…)` /
+  `.scope::<R, _>(…)` registrations (issue #802). Those builder calls are
+  closures the serving path replays onto live state before checking that every
+  `#[repository(policy = X)]` route really has an `X` registered — a check that
+  refuses to start under a production profile. The export dropped the closures
+  and confirmed only that the macro argument existed, so an app declaring a
+  policy but missing the builder call exported a contract `--check` would
+  approve. It now replays them onto a throwaway `PolicyRegistry` and runs the
+  same rule; `validate_repository_policies_registered` takes that registry
+  rather than the whole `AppState`, which is all it ever read, so the export
+  still opens no database.
+
+- **openapi:** `autumn openapi export` runs the two config-only guards that stop
+  a boot before anything route-shaped is looked at (issue #802): a `web`/`worker`
+  process role on a non-durable jobs backend — where the web replica enqueues
+  into an in-memory queue no worker can drain — and a duplicate `#[scheduled]`
+  task name, which spawns two loops competing for one coordination lock. Either
+  refuses to start, and neither was reachable from the router, so an export that
+  mirrored the router faithfully still approved the contract. Both now live in a
+  `validate_config_preconditions` the two paths share. The task check validates
+  the list with the framework's `[retention]` sweep merged in, exactly as the
+  serving path does — the collision it most often catches is between a
+  hand-declared task and that generated one, so validating the unmerged list
+  would miss the very case it exists for. The merge happens in exactly one
+  place, `merge_framework_scheduled_tasks`, covering both the
+  `#[repository(..., retention(...))]` sweeps and the config-driven one.
+
+- **Breaking:** `#[derive(OpenApiSchema)]` now refuses
+  `#[serde(skip_serializing_if = "…")]` on a field with no `#[serde(default)]`,
+  including on `Option<T>`, which previously compiled. `skip_serializing_if`
+  governs serialization only, so a response may omit the field while serde still
+  rejects a request that omits it; being spelled `Option<T>` used to be accepted
+  as proof that omission is valid on the way in, but a proc macro sees only the
+  tokens, and an application's own type named `Option` reads identically while
+  serde does require it. For such a type neither answer is right — `required`
+  lets a response omit what the schema demands, optional lets a client omit what
+  serde rejects — so the shape is refused rather than guessed. Add
+  `#[serde(default)]`, which is a no-op on a real `Option<T>` (serde already
+  fills a missing one with `None`) and makes omission genuinely valid in both
+  directions. `#[model]` is unaffected: its read schema describes a response
+  only. See the [migration guide](docs/migrations/next.md).
+
+- **openapi:** `autumn openapi export` no longer applies the application-router
+  checks under a non-HTTP process role (issue #802). With `role = "worker"`,
+  `run()` takes the probe-only branch and never builds the application router,
+  so none of those six rules execute — a route may legitimately own
+  `/openapi.json` under that profile. Enforcing them anyway *rejected* a
+  deployment that starts perfectly well. The config-only preconditions still
+  apply to every role, because `run()` performs those before it branches, and
+  the document is still exported either way: it is built from the routes and the
+  `OpenApiConfig`, neither of which depends on the role, so a worker-profile
+  export writes down the same contract the web role serves.
+
+
+### Changed
+
+- **macros:** **Breaking:** `#[lifecycle]` now proves the *whole* declared graph
+  sound at compile time, not just its endpoints (issue #1675). Two faults are
+  new compile errors: a state not reachable from the initial state, and a
+  reachable non-terminal state with no declared path to a terminal. Each
+  diagnostic names the variant and is spanned at it, so `cargo` underlines the
+  state to fix, and every offending state is reported in declaration order. A
+  state that is both unreachable and exit-less is reported once, as unreachable
+  — reachability is the root cause. Previously these two whole-graph properties
+  were proven only by `autumn lifecycle check`, which scans source and skips a
+  `#[lifecycle]` reached through a cross-file alias or a glob re-export (#1925),
+  so an unsound lifecycle spelled that way compiled and shipped. A lifecycle the
+  scanner reports sound is unaffected; one it skipped may now fail the build.
+  See the [migration
+  guide](docs/migrations/next.md#lifecycle-an-unsound-lifecycle-graph-is-now-a-compile-error).
+
+- **web:** `AutumnError`'s `Display` now appends the failing fields to a
+  validation error, sorted by field name — `Validation failed: email: Must be
+  a valid email address` instead of the bare `Validation failed` (issue
+  #2587). Exact `Display` output is outside the SemVer surface (see
+  `STABILITY.md`), and the `application/problem+json` body is unaffected: it
+  renders the wrapped error, so `detail` still reads `Validation failed` with
+  the fields in `errors`. Persisted failure strings are unaffected too — the
+  job failure capsule, the job and scheduled-task `last_error` columns, the
+  repository commit-hook `last_error`, alerts and the `sys:tasks` broadcast
+  now record `message()`, so a capsule recorded before this change still
+  replays as a match. Keep untrusted text out of
+  `#[validate(message = "...")]`: `Display` output reaches your logs.
+- **The metrics facade's three cardinality caps are now configurable
+  (`[metrics]`, revisits the limits #1378 shipped in 0.7.0):** the call-site
+  facade caps labeled series per instrument (100), instruments in the registry
+  (256) and labels per series (8), and those numbers were compile-time
+  constants. They are the right defaults, but the line between "a
+  label-cardinality mistake" and "a large but deliberate label space" is a
+  property of the app, not of the framework: an app with 150 routes recording a
+  per-route histogram lost 50 series to a cap it had no way to raise, saw one
+  warning and a climbing `autumn_metrics_series_dropped_total`, and had no
+  remedy short of forking. A new `[metrics]` section sets the three:
+
+  ```toml
+  [metrics]
+  max_series_per_metric = 500
+  max_instruments = 512
+  max_labels_per_series = 12
+  ```
+
+  with the usual `AUTUMN_METRICS__MAX_SERIES_PER_METRIC` (and siblings)
+  environment overrides. Every key defaults to the value 0.7.0 shipped, so an
+  app with no `[metrics]` section behaves exactly as before.
+
+  **Only the cardinality caps moved.** The caps that protect the exposition
+  format rather than memory — metric- and label-name length, label-value and
+  help-text length, bucket count — stay fixed, because raising one lets an app
+  emit a scrape body a stricter parser may reject without letting it express
+  anything it could not express already.
+
+  Applied once in `load_config_and_telemetry`, before anything is built from
+  the config and therefore before any call site can record; every `run_*` mode
+  reaches that function, so no path boots with the defaults silently in force.
+  The caps are read at each decision rather than baked in at registration, so
+  the semantics are stated and tested: **lowering a cap never evicts** what is
+  already retained (evicting a counter would reset it, and a reset is
+  indistinguishable from a restart to `rate()`) — it only refuses further
+  series; **raising one takes effect at once**, including on an instrument
+  already at its old cap.
+
+  An out-of-range value (`0`, or above the ceilings of 100 000 / 100 000 / 64)
+  is **rejected** by `AutumnConfig::validate` naming the key, so it fails the
+  boot and `autumn check`, rather than being clamped into something the
+  operator did not ask for — a cap of `0` would otherwise silently drop every
+  labeled sample the app records. `metrics::set_limits`, the programmatic entry
+  point, has no boot to fail and clamps instead, warning when it does.
+
+  The `describe_*` / `set_histogram_buckets` staging areas are bounded by the
+  *ceiling* rather than by the running cap, because the documented startup
+  pattern fills them from `main` before `run` installs `[metrics]` — bounding
+  them by the running cap would silently discard exactly the descriptions an
+  app raising `max_instruments` was entitled to keep, and no later raise can
+  recover a stash that was never taken. What actually registers is still
+  governed by the configured cap.
+
+  `metrics::{MAX_SERIES_PER_METRIC, MAX_INSTRUMENTS, MAX_LABELS_PER_SERIES}`
+  are **deprecated, not removed** — they now read as
+  `DEFAULT_MAX_SERIES_PER_METRIC` and friends, with
+  `metrics::max_series_per_metric()` and siblings returning the effective
+  value. The three keys also appear on `/actuator/configprops`.
+  `docs/guide/metrics.md` documents the split between configurable and fixed
+  caps, and both warnings about raising one. `[metrics]` is declared before
+  `database` in `AutumnConfig` so strict unknown-key validation descends into
+  it — a typo like `max_serie_per_metric` is rejected rather than silently
+  leaving the cap the operator meant to raise at its default; the new
+  `metrics_child_keys_are_strictly_validated` guard fails if that ordering
+  breaks.
+
+
+- **🧭 Wayfinder: `examples/invoice`'s on-screen detail page is now a real
+  HTML document (a11y `html-has-lang`/`bypass` Serious 2→0,
+  `landmark-one-main` Moderate 1→0) [no-plugin]:** `autumn check --a11y`, run against the
+  live `/invoices/{id}` route (`supported`-tier, Chromium-smoked by
+  `tests/system/smoke.rs`), found the on-screen page was a bare Maud
+  fragment with no `<!DOCTYPE>`, `<html>`, `<head>`, or `<main>` — `Invoice`'s
+  own doc comment calls it "the on-screen detail page", so it is a real page
+  a user navigates to, not an htmx partial. A screen reader had no document
+  language to announce and no landmark to jump to; the browser tab and
+  history showed no title; the page also had no viewport meta, so it never
+  reflowed for a 320px/zoomed viewport. Root cause: `invoice_detail` returned
+  `invoice_view(...)` directly with no document wrapper, unlike every other
+  `supported`-tier example's `layout()` function.
+  Baseline (`autumn check --a11y --html "<rendered /invoices/42>"`):
+  2 Serious (`html-has-lang`, `bypass`) + 1 Moderate (`landmark-one-main`).
+  Fix: a new `page()` wrapper in `examples/invoice/src/lib.rs` adds
+  `<!DOCTYPE html>`, `<html lang="en">`, a `<head>` with a charset/viewport
+  meta and a `<title>` via the existing `autumn_web::seo::SeoMeta` (no new
+  dependency), and wraps the content in `<main>` — applied only to
+  `invoice_detail`. `invoice_view` itself is untouched and still returns a
+  bare fragment, so `invoice_pdf`'s `Pdf::from_markup(invoice_view(...))`
+  keeps rendering exactly that fragment; a `<head>` in the shared view would
+  have rendered `<title>`/meta content as visible PDF text.
+  No skip link was added: the page has no nav/header before `<main>` (it's
+  the first thing in `<body>`), the same reasoning `todo-app`/`media-room`
+  established in #2483 — `autumn check --a11y`'s `bypass` rule already
+  exempts this shape, confirmed by the 0-violation re-run below.
+  After (`autumn check --a11y --url http://127.0.0.1:3000/invoices/42`,
+  built binary, live server): 0 violations. `cargo test -p invoice`: 5
+  passed (4 pre-existing + 1 new `detail_page_has_a_document_shell`
+  regression test asserting the doctype/lang/title/main are present);
+  `pdf_route_renders_the_same_content_as_the_html_view` and
+  `pdf_rendering_is_deterministic_given_a_fixed_clock` still pass unchanged,
+  confirming the PDF output is untouched.
+- **🧭 Wayfinder: `examples/flock`'s island page gets a `<main>` landmark
+  (a11y `bypass` Serious 1→0, `landmark-one-main` Moderate 1→0) [no-plugin]:**
+  `autumn check --a11y`, run against the live `/` route (its
+  own `tests/system/smoke.rs` says it "mirrors the other supported
+  examples"), found the whole page — the server-rendered heading/paragraph
+  *and* the WASM-island mount point — had no `<main>` landmark, and (since
+  the page carries no other link either) no skip-to-content link. This is
+  not a static-shell artifact of a client-rendered app the way, say,
+  `examples/react-graphql`'s pre-hydration shell would be: neither the maud
+  page nor the Yew `Flock` component that later mounts into `<div
+  data-autumn-island="flock">` (`examples/island-flock/src/lib.rs`'s `view`)
+  emits any landmark, so the gap holds both before and after the island
+  boots — a real end state, not a curl-only false positive.
+  Baseline (`autumn check --a11y --url http://127.0.0.1:3000/`, built
+  binary, live server, pre-fix): 1 Serious (`bypass`) + 1 Moderate
+  (`landmark-one-main`).
+  Fix: wrap the existing content in `main id="main-content"` as the literal
+  first child of `<body>` — matching `todo-app`/`media-room`'s convention —
+  moving nothing else. The deferred module `<script>` moves to after
+  `</main>` (rather than into `<head>`) so `<main>` stays first; a `defer`
+  script's execution order is unaffected by its position in the document.
+  No skip link was added: with `<main>` first in `<body>` there is nothing
+  to bypass, the same reasoning `todo-app`/`media-room` established in
+  #2483 — `autumn check --a11y`'s `bypass` rule already exempts this shape.
+  After (same live-server check, post-fix): 0 violations. `cargo test -p
+  flock`: 1 passed (a new `index_wraps_content_in_a_main_landmark_first_in_body`
+  regression test asserting the `<main id="main-content">` landmark is
+  present, that nothing precedes it in `<body>`, and that the island mount
+  point stays inside it); the existing Chromium smoke test is unaffected.
+  `cargo fmt -p flock -- --check` and `cargo clippy -p flock --all-targets
+  -- -D warnings` both clean.
+- **`autumn-admin-plugin`: shared `execute_action` restore/purge fallthrough.** [no-plugin]
+  `TokenAdminModel` and `FeatureFlagAdminModel` each override
+  `AdminModel::execute_action` to batch their `"delete"` bulk action into one
+  query, and both carried an unchanged copy of the trait default's
+  `"restore"`/`"purge"`/unhandled-action dispatch loop alongside it — a third
+  copy of the same logic, after the trait's own default. Both overrides now
+  delegate the non-`"delete"` cases to a shared
+  `dispatch_restore_purge_or_unhandled` helper instead. No behavior change:
+  the affected error paths are unreachable in practice (neither model
+  declares soft-delete support), and characterization tests pin the exact
+  error text before and after. Internal-only; no public API change.
 
 - **SQLite runtime honesty (issues #1905 / #2539).** The runtime landed in
   #2537; three things still behaved or read as though it had not.
@@ -78,7 +2885,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A side effect of the digest being taken over LF-normalised text: a CRLF
   checkout of a generated file (`core.autocrlf`) no longer reads as an edit,
   whether or not a manifest entry backs it.
-
+- **`autumn migrate check` classifies against the app's own backend** (issue
+  #1906). The safety classifier was Postgres-only and gave SQLite apps incorrect
+  advice: it recommended `CREATE INDEX CONCURRENTLY`, which SQLite has no syntax
+  for; it flagged every `DROP INDEX` as blocking, though on SQLite it is a cheap
+  catalog edit *and* a precondition of `DROP COLUMN`, so the generator's own
+  remove-column migrations failed the gate; and it rated `ADD COLUMN NOT NULL`
+  without a default merely "potentially blocking" where SQLite rejects it
+  outright. `check` now detects the backend and applies SQLite's rules. A new
+  `unsupported` risk level marks statements the backend cannot run at all —
+  `ALTER COLUMN` in any spelling, `TRUNCATE`, `CONCURRENTLY`, inline
+  `UNIQUE`/`PRIMARY KEY` on `ADD COLUMN`, a non-constant `ADD COLUMN` default, a
+  multi-action `ALTER TABLE`, sequences, types, extensions, materialized views,
+  `COMMENT ON`, `GRANT`/`REVOKE`, `MERGE`, a writing CTE and the Postgres-only
+  `CREATE INDEX`/`CREATE TABLE` clauses — and fails the `up.sql` gate, since they
+  cannot apply. Postgres classification is unchanged.
+- **openapi:** `#[derive(OpenApiSchema)]` now covers enums whose variants are
+  all unit variants, emitting the closed string set serde puts on the wire
+  (`{"type": "string", "enum": [...]}`) and honoring `#[serde(rename)]`,
+  `#[serde(rename_all)]` and `#[serde(skip)]`. Previously the derive rejected
+  every enum outright, so an enum on the API boundary had no opt-in short of a
+  hand-written impl and fell back to the opaque object placeholder. Enums with
+  data-carrying variants are still a compile error rather than a guess: serde's
+  representation for those depends on `#[serde(tag/content/untagged)]`, so an
+  inferred shape could confidently advertise a contract the handler will not
+  accept.
+- **openapi:** the opaque-schema predicate MCP used to warn on degraded tool
+  input schemas is now `openapi::is_opaque_object_schema`, paired with a new
+  `openapi::opaque_component_schemas` that reports every placeholder component in
+  a built spec along with the operations reaching it. `autumn openapi export`
+  prints that report on every run, so a half-untyped contract is a visible
+  condition rather than a silent one. Behaviour of the existing MCP warnings is
+  unchanged — they now call the shared predicate instead of a private copy.
 - **plugin-sandbox:** three consequences of #1632 that an existing sandbox
   embedder will notice. `SandboxManifest` gains `grants` and `quotas` fields, so
   a struct literal over it needs two more lines — prefer `SandboxManifest::parse`
@@ -101,6 +2939,910 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **db:** `#[derivation]` maintains a **filtered or weighted** derived column on
+  a parent row (#1769). Declared on the child, below `#[model]`:
+  `#[derivation(Post, column = "published_comment_count", filter = published)]`,
+  or `#[derivation(Post, column = "visible_score", transform = sum(score),
+  filter = published && score > 0)]`. One filter declaration is lowered twice,
+  to a Rust predicate for the record paths and to a SQL predicate for the
+  set-based ones, so the two can never disagree; the grammar covers `bool`,
+  integer and `String` fields and their `Option` forms, with SQL NULL semantics.
+  Every generated repository mutation maintains it **inside the same transaction
+  as the row mutation** with atomic set-based SQL, including bulk paths,
+  soft delete, restore, `dependent` cascades, a re-parent (the old contribution
+  off the old parent, the new one onto the new) and a filter flip on an unchanged
+  parent. A `#[derivation]` is a superset of `counter_cache`, which is now its
+  unfiltered special case with byte-identical SQL. Each derivation is
+  content-addressed by a `definition_hash` over its lowered shape, so a changed
+  filter enqueues a resumable, checkpointed, idempotent backfill (`run_backfill`,
+  `BackfillOptions`) and a rename or reformat does not (a renamed derivation
+  adopts its old state row, finished backfill included, matched by hash before
+  name so two derivations that swapped names both keep theirs); the framework-owned
+  `_autumn_derivations` state table ships in the framework migration set (so
+  `autumn migrate` creates it on the control database, and on a `sqlite://`
+  target applies the SQLite variants of the shard-required sets, which it had
+  skipped, version-disambiguated together with the app's own set so a shared
+  version masks nothing, and an app migration a database already ran under
+  such a version keeps its record under its new tracked version instead of
+  running twice, and `autumn migrate down` plans and reverts under the same
+  identities; on a Postgres target, where the app set goes through the
+  `diesel` CLI, it refuses to apply or roll back, and says so in `status`,
+  while an app migration shares a version with a framework migration that
+  target receives, naming both and the rename to make) and as a standalone
+  set the runtime applies when a
+  derivation is
+  registered (on every shard primary too).
+  Each batch locks its state row, so replicas take turns on one sweep.
+  `GET /actuator/derivations` (sensitive-gated) reports each derivation's
+  hashes, backfill state, checkpoint and current drift (capped at
+  `DRIFT_SCAN_LIMIT`, with a per-derivation `drift_error` and an `unregistered`
+  state for a leftover row), and `recompute(conn, name)` repairs it. Beyond
+  `column`, `transform` and `filter`, the attribute takes `fk`, `parent_table`,
+  `tenant` and `name`; a duplicate parent column or derivation name stops the
+  boot before it opens a connection, and so does a derivation on a column a
+  plain `counter_cache` on another model already maintains. A string filter
+  compares bytewise on both sides (`COLLATE "C"` / `COLLATE BINARY`), so a
+  `NOCASE` column cannot make the SQL and Rust lowerings disagree. A
+  derivation onto its own table sweeps one parent per batch, a batch the
+  database aborts to break a deadlock is retried from its checkpoint, every
+  mutation on such a table takes a per-table advisory lock before its first
+  row lock (a save before its insert, `upsert_many` before the `FOR UPDATE`
+  load it diffs against, the delete family and retention before theirs) so
+  crossing mutations wait rather than deadlock (a raw write of your own takes
+  it first through the now-public `counter_cache_serialize_self_referential`,
+  and `autumn migrate down` on SQLite moves a legacy record to its tracked
+  identity before planning, as the apply path would; `recompute` and
+  `resweep` run the registry check before selecting a definition), the
+  registry refuses a
+  derivation column that is the parent's primary key under the backend's
+  identifier rules (`"ID"` on SQLite), and
+  `derivation::resweep` re-enqueues one derivation for the settling pass a
+  rolling deployment that changed a definition needs (see the guide). The
+  collision check also covers the column a `#[commentable(counter_cache)]`
+  parent keeps, a `#[votable]` model's aggregate column, a repository's
+  `position(...)` ordering column, a model's `#[lock_version]` token, its
+  `tenant_id` discriminator and its `deleted_at` marker (each under its
+  `#[diesel(column_name)]` when it has one; `column = "tenant_id"` and
+  `column = "deleted_at"` are also compile errors),
+  string filters cast to `TEXT` so Postgres `citext` compares bytewise too,
+  a tenant-scoped leg captures the child's tenant before an update so a child
+  moved between tenants leaves its old parent under the old tenant (the
+  `tenant` field must be an integer or string),
+  `column = "id"` and a self-referential derivation reading the column it
+  maintains (its `fk` and `tenant` columns included) are compile errors, and
+  so is a derivation reading a column another derivation or counter cache of
+  its model maintains on its table (across models the registry refuses it at
+  boot); an `#[id]` or `fk` field renamed with `#[diesel(column_name)]`
+  reaches the spec under its physical column,
+  reconciliation holds the state table for its transaction so replicas
+  booting together take turns, `recompute` sweeps a self-referential table
+  one parent per batch with the same deadlock retry, `sum(...)` rejects
+  anything after its one field name, `BackfillReport::batches_run` lets a paced caller tell "more
+  to do" from "stuck" (the boot sweep now stops on no progress rather than
+  after a fixed number of rounds), a tenant-scoped leg orders each parent's
+  deltas so no intermediate value overflows, and `/actuator/derivations`
+  still reports leftover rows after the last derivation is removed. `CounterCacheSpec`
+  gains four plumbing fields `#[model]` fills in (`contrib_of`, `contrib_sql`,
+  `filter_sql`, `derivation`), so a hand-written spec literal needs four more
+  lines; it is framework plumbing and not constructed by hand. The one other
+  API-visible change is that the doc-hidden
+  `counter_cache_capture_fks`/`_many` now return `(parent, contribution)` pairs
+  rather than parent ids. See `docs/guide/derivations.md`.
+
+- **a11y:** `autumn a11y verify` now keys its findings to the **routes** that
+  serve them, and rolls them up by WCAG success criterion (part of #1706). The
+  scan reads the route attribute macros — `#[get]`, `#[post]`, `#[put]`,
+  `#[patch]`, `#[delete]`, `#[static_get]` — out of the token stream it already
+  walks, indexes every function and the free functions it calls, then walks out
+  from each handler to the markup it reaches, so a defect in a shared partial
+  names the routes that reach it, not just a file and a line. The JSON manifest gains a `routes` array
+  (per-route `pass`/`fail` with a finding count), a `routes` list on each
+  finding, and a `wcag` rollup that splits the multi-criterion rules so `label`
+  reports separately under 1.3.1, 3.3.2 and 4.1.2; the summary gains `routes`,
+  `routes_failing` and `unrouted`. Attribution is a conservative lower bound in
+  the same spirit as the scanner: a call is followed only when the called name
+  is defined exactly once across the scan as a free item (a nested or
+  associated `fn` is not a bare-call target); method calls, type-qualified
+  associated calls (`Widget::new()`), functions passed by name and names a
+  parameter or local shadows are not resolved; and the path is the one declared on the handler (mount-time prefixes
+  are applied at runtime and are not resolved). So `status: "pass"` means no
+  finding was attributed to that route, which `summary.unrouted` qualifies.
+  Exit codes are unchanged — route data reports, it does not gate.
+
+- **a11y:** new typed `a11y::RadioGroup` / `a11y::RadioOption` primitives (part
+  of #1706) — the last common form control without a compile-time label
+  obligation. A radio group needs two accessible names, and both are now
+  type-level: `RadioOption::new(value, label)` requires the choice label, and
+  `RadioGroup::new(name, first)` returns a `RadioGroup<NoLabel>` that does not
+  implement `Render` until `.label(..)`/`.aria_label(..)`/`.labelled_by(..)`
+  transitions it to `RadioGroup<Labeled>`, so an unnamed group is
+  unrepresentable as markup (proven by trybuild fixtures). The first choice is a
+  constructor argument, so a group of choices always has one. A visible name
+  renders `<fieldset><legend>`, the ARIA variants a `<div>`, both with
+  `role="radiogroup"` — `<fieldset>` alone maps to role `group`, which does not
+  support `aria-required`. `aria-invalid` and `hx-*` land on each `<input>`,
+  where assistive technology reads validity and htmx reads a value;
+  `aria-describedby` and `aria-required` stay on the group. `checked_value(..)`
+  sets the single selection authoritatively, and each choice gets an id pairing
+  it with its own `<label for=…>` — derived from the group name and the choice
+  value with any `-` doubled, so two groups cannot collide, and prefixable with
+  `.id_prefix(..)` when the same group is rendered repeatedly.
+
+- **cli:** `autumn db scrub --sample <table>=<count|percent%>` emits a
+  **referentially-intact subset** instead of the whole scrubbed copy (issue
+  #1636), so a production copy fits on a laptop. The subset is anchored on
+  developer-chosen roots (`--sample users=1%`, `--sample orders=500`,
+  repeatable) and follows the database's own foreign key graph: rows that
+  reference a selected row are carried along with it, and rows a selected row
+  references are carried too, so every foreign key still resolves. The walk
+  deliberately never descends out of an `always_include` table, or one lookup
+  row would drag the whole database back in. Two per-table rules live alongside
+  the PII declaration in `scrub.toml` — `[sample] always_include` copies
+  reference data whole, `never_include` excludes a table entirely.
+  Selection is deterministic: rows are ordered by a hash of `--seed` (default
+  `0`) and the row key, so the same seed against the same source reproduces the
+  identical subset. Sampling is a phase of the scrub's own transaction, never a
+  command of its own, so no flag combination emits sampled-but-unscrubbed rows.
+  It is fail-closed like the classification: a table no root can reach, a
+  foreign key into a `never_include` table, a table with no primary key, a
+  reference cycle between tables, and a framework-owned table referencing a
+  sampled one all abort with a non-zero exit that names the offenders — before a
+  row is removed. Each run reports per-table row counts, the total against the
+  source, and the size after every table it emptied or subsetted is compacted —
+  `[framework] purge` targets included, since `DELETE` frees no file space and an
+  emptied buffer is often the largest thing the run removes — and re-verifies
+  every foreign key inside the transaction so a violation rolls the run back.
+  `--check` and `--dry-run` cover the sample too and still write nothing.
+  One ordering change reaches every scrub, sampled or not: `[framework] purge`
+  now empties its tables at the START of the transaction rather than after the
+  column rewrites, so a framework-owned table that references a sampled one is
+  already empty when the sample removes the rows it points at — except a purge
+  the sample's own emptied rows reference, which waits until after it instead,
+  and the shape no order satisfies (rows the sample KEEPS referencing a purged
+  table) is refused up front, as is a purge one edge needs before the sample and
+  another needs after it; a deferred purge also carries the purges it references
+  into the same phase, so the split never separates two framework tables that
+  reference each other. The purge also runs a final pass AFTER the column
+  rewrites, which is the pass the guarantee rests on: an audit trigger on a
+  scrubbed table can copy `OLD` values — the original PII — into a purged table
+  while the rewrites run, so a purge that ran only beforehand would report the
+  table emptied while it held real data. That final pass covers `[sample]
+  never_include` tables too — both settings promise a table ends up empty, and
+  both are now enforced after every write rather than only before. **Breaking:**
+  running that pass last means its own `DELETE`s fire after every column
+  rewrite, so an archive trigger on a purged or `never_include` table can copy
+  the rows it removes into an ordinary classified table that has already been
+  scrubbed. No ordering avoids it and no postcondition catches it — a trigger
+  body can write anywhere — so a `DELETE` trigger, or an `ON DELETE` rewrite
+  rule, on a table the run empties is now refused before anything is written,
+  `--check` and `--dry-run` included. Drop or disable it on the copy.
+  Each printed target block now opens with `\set ON_ERROR_STOP on` and, inside
+  its transaction, a guard that aborts unless the session is on the target the
+  block is for — database name **and** the address and port the server reports,
+  since a sharded fleet runs the same database name on every shard and a
+  name-only check passes on the wrong one: `\connect` does **not** close the old connection when the new
+  one fails — psql prints `Previous connection kept` and carries on — so a pasted
+  stream would otherwise run one target's deletes against the previous one, which
+  the deliberately password-free conninfo makes likely rather than remote.
+  `ON_ERROR_STOP` alone does not help an interactive paste; the guard aborts the
+  transaction, so every following statement is refused and `COMMIT` rolls back.
+  Identity includes the cluster's `system_identifier`: address and port are NULL
+  for every Unix-socket connection, so two socket clusters holding the same
+  database name were indistinguishable without it. It also includes the server's
+  configured `port` and its `data_directory`, because a *physical copy* of a
+  cluster — a replica, or a promoted staging clone — carries the identifier of
+  the cluster it was cloned from. Measured with a `pg_basebackup` clone of a live
+  cluster, both reached over `/tmp`: same database name, same identifier, both
+  address and port NULL, and the clone's block would have scrubbed the origin.
+  `current_setting('port')` answers over a socket where `inet_server_port()` is
+  NULL, and two postmasters on one machine cannot hold one data directory. The
+  data directory is restricted to `pg_read_all_settings`, so it is read out of
+  `pg_settings` rather than with `current_setting`, which raises `permission
+  denied to examine ...` for a role without it: the view omits the row, both
+  sides compare NULL, and an ordinary role loses the discriminator rather than
+  the run — verified with a plain `LOGIN` role, which still refuses the clone on
+  the port alone. A discriminator the PLANNING role could not read is now
+  dropped from the guard rather than compared against the value it never
+  learned: `None` there means "unknown", not "the target has none", and such a
+  term refuses a CORRECT paste whenever the pasting role can read what the
+  planning role could not — measured, with `EXECUTE` revoked on
+  `pg_control_system()` (a per-database ACL) the emitted guard aborted the whole
+  paste with `permission denied for function pg_control_system`. Address and
+  port are still compared when NULL, because for a Unix-socket target that IS
+  the answer.
+  `--dry-run` now also refuses to print a runnable script for a profile the
+  command will not scrub without `--force`. The guard runs only when the run
+  writes, which was harmless while the dry run merely described a plan and is
+  not now that it prints a paste-ready script whose `\connect` names the
+  protected database — measured, `--dry-run --profile production` printed 14
+  runnable lines for a target the same command refuses to touch, with the
+  password removed on purpose and `.pgpass` to supply it. The plan report is
+  unchanged; only the script is withheld.
+  A positive `--sample` percentage of a nonempty table now always selects at
+  least one row. `ceil` alone did not guarantee the documented round-up: a
+  denormal percentage (`5e-324` parses as finite and greater than zero) makes
+  `total * pct / 100.0` UNDERFLOW to `0.0`, measured for a table of 1 and of 10
+  rows, and `ceil(0.0)` is `0` — a zero-row seed, whose root
+  `DELETE ... WHERE NOT EXISTS (keep)` then matches every row and empties the
+  table it was asked to sample.
+  The compaction that runs AFTER the transaction — `VACUUM (FULL)` cannot run
+  inside one — is fenced by psql rather than by the guard, because the guard
+  cannot reach it: the printed `COMMIT` turns its abort into a `ROLLBACK` and
+  clears the aborted state. Measured, that gap was reachable — a clone's script
+  pasted at its origin had all 64 destructive statements refused and then ran six
+  `VACUUM (FULL, ANALYZE)` statements on the origin, each taking an `ACCESS
+  EXCLUSIVE` lock. The script now emits the same predicate through `\gset` and
+  wraps the compaction in `\if`; both failure modes are closed (a false value
+  prints `query ignored`, and a `\gset` whose query errored leaves the variable
+  unset, which `\if` reports and still skips). That fence also requires the
+  transaction to have SUCCEEDED, not merely to be on the right server: measured,
+  a statement failing inside the transaction for a reason the guard knows
+  nothing about still left an endpoint-only probe true, and all six
+  `VACUUM (FULL, ANALYZE)` ran — `ACCESS EXCLUSIVE` locks and full rewrites on a
+  target whose scrub had just rolled back. psql's own `:ERROR` does not catch it
+  (it reports that `ROLLBACK` as success), so the transaction's last statement
+  sets a `\gset` flag that an aborted transaction cannot set. That flag spans the
+  whole stream rather than one target: `execute` returns on the first target that
+  fails and never touches the rest, and the printed script now matches —
+  measured with two targets and a failure in the first, the second target's
+  `\connect` and its entire destructive block used to run anyway, leaving a
+  partially scrubbed topology and a stream that ends with no error at all.
+  The printed transaction now also emits the `REFRESH MATERIALIZED VIEW`
+  statements the run performs, in the same dependency order and the same place
+  inside the envelope. A materialized view keeps its own physical copy of what
+  it selected, so a script that skipped them left the view's heap holding the
+  pre-scrub rows — measured against a view over `users.email`, the base table
+  finished with 0 original addresses and the view still held all 200.
+  The size report measures over EVERY materialized view in `public`, enumerated
+  flat, rather than over the dependency-ordered list the refresh uses: that list
+  comes from a recursive walk with a depth cap, and a view past it would be left
+  out of both sides of the ratio while still holding its heap. Refresh order and
+  measurement are now separate questions with separate lists.
+  Both lists are now drawn from the views the run actually has to refresh:
+  every POPULATED view, plus every view one of those reads. A materialized view
+  left `WITH NO DATA` holds no rows — selecting from one raises `materialized
+  view "…" has not been populated` — so it has no pre-scrub copy to rebuild, and
+  refreshing it ran the view's query and materialized a heap the database
+  deliberately did not have: on the expensive query such a view usually guards,
+  time and disk spent inside the scrub's transaction, where exhausting either
+  rolls the whole run back. One a populated view reads is the exception, because
+  the dependent's own `REFRESH` fails while its source is unpopulated and an
+  unrefreshed populated view keeps its pre-scrub rows — so it is refreshed, and
+  then emptied again with `REFRESH ... WITH NO DATA` once the dependent has been
+  rebuilt. Measured: the dependent keeps its rows and its populated state when
+  its source is emptied afterwards, so both relations end as the run found them.
+  That closing `REFRESH ... WITH NO DATA` covers EVERY view that had no data,
+  not only the one populated for a dependent, because skipping one outright left
+  a race: probing runs on its own connection before the apply transaction, which
+  locks base tables and no views at all, and `REFRESH` needs only `ACCESS SHARE`
+  on the tables it reads. Measured — a concurrent `REFRESH` of a skipped view
+  fired while the scrub held `SHARE ROW EXCLUSIVE` on `users` did not wait, and
+  the run committed with `users` at 2 rows and the view holding all 200 original
+  addresses. It costs nothing that skipping saved: `REFRESH ... WITH NO DATA`
+  does not run the view's query, measured on a view defined as `SELECT 1/0`,
+  where it succeeds and a plain `REFRESH` raises `division by zero`.
+  `--dry-run` now prints the compaction after EVERY target's transaction rather
+  than inside each one, and turns `ON_ERROR_STOP` off first, matching the
+  executor: it commits every target in one loop and compacts in a second, where
+  a failed `VACUUM` is a warning and the next target is compacted anyway.
+  Measured on two TCP targets — a first-target `VACUUM (FULL, ANALYZE)` that
+  timed out against a concurrent reader ended the script at rc=3 with that
+  database scrubbed and sampled and the SECOND still holding all 200 of its
+  original addresses. Each target's compaction reconnects and re-checks the
+  endpoint before running, so a failed `\connect` in that pass cannot compact
+  the previous target's database.
+  Each target's block also proves the reconnect landed where it was aimed, from
+  psql's OWN `:HOST`, `:PORT` and `:DBNAME` rather than from anything the server
+  reports. The in-transaction guard compares server-side values, and those are
+  not the connection's identity: `inet_server_addr()`/`inet_server_port()` are
+  the endpoint the SERVER accepted on, measured through a forwarder as
+  `127.0.0.1:5433` for a session connected to `127.0.0.1:15433`. Two servers
+  behind different forwards, or in separate container networks sharing a private
+  address, report the same pair — and with a physical clone's inherited
+  `system_identifier` and a container-local `data_directory`, every value that
+  guard compares can match on two different databases. psql's variables are
+  connection-specific instead, and a failed `\connect` leaves them describing the
+  PREVIOUS connection (measured: `HOST=127.0.0.1 PORT=15433 DBNAME=postgres`
+  before and after a `\connect` to port 25433 failed). Measured end to end — one
+  target's script pasted interactively into a session on another, with the
+  reconnect refused: `Previous connection kept`, then every statement from
+  `BEGIN;` onward reported `query ignored`, the server-side guard never ran at
+  all, and the pasting session's database was untouched at 200 rows. Only the
+  components a conninfo STATES are asserted: `PGPORT` can differ between the
+  machine that planned the run and the one pasting the script, so a guessed
+  default would refuse a correct paste, and an omitted component cannot be what
+  distinguishes two targets anyway. A comma-separated FAILOVER list is matched
+  the way libpq resolves it, since psql's `:HOST`/`:PORT` name the single server
+  it selected (measured: `?host=127.0.0.9,127.0.0.1` reports `HOST=127.0.0.1`):
+  host and port are paired POSITIONALLY, with a single port broadcast to every
+  host. Measured on 16.13 — `host=127.0.0.9,127.0.0.1&port=5433,5434` connected
+  to 5434, the port belonging to the host it reached, and the same hosts with
+  `port=5433` connected to 5433 — so `a:5433` is not an endpoint
+  `host=a,b&port=5432,5433` names, and matching the two independently would have
+  accepted a retained connection to one that was never configured. A length
+  mismatch libpq itself rejects (`could not match 3 port numbers to 2 hosts`)
+  proves nothing rather than inventing a pairing. A conninfo stating no host
+  proves nothing either — unreachable, since an empty authority is already
+  refused as an unprintable target, but stated rather than left to that distant
+  refusal, because omitting the host term would leave the database name standing
+  alone against a physical clone that shares it.
+  A conninfo that leaves the PORT to libpq is now REFUSED rather than printed.
+  psql reports the resolved port in `:PORT`, and the same host-only URI resolves
+  to 5433 under `PGPORT=5433` and to 5432 without it — two different servers — so
+  accepting any port for the host would drop the discriminator on exactly the
+  pair the proof exists to tell apart. Embedding the port this run resolved is
+  not honest either: libpq's resolution can come from a service file this
+  command does not read. State the port, or run without `--dry-run`, where the
+  command holds its own connection and never has to prove which one it is.
+  The compaction pass carries the same proof, not the endpoint alone: it is a
+  second `\connect` with the same retained-connection failure, and a
+  `VACUUM (FULL)` on the wrong target locks and rewrites every table it names.
+  The printed transaction also asserts `session_replication_role = origin`, the
+  precondition the run refuses to PLAN without. `origin` fires `O`/`A` triggers
+  and `replica` fires `R`/`A`, and the trigger walk only ever inspected the
+  first set — but the script inherits whatever the pasting session is in.
+  Measured: with the session in `replica` and the printed `\connect` failing, so
+  that session is retained ON the right endpoint and passes both the psql proof
+  and the endpoint guard, the assertion raised and the transaction aborted with
+  the database untouched at 200 rows. Asserted rather than pinned, as the
+  command refuses rather than resets: the setting is `SUSET`, so a `SET LOCAL`
+  would fail for the ordinary role the script is written for.
+  The dependency walk now traverses ordinary views. `pg_depend` records only the
+  hop a rewrite rule actually took, so matching a materialized view's dependency
+  straight against the set of materialized views lost both hops of `a_report ->
+  bridge_view -> z_source` and left two roots that sorted by name. Measured:
+  `a_report` refreshed FIRST from a `z_source` still holding pre-scrub rows, and
+  since refreshing a source does not update a view built from it, the run
+  reported success with `users` at 2 rows, 0 original addresses in the base
+  tables and in `z_source`, and all 200 still in `a_report`. Rule dependencies
+  are now read between relations of any kind and walked through anything that is
+  not a materialized view, so the edge is recovered however many ordinary views
+  sit in between. The walk also follows the one function hop PostgreSQL records,
+  `rewrite -> pg_proc -> pg_class`, which a `BEGIN ATOMIC` body produces — and
+  REFUSES a view read through a function whose body it does not track. Measured
+  on `a_report -> bridge_fn() -> z_source` with a string-literal body:
+  `pg_depend` holds `a_report -> pg_proc(bridge_fn)` and the function holds no
+  relation dependency at all, so no path exists to walk; the views sorted by
+  name, `a_report` refreshed FIRST from a stale `z_source`, and the run reported
+  success with `users` at 2 rows, both base tables clean, and all 200 original
+  addresses still in `a_report`. The same shape with a `BEGIN ATOMIC` body is
+  ordered correctly instead — measured, `z_source` refreshed first despite
+  sorting later, both views ending clean. That refusal covers every relation
+  REACHABLE from a materialized view, not only the views themselves: the walk
+  crosses ordinary views, so a function called by one of those is just as
+  invisible. Measured on `a_report -> bridge_view -> bridge_fn() -> z_source`,
+  where only the ordinary view's rule names the function — a check restricted to
+  materialized views skipped it, `a_report` refreshed first from a stale
+  `z_source`, and the run reported success with all 200 original addresses still
+  in `a_report`. Both the traversal and the refusal close over function-to-
+  function calls as well. A tracked function that calls another tracked function
+  yielded no edge when only its own relation dependencies were read — measured on
+  `a_report -> outer_fn() -> inner_fn() -> z_source`, `a_report` refreshed first
+  and kept all 200 — and a tracked function calling an OPAQUE one passed the
+  refusal on the strength of its own relation dependency while the body that
+  actually read `z_source` was invisible. Both are now followed to the end of the
+  chain: measured, the tracked pair orders `z_source` first and ends clean, and
+  the opaque one is refused as `a_report via opaque_inner` before a row is
+  written. Opacity is read from `pg_proc.prosqlbody`, the parsed body a
+  `BEGIN ATOMIC` function has and a string-literal, `plpgsql` or C function does
+  not — the property itself, where "records no relation dependency" was a proxy
+  for it and a wrong one. A tracked wrapper that only calls another tracked
+  function records no relation of its own and was refused although the closure
+  can follow it to the table: measured on `a_report -> wrap_fn() -> inner_fn() ->
+  z_source`, refused as `via wrap_fn`, and now scrubbing with `z_source`
+  refreshed first and both views clean. `prosqlbody` is PostgreSQL 14 and is
+  probed for with `has_catalog_column`, like every other version-specific
+  catalog column this file reads; on an older server every function reached from
+  a view is treated as opaque, which is what it is, since no SQL body is parsed
+  into the catalog before 14. The function closure is seeded from every catalog
+  path a rewrite rule can record, not only `pg_proc`. Measured over the four
+  indirections: a direct call, a cast and an aggregate all record `pg_proc`, but
+  a user-defined OPERATOR records `pg_operator` and a DOMAIN's `CHECK` records
+  `pg_type`, each with no `pg_proc` row at all. The operator case was a silent
+  leak — `a_report` reading `z_source` only through `1 ==> 200`, whose
+  implementation is a tracked `BEGIN ATOMIC` function, produced no edge, the two
+  views sorted by name, and the run reported success with `users` at 2 rows,
+  `z_source` clean, and all 200 original addresses still in `a_report`. Both are
+  now followed: measured, `z_source` refreshes first against alphabetical order
+  and `a_report` ends with 0 original addresses, and an opaque body behind
+  either an operator or a domain check is refused rather than ordered around.
+  Those paths are resolved at every step of the closure, not only where it is
+  seeded from a rewrite rule. A tracked function that itself uses a custom
+  operator records `pg_proc -> pg_operator`, and one that casts to a domain
+  records `pg_proc -> pg_type`; following only `pg_proc -> pg_proc` from a
+  reached function missed both. Measured on `a_report -> harvest() ->
+  (1 ==> 200) -> z_source`, every body `BEGIN ATOMIC`: no edge at all, `a_report`
+  refreshed FIRST, and the run reported success with `users` at 2 rows,
+  `z_source` clean and all 200 original addresses still in `a_report`. One
+  relation now resolves a dependency to the function it denotes, and both the
+  seed and the recursive step read it, so the two cannot diverge again.
+  A partition leaf whose top-level parent is emptied by `[framework] purge` is
+  treated like one under `never_include` — its outgoing foreign key is ignored
+  rather than refused. Purging the parent removes every leaf row before the
+  sample runs, so nothing can dangle, and refusing it left NO remedy: measured, a
+  partitioned `autumn_jobs` with a leaf-local key to `countries` was refused with
+  "drop the table with `never_include`", and naming a framework table there is
+  itself refused with "framework-owned rows are emptied with `[framework]
+  purge`". The purge-order deferral the excluded-leaf path already computes is
+  applied unchanged.
+  Two refusals close paths that were silently wrong. A materialized-view chain
+  the dependency walk cannot reach the end of is refused rather than partly
+  refreshed: measured on a 36-deep chain, the run refreshed 33 views, reported
+  success, left `users` with 0 original addresses and the deepest view holding
+  all 200. And `--dry-run` refuses to print a script for a Unix-socket target
+  whose role cannot read `data_directory`: over a socket the address and port
+  are NULL and a physical copy shares its origin's `system_identifier`, so
+  nothing distinguishes the two. Measured with two clusters on port 5433 under
+  different socket directories, the clone's script pasted at its origin after a
+  failed `\connect` — the guard passed, the transaction committed, and the
+  ORIGIN went from 200 users to 25. A privileged socket role and any TCP target
+  still print. That refusal now covers EVERY Unix-socket target, not only one
+  whose role cannot read `data_directory`: nothing the server reports over a
+  socket identifies the instance. `system_identifier` is copied by any physical
+  clone, the configured port is shared by two clusters on different socket
+  directories, and `data_directory` is server-local — two containers each
+  answering `/var/lib/postgresql/data` match on it while being different
+  databases. Connect over TCP, where the address and port identify the endpoint,
+  or run without `--dry-run`. The guide states that requirement under its own
+  heading instead of walking through a socket guard the refusal now makes
+  unreachable.
+  A purged partition leaf whose outgoing key points into a subsetted table now
+  records that the purge must run BEFORE the sample, the mirror of the deferral
+  the same path already recorded. Without it, another edge deferring the very
+  same purge left two contradictory conclusions standing and the run failed at
+  delete time instead of refusing.
+  Its values are asked of the
+  target connection rather than parsed out of its URL — libpq defaults an omitted database name to the user name, so deriving it
+  meant reimplementing those rules — and every call is `pg_catalog`-qualified and
+  emitted after the session pins, so a `public.current_database()` in the pasting
+  session's `search_path` cannot answer for the catalog.
+  Where a schema has an `#[encrypted]` column, `--dry-run` now reports the plan
+  and WITHHOLDS the runnable script entirely. That rewrite has no SQL text — the
+  value is re-encrypted per row under the target's key, which cannot be printed
+  without embedding that key — and a script printed without it commits a sampled
+  copy still holding the original production ciphertext with every other column
+  scrubbed, the one state this command promises is impossible. Nor can a marker
+  in the stream close that: a `RAISE EXCEPTION` aborts only its own transaction,
+  the printed `COMMIT` clears the aborted state, and the following `VACUUM
+  (FULL)`s and the NEXT target's `\connect` and DELETEs then run for real —
+  measured, a stopped first target still took a second cluster from 200 rows to
+  0. The classification report, the sample plan and the purge list are unchanged;
+  only the paste-ready SQL is refused.
+  `--dry-run` also refuses a target configured with a keyword-form connection string
+  (`host=... password=...`): each printed block is destructive and the `\connect`
+  line above it is what points `psql` at the right database, but a keyword-form
+  string cannot be printed with its password removed for certain, so the
+  boundary is withheld — and a block without one runs against whichever database
+  the pasting session is already on. Configure such a target as a URI to use
+  `--dry-run`. The URI it does print is re-encoded the way libpq reads one,
+  through the parser and encoder in `pg.rs` rather than `url::Url`'s
+  `query_pairs()`: the latter applies `x-www-form-urlencoded` rules and writes a
+  space back as `+`, which libpq — which only percent-decodes — then reads
+  literally. Measured against psql 16.13, an operator's
+  `?options=-c%20search_path%3Dpg_catalog` connects and sets the path, while the
+  `+` form printed in its place did not connect at all (`FATAL: unrecognized
+  configuration parameter "+search_path"`) — leaving the session on the previous
+  database, which is the case the target guard exists for. The size report now
+  also counts the materialized views the run
+  refreshes: a view is rebuilt from whatever survives the sample, so one over
+  reference data does not shrink, and measuring the sampled base tables alone
+  reported `488.0 kB → 232.0 kB` on a database still holding a 44 MB view.
+  An excluded partition leaf's outgoing foreign key is still ignored for the
+  walk and the re-count — emptying its top-level parent takes every leaf row, so
+  it cannot dangle — but it now keeps its say over removal ORDER: a leaf pointing
+  into a `[framework] purge` table defers that purge, instead of letting it run
+  first against rows the leaf has not lost yet and failing the run.
+  A `--sample` spec splits at its LAST `=`, so a table whose quoted name
+  contains one (`events=2026`) can be named as a root, and the table portion is
+  taken verbatim rather than trimmed — a quoted name may begin or end with a
+  space, and trimming silently retargeted such a root at whatever table the
+  trimmed name happened to hit. A root that differs from a real table only by
+  surrounding space is now reported as unknown, with the trimmed name suggested.
+  See the
+  [migration guide](docs/migrations/next.md#scrub-a-delete-trigger-or-rule-on-a-table-autumn-db-scrub-empties-is-refused). Legacy
+  `INHERITS` inheritance is refused for a sampled run (a statement naming the
+  parent reaches the child, which the plan models separately); an exact `100%`
+  root counts as removing no rows, so it no longer trips the outside-reference
+  refusal; and `--dry-run` wraps its SQL in `BEGIN`/`COMMIT`, without which the
+  printed `ON COMMIT DROP` keep-sets could not be run as shown. With `--output`,
+  the artifact is now captured BEFORE the sampled tables are compacted: locks are
+  released at commit, and running a whole-schema `VACUUM (FULL)` first would
+  stretch the commit-to-dump window — during which a concurrent write could land
+  unscrubbed rows in the artifact — from moments to minutes, for no benefit,
+  since `pg_dump` is logical and a compacted table dumps to the same bytes.
+  Finally, every promised-empty table is COUNTED after all writes and the run
+  aborts if any holds rows: each emptying statement fires triggers, one of which
+  can refill a table an earlier statement emptied, so the promise is verified
+  rather than ordered for. The integrity re-count also now covers a retained
+  table's foreign keys into framework tables nothing empties, which a `NOT VALID`
+  constraint over a pre-existing orphan would otherwise hide — including from a
+  full-copy or exact-100% table, which keeps every row and so is the likeliest to
+  still hold one. `--dry-run` prints the emptiness assertions too, as `DO` blocks
+  that abort, so the advertised SQL refuses exactly where the real run does — as
+  do the foreign key checks, and the printed sequence now opens with the same
+  `SHARE ROW EXCLUSIVE` locks the run takes, without which a paste into a target
+  still accepting writes would let a row inserted after its `DELETE` survive. A foreign key declared on a partition rather than
+  cloned onto it from its partitioned parent is likewise refused, rather than
+  dropped from the walk and the integrity re-check as if it were a clone. The
+  re-check honours each constraint's own NULL rule, so a partly-NULL composite
+  reference is skipped under `MATCH SIMPLE` but counted under `MATCH FULL`,
+  where it is itself a violation.
+
+- **cli:** `autumn db scrub --dry-run` refuses a target whose connection string
+  cannot name ONE endpoint, alongside the existing socket and port-less
+  refusals. A conninfo stating `hostaddr` selects the endpoint independently of
+  `host`, and psql reports no variable for it — measured,
+  `host=not-a-real-host.example hostaddr=127.0.0.1` connects to 127.0.0.1
+  although the name does not resolve, psql still reports
+  `HOST=not-a-real-host.example`, and `\echo [:HOSTADDR]` prints the name back
+  unexpanded because no such variable exists. One naming several endpoints is
+  chosen between per connection: 20 connections with `load_balance_hosts=random`
+  split 7/13 across two members, so the run sizes the sample on one member and
+  the pasted script runs on another. Against a two-member URI whose first member
+  held 200 rows and whose second held none, ten dry runs printed `LIMIT 2` six
+  times and `LIMIT 0` four times — and `LIMIT 0` selects no root rows, so the
+  delete pass empties the table instead of sampling it. Both still scrub without
+  `--dry-run`, where the command sizes and writes on the one connection it holds.
+- **cli:** `autumn db scrub --dry-run` sizes every target before printing a
+  line. Sizing opens its own connection and reads live counts, so it was the one
+  fallible step left inside the emission loop, and a failure on a LATER target
+  landed after an EARLIER one's complete transaction had been printed, `COMMIT`
+  included. Measured on a control plus one shard where the role could read the
+  catalogs but not `SELECT` the shard's `users`: the run exited 1 with
+  `permission denied for table users`, having already printed the control's
+  whole block — one `COMMIT`, seven `DELETE FROM` — so saving that output and
+  running it would scrub the control and leave the shard untouched, the
+  half-anonymized topology the classify-then-apply split exists to prevent. Now
+  nothing runnable is printed at all when any target cannot be sized (measured:
+  zero `BEGIN`, `COMMIT`, `DELETE FROM` and `ON_ERROR_STOP` lines), and a
+  healthy two-target run still prints both blocks in full.
+- **cli:** `autumn db scrub` proves its promised-empty tables are empty AFTER
+  the materialized-view refreshes, not before them. `REFRESH` runs the view's
+  query, and that query can call a function whose body INSERTs — measured on a
+  tracked `BEGIN ATOMIC` function writing into a `never_include` table, the run
+  reported `audit_logs: 503 -> 0 row(s)` and `✓ Scrub complete` while the table
+  held three rows carrying real addresses. Volatility does not identify such a
+  function: measured, `CREATE FUNCTION ... STABLE BEGIN ATOMIC INSERT ...` is
+  accepted, so a `provolatile` test would miss exactly this one. Checking after
+  every write covers both this and the emptying-trigger case the check was
+  written for, and needs no guess about which functions can write. The run now
+  refuses and rolls back, naming the table.
+- **cli:** `autumn db scrub` no longer refuses a materialized view that uses a
+  fully tracked user-defined **aggregate**. An aggregate's `pg_proc` row is a
+  shell with no body of any kind, so `prosqlbody` is NULL for a traceable one
+  and the opacity check reported the aggregate itself as untraceable — measured,
+  an aggregate whose transition function is a tracked `BEGIN ATOMIC` body was
+  refused as `a_report via gather`, blocking a valid scrub. Only `prokind = 'a'`
+  is exempt, and only the shell: everything an aggregate runs is a separate
+  `pg_proc` the closure already reaches, so an opaque transition or final
+  function is still named (measured on both). A window function is not exempt —
+  it has no body because it is written in C, which is opacity rather than a
+  shell.
+- **cli:** `autumn db scrub` refuses a materialized view that reads relations
+  named in a **string the server executes**. `query_to_xml` takes its query as
+  text, and `schema_to_xml`/`database_to_xml` take no relation argument at all,
+  so `pg_depend` records nothing about what they read — measured, a view defined
+  `SELECT query_to_xml('SELECT email FROM z_source', …)` records only itself.
+  Refresh order comes from those dependencies, so the two views sorted by name,
+  the dependent refreshed FIRST from a stale source, and the run reported
+  `✓ Scrub complete` with the base tables clean and all 200 original addresses
+  still in the dependent. Nothing in the catalog can recover the edge, so it is
+  refused. `table_to_xml` is not refused: measured, its `regclass` argument
+  records `pg_class -> users` like any other reference. Detected from the rule's
+  PARSED tree, so a column or literal that merely spells the name cannot trip it.
+- **cli:** `autumn db scrub` no longer refuses on rules and views its refresh
+  never evaluates. Two false refusals, both measured: an `ON INSERT` rule on a
+  table a view reads refused the run as `a_view via log_it`, though a `REFRESH`
+  is a `SELECT` and can never fire it — the walk now follows only `_RETURN`
+  rules, the ones that define a view. And a standalone view left `WITH NO DATA`
+  refused the run as `lonely via opaque_fn`, though it only ever gets
+  `REFRESH ... WITH NO DATA`, which provably never runs its query — the opacity
+  walk now covers the views the run will actually evaluate.
+- **cli:** `autumn db scrub --dry-run` refuses a target whose endpoint is chosen
+  by the environment rather than by `host`/`port`: `PGHOSTADDR`, or a service
+  file named by `service=` in the connection string or by `PGSERVICE`. All three
+  were measured reaching 127.0.0.1 through `host=not-a-real-host.example`, a
+  name that does not resolve, with psql still reporting that name as `:HOST`. A
+  pasting session brings its own environment, so what this run resolved need not
+  be what it resolves. Each still scrubs without `--dry-run`.
+- **cli:** `autumn db scrub` re-checks the sample's own postconditions after the
+  materialized-view refreshes. `sample::apply` selects the subset, deletes,
+  verifies the foreign keys and counts — all before the refreshes, which are the
+  last writes in the transaction and can perform DML of their own. Measured, a
+  tracked `BEGIN ATOMIC` function writing into `comments` left the run reporting
+  `comments: 403 → 4 row(s)` and `✓ Scrub complete` over a table holding 7 rows,
+  3 of them never rewritten: the subset was not the subset, and the reported
+  number was not the number. The counts and the foreign-key checks now run again
+  after every refresh, and the run refuses and rolls back if either moved. A
+  refresh that UPDATEs in place without changing a count or invalidating a
+  reference is not detected, and is not claimed to be.
+
+- **An actuator path drift gate for the docs corpus [no-plugin]:** the five
+  docs gates that came before it cover the link a reader clicks
+  (`check-docs-links.sh`), the command they run (`check-docs-cli.sh`), the
+  variable they set (`check-docs-config.sh`), the config key they write
+  (`check-docs-toml.sh`) and the Rust path they import
+  (`check-docs-symbols.sh`). None of them looks at the sixth thing a reader
+  copies off a page: the **URL they curl**. `scripts/check-docs-routes.sh`
+  resolves every `/actuator/…` path in the corpus — **250 occurrences across
+  206 files** — against the paths the framework actually mounts, and it runs in
+  CI's docs-only job beside the other five. The corpus is every markdown surface
+  a reader can end up holding, which is wider than a `docs/`-shaped view of one:
+  besides the guide it covers every `*.md.tmpl` (`new.rs` writes
+  `templates/README.md.tmpl` as every scaffolded application's README), all of
+  `examples/` (the wiki example compiles `content/*.md` in and serves them at
+  `/docs/…`), `.claude/skills/` (a second skill tree the agent machinery loads
+  by name, whose `run-autumn` drives a real server with `curl`), and every file
+  a `Cargo.toml` names with `readme = "…"` — a crates.io landing page is
+  reader-facing by publication rather than by where it sits, and reading the
+  manifests keeps vendor notes and starter templates out.
+  It is the only one of the six whose failure lands against a *running app*
+  rather than while the reader is still reading, and the actuator is the
+  operator surface: `/actuator/health` is what a load balancer probes,
+  `/actuator/jobs` and `/actuator/tasks` are what someone opens at 3am to find
+  out why a scheduled backup stopped. `curl` answers `404 Not Found` with no
+  hint of the right name, and because most of the surface sits behind
+  `[actuator] sensitive = true`, that 404 reads like an endpoint they failed to
+  *enable* rather than one that was never there — so the reader goes and debugs
+  their own deployment instead of doubting the page.
+  It found **4 live defects**, all fixed here.
+  `docs/guide/coming-from-other-frameworks.md` is the sharp one: its
+  Spring→Autumn actuator table exists for the sole purpose of telling a
+  migrating reader what an endpoint is *called* here, and its `scheduledtasks`
+  row said the name was unchanged. It is not — Autumn serves scheduled tasks at
+  `/actuator/tasks`, as a `scheduled_tasks` object keyed by task name rather
+  than Spring's per-trigger-type lists — so the one page
+  written to prevent that 404 was the page causing it, and because the real
+  endpoint shares no token with the word the reader searched for, searching
+  again could not rescue them. `docs/guide/generators.md` and
+  `docs/guide/tutorial/07-htmx.md` both told readers that `autumn routes` and
+  `/actuator/routes` report the declared method behind an HTMX method override;
+  there is no `/actuator/routes`, and the route table with its declared methods
+  is served from `/actuator/graph`. The fourth is the one worth pausing on:
+  `.claude/skills/run-autumn/SKILL.md` had *already discovered* that
+  `/actuator/routes` 404s — someone hit it driving a real server and wrote the
+  warning down — but concluded "the route table comes from the CLI, not the
+  actuator", which is also wrong. So the corpus held the mistaken claim and its
+  own correction in different files, each stale in its own direction, with
+  nothing connecting them. That is precisely the state a drift gate exists to
+  make impossible.
+  The truth set is the string literals passed to `actuator_route_path()` at a
+  `.route(…)` **mount**, across non-test workspace Rust source — the one path
+  builder every actuator mount goes through, whose own doc comment says why
+  ("so paths match byte-for-byte"). Nothing to regenerate: a renamed endpoint
+  lands in the same commit as the rename. The same builder is also called from
+  two inventories (`actuator_endpoint_paths`, `actuator_mutating_routes`) and
+  from `alerts.rs`; those are read as second copies of a list, never as evidence
+  that a URL answers, so an endpoint dropped from the router but left in an
+  inventory cannot go on blessing documentation for a path nothing serves.
+  `#[cfg(test)] mod` bodies are stripped for the same reason — a drift gate must
+  not be able to inherit the drift it is checking for. Resolution is deliberately permissive in three ways that each make the
+  gate report *fewer* paths — a mounted `{param}` matches a concrete value
+  (`/actuator/loggers/root`), a documented path that is a prefix of a mounted
+  one resolves *when a page names it* (`/actuator/webhooks`), and a `*` segment
+  matches anything (`/actuator/*`) — and none of them can rescue a name that is
+  simply not there. On a line that hands the reader a **request** — a `curl`, or
+  an HTTP method followed by a path — the prefix rule is withdrawn, since there
+  a prefix is a URL someone sends and `curl …/actuator/webhooks` is a 404. A page that must name a foreign framework's endpoint waives it in
+  place with `<!-- route-surface-allow: /actuator/… — reason -->`, scoped to its
+  own block and the one above it. Run it with
+  `./scripts/check-docs-routes.sh` (`--list` for the mounted surface,
+  `--self-test` for the matcher's own cases).
+
+- **sqlite:** durable background jobs and a single-host scheduler on the SQLite
+  tier (issue #1907). `jobs.backend = "sqlite"` puts the queue in an
+  `autumn_jobs` table in the app's own database file, so `#[job]` work is
+  durable and restart-safe with **no Redis and no Postgres**. SQLite serializes
+  writers, so a worker claims a row with one
+  `UPDATE … WHERE id = (SELECT … LIMIT 1) RETURNING …` — the single-host analog
+  of `FOR UPDATE SKIP LOCKED` — and a claim left behind by a crashed worker is
+  re-enqueued once it outlives `jobs.sqlite.visibility_timeout_ms`. Attempt
+  counting, exponential backoff, dead-lettering, `#[job(unique)]` windows,
+  `#[job(concurrency = N)]` limits, named queues and `[jobs] pin` all behave as
+  they do on Postgres, and the `/admin/jobs` dashboard reads the table, so every
+  process on the host sees one queue. Workers poll (`jobs.sqlite.poll_interval_ms`,
+  default 250ms) because SQLite has no `LISTEN`/`NOTIFY`. The runtime creates
+  the table and its indexes itself — framework migrations are Postgres SQL — so
+  there is nothing to run by hand. Alongside it, `scheduler.backend = "sqlite"`
+  leases each `(task, tick)` in an `autumn_scheduler_leases` table, so several
+  processes on one host elect exactly one leader per tick; the lease expires
+  after `scheduler.lease_ttl_secs` rather than wedging the task when a leader
+  dies. A durable SQLite queue is shared by both processes of a web/worker
+  split, so that topology is now valid on the tier. Both backends need the
+  non-default `sqlite` cargo feature, and both are refused with an actionable
+  message on a build without it. Nothing on the Postgres path changes.
+  `autumn_web::lock::Lock` works on the tier too: the same API takes a lease row
+  in an `autumn_locks` table instead of a `pg_advisory_lock` session, so the
+  processes sharing the file contend, a live holder renews in the background,
+  and a dead one's lock frees at the lease expiry rather than wedging. It is
+  single-host in scope and not re-entrant; both are documented.
+  **Breaking:** `JobConfig` gains a public `sqlite` field and `SchedulerBackend`
+  gains a `Sqlite` variant, so a struct literal over `JobConfig` or an
+  exhaustive `match` on `SchedulerBackend` needs one line — see the
+  [migration guide](docs/migrations/next.md).
+
+- **sqlite:** connections opened at the same instant against a brand-new
+  database file no longer fail with "database is locked". `PRAGMA journal_mode
+  = WAL` takes an exclusive lock and SQLite does not run the busy handler for
+  it, so the `busy_timeout` set one pragma earlier never covered it: whichever
+  connection lost that race failed setup, and the request behind it got a 500.
+  The journal mode is a persistent property of the file, so the setup now
+  retries briefly and every retry after the winner is a no-op. Reachable
+  whenever several subsystems open the database at boot, which the durable
+  SQLite job runtime above does.
+- **web:** `AutumnError` now reads back its own validation details (issue
+  #2587). `details()` returns the per-field message map for a validation
+  failure and `None` for anything else, `code()` returns the stable problem
+  code the `application/problem+json` body carries
+  (`autumn.validation_failed`, `autumn.not_found`, …), and `message()`
+  returns the wrapped error's message alone — the string the body's `detail`
+  shows. A consumer with no HTTP response to parse (a GraphQL resolver, a
+  `#[task]`, a CLI, an MCP tool, a `MutationHooks` impl) no longer has to
+  re-run `validator` to say which field failed. The body is unchanged: `code`
+  now comes from one derivation shared with `code()`, so the two cannot
+  disagree. Guide: `docs/guide/forms.md`, "Reading the failure back".
+
+- **tls:** tenants can connect their own domains, each with its own
+  automatically issued and renewed certificate (issue #1635). Enable
+  `[server.tls.acme.custom_domains]` with an ingress hostname (and addresses,
+  for apex domains) and the whole journey ships: the app registers a hostname
+  for a tenant, autumn renders the exact CNAME or A/AAAA records to show that
+  tenant, and the domain moves through queryable `pending_dns` → `verified` →
+  `issuing` → `active` states carrying the reason whenever it is stuck. No
+  ACME order is created until autumn independently confirms the hostname
+  resolves to this deployment; once active, requests on that `Host` resolve to
+  the owning tenant and are served that domain's certificate by SNI. An SNI
+  hostname nobody registered is refused at the handshake without contacting the
+  CA, and issuance is capped per domain and deployment-wide with exponential
+  backoff on repeated failure. Renewal is per domain and isolated: a failure
+  names the domain and tenant in `/actuator/health` and raises the
+  `scheduled_task_failure` alert while every other domain keeps serving and
+  renewing. Certificates load incrementally through a bounded cache, so a
+  1,000-domain deployment does not need them all resident. Offboarding stops
+  routing, serving and renewal and deletes the stored certificate; the new
+  `custom_domains` retention dataset prunes abandoned registrations and
+  orphaned certificates. `autumn doctor` grades the section and, with
+  `--online`, flags registered domains whose DNS no longer points here. See
+  `docs/guide/tls.md`.
+- **A Rust symbol drift gate for the docs corpus [no-plugin]:** the four docs
+  gates that came before it cover the link a reader clicks
+  (`check-docs-links.sh`), the command they run (`check-docs-cli.sh`), the
+  variable they set (`check-docs-config.sh`) and the config key they write
+  (`check-docs-toml.sh`). None of them looks at what the guide is mostly *made*
+  of. The reader-facing corpus names **1,495 `autumn_web::…` paths** — 864 of
+  them inside `rust` fences, the rest in prose a reader reads as authoritative
+  — a larger copy-surface than the env layer (689 occurrences) and the
+  `autumn.toml` layer (172 fences) together — and nothing in the tree could
+  tell a live path from a renamed one.
+  `scripts/check-docs-symbols.sh` resolves every one of them against the crate
+  sources, and it runs in CI's docs-only job beside the other four.
+  It catches **both** ends of the visibility scale, which is the reason to gate
+  the whole surface rather than import lines alone. It found **3 live
+  defects**, all fixed here. Loud:
+  `docs/guide/maintenance-mode.md` handed over
+  `use autumn_web::middleware::{MaintenanceLayer, MaintenanceState};` where only
+  the first name is there — `MaintenanceState` lives in
+  `autumn_web::maintenance`, a *different* module that happens to have a
+  same-named sibling under `middleware::` — so a reader copying it got E0432 on
+  a line where half the import was correct. Silent, and the reason this gate is
+  worth more than its loud half: `#[autumn_web::main]` parses the function it
+  decorates and emits `fn main()` **fresh** (`main_macro.rs` reads
+  `input_fn.sig` only to check `async`), so the declared return type is never
+  re-emitted and never reaches name resolution. The opening fence of
+  `docs/guide/api-versioning.md` — the first thing a reader of that page
+  compiles — declared `-> Result<(), autumn_web::Error>` for a type that does
+  not exist (the crate root exports `AutumnError` and `AutumnResult`), and it
+  **still built**. Nothing reported it, and the reader carried away the wrong
+  name for the framework's error type with nothing anywhere to correct them.
+  And unnameable: `docs/guide/macro-transparency.md` showed the route macro
+  emitting `::autumn_web::route::Route`, but `route` is a `pub(crate) mod`, so
+  that path is E0603 in a reader's crate — the macro itself emits the crate-root
+  re-export `::autumn_web::Route`, which the same page already used correctly
+  forty lines further down.
+  The truth set is the crate sources themselves — no snapshot to regenerate,
+  because a rename lands in the same commit as the surface it renames.
+  Resolution follows what Rust *does* rather than what the source looks like,
+  since a documented path is almost never a path to where the item is defined:
+  `pub use` re-exports including aliased ones (`pub use http_client as http` is
+  why `autumn_web::http::Client` is real and `autumn_web::http_client::Client`
+  is what nobody writes) and ones through a *private* facade module, glob
+  re-exports, `#[macro_export]` macros hoisting to the crate root (so
+  `autumn_web::declassify` resolves and `autumn_web::classify::declassify` does
+  not), the `pub use <crate-root macro>;` idiom that makes the module path real
+  again, inline `mod x { … }` blocks, `#[proc_macro_derive(Name)]` exporting
+  under its attribute's name rather than its function's, a leading `::` naming
+  the external crate over a local module of the same name, and hops into sibling
+  workspace crates. Visibility is part of resolution, not an afterthought: only
+  bare `pub` counts — for modules, items and re-exports alike — because a path
+  through one of `lib.rs`'s 49 `pub(crate)`/`pub(super)` modules is E0603 for a
+  reader however public the item inside it is, and a `pub(crate) use` (as
+  `cluster/mod.rs` does for `LEAVE_BUDGET`) republishes a name inside the crate
+  only. Declarations are read at module scope, tracked by counting braces with
+  string and comment contents masked out, so an indented `pub fn` inside an
+  `impl` block is a method on the type rather than an item in the module — a
+  line-anchored regex credited `AppBuilder::run` to the `app` module and made
+  `autumn_web::app::run` resolve. A `macro_rules!` without `#[macro_export]` is
+  textually scoped and joins no path. And where a module shares its name with a
+  value (`pub mod app` beside `pub use app::app`), the type namespace wins for
+  traversal, as Rust's own resolution does — the same rule covering a whole
+  crate re-exported under an alias (`pub use autumn_edge as edge`) that a
+  same-named macro re-export would otherwise shadow, which had left everything
+  under `autumn_web::edge::` unaudited. Grouped imports are matched by counting braces over the
+  whole document rather than per line, so the 14 groups that nest
+  (`storage::{BlobStoreState, variant::{Transform, …}}`) or run across lines
+  have their symbols audited instead of silently collapsing to the module
+  prefix. Deliberately out of scope: anything past the first item
+  segment (`AutumnError::not_found_msg` is checked as far as `AutumnError`;
+  associated items need type resolution, and guessing at them is how a gate
+  starts reporting confident nonsense), feature gates (the surface is read as a
+  superset so a path behind `--features ws` still resolves), and bare
+  identifiers after a prelude glob. Paths that leave the workspace —
+  `reexports::axum::…`, maud's `PreEscaped`, diesel's `db::Pool`: 57 of the
+  1,495 — are reported as **opaque** and counted rather than guessed at, because
+  an opaque count that grows quietly is how a gate goes hollow. Waivers are
+  rules, not a list of paths: a page *shows* a path as often as it tells someone
+  to write one, so a path inside a compiler-error line (the migration-guide
+  cheat-sheet row in `docs/migrations/TEMPLATE.md` exists to display one) or a
+  log line (`INFO  autumn_web::router: …` is the crate's own tracing target,
+  and `router` is private) is read as output. The compiler-error exemption
+  covers the error's own table CELL rather than the row, because the next cell
+  holds the fix and a fix is a live recommendation — `0.7.0.md` pairs an
+  `error[E0063]` with `autumn_web::seo::SeoRouteDefaults::EMPTY`, the one path
+  in that row a reader actually copies. A brace group containing `(` is
+  not a path claim at all — the skill's api-reference lists *signatures* that
+  way — so its prefix is kept and the group dropped, rather than inventing
+  `autumn_web::widgets::current_locale` out of an argument name. 47 self-tests:
+  `./scripts/check-docs-symbols.sh --self-test`.
+
+- **ci:** [no-plugin] the dependency-advisory gate (#1600, #2050) now also audits the two
+  satellite dependency graphs that sit **outside** the main workspace and its
+  own `Cargo.lock` — `fuzz/` (compiled and run by every `fuzz.yml` CI job) and
+  `examples/island-flock/` (never built in CI, but its compiled wasm/js
+  bundle is committed and served by the `flock` example). Each satellite now
+  carries its own narrower `deny.toml` (advisories + sources; licenses are not
+  yet gated there — see that file's header), audited by
+  `scripts/check-advisories.sh`'s new `audit_satellite_graphs` step. Neither
+  graph had ever been checked before: `fuzz/Cargo.lock` was regenerated here
+  (502 lines stale, and resolving to a yanked `chacha20 0.10.1` until this
+  fix), and `examples/island-flock/`'s graph carries two `unmaintained`
+  advisories now triaged and waived with reachability notes (RUSTSEC-2024-0370
+  confirmed unreachable — a proc-macro dependency never linked into the wasm
+  output; RUSTSEC-2025-0141 reachability undetermined, revisit at the next
+  rebuild). See `docs/reports/2026-09-07-ballast-dependency-ledger-audit.md`
+  for the full evidence trail.
+- **docs/ci:** the CLI drift gate (`scripts/check-docs-cli.sh`) now resolves
+  every **option** a documented `autumn …` line passes, not only its command.
+  A flag the command does not declare is the same dead end as a phantom
+  subcommand — `autumn build --release` is `error: unexpected argument
+  '--release' found`, exit 2, because the flag is `--debug` and release is the
+  default — and until now the walk stopped at such an option in silence. The
+  baseline found five, all fixed here: `autumn build --release` in
+  `docs/guide/wasm-islands.md` and `examples/blog/README.md`; `autumn dev
+  --profile demo` in `docs/guide/console.md` (`dev` reads the profile from the
+  environment: `AUTUMN_ENV=demo autumn dev`); `autumn setup --tailwind` in
+  `docs/guide/deployment.md` (`autumn setup` *is* the Tailwind install and
+  takes only `--force`); and, inside a copyable fence commented "explicit
+  project path", `autumn lifecycle check --path .` in `docs/guide/lifecycle.md`,
+  where `path` is a positional. Gating flags needs clap forms the command walk
+  did not: `#[command(flatten)]`; `trailing_var_arg` (so the task arguments the
+  guide documents are seen as forwarded, not judged); `allow_hyphen_values` on
+  a positional (so `autumn config set retries -1` is read as the correct line
+  it is); clap's own `--help`/`-h` on every command, and `--version` on the
+  root ALONE, since nothing sets `propagate_version`; and a bracket-balanced
+  read of `#[arg(…)]`. That last one was also a latent bug in the shipped gate:
+  the attribute body was matched with a character class that cannot cross a
+  `]`, so every option whose attribute carries a list — `sbom --binary`,
+  `upgrade --accept`, `db scrub --check`, `db scrub --dry-run`, `generate admin
+  --select` — was missing from the option map, and the walk silently stopped at
+  each of them. Options passed to the root itself are resolved too, so
+  `autumn --helpp` no longer reads like the `autumn --help` the guide runs. A
+  token starting with `-` is judged unless it carries prose punctuation, so
+  arrows and slash-joined shorthand are not reported while a misspelling like
+  `--show_config` is. Corpus-wide noise: zero. `--list-options` prints the
+  parsed option surface. [no-plugin] — a CI gate
+  over this repo's own docs, with no surface an agent reaches for. The plugin
+  needed no correction either: it names none of the five dead flags, and its one
+  `build --release` is a genuine `cargo build --release` in the image builder.
 - **`scripts/check-sqlite-unification.sh`** — the `sqlite` feature is a backend
   flip, so one dependency edge enabling it (`autumn-web = { …, features =
   ["sqlite"] }`, or a feature forwarding `autumn-web/sqlite` under another
@@ -238,6 +3980,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "autocomplete", "typeahead", "as you type", "outbound webhooks"), none of
   which appeared anywhere in the README before. Wired into the docs-only CI
   job; no toolchain needed.
+- **`Remove…From…` drops a pre-existing index on SQLite** (issue #1906). SQLite
+  refuses `DROP COLUMN` while any index names the column. The generator only
+  knew the conventional `idx_<table>_<col>` name, so a composite, partial,
+  expression or hand-named index from an earlier migration broke the migration
+  at apply time. `generate migration Remove…From…` now replays the project's
+  `migrations/*/up.sql` in timestamp order to recover the indexes live on the
+  table, emits `DROP INDEX IF EXISTS` for each one that names a removed column
+  before the `DROP COLUMN`, and re-creates them in `down.sql` after the column
+  is restored. Indexes created outside `migrations/` stay invisible. Postgres
+  output is unchanged — it cascades index drops with the column.
+
+- **sqlite:** `Uuid`, `decimal{p,s}` and `enum{…}` model fields now work on a
+  SQLite app — the last three field kinds `autumn generate` refused (#1924).
+  `uuid::Uuid` and `rust_decimal::Decimal` belong to other crates, and so does
+  every diesel item their conversion would name, so `autumn-web` can implement
+  nothing for them; they render the new `TEXT`-backed newtypes
+  `autumn_web::db::sqlite_types::{SqliteUuid, SqliteDecimal}` instead, which are
+  `Copy`, deref to the wrapped type, convert with `From`/`Into`, and are
+  `#[serde(transparent)]`. A generated `enum` is local to your app, so the model
+  generator emits its `ToSql`/`FromSql<Text, Sqlite>` impls directly. All three
+  store `TEXT`. `SqliteDecimal` writes the normalized value, so it keeps sign and
+  every significant digit but **not** trailing-zero scale: a column holding
+  `0.10` reads back as `0.1`, and one holding `19.9` reads back as `19.9` where
+  Postgres `NUMERIC(10,2)` would give `19.90`. The values are numerically equal —
+  format for display rather than relying on the stored scale. Normalizing is what
+  makes SQLite's byte-wise `=` and `UNIQUE` agree with Rust equality. Note also
+  that a `TEXT` column sorts lexicographically, so `ORDER BY` on a decimal column
+  compares strings — see `docs/guide/sqlite-in-production.md`. Postgres output is
+  unchanged.
+- **sqlite:** a SQLite app's `Cargo.toml` now describes the SQLite backend
+  (#1924): diesel on its `sqlite` feature with the bundled `libsqlite3-sys`,
+  `diesel-async` on the sync-connection wrapper, `autumn-web`'s `sqlite`
+  feature, and no `pq-sys`. Before this a generated SQLite app pulled the
+  Postgres dependency set and could not compile at all.
+- **sqlite:** a `decimal{p,s}` column now carries a generated `CHECK` enforcing
+  the declared precision and scale (#1924). The SQLite column is `TEXT`, so
+  without it the declaration bound nothing and a repository write could persist
+  `123456.789` into a `decimal{5,2}`. Postgres keeps its native `NUMERIC(p,s)`
+  and gains no `CHECK`. Note that Postgres *rounds* a value to `scale` where
+  SQLite rejects it — round before saving if your input can be wider.
+- **sqlite:** a `decimal` `--default` is now written as a quoted, normalized
+  text literal (#1924). Unquoted, SQLite evaluated `DEFAULT 0.10` numerically
+  and TEXT affinity stored `0.1`; a wide default became scientific notation that
+  could not be read back at all. It is normalized through the real `Decimal` so
+  it is byte-identical to what `SqliteDecimal` writes — otherwise a row holding
+  its own default would not match a `find_by_…` for that value, and a unique
+  index would admit both spellings.
+
+### Fixed
+
+- **🛣️ Onramp: corrected the "Local development" guidance in
+  `docs/guide/getting-started.md` about what `autumn doctor`'s
+  `version_compat` check can actually catch (docs overclaim → accurate):**
+  the guide said a source-built CLI "may scaffold projects pinning an
+  `autumn-web` version that is not on crates.io yet" and that
+  `version_compat` "reports the two versions side by side; if they
+  disagree" — implying a green check rules out version skew. In reality
+  `autumn new` always pins the CLI's own frozen-until-release
+  `CARGO_PKG_VERSION` (CLAUDE.md: never bump the workspace version outside a
+  release), which is normally already published; it is the *code* behind
+  that version number that has moved on between releases. `version_compat`
+  compares version strings, so it prints `✅ version_compat — autumn-cli
+  0.7.0 matches autumn-web 0.7.0` regardless — confirmed live on
+  `quickstart-gate.yml`'s `local-dev-quickstart` job (red since #2459
+  landed, still red as of this fix, always on this exact version-strings-
+  match-but-code-diverged path). The guide now says so plainly: don't trust
+  a green `version_compat` to rule out version skew, watch for a `cargo
+  build` failure referencing `autumn_web::` right after `autumn new`
+  instead, and apply the `[patch.crates-io]` workaround proactively when
+  building from a checkout that's ahead of the last release tag. No code
+  changes — `version_compat` still cannot see this drift (a version bump is
+  the only real fix, out of scope here), so nothing to re-measure on the
+  quickstart-gate harness; this closes the gap between what the docs
+  promised and what the check actually does.
+- **macros:** the `#[model]` association preloader named `diesel::pg::Pg`
+  directly, so a `--belongs-to … --counter-cache` scaffold did not compile on a
+  SQLite app. It now names `autumn_web::RuntimeBackend`, the alias that already
+  exists for this — the same type on Postgres (#1924).
+- **macros:** `#[model]` recognises the SQLite `Uuid`/`Decimal` newtypes where
+  it previously matched only `Uuid`/`Decimal` by name (#1924), so `.fake()`
+  factories mint distinct values instead of one shared nil UUID (which collided
+  on a `:unique` column), `form_for` renders a decimal as a number input, and a
+  `Uuid` column keeps its sortable index header. A `SqliteDecimal` column is
+  deliberately *not* sortable: its `TEXT` column orders lexicographically, so
+  the header would lie.
+- **schema:** `autumn schema parse` silently dropped every `Uuid` and `decimal`
+  column of a SQLite app, so snapshots and diffs were computed against an
+  incomplete schema (#1924).
+- **cli:** `autumn destroy` no longer strips `autumn-web`'s `sqlite` feature
+  when the last model goes. It is a whole-app backend flip, not a per-resource
+  capability, and without it the app's `sqlite://` URL is refused at boot
+  (#1924).
+
+### Changed
+
+- **cli:** a generated `Scope::list` now takes `autumn_web::RuntimeConnection`
+  instead of a hard-coded `diesel_async::AsyncPgConnection`, matching what
+  `generate auth` already emits. The same type on Postgres, so behaviour is
+  unchanged — but the emitted bytes of `src/policies/<model>.rs` differ, and a
+  SQLite app needs it to compile at all (#1924).
+
+### Added
+
+- **openapi:** `autumn openapi export` gets the spec out of the app without
+  running it (issue #802). It compiles the target binary and runs it in a dump
+  mode that binds no port and opens no database connection — the same no-boot
+  child-process protocol `autumn routes` uses — then writes the same OpenAPI 3.1
+  document `/openapi.json` serves, built through the very same
+  `collect_openapi_docs` + `generate_spec` pair so an exported spec and a served
+  one cannot drift. Until now the only ways to obtain the contract were to boot
+  the server and curl it, or to run a full static build (`autumn build` emits
+  `dist/openapi.json` as a side effect, and bails out entirely on an app with no
+  `#[static_get]` routes). `--out <path>` writes a file, `--check <path>`
+  re-exports and fails on drift against a committed copy — comparing parsed JSON
+  rather than bytes, and printing the operations that were added, removed or
+  changed — and `--strict` additionally fails on any opaque component schema.
+  An app built without the `openapi` feature, or one that never called
+  `.openapi(...)`, reports which of the two it is instead of emitting nothing.
+  The point of the command is to hand the standard generators
+  (`openapi-typescript`, `progenitor`, `openapi-generator`) a spec worth
+  generating from; Autumn does not ship its own client emitters.
 
 - **plugin-sandbox:** the capability vocabulary grows past request handling
   (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,
@@ -392,6 +4255,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `on_thread_start` has fired. Documented in the getting-started guide under
   "Tuning the Tokio runtime".
 
+- **A TOML config-key drift gate for the docs corpus [no-plugin]:** the
+  `AUTUMN_*` gate (`scripts/check-docs-config.sh`, this same release) covers the
+  config a reader **sets**; this covers the config they **write** — a key in
+  `autumn.toml` itself. Same silent-failure
+  class, one layer over, and the two do not overlap: the env layer is written
+  field by field, so a schema leaf can exist with no environment spelling at all
+  (90 of 397 have none), and a `[section] key` in a fence is never an `AUTUMN_*`
+  name. `server.strict_config` and `autumn check --config` *do* reject an
+  unknown `autumn.toml` key — but strict_config is **off by default**, so on a
+  default app serde drops the key with no warning: the app boots, the setting
+  the reader believed they changed keeps its default, and nothing anywhere says
+  so.
+  `scripts/check-docs-toml.sh` resolves every key in every `autumn.toml` fence
+  in the reader-facing corpus (171 of the corpus's 251 TOML fences) against the
+  484-leaf schema, using the same walk semantics as the framework's own
+  `AutumnConfig::validate_toml` — including the rule that a section with no
+  schema entry (`jobs.queues`, `auth.oauth2`, `http.client.base_urls`,
+  `resilience.circuit_breaker.hosts`) is opaque, since those take arbitrary
+  valid children. It runs in CI's docs-only job beside the other three gates.
+  Its baseline found **4 live defects**, all fixed here: `[session] ttl_seconds`
+  in `wizards.md` under "consider increasing the session TTL" — there is no
+  `ttl_seconds`, the key is `session.max_age_secs`, and its default is `86400`,
+  so the documented "increase" to 3600 was also a 24x *decrease*; an impossible
+  `[app] profile = "production"` in `dev-error-overlay.md`, where `AutumnConfig`
+  has no `[app]` section and `profile` is `#[serde(skip)]` (it traces to ADR
+  0006, which proposed that opt-out; the implementation went another way and the
+  guide shipped the proposal); a duplicate `read_your_writes` key in
+  `cloud-native.md`, which makes the whole fence a TOML parse error under prose
+  telling the reader to add it; and `[logging] level` for the root that is
+  `[log]` on `examples/wiki/content/configuration.md`, which is `include_str!`'d
+  into the wiki example and served at `/docs/configuration`. The truth set needs
+  no regeneration: `autumn/tests/fixtures/schema_keys.snapshot`, which
+  `schema_keys_snapshot_guard` already asserts both ways against the compiled
+  schema, plus the workspace's `config_section()` calls (with Rust comments
+  stripped, so a call written in prose registers nothing) and the `[dev]` fields
+  parsed from `autumn-cli`'s own `DevConfig`. Values are deliberately out of
+  scope — only whether the key exists — with one exception: an identified
+  `autumn.toml` fence that does not **parse** is itself a gate failure, with no
+  waiver, since a fence is copyable and TOML that does not parse fails at boot
+  for whoever copies it. Archive trees (`docs/plans/`, `docs/adr/`,
+  `docs/design/`, `CHANGELOG.md`, …) are out of scope; their 13 out-of-schema
+  keys are accurate records of superseded proposals rather than instructions a
+  reader follows today.
 - **macros:** closes out the residual long tail of partial-patch (`Patch<T>`)
   update validation left after #1719/#1742/#1778/#1801 (issue #1751).
   `must_match` — like `custom`, `ip` on `Option<_>` fields, and
@@ -2173,6 +6079,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   internal-only receiver during development) will see those deliveries start
   failing after upgrade — this is the intended effect of closing the gap. See
   `docs/security/2026-09-03-webhook-ssrf/`.
+- **`#[cached]`'s generated cache key now folds in the ambient resolved
+  tenant:** the key was built exclusively from the function's own explicit
+  arguments (every parameter by default, or exactly the parameters named in
+  `key(...)`) and never consulted the `CURRENT_TENANT` task-local a
+  `tenant_scoped` repository read filters by. An app that turned on Autumn's
+  multi-tenancy (`[tenancy] enabled = true`) and cached a `tenant_scoped`
+  read keyed on any parameter *other* than the tenant itself — a page, an
+  export format, a filter, anything but the literal `tenant_id` the SaaS
+  starter's own `cached_project_count` goes out of its way to thread through
+  `key(tenant_id)` — shared one cache slot across every tenant that called it
+  with the same non-tenant arguments: tenant B received **tenant A's cached
+  response** for the remainder of the entry's TTL. Nothing in the macro, the
+  build-time cache-coherence gate (`autumn cache audit`), or `autumn routes
+  audit` detected or prevented the omission, and Autumn's own tenancy idiom
+  never requires threading `tenant_id` through a function signature for any
+  *other* tenant-scoped operation (`tenant_scoped` finders resolve it from
+  `CURRENT_TENANT` automatically) — so the omission was an easy, natural
+  mistake, not a documented misuse. The generated wrapper now reads
+  `CURRENT_TENANT` (when tenancy is enabled and a tenant has been resolved)
+  and folds it into the key unconditionally, in addition to whatever `key(...)`
+  already names. Apps without tenancy enabled, or calling a `#[cached]`
+  function outside a request (a background job, a scheduled sweep), compute
+  the same key as before — `CURRENT_TENANT` resolves to `None` in both cases.
+  **Compatibility note:** a `#[cached]` function that intentionally serves one
+  shared, cross-tenant value (a genuinely global computation, not a
+  `tenant_scoped` read) now partitions its cache per resolved tenant too when
+  called from within a tenant's request — a harmless drop in hit rate, not a
+  correctness change, since the computed value does not vary by tenant. See
+  `docs/security/2026-09-05-cached-tenant-key/`.
 
 ### Performance
 
@@ -2270,6 +6205,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   defect and the regression test pinning it
   (`form_and_search_input_focus_keeps_a_visible_outline`) are in
   `autumn-admin-plugin/src/templates.rs`.
+
+- **`#[validate]` on a `#[model]` was ignored by every repository write that did
+  not go through a generated REST handler (issue #2586):** `docs/guide/forms.md`
+  promises a rule put on the model covers every write path — a form, an API
+  endpoint, a seed, a job, a CSV import — but `#[repository]` spliced the check
+  into the `api = "..."` `create`/`update` handlers only. A GraphQL resolver, a
+  `#[task]`, a seed or an admin action calling `save` wrote a row the model
+  forbids, and `#[normalize]` running on that same path made the gap easy to
+  miss: a `#[normalize(trim)] #[validate(length(min = 1))]` title submitted as
+  `"   "` was trimmed to `""` and then inserted.
+  The rules now run on every generated insert path — `save`, `save_many`,
+  `save_many_skip_invalid`, and the create half of `find_or_create_by_*` — after
+  normalization and before the `before_create` hook, exactly where the guide
+  says they run. `save` and `save_many` raise a 422 with the per-field map and
+  write nothing; `save_many_skip_invalid` keeps its partial-success contract and
+  reports a rejected row as `(index, error)` against the caller's own index; and
+  `find_or_create_by_*` validates only when it is about to insert, so a row that
+  already exists is still returned. `save_many_skip_invalid` also normalizes its
+  rows now, which it did not before, so it judges and stores the same canonical
+  value `save_many` does.
+  A payload type without `#[validate]` columns still compiles to a no-op, so no
+  repository needs migrating — but a caller that has been writing rows its own
+  model forbids will now get a 422 where it used to get a row. Update paths are
+  unchanged: they keep the documented hooked / `validate_on_update = fetch` /
+  blind table.
+  Three consequences worth knowing before you upgrade. A `#[validate]` rule on a
+  column that `before_create` **populates** now rejects every insert, because
+  the rules run first — put rules on what the caller supplies, and derive the
+  value before building the `New*`. On a `tenant_scoped` repository, `save` with
+  an invalid payload and no tenant context now returns the 422 rather than the
+  "no tenant context was established" 500; both are still errors, but the
+  precedence changed. And `Model::factory().create()` — so `autumn seed` — still
+  inserts through Diesel directly and is deliberately **not** covered, along
+  with hand-written repositories, raw `diesel::insert_into`, and `upsert_many`;
+  `docs/guide/forms.md` now says so rather than implying otherwise.
+  `find_or_create_by_*` additionally canonicalizes a `#[normalize]` lookup
+  column, the same probe the derived `find_by_*` finders already used. Without
+  it the create half would insert the canonical value while the lookup searched
+  for the raw one, so a repeated identical call would miss the row it had just
+  written and surface the "no matching row on re-lookup" 500.
+
 - **examples/reddit-clone: concurrent identical `/submit`s could duplicate a
   post's slug and make its permalink silently serve a different post (issue
   #2544):** `unique_slug()`/`unique_slug_excluding()` proved uniqueness with a
@@ -4098,6 +8074,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls 820 → 1, buffers 9,639 → 6,977 (-27.6%). See
   `docs/reports/2026-09-06-ledger-feature-flag-admin-bulk-delete-batch/`.
 
+- **`ExperimentAdminModel`'s admin panel bulk "delete" action now issues one
+  `DELETE` CTE instead of one per selected experiment:** it never overrode
+  `AdminModel::execute_action`'s trait default either, so it inherited the
+  same per-id loop the `TokenAdminModel`/`FeatureFlagAdminModel` fixes above
+  closed — a full connection checkout plus a single-row `DELETE ... WHERE
+  id = $1 RETURNING name` per id, cascading to that experiment's sticky
+  assignments and staff overrides and feeding the `autumn_experiment_changes`
+  audit insert. It now overrides `execute_action` for `"delete"` to batch
+  every id into one `WHERE id = ANY($1)` round trip; the returned count,
+  final row state (including the cascaded assignment/override deletes), and
+  audit trail are unchanged (an already-deleted or nonexistent id is still a
+  silent no-op, still counted as "applied"). Measured against a 3,000-row
+  fixture (plus ~270k assignment and ~4.5k override rows) with a 615-id bulk
+  action: delete-CTE statement calls 615 → 1, buffers 62,012 → 58,616
+  (-5.5%; batching flips the cascading assignment/override deletes from
+  555 separate bitmap-index probes to one seq-scan-driven hash join per
+  child table — a different, net-cheaper plan, not the same work counted
+  once — but the N+1 elimination on statement count, not that plan
+  change, is what clears the impact floor here). See
+  `docs/reports/2026-09-07-ledger-experiment-admin-bulk-delete-batch/`,
+  including its "Known limitation" section: neither child table has an FK
+  to `autumn_experiments`, so a concurrent `record_assignment`/
+  `set_override` on a `running` experiment being bulk-deleted can still
+  orphan a row (a pre-existing race this change widens the window on, not
+  a new one — not fixed here, flagged for a follow-up decision).
+
 - **scaffolded form helpers no longer re-escape their own constant HTML at
   render time:** `text_input`, `password_input`, `textarea_input`,
   `number_input`, `checkbox_input`, `date_input`/`datetime_input` (and their
@@ -4326,6 +8328,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   function that quietly delegated to its borrowed twin would fail even though
   its output is correct.
 
+### Fixed
+
+- **macros: `#[throttle]`/`#[secured]`/`#[step_up]` above the route macro no
+  longer fail to compile, or silently drop the OpenAPI response schema, once
+  stacked (#1668 regression):** #1668 moved these three guards' runtime
+  checks out of the handler body into each guard's own handler-unique
+  `FromRequestParts` gate — `struct` + `impl`, emitted as a sibling item
+  ahead of the (still single) handler function. Every route macro's own
+  `item` parser (`parse::parse_async_handler`, plus the three guard macros'
+  own parsers, needed when one guard expands above another) only ever
+  accepted a lone `ItemFn`, so a guard macro receiving that two-item output
+  as `item` — any of `#[throttle]`/`#[secured]`/`#[step_up]`/`#[route]`
+  written *above* another guard already using the #1668 gate shape — hit a
+  spurious `route macros can only be applied to functions` compile error.
+  `parse::parse_async_handler_with_preamble` now accepts zero or more
+  leading item definitions ahead of the trailing function, returning them
+  separately so the route/guard macro re-emits that preamble (the gate type
+  the function's new first parameter names) verbatim instead of choking on
+  it.
+
+  Fixing the parse gap surfaced a second, previously-masked bug: with
+  parsing no longer failing first, `#[throttle]`/`#[step_up]` above
+  `#[route]` still resolved to no OpenAPI response schema, because
+  `api_doc::infer_response_body`'s `__autumn_inner`-binding recovery (#1677)
+  only trusts that binding when one of `RESPONSE_REWRITING_GUARD_MARKERS`'s
+  marker consts sits earlier in the *same* handler-body block — and #1668
+  moved `#[throttle]`'s/`#[step_up]`'s marker consts into their gate's
+  `impl` block, out of the body, while `#[secured]`'s marker consts stayed
+  in-body for exactly this reason. Both guards now also leave a dead-code
+  copy of their marker const in the handler body (mirroring `#[secured]`'s
+  existing `role_scope_consts` pattern), restoring the invariant
+  `infer_response_body` relies on — including through stacked guards, where
+  only the innermost binding carries the handler's real return type.
+
+  Regression-proven at both the macro-expansion level (`route.rs`'s
+  existing `route_macro_infers_response_schema_when_throttle_expands_first`
+  / `..._when_step_up_expands_first` / `..._under_stacked_guards_above_route`
+  tests, which predate this fix but never previously reached the code path
+  they exercise) and end to end: `cargo test -p autumn-macros --lib` (1073
+  passed), `cargo fmt --all -- --check`, `cargo clippy -p autumn-macros
+  --all-targets -- -D warnings` all clean.
 - **`MemorySearchBackend::keyword_search` no longer compares every field
   token against every query token:** `score` (in `autumn-search/src/memory.rs`)
   looped over each field's tokens and, for every one, scanned the *entire*
@@ -4349,6 +8392,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   marginal allocation blocks/query and bytes/query (dhat) are unchanged
   (8,583.28 / 530,252.6, both sides) — this change is instruction-bound, not
   allocation-bound, so only the instruction floor is claimed.
+- **`autumn deploy up` now has a direct test that it refuses the whole fleet
+  when any host fails preflight (#2269, #1621 AC-7 follow-up):** the behavior
+  was correct, but only proven by code reading and by an adjacent `deploy
+  check` test — `run_up_with` takes `checks` as already-graded input, so it
+  cannot exercise the refusal, and `run_up` itself needs disk/network I/O to
+  drive directly. The refusal is now its own function,
+  `refuse_if_preflight_failed`, called by `run_up` right after
+  `collect_fleet_preflight` and before any executor is built. One new test
+  drives that same gate against a three-host fleet with one failing host and
+  asserts zero executors are built and the fleet's call tape stays empty —
+  mirroring `execute_first_deploy`'s existing
+  `preflight_failure_aborts_before_any_executor_call` one level up, at the
+  fleet driver. A second new test asserts the call order inside `run_up`'s
+  own source (mirroring the existing
+  `media_provisioning_is_deferred_past_app_cutover_in_up` pattern), so a
+  refactor that moved the gate after the `run_up_with` hand-off — the exact
+  risk the issue named — fails a test even though the gate function itself
+  still works.
+- **`comments:commentable` (#2265): a hard-deleted parent no longer leaves
+  orphaned comment rows behind.** `commentable_id` has no foreign key.
+  Nothing cascaded a deleted parent's comments away. No generated route
+  could reach the orphaned rows afterward. `autumn generate scaffold …
+  comments:commentable` now writes an `AFTER DELETE` trigger into the
+  parent's own migration. The trigger removes that parent's comments on
+  any hard delete — through the repository, raw SQL, or an admin tool. A
+  soft-deleted parent is not affected: its row is never removed. New tests
+  cover this: a database-level test in
+  `autumn/tests/integration/commentable.rs`, and scaffold-output tests in
+  `autumn-cli`'s `scaffold_commentable.rs`.
+
+### Performance
+
+- **The Postgres pool no longer pings twice per checkout (#2485):** every
+  `#[repository]`-generated acquire, and every `Db::checkout`, already runs
+  `SET statement_timeout` on each checkout — a round trip to Postgres that
+  already proves the connection is alive. Deadpool's default
+  `RecyclingMethod::Verified` sent a second, redundant `SELECT 1` for the
+  same signal. `create_pool`'s `ManagerConfig` now sets
+  `RecyclingMethod::Fast`, dropping that extra round trip — the same
+  recycling method the `record_db`/`replay_db` capture pools already use,
+  for the same reason. A dead connection still fails fast: at the `SET
+  statement_timeout` call, not at the pool's own ping. Measured in the
+  issue's `repository_crud` bench: -13.00% instructions and
+  -14.44%/-16.20% allocation blocks/bytes per round (`valgrind
+  --tool=callgrind`/`--tool=dhat`, 5,020 rounds).
+
+  Two health/readiness checks relied on the pool's own ping instead of
+  running a query: `ShardHealthIndicator`'s primary/replica checks
+  (`sharding.rs`) and the replica readiness probe (`probe.rs`) checked out a
+  connection and dropped it, with no query in between. Under `Fast` that
+  checkout alone no longer proves the connection is alive, so a dead
+  primary or replica could report ready. Both now run a `SELECT 1` (the new
+  `db::probe_connection_alive`) on the checked-out connection before
+  deciding readiness, independent of the pool's recycling method.
 
 ## [0.7.0] - 2026-08-23
 

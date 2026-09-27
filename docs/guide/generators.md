@@ -11,7 +11,9 @@ single command. Four subcommands cover the cases you actually hit:
 | `autumn generate job`                | A `#[job]` background-job handler with args struct, `registered_jobs()` aggregator, and `.jobs(…)` wiring in `src/main.rs` |
 | `autumn generate channel`            | A real-time broadcast channel over the `Channels` API — an htmx SSE live view by default, or a raw `#[ws]` handler with `--ws` |
 | `autumn generate webhook`            | A signature-verified, replay-protected inbound provider webhook (Stripe/GitHub/Slack/generic) — handler, event dispatch, `autumn.toml` endpoint config, and tests |
+| `autumn generate inbound-mail`       | An `#[inbound_mail]` handler for email your app receives — a **Mailgun** endpoint, router wiring, and a signed-fixture integration test (no provider flag; SES and generic are a hand edit) |
 | `autumn generate scaffold`           | Everything `model` does plus `#[repository]`, HTML routes, smoke test, `routes![]` registration |
+| `autumn generate policy`             | A record-level `Policy`/`Scope` pair for a model that already exists, registered in `src/main.rs` |
 | `autumn generate wizard`             | A session-backed multi-step form wizard with per-step validation and a confirm/commit/cancel flow |
 | `autumn generate admin`              | An `AdminModel` adapter for an existing model, wired to `autumn-admin-plugin`   |
 | `autumn generate tauri`              | A complete `src-tauri/` sidecar project so the app ships as a native desktop installer (see [Tauri guide](tauri.md)) |
@@ -529,7 +531,7 @@ pub struct Post {
 
 | Generated file                   | Existing concept it maps to                            |
 | -------------------------------- | ------------------------------------------------------ |
-| `src/models/post.rs`             | The [`#[autumn_web::model]`](../../autumn-macros/src/model.rs) macro |
+| `src/models/post.rs`             | The [`#[autumn_web::model]`](../../autumn-macros-model/src/model.rs) macro |
 | `migrations/.../up.sql`          | Diesel migrations consumed by [`autumn migrate`](../../autumn-cli/src/migrate.rs) |
 | `src/schema.rs`                  | The Diesel `table!` block referenced by `#[model]`     |
 | `src/models/mod.rs`              | Standard Rust module aggregator                        |
@@ -863,7 +865,9 @@ tests/chat_channel.rs     # smoke test: publishes a message, asserts a subscribe
 
 SSE-over-htmx is the default transport — `GET /chat` renders a view wired to
 htmx's `sse-connect`/`sse-swap`, so browser tabs update live with **zero
-client JS authored by the user**:
+client JS authored by the user**. `autumn_web::sse::stream` is behind the
+non-default `ws` feature (`features = ["ws"]`); see
+[WebSockets](websockets.md):
 
 ```rust
 #[get("/chat/events")]
@@ -1058,6 +1062,74 @@ These scaffold a fresh project, generate all four presets, and assert `cargo
 check --tests` passes with no hand-editing — plus one gate that actually runs
 the generated tests to confirm they pass on first run.
 
+## `autumn generate inbound-mail`
+
+The receiving half of `generate webhook`: a handler for mail your app is *sent*,
+rather than callbacks a SaaS provider posts. See
+[Receiving Mail](mail.md#receiving-mail-inbound-email) for the subsystem itself.
+
+```bash
+autumn generate inbound-mail Support
+```
+
+Produces:
+
+```
+src/inbound_mailers/support.rs   # SupportMailHandler + #[inbound_mail] handler and unit test
+src/inbound_mailers/mod.rs       # pub mod support;  (created or appended)
+tests/support_inbound_mail.rs    # posts a signed Mailgun fixture through the real route
+src/main.rs                      # mod inbound_mailers; + .inbound_mail_router(...) in the builder
+Cargo.toml                       # "inbound-mailgun" added to autumn-web's feature list
+```
+
+The router it wires in serves Mailgun at `/inbound/mailgun` and reads the signing
+key from `MAILGUN_SIGNING_KEY`:
+
+```rust,ignore
+.inbound_mail_router(
+    InboundMailRouter::new()
+        .endpoint(InboundMailEndpointConfig::mailgun(
+            "/inbound/mailgun",
+            std::env::var("MAILGUN_SIGNING_KEY").unwrap_or_default(),
+        ))
+        .handler(inbound_mailers::support::support_handler_info()),
+)
+```
+
+**Set that variable before you point Mailgun at the route.** The fallback is an
+empty key, and an endpoint with an empty signing key rejects every request with
+`500` rather than accept unsigned mail — the scaffold is inert, not open, until
+the key is there.
+
+### Generating a second handler
+
+Run it again with a **different** name and the new handler is chained onto the
+router already in `src/main.rs`, rather than a second router being inserted.
+
+Re-running with the **same** name is not a no-op. The handler and integration-test
+files are emitted as creations every time, so without `--force` the run stops on
+a collision and writes nothing; with `--force` it overwrites them, your edits
+included. Only the `src/main.rs` registration is skipped when that handler is
+already wired in, so a `--force` re-run does not register it twice.
+
+There is a catch the second run makes visible: the emitted handler starts at
+`#[inbound_mail(to = "*", processing = "background")]`, and `to = "*"` matches
+**every** message. Handlers are tried in registration order and the first match
+wins, so a second generated handler is unreachable until you narrow the first
+one's `to` to the address it is really for — an exact address, a `ticket*`
+local-part prefix, or a `replies+{token}@…` plus-address. The
+[recipient pattern table](mail.md#routing-a-message-to-a-handler) has the
+spellings.
+
+`processing = "background"` is also the default the scaffold ships, which means
+the webhook answers `200` before your handler runs and a handler error is logged
+and dropped. Switch it to `"sync"` and the error becomes a `500` instead, which
+leaves redelivery up to your provider rather than discarding the message.
+
+`autumn destroy inbound-mail Support` reverses all of it, including the
+`src/main.rs` registration — see
+[Undoing a generator](#undoing-a-generator-autumn-destroy).
+
 ## `autumn generate scaffold`
 
 Everything `model` produces, plus:
@@ -1116,7 +1188,7 @@ async fn edit_form(id: Path<i64>, csrf: Option<CsrfToken>) -> Markup {
 }
 ```
 
-`autumn routes` and `/actuator/routes` keep reporting the declared
+`autumn routes` and `/actuator/graph` keep reporting the declared
 method (`PUT`, `PATCH`, or `DELETE`); the rewrite is a transport
 concession, not a routing one. CSRF protection still treats the
 overridden mutation as unsafe and rejects submissions without a valid
@@ -1331,6 +1403,10 @@ autumn generate scaffold Post title:String comments:commentable
   attribute is what brings `add_comment` / `comment_thread` / `delete_comment`
   onto the generated repository and registers the model with the framework's
   comment router.
+- The **model's own migration** also gets an `AFTER DELETE` trigger (#2265).
+  `commentable_id` has no foreign key. Nothing else removes a deleted
+  parent's comments. The trigger removes them on any hard delete — a
+  delete through the repository, raw SQL, or an admin tool.
 - **No comment routes are generated at all.** Mount the framework's once:
 
   ```rust
@@ -1557,7 +1633,7 @@ Contract of the generated handler:
 | Whitespace around a column name | Trimmed, consistently. RFC 4180 keeps the space in `a, b, c`, and plenty of exporters write it — so both the header check and the row decoder compare trimmed names. They have to agree: a check that accepted `" published"` while the decoder looked for `published` would default the field and import blanks under a guarantee that the column was there. |
 | How a row becomes a record | The row (`column -> value`) is re-encoded as a urlencoded body and handed to the module's own `decode_form`, so it is decoded, blank-normalized and validated by **exactly** the code path a browser form submission takes — the same `#[validate(...)]` rules, the same `into_new`. |
 | A row that fails to parse | A row error naming the parse failure, against that row's line. The rest of the file still imports. |
-| A row that fails validation | A **field** error naming the column (alphabetically first, so the message is stable) and its messages. |
+| A row that fails validation | A **field** error naming the column (alphabetically first, so the message is stable) and its messages. On a `#[normalize]` column there is a second, later check: the repository re-runs the model's rules on the normalized value (#2586), and a row only that pass rejects is reported against its CSV line as a write failure instead, with nothing written for it. |
 | A row the database rejects (e.g. a unique violation) | Reported against its own CSV line. `save_many_skip_invalid` isolates the failing chunk row-by-row rather than aborting the batch. |
 | Atomicity | Owned by `save_many_skip_invalid`, which this handler calls exactly once: successful rows commit, failed rows are skipped and reported. For all-or-nothing, swap in `save_many`, which aborts the batch on the first failure. |
 | Model hooks | Run per inserted row, exactly as for `create` — including `after_create_commit` and counter caches. An import of N rows is N records' worth of side effects. |
@@ -1577,7 +1653,7 @@ Contract of the generated handler:
 | Owner-scoped scaffold | `authorize_create` runs once, exactly as for `create` — and, exactly as for `create`, an owner column is taken from the submitted data, so an authorized user can insert rows owned by anyone. That is not new (the create form has the same property), but note the asymmetry with the export directly above, which *is* owner-scoped through `list_scoped`. Move the owner column out of the file and set it from the session in the row closure if that matters. |
 | `--belongs-to` child | The parent foreign key comes from the FILE, not from a URL — the nested create route's "the parent is the route" rule does not apply to a flat `POST /<children>/import`. |
 | A write that fails partway | `save_many_skip_invalid` writes in chunks, each in its own transaction. A failure a constraint cannot explain (a timeout, a dropped connection) aborts the call with earlier chunks already committed; the report says so in a `role="alert"` banner rather than 500ing, because the operator's natural next move — re-upload — would duplicate whatever landed. How many rows landed is unknowable there, so the count keeps the parse pass's total (rows that *reached* the write) and its label reverts to the dry run's wording rather than claiming an insert count it cannot have. |
-| A row reported as failed | May still be **in the database**. `after_create` hooks run once the insert has committed, and a hook that fails puts an already-persisted row among the failures with nothing to distinguish it from a row that never landed. Whenever the database stage rejected any row, the report carries a `role="alert"` note saying so — check the list view before re-importing. |
+| A row reported as failed | May still be **in the database**. `after_create` hooks run once the insert has committed, and a hook that fails puts an already-persisted row among the failures with nothing to distinguish it from a row that never landed. (A row the model's own `#[validate]` rules rejected is the exception: that check runs before the insert, so nothing was written — but the report cannot tell you which kind you are looking at.) Whenever the database stage rejected any row, the report carries a `role="alert"` note saying so — check the list view before re-importing. |
 | A value for a column the import cannot set | Named in a `role="alert"` note on the report when the uploaded file actually carries one (`id` and `created_at` excluded — every exported file has those, so flagging them would fire on every round trip). Silently dropping an operator's spreadsheet edit is the one failure the counts could otherwise hide entirely. |
 | Row volume | Capped at `MAX_IMPORT_ROWS` (10 000), mirroring the export. A file over the cap is **refused whole** with a 422, never imported as a prefix — a partially imported spreadsheet is the trap this route exists to avoid. The count is taken by `autumn_web::data::csv::count_data_rows` *before* the import, because a malformed row never reaches the row handler (`import_csv` records it and moves on), so an in-handler counter would miss exactly the file that costs the most to accumulate. The rendered error list is separately capped at `MAX_REPORT_ERRORS` (200) with a "further errors not listed" line; the counts above the table are always the whole truth. |
 | An oversized upload | A **413** from the framework's size guard, not the friendly 422 the other refusals use — the status is the accurate one, but the page is the generic error page. |
@@ -1695,26 +1771,24 @@ autumn generate scaffold Post title:String body:Text published:bool --i18n
   ({ $media }, { $size } bytes)` — so the media type and byte count
   interpolate as arguments and a translator owns the parentheses, the comma
   and the unit noun.
-- **Two widgets are not covered yet**, both because they build their text
-  inside autumn-web from arguments that carry no label seam. A `richtext`
-  column's field label translates, but `rich_text_area`'s own chrome — the
-  toolbar's group label and per-control names, the "Markdown supported…"
-  hint, and the preview heading — stays English; and a `:states(…)` column's
-  `transition_controls` keeps its `Mark as …` buttons and `… transitions`
-  group label in English. Unlike the pager and bulk-delete widgets, these
-  two are free functions with no label setters to call, so covering them
-  needs new autumn-web API (a label per transition edge, and per toolbar
-  control). Scaffolding either column with `--i18n` warns and names it,
-  rather than leaving you to find it in the browser.
-- **Validation messages stay English.** A field label translates; the
-  inline error under it after a rejected submission does not.
-  `#[validate(...)]` accepts a `message`, but `validator` takes it as a
-  compile-time literal, so a runtime lookup cannot go there — and a rule
-  with no message renders as `validation failed: <code>`. Reaching these
-  means mapping error *codes* to lookups before the changeset is built,
-  and that conversion happens inside autumn-web, so it needs a seam there
-  rather than a generator change. Scaffolding with `--validate` under
-  `--i18n` warns.
+- **The two widgets with their own chrome are covered too** (issue #2227).
+  A `richtext` column passes `RichTextLabels` to the editor. The toolbar
+  group label, the seven control names, the hint and the preview heading
+  come from the bundle, under `common.richtext.*`. The Markdown syntax
+  beside each name — `**bold**`, `- item` — stays as it is, because the
+  user types it. A `:states(…)` column passes `TransitionLabels`. The group
+  label reads from `<model>.field.<column>.transitions`, and each button
+  from `<model>.field.<column>.transition.<state>`. Two edges that end at
+  the same state share one button and one key.
+- **Validation messages are translated on the create and update forms.**
+  The handler resolves each validator error code through the bundle, under
+  `<model>.field.<column>.error.<code>`. The English default is the text
+  autumn-web shows today: `validation failed: <code>`. So an `en` app reads
+  the same, and a translator writes better wording in their own locale file.
+  A rule that carries its own `message` keeps it, and gets no key.
+  The CSV import report is the one gap. `import_csv` calls its row handler
+  per line, away from the request, so there is no locale to look a message
+  up in. Scaffolding `--import` with `--validate` under `--i18n` warns.
 - Each view-rendering handler takes the `Locale` extractor as its **first**
   parameter (`Locale` is a `FromRequestParts` extractor, and axum requires
   the one body-consuming argument to stay last).
@@ -1733,8 +1807,8 @@ Keys are split so a translator sees each string exactly once:
 
 | Kind | Examples | Written |
 | ---- | -------- | ------- |
-| Shared chrome | `common.create`, `common.save`, `common.back`, `common.edit`, `common.delete`, `common.show`, plus the widget defaults `common.pagination` / `common.previous` / `common.next` / `common.delete.selected` | Once per project, under one header. A second resource reuses the block rather than duplicating it per model. |
-| This resource's strings | `post.new`, `post.name.plural`, `post.index.title`, `post.index.empty`, `post.show.title`, `post.edit.title`, `post.delete.confirm`, `post.field.<column>`, `post.flash.*` | Once per resource, under a marked comment block. |
+| Shared chrome | `common.create`, `common.save`, `common.back`, `common.edit`, `common.delete`, `common.show`, plus the widget defaults `common.pagination` / `common.previous` / `common.next` / `common.delete.selected`, and the Markdown editor chrome `common.richtext.*` | Once per project, under one header. A second resource reuses the block rather than duplicating it per model. |
+| This resource's strings | `post.new`, `post.name.plural`, `post.index.title`, `post.index.empty`, `post.show.title`, `post.edit.title`, `post.delete.confirm`, `post.field.<column>`, `post.field.<column>.error.<code>`, `post.field.<column>.transition.<state>`, `post.flash.*` | Once per resource, under a marked comment block. |
 
 **What interpolates and what does not.** A row key or a count travels as a
 Fluent argument, so a translation can *position* it: `post.show.title =
@@ -1878,8 +1952,8 @@ autumn generate scaffold Bookmark url:String title:String tag:String alive:bool 
 
 | Generated file                        | Existing concept it maps to                                                                |
 | ------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `src/models/<name>.rs`                | [`#[autumn_web::model]`](../../autumn-macros/src/model.rs)                                 |
-| `src/repositories/<name>.rs`          | [`#[autumn_web::repository]`](../../autumn-macros/src/repository.rs)                       |
+| `src/models/<name>.rs`                | [`#[autumn_web::model]`](../../autumn-macros-model/src/model.rs)                                 |
+| `src/repositories/<name>.rs`          | [`#[autumn_web::repository]`](../../autumn-macros-repository/src/repository.rs)                       |
 | `src/routes/<plural>.rs`              | [`#[get]`/`#[post]` route macros](../../autumn-macros/src/route.rs) returning `Maud Markup` |
 | `src/main.rs` `routes![…]`            | The [`routes!` collection macro](../../autumn-macros/src/routes_macro.rs)                  |
 | `migrations/<ts>_create_<plural>/`    | Diesel migrations                                                                          |
@@ -1993,6 +2067,72 @@ to install the OpenSSL libraries through `vcpkg` and set `VCPKG_ROOT` so
 The release SemVer gate checks `autumn-web` optional public feature APIs, so this
 native dependency must be present on machines that run `scripts/check-semver.sh`
 locally.
+
+## `autumn generate policy`
+
+Record-level authorization for a model that already exists — the same
+`Policy`/`Scope` pair a `scaffold` wires in for a *new* resource, for one you
+already have.
+
+```bash
+autumn generate policy Post
+```
+
+Produces:
+
+```
+src/policies/post.rs           # PostPolicy (Policy<Post>) + PostScope (Scope<Post>)
+src/policies/mod.rs            # pub mod post;  (created or appended)
+src/main.rs                    # mod policies; + .policy(...)/.scope(...) in the builder
+```
+
+The model has to exist first — the generated code names its type. Run
+`autumn generate model Post` (or `scaffold`) before this, or the generator stops
+with `no model 'Post' found` and writes nothing.
+
+### The owner column decides what you get
+
+The generator parses the model's `#[model]` struct looking for an owner column,
+and it accepts exactly three names: `user_id`, `author_id`, or `owner_id`. Those
+three only — a foreign key spelled anything else (`account_id`, `member_id`)
+reads as "no owner column" and takes the second branch below, quietly. (The
+`scaffold` generator has one extra heuristic, a column whose `references` target
+is the users table, but it needs the field DSL that only `scaffold` is given.)
+
+Either way `can_show` allows everyone (reads are public until you tighten them)
+and `can_create` allows any authenticated user. The other two methods, and the
+scope, depend on what it found.
+
+**With an owner column**, the rules are real ones:
+
+- `can_update`/`can_delete` allow the row's owner, or a user holding the `admin`
+  role.
+- `Scope::list` filters list queries to the current user's rows. A nullable
+  owner column — an `Option<i64>`, as `user:references?` leaves `user_id` — is
+  compared option-to-option instead of being wrapped, so it behaves the same.
+
+**Without one**, there is no ownership rule to emit, and the generator does not
+invent one:
+
+- `can_update`/`can_delete` check only that the caller is **signed in** — any
+  authenticated user may update or delete any row. Both carry a
+  `// SECURITY TODO` comment saying exactly that.
+- `Scope::list` denies: it returns no rows until you write the filter, under a
+  plain `// TODO`.
+
+The halves diverge on purpose. Denying the mutations too would make a freshly
+generated app 403 on its own edit form, so the generator emits the weakest check
+it can justify and marks it loudly; the scope has no such constraint, so it
+stays closed. **Neither is a finished policy.** Grep for `SECURITY TODO` before
+you deploy, and replace the authentication check with the real per-record rule.
+
+Once generated, the file is ordinary user code — edit it freely. The
+[Authorization guide](./authorization.md) covers the `Policy` trait,
+`PolicyContext`, and the ownership and role patterns the generated impl is a
+starting point for.
+
+`autumn destroy policy Post` reverses all of it, including the `src/main.rs`
+registrations — see [Undoing a generator](#undoing-a-generator-autumn-destroy).
 
 ## `autumn generate wizard`
 

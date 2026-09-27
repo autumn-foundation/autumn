@@ -54,6 +54,42 @@ changes — see CLAUDE.md "CI test sharding" for the two cases that do matter
 (renaming a `compile_fail.rs` test function, and what branch protection should
 require).
 
+## Changelog notes
+
+A release note does **not** go into `CHANGELOG.md`. It goes into its own file:
+
+```
+changelog.d/<slug>.md
+```
+
+Every PR used to write its note to the top of the `## [Unreleased]` section.
+That is the same few lines every other open PR writes to, so every PR
+conflicted with every other PR, and the conflict was never about the code. A
+fragment is a file of its own, which two PRs never both edit.
+
+A fragment holds the markdown the section holds — a `### <Kind>` heading and
+its bullets:
+
+```markdown
+### Added
+
+- **money:** typed `Money<C>` and an enforced double-entry ledger
+  (issue #1837). `Money<Usd>` plus `Money<Eur>` does not compile.
+```
+
+Write one for a change a user of the framework can see. Skip it for an
+internal refactor that changes nothing on the outside.
+
+A breaking entry keeps the `**Breaking:**` marker and links its migration
+guide, `docs/migrations/next.md`. The migration-guide gate reads the fragments
+together with the changelog, so a break without a guide fails the PR that makes
+it, not the release that ships it.
+
+`./scripts/check-changelog-fragments.sh` gates the shape, and fails a PR that
+edits `CHANGELOG.md`. `./scripts/update-changelog.sh` folds the fragments into
+the changelog when a release is cut. See
+[`changelog.d/README.md`](changelog.d/README.md).
+
 ## Generator conformance gate
 
 Autumn's headline DX promise is that `autumn new` and `autumn generate` emit
@@ -64,6 +100,7 @@ code that **compiles, boots, and serves**. The tests that prove this live in
 |------|------|----------------|
 | `generated_project_compiles_runs_and_serves` | `e2e.rs` | `autumn new` → `cargo build` + HTTP responses |
 | `generated_scaffold_cargo_checks` | `generate.rs` | `generate scaffold` → `cargo check --tests` |
+| `generated_sqlite_scaffold_cargo_checks` | `generate.rs` | SQLite-configured scaffold (`Uuid`/`decimal`/`enum`/`DateTime`/`Attachment`/`json`) → `cargo check`. Not `--all-targets`: the scaffold smoke test is Postgres-only until #1905 (#1924) |
 | `generated_scaffold_config_cargo_checks` | `generate.rs` | config-driven scaffold → `cargo check --tests` |
 | `generated_scaffold_serves_posts_index_and_json_api` | `generate.rs` | scaffold + Postgres migrations + live HTTP |
 | `generated_constrained_scaffold_enforces_validation_end_to_end` | `generate.rs` | scaffold DSL `{…}` constraints + Postgres + live HTTP: rendered HTML5 attributes, 422 + inline errors, nothing stored (#1388) |
@@ -182,13 +219,20 @@ a panic there would take down the very request they exist to record), and the
 sandboxed-plugin runtime (`autumn/src/plugin_sandbox/host.rs`, `wire.rs`,
 `plugin.rs`: they run an artifact the operator explicitly did not audit, and the
 lane's whole promise is that nothing a hostile guest does can abort the host
-process). These are the files listed in the `REQUEST_PATH_MODULES` array in
+process), and the generated-UI pipeline (`autumn/src/constela/*`: it parses,
+validates, evaluates and renders a document a language model wrote, so every
+panic in it is reachable by whoever can shape that model's prompt — an
+out-of-range index there is a 500 on demand, not an injection, but just as much
+a vulnerability). These are the files listed in the `REQUEST_PATH_MODULES` array in
 `scripts/check-panic-gate.sh`, each entry carrying the Cargo feature that gates
 its `mod` declaration.
 
 **Honest scoping — the manifest is the *enforced* subset, not the whole request
-path.** The 37 modules are the files the gate enforces today, not a claim that
-they are the *only* per-request code. Other unambiguously per-request or
+path.** The modules in that array are the files the gate enforces today, not a
+claim that they are the *only* per-request code. (Stated without a count on
+purpose: the manifest grows every time a batch is audited, and a number written
+here goes stale the first time it does — `check-panic-gate.sh` prints the live
+one on every run.) Other unambiguously per-request or
 framework-owned modules are **not yet gated** and still contain production-path
 panics — known examples include `router.rs`, `etag.rs`, `security/rate_limit.rs`,
 `security/headers.rs`, `sse.rs`, and the `csrf` / `negotiate` / `range` /
@@ -733,7 +777,7 @@ RustSec advisory sits in the tree being published. Run it locally exactly as CI
 does:
 
 ```bash
-./scripts/check-advisories.sh              # workspace, sqlite graph, scaffold graph
+./scripts/check-advisories.sh              # workspace, sqlite, scaffold, fuzz, island-flock graphs
 ./scripts/check-advisories.sh --self-test  # prove the gate still rejects a CVE
 ```
 
@@ -750,9 +794,15 @@ reject it, then to accept it once — and only once — that id is waived.
 additive Postgres feature graph (`deny.toml`) and the mutually-exclusive sqlite
 backend graph (`deny-sqlite.toml`), including dev- and build-dependency
 licenses — plus, for advisories only, autumn-web's tree under the policy
-`autumn new` ships (`autumn-cli/src/templates/deny.toml.tmpl`). The repository's separate *excluded* sub-workspaces — `fuzz/` and
+`autumn new` ships (`autumn-cli/src/templates/deny.toml.tmpl`). It also covers
+the repository's separate *excluded* sub-workspaces — `fuzz/` and
 `examples/island-flock`, which each declare their own `[workspace]` and are
-excluded from the root `Cargo.toml` — are non-shipped harnesses/examples and are
-not gated here. Adding a per-sub-workspace cargo-deny pass (each needs its own
-config, and `fuzz/Cargo.lock` is currently out of sync with its manifest) is a
-possible follow-up.
+excluded from the root `Cargo.toml` for their own build reasons (a
+nightly/ASAN toolchain and a wasm32-only target, respectively), but are still
+real, shipped CI surface: `fuzz` is compiled and run by every `fuzz.yml` job,
+and `island-flock`'s compiled wasm/js bundle is committed and served by the
+`flock` example. Each has its own narrower `deny.toml`
+(`fuzz/deny.toml`, `examples/island-flock/deny.toml` — advisories + sources
+only; licenses aren't gated on either yet, see each file's header) audited by
+`audit_satellite_graphs` in `scripts/check-advisories.sh`. Triage a failing
+satellite check against that satellite's own `deny.toml`, not the root one.

@@ -530,6 +530,31 @@ fn scaffolded_app_passes_routes_audit_gate() {
     );
 }
 
+/// Issue #1706's success metric has two halves: a seeded fixture app carrying
+/// known defects is caught in full (`a11y_verify`'s red fixture), and the
+/// scaffolded starter passes clean. This is the second half, and it guards the
+/// gate the scaffold's own CI runs against itself. `a11y verify` is a static
+/// scan, so this needs no compile.
+#[test]
+fn scaffolded_app_passes_a11y_verify_gate() {
+    let temp_dir = scaffold("a11y-verify-gate-app");
+    let project_dir = temp_dir.path().join("a11y-verify-gate-app");
+
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let verify = Command::new(autumn_bin)
+        .args(["a11y", "verify", "."])
+        .current_dir(&project_dir)
+        .output()
+        .expect("failed to run `autumn a11y verify`");
+    assert!(
+        verify.status.success(),
+        "a freshly scaffolded app must pass `autumn a11y verify` unmodified — \
+         the gate its own generated CI runs:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&verify.stdout),
+        String::from_utf8_lossy(&verify.stderr),
+    );
+}
+
 /// Same guarantee as [`scaffolded_app_passes_routes_audit_gate`], for the
 /// `--api` JSON-first starter (`main.api.rs.tmpl`), which has its own set of
 /// starter handlers.

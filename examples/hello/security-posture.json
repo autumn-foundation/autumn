@@ -84,6 +84,17 @@
           "provenance": "provable"
         },
         {
+          "path": "/actuator/derivations",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
           "path": "/actuator/env",
           "method": "GET",
           "name": "actuator",

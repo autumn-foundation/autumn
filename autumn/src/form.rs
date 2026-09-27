@@ -428,6 +428,21 @@ pub(crate) fn strip_nul_from_pairs(pairs: &mut [(String, String)]) -> Vec<String
 pub trait IntoChangeset: Sized {
     /// Run validation and produce a `Changeset<Self>`.
     fn into_changeset(self) -> Changeset<Self>;
+
+    /// Build a changeset. Use `resolve` to look up a message for a field and
+    /// error code.
+    /// Return `None` from `resolve` to keep autumn-web's default English
+    /// message.
+    ///
+    /// The default implementation ignores `resolve` and defers to
+    /// [`into_changeset`](Self::into_changeset). This keeps a hand-rolled
+    /// `IntoChangeset` impl written before this method compiling unchanged.
+    fn into_changeset_with(
+        self,
+        _resolve: impl Fn(&str, &str) -> Option<String>,
+    ) -> Changeset<Self> {
+        self.into_changeset()
+    }
 }
 
 impl<T: validator::Validate> IntoChangeset for T {
@@ -435,6 +450,18 @@ impl<T: validator::Validate> IntoChangeset for T {
         match validator::Validate::validate(&self) {
             Ok(()) => Changeset::new(self),
             Err(errors) => Changeset::from_errors(self, validation_errors_to_map(&errors)),
+        }
+    }
+
+    fn into_changeset_with(
+        self,
+        resolve: impl Fn(&str, &str) -> Option<String>,
+    ) -> Changeset<Self> {
+        match validator::Validate::validate(&self) {
+            Ok(()) => Changeset::new(self),
+            Err(errors) => {
+                Changeset::from_errors(self, validation_errors_to_map_with(&errors, &resolve))
+            }
         }
     }
 }
@@ -656,11 +683,40 @@ impl<T: Serialize> ChangesetForm<T> {
         rich_text_area(&self.changeset, field, label)
     }
 
+    /// Render a labeled Markdown editor for a rich-text `field`, with
+    /// caller-supplied chrome labels.
+    ///
+    /// Delegates to [`rich_text_area_with_labels`]; see [`rich_text_area`] for
+    /// the full contract.
+    pub fn rich_text_area_with_labels(
+        &self,
+        field: &str,
+        label: &str,
+        labels: &RichTextLabels<'_>,
+    ) -> maud::Markup {
+        rich_text_area_with_labels(&self.changeset, field, label, labels)
+    }
+
     /// Render a Markdown editor with an htmx-driven live preview pane.
     ///
     /// Delegates to [`rich_text_area_htmx`]; see that function for full docs.
     pub fn rich_text_area_htmx(&self, field: &str, label: &str, preview_url: &str) -> maud::Markup {
         rich_text_area_htmx(&self.changeset, field, label, preview_url)
+    }
+
+    /// Render a Markdown editor with an htmx-driven live preview pane, with
+    /// caller-supplied chrome labels.
+    ///
+    /// Delegates to [`rich_text_area_htmx_with_labels`]; see
+    /// [`rich_text_area_htmx`] for full docs.
+    pub fn rich_text_area_htmx_with_labels(
+        &self,
+        field: &str,
+        label: &str,
+        preview_url: &str,
+        labels: &RichTextLabels<'_>,
+    ) -> maud::Markup {
+        rich_text_area_htmx_with_labels(&self.changeset, field, label, preview_url, labels)
     }
 
     /// Render a Markdown editor with an htmx live preview, excluding the
@@ -681,6 +737,31 @@ impl<T: Serialize> ChangesetForm<T> {
             label,
             preview_url,
             token_field,
+        )
+    }
+
+    /// Render a Markdown editor with an htmx live preview, excluding the
+    /// configured submit-token field `token_field` from the preview POST,
+    /// with caller-supplied chrome labels.
+    ///
+    /// Delegates to [`rich_text_area_htmx_with_token_field_with_labels`]; use
+    /// this when the app both customizes `[security.submit_token].field_name`
+    /// (issue #1843) and needs translated chrome labels.
+    pub fn rich_text_area_htmx_with_token_field_with_labels(
+        &self,
+        field: &str,
+        label: &str,
+        preview_url: &str,
+        token_field: &str,
+        labels: &RichTextLabels<'_>,
+    ) -> maud::Markup {
+        rich_text_area_htmx_with_token_field_with_labels(
+            &self.changeset,
+            field,
+            label,
+            preview_url,
+            token_field,
+            labels,
         )
     }
 
@@ -990,7 +1071,21 @@ pub(crate) fn validation_errors_to_map(
     errors: &validator::ValidationErrors,
 ) -> HashMap<String, Vec<String>> {
     let mut map = HashMap::new();
-    collect_errors(errors, "", &mut map);
+    collect_errors(errors, "", &mut map, &|_, _| None);
+    map
+}
+
+/// Like [`validation_errors_to_map`], but `resolve` gets a chance to supply a
+/// message for a field and code before the hardcoded English fallback runs.
+///
+/// `resolve` is consulted only when a `validator::ValidationError` has no
+/// explicit `.message` — an explicit message always wins.
+pub(crate) fn validation_errors_to_map_with(
+    errors: &validator::ValidationErrors,
+    resolve: &dyn Fn(&str, &str) -> Option<String>,
+) -> HashMap<String, Vec<String>> {
+    let mut map = HashMap::new();
+    collect_errors(errors, "", &mut map, resolve);
     map
 }
 
@@ -998,6 +1093,7 @@ fn collect_errors(
     errors: &validator::ValidationErrors,
     prefix: &str,
     map: &mut HashMap<String, Vec<String>>,
+    resolve: &dyn Fn(&str, &str) -> Option<String>,
 ) {
     for (field, kind) in errors.errors() {
         let key = if prefix.is_empty() {
@@ -1011,7 +1107,10 @@ fn collect_errors(
                     .iter()
                     .map(|e| {
                         e.message.as_ref().map_or_else(
-                            || format!("validation failed: {}", e.code),
+                            || {
+                                resolve(&key, &e.code)
+                                    .unwrap_or_else(|| format!("validation failed: {}", e.code))
+                            },
                             ToString::to_string,
                         )
                     })
@@ -1019,12 +1118,12 @@ fn collect_errors(
                 map.entry(key).or_default().extend(messages);
             }
             validator::ValidationErrorsKind::Struct(nested) => {
-                collect_errors(nested, &key, map);
+                collect_errors(nested, &key, map, resolve);
             }
             validator::ValidationErrorsKind::List(list) => {
                 for (idx, nested) in list {
                     let indexed_key = format!("{key}[{idx}]");
-                    collect_errors(nested, &indexed_key, map);
+                    collect_errors(nested, &indexed_key, map, resolve);
                 }
             }
         }
@@ -1740,6 +1839,69 @@ const RICH_TEXT_TOOLBAR: &[(&str, &str)] = &[
     ("Quote", "> quote"),
 ];
 
+/// Labels for the rich text editor chrome. Set a label to change its text.
+///
+/// The default labels are English. Pass a customized `RichTextLabels` to a
+/// `_with_labels` function (e.g. [`rich_text_area_with_labels`]) to translate
+/// the toolbar, hint, and preview heading for a non-English locale.
+#[cfg(feature = "maud")]
+#[derive(Clone, Copy)]
+pub struct RichTextLabels<'a> {
+    toolbar_group: &'a str,
+    controls: &'a [(&'a str, &'a str)],
+    hint: &'a str,
+    preview_heading: &'a str,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> RichTextLabels<'a> {
+    /// Make the default English labels.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            toolbar_group: "Markdown formatting",
+            controls: RICH_TEXT_TOOLBAR,
+            hint: RICH_TEXT_HINT,
+            preview_heading: "Preview",
+        }
+    }
+
+    /// Set the toolbar group label.
+    #[must_use]
+    pub const fn toolbar_group(mut self, label: &'a str) -> Self {
+        self.toolbar_group = label;
+        self
+    }
+
+    /// Set the toolbar control names and syntax hints.
+    #[must_use]
+    pub const fn controls(mut self, controls: &'a [(&'a str, &'a str)]) -> Self {
+        self.controls = controls;
+        self
+    }
+
+    /// Set the hint text under the editor.
+    #[must_use]
+    pub const fn hint(mut self, hint: &'a str) -> Self {
+        self.hint = hint;
+        self
+    }
+
+    /// Set the preview pane heading.
+    #[must_use]
+    pub const fn preview_heading(mut self, heading: &'a str) -> Self {
+        self.preview_heading = heading;
+        self
+    }
+}
+
+#[cfg(feature = "maud")]
+impl Default for RichTextLabels<'static> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Render a labeled Markdown editor for a rich-text field (issue #1255).
 ///
 /// The control is a plain `<textarea>` carrying the Markdown **source** — the
@@ -1766,7 +1928,20 @@ pub fn rich_text_area<T: Serialize>(
     field: &str,
     label: &str,
 ) -> maud::Markup {
-    rich_text_area_inner(changeset, field, label, None, false)
+    rich_text_area_inner(changeset, field, label, None, false, &RichTextLabels::new())
+}
+
+/// Like [`rich_text_area`] but with caller-supplied chrome labels, for
+/// translating the toolbar, hint, and preview heading (issue #2227).
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn rich_text_area_with_labels<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    labels: &RichTextLabels<'_>,
+) -> maud::Markup {
+    rich_text_area_inner(changeset, field, label, None, false, labels)
 }
 
 /// Render a [`rich_text_area`] with an htmx-driven live preview pane.
@@ -1824,6 +1999,27 @@ pub fn rich_text_area_htmx<T: Serialize>(
     )
 }
 
+/// Like [`rich_text_area_htmx`] but with caller-supplied chrome labels; see
+/// [`rich_text_area_with_labels`] for why the labels seam exists.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn rich_text_area_htmx_with_labels<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    preview_url: &str,
+    labels: &RichTextLabels<'_>,
+) -> maud::Markup {
+    rich_text_area_htmx_with_token_field_with_labels(
+        changeset,
+        field,
+        label,
+        preview_url,
+        DEFAULT_SUBMIT_TOKEN_FIELD,
+        labels,
+    )
+}
+
 /// Like [`rich_text_area_htmx`] but excludes the caller-supplied submit-token
 /// field name from the preview POST instead of the hardcoded default
 /// `_submit_token`.
@@ -1847,6 +2043,30 @@ pub fn rich_text_area_htmx_with_token_field<T: Serialize>(
         label,
         Some((preview_url, token_field)),
         false,
+        &RichTextLabels::new(),
+    )
+}
+
+/// Like [`rich_text_area_htmx_with_token_field`] but with caller-supplied
+/// chrome labels; see [`rich_text_area_with_labels`] for why the labels seam
+/// exists.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn rich_text_area_htmx_with_token_field_with_labels<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    preview_url: &str,
+    token_field: &str,
+    labels: &RichTextLabels<'_>,
+) -> maud::Markup {
+    rich_text_area_inner(
+        changeset,
+        field,
+        label,
+        Some((preview_url, token_field)),
+        false,
+        labels,
     )
 }
 
@@ -1870,7 +2090,20 @@ pub fn required_rich_text_area<T: Serialize>(
     field: &str,
     label: &str,
 ) -> maud::Markup {
-    rich_text_area_inner(changeset, field, label, None, true)
+    rich_text_area_inner(changeset, field, label, None, true, &RichTextLabels::new())
+}
+
+/// Like [`required_rich_text_area`] but with caller-supplied chrome labels;
+/// see [`rich_text_area_with_labels`] for why the labels seam exists.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_rich_text_area_with_labels<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    labels: &RichTextLabels<'_>,
+) -> maud::Markup {
+    rich_text_area_inner(changeset, field, label, None, true, labels)
 }
 
 /// Render a **required** Markdown editor with an htmx-driven live preview.
@@ -1895,6 +2128,27 @@ pub fn required_rich_text_area_htmx<T: Serialize>(
     )
 }
 
+/// Like [`required_rich_text_area_htmx`] but with caller-supplied chrome
+/// labels; see [`rich_text_area_with_labels`] for why the labels seam exists.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_rich_text_area_htmx_with_labels<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    preview_url: &str,
+    labels: &RichTextLabels<'_>,
+) -> maud::Markup {
+    required_rich_text_area_htmx_with_token_field_with_labels(
+        changeset,
+        field,
+        label,
+        preview_url,
+        DEFAULT_SUBMIT_TOKEN_FIELD,
+        labels,
+    )
+}
+
 /// Like [`required_rich_text_area_htmx`] but excludes the caller-supplied
 /// submit-token field name from the preview POST instead of the hardcoded
 /// default `_submit_token`.
@@ -1915,11 +2169,37 @@ pub fn required_rich_text_area_htmx_with_token_field<T: Serialize>(
         label,
         Some((preview_url, token_field)),
         true,
+        &RichTextLabels::new(),
+    )
+}
+
+/// Like [`required_rich_text_area_htmx_with_token_field`] but with
+/// caller-supplied chrome labels; see [`rich_text_area_with_labels`] for why
+/// the labels seam exists.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_rich_text_area_htmx_with_token_field_with_labels<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    preview_url: &str,
+    token_field: &str,
+    labels: &RichTextLabels<'_>,
+) -> maud::Markup {
+    rich_text_area_inner(
+        changeset,
+        field,
+        label,
+        Some((preview_url, token_field)),
+        true,
+        labels,
     )
 }
 
 /// Shared body of [`rich_text_area`] and its htmx variant. `preview` is
-/// `Some((preview_url, token_field))` for the live-preview flavour.
+/// `Some((preview_url, token_field))` for the live-preview flavour. `labels`
+/// carries the chrome text (toolbar, hint, preview heading) — pass
+/// `&RichTextLabels::new()` for the default English labels.
 #[cfg(feature = "maud")]
 fn rich_text_area_inner<T: Serialize>(
     changeset: &Changeset<T>,
@@ -1927,6 +2207,7 @@ fn rich_text_area_inner<T: Serialize>(
     label: &str,
     preview: Option<(&str, &str)>,
     required: bool,
+    labels: &RichTextLabels<'_>,
 ) -> maud::Markup {
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
@@ -1948,8 +2229,8 @@ fn rich_text_area_inner<T: Serialize>(
     maud::html! {
         div id=(wrapper_id) class="autumn-field autumn-rich-text" data-autumn-field-wrapper=(field) {
             label for=(field) class="autumn-field__label" { (label) }
-            div class="autumn-rich-text__toolbar" role="group" aria-label="Markdown formatting" {
-                @for (control, syntax) in RICH_TEXT_TOOLBAR {
+            div class="autumn-rich-text__toolbar" role="group" aria-label=(labels.toolbar_group) {
+                @for (control, syntax) in labels.controls {
                     span class="autumn-rich-text__toolbar-item" {
                         span class="autumn-rich-text__toolbar-label" { (control) }
                         code class="autumn-rich-text__toolbar-syntax" { (syntax) }
@@ -1972,7 +2253,7 @@ fn rich_text_area_inner<T: Serialize>(
                 hx-include=[preview.map(|_| "closest form")]
                 hx-params=[hx_params.as_deref()]
                 { (value) }
-            p id=(hint_id) class="autumn-rich-text__hint" { (RICH_TEXT_HINT) }
+            p id=(hint_id) class="autumn-rich-text__hint" { (labels.hint) }
             @if has_errors {
                 div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
                     @for error in errors {
@@ -1982,7 +2263,7 @@ fn rich_text_area_inner<T: Serialize>(
             }
             @if preview.is_some() {
                 div class="autumn-rich-text__preview-wrapper" {
-                    span class="autumn-rich-text__preview-label" id=(format!("{field}-preview-label")) { "Preview" }
+                    span class="autumn-rich-text__preview-label" id=(format!("{field}-preview-label")) { (labels.preview_heading) }
                     // Deliberately NOT an `aria-live` region: this element is
                     // the htmx swap target and re-renders on every pause in
                     // typing, so announcing it would read the entire post back
@@ -3828,6 +4109,61 @@ mod tests {
     }
 
     #[test]
+    fn into_changeset_with_resolves_a_translated_message_for_an_unmessaged_code() {
+        #[derive(validator::Validate)]
+        struct F {
+            #[validate(email)]
+            email: String,
+        }
+        let cs = F {
+            email: "not-an-email".into(),
+        }
+        .into_changeset_with(|field, code| {
+            if field == "email" && code == "email" {
+                Some("not a valid address".to_string())
+            } else {
+                None
+            }
+        });
+        assert!(!cs.is_valid());
+        assert_eq!(cs.errors_for("email"), ["not a valid address".to_string()]);
+    }
+
+    #[test]
+    fn into_changeset_with_falls_back_to_the_default_message_when_resolve_returns_none() {
+        #[derive(validator::Validate)]
+        struct F {
+            #[validate(email)]
+            email: String,
+        }
+        let without_resolver = F {
+            email: "not-an-email".into(),
+        }
+        .into_changeset();
+        let with_noop_resolver = F {
+            email: "not-an-email".into(),
+        }
+        .into_changeset_with(|_, _| None);
+        assert_eq!(
+            with_noop_resolver.errors_for("email"),
+            without_resolver.errors_for("email")
+        );
+    }
+
+    #[test]
+    fn into_changeset_with_never_overrides_an_explicit_message() {
+        #[derive(validator::Validate)]
+        struct F {
+            #[validate(length(min = 5, message = "too short"))]
+            name: String,
+        }
+        let cs = F { name: "ab".into() }.into_changeset_with(|_, _| {
+            Some("the resolver's message, which must never win".to_string())
+        });
+        assert_eq!(cs.errors_for("name"), ["too short".to_string()]);
+    }
+
+    #[test]
     fn into_changeset_preserves_data_on_failure() {
         #[derive(validator::Validate)]
         struct F {
@@ -3881,6 +4217,42 @@ mod tests {
             .into_changeset();
             assert!(!cs.is_valid());
             assert!(!cs.errors_for("address.street").is_empty());
+        }
+
+        #[derive(validator::Validate)]
+        struct NestedContact {
+            #[validate(email)]
+            email: String,
+        }
+
+        #[derive(validator::Validate)]
+        struct PersonWithContact {
+            #[validate(nested)]
+            contact: NestedContact,
+        }
+
+        #[test]
+        fn into_changeset_with_resolver_sees_the_dotted_nested_key() {
+            use std::cell::RefCell;
+
+            let seen_keys: RefCell<Vec<String>> = RefCell::new(Vec::new());
+            let cs = PersonWithContact {
+                contact: NestedContact {
+                    email: "not-an-email".into(),
+                },
+            }
+            .into_changeset_with(|field, code| {
+                seen_keys.borrow_mut().push(field.to_string());
+                (field == "contact.email" && code == "email")
+                    .then(|| "not a valid address".to_string())
+            });
+            assert!(!cs.is_valid());
+            assert_eq!(
+                cs.errors_for("contact.email"),
+                ["not a valid address".to_string()]
+            );
+            // The resolver received the fully dotted key, not the bare field name.
+            assert_eq!(seen_keys.into_inner(), vec!["contact.email".to_string()]);
         }
     }
 
@@ -4296,6 +4668,235 @@ mod tests {
         assert_eq!(field_from_urlencoded(b"", "body"), None);
         // A key that merely *contains* the name must not match.
         assert_eq!(field_from_urlencoded(b"body_extra=no", "body"), None);
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn rich_text_area_with_labels_overrides_the_hint() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: String::new(),
+        });
+        let labels = RichTextLabels::new().hint("Se admite Markdown.");
+        let html = rich_text_area_with_labels(&cs, "body", "Body", &labels).into_string();
+        assert!(html.contains("Se admite Markdown."), "{html}");
+        assert!(!html.contains("Markdown supported"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn rich_text_area_with_labels_overrides_the_toolbar_group_label() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: String::new(),
+        });
+        let labels = RichTextLabels::new().toolbar_group("Formato Markdown");
+        let html = rich_text_area_with_labels(&cs, "body", "Body", &labels).into_string();
+        assert!(html.contains(r#"aria-label="Formato Markdown""#), "{html}");
+        assert!(!html.contains("Markdown formatting"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn rich_text_area_with_labels_overrides_the_controls() {
+        const CUSTOM_CONTROLS: &[(&str, &str)] = &[("Negrita", "**negrita**")];
+
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: String::new(),
+        });
+        let labels = RichTextLabels::new().controls(CUSTOM_CONTROLS);
+        let html = rich_text_area_with_labels(&cs, "body", "Body", &labels).into_string();
+        assert!(html.contains("Negrita"), "{html}");
+        assert!(html.contains("**negrita**"), "{html}");
+        // The default English control names are gone entirely, not just augmented.
+        assert!(!html.contains(">Bold<"), "{html}");
+        assert!(!html.contains("**bold**"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn rich_text_area_htmx_with_labels_overrides_the_preview_heading() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: String::new(),
+        });
+        let labels = RichTextLabels::new().preview_heading("Vista previa");
+        let html =
+            rich_text_area_htmx_with_labels(&cs, "body", "Body", "/p", &labels).into_string();
+        assert!(html.contains("Vista previa"), "{html}");
+        assert!(!html.contains(">Preview<"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn rich_text_area_htmx_with_token_field_with_labels_overrides_the_preview_heading() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: String::new(),
+        });
+        let labels = RichTextLabels::new().preview_heading("Vista previa");
+        let html = rich_text_area_htmx_with_token_field_with_labels(
+            &cs,
+            "body",
+            "Body",
+            "/p",
+            "_one_time",
+            &labels,
+        )
+        .into_string();
+        assert!(html.contains("Vista previa"), "{html}");
+        assert!(html.contains(r#"hx-params="not _one_time""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_rich_text_area_with_labels_keeps_the_required_signal_and_labels() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: String::new(),
+        });
+        let labels = RichTextLabels::new().hint("Se admite Markdown.");
+        let html = required_rich_text_area_with_labels(&cs, "body", "Body", &labels).into_string();
+        assert!(html.contains(r#"aria-required="true""#), "{html}");
+        assert!(html.contains("Se admite Markdown."), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_rich_text_area_htmx_with_labels_keeps_the_required_signal_and_labels() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: String::new(),
+        });
+        let labels = RichTextLabels::new().preview_heading("Vista previa");
+        let html = required_rich_text_area_htmx_with_labels(&cs, "body", "Body", "/p", &labels)
+            .into_string();
+        assert!(html.contains(r#"aria-required="true""#), "{html}");
+        assert!(html.contains("Vista previa"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_rich_text_area_htmx_with_token_field_with_labels_keeps_the_required_signal_and_labels()
+     {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: String::new(),
+        });
+        let labels = RichTextLabels::new().preview_heading("Vista previa");
+        let html = required_rich_text_area_htmx_with_token_field_with_labels(
+            &cs,
+            "body",
+            "Body",
+            "/p",
+            "_one_time",
+            &labels,
+        )
+        .into_string();
+        assert!(html.contains(r#"aria-required="true""#), "{html}");
+        assert!(html.contains("Vista previa"), "{html}");
+        assert!(html.contains(r#"hx-params="not _one_time""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn rich_text_area_with_labels_default_labels_match_rich_text_area() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: "Hello **world**".into(),
+        });
+        assert_eq!(
+            rich_text_area_with_labels(&cs, "body", "Body", &RichTextLabels::new()).into_string(),
+            rich_text_area(&cs, "body", "Body").into_string()
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn rich_text_area_htmx_with_labels_default_labels_match_rich_text_area_htmx() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F { body: "hi".into() });
+        assert_eq!(
+            rich_text_area_htmx_with_labels(&cs, "body", "Body", "/p", &RichTextLabels::new())
+                .into_string(),
+            rich_text_area_htmx(&cs, "body", "Body", "/p").into_string()
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn changeset_form_exposes_the_rich_text_labels_helpers() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let form = ChangesetForm {
+            changeset: Changeset::new(F { body: "hi".into() }),
+            csrf_token: None,
+            csrf_field: "_csrf".to_owned(),
+        };
+        let labels = RichTextLabels::new().hint("Se admite Markdown.");
+        assert_eq!(
+            form.rich_text_area_with_labels("body", "Body", &labels)
+                .into_string(),
+            rich_text_area_with_labels(&form.changeset, "body", "Body", &labels).into_string()
+        );
+        assert_eq!(
+            form.rich_text_area_htmx_with_labels("body", "Body", "/p", &labels)
+                .into_string(),
+            rich_text_area_htmx_with_labels(&form.changeset, "body", "Body", "/p", &labels)
+                .into_string()
+        );
+        assert_eq!(
+            form.rich_text_area_htmx_with_token_field_with_labels(
+                "body",
+                "Body",
+                "/p",
+                "_one_time",
+                &labels
+            )
+            .into_string(),
+            rich_text_area_htmx_with_token_field_with_labels(
+                &form.changeset,
+                "body",
+                "Body",
+                "/p",
+                "_one_time",
+                &labels
+            )
+            .into_string()
+        );
     }
 
     #[cfg(feature = "maud")]

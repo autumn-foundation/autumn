@@ -55,10 +55,11 @@ For large inputs, queries are automatically chunked under the Postgres parameter
 
 ### Hook-Aware Execution
 If hooks are enabled on your repository, `save_many` guarantees full transaction integrity:
-1. Runs `before_create` hooks **sequentially** on each record.
-2. Batches the validated records and inserts them in a single database round trip inside a transaction.
-3. Runs `after_create` hooks sequentially on successfully inserted records.
-4. Stages `after_create_commit` hooks to fire only after the surrounding transaction successfully commits.
+1. Runs the model's `#[validate]` rules on every record, before any record is written — one offender aborts the batch with a 422.
+2. Runs `before_create` hooks **sequentially** on each record.
+3. Batches the validated records and inserts them in a single database round trip inside a transaction.
+4. Runs `after_create` hooks sequentially on successfully inserted records.
+5. Stages `after_create_commit` hooks to fire only after the surrounding transaction successfully commits.
 
 ---
 
@@ -66,7 +67,8 @@ If hooks are enabled on your repository, `save_many` guarantees full transaction
 
 When bulk importing dirty external data (e.g., from CSVs or public API hooks), some rows might violate business rules or database constraints. `save_many_skip_invalid` enables maximum throughput without losing valid rows.
 
-- It runs `before_create` hooks on each row and filters out custom validation failures.
+- It runs the model's `#[validate]` rules on each row first, then the `before_create` hooks, and filters out the failures of either.
+- A rejected row is reported against **the caller's own index**, so a `(index, error)` pair still points at the CSV line it came from.
 - It attempts a high-speed batch insert of all successful records in a transaction.
 - **Constraint Fallback**: If the batch insert fails due to a database constraint (e.g., `UniqueViolation`), it automatically falls back to row-by-row insertion for that chunk, isolating individual DB constraint failures.
 - Returns a tuple of `(successful_models, list_of_errors_with_indices)`.
@@ -121,6 +123,9 @@ RETURNING *;
 > [!IMPORTANT]
 > **Compile-Time Hook Safety**: If hooks are enabled on your repository, calling `upsert_many` is explicitly **rejected at compile-time**. 
 > Because Postgres determines whether a row will insert vs update at runtime, it is impossible to correctly invoke `before_create` or `before_update` hooks before sending the query. To prevent silent hook bypass, this is caught during compilation.
+
+> [!NOTE]
+> **`position(...)` repositories chunk one row at a time.** A batched upsert that reassigns a scoped `position` field's scope column can rescope several same-scope rows in one statement. Each row's compaction trigger only sees its own pre-statement position, so this can gap or duplicate ranks. `upsert_many` forces a chunk size of 1 whenever the repository declares `position(...)`, trading batch throughput for a correct sequence.
 
 ---
 
@@ -180,9 +185,16 @@ concurrent caller won the insert race — you get the existing row with
 ### How it stays race-safe
 
 1. **Preliminary lookup** on the read path (replica-eligible, honoring tenant
-   scoping and soft-delete). A hit returns `(row, false)` immediately and fires
-   **no** hooks.
-2. Otherwise **insert on the primary** with `INSERT ... ON CONFLICT DO NOTHING`.
+   scoping and soft-delete). A `#[normalize]` lookup column is canonicalized
+   first, so the lookup matches the value step 2 would store. A hit returns
+   `(row, false)` immediately and fires **no** hooks.
+2. Otherwise the payload is **normalized and validated** — the create half is an
+   insert, so the model's rules apply (#2586). A refusal does not overtake the
+   found path: because step 1 is replica-eligible and a concurrent caller may
+   have inserted since, the method re-checks the primary and returns that row if
+   it exists, rather than letting replication lag decide between `(row, false)`
+   and a 422.
+3. Then **insert on the primary** with `INSERT ... ON CONFLICT DO NOTHING`.
    `ON CONFLICT DO NOTHING` is the crux: instead of raising `23505` (and
    poisoning the transaction), Postgres silently skips a conflicting insert.
    - If a row comes back, this call created it → `(row, true)`, and create/commit

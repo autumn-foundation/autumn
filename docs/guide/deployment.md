@@ -1244,6 +1244,130 @@ the systemd unit via `EnvironmentFile`. They are never inlined into the
 world-readable unit, never placed on a command line, and never printed to logs
 or error messages.
 
+### Where a SQLite data file lives
+
+On the [SQLite tier](./sqlite-in-production.md) the database is a **file**, and a
+file inside a release directory does not survive the next deploy: each release
+gets its own directory, a slot unit's `WorkingDirectory` is that directory, and
+release retention deletes old ones. So `autumn deploy` treats the data file as
+persistent state:
+
+| Configured `[database] url` | What the deploy does |
+| --- | --- |
+| Relative — `sqlite://app.db` | Keeps the real file at `app_dir/shared/data/app.db` and links each release at `app.db`. |
+| Absolute outside the releases dir — `sqlite:///var/lib/myapp/app.db` | Leaves it exactly there; it is already release-independent. |
+| Absolute inside the app dir but outside `shared/data/` (`releases/…`, `current/…`, `shared/autumn.env`) | Refused at preflight. `releases/` is deleted by retention, and the rest of `shared/` holds deploy state files — `autumn.env`, `live-slot`, `previous-release`, `proxy-options`, `last-deploy` — that would overwrite the database. |
+| Relative but not a plain name — `sqlite://../x.db`, `sqlite://.` | Refused at preflight — it does not name a file inside the release dir. |
+| Relative, starting with the name of a file the deploy uploads — `sqlite://myapp`, `sqlite://autumn.toml`, `sqlite://myapp/app.db` | Refused at preflight — the upload writes through the data link and would truncate the database. `scp` writes *into* `myapp` when a directory is there, so a payload name is refused as the leading component too, not just as the whole path. Use a name of your own (`sqlite://data/app.db`). |
+| In-memory — `sqlite::memory:` | Refused at preflight — it does not survive a restart, let alone a deploy. |
+
+`[deploy] app_dir` must be absolute for a SQLite app. A relative one makes the
+link target resolve beneath the release directory instead of your SSH working
+directory, so the migration would open a dangling link.
+
+For an **absolute** database the deploy also re-checks containment on the host,
+as a `check-data-dir` step, before anything is uploaded. That step creates
+`shared/data/` when the database lives there — `prepare-dirs` makes `shared/`
+but not `shared/data/`, and SQLite will not create a database whose parent
+directory is missing. It applies the same `sqlite-data-adopted` guard described
+below before doing so, so an absolute database in `shared/data` on an
+unavailable mount stops the deploy instead of having its mount point recreated
+underneath it. A path *outside* the app dir is yours: it is verified, never
+created, and never guarded. It has to: if `app_dir`
+is itself a symlink (`/srv/autumn/myapp -> /mnt/apps/myapp`) and your database URL
+uses the resolved spelling, the CLI compares two unrelated strings and sees a file
+outside the app dir — while release retention walks the symlink to the same
+directory and deletes it. Only the host can resolve that.
+
+`shared/` is created by the deploy's `prepare-dirs` step, is never pruned, and is
+seen by both blue/green slots, so the file a release writes is the file the next
+release reads. SQLite follows the symlink when it names the `-wal`, `-shm` and
+`-journal` sidecars, so those land beside the shared file too. The link is created
+**before** the migration one-shot, so migrations and the app always open the same
+database. `deploy rollback` re-links its target before it starts it, because a
+release deployed before adoption holds no file at that path.
+
+**Upgrading an app deployed before this contract existed.** If the data file is
+still a real file in the currently serving release, the next `deploy up` **stops
+and tells you what to run**. It does not move the file for you, and that is
+deliberate: SQLite derives the `-wal` name from the path a connection resolved,
+so a connection opened before a move and one opened after would use two different
+write-ahead logs for one database — and there is no way to move a file and
+create the link in its place atomically, so a pooled connection opening in that
+window creates an empty database at the old path.
+
+The one-time migration, on the host (the deploy prints these paths for you):
+
+```sh
+autumn db backup                      # first, from the project dir
+systemctl stop myapp-blue.service myapp-green.service &&
+  { [ ! -e /srv/autumn/myapp/current/app.db-wal ] ||
+    mv /srv/autumn/myapp/current/app.db-wal /srv/autumn/myapp/shared/data/app.db-wal; } &&
+  { [ ! -e /srv/autumn/myapp/current/app.db-shm ] ||
+    mv /srv/autumn/myapp/current/app.db-shm /srv/autumn/myapp/shared/data/app.db-shm; } &&
+  { [ ! -e /srv/autumn/myapp/current/app.db-journal ] ||
+    mv /srv/autumn/myapp/current/app.db-journal /srv/autumn/myapp/shared/data/app.db-journal; } &&
+  mv /srv/autumn/myapp/current/app.db /srv/autumn/myapp/shared/data/app.db
+```
+
+The **sidecars move first and the database last**, and each step gates the next.
+`shared/data/app.db` existing is what tells the next deploy the move is done, so
+moving it first and then failing on the `-wal` would strand a write-ahead log the
+next deploy no longer stops for — the app would start without every transaction
+it held. Stop on the first failure and the refusal simply fires again, so a retry
+resumes.
+
+Each file moves by name rather than through `app.db*`: that glob also matches an
+unrelated `app.db.backup` and would move it, possibly over a file of that name
+already in `shared/data`.
+
+Then re-run `autumn deploy up`. From that point on nothing is ever relocated: the
+file stays in `shared/data` and each release is linked at it.
+
+**If you already hand-symlinked the data file** at a database you keep elsewhere,
+the deploy stops on that too, and prints a different one-time migration — `mv` on
+a symlink moves the link, not the database behind it:
+
+```sh
+autumn db backup                      # first, from the project dir
+systemctl stop myapp-blue.service myapp-green.service &&
+  src=$(readlink -f /srv/autumn/myapp/current/app.db) &&
+  { [ ! -e "$src"-wal ] || mv "$src"-wal /srv/autumn/myapp/shared/data/app.db-wal; } &&
+  { [ ! -e "$src"-shm ] || mv "$src"-shm /srv/autumn/myapp/shared/data/app.db-shm; } &&
+  { [ ! -e "$src"-journal ] || mv "$src"-journal /srv/autumn/myapp/shared/data/app.db-journal; } &&
+  mv "$src" /srv/autumn/myapp/shared/data/app.db &&
+  rm -f /srv/autumn/myapp/current/app.db
+```
+
+Each file moves to its **exact** shared name rather than just into `shared/data`:
+your symlink may point at a different basename (`legacy.sqlite`), and leaving it
+under that name puts the database beside the one the deploy opens instead of at
+it — so the next deploy would create an empty one anyway.
+
+The deploy refuses rather than link past your symlink, **whether or not** a file
+already exists in `shared/data`. If there is none, the migration would create an
+empty database there and the cutover would serve it while yours sat untouched at
+the old path. If there is one, the cutover would quietly start serving *that*
+database instead of yours, with no error at all — so the deploy stops and lets you
+decide which of the two is the real one.
+
+**If `shared/data` is a mounted volume**, note that the deploy records a
+`shared/sqlite-data-adopted` marker as soon as the database exists — right after
+the migration that creates it, and again on any later deploy that sees the file. Once that
+marker exists, a *missing* database stops the deploy instead of creating a fresh
+one — an unmounted volume is otherwise indistinguishable from a first deploy, and
+guessing wrong orphans your data. The marker lives in `shared/`, not
+`shared/data`, so it is still there when the mount is not. If you removed the
+database deliberately and want a new one, delete the marker too.
+
+The deploy never deletes a database file. A real file it finds at the link path
+in some other release — a rollback target from before the migration — is set
+aside as `shared/data/<file>.superseded`, out of retention's reach; a deploy that
+would overwrite an existing one refuses instead.
+
+Back it up with [`autumn db backup`](./daemon.md#database-backups), which takes an
+online-safe snapshot of the file with no external tools.
+
 ### Troubleshooting
 
 - **Preflight is failing.** Run `autumn deploy check` (or `autumn doctor --online`)
@@ -1339,11 +1463,6 @@ or error messages.
   cutover leaves the previous release serving against the migrated schema with
   nothing saying so. See
   [What fleet support changed for an existing single-host deploy](#what-fleet-support-changed-for-an-existing-single-host-deploy).
-- **A compensated first deploy leaves its proxy route behind.** When the fleet
-  removes a host's just-completed *first* deploy, that host's kamal-proxy still
-  holds a route pointing at the (now stopped) slot, so its public port answers
-  `502` instead of refusing the connection until the host is deployed again. The
-  state table names the host so this is never a surprise.
 - **Host identity is compared literally.** Duplicate `[deploy] hosts` entries are
   refused after trimming, but two DNS names for the same machine are not detected
   — the same limitation `autumn migrate` has for duplicate target URLs.
@@ -1377,8 +1496,9 @@ enabled = true                 # off by default; the controller is a no-op when 
 # recordings_dir = "/var/lib/mediamtx/recordings"
 # record_delete_after = "72h"  # MediaMTX recordDeleteAfter retention window
 # webrtc_additional_hosts = ["my-app-mediamtx.example.com"]  # extra WebRTC ICE hosts
-# The listen ports below default to MediaMTX's standard values; override only if
-# you also change the app-side *_base URLs to match.
+# The listen ports below default to MediaMTX's standard values. Override one and
+# you must update the matching app-side *_base URL too — a pure-config preflight
+# fails the deploy closed when they disagree.
 # api_port = 9997        # control API
 # rtmp_port = 1935       # RTMP ingest only (OBS / RTMP encoders)
 # hls_port = 8888        # HLS playback
@@ -1395,11 +1515,15 @@ enabled = true                 # off by default; the controller is a no-op when 
 
 When `enabled = true`, `autumn deploy up`:
 
-1. Runs **four fail-closed host preflight checks before touching the host** —
-   FFmpeg resolves (the concrete `[media.ffmpeg] bin`), the MediaMTX binary is
-   executable, the recordings directory is writable, and the MediaMTX ports are
-   free — plus a pure-config precheck that the configured MediaMTX listener ports
-   are distinct, and **aborts the deploy** if the host cannot serve media, rather
+1. Runs **six fail-closed preflight checks before touching the host**. Two are
+   pure config and run first: the MediaMTX listener ports are distinct, and each
+   listener port matches the app-side `[media.mediamtx] *_base` URL that calls it
+   (so a customized port cannot strand the app on an origin the daemon no longer
+   binds). Four then probe the host: FFmpeg resolves (the concrete
+   `[media.ffmpeg] bin`), the MediaMTX binary is executable, the recordings
+   directory is writable — or absent under a writable parent, which provisioning
+   then creates — and the MediaMTX ports are free. Any blocking failure
+   **aborts the deploy**, rather
    than shipping a half-provisioned box. One caveat on the FFmpeg check: only a
    **concrete literal** `[media.ffmpeg] bin` is probed and fail-closed here; an
    env/interpolation-indirected path (an empty value, or one carrying a `${...}`
@@ -1422,39 +1546,28 @@ collapse to your public MediaMTX origin, and your object-store origin must also
 be allowed in `media-src` for recorded playback.
 
 > **`strict_config` interaction.** The `[media]` table is **plugin-owned** — it
-> is not part of autumn-web's `AutumnConfig` schema. `autumn deploy` reads the
-> `[media.mediamtx]` / `[media.ffmpeg]` **subtree** straight from the merged
-> `autumn.toml` (base ← inline `[profile.<name>]` ← `autumn-<profile>.toml`), so
-> that media-subtree read never itself routes through the strict schema. But that
-> does **not** make strict config deploy-safe. Before it ever reads the raw
-> `[media]` subtree, `deploy::run` calls `AutumnConfig::load()` — the strict
-> loader (`autumn-cli/src/deploy.rs`, ahead of `load_media_host_config`) — for
-> **every** subcommand. So if you turn on autumn-web's strict config validation
-> (`[server] strict_config = true`, or `AUTUMN_SERVER__STRICT_CONFIG=1`) **and**
-> keep a top-level `[media]` table in that strict-loaded config, the `[media]`
-> table is flagged as an **unknown top-level key** and **hard-fails** during that
-> load (unknown top-level keys were already strict pre-#1890, so this fails even
-> without `strict_config_enforce_all`). That means **both**:
->
-> - the **app runtime fails to boot**, *and*
-> - **`autumn deploy plan` / `deploy up` also exit during config load** on the
->   unknown `[media]` key — they never reach `load_media_host_config` and never
->   provision MediaMTX, because the strict `AutumnConfig::load()` runs first.
->
-> **Workaround:** treat `strict_config` and a top-level `[media]` table as
-> mutually exclusive today — don't enable `strict_config` while the strict-loaded
-> config carries a top-level `[media]` table (the validator has no knowledge of
-> the plugin's `[media]` section, on either the app-boot or the deploy path).
+> is not part of autumn-web's `AutumnConfig` schema — and both paths that read a
+> strict config now accept it. The app declares the section
+> (`AppBuilder::config_section("media")`, which `MediaPlugin::build` calls), so
+> `[server] strict_config = true` boots cleanly; every *other* unknown top-level
+> root still hard-fails, so the seam is not a blanket escape hatch. `autumn
+> deploy` cannot know an app's plugin set, so it loads the ambient config with
+> unknown top-level roots accepted **opaque-with-a-warning** while keeping strict
+> validation of every known section (and of typos inside them). Either way,
+> `autumn deploy` still reads the `[media.mediamtx]` / `[media.ffmpeg]` subtree
+> straight from the merged `autumn.toml` (base ← inline `[profile.<name>]` ←
+> `autumn-<profile>.toml`); the plugin, not core, validates its own section.
+
+`autumn deploy` `mkdir -p`s both the MediaMTX config file's parent directory and
+`recordings_dir` (default `/recordings`), so a fresh host needs neither created
+by hand; the preflight passes an absent dir whose nearest existing parent is
+writable and fails closed on anything it cannot verify.
 
 **Deferred (host-bootstrap prerequisites, not done by `autumn deploy`):**
 installing/pinning the MediaMTX binary itself (like the kamal-proxy binary, it is
-a host-bootstrap step); **creating and permissioning the `recordings_dir`**
-(default `/recordings`) so the media user can write to it — `autumn deploy` only
-`mkdir`s the MediaMTX config file's parent directory, so the fail-closed
-recordings-dir preflight (`test -d && test -w`) aborts `deploy up` when the
-directory is missing or not writable; and wiring the four host preflight checks
-into the offline `autumn doctor` CLI (they run only in the executor-holding
-`deploy up` path today; `deploy plan` names them but never executes them).
+a host-bootstrap step), and wiring the host preflight checks into the offline
+`autumn doctor` CLI (they run only in the executor-holding `deploy up` path
+today; `deploy plan` names them but never executes them).
 
 ### How the deploy path is validated in CI
 
@@ -1767,6 +1880,9 @@ hosts = ["app.example.com", ".example.com"]
 - `app.example.com` matches exactly that hostname.
 - `.example.com` matches both `example.com` and any subdomain like `api.example.com`.
 - `hosts = ["*"]` disables host filtering (escape hatch; not recommended for production).
+- A tenant hostname connected through
+  [custom domains](tls.md#tenant-custom-domains-servertlsacmecustom_domains) is
+  trusted while it is `active`, without a line here.
 
 In `prod`/`production` profile, startup fails when `security.trusted_hosts.hosts` is empty.
 Health/probe routes (`/actuator/health`, `/live`, `/ready`, `/startup`) intentionally bypass host checks so orchestration probes remain reliable.
@@ -2796,6 +2912,7 @@ when export is disabled.
 The generated `fly.toml` wires Fly's `[metrics]` block to this endpoint:
 
 ```toml
+# fly.toml — Fly's own [metrics] block, not Autumn's `[metrics]` section
 [metrics]
   port = 3000
   path = "/actuator/prometheus"
@@ -2809,6 +2926,7 @@ still want it unreachable from public traffic. The Fly-native way is to scrape a
 Bind a second internal listener and point `[metrics]` at it:
 
 ```toml
+# fly.toml — Fly's own [metrics] block, not Autumn's `[metrics]` section
 [metrics]
   port = 9091                       # internal-only; no [http_service] on it
   path = "/actuator/prometheus"
@@ -3017,7 +3135,7 @@ default `cargo test` run; pass `-- --ignored` to include them.
 
 ### Extending the CI workflow
 
-**Tailwind CSS**: install the Tailwind CLI (`autumn setup --tailwind`) and add a
+**Tailwind CSS**: install the Tailwind CLI (`autumn setup`) and add a
 step before `cargo build` to run it. The generated `build.rs` will auto-detect
 it on `PATH` or at `target/autumn/tailwindcss`.
 

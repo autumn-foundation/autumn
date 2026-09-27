@@ -7,7 +7,12 @@
 //! - Route annotation macros (`#[get]`, `#[post]`, etc.)
 //! - The `routes![]` collection macro
 //! - The `#[autumn_web::main]` entry point macro (S-008)
-//! - The `#[model]` attribute macro (S-018)
+//!
+//! The database-layer macros (`#[model]`, `#[repository]`, `#[service]`)
+//! live in the sibling crates `autumn-macros-model` and
+//! `autumn-macros-repository`, so a build that never touches the database
+//! never compiles their codegen. All three crates share parsing, path
+//! rewriting, schema, and naming helpers through `autumn-macros-support`.
 //!
 //! Users should not depend on this crate directly — use `autumn-web` instead,
 //! which re-exports everything.
@@ -33,9 +38,6 @@ mod api_doc;
 mod authorize;
 mod cached;
 mod collect;
-#[cfg(feature = "db")]
-mod commentable;
-mod crate_path;
 mod edge;
 mod edge_routes_macro;
 mod event;
@@ -53,8 +55,6 @@ mod mail_previews_macro;
 mod mailer;
 mod mailer_preview;
 mod main_macro;
-#[cfg(feature = "db")]
-mod model;
 mod oauth2_callback;
 mod one_off_task;
 mod one_off_tasks_macro;
@@ -64,15 +64,11 @@ mod parse;
 mod paths_macro;
 mod public;
 mod query_budget;
-#[cfg(feature = "db")]
-mod repository;
 mod request_gate;
 mod route;
 mod routes_macro;
 mod scheduled;
-mod schema;
 mod secured;
-mod service;
 mod sim_test;
 mod static_route;
 mod static_routes_macro;
@@ -80,6 +76,7 @@ mod step_up;
 mod story_macro;
 mod tasks_macro;
 mod throttle;
+mod wire;
 mod ws;
 
 use proc_macro::TokenStream;
@@ -139,12 +136,14 @@ use proc_macro::TokenStream;
 /// declares.
 #[proc_macro_attribute]
 pub fn get(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(route::route_macro("GET", "get", attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(route::route_macro("GET", "get", attr, item.into()))
+        .into()
 }
 
 /// Annotate an async function as a POST route handler.
@@ -167,12 +166,19 @@ pub fn get(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn post(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(route::route_macro("POST", "post", attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(route::route_macro(
+        "POST",
+        "post",
+        attr,
+        item.into(),
+    ))
+    .into()
 }
 
 /// Annotate an async function as a PUT route handler.
@@ -195,12 +201,14 @@ pub fn post(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn put(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(route::route_macro("PUT", "put", attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(route::route_macro("PUT", "put", attr, item.into()))
+        .into()
 }
 
 /// Annotate an async function as a PATCH route handler.
@@ -220,12 +228,19 @@ pub fn put(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn patch(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(route::route_macro("PATCH", "patch", attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(route::route_macro(
+        "PATCH",
+        "patch",
+        attr,
+        item.into(),
+    ))
+    .into()
 }
 
 /// Annotate an async function as a DELETE route handler.
@@ -248,12 +263,19 @@ pub fn patch(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn delete(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(route::route_macro("DELETE", "delete", attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(route::route_macro(
+        "DELETE",
+        "delete",
+        attr,
+        item.into(),
+    ))
+    .into()
 }
 
 /// Annotate an OAuth2/OIDC callback handler.
@@ -262,12 +284,17 @@ pub fn delete(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// callback endpoints such as `/auth/github/callback`.
 #[proc_macro_attribute]
 pub fn oauth2_callback(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(oauth2_callback::oauth2_callback_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(oauth2_callback::oauth2_callback_macro(
+        attr,
+        item.into(),
+    ))
+    .into()
 }
 
 /// Collect annotated route handlers into a `Vec<Route>`.
@@ -291,8 +318,8 @@ pub fn oauth2_callback(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro]
 pub fn routes(input: TokenStream) -> TokenStream {
-    let _guard = crate_path::set_target(None);
-    crate_path::finalize(routes_macro::routes_macro(input.into())).into()
+    let _guard = autumn_macros_support::crate_path::set_target(None);
+    autumn_macros_support::crate_path::finalize(routes_macro::routes_macro(input.into())).into()
 }
 
 /// Emit a `pub mod paths { … }` that re-exports each handler's typed path helper.
@@ -315,8 +342,8 @@ pub fn routes(input: TokenStream) -> TokenStream {
 /// then `paths::show_post(id)`.
 #[proc_macro]
 pub fn paths(input: TokenStream) -> TokenStream {
-    let _guard = crate_path::set_target(None);
-    crate_path::finalize(paths_macro::paths_macro(input.into())).into()
+    let _guard = autumn_macros_support::crate_path::set_target(None);
+    autumn_macros_support::crate_path::finalize(paths_macro::paths_macro(input.into())).into()
 }
 
 /// Set up the async runtime for an Autumn application.
@@ -368,12 +395,13 @@ pub fn paths(input: TokenStream) -> TokenStream {
 /// not name.
 #[proc_macro_attribute]
 pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(main_macro::main_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(main_macro::main_macro(attr, item.into())).into()
 }
 
 /// Annotate an async function as a deterministic simulation test (S-1797, W1).
@@ -400,12 +428,13 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn sim_test(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(sim_test::sim_test_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(sim_test::sim_test_macro(attr, item.into())).into()
 }
 
 /// Annotate an async inbound mail handler function.
@@ -436,41 +465,52 @@ pub fn sim_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn inbound_mail(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(inbound_mail::inbound_mail_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(inbound_mail::inbound_mail_macro(attr, item.into()))
+        .into()
 }
 
 /// Generate `send_*` and `deliver_later_*` helpers for a mailer impl block.
 #[proc_macro_attribute]
 pub fn mailer(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(mailer::mailer_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(mailer::mailer_macro(attr, item.into())).into()
 }
 
 /// Register zero-argument mail preview methods for the dev mail preview UI.
 #[proc_macro_attribute]
 pub fn mailer_preview(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(mailer_preview::mailer_preview_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(mailer_preview::mailer_preview_macro(
+        attr,
+        item.into(),
+    ))
+    .into()
 }
 
 /// Collect `#[mailer_preview]` impl blocks into runtime preview registrations.
 #[proc_macro]
 pub fn mail_previews(input: TokenStream) -> TokenStream {
-    let _guard = crate_path::set_target(None);
-    crate_path::finalize(mail_previews_macro::mail_previews_macro(input.into())).into()
+    let _guard = autumn_macros_support::crate_path::set_target(None);
+    autumn_macros_support::crate_path::finalize(mail_previews_macro::mail_previews_macro(
+        input.into(),
+    ))
+    .into()
 }
 
 /// Define a widget story for the `/_stories` gallery:
@@ -484,308 +524,31 @@ pub fn mail_previews(input: TokenStream) -> TokenStream {
 /// surrounding environment is a compile error.
 #[proc_macro]
 pub fn story(input: TokenStream) -> TokenStream {
-    let _guard = crate_path::set_target(None);
-    crate_path::finalize(story_macro::story_macro(input.into())).into()
-}
-
-/// Attribute macro for Autumn database models.
-///
-/// Applies Diesel (`Queryable`, `Selectable`, `Insertable`) and Serde
-/// (`Serialize`, `Deserialize`) derives, plus a `#[diesel(table_name)]`
-/// attribute. The table name can be specified explicitly or inferred
-/// from the struct name by converting `PascalCase` to `snake_case`
-/// and appending `s`.
-///
-/// # Examples
-///
-/// Explicit table name:
-///
-/// ```ignore
-/// use autumn_web::model;
-///
-/// #[model(table = "users")]
-/// pub struct User {
-///     pub id: i64,
-///     pub name: String,
-/// }
-/// ```
-///
-/// Inferred table name (`BlogPost` -> `blog_posts`):
-///
-/// ```ignore
-/// use autumn_web::model;
-///
-/// #[model]
-/// pub struct BlogPost {
-///     pub id: i64,
-///     pub title: String,
-/// }
-/// ```
-///
-/// # Associations
-///
-/// Declare `#[belongs_to]`, `#[has_many]`, and `#[has_one]` on the struct to
-/// get batched eager preloading for free — no hand-written join queries, no
-/// N+1. Foreign keys and accessor names are inferred from the target's type
-/// name, with `fk = ...` / `name = ...` overrides:
-///
-/// ```ignore
-/// #[model]
-/// #[belongs_to(User, fk = author_id)]  // fk on THIS model
-/// #[has_many(Comment)]                 // fk (post_id) on the TARGET
-/// pub struct Post {
-///     #[id]
-///     pub id: i64,
-///     pub author_id: i64,
-///     pub title: String,
-/// }
-/// ```
-///
-/// Preload associations through a repository (`Model::preload()` builds the
-/// spec; `_with` nests into the related model's own associations):
-///
-/// ```ignore
-/// let posts = repo.find_all().await?;
-/// let posts = repo.preload(posts, Post::preload().author().comments()).await?;
-/// for post in &posts {
-///     let author = post.author()?;      // Result<Option<&Preloaded<User>>, NotLoaded>
-///     let comments = post.comments()?;  // Result<&[Preloaded<Comment>], NotLoaded>
-/// }
-/// ```
-///
-/// An association that was not preloaded returns `NotLoaded` from its
-/// accessor rather than issuing SQL — autumn never lazy-loads.
-///
-/// ## Many-to-many (`through =`)
-///
-/// Add `through = <join_table>` to `#[has_many]` to declare a many-to-many
-/// association backed by a join table, with the same batched preload
-/// semantics as `belongs_to`/`has_many`/`has_one`:
-///
-/// ```ignore
-/// #[model]
-/// #[has_many(Tag, through = post_tags)]  // join columns default to post_id / tag_id
-/// pub struct Post {
-///     #[id]
-///     pub id: i64,
-///     pub title: String,
-/// }
-/// ```
-///
-/// Join columns default to `{source}_id` / `{target}_id` and can be
-/// overridden with `fk = ...` and `target_fk = ...`; the join table itself
-/// needs no hand-written `diesel::table!` — the macro emits one and requires
-/// a composite primary key on `(fk, target_fk)`:
-///
-/// ```sql
-/// CREATE TABLE post_tags (
-///     post_id BIGINT NOT NULL REFERENCES posts(id),
-///     tag_id  BIGINT NOT NULL REFERENCES tags(id),
-///     PRIMARY KEY (post_id, tag_id)
-/// );
-/// ```
-///
-/// `Post::preload().tags()` issues one batched `INNER JOIN` query (plus one
-/// more per level of `_with` nesting) — a fixed number of queries regardless
-/// of how many tags each post has. The generated `tags()` accessor returns
-/// `&[Arc<Preloaded<Tag>>]` (rather than `has_many`'s plain
-/// `&[Preloaded<Tag>]`): the same tag can legitimately be linked to more than
-/// one currently-loaded post, so it's shared via `Arc` instead of being
-/// duplicated per parent.
-///
-/// The association also generates three mutation helpers on the model's
-/// `#[repository]` — `add_{singular}`, `remove_{singular}`, and
-/// `set_{plural}` (replace-all) — each idempotent and requiring no
-/// hand-written SQL:
-///
-/// ```ignore
-/// repo.add_tag(post_id, tag_id).await?;      // idempotent: ON CONFLICT DO NOTHING
-/// repo.remove_tag(post_id, tag_id).await?;   // idempotent: no-op if unlinked
-/// repo.set_tags(post_id, &tag_ids).await?;   // replace-all, one transaction
-/// ```
-///
-/// The `add_`/`remove_` singular is derived from the target *type* name, so a
-/// model may declare at most one m2m association per target type by default —
-/// a second one to the same target would generate colliding helpers (a compile
-/// error). To declare two m2m associations to the same target (e.g. a
-/// self-referential `followers`/`following` pair through one `Friendship` join
-/// table), give each a distinct explicit `helper = "..."` override, which sets
-/// the singular used for its `add_`/`remove_` helpers:
-///
-/// ```ignore
-/// #[model]
-/// #[has_many(User, through = friendships, name = followers,
-///            fk = followed_id, target_fk = follower_id, helper = "follower")]
-/// #[has_many(User, through = friendships, name = following,
-///            fk = follower_id, target_fk = followed_id, helper = "following")]
-/// pub struct User { /* ... */ }
-/// // -> add_follower/remove_follower and add_following/remove_following
-/// ```
-///
-/// # Votable (reactions)
-///
-/// `#[votable(by = <Reactor>)]` declares a reaction association (#1362): a
-/// `(reactor, target)`-unique edge table plus an aggregate column maintained on
-/// this model. It replaces the hand-written toggle/flip/upsert SQL and the
-/// score recompute that every voting, liking or bookmarking feature otherwise
-/// grows.
-///
-/// ```ignore
-/// #[model]
-/// #[votable(by = User, aggregate = sum)]   // signed up/down votes
-/// pub struct Post {
-///     #[id]
-///     pub id: i64,
-///     pub title: String,
-///     pub score: i64,                      // the aggregate column
-/// }
-/// ```
-///
-/// Two modes: `aggregate = sum` (the default — signed values, `score =
-/// SUM(value)`) and `aggregate = count` (unary likes — no value column,
-/// `{name}_count = COUNT(*)`). Every name is inferred and every inference has
-/// an override:
-///
-/// | Key | Default | Meaning |
-/// |---|---|---|
-/// | `by` | **required** | the reactor model, e.g. `User` |
-/// | `aggregate` | `sum` | `sum` \| `count` |
-/// | `name` | `vote` | reaction name; drives `table` and the count column |
-/// | `table` | `pluralize(name)` → `votes` | the edge table |
-/// | `reactor_fk` | `{snake(by)}_id` → `user_id` | edge column → reactor |
-/// | `target_fk` | `{snake(Model)}_id` → `post_id` | edge column → this model |
-/// | `value_column` | `value` (sum only) | the edge's signed value |
-/// | `column` | `score` (sum) / `{name}_count` (count) | aggregate column |
-///
-/// A likes feature is therefore `#[votable(by = User, aggregate = count, name
-/// = like)]` → table `likes`, column `like_count`. At most one `#[votable]` per
-/// model.
-///
-/// `by` may name a hand-written struct — it is name-resolved at compile time
-/// but carries no trait bound, so the reactor's `i64` primary key is
-/// documented contract, not a compile check (the edge table binds the reactor
-/// FK as `BIGINT`; a UUID-keyed reactor fails on first use with a database
-/// type error). The **target** model's `#[id]` and aggregate column *are*
-/// compile-checked as `i64`.
-///
-/// **Write `#[votable]` *below* `#[model]`.** It is consumed by `#[model]`, not
-/// registered as an attribute in its own right, so an attribute macro written
-/// above it never sees it — an error reading `cannot find attribute `votable`
-/// in this scope` means the two lines are the wrong way round.
-///
-/// ## Required migration
-///
-/// The edge table is the user's to create, and its **composite `UNIQUE
-/// (reactor_fk, target_fk)` is load-bearing**: it is the `ON CONFLICT` arbiter
-/// the generated upsert names, and it is what makes "at most one edge per
-/// (reactor, target)" a database guarantee. The value column is `SMALLINT`, the
-/// aggregate column `BIGINT NOT NULL DEFAULT 0`, and the model's own primary key
-/// must be `BIGINT`/`i64` (both edge foreign keys are bound as `i64`; a
-/// UUID-keyed model is a compile error).
-///
-/// `NOT NULL` on both foreign keys is strongly recommended: `NULL`s are
-/// distinct in a unique constraint, so a nullable column is not covered by the
-/// arbiter. A nullable *target* FK is nevertheless tolerated when every row this
-/// association writes is non-`NULL` — the shape an XOR edge table has (reddit-
-/// clone's `votes` points at either a post or a comment), where the unique
-/// constraint still fully covers the non-`NULL` rows `react()` creates.
-///
-/// The `CHECK` on `value` is load-bearing in sum mode: **`react()` does not
-/// validate `value`** — it writes what it is given, and the sum is only
-/// meaningful because the database refuses anything outside the legal set.
-/// Never bind `value` straight from a request; map the request to `1` / `-1`
-/// yourself. A violating value surfaces as a database error (a 500), not a
-/// validation failure.
-///
-/// ```sql
-/// CREATE TABLE votes (
-///     id      BIGSERIAL PRIMARY KEY,
-///     user_id BIGINT NOT NULL REFERENCES users(id),
-///     post_id BIGINT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
-///     value   SMALLINT NOT NULL CHECK (value IN (-1, 1)),
-///     UNIQUE (user_id, post_id)          -- the ON CONFLICT arbiter
-/// );
-/// ALTER TABLE posts ADD COLUMN score BIGINT NOT NULL DEFAULT 0;
-/// -- aggregate = count: drop the `value` column entirely.
-/// ```
-///
-/// ## Generated helpers
-///
-/// A `{Model}Reactions` trait, blanket-implemented for the model's
-/// `#[repository]`:
-///
-/// ```ignore
-/// use autumn_web::repository::{Reaction, ReactionOutcome};
-///
-/// // sum mode. (count mode: `react(reactor_id, target_id)` — no value.)
-/// let r: Reaction = posts.react(user_id, post_id, 1).await?;
-/// r.value;      // Option<i16>: the reactor's reaction AFTER the call
-/// r.aggregate;  // i64: the newly persisted score, ground truth at commit
-/// r.outcome;    // Inserted | Flipped | Removed
-///
-/// let mine: Option<i16> = posts.reaction_of(user_id, post_id).await?;
-/// ```
-///
-/// `react()` is race-safe: the same value again toggles the edge off, a
-/// different value flips it in place, a new one inserts it — and the aggregate
-/// is recomputed from ground truth (`SUM`/`COUNT`) and persisted in the **same
-/// transaction**, so a reader never observes edge/aggregate disagreement. The
-/// target row is locked (`SELECT ... FOR NO KEY UPDATE` on Postgres — it does
-/// not conflict with the `FOR KEY SHARE` locks foreign-key checks take, so
-/// concurrent inserts referencing the target do not queue behind votes;
-/// `BEGIN IMMEDIATE` on `SQLite`) for the whole read-decide-write-recompute
-/// window, so concurrent reactions on one target converge to at most one edge
-/// per `(reactor, target)` and the persisted aggregate is exact even across
-/// *different* reactors.
-///
-/// It is **not idempotent** — it is a toggle. Retrying a call that timed out can
-/// invert the outcome, because the first attempt may have committed; callers
-/// that need retry safety dedupe above this layer (an idempotency key on the
-/// HTTP request). `reaction_of()` is a plain read: it follows the repository's
-/// read route (so a replica may serve it) and does not pin read-your-writes, so
-/// render from the `Reaction` that `react()` returned rather than re-reading.
-///
-/// When the model has a `deleted_at` field, reacting to a soft-deleted target
-/// is `NotFound` and leaves its aggregate untouched.
-///
-/// Tenant-isolated on the same terms: when the model has a `tenant_id` field
-/// **and** the repository is `#[repository(..., tenant_scoped)]`, both the
-/// target lock and the aggregate `UPDATE` carry `tenant_id = <current
-/// tenant>`, so another tenant's `target_id` is `NotFound` before any write and
-/// `reaction_of()` reports `None` for it. No tenant context is an error (as for
-/// any derived query) and `across_tenants()` opts out. A model without the
-/// column emits none of this. The m2m `add_*` / `remove_*` helpers are not
-/// covered — they remain id-scoped.
-///
-/// `react()` acquires its **own** pooled connection and does not join an
-/// enclosing `Db::tx` — do not hold a `Db` extractor across the call on a small
-/// connection pool.
-#[cfg(feature = "db")]
-#[proc_macro_attribute]
-pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(model::model_macro(attr, item.into())).into()
+    let _guard = autumn_macros_support::crate_path::set_target(None);
+    autumn_macros_support::crate_path::finalize(story_macro::story_macro(input.into())).into()
 }
 
 /// Derive a field-accurate `OpenApiSchema` impl for a plain struct with named
-/// fields (issue #1972).
+/// fields, or a unit-variant enum (issue #1972).
 ///
-/// Use it on a handler-arg struct — a `Query<T>` param struct or a
-/// non-`#[model]` `Json<T>` request body — so its `OpenAPI` component schema and
-/// MCP tool `inputSchema` describe the real fields instead of degrading to a
-/// generic `{"type":"object"}` placeholder, without a hand-written impl or an
-/// `OpenApiConfig::register_schema` call.
+/// Use it on a handler-arg type — a `Query<T>` param struct, a non-`#[model]`
+/// `Json<T>` request body, or an enum appearing in either — so its `OpenAPI`
+/// component schema and MCP tool `inputSchema` describe the real contract
+/// instead of degrading to a generic `{"type":"object"}` placeholder, without a
+/// hand-written impl or an `OpenApiConfig::register_schema` call.
 ///
-/// Each field becomes a JSON-schema property (nullable `Option<T>`, `Vec<T>`
-/// arrays, inline primitives, `$ref`s for other named types) and every
+/// **Structs**: each field becomes a JSON-schema property (nullable `Option<T>`,
+/// `Vec<T>` arrays, inline primitives, `$ref`s for other named types) and every
 /// non-`Option` field is `required` — mirroring the schema `#[model]` already
-/// generates. The derive also registers the schema in the compile-time
-/// inventory the spec/MCP back-fill consults, so the referencing route resolves
-/// it automatically.
+/// generates.
+///
+/// **Enums**: all-unit-variant enums become the closed string set
+/// `{"type":"string","enum":[…]}` that serde puts on the wire, honoring
+/// `#[serde(rename)]` / `#[serde(rename_all)]` / `#[serde(skip)]`. A
+/// data-carrying variant is a compile error rather than a guess: serde's
+/// representation for those depends on `#[serde(tag/content/untagged)]`, so an
+/// inferred shape could confidently advertise a contract the handler does not
+/// accept. Write the impl by hand and register it for that case.
 ///
 /// # Examples
 ///
@@ -796,74 +559,21 @@ pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// struct SearchParams {
 ///     q: String,
 ///     limit: Option<i32>,
+///     status: Option<Status>,
+/// }
+///
+/// #[derive(serde::Deserialize, OpenApiSchema)]
+/// #[serde(rename_all = "snake_case")]
+/// enum Status {
+///     Open,
+///     InProgress,
 /// }
 /// ```
 #[proc_macro_derive(OpenApiSchema)]
 pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
-    let _guard = crate_path::set_target(None);
-    crate_path::finalize(openapi_schema::derive_openapi_schema(input).into()).into()
-}
-
-/// Derive a repository with CRUD operations and derived queries.
-///
-/// Generates a `PgXxxRepository` struct implementing the annotated trait,
-/// with auto-generated CRUD methods and query-by-name derived methods.
-///
-/// # Read replica routing
-///
-/// When `database.replica_url` is configured, generated read-only methods
-/// (`find_by_id`, `find_all`, `count`, `paginate`, `cursor_page`, derived
-/// `find_by_*`, search reads) acquire their connection from the replica
-/// pool; mutating methods always use the primary. Add `primary_reads` to
-/// pin a read-after-write-sensitive repository's reads to the primary, or
-/// call the generated `on_primary()` method to pin a single call chain
-/// (read-your-writes).
-///
-/// # Examples
-///
-/// ```ignore
-/// use autumn_web::repository;
-///
-/// #[repository(Post)]
-/// trait PostRepository {
-///     fn find_by_published(published: bool) -> Vec<Post>;
-/// }
-///
-/// // Reads pinned to the primary even when a replica is configured.
-/// #[repository(LedgerEntry, primary_reads)]
-/// trait LedgerEntryRepository {}
-///
-/// // Cache coherence (#1716): every write below can strand
-/// // `views::recent_posts`, so the edge is declared here. The path resolves
-/// // to the identity constant `#[cached]` generates beside that function, so
-/// // naming anything else does not compile.
-/// #[repository(Post, invalidates(crate::views::recent_posts))]
-/// trait CoherentPostRepository {
-///     // A per-method edge adds to the trait-level ones.
-///     #[invalidates(crate::views::by_author)]
-///     fn delete_by_author_id(author_id: i64) -> ();
-/// }
-/// ```
-///
-/// # Cache coherence (issue #1716)
-///
-/// Every generated write method publishes which model it mutates, so
-/// `autumn cache audit` can fail the build when a write's model appears in a
-/// `#[cached]` read's dependency set with no invalidation covering the pair.
-/// Discharge the obligation with `invalidates(...)` — on the attribute for
-/// every write, or as `#[invalidates(...)]` on one trait method — or opt out
-/// with `acknowledge_stale = "reason"`. A repository that declares any edge
-/// also gets a generated `invalidate_declared_caches()` for its write paths to
-/// call. See `docs/guide/cache-coherence.md`.
-#[cfg(feature = "db")]
-#[proc_macro_attribute]
-pub fn repository(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(repository::repository_macro(attr, item.into())).into()
+    let _guard = autumn_macros_support::crate_path::set_target(None);
+    autumn_macros_support::crate_path::finalize(openapi_schema::derive_openapi_schema(input).into())
+        .into()
 }
 
 /// Declare a scheduled background task.
@@ -879,12 +589,14 @@ pub fn repository(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn scheduled(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(scheduled::scheduled_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(scheduled::scheduled_macro(attr, item.into()))
+        .into()
 }
 
 /// Declare an on-demand background job.
@@ -924,12 +636,13 @@ pub fn scheduled(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(job::job_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(job::job_macro(attr, item.into())).into()
 }
 
 /// Declare a typed domain event.
@@ -944,12 +657,13 @@ pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn event(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(event::event_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(event::event_macro(attr, item.into())).into()
 }
 
 /// Declare an event listener that reacts to a typed `#[event]`.
@@ -963,30 +677,33 @@ pub fn event(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn listener(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(listener::listener_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(listener::listener_macro(attr, item.into())).into()
 }
 
 /// Collect `#[listener]` handlers into a `Vec<ListenerInfo>`.
 #[proc_macro]
 pub fn listeners(input: TokenStream) -> TokenStream {
-    let _guard = crate_path::set_target(None);
-    crate_path::finalize(listeners_macro::listeners_macro(input.into())).into()
+    let _guard = autumn_macros_support::crate_path::set_target(None);
+    autumn_macros_support::crate_path::finalize(listeners_macro::listeners_macro(input.into()))
+        .into()
 }
 
 /// Declare a one-off operational task runnable with `autumn task <name>`.
 #[proc_macro_attribute]
 pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(one_off_task::task_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(one_off_task::task_macro(attr, item.into())).into()
 }
 
 /// Annotate an async function as a statically pre-rendered GET route.
@@ -1024,12 +741,14 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn static_get(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(static_route::static_get_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(static_route::static_get_macro(attr, item.into()))
+        .into()
 }
 
 /// Collect `#[scheduled]` task handlers into a `Vec<TaskInfo>`.
@@ -1039,22 +758,25 @@ pub fn static_get(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro]
 pub fn tasks(input: TokenStream) -> TokenStream {
-    let _guard = crate_path::set_target(None);
-    crate_path::finalize(tasks_macro::tasks_macro(input.into())).into()
+    let _guard = autumn_macros_support::crate_path::set_target(None);
+    autumn_macros_support::crate_path::finalize(tasks_macro::tasks_macro(input.into())).into()
 }
 
 /// Collect `#[job]` handlers into a `Vec<JobInfo>`.
 #[proc_macro]
 pub fn jobs(input: TokenStream) -> TokenStream {
-    let _guard = crate_path::set_target(None);
-    crate_path::finalize(jobs_macro::jobs_macro(input.into())).into()
+    let _guard = autumn_macros_support::crate_path::set_target(None);
+    autumn_macros_support::crate_path::finalize(jobs_macro::jobs_macro(input.into())).into()
 }
 
 /// Collect `#[task]` handlers into a `Vec<OneOffTaskInfo>`.
 #[proc_macro]
 pub fn one_off_tasks(input: TokenStream) -> TokenStream {
-    let _guard = crate_path::set_target(None);
-    crate_path::finalize(one_off_tasks_macro::one_off_tasks_macro(input.into())).into()
+    let _guard = autumn_macros_support::crate_path::set_target(None);
+    autumn_macros_support::crate_path::finalize(one_off_tasks_macro::one_off_tasks_macro(
+        input.into(),
+    ))
+    .into()
 }
 
 /// Secure a route handler with authentication and optional role checks.
@@ -1086,12 +808,13 @@ pub fn one_off_tasks(input: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(secured::secured_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(secured::secured_macro(attr, item.into())).into()
 }
 
 /// Declare a route handler as deliberately public (unauthenticated).
@@ -1114,12 +837,13 @@ pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn public(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(public::public_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(public::public_macro(attr, item.into())).into()
 }
 
 /// Declare a read-path route as eligible to run in the edge capsule (#1790).
@@ -1171,12 +895,13 @@ pub fn public(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn edge(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(edge::edge_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(edge::edge_macro(attr, item.into())).into()
 }
 
 /// Collect `#[edge]` handlers into a `Vec<EdgeRoute>` (#1790).
@@ -1199,8 +924,9 @@ pub fn edge(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro]
 pub fn edge_routes(input: TokenStream) -> TokenStream {
-    let _guard = crate_path::set_target(None);
-    crate_path::finalize(edge_routes_macro::edge_routes_macro(input.into())).into()
+    let _guard = autumn_macros_support::crate_path::set_target(None);
+    autumn_macros_support::crate_path::finalize(edge_routes_macro::edge_routes_macro(input.into()))
+        .into()
 }
 
 /// Require fresh ("step-up") authentication before a route handler runs.
@@ -1244,12 +970,13 @@ pub fn edge_routes(input: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn step_up(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(step_up::step_up_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(step_up::step_up_macro(attr, item.into())).into()
 }
 
 /// Apply a per-route rate limit to a handler.
@@ -1302,12 +1029,13 @@ pub fn step_up(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// inference does not depend on expansion order (#1677).
 #[proc_macro_attribute]
 pub fn throttle(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(throttle::throttle_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(throttle::throttle_macro(attr, item.into())).into()
 }
 
 /// Bound the number of database queries a handler can issue — at compile time.
@@ -1360,12 +1088,14 @@ pub fn throttle(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// rustc. See `docs/guide/query-budgets.md` for the full guide.
 #[proc_macro_attribute]
 pub fn query_budget(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(query_budget::query_budget_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(query_budget::query_budget_macro(attr, item.into()))
+        .into()
 }
 
 /// Declare a handler agent-operable, under a named authority grant.
@@ -1448,12 +1178,17 @@ pub fn query_budget(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// See `docs/guide/agent-authority.md` for the full guide.
 #[proc_macro_attribute]
 pub fn agent_operable(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(agent_authority::agent_operable_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(agent_authority::agent_operable_macro(
+        attr,
+        item.into(),
+    ))
+    .into()
 }
 
 /// Gate a route handler on a named feature flag.
@@ -1485,12 +1220,14 @@ pub fn agent_operable(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 #[proc_macro_attribute]
 pub fn feature_flag(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(feature_flag::feature_flag_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(feature_flag::feature_flag_macro(attr, item.into()))
+        .into()
 }
 
 /// Enforce a record-level authorization policy on a route handler.
@@ -1516,12 +1253,14 @@ pub fn feature_flag(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn authorize(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(authorize::authorize_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(authorize::authorize_macro(attr, item.into()))
+        .into()
 }
 
 /// Collect `#[static_get]` handlers into a `Vec<StaticRouteMeta>`.
@@ -1536,55 +1275,140 @@ pub fn authorize(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro]
 pub fn static_routes(input: TokenStream) -> TokenStream {
-    let _guard = crate_path::set_target(None);
-    crate_path::finalize(static_routes_macro::static_routes_macro(input.into())).into()
+    let _guard = autumn_macros_support::crate_path::set_target(None);
+    autumn_macros_support::crate_path::finalize(static_routes_macro::static_routes_macro(
+        input.into(),
+    ))
+    .into()
 }
 
-/// Define a service for cross-model orchestration and non-DB side effects.
+/// Mark a typed handler as a service endpoint (issue #1755).
 ///
-/// Generates a `XxxServiceImpl` struct with dependency injection via
-/// `FromRequestParts`, so it can be used as a handler parameter just
-/// like repositories.
+/// **Experimental** — see `STABILITY.md`.
 ///
-/// Use `#[service]` when your logic orchestrates **multiple repositories**
-/// or involves **non-DB side effects** (email, API calls, etc.).
-/// For single-model CRUD and validation, use `#[repository]` instead.
+/// Emits a marker type — `<name>_endpoint` — implementing
+/// `autumn_web::wire::Endpoint`, and writes the endpoint's JSON wire
+/// descriptor as a build artifact. The handler itself is untouched.
 ///
-/// # Examples
+/// Everything comes from the handler's own signature and the route attribute
+/// below it: the `Json<T>` parameter is the request shape, the `Json<T>` in the
+/// return type is the response shape, and the route attribute supplies the
+/// method and path.
 ///
-/// ```ignore
-/// use autumn_web::service;
+/// # Placement
 ///
-/// #[service]
-/// pub trait OrderService {
-///     fn deps(order_repo: PgOrderRepository, inventory_repo: PgInventoryRepository);
+/// `#[endpoint]` must sit **above** the route attribute. A route attribute
+/// placed outermost expands first and rewrites the signature, leaving nothing
+/// to read.
 ///
-///     async fn place_order(&self, req: PlaceOrderRequest) -> AutumnResult<Order>;
-/// }
+/// ```rust,ignore
+/// #[endpoint(service = "catalog")]
+/// #[get("/items/{id}")]
+/// async fn get_item(id: Path<String>) -> AutumnResult<Json<Item>> { … }
+/// ```
 ///
-/// // You implement the business logic:
-/// impl OrderServiceImpl {
-///     pub async fn place_order(&self, req: PlaceOrderRequest) -> AutumnResult<Order> {
-///         let order = self.order_repo.save(&req.into()).await?;
-///         self.inventory_repo.reserve(order.id).await?;
-///         Ok(order)
-///     }
-/// }
+/// # Arguments
 ///
-/// // Then use it in handlers, just like a repository:
-/// #[get("/orders/{id}")]
-/// async fn get_order(svc: OrderServiceImpl) -> AutumnResult<Json<Order>> {
-///     // ...
+/// | Argument | Required | Description |
+/// |---|---|---|
+/// | `service` | yes | The service this endpoint belongs to |
+/// | `name` | no | Endpoint name; defaults to the handler's function name |
+#[proc_macro_attribute]
+pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(wire::endpoint::endpoint_macro(attr, &item.into()))
+        .into()
+}
+
+/// Generate a typed client for another Autumn service's endpoints (issue #1755).
+///
+/// **Experimental** — see `STABILITY.md`.
+///
+/// ```rust,ignore
+/// wire_client! {
+///     name = CatalogClient,
+///     endpoints = [
+///         catalog::get_item_endpoint(id),
+///         catalog::create_item_endpoint,
+///     ],
 /// }
 /// ```
+///
+/// Each entry names an endpoint marker and, in parentheses, the path
+/// parameters its route takes. Request and response types come from the
+/// marker's associated types, so they are the callee's own types. A const
+/// assertion holds the declared path parameters to the endpoint's real path.
+#[proc_macro]
+pub fn wire_client(input: TokenStream) -> TokenStream {
+    let _guard = autumn_macros_support::crate_path::set_target(None);
+    autumn_macros_support::crate_path::finalize(wire::client::wire_client_macro(input.into()))
+        .into()
+}
+
+/// Check every service call in a function against the callee's contract
+/// (issue #1755).
+///
+/// **Experimental** — see `STABILITY.md`.
+///
+/// ```rust,ignore
+/// #[contract_checked(client = CatalogClient)]
+/// async fn page(catalog: CatalogClient, id: Path<String>) -> AutumnResult<Markup> {
+///     let item = catalog.get_item(&*id, NoBody).await?;
+///     Ok(html! { h1 { (item.name) } })
+/// }
+/// ```
+///
+/// Every response field the function names, and every request field an inline
+/// literal sets, becomes a const assertion against the callee's own field
+/// table. A field the endpoint no longer produces — or a required field a
+/// `..rest` initializer omits — fails the build at the call site.
+///
+/// Repeat `client = …` for a function that calls more than one service. A
+/// declared client with no value in the function is an error, so the attribute
+/// can never pass by checking nothing.
 #[proc_macro_attribute]
-pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
+pub fn contract_checked(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(wire::checked::contract_checked_macro(
+        attr,
+        &item.into(),
+    ))
+    .into()
+}
+
+/// Derive a type's serde-visible wire shape (issue #1755).
+///
+/// **Experimental** — see `STABILITY.md`.
+///
+/// Emits two const field tables — what the type puts on the wire and what it
+/// takes off it — and writes the type's JSON descriptor as a build artifact.
+/// `#[contract_checked]` asserts against those tables.
+///
+/// The two tables differ under directional serde attributes, and that is the
+/// point: a field carrying `#[serde(skip_serializing)]` is accepted but never
+/// produced, so a caller reading it is broken even though the code compiles.
+///
+/// Refused rather than guessed at: generics, enums, tuple structs,
+/// `#[serde(flatten)]`, and split `rename(serialize = …, deserialize = …)`.
+#[proc_macro_derive(WireShape)]
+pub fn derive_wire_shape(input: TokenStream) -> TokenStream {
+    let _guard = autumn_macros_support::crate_path::set_target(None);
+    let parsed = syn::parse_macro_input!(input as syn::DeriveInput);
+    let out = match wire::shape::derive_wire_shape(&parsed) {
+        Ok(ts) => ts,
+        Err(err) => err.to_compile_error(),
     };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(service::service_macro(attr, item.into())).into()
+    autumn_macros_support::crate_path::finalize(out).into()
 }
 
 /// Cache the return value of a function based on its arguments.
@@ -1643,12 +1467,13 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn cached(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(cached::cached_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(cached::cached_macro(attr, item.into())).into()
 }
 
 /// Enrich a route handler's auto-generated `OpenAPI` documentation.
@@ -1724,13 +1549,14 @@ pub fn api_doc(attr: TokenStream, item: TokenStream) -> TokenStream {
     // `api_doc::extract`), so every attribute macro accepts and validates
     // the argument uniformly even though this one has nothing to apply it
     // to.
-    let (_crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
+    let (_crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
     let out: proc_macro2::TokenStream = api_doc_standalone(attr.into(), item).into();
-    let _guard = crate_path::set_target(None);
-    crate_path::finalize(out).into()
+    let _guard = autumn_macros_support::crate_path::set_target(None);
+    autumn_macros_support::crate_path::finalize(out).into()
 }
 
 const ROUTE_ATTR_NAMES: &[&str] = &["get", "post", "put", "delete", "patch", "static_get", "ws"];
@@ -1818,12 +1644,13 @@ fn api_doc_standalone(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn ws(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(ws::ws_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(ws::ws_macro(attr, item.into())).into()
 }
 
 /// Translate an i18n key, with **compile-time validation** that the key
@@ -1856,8 +1683,8 @@ pub fn ws(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// produce the visible `{$key}` marker on miss.
 #[proc_macro]
 pub fn t(input: TokenStream) -> TokenStream {
-    let _guard = crate_path::set_target(None);
-    crate_path::finalize(i18n::t_macro(input.into())).into()
+    let _guard = autumn_macros_support::crate_path::set_target(None);
+    autumn_macros_support::crate_path::finalize(i18n::t_macro(input.into())).into()
 }
 
 /// Turn a plain state enum into a statically-verified lifecycle.
@@ -1872,6 +1699,10 @@ pub fn t(input: TokenStream) -> TokenStream {
 /// 2. A typestate transition module named after the enum in `snake_case`, whose
 ///    `Machine<S>` exposes a consuming `to_<target>` method *only* for declared
 ///    edges — firing an undeclared transition does not compile.
+///
+/// The declared graph is proven structurally sound at compile time: a state
+/// unreachable from `initial`, or a reachable non-terminal state with no path
+/// to a terminal, is a compile error naming the variant.
 ///
 /// # Example
 ///
@@ -1897,10 +1728,114 @@ pub fn t(input: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn lifecycle(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
-        Ok(pair) => pair,
-        Err(err) => return err.into(),
-    };
-    let _guard = crate_path::set_target(crate_override.as_deref());
-    crate_path::finalize(lifecycle::lifecycle_macro(attr, item.into())).into()
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(lifecycle::lifecycle_macro(attr, item.into()))
+        .into()
+}
+
+#[cfg(test)]
+mod rename_pipeline_tests {
+    //! Cross-pipeline rename contract (#1828): every macro's expansion must
+    //! rewrite `::autumn_web` token paths to the active crate target
+    //! (`finalize`), and the idempotency replay-guard recognizer must accept
+    //! the renamed target. These tests couple core pipelines (`#[get]`,
+    //! `#[authorize]`/`#[secured]`) with the shared path rewriting, so they
+    //! live with the core crate; the `#[model]`/`#[repository]` halves of
+    //! this contract moved with those macros into their own crates.
+    use autumn_macros_support::crate_path::{finalize, set_target};
+    use quote::quote;
+
+    fn ts_string(ts: &proc_macro2::TokenStream) -> String {
+        ts.to_string()
+    }
+
+    /// No genuine `::autumn_web` *token* path (crate-root anchored) may
+    /// survive `finalize`. `to_string()` renders a real `:: Ident ::` token
+    /// sequence with spaces around the identifier; a doc comment or string
+    /// literal's *contents* render with no such surrounding space, so this
+    /// specifically will not (and must not) flag those.
+    fn assert_no_leaked_autumn_web_token_path(s: &str) {
+        assert!(
+            !s.contains(":: autumn_web"),
+            "leaked `::autumn_web` token path in: {s}"
+        );
+    }
+
+    #[test]
+    fn route_macro_pipeline_has_no_leaked_autumn_web_after_override() {
+        let _guard = set_target(Some("renamed_autumn_web"));
+        let generated = crate::route::route_macro(
+            "GET",
+            "get",
+            quote! { "/users/{id}", seo(title = "User") },
+            quote! {
+                async fn show_user(Path(id): Path<i64>) -> AutumnResult<Json<User>> {
+                    Ok(Json(repo.find_by_id(id).await?))
+                }
+            },
+        );
+        let rewritten = finalize(generated);
+        let s = ts_string(&rewritten);
+        assert_no_leaked_autumn_web_token_path(&s);
+        assert!(s.contains("renamed_autumn_web"), "got: {s}");
+    }
+
+    /// Regression test for the exact scenario a Codex review on #2552 found:
+    /// stacking `#[authorize]` above `#[secured]` under a rename must still
+    /// let the route macro recognize the replay guard `#[authorize]`'s own
+    /// (already-finalized, already-renamed) expansion injected, rather than
+    /// missing it because the recognizer only knew the literal
+    /// `"autumn_web"`.
+    #[test]
+    fn replay_guard_recognized_after_stacked_macro_rename() {
+        let _guard = set_target(Some("renamed_autumn_web"));
+        // Simulate what `#[authorize]` (or `#[secured]`/`#[step_up]`) leaves
+        // behind once ITS OWN `finalize` has already run: a block whose
+        // early-return replay check is rooted at the *renamed* crate, not
+        // `autumn_web` literally.
+        let block: syn::Block = syn::parse_quote! {{
+            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
+            if let ::core::option::Option::Some(__autumn_response) =
+                ::renamed_autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+            {
+                return __autumn_response;
+            }
+        }};
+        assert!(
+            crate::idempotency_guard::block_has_replay_guard(&block),
+            "recognizer must accept the actively-resolved crate name, not just the literal \
+             \"autumn_web\""
+        );
+    }
+
+    /// Regression test for a second Codex round on the same #2552 scenario:
+    /// once the target is a keyword (`"type"`, from automatic resolution —
+    /// see `ident_for_target`/`rewrite`), an earlier-expanded macro's own
+    /// `finalize` pass emits the *raw* identifier `r#type`, not the bare
+    /// `type`. A recognizer comparing against the bare `current_target()`
+    /// (rather than `current_target_path_segment()`, which accounts for the
+    /// raw prefix) misses the match — the same class of bug as
+    /// `replay_guard_recognized_after_stacked_macro_rename` above, just
+    /// triggered by a keyword target instead of a plain renamed one.
+    #[test]
+    fn replay_guard_recognized_after_stacked_macro_rename_with_keyword_target() {
+        let _guard = set_target(Some("type"));
+        let block: syn::Block = syn::parse_quote! {{
+            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
+            if let ::core::option::Option::Some(__autumn_response) =
+                ::r#type::idempotency::__replay_response(&__autumn_idempotency_replay)
+            {
+                return __autumn_response;
+            }
+        }};
+        assert!(
+            crate::idempotency_guard::block_has_replay_guard(&block),
+            "recognizer must compare against the raw-escaped target, not the bare keyword"
+        );
+    }
 }

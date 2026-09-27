@@ -41,6 +41,7 @@ mod maintenance;
 mod migrate;
 mod monitor;
 mod new;
+mod openapi;
 mod overload_driver;
 mod paths;
 mod pg;
@@ -62,6 +63,7 @@ mod schema;
 mod search;
 mod seed;
 mod serve;
+mod service;
 mod setup;
 mod shard;
 mod starters;
@@ -454,6 +456,60 @@ pub enum GraphSubcommands {
     },
 }
 
+/// Arguments for `autumn openapi export`.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
+pub struct OpenApiExportArgs {
+    /// Package to inspect (for workspaces).
+    #[arg(short, long)]
+    package: Option<String>,
+    /// Binary target to inspect (for packages with multiple bin targets).
+    #[arg(long, value_name = "BIN")]
+    bin: Option<String>,
+    /// Write the document to this path instead of stdout.
+    #[arg(long, value_name = "PATH")]
+    out: Option<PathBuf>,
+    /// Compare a fresh export against this committed document and exit
+    /// non-zero on drift, so an unreviewed contract change fails CI.
+    ///
+    /// Comparison is on parsed JSON, not bytes, so reindenting the committed
+    /// file is not a failure. Takes precedence over `--out`.
+    #[arg(long, value_name = "PATH")]
+    check: Option<PathBuf>,
+    /// Fail when any component schema exports as an opaque `{"type":"object"}`.
+    ///
+    /// Those are the types with no `#[derive(OpenApiSchema)]` and no registered
+    /// schema: they reach a generated client as `unknown`/`serde_json::Value`,
+    /// so a spec meant to drive codegen should not contain them. Reported
+    /// either way; this makes it a gate.
+    #[arg(long)]
+    strict: bool,
+    /// Cargo features to build the app with (repeatable).
+    #[arg(long = "features", value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build with `--all-features`.
+    #[arg(long)]
+    all_features: bool,
+    /// Build with `--no-default-features`.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Export from the release build rather than the debug one.
+    ///
+    /// A route or schema gated behind `#[cfg(not(debug_assertions))]` exists
+    /// only in the release binary, so a debug export can describe a contract
+    /// the deployed build does not serve. Use this wherever `--check` is
+    /// gating the shipped artifact.
+    #[arg(long)]
+    release: bool,
+}
+
+/// Subcommands for `autumn openapi`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum OpenApiSubcommands {
+    /// Emit the app's `OpenAPI` 3.1 document without booting it.
+    Export(OpenApiExportArgs),
+}
+
 /// Subcommands for `autumn agents`.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
 pub enum AgentsSubcommands {
@@ -521,10 +577,14 @@ pub enum LifecycleSubcommands {
     /// can reach some terminal state. Exits non-zero when any lifecycle is
     /// unsound (CI-friendly).
     ///
+    /// The `#[lifecycle]` macro proves the same properties at compile time. This
+    /// pass adds a whole-workspace report without a build, and the
+    /// machine-readable artifact behind `--format json`.
+    ///
     /// Note: this is a best-effort source scanner — it resolves bare, qualified,
     /// and same-module-aliased `#[lifecycle]` attributes, but not cross-file or
-    /// glob-reexport aliases (tracked in #1925). The compile-time typestate is
-    /// the by-construction guarantee.
+    /// glob-reexport aliases (tracked in #1925). A lifecycle it skips is still
+    /// proven by the compiler.
     Check {
         /// Project root to scan (defaults to the current directory).
         #[arg(value_name = "PATH", default_value = ".")]
@@ -1041,6 +1101,14 @@ enum Commands {
         /// production Dockerfile does this for `embed-assets` builds.
         #[arg(long, value_name = "FEATURES", conflicts_with = "binary")]
         features: Option<String>,
+        /// Resolve with the `default` feature disabled.
+        ///
+        /// An app built with `cargo build --no-default-features` links fewer
+        /// crates than the default set; without this the SBOM would list the
+        /// optional dependencies the default feature set pulls in. Composes
+        /// with `--features`.
+        #[arg(long, conflicts_with = "binary")]
+        no_default_features: bool,
         /// Restrict resolution to one target triple.
         ///
         /// Without it the document lists target-specific dependencies for
@@ -1681,11 +1749,13 @@ enum Commands {
 
     /// Statically audit accessibility of raw `html!` markup at build time.
     ///
-    /// The typed `autumn_web::a11y` primitives (`Img`, `Button`, `Link`,
-    /// `MenuItem`, `TextField`) prove accessible-name obligations at compile
-    /// time. `autumn a11y verify` covers the escape hatch they cannot see: raw
+    /// The typed `autumn_web::a11y` primitives prove accessible-name
+    /// obligations at compile time. `autumn a11y verify` covers the escape
+    /// hatch they cannot see: raw
     /// markup written directly in `html!` blocks. It scans the project's `.rs`
     /// files, reports WCAG-keyed findings, and exits non-zero when any exist.
+    /// Findings are keyed to the routes that reach them, and rolled up per
+    /// WCAG success criterion.
     ///
     /// # Examples
     ///
@@ -1699,14 +1769,15 @@ enum Commands {
     },
 
     /// Verify the soundness of `#[lifecycle]` state machines and render their
-    /// lifecycle diagrams at build time.
+    /// lifecycle diagrams.
     ///
-    /// The `#[lifecycle]` macro proves that transition endpoints are real
-    /// variants and that only declared edges are callable. `autumn lifecycle
-    /// check` closes the remaining gap by verifying the *shape* of the
-    /// reachability graph: every referenced state exists, every state is
-    /// reachable from the initial state, and every reachable non-terminal state
-    /// can reach some terminal. Exits non-zero when any lifecycle is unsound.
+    /// The `#[lifecycle]` macro proves the same properties at compile time:
+    /// every referenced state exists, a terminal has no exit, no edge is
+    /// declared twice, every state is reachable from the initial state, and
+    /// every reachable non-terminal state can reach some terminal. `autumn lifecycle check` re-proves them by
+    /// scanning source, which reports a whole workspace without a build and
+    /// emits a machine-readable artifact. Exits non-zero when any lifecycle is
+    /// unsound.
     ///
     /// # Examples
     ///
@@ -1922,6 +1993,28 @@ enum Commands {
     ///   autumn cache audit --strict -p blog
     #[command(subcommand, verbatim_doc_comment)]
     Cache(CacheSubcommands),
+
+    /// `OpenAPI` tooling — get the contract out of the app.
+    ///
+    /// `autumn openapi export` compiles the app, runs it in a dump mode that
+    /// binds no port and touches no database, and writes the same `OpenAPI` 3.1
+    /// document `/openapi.json` serves. That document is the input the standard
+    /// generators want, so a typed client is one pipe away:
+    ///
+    ///   autumn openapi export --out openapi.json
+    ///   npx openapi-typescript openapi.json -o src/api.d.ts
+    ///
+    /// It also reports every component schema that degraded to an opaque
+    /// `{"type":"object"}` — the types a generated client can only see as
+    /// `unknown` — and `--strict` turns that report into a gate.
+    ///
+    /// # Examples
+    ///
+    ///   autumn openapi export
+    ///   autumn openapi export --out openapi.json
+    ///   autumn openapi export --check openapi.json --strict
+    #[command(subcommand, verbatim_doc_comment)]
+    Openapi(OpenApiSubcommands),
     /// Emit the classified-data flow manifest (#1654).
     ///
     /// Compiles the app and reads back the manifest the framework assembles from
@@ -2459,6 +2552,27 @@ enum DbCommands {
         /// staging drill always passes.
         #[arg(long)]
         allow_source_overwrite: bool,
+        /// Emit a referentially-intact SUBSET instead of the whole copy.
+        ///
+        /// Roots the subset on this many rows of TABLE — `--sample users=1%` or
+        /// `--sample users=500` — and repeats for more than one root. Every row
+        /// the selected roots relate to is carried along, so every foreign key
+        /// still resolves, and the subset is scrubbed in the same pass.
+        /// Per-table `always_include` / `never_include` rules live in
+        /// `[sample]` in `scrub.toml`.
+        ///
+        /// The amount applies PER TARGET: with shards configured,
+        /// `--sample users=500` selects up to 500 rows from each database.
+        /// After a successful run every subsetted table is rewritten with
+        /// `VACUUM (FULL, ANALYZE)`, which takes an exclusive lock and needs
+        /// room for a second copy of the table while it runs.
+        #[arg(long, value_name = "TABLE=COUNT|PERCENT%")]
+        sample: Vec<String>,
+        /// The seed `--sample` derives its row selection from. The same seed
+        /// against the same source data reproduces the identical subset, so a
+        /// teammate can rebuild the exact rows that exhibit a bug.
+        #[arg(long, value_name = "N", default_value_t = 0, requires = "sample")]
+        seed: u64,
     },
     /// Report, dry-run, or enforce the retention policy for framework-owned data.
     ///
@@ -2665,6 +2779,44 @@ enum ServeCommands {
     Status,
     /// Stop the daemon (if running) and start it again in the background.
     Restart,
+    /// Windows only: build the app and register it as a Windows service that
+    /// starts at boot and restarts after a crash.
+    ///
+    /// The service runs the same app `--daemon` runs and leaves the same
+    /// pidfile, address file and logs, so `autumn serve status` and
+    /// `autumn serve stop` keep working against it. It is an ordinary entry in
+    /// `services.msc` and `sc.exe`.
+    InstallService,
+    /// Windows only: stop the registered service, deregister it, and remove the
+    /// daemon's state. The managed-Postgres data directory is kept.
+    UninstallService,
+    /// Internal: run as the Windows Service Control Manager's hosted process.
+    ///
+    /// Registered as the service's command line by `install-service`; running it
+    /// by hand does nothing useful.
+    #[command(hide = true)]
+    RunService {
+        /// Path to the record `install-service` wrote.
+        #[arg(long = "service-record")]
+        service_record: Option<std::path::PathBuf>,
+    },
+}
+
+/// Normalize a repeated/comma-separated `--pin` into what the app parses.
+///
+/// No `--pin` at all leaves `AUTUMN_JOBS__PIN` untouched so the child reads
+/// `[jobs] pin` from its own config; `--pin ""` is a deliberate unpin and must
+/// stay distinguishable from that, so presence is carried by the `Option`, not
+/// by the list being non-empty. Trimming and dropping blanks here means the pin
+/// `serve restart` recovers and the pin the app parses are the same list.
+fn normalize_pin(pin: &[String]) -> Option<Vec<String>> {
+    (!pin.is_empty()).then(|| {
+        pin.iter()
+            .map(|q| q.trim())
+            .filter(|q| !q.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
 }
 
 /// Process role selector for `autumn serve --role`.
@@ -2781,6 +2933,50 @@ enum MigrateCommands {
         #[arg(long = "force", value_name = "VERSION")]
         force: Option<String>,
     },
+    /// Create `migrations/<version>_<name>/{up,down}.sql` with a version
+    /// that will not collide with any migration this checkout can see.
+    ///
+    /// Diesel records applied migrations BY VERSION (the leading
+    /// `YYYYMMDDHHMMSS` directory prefix). When two directories share one
+    /// version, a fresh database runs exactly one of them and records the
+    /// version as done — the other is skipped forever, with no error
+    /// anywhere. This picks a version free across the working tree, every
+    /// local and remote-tracking git branch, and this CLI's own compiled-in
+    /// framework migrations — never before the latest version already
+    /// claimed anywhere it can see.
+    ///
+    /// Does not touch the database. Prints the created directory's path.
+    ///
+    /// # Example
+    ///
+    ///   autumn migrate new add_widget_archived_at
+    #[command(verbatim_doc_comment)]
+    #[allow(clippy::doc_markdown)]
+    New {
+        /// `snake_case` name for the migration (no leading digit — the CLI
+        /// treats everything up to the first `_` as part of the version).
+        name: String,
+    },
+    /// Fail when a migration version this checkout introduces is already
+    /// claimed by a different directory elsewhere.
+    ///
+    /// The CI-time backstop for `autumn migrate new`: checks the working
+    /// tree's migration versions against the repository's default branch,
+    /// every other pushed branch, and this CLI's own compiled-in framework
+    /// migrations. Reports a collision only when this checkout's working
+    /// tree is one of the colliding directories — a collision between two
+    /// other branches is real but is that branch's own gate to fail on.
+    ///
+    /// Requires the full branch history (`git fetch --all` or
+    /// `actions/checkout` with `fetch-depth: 0`); degrades to a working-tree-
+    /// only check with a loud warning otherwise. Does not require a database
+    /// connection.
+    ///
+    /// # Example
+    ///
+    ///   autumn migrate check-collisions
+    #[command(verbatim_doc_comment, name = "check-collisions")]
+    CheckCollisions,
 }
 
 /// Subcommands for `autumn shard`.
@@ -3617,7 +3813,13 @@ enum GenerateCommands {
     /// When an owner column (`user_id`, `author_id`, or `owner_id`) is present,
     /// the generated `can_update`/`can_delete` allow the record owner or an
     /// `admin`, and the scope filters lists to the current user's rows.
-    /// Otherwise those default-deny with a `TODO` marker.
+    ///
+    /// When NO owner column is detected there is no ownership rule to emit, so
+    /// `can_update`/`can_delete` fall back to an authentication check under a
+    /// `SECURITY TODO` marker: any signed-in user may update or delete any row.
+    /// That is a placeholder, not a policy — replace it with a real per-record
+    /// rule before production. (The `Scope` does deny by default: it lists no
+    /// rows until its own `TODO` filter is written.)
     ///
     /// Requires the target model to already exist (`src/models/<snake>.rs`).
     /// Run `autumn generate model <Pascal>` (or `scaffold`) first.
@@ -3847,7 +4049,7 @@ enum GenerateCommands {
     ///   - `src/inbound_mailers/mod.rs`      — created/updated with `pub mod`
     ///   - `tests/<snake>_inbound_mail.rs`   — integration smoke test
     ///   - `src/main.rs`                    — wired into `InboundMailRouter`
-    ///   - `Cargo.toml`                     — `inbound-mail` feature added
+    ///   - `Cargo.toml`                     — `inbound-mailgun` feature added
     ///
     /// Example:
     ///
@@ -4328,41 +4530,39 @@ fn run_command(command: Commands) {
             role,
             pin,
         } => {
-            let action = action.map(|a| match a {
-                ServeCommands::Stop => serve::ServeAction::Stop,
-                ServeCommands::Status => serve::ServeAction::Status,
-                ServeCommands::Restart => serve::ServeAction::Restart,
-            });
-            serve::run(
-                action,
-                &serve::ServeOptions {
-                    package,
-                    // --bundled-pg implies --daemon.
-                    daemon: daemon || bundled_pg,
-                    release,
-                    bundled_pg,
-                    // Normal start: the child inherits this shell's env. Only
-                    // `restart` sets this, to restore a lost profile.
-                    profile: None,
-                    // Forwarded to the app binary via `AUTUMN_ROLE`. `None` lets
-                    // the child pick its default (combined) or read its own env.
-                    role: role.map(|r| r.as_str().to_owned()),
-                    // Forwarded via `AUTUMN_JOBS__PIN` (#1623, AC3). No `--pin`
-                    // at all leaves the variable untouched so the child reads
-                    // `[jobs] pin`; `--pin ""` is a deliberate unpin and must
-                    // stay distinguishable from that, so presence is carried by
-                    // the `Option`, not by the list being non-empty. Normalized
-                    // here (trim, drop blanks) so the recorded pin and the pin
-                    // the app parses are the same list.
-                    pin: (!pin.is_empty()).then(|| {
-                        pin.iter()
-                            .map(|q| q.trim())
-                            .filter(|q| !q.is_empty())
-                            .map(str::to_owned)
-                            .collect()
-                    }),
-                },
-            );
+            // The service journeys are their own command family: they build
+            // and register rather than start, so they never reach `serve::run`.
+            let service_action = match action {
+                Some(ServeCommands::InstallService) => Some(service::ServiceAction::Install),
+                Some(ServeCommands::UninstallService) => Some(service::ServiceAction::Uninstall),
+                Some(ServeCommands::RunService { .. }) => Some(service::ServiceAction::Run),
+                _ => None,
+            };
+            let lifecycle = match action {
+                Some(ServeCommands::Stop) => Some(serve::ServeAction::Stop),
+                Some(ServeCommands::Status) => Some(serve::ServeAction::Status),
+                Some(ServeCommands::Restart) => Some(serve::ServeAction::Restart),
+                _ => None,
+            };
+            let opts = serve::ServeOptions {
+                package,
+                // --bundled-pg implies --daemon, and a service always hosts one.
+                daemon: daemon || bundled_pg || service_action.is_some(),
+                release,
+                bundled_pg,
+                // Normal start: the child inherits this shell's env. Only
+                // `restart` sets this, to restore a lost profile.
+                profile: None,
+                // Forwarded to the app binary via `AUTUMN_ROLE`. `None` lets
+                // the child pick its default (combined) or read its own env.
+                role: role.map(|r| r.as_str().to_owned()),
+                // Forwarded via `AUTUMN_JOBS__PIN` (#1623, AC3).
+                pin: normalize_pin(&pin),
+            };
+            if let Some(service_action) = service_action {
+                std::process::exit(service::run(service_action, &opts));
+            }
+            serve::run(lifecycle, &opts);
         }
         Commands::Schema { action } => schema::run(action),
         Commands::Migrate {
@@ -4373,6 +4573,21 @@ fn run_command(command: Commands) {
             profile,
             wait,
         } => {
+            // `new` and `check-collisions` are pure filesystem/git operations
+            // with no database target — handle them before the DB-target
+            // resolution below, which every other `MigrateCommands` variant
+            // needs.
+            match &action {
+                Some(MigrateCommands::New { name }) => {
+                    migrate::versions::run_new(name);
+                    return;
+                }
+                Some(MigrateCommands::CheckCollisions) => {
+                    migrate::versions::run_check_collisions();
+                    return;
+                }
+                _ => {}
+            }
             let action = match action {
                 Some(MigrateCommands::Status) => migrate::MigrateAction::Status,
                 Some(MigrateCommands::Check) => migrate::MigrateAction::Check,
@@ -4389,6 +4604,9 @@ fn run_command(command: Commands) {
                     migrate::MigrateAction::Baseline(migrate::BaselineArgs {
                         force_version: force,
                     })
+                }
+                Some(MigrateCommands::New { .. } | MigrateCommands::CheckCollisions) => {
+                    unreachable!("handled above and returned")
                 }
                 None => migrate::MigrateAction::Run,
             };
@@ -4465,6 +4683,8 @@ fn run_command(command: Commands) {
                 dry_run,
                 force,
                 allow_source_overwrite,
+                sample,
+                seed,
             } => db::scrub::run(&db::scrub::ScrubArgs {
                 profile,
                 artifact,
@@ -4474,6 +4694,8 @@ fn run_command(command: Commands) {
                 dry_run,
                 force,
                 allow_source_overwrite,
+                sample,
+                seed,
             }),
             DbCommands::Retention {
                 package,
@@ -4759,6 +4981,7 @@ fn run_command(command: Commands) {
             locked,
             all_features,
             features,
+            no_default_features,
             filter_platform,
             expect_version,
         } => sbom::run(&sbom::SbomOptions {
@@ -4769,6 +4992,7 @@ fn run_command(command: Commands) {
             locked,
             all_features,
             features,
+            no_default_features,
             filter_platform,
             expect_version,
         }),
@@ -4813,6 +5037,22 @@ fn run_command(command: Commands) {
                 json: args.json,
                 strict: args.strict,
                 features,
+            });
+        }
+        Commands::Openapi(OpenApiSubcommands::Export(args)) => {
+            let features = routes::CargoFeatures {
+                features: args.features,
+                all: args.all_features,
+                no_default: args.no_default_features,
+            };
+            openapi::run(&openapi::ExportOptions {
+                package: args.package.as_deref(),
+                bin: args.bin.as_deref(),
+                out: args.out.as_deref(),
+                check: args.check.as_deref(),
+                strict: args.strict,
+                features,
+                release: args.release,
             });
         }
         Commands::Graph(command) => {
@@ -6484,6 +6724,8 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[test]
@@ -6636,6 +6878,7 @@ mod tests {
             expect_version,
             all_features,
             features,
+            no_default_features,
             filter_platform,
         } = cli.command
         else {
@@ -6656,6 +6899,11 @@ mod tests {
              what the document describes by default"
         );
         assert!(features.is_none());
+        assert!(
+            !no_default_features,
+            "the default feature set is what a build actually links by default, \
+             so disabling it must be opt-in"
+        );
         assert!(
             filter_platform.is_none(),
             "a source release is consumed on every platform, so no filter by default"
@@ -6690,6 +6938,19 @@ mod tests {
             panic!("expected Sbom command");
         };
         assert_eq!(features.as_deref(), Some("embed-assets"));
+    }
+
+    #[test]
+    fn parse_sbom_no_default_features() {
+        let cli = Cli::try_parse_from(["autumn", "sbom", "--no-default-features"]).unwrap();
+        let Commands::Sbom {
+            no_default_features,
+            ..
+        } = cli.command
+        else {
+            panic!("expected Sbom command");
+        };
+        assert!(no_default_features);
     }
 
     #[test]
@@ -7003,6 +7264,89 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn serve_service_subcommands_parse() {
+        for (argv, expected) in [
+            (["autumn", "serve", "install-service"].as_slice(), "install"),
+            (
+                ["autumn", "serve", "uninstall-service"].as_slice(),
+                "uninstall",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            match cli.command {
+                Commands::Serve { action, .. } => {
+                    let got = match action {
+                        Some(ServeCommands::InstallService) => "install",
+                        Some(ServeCommands::UninstallService) => "uninstall",
+                        _ => "other",
+                    };
+                    assert_eq!(got, expected, "{argv:?}");
+                }
+                _ => panic!("expected Serve for {argv:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn serve_flags_belong_to_serve_not_to_the_service_subcommand() {
+        // clap gives everything after a subcommand NAME to that subcommand, and
+        // `install-service` takes no arguments — so `serve install-service
+        // --bundled-pg` is a parse error, not a bundled install. The supported
+        // spelling puts the flag before the subcommand, exactly as `--pin` and
+        // `--role` already do for `restart`. Pinned here because the failure is
+        // silent in a script: exit 2 with a usage message.
+        let cli = Cli::try_parse_from(["autumn", "serve", "--bundled-pg", "install-service"])
+            .expect("flags before the subcommand must parse");
+        match cli.command {
+            Commands::Serve {
+                action, bundled_pg, ..
+            } => {
+                assert!(matches!(action, Some(ServeCommands::InstallService)));
+                assert!(bundled_pg);
+            }
+            _ => panic!("expected Serve"),
+        }
+        assert!(
+            Cli::try_parse_from(["autumn", "serve", "install-service", "--bundled-pg"]).is_err(),
+            "a flag after the subcommand is a parse error, so callers must not \
+             be told that spelling works"
+        );
+    }
+
+    #[test]
+    fn run_service_carries_the_record_path_the_scm_was_registered_with() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "serve",
+            "run-service",
+            "--service-record",
+            "C:\\state\\serve.service.toml",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Serve { action, .. } => assert!(matches!(
+                action,
+                Some(ServeCommands::RunService {
+                    service_record: Some(_)
+                })
+            )),
+            _ => panic!("expected Serve"),
+        }
+    }
+
+    #[test]
+    fn normalize_pin_distinguishes_unpinned_from_absent() {
+        // `--pin ""` is a deliberate unpin and must stay distinguishable from no
+        // `--pin` at all, which leaves the app reading `[jobs] pin` itself.
+        assert_eq!(normalize_pin(&[]), None);
+        assert_eq!(normalize_pin(&[String::new()]), Some(vec![]));
+        assert_eq!(
+            normalize_pin(&[" critical ".to_owned(), String::new(), "default".to_owned()]),
+            Some(vec!["critical".to_owned(), "default".to_owned()])
+        );
     }
 
     #[test]
@@ -7891,6 +8235,8 @@ mod tests {
             dry_run,
             force,
             allow_source_overwrite,
+            sample,
+            seed,
         }) = cli.command
         else {
             panic!("expected db scrub");
@@ -7903,6 +8249,8 @@ mod tests {
         assert!(!check);
         assert!(!dry_run);
         assert!(!force);
+        assert!(sample.is_empty(), "sampling is opt-in");
+        assert_eq!(seed, 0);
     }
 
     #[test]
@@ -7931,6 +8279,8 @@ mod tests {
             dry_run,
             force,
             allow_source_overwrite,
+            sample: _,
+            seed: _,
         }) = cli.command
         else {
             panic!("expected db scrub");
@@ -7949,6 +8299,52 @@ mod tests {
         assert!(!check);
         assert!(!dry_run);
         assert!(force);
+    }
+
+    // ── autumn db scrub --sample tests (issue #1636) ───────────────────────
+
+    #[test]
+    fn parse_db_scrub_with_repeated_sample_roots_and_a_seed() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "db",
+            "scrub",
+            "--sample",
+            "users=1%",
+            "--sample",
+            "orders=500",
+            "--seed",
+            "42",
+        ])
+        .unwrap();
+        let Commands::Db(DbCommands::Scrub { sample, seed, .. }) = cli.command else {
+            panic!("expected db scrub");
+        };
+        assert_eq!(sample, vec!["users=1%".to_owned(), "orders=500".to_owned()]);
+        assert_eq!(seed, 42);
+    }
+
+    #[test]
+    fn parse_db_scrub_seed_requires_sample() {
+        // A seed with nothing to seed is a mistyped command, not a no-op: it
+        // reads as "this run is reproducible" when nothing was subsetted.
+        assert!(
+            Cli::try_parse_from(["autumn", "db", "scrub", "--seed", "42"]).is_err(),
+            "--seed only means something alongside --sample"
+        );
+    }
+
+    #[test]
+    fn parse_db_scrub_sample_works_with_check_and_dry_run() {
+        // Both write nothing, and both must still be able to prove the sample
+        // plan is complete — that is the CI gate for a graph gap.
+        for mode in ["--check", "--dry-run"] {
+            assert!(
+                Cli::try_parse_from(["autumn", "db", "scrub", "--sample", "users=1%", mode])
+                    .is_ok(),
+                "--sample must be inspectable with {mode}"
+            );
+        }
     }
 
     #[test]
@@ -8502,6 +8898,74 @@ mod tests {
         match cli.command {
             Commands::Routes { command, .. } => assert!(command.is_none()),
             _ => panic!("expected Routes command"),
+        }
+    }
+
+    // ── autumn openapi export tests (#802) ─────────────────────────────────
+
+    #[test]
+    fn parse_openapi_export_defaults_to_stdout() {
+        let cli = Cli::try_parse_from(["autumn", "openapi", "export"]).unwrap();
+        match cli.command {
+            Commands::Openapi(OpenApiSubcommands::Export(args)) => {
+                assert!(args.out.is_none(), "no --out means stdout");
+                assert!(args.check.is_none());
+                assert!(!args.strict);
+                assert!(args.package.is_none());
+                assert!(args.features.is_empty());
+            }
+            _ => panic!("expected Openapi export subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_openapi_export_out_and_strict() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "openapi",
+            "export",
+            "--out",
+            "openapi.json",
+            "--strict",
+            "-p",
+            "bookmarks",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Openapi(OpenApiSubcommands::Export(args)) => {
+                assert_eq!(args.out.as_deref(), Some(Path::new("openapi.json")));
+                assert!(args.strict);
+                assert!(!args.release, "debug is the default profile");
+                assert_eq!(args.package.as_deref(), Some("bookmarks"));
+            }
+            _ => panic!("expected Openapi export subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_openapi_export_check_and_features() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "openapi",
+            "export",
+            "--check",
+            "contract/openapi.json",
+            "--features",
+            "openapi,mcp",
+            "--no-default-features",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Openapi(OpenApiSubcommands::Export(args)) => {
+                assert_eq!(
+                    args.check.as_deref(),
+                    Some(Path::new("contract/openapi.json"))
+                );
+                assert_eq!(args.features, vec!["openapi,mcp".to_owned()]);
+                assert!(args.no_default_features);
+                assert!(!args.all_features);
+            }
+            _ => panic!("expected Openapi export subcommand"),
         }
     }
 

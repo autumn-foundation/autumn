@@ -422,7 +422,7 @@ fn translate_requiressl_param(pairs: &mut Vec<(String, String)>) {
 /// that — so reading a query string through `query_pairs()` would silently
 /// turn `application_name=ops+cli` into `ops cli` before this sanitizer
 /// even got a chance to look at it.
-fn parse_raw_query_pairs(query: &str) -> Vec<(String, String)> {
+pub fn parse_raw_query_pairs(query: &str) -> Vec<(String, String)> {
     query
         .split('&')
         .filter(|segment| !segment.is_empty())
@@ -438,11 +438,25 @@ fn parse_raw_query_pairs(query: &str) -> Vec<(String, String)> {
 /// `form_urlencoded` serialization encodes a space as `+`, which
 /// `tokio_postgres`'s own query-string decoder (pure percent-decoding, see
 /// `UrlParser::decode`) would then read back as a literal `+` rather than a
-/// space. `NON_ALPHANUMERIC` is broader than strictly necessary (it also
-/// escapes `-`/`_`/`.`/`~`, which are already query-safe), but over-encoding
-/// is harmless to a decoder that only ever percent-decodes.
-fn query_value_token(s: &str) -> String {
-    percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
+/// space.
+///
+/// Everything outside RFC 3986's *unreserved* set is escaped, which covers
+/// every character that could change the meaning of a query string — `&`, `=`,
+/// `?`, `#`, `%`, `+` and space among them. The four unreserved punctuation
+/// marks are deliberately left alone: a decoder that only percent-decodes reads
+/// them identically either way, and `autumn db scrub --dry-run` prints one of
+/// these strings into a `\connect` line an operator has to read before pasting,
+/// where `application%5Fname=ops%20cli` is strictly worse than
+/// `application_name=ops%20cli` for no gain.
+pub fn query_value_token(s: &str) -> String {
+    /// RFC 3986 unreserved: `A-Z a-z 0-9 - . _ ~` pass through, all else is
+    /// escaped.
+    const RESERVED: percent_encoding::AsciiSet = percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    percent_encoding::utf8_percent_encode(s, &RESERVED).to_string()
 }
 
 /// Quote `value` in `libpq` keyword/value form if needed (empty, contains
@@ -1883,12 +1897,27 @@ mod tests {
         // just appending an `sslmode=require` at the end regardless of
         // position) preserves whichever of the two actually comes last, the
         // same "last one wins" rule that already governs a connection
-        // string with two explicit `sslmode=` occurrences.
-        let sanitized = sanitize_db_url("postgres://host/db?ssl=true&sslmode=disable").unwrap();
-        let config: tokio_postgres::Config = sanitized.parse().unwrap();
-        assert_eq!(
-            config.get_ssl_mode(),
-            tokio_postgres::config::SslMode::Disable
+        // string with two explicit `sslmode=` occurrences. Scopes away
+        // PGSSLROOTCERT/PGSSLCERT/PGSSLKEY so an ambient/racing value set by
+        // another test's `temp_env` call (e.g.
+        // `sanitize_rejects_pgsslcert_env_var_in_url_form`) can't trip the
+        // sslcert/sslkey rejection instead of the translation this test is
+        // actually about.
+        temp_env::with_vars(
+            [
+                ("PGSSLROOTCERT", None::<&str>),
+                ("PGSSLCERT", None::<&str>),
+                ("PGSSLKEY", None::<&str>),
+            ],
+            || {
+                let sanitized =
+                    sanitize_db_url("postgres://host/db?ssl=true&sslmode=disable").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(
+                    config.get_ssl_mode(),
+                    tokio_postgres::config::SslMode::Disable
+                );
+            },
         );
     }
 
@@ -1900,9 +1929,22 @@ mod tests {
         // other `ssl=` value passes through unchanged here and only fails
         // once `tokio_postgres` itself tries to parse it (it has no `ssl`
         // keyword at all), the same as before this translation existed.
-        let sanitized = sanitize_db_url("postgres://host/db?ssl=false").unwrap();
-        let parsed: Result<tokio_postgres::Config, _> = sanitized.parse();
-        assert!(parsed.is_err());
+        // Scopes away PGSSLROOTCERT/PGSSLCERT/PGSSLKEY so an ambient/racing
+        // value set by another test's `temp_env` call can't trip the
+        // sslcert/sslkey rejection instead of the pass-through this test is
+        // actually about.
+        temp_env::with_vars(
+            [
+                ("PGSSLROOTCERT", None::<&str>),
+                ("PGSSLCERT", None::<&str>),
+                ("PGSSLKEY", None::<&str>),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres://host/db?ssl=false").unwrap();
+                let parsed: Result<tokio_postgres::Config, _> = sanitized.parse();
+                assert!(parsed.is_err());
+            },
+        );
     }
 
     #[test]

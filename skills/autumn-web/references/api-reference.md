@@ -22,6 +22,7 @@ arrived in: **(0.6.0)** is absent from 0.5.x, and **(0.7.0)** is absent from
 | `autumn-storage-s3` | `autumn-storage-s3/` | S3-compatible `BlobStore` plugin |
 | `autumn-cache-redis` | `autumn-cache-redis/` | Redis cache plugin |
 | `autumn-search` | `autumn-search/` | Keyword + vector search plugin |
+| `autumn-billing` | `autumn-billing/` | Stripe subscription billing plugin |
 
 All publishable crates share the `[workspace.package]` version and release
 together at `0.7.0`. This table lists the same crates, in the same order, as
@@ -46,7 +47,7 @@ copy of the publish order.
 
 - `AppState`
 - `AutumnError`, `AutumnResult<T>`
-- `Db`
+- `Db`, `LazyDb` (defers the checkout past a body extractor, #2264)
 - `Page<T>`, `PageRequest`, `CursorPage<T>`, `CursorRequest`
 - `Valid<T>`, `Validated<T>`, `ValidateExt`
 - `Redirect`
@@ -128,6 +129,7 @@ copy of the publish order.
 | `#[public]` | Marks a route handler as deliberately unauthenticated for the `autumn routes audit` coverage manifest — mirrors `#[secured]`, classifying the route `public` vs `gated`/`framework`/`unclassified` (0.6.0, #1604) |
 | `#[authorize]` | Record-level policy guard |
 | `#[api_doc]` | Route OpenAPI metadata |
+| `#[derive(OpenApiSchema)]` | Field-accurate component schema for a plain `Query<T>` / `Json<T>` type, registered in the back-fill inventory so no `register_schema` call is needed. Named-field structs, and enums whose variants are all unit variants (a JSON string enum honoring `rename` / `rename_all` / `skip`). Generic types, tuple structs, data-carrying variants and non-default enum representations (`#[serde(tag/content/untagged)]`) are compile errors — write the impl by hand for those. `#[model]` types register themselves and need no derive (#802) |
 | `#[oauth2_callback]` | OAuth2/OIDC callback route |
 | `#[cached]` | Memoize function results; `key(a, b)` narrows the cache key, `reads(Model, …)` declares the cache-coherence dependency set, `acknowledge_stale = "…"` opts out of the gate (#1716) |
 | `#[scheduled]`, `tasks![...]` | Recurring scheduled tasks |
@@ -257,6 +259,55 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   be declared `#[translatable]` with **no data migration**; keys are never gated
   on locale-tag shape, so every key an app can write round-trips through the
   column.
+- **(0.7.0)** `#[collaborative]` (issue #1806, needs the `collab` feature) — the column
+  stores a **text CRDT** instead of a plain string, so two people editing the
+  same field merge character by character rather than overwriting each other.
+  The field type becomes `autumn_web::collab::CollabText`, a Replicated
+  Growable Array persisted as JSON in the field's own `TEXT` column (portable
+  Postgres + `SQLite`, the same storage shape `#[translatable]` uses). Give the
+  column `DEFAULT '{"elems":[]}'` (`collab::EMPTY_DOCUMENT`); a bare `'{}'`
+  reads as prose, not as an empty document. Guarantees: replicas holding the
+  same operations render the same text **in any delivery order**; an operation
+  arriving before the character it refers to waits in a buffer rather than
+  being dropped; applying one twice is a no-op, so a reconnect is safe; and an
+  edit anchors to a neighbouring character rather than an index, so it lands
+  where the author meant even when the document changed in flight.
+  Generated: per-field `<f>_text()` / `<f>_insert(actor, index, text)` /
+  `<f>_remove(index, count)` / `<f>_set_text(actor, text)` /
+  `<f>_merge(&other)`, plus field-name-keyed `collaborative(field)` /
+  `collaborative_mut(field)` / `Model::collaborative_fields()`, and a
+  `collab::CollaborativeColumnDescriptor` inventory registration.
+  **Write semantics matter**: use `<f>_set_text` for a whole-field form post —
+  it emits the smallest edit, so a concurrent edit outside the changed span
+  survives. Assigning a fresh `CollabText::from(str)` throws the merge history
+  away. `Serialize` is lossless; `Deserialize` refuses a bare string, so
+  `PUT {"body": "hi"}` is a 422 rather than a silent wipe of everyone else's
+  characters. Refused in combination with `#[encrypted]`, `#[classified]`,
+  `#[searchable]`, `#[translatable]`, `#[normalize]`, `unique`/`indexed`,
+  `#[id]`, `#[lock_version]`, `#[position]`, `#[state_machine]`,
+  `#[serde(rename)]` and `#[diesel(column_name)]`. `Option<CollabText>` is a
+  compile error — an empty document already means "no text". A pre-existing
+  plain-text column can be declared `#[collaborative]` with **no data
+  migration** (it must be `NOT NULL`; back-fill `''` first).
+  **Live sessions** (needs `presence` too): `state.collab()` is a
+  `collab::CollabHub` holding one live document per field instance.
+  `hub.open_with(&doc_key("notes", id, "body"), || note.body.clone())?` seeds it
+  from the row once, and `collab::hub::serve_socket(&doc, actor, label, socket)`
+  is the whole client protocol from a `#[ws]` handler — operations fan out over
+  a `Channels` topic, membership comes from `Presence`, cursors ride a message
+  merged into the participant list. Authorize the **record** before opening the
+  document: the hub applies no ownership check. The last editor to leave evicts
+  the document; `hub.close(key)` hands back a `CollabClose` whose `text()` is
+  the final state to persist. The document stays discoverable until
+  `finalize()`, so a reconnect during the write joins it instead of seeding a
+  second authority from the stale row.
+  **Offline**: `collab::CollabResolver::for_table("notes")` replaces
+  last-write-wins for the marked columns of that collection in the
+  offline-sync engine (`sync::server::router`), leaving every other column and
+  every row-level delete to the wrapped resolver. Cost: the merge scans the
+  character list, so it suits note-sized and comment-sized fields. See
+  [collaboration](../../../docs/guide/collaboration.md) and
+  `examples/collab-notes`.
 - **(0.7.0)** `#[classified]` / `#[classified(personal_data)]` (issue #1654) — marks a
   non-null `String` column as **personal data** and carries that classification
   on the *type*, not in a name denylist. The generated field becomes
@@ -298,13 +349,49 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   `classify::manifest::ClassifiedFieldDescriptor` inventory registration, and
   `Model::__AUTUMN_CLASSIFIED_COLUMNS`. `autumn data-flow` emits the manifest.
   See `docs/guide/data-classification.md`.
+- **(0.7.0)** `#[confidential]` / `#[confidential(blind_index)]` (issue #1771) —
+  marks a column **operator-blind**: the value is sealed on the client under a
+  key the server never receives, so the server holds only ciphertext. Unlike
+  `#[encrypted]` (operator-held keys, `String` field, transparent plaintext in
+  Rust), the field is declared as `autumn_web::confidential::Sealed` — an opaque
+  envelope with no `Display`, no `Deref` and no accessor that yields plaintext.
+  Every generated struct (`NewX`/`UpdateX`/`Changeset`/`XFactory`/JSON view)
+  therefore carries ciphertext, and the database, `autumn db backup` output, the
+  access and error log, replay capsules, record version history, the admin UI and
+  its CSV export hold only that.
+  Client side: `RootKey::generate()` / `::from_hex` / `::from_bytes` (no
+  `Serialize`, no `Display`, no byte accessor, zeroizes on drop, never built from
+  config or the credentials store),
+  `FieldContext::for_record(table, column, owner, record)` (or `::new` without
+  the record, which leaves rows interchangeable), then
+  `key.seal(&ctx, plaintext)? -> Sealed` and `key.unseal(&ctx, &sealed)?`.
+  Equality: `#[confidential(blind_index)]` requires a companion
+  `<field>_bidx: autumn_web::confidential::BlindIndex` column; the client sends
+  `key.blind_index(&ctx, plaintext)` and the server compares the token
+  (constant-time `PartialEq`, fixed 32 hex characters, so no length leak).
+  Refused at **build time**: `#[encrypted]`, `#[classified]`, `#[searchable]`,
+  `#[unique]`, `#[indexed]`, `#[references]`, `#[normalize]`, `#[translatable]`,
+  `#[id]`, `#[lock_version]`, `#[position]`, `#[state_machine]`, `#[default]`, a
+  `tenant_id` column, `#[serde(rename)]` / `rename_all`,
+  `#[diesel(column_name)]`, the model's shard key, a non-`Sealed` field type —
+  and, through the `Model::__AUTUMN_CONFIDENTIAL_COLUMNS` list `#[model]`
+  publishes, a `#[repository]` `find_by_<field>` / `count_by_` / `delete_by_` /
+  `exists_by_`, `find_or_create_by_<field>`, `cursor_key = <field>` or grouped
+  aggregate. Query the `_bidx` companion instead. Generated: a type assertion
+  proving the field really is `Sealed`, a
+  `confidential::ConfidentialColumnDescriptor` inventory registration, and
+  `Model::__AUTUMN_CONFIDENTIAL_COLUMNS`. See
+  `docs/guide/confidential-fields.md` for the threat model, including what
+  sealing does not hide.
 - `#[normalize(trim, downcase, upcase, squish, strip_nul, with = path::to::fn)]` (issue
   #1379) — canonicalizes a `String` column, composing normalizers
   left-to-right. Built-ins live in `autumn_web::normalize`
   (`trim`/`downcase`/`upcase`/`squish`/`strip_nul`); `with = path` calls a user
-  `fn(&str) -> String`. Runs on the **write** path (`save`/`save_many` insert;
-  `update` via `UpdateDraft::from_patch`) *before* the `before_create` /
-  `before_update` hooks and the DB write, and on derived `#[repository]`
+  `fn(&str) -> String`. Runs on the **write** path (`save`, `save_many`,
+  `save_many_skip_invalid` and the create half of `find_or_create_by_*` on
+  insert; `update` via `UpdateDraft::from_patch`) *before* the model's
+  `#[validate]` rules, the `before_create` / `before_update` hooks and the DB
+  write, and on derived `#[repository]`
   `find_by_`/`count_by_` lookups (so `find_by_email("  FOO@X.com ")` matches the
   stored `foo@x.com` row). Built-ins are idempotent; composing
   `#[normalize(downcase)]` with a `unique` column yields case-insensitive
@@ -560,6 +647,47 @@ delete actions remain last-write-wins.
   `.initial_backoff(d)` / `.max_backoff(d)`; retrying constructors default
   to 5 attempts.
 
+## Money and the ledger (`autumn_web::money`, unreleased, #1837)
+
+Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
+
+- `Money<C>` — an amount in currency `C`, as an `i64` count of minor units.
+  No `f64`, and no `Add`/`Sub` impls (an operator cannot report an overflow).
+  `from_minor` / `from_major` / `minor` / `currency` / `to_decimal` /
+  `checked_add` / `checked_sub` / `checked_neg` / `checked_abs` /
+  `checked_mul` / `try_sum` / `is_zero` / `is_positive` / `is_negative` /
+  `to_any`; `ZERO`.
+- `Money::from_decimal(d, Rounding)` and `from_decimal_exact(d)` (refuses to
+  round). `Rounding` {`HalfUp`, `HalfEven`, `HalfDown`, `TowardZero`,
+  `AwayFromZero`, `Floor`, `Ceiling`} — no default, every call names one.
+- `Money::allocate(&[i64])` / `split(n)` — largest-remainder; the parts always
+  sum back to the whole. `split` is bounded by `money::MAX_PARTS`.
+- `Currency` (sealed) with markers `Usd`, `Eur`, `Gbp`, `Jpy`, … (34 ISO 4217
+  codes, exponents 0/2/3). `Usd::currency()` gives the runtime `CurrencyCode`;
+  `CurrencyCode::parse(code)` / `::known()`.
+- `AnyMoney` — runtime-tagged amount for a stored row: `new` / `zero` /
+  `minor` / `currency` / `to_decimal` / `checked_add` / `checked_sub` /
+  `checked_neg` / `try_sum` / `try_into_typed::<C>()`.
+- `MoneyError` {`Overflow`, `CurrencyMismatch`, `UnknownCurrency`, `Inexact`,
+  `InvalidWeights`} → 422, except `Overflow` → 500.
+- `money::ledger::{ensure_account, set_allow_negative, account, post, balance,
+  transaction_by_key, trial_balance}` — all take `&mut RuntimeConnection`, so
+  they nest inside `Db::tx`. `post` **requires** a transaction.
+- `Account::new(id, currency)` / `.disallow_negative()`; `Posting::debit(...)` /
+  `::credit(...)`; `Transaction::new(key, postings).memo(...)` /
+  `.validate()`; `IdempotencyKey::new(s)` / `::derive(namespace, &postings)`;
+  `PostOutcome::{Posted, Replayed}` with `is_posted` / `is_replayed` /
+  `transaction`; `PostedTransaction`, `CurrencyTotal`, `Side`.
+- `LedgerError` {`Money`, `Unbalanced`, `PostingCount`, `OneSided`,
+  `ZeroPosting`, `MixedCurrencies`, `NegativeAmount`, `UnknownAccount`,
+  `AccountCurrency`, `KeyReuse`, `InvalidText`, `NegativeBalance`,
+  `NotInTransaction`, `Conflict`, `EmptyTransaction`, `Database`} — 409 for
+  `KeyReuse` / `NegativeBalance` / `Conflict`, 500 for `NotInTransaction` /
+  `EmptyTransaction` / `Database`, 422 for the rest.
+- Tables `ACCOUNTS_TABLE` / `TRANSACTIONS_TABLE` / `POSTINGS_TABLE`
+  (`_autumn_money_*`), append-only by trigger on both backends, shipped in the
+  framework migration set.
+
 ## Form helpers (`autumn_web::form`)
 
 Free functions rendering changeset-aware, accessible inputs:
@@ -597,6 +725,20 @@ Free functions rendering changeset-aware, accessible inputs:
   `deserialize_naive_datetime_local[_option]` (offsetless `datetime-local`
   values decode; RFC 3339 still accepted). `DateTime` columns with a zone
   other than `Utc`/`Local` render as `Text` (RFC 3339 string), not a picker.
+- `rich_text_area(&changeset, field, label)` (#1255) renders a Markdown
+  `<textarea>` with a syntax toolbar, a hint line, and (via
+  `rich_text_area_htmx`/`rich_text_area_htmx_with_token_field`) an htmx live
+  preview pane. `required_*` variants add the required signal. `RichTextLabels`
+  (#2227) overrides the toolbar's chrome text: `.toolbar_group(label)`,
+  `.controls(&[(name, syntax)])`, `.hint(text)`, `.preview_heading(text)`. Pass
+  one to the matching `*_with_labels` sibling (e.g.
+  `rich_text_area_htmx_with_token_field_with_labels`); the plain functions
+  keep rendering the English default.
+- `IntoChangeset::into_changeset_with(resolve)` (#2227) is
+  `into_changeset`'s sibling: `resolve: impl Fn(field, code) -> Option<String>`
+  supplies a message for a `#[validate(...)]` rule that has no explicit
+  `message`. Return `None` to keep the default `"validation failed: {code}"`.
+  An explicit `message` on the rule always wins and skips the resolver.
 
 ## Typed accessible primitives (`autumn_web::a11y`, feature `maud`, 0.6.0, #1706)
 
@@ -606,8 +748,8 @@ compile error enforced via trybuild, not a runtime `autumn a11y verify` miss).
 Each maps to a WCAG 2.1 success criterion. Full narrative in
 `docs/guide/accessibility.md`. `Img`, `Button`, `ButtonType`, `Link`,
 `MenuItem`, and `TextField` are prelude re-exported; the remaining form
-primitives (`TextArea`, `Select` + `SelectOption`, `Checkbox`, `FileField`) are
-reached via the `autumn_web::a11y` path.
+primitives (`TextArea`, `Select` + `SelectOption`, `Checkbox`, `FileField`,
+`RadioGroup` + `RadioOption`) are reached via the `autumn_web::a11y` path.
 
 - `Img::new(src, alt)` (alt required) / `Img::decorative(src)` (explicit
   `alt=""` + `aria-hidden="true"`); `.class(..)` / `.width(u32)` /
@@ -622,7 +764,7 @@ reached via the `autumn_web::a11y` path.
   switches to `<a>`); `.icon(markup)` (name ⇒ `aria-label`) / `.class(..)`.
   WCAG 4.1.2.
 
-### Labeled-typestate form primitives (`TextField` / `TextArea` / `Select` / `Checkbox` / `FileField`)
+### Labeled-typestate form primitives (`TextField` / `TextArea` / `Select` / `Checkbox` / `FileField` / `RadioGroup`)
 
 Each starts in a `NoLabel` typestate that does **not** implement `Render`. Only
 after a label is attached — `.label(text)` (visible `<label for=…>`),
@@ -634,7 +776,7 @@ validation setters are chainable in **either** typestate and none supplies an
 accessible name, so none lifts the compile-time label obligation — the guarantee
 is additive.
 
-Shared setters on all five: `.required()` (native `required`),
+Shared setters on all six: `.required()` (native `required`),
 `.aria_required()` (mirroring `aria-required="true"`, matching the scaffold
 generator's non-nullable ARIA wiring), `.class(s)` (on the control),
 `.label_class(s)` (on the visible `<label>`), `.aria_invalid(bool)`
@@ -657,6 +799,14 @@ Per-primitive setters (in addition to the shared set):
 - **`Checkbox::new(name)`** — `.value(s)`, `.checked(bool)`.
 - **`FileField::new(name)`** — `.accept(s)` (MIME/extension filter),
   `.multiple()` (sets the `multiple` attribute).
+- **`RadioGroup::new(name, first)`** — the first `RadioOption` is a constructor
+  argument, so a group always has a choice; `.option(RadioOption)` /
+  `.options(iter)`, `.checked_value(s)`, `.id_prefix(s)` (for the same group
+  rendered repeatedly). `RadioOption::new(value, label)`
+  requires the choice label; `.checked()` / `.disabled()`. The group renders
+  `<fieldset><legend>` (visible name) or `<div>` (ARIA name), both with
+  `role="radiogroup"`; `aria-invalid` and `hx-*` land on each `<input>`,
+  `aria-describedby` and `aria-required` on the group.
 
 ## View widgets and UI (all 0.6.0)
 
@@ -673,6 +823,12 @@ Per-primitive setters (in addition to the shared set):
   Option<guard>)]`) and `can` is `|to| record.can_transition_<field>_to(to)`;
   a legal edge whose guard currently fails still renders but as a `disabled`
   button. CSS hooks `.autumn-transition-controls` / `.autumn-transition`.
+  `transition_controls_with_labels(..., &TransitionLabels)` (#2227) takes the
+  same arguments plus a trailing `TransitionLabels` builder: `.group(label)`
+  overrides the `"{field} transitions"` aria-label, `.buttons(&[(state,
+  label)])` overrides `"Mark as {state}"` per target state. A state not
+  listed keeps the default text. `transition_controls` still renders the
+  same default text as before.
 - `autumn_web::widgets::{ReactionControls, reaction_controls}` (#1362) — the
   view half of `#[votable]`. `ReactionControls::votes(dom_id, up_action,
   down_action)` (signed up/down, `aggregate = sum`) or
@@ -1031,7 +1187,7 @@ double-submits and replays.
 - Rendering: `asset_url`, `Markup`, `PreEscaped`, `html!`.
 - Accessibility primitives (`maud` feature, 0.6.0):
   `Button`, `ButtonType`, `Img`, `Link`, `MenuItem`, `TextField`.
-- Extractors: `Db`, `Form`, `Json`, `Path`, `Query`, `State`, `Session`,
+- Extractors: `Db`, `LazyDb`, `Form`, `Json`, `Path`, `Query`, `State`, `Session`,
   `Auth`, `ApiToken`, `RequireApiToken`, `CsrfToken`, `CsrfFormField`,
   `PageRequest`, `Page`, `CursorRequest`, `CursorPage`, `Valid`,
   `ValidateExt`, `Validated`, `Flash`, `Multipart`, `HxRequest`,
@@ -1054,7 +1210,7 @@ double-submits and replays.
 | `jobs(Vec<JobInfo>)` | Background jobs |
 | `one_off_tasks(Vec<OneOffTaskInfo>)` | CLI tasks |
 | `migrations(EmbeddedMigrations)` | Diesel embedded migrations |
-| `openapi(OpenApiConfig)` | OpenAPI generation |
+| `openapi(OpenApiConfig)` | OpenAPI generation; `register_schema(key, json)` seeds a hand-written component schema (seeded first, so it wins over anything derived). Get the document out with `autumn openapi export` — no boot, no database (#802) |
 | `mount_mcp(path)`, `expose_all_as_mcp()`, `secure_mcp(layer)` | MCP endpoint projection (`mcp`); `Route::mcp()/mcp_exclude()/mcp_stream()` toggle exposure per route (plugin fluent opt-in) |
 | `exception_filter(...)`, `error_pages(...)` | Error rendering |
 | `scoped(prefix, layer, routes)` | Scoped route group |
@@ -1180,6 +1336,7 @@ http-client = ["dep:reqwest"]
 openapi = ["dep:serde_yaml"]
 mcp = ["openapi"]
 markdown = ["dep:pulldown-cmark"]
+constela = ["maud"]
 db = [
     "dep:deadpool",
     "dep:diesel",
@@ -1212,6 +1369,57 @@ system-tests = ["dep:chromiumoxide"]
 ```
 
 `storage-s3` is not an `autumn-web` feature. Use `autumn-storage-s3 = "0.7"`.
+
+## Generated UI (`autumn_web::constela`, feature `constela`)
+
+Parse, validate and server-render [Constela](https://github.com/yuuichieguchi/constela)
+documents — the constrained JSON UI language — so an app can serve an interface
+a language model generated. Implies `maud`; adds no new dependencies. The
+`markdown` node kind additionally needs the `markdown` feature (without it a
+document containing one fails validation with `constela.feature_required`).
+
+| Item | Signature / shape |
+|---|---|
+| `Document::parse` | `fn(&str, &Limits) -> Result<Document, ConstelaError>` — parses **and** validates |
+| `Document::from_program` | `fn(Program) -> Result<Document, ConstelaError>` — validates an already-parsed AST |
+| `Document::initial_state` | `fn(&self) -> serde_json::Map<String, Value>` — the declared initials |
+| `Document::action_names` | `fn(&self) -> Vec<&str>` |
+| `Document::render` | `fn(&self, &RenderContext) -> Result<RenderedUi, ConstelaError>` |
+| `Document::dispatch` | `fn(&self, &str, &mut Map<String, Value>, &Map<String, Value>) -> Result<Dispatched, ConstelaError>` |
+| `Document::dispatch_with` | as `dispatch`, plus a `&RouteValues` |
+| `parse` | free-function alias for `Document::parse` |
+| `parse_program` | `fn(&str, &Limits) -> Result<Program, ConstelaError>` — syntax only, no validation |
+| `validate` | `fn(&Program) -> Result<(), ConstelaError>` |
+| `RenderedUi` | `{ body: Markup, portals: Vec<RenderedPortal>, title: Option<String>, meta: BTreeMap<String, String> }`, plus `portals_for(target)` |
+| `Dispatched` | `{ effects: Vec<Effect>, suspended_at: Option<String> }`, plus `is_pure()` / `is_suspended()`; dispatch stops at the first effect |
+| `Effect` | `#[non_exhaustive]` — `Fetch`, `Storage`, `Navigate`, `Delay`, `Interval`, `Focus` |
+| `ConstelaError` | `Limit` / `Syntax` / `Invalid(Vec<Diagnostic>)` / `Render`, plus `diagnostics()` and `to_json()`; maps to **422** |
+| `Diagnostic` | `{ path: String, code: &'static str, message: String }` |
+| `codes` | `constela.limit`, `.syntax`, `.version`, `.state.type`, `.unknown_ref`, `.duplicate`, `.tag_not_allowed`, `.attr_not_allowed`, `.url_scheme`, `.misplaced`, `.cycle`, `.step_shape`, `.feature_required`, `.eval`, `.render_limit` |
+
+`RenderContext { state, route, id_prefix, limits }` — `id_prefix` defaults to
+`"c-"` and is applied to every element id the document writes and every
+attribute referencing one, so a fragment cannot collide with or clobber a
+host-page id. Give each fragment its own prefix when a page embeds several.
+
+Limits are two independent sets. `Limits { max_bytes: 512 KiB, max_depth: 64,
+max_nodes: 20_000 }` bounds the **document** and is applied before and around
+deserialization. `RenderLimits { max_depth: 128, max_nodes: 50_000, max_each_items: 5_000,
+max_output_bytes: 4 MiB }` bounds the **expansion** against runtime state.
+`max_output_bytes` spans the body and every portal together and also caps what
+one expression may *build* (`concat`/`array`/`obj`/`+` assemble a value inside
+the evaluator before any of it is emitted); `max_depth` caps the shape of state
+on every mutation, not only `setPath`, because state persists between dispatches
+and `serde_json::Value` drops recursively. `Limits::unbounded()`
+exists for trusted, locally-authored documents only.
+
+Safety lives in `constela::policy` — `ALLOWED_TAGS`, `ALLOWED_ATTRS`,
+`URL_ATTRS`, `ALLOWED_URL_SCHEMES`, `ID_REF_ATTRS`, `VOID_TAGS`,
+`RESERVED_ATTR_PREFIX`, and the `is_allowed_tag` / `is_allowed_attr` /
+`is_allowed_url` / `canonical_attr` predicates. Fixed lists, no per-app
+configuration.
+
+Guide: `docs/guide/constela.md`.
 
 ## Workspace dependency versions
 
@@ -1268,6 +1476,27 @@ time = { version = ">=0.3, <0.4" }
 - `validation(details)` - 422 with field errors
 
 JSON clients receive `application/problem+json`.
+
+Read accessors, for a caller with no HTTP response to parse (a GraphQL
+resolver, a `#[task]`, a CLI, an MCP tool, a `MutationHooks` impl):
+
+- `status() -> StatusCode`
+- `details() -> Option<&HashMap<String, Vec<String>>>` - per-field validation
+  messages, `None` when the error did not come from validation
+- `code() -> Cow<'static, str>` - the same stable code the `problem+json`
+  body carries (`autumn.validation_failed`, `autumn.not_found`, ...)
+- `message() -> String` - the wrapped error's message alone. Not redacted,
+  and `status()` is not the guard: it reports the assigned status, while the
+  renderer reclassifies a cancelled database statement to a redacted `503`.
+  Render the error when you need a client-safe string
+- `source_chain() -> Vec<String>`
+- `downcast_ref::<T>()` / `downcast_chain_ref::<T>()`
+
+`Display` on a validation error appends the failing fields to `message()`,
+sorted by field name: `Validation failed: email: Must be a valid email
+address`. The `problem+json` `detail` is unchanged - it stays the bare title,
+with the fields in `errors`. Keep untrusted text out of validation messages;
+`Display` output reaches logs.
 
 ## Signed webhook API
 
@@ -1398,9 +1627,11 @@ Frequently used env keys:
 | `AUTUMN_SESSION__REDIS__URL` | `session.redis.url` |
 | `AUTUMN_CHANNELS__BACKEND` | `channels.backend` |
 | `AUTUMN_CHANNELS__REPLAY_BUFFER` | `channels.replay_buffer` (0.6.0) |
-| `AUTUMN_JOBS__BACKEND` | `jobs.backend` |
+| `AUTUMN_JOBS__BACKEND` | `jobs.backend` (`local` / `postgres` / `redis` / `sqlite`) |
+| `AUTUMN_JOBS__SQLITE__VISIBILITY_TIMEOUT_MS` | `jobs.sqlite.visibility_timeout_ms` |
+| `AUTUMN_JOBS__SQLITE__POLL_INTERVAL_MS` | `jobs.sqlite.poll_interval_ms` |
 | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` |
-| `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` |
+| `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` (`in_process` / `postgres` / `sqlite`) |
 | `AUTUMN_SECURITY__SIGNING_SECRET` | `security.signing_secret.secret` |
 | `AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API` | `security.allow_unauthorized_repository_api` |
 | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__BACKEND` | `security.webhooks.replay.backend` |
@@ -1497,6 +1728,42 @@ In-process HTTPS termination on the same host:port (off by default).
   probes its own loopback listener over TLS instead of failing forever. See
   `docs/guide/tls.md`.
 
+### `[server.tls.client_auth]` (feature `tls`, unreleased, #1640)
+
+Mutual TLS: verify the *caller's* certificate, not just prove the server's.
+Absent, the handshake is byte-for-byte the server-only TLS above.
+
+- `mode` — `off` (default), `optional` (certificate requested; verified when
+  presented), `required` (no valid certificate, no handshake). `optional` still
+  verifies a certificate that IS offered; the option is whether offering one is
+  mandatory.
+- `ca_bundle_path` (required unless `off`) — PEM bundle of one or more client
+  CAs. `crl_path` — optional PEM revocation list. Both hot-reload on their own
+  `reload_interval_secs` (default `60`) poll, so a CA rotation (ship old+new in
+  one bundle, later drop old) needs no restart and drops no established
+  connection.
+- `required_paths` — rooted path prefixes whose routes demand a certificate,
+  matched against the raw request path and the normalized one (either match
+  requires a certificate, so normalization cannot drop a requirement). A trailing-slash prefix also
+  covers the bare route: `/internal/` covers `/internal`. A request reaching one
+  over an uncertified connection gets `403` with the standard problem+json body.
+- Handlers extract `autumn_web::tls::client_auth::ClientCert` (rejects `403`) or
+  `OptionalClientCert`. `ClientIdentity` carries `subject`, `issuer`, `sans`
+  (`DNS:`/`URI:`/`IP:`/`email:` prefixed), `fingerprint`, `serial` and
+  `common_name()`. **Authorize on `common_name()` / `has_san()`, never by
+  string-searching `subject`:** DN rendering does not escape attribute values.
+- Policies read the same identity: `ctx.client_identity()`,
+  `ctx.has_client_identity()`, `ctx.client_has_san("URI:spiffe://…")`. It is
+  ambient to the request task, so a `tokio::spawn`ed check sees `None`.
+- `RequireClientCertLayer::new()` locks a sub-router in code.
+- Rejections: `tls_client_auth_rejected_total{reason}` (`no_certificate`,
+  `untrusted_ca`, `expired`, `not_yet_valid`, `revoked`,
+  `unknown_revocation`, `invalid`) and `tls_client_auth_route_rejected_total`,
+  plus a rate-limited operator log. The client sees only the TLS alert.
+- Fail-fast at startup on a missing / unparseable / empty bundle or CRL, on a
+  non-`off` mode with no `ca_bundle_path`, on `required_paths` under
+  `mode = "off"`, and on a noncanonical prefix (`//`, `.` or `..` segment). Revocation is CRL-only — no OCSP. See `docs/guide/tls.md`.
+
 ### `[server.tls.acme]` (feature `acme`, 0.6.0, #1608)
 
 Automatic ACME certificate provisioning + renewal; builds on `tls`, off by
@@ -1568,6 +1835,73 @@ provider = "cloudflare"
 - A failed issuance/renewal raises #1610's `scheduled_task_failure` operator
   alert for `acme-renewal` and clears it on the next success; the `acme` health
   indicator reports `challenge` and `dns_provider`.
+
+See `docs/guide/tls.md`.
+
+### `[server.tls.acme.custom_domains]` (feature `acme`, unreleased — trunk-dev, #1635)
+
+Lets a **tenant connect its own hostname** (`app.clientco.com`), each getting its
+own verified, auto-renewing certificate served by SNI. Config-only: no per-domain
+entry ever appears in `autumn.toml`, so a 1,000-tenant deployment is the same
+block as a 1-tenant one. Wildcards (#1620) cover subdomain tenants; this covers
+the B2B customer who brings their own domain.
+
+```toml
+[server.tls.acme.custom_domains]
+enabled          = true
+ingress_hostname = "ingress.myapp.com"   # CNAME target for tenant subdomains
+ingress_ipv4     = ["203.0.113.10"]      # A records, for tenant APEX domains
+```
+
+- `enabled` (default `false`), `ingress_hostname` / `ingress_ipv4` /
+  `ingress_ipv6` — at least one target is required; an **apex** domain cannot
+  carry a CNAME, so accepting apex domains needs the addresses.
+- `store_dir` (default `config/acme/domains`), `max_domains` (default `1000`),
+  `cert_cache_size` (default `256`) — certificates load incrementally, so the
+  cache is a memory knob, not a correctness one.
+- `issuance_per_domain_per_day` (default `5`), `issuance_global_per_hour`
+  (default `50`), `failure_backoff_secs` (default `300`, doubling),
+  `max_failure_backoff_secs` (default `86400`), `poll_interval_secs`
+  (default `60`).
+
+The app drives the journey through
+`autumn_web::custom_domain::CustomDomainRegistry` (published in `AppState`):
+`register(hostname, tenant, now)` connects one, `DnsInstructions::for_hostname`
+renders the exact record to show the tenant, and `list_for_tenant` renders
+status. States are `pending_dns` → `verified` → `issuing` → `active`; a stuck
+domain carries `failure_reason`, and an `active` domain that fails renewal STAYS
+active and serving.
+
+**Offboard through `<dyn CustomDomainPruner>::from_state(&state)`** —
+`offboard_domain(hostname)` and `offboard_tenant_domains(tenant)`. The
+registry's own `remove` / `remove_tenant` only drop the record: they stop
+routing, but the certificate and its private key stay in the ACME store until a
+`[retention] custom_domains` window prunes them, which is unset by default.
+`CustomDomainPruner` does both.
+
+Three gates stand between a tenant-supplied hostname and an ACME order: the app
+registered it, DNS independently resolves to this deployment, and the budget has
+headroom. An SNI hostname nobody registered is refused at the handshake without
+contacting the CA. A hostname the deployment already owns (under
+`[server.tls.acme] domains` or `[tenancy] base_domain`) is refused at
+registration, so a tenant cannot claim another tenant's subdomain.
+
+Requests carrying a registered `Host` resolve to the owning tenant — under
+`[tenancy] source = "subdomain"` only, so a client-supplied `Host` never
+outranks an authenticated `jwt`/`session`/`header` tenant. Tenant certificates
+are issued over **HTTP-01** even when the deployment's own uses DNS-01: the
+record lives in the tenant's zone, where autumn holds no credential.
+
+A failure names the domain AND its tenant in the `custom_domains` health
+indicator and raises #1610's `scheduled_task_failure` alert for
+`custom_domain_certificates`, while every other domain keeps serving and
+renewing. `autumn doctor` grades the section and, with `--online`, flags
+registered domains whose DNS no longer points here. Offboarding stops routing,
+serving and renewal and deletes the stored certificate; the `custom_domains`
+retention dataset prunes abandoned registrations and orphaned certificates.
+
+Single-host, like the rest of the ACME path: the HTTP-01 token map and
+certificate store are per-process. Behind a load balancer, terminate TLS there.
 
 See `docs/guide/tls.md`.
 

@@ -343,8 +343,9 @@ serves `static/` at `/static/` out of the box, so no route wiring is required.
 
 - **Dev** (`cargo run`): `asset_url("islands/flock-boot.js")` returns
   `/static/islands/flock-boot.js` verbatim — edits are visible immediately.
-- **Release** (`autumn build --release`): the asset pipeline fingerprints and
-  long-caches files it knows about (`public, max-age=31536000, immutable`). The
+- **Release** (`autumn build`, which builds in release by default): the asset
+  pipeline fingerprints and long-caches files it knows about
+  (`public, max-age=31536000, immutable`). The
   `.wasm`/`.js` pair flows through the existing manifest unchanged. The one
   wrinkle: the loader imports the glue by a relative name
   (`./autumn_island_flock.js`), so keep the glue+wasm pair addressed the way

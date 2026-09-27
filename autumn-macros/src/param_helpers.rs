@@ -20,6 +20,7 @@
 //!   `#[secured]` then runs on the modified function, sees the
 //!   existing parameters, and skips re-injection.
 
+use quote::quote;
 use syn::ItemFn;
 
 /// Return `true` when `func` already has a parameter bound to a
@@ -48,21 +49,40 @@ fn pat_binds_name(pat: &syn::Pat, name: &str) -> bool {
 /// `#[throttle]` each mint a handler-unique gate type named
 /// `__Autumn{Kind}Gate_{fn_name}` and insert it as a new leading parameter, so
 /// its check runs — and can reject — before Axum's body extractor ever runs.
+/// `#[feature_flag]` mints the same shape (`__AutumnFlagGate_{fn_name}`) —
+/// Codex review on #2628 found it missing here, which let it wrongly own a
+/// cached idempotency replay (and let a later-expanding `#[secured]`/
+/// `#[step_up]`/`#[throttle]` also wrongly claim ownership, since neither
+/// could see its gate was already there) even when a still-pending
+/// `#[authorize]` needed to run first.
 const GUARD_GATE_TYPE_PREFIXES: &[&str] = &[
     "__AutumnSecuredGate_",
     "__AutumnStepUpGate_",
     "__AutumnThrottleGate_",
+    "__AutumnFlagGate_",
 ];
 
 /// Whether `func` already carries another guard's pre-body gate parameter.
 ///
-/// Used by each of `#[secured]`/`#[step_up]`/`#[throttle]` to decide whether
-/// ITS OWN gate should own idempotency-replay serving: whichever gate is
-/// applied to a still-unguarded function (no earlier gate parameter, and per
-/// [`crate::idempotency_guard::block_has_replay_guard`] no earlier in-body
-/// guard either) is the one whose check every other stacked guard's check is
-/// guaranteed to have already passed by the time it runs, so it — and only
-/// it — may serve a cached replay.
+/// Used two ways:
+/// - By each of `#[secured]`/`#[step_up]`/`#[throttle]` to decide whether ITS
+///   OWN gate should own idempotency-replay serving: whichever gate is
+///   applied to a still-unguarded function (no earlier gate parameter, and
+///   per [`crate::idempotency_guard::block_has_replay_guard`] no earlier
+///   in-body guard either) is the one whose check every other stacked
+///   guard's check is guaranteed to have already passed by the time it
+///   runs, so it — and only it — may serve a cached replay.
+/// - By `static_route.rs` to detect an already-expanded gate (of *any* of
+///   the four kinds, `#[feature_flag]` included) stacked above
+///   `#[static_get]`: none of these pre-body checks run on a cached
+///   SSG/ISR hit (served by the static-first middleware before the inner
+///   router, and the handler along with it, is ever reached), so all four
+///   are incompatible with a static route for the same reason, not just
+///   the three auth/rate ones (Codex review on #2628, tenth finding — an
+///   attempt to narrow this to an auth/rate-only prefix list for that
+///   check, in response to the eighth finding, missed that a disabled
+///   `#[feature_flag]` on a static route would then silently fail to hide
+///   the cached page).
 pub fn has_any_guard_gate_param(func: &ItemFn) -> bool {
     GUARD_GATE_TYPE_PREFIXES
         .iter()
@@ -209,6 +229,69 @@ pub fn reject_if_incompatible_route_marker(func: &ItemFn) -> Option<proc_macro2:
     None
 }
 
+/// Shared preamble for every pre-body gate macro (`#[secured]`, `#[step_up]`,
+/// `#[throttle]`, `#[authorize]`): split `item` into its leading items and
+/// the function the attribute is attached to, reject a non-async function
+/// with `#[{attr_name}] can only be applied to async functions`, then reject
+/// a function [`reject_if_incompatible_route_marker`] already flags as
+/// incompatible. Every one of the four macros ran this exact sequence
+/// independently (co-changed together in #1668 and #2628 — the latter added
+/// the identical 7-line marker-check call to three of them in one commit);
+/// `attr_name` is the only thing that ever varied between the copies.
+pub fn split_leading_items_and_reject_incompatible(
+    item: &proc_macro2::TokenStream,
+    attr_name: &str,
+) -> Result<(proc_macro2::TokenStream, ItemFn), proc_macro2::TokenStream> {
+    let (leading_items, input_fn) = crate::parse::split_leading_items_and_fn(item)?;
+    if input_fn.sig.asyncness.is_none() {
+        return Err(syn::Error::new_spanned(
+            input_fn.sig.fn_token,
+            format!("#[{attr_name}] can only be applied to async functions"),
+        )
+        .to_compile_error());
+    }
+    if let Some(err) = reject_if_incompatible_route_marker(&input_fn) {
+        return Err(err);
+    }
+    Ok((leading_items, input_fn))
+}
+
+/// Build the `original_response` binding shared byte-for-byte by
+/// `#[secured]`, `#[step_up]` and `#[authorize]`: await the handler's
+/// original body, then convert it to a `Response` — binding it to the
+/// handler's own declared return type unless that type contains `impl
+/// Trait` anywhere (see [`type_contains_impl_trait`]'s doc comment for why).
+///
+/// `#[throttle]` does NOT share this helper: it also stringifies a bare
+/// primitive return type (`should_stringify_primitive_output`), a case the
+/// other three don't have — a deliberate divergence, not an omission, so
+/// throttle keeps its own copy rather than taking a mode flag here.
+pub fn build_original_response(
+    original_body: &syn::Block,
+    output: &syn::ReturnType,
+) -> proc_macro2::TokenStream {
+    match output {
+        syn::ReturnType::Default => quote! {
+            let __autumn_inner: () = (async move #original_body).await;
+            ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+        },
+        // Avoid `let x: T = …` when T contains `impl Trait` at any depth.
+        // Rust rejects `impl Trait` in local variable type annotations; drop
+        // the annotation and let type inference handle it instead.
+        syn::ReturnType::Type(_, ty) if type_contains_impl_trait(ty) => {
+            quote! {
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                    (async move #original_body).await
+                )
+            }
+        }
+        syn::ReturnType::Type(_, ty) => quote! {
+            let __autumn_inner: #ty = (async move #original_body).await;
+            ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+        },
+    }
+}
+
 /// Test-only helper: pull the `fn` named `name` out of a macro's generated
 /// output.
 ///
@@ -234,6 +317,36 @@ pub fn extract_fn_item(tokens: proc_macro2::TokenStream, name: &str) -> ItemFn {
             _ => None,
         })
         .unwrap_or_else(|| panic!("fn `{name}` not found among the generated items"))
+}
+
+/// Returns `true` if `ty` contains an `impl Trait` anywhere in its tree.
+///
+/// Rust forbids `impl Trait` in local variable type annotations (E0562), so
+/// every `#[secured]`/`#[authorize]`/`#[step_up]`/`#[throttle]` expansion
+/// that binds a handler's awaited output to an explicit local type
+/// (`let __autumn_inner: #ty = …`) must skip that annotation when `ty`
+/// contains `impl Trait` at any depth — not just when `ty` itself is
+/// `impl Trait`, since the common shape is a wrapper like
+/// `AutumnResult<impl IntoResponse>` with `impl Trait` only nested inside.
+pub fn type_contains_impl_trait(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::ImplTrait(_) => true,
+        syn::Type::Path(tp) => tp.path.segments.iter().any(|seg| match &seg.arguments {
+            syn::PathArguments::AngleBracketed(args) => args.args.iter().any(|arg| match arg {
+                syn::GenericArgument::Type(t) => type_contains_impl_trait(t),
+                _ => false,
+            }),
+            syn::PathArguments::Parenthesized(args) => {
+                args.inputs.iter().any(type_contains_impl_trait)
+                    || matches!(&args.output,
+                            syn::ReturnType::Type(_, t) if type_contains_impl_trait(t))
+            }
+            syn::PathArguments::None => false,
+        }),
+        syn::Type::Reference(r) => type_contains_impl_trait(&r.elem),
+        syn::Type::Tuple(t) => t.elems.iter().any(type_contains_impl_trait),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -295,5 +408,19 @@ mod tests {
             async fn h(Json(body): Json<T>) {}
         };
         assert!(!has_any_guard_gate_param(&f));
+    }
+
+    #[test]
+    fn has_any_guard_gate_param_detects_feature_flag_too() {
+        // Codex review on #2628 (tenth finding): a feature-flag gate never
+        // runs on a cached SSG/ISR hit, the same reason the three auth/rate
+        // gates are incompatible with a static route -- so this function
+        // must keep matching it, for both its callers (idempotency-replay
+        // ownership in idempotency_guard.rs, and static-route incompatibility
+        // in static_route.rs).
+        let flagged: ItemFn = parse_quote! {
+            async fn h(_g: __AutumnFlagGate_h) {}
+        };
+        assert!(has_any_guard_gate_param(&flagged));
     }
 }

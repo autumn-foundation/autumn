@@ -247,6 +247,49 @@ for entry in "${entries[@]}"; do
   pairs+=("$version $entry")
 done
 
+# A built-in starter under `autumn-cli/src/starters/<name>/migrations/` is a
+# TEMPLATE, and each one is a byte-for-byte mirror of its committed example
+# (pinned by `embedded_<name>_matches_example_<name>` in
+# `autumn-cli/src/starters/mod.rs`). The two are the same migration, and they
+# never coexist in one database: scaffolding copies the template into a new
+# project which then owns the only instance. So a starter/example pair sharing
+# a version is the intended state, not the collision this check exists to
+# catch — the `saas` pair predates this and is grandfathered on both sides in
+# the baseline instead, which is why it never surfaced here before.
+#
+# The exemption is narrow on purpose: it covers UNIQUENESS only. A starter
+# migration still has to satisfy the shape, real-time and precision rules
+# above, because the scaffolded project inherits its version verbatim.
+is_starter_mirror_of() {
+  local a="$1" b="$2" starter example
+
+  # Entries may or may not carry a `./` prefix depending on how the tree was
+  # walked, so strip it before matching.
+  a="${a#./}"
+  b="${b#./}"
+
+  # Exactly one side must be a starter and the other its example.
+  case "$a:$b" in
+    autumn-cli/src/starters/*:examples/*) starter="$a"; example="$b" ;;
+    examples/*:autumn-cli/src/starters/*) starter="$b"; example="$a" ;;
+    *) return 1 ;;
+  esac
+
+  # Same migration directory name...
+  [[ "$(basename "$starter")" == "$(basename "$example")" ]] || return 1
+
+  # ...and the same PROJECT. Without this, a collision between, say,
+  # `starters/foo/.../<version>_x` and `examples/bar/.../<version>_x` would be
+  # waved through even though those two really can coexist in one database and
+  # really are a collision. The pair is only "one migration in two copies" when
+  # the example is the starter's own rendered form.
+  local starter_project="${starter#autumn-cli/src/starters/}"
+  starter_project="${starter_project%%/*}"
+  local example_project="${example#examples/}"
+  example_project="${example_project%%/*}"
+  [[ "$starter_project" == "$example_project" ]]
+}
+
 collisions=()
 prev_version=""
 prev_entry=""
@@ -258,6 +301,8 @@ while IFS=' ' read -r version entry; do
     # gate exists to catch.
     if is_legacy "$entry" && is_legacy "$prev_entry"; then
       : # both pre-existing — already-shipped debt, recorded in the baseline
+    elif is_starter_mirror_of "$entry" "$prev_entry"; then
+      : # a starter template and the example it mirrors — one migration, two copies
     else
       collisions+=("$version — $prev_entry and $entry")
     fi

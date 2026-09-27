@@ -187,24 +187,39 @@ jobs:
     # generator-emitted call site is a separate, uncovered instance of the
     # same gap, not something a red/green here proves either way.
     #
-    # A red run here means precisely that has happened. Until the next
-    # release ships, the workaround is the one `autumn doctor`'s own docs
-    # already describe: point the generated `Cargo.toml` at the checkout
-    # with a `[patch.crates-io]` override (see
-    # `generated_project_compiles_against_published_autumn_web`'s doc
-    # comment in autumn-cli/tests/e2e.rs for the mechanism and the exact
-    # commit — 76c56b1 — that first triggered it, undetected, for three
-    # days). This job does not gate anything else in this repo; it exists
-    # to make that failure visible the moment it happens instead of
-    # leaving it for whoever tries `cargo install --path autumn-cli` next.
+    # A red run here means precisely that has happened, and it is not, on its
+    # own, actionable: this repo never bumps the workspace version outside a
+    # deliberate release (CLAUDE.md), and trunk-dev is *expected* to keep
+    # moving ahead of the last release indefinitely — there is no cadence at
+    # which this job settles green on its own. Treating that as a build
+    # failure was mistaking a permanent, by-design gap for a regression: it
+    # produced 26+ straight red runs (issue #2620) with no code fix and no
+    # release to cut, which trains reviewers to stop looking at this job at
+    # all — the opposite of what an advisory signal is for.
+    #
+    # Only the *build* step below carries `continue-on-error: true` — not
+    # this job as a whole. It keeps the drift signal (a neutral ⊘, not a red
+    # ✗, with the exact drifted call site in the job log) without it counting
+    # toward the workflow's pass/fail, while still hard-failing on anything
+    # `continue-on-error` would otherwise mask: `autumn new` itself has no
+    # version pin to drift against, so if the source-built CLI's own
+    # scaffolding logic breaks, that is always a real regression, never the
+    # expected release-cadence gap — see the "autumn new" step, which stays
+    # hard-gated. The workaround for the tolerated build failure remains the
+    # one `autumn doctor`'s own docs already describe: point the generated
+    # `Cargo.toml` at the checkout with a `[patch.crates-io]` override (see
+    # `generated_project_compiles_against_published_autumn_web`'s doc comment
+    # in autumn-cli/tests/e2e.rs for the mechanism). A maintainer only needs
+    # to act on the build step at release-cut time (docs/release-checklist.md),
+    # not on every red run in between.
     #
     # Skipped on workflow_dispatch: a dispatched run gates a specific
     # release *candidate* pinned via `cli-version` (docs/release-checklist.md
     # step 7 — "a red run is a release blocker"), always built against the
     # candidate's own published crates. This job ignores `cli-version`
-    # entirely and tests the checked-out *source* CLI instead, which is
-    # expected to go red whenever trunk-dev carries unreleased drift —
-    # unrelated to whether the candidate being gated is healthy. Running it
+    # entirely and tests the checked-out *source* CLI instead, whose build
+    # step is expected to go red whenever trunk-dev carries unreleased drift
+    # — unrelated to whether the candidate being gated is healthy. Running it
     # on push/schedule (where it belongs) and excluding it here keeps it
     # from turning an otherwise-green candidate gate into a false release
     # blocker.
@@ -215,10 +230,27 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: "autumn new my-app, then cargo build against published autumn-web"
+      - name: "autumn new my-app against published autumn-web"
+        # Hard-gated, deliberately no continue-on-error: `autumn new` has no
+        # version pin to drift against, so a failure here is always a real
+        # CLI regression, never the expected build-time gap the next step
+        # tolerates.
+        run: |
+          cargo test -p autumn-cli --test e2e \
+            autumn_new_succeeds_against_published_autumn_web \
+            -- --ignored --exact
+
+      - name: "cargo build the scaffold against published autumn-web"
         # No DATABASE_URL, no Postgres service: the base `autumn new`
         # output (no generate/scaffold) needs neither to reach its first
         # `cargo build` — and that first build is exactly what breaks.
+        #
+        # continue-on-error is scoped to this step only: this is the one
+        # half of the journey that is expected to fail between releases
+        # (see the job-level comment above). The preceding "autumn new" step
+        # stays hard-gated, so a real CLI regression can never hide behind
+        # this tolerance.
+        continue-on-error: true
         run: |
           cargo test -p autumn-cli --test e2e \
             generated_project_compiles_against_published_autumn_web \
