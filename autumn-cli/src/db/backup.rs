@@ -8,7 +8,7 @@
 //! captures precisely the databases the running app uses — control plus every
 //! configured shard — under the active profile/env overlay. The destructive
 //! `restore` is gated by the same production guard as `autumn db drop`
-//! ([`super::guard_destructive`]).
+//! (`guard_destructive`).
 //!
 //! # Artifact layout (S3-bolt-on friendly — issue #1619)
 //!
@@ -27,7 +27,8 @@
 //!
 //! # Zero-external-tools for managed Postgres (AC #2)
 //!
-//! [`PgTools::locate`] resolves `pg_dump`/`pg_restore` from, in order: an
+//! [`PgTools::locate`](crate::db::backup::PgTools::locate) resolves
+//! `pg_dump`/`pg_restore` from, in order: an
 //! explicit `AUTUMN_PG_BIN_DIR`, the managed-Postgres bundle's `bin` directory
 //! (derived from `AUTUMN_MANAGED_PG_DATA_DIR`, which `autumn serve --bundled-pg`
 //! sets), then the `PATH`. A managed-pg daemon therefore needs no externally
@@ -35,11 +36,16 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
+use autumn_web::alerts::{Alert, AlertChannel, AlertCondition};
+
+use crate::db::s3::{self, S3Client, S3Config, S3Credentials};
+use crate::db::sqlite_snapshot;
 use crate::migrate;
 
 /// Environment variable that pins the directory holding `pg_dump`/`pg_restore`.
-/// Highest precedence in [`PgTools::locate`]; lets an operator point at a
+/// Highest precedence in [`PgTools::locate`](crate::db::backup::PgTools::locate); lets an operator point at a
 /// specific client-tools install.
 const PG_BIN_DIR_ENV: &str = "AUTUMN_PG_BIN_DIR";
 
@@ -131,6 +137,10 @@ pub struct BackupArgs {
     pub keep: Option<usize>,
     /// Which databases to capture.
     pub target: TargetSelector,
+    /// Upload the completed run to the configured offsite destination after
+    /// local verification + prune (issue #1619). The configured
+    /// `backup.offsite.auto_upload = true` has the same effect without the flag.
+    pub upload: bool,
 }
 
 /// Arguments for `autumn db restore`.
@@ -144,6 +154,11 @@ pub struct RestoreArgs {
     pub force: bool,
     /// Restore only this shard from the artifact (mirrors `--shard`).
     pub shard: Option<String>,
+    /// Treat `artifact` as an offsite reference (`<profile>/<timestamp|latest>`,
+    /// with an optional `offsite:` prefix) and restore from the offsite
+    /// destination instead of a local path (issue #1619). An `offsite:` prefix
+    /// on `artifact` implies this even when the flag is not set.
+    pub offsite: bool,
 }
 
 /// Failure modes for backup/restore. `Display` is credential-safe: no variant
@@ -160,6 +175,15 @@ pub enum BackupError {
     /// A shelled-out tool exited non-zero. Carries the tool name and a
     /// credential-safe context string.
     ToolFailed { tool: String, context: String },
+    /// A `SQLite` snapshot or restore failed (issue #1909). `detail` is a
+    /// [`sqlite_snapshot::SnapshotError`] rendering — a file path, never a
+    /// credential (`SQLite` targets carry none).
+    SqliteFailed {
+        /// `"backup"` or `"restore"`.
+        op: &'static str,
+        /// Operator-facing detail.
+        detail: String,
+    },
     /// A filesystem operation failed.
     Io {
         context: String,
@@ -172,6 +196,28 @@ pub enum BackupError {
     /// A destructive restore was refused because the active profile is
     /// production and `--force` was not supplied.
     ProductionRefused { profile: String },
+    /// `--upload` (or an offsite restore) was requested but no
+    /// `[backup.offsite]` section is configured.
+    OffsiteNotConfigured,
+    /// The `[backup.offsite]` section is present but invalid (e.g. no bucket).
+    OffsiteConfig { detail: String },
+    /// The offsite destination points at the same bucket+endpoint as the app's
+    /// user-facing blob storage and `allow_shared_bucket` was not set (AC #3).
+    /// Carries only the bucket name (not a credential).
+    SharedBucketRefused { bucket: String },
+    /// A credential could not be read: the config names an env var that is unset
+    /// (or names no env var at all). Carries the VARIABLE NAME, never a value.
+    MissingCredentialEnv { var: String },
+    /// The local backup succeeded but the offsite upload/verify failed — the
+    /// unambiguous split outcome (AC #2/#6). The local artifact is intact.
+    OffsiteUploadFailed { local_path: String, detail: String },
+    /// A non-split offsite operation (list / download / config load) failed.
+    /// `detail` is credential-safe (S3 status/code, never secrets).
+    Offsite { op: &'static str, detail: String },
+    /// An offsite restore was requested (`--offsite` or an `offsite:` prefix) but
+    /// the reference is malformed. Carries the bad reference (no secrets). The
+    /// restore MUST fail rather than fall through to a local artifact.
+    InvalidOffsiteRef { reference: String },
 }
 
 impl std::fmt::Display for BackupError {
@@ -199,6 +245,7 @@ impl std::fmt::Display for BackupError {
             Self::ToolFailed { tool, context } => {
                 write!(f, "`{tool}` failed: {context}")
             }
+            Self::SqliteFailed { op, detail } => write!(f, "SQLite {op} failed: {detail}"),
             Self::Io { context, source } => write!(f, "{context}: {source}"),
             Self::IntegrityFailed { detail } => write!(
                 f,
@@ -211,6 +258,40 @@ impl std::fmt::Display for BackupError {
                 "Refusing to restore over the {profile:?} profile database.\n  \
                  Re-run with --force if you really mean it (this overwrites data)."
             ),
+            Self::OffsiteNotConfigured => write!(
+                f,
+                "No offsite destination is configured.\n  Add a [backup.offsite] section \
+                 (with [backup.offsite.s3] bucket/region/endpoint and *_env credential \
+                 indirection) to autumn.toml, or set AUTUMN_BACKUP__OFFSITE__* env vars."
+            ),
+            Self::OffsiteConfig { detail } => {
+                write!(f, "Invalid [backup.offsite] configuration: {detail}")
+            }
+            Self::SharedBucketRefused { bucket } => write!(
+                f,
+                "The offsite destination bucket {bucket:?} is the same as the app's \
+                 [storage.s3] bucket at the same endpoint.\n  A shared bucket is a deliberate \
+                 choice: set backup.offsite.allow_shared_bucket = true to opt in, or point the \
+                 offsite backup at a distinct bucket."
+            ),
+            Self::MissingCredentialEnv { var } => write!(
+                f,
+                "Offsite credential environment variable {var:?} is not set (or the config \
+                 names no *_env variable).\n  Set it to the S3 access key / secret, or fix \
+                 backup.offsite.s3.access_key_id_env / secret_access_key_env."
+            ),
+            Self::OffsiteUploadFailed { local_path, detail } => write!(
+                f,
+                "Local backup OK at {local_path}\n  OFFSITE UPLOAD FAILED: {detail}\n  \
+                 The local artifact is intact — re-run `autumn db backup --upload` after \
+                 fixing the offsite destination."
+            ),
+            Self::Offsite { op, detail } => write!(f, "Offsite {op} failed: {detail}"),
+            Self::InvalidOffsiteRef { reference } => write!(
+                f,
+                "Invalid offsite reference {reference:?}.\n  Expected \
+                 offsite:<profile>/<timestamp|latest> (for example offsite:prod/latest)."
+            ),
         }
     }
 }
@@ -222,6 +303,60 @@ impl BackupError {
     }
 }
 
+/// Which mechanism captures and restores ONE target (issue #1909).
+///
+/// [`BackupFormat`] grades Postgres artifacts only. A `SQLite` target is always a
+/// `.sqlite` file, whatever `--format` says. Each manifest entry records its own
+/// backend, so a mixed run restores every entry through the mechanism that wrote
+/// it. A manifest without the field is Postgres.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum TargetBackend {
+    /// `pg_dump`/`pg_restore`/`psql`. The default, and what an absent manifest
+    /// field means.
+    #[default]
+    Postgres,
+    /// `SQLite`'s own `VACUUM INTO` snapshot ([`crate::db::sqlite_snapshot`]).
+    Sqlite,
+}
+
+impl TargetBackend {
+    /// Classify a resolved connection URL. Anything that is not an explicit
+    /// `sqlite:`/`file:` target is Postgres, mirroring `autumn migrate`'s rule
+    /// (`is_sqlite_target`): an unrecognized string keeps the historical path.
+    fn detect(url: &str) -> Self {
+        match autumn_web::config::DatabaseBackend::detect(url) {
+            Some(autumn_web::config::DatabaseBackend::Sqlite) => Self::Sqlite,
+            _ => Self::Postgres,
+        }
+    }
+
+    /// The manifest spelling.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::Sqlite => "sqlite",
+        }
+    }
+
+    /// Read a manifest spelling. An empty or unknown value is Postgres, so a
+    /// manifest without the field restores exactly as before.
+    fn from_manifest(raw: &str) -> Self {
+        if raw.eq_ignore_ascii_case("sqlite") {
+            Self::Sqlite
+        } else {
+            Self::Postgres
+        }
+    }
+
+    /// The artifact file extension for this backend and (Postgres) format.
+    const fn extension(self, format: BackupFormat) -> &'static str {
+        match self {
+            Self::Postgres => format.extension(),
+            Self::Sqlite => "sqlite",
+        }
+    }
+}
+
 /// A single database captured by (or to be restored from) a backup run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedTarget {
@@ -229,6 +364,8 @@ struct ResolvedTarget {
     label: String,
     /// The resolved connection URL (never printed).
     url: String,
+    /// Which backend captures this target.
+    backend: TargetBackend,
 }
 
 // ─── Entry points ───────────────────────────────────────────────────────────
@@ -255,32 +392,66 @@ pub fn run_restore(args: &RestoreArgs) {
 
 // ─── Backup ─────────────────────────────────────────────────────────────────
 
-fn backup(args: &BackupArgs) -> Result<(), BackupError> {
+pub(super) fn backup(args: &BackupArgs) -> Result<(), BackupError> {
     let targets = resolve_targets(args.profile.as_deref(), &args.target)?;
     // Include the managed cluster's bundled tools (daemon/cron path, where
     // AUTUMN_MANAGED_PG_DATA_DIR isn't inherited) so a managed backup needs zero
     // external tools on PATH (issue #1595).
     let tools = PgTools::locate_with_extra(managed_pg_data_dir());
-    let pg_dump = tools.require("pg_dump")?;
+    // Resolve `pg_dump` only when the run holds a Postgres target (issue #1909).
+    // An all-SQLite app has no client tools and needs none. A mixed run still
+    // fails before any artifact is written.
+    let pg_dump = if targets.iter().any(|t| t.backend == TargetBackend::Postgres) {
+        Some(tools.require("pg_dump")?)
+    } else {
+        None
+    };
 
     let profile = migrate::effective_profile(args.profile.as_deref());
+
+    // Offsite pre-flight (issue #1619). Decide whether to upload with a LIGHT
+    // probe that reads ONLY `[backup.offsite].auto_upload` (real env → `.env.<p>`
+    // → merged TOML), WITHOUT a full `AutumnConfig` load — so a local-only backup
+    // never triggers global config validation or encrypted-credentials
+    // decryption (a cron job may not export AUTUMN_MASTER_KEY). Only when an
+    // upload is actually requested do we do the full, strict resolve (bucket
+    // required, creds env resolved, distinct-destination guard) and build the
+    // client — BEFORE dumping — so a misconfigured offsite fails fast.
+    let should_upload = args.upload || auto_upload_probe(&profile);
+    let upload_ctx = if should_upload {
+        let offsite = load_offsite(&profile)?
+            .ok_or(BackupError::OffsiteNotConfigured)?
+            .resolve()?;
+        let client = offsite.build_client()?;
+        Some((offsite, client))
+    } else {
+        None
+    };
+
     let root = backup_root(args.dir.as_deref(), &profile);
     let run_dir = create_unique_run_dir(&root, &run_dir_name(&now_utc()))?;
 
     // Everything below writes into `run_dir`. On ANY failure we remove the
     // whole run directory so a partial/empty artifact is never left behind and
     // never counted toward retention (AC #1).
-    let result = backup_into(&run_dir, &targets, args.format, &pg_dump, &tools, &profile);
+    let result = backup_into(
+        &run_dir,
+        &targets,
+        args.format,
+        pg_dump.as_deref(),
+        &tools,
+        &profile,
+    );
     if let Err(e) = result {
         let _ = std::fs::remove_dir_all(&run_dir);
         return Err(e);
     }
 
     eprintln!(
-        "\n\u{2713} Backup complete: {} ({} target(s), {} format).",
+        "\n\u{2713} Backup complete: {} ({} target(s), {}).",
         run_dir.display(),
         targets.len(),
-        args.format.pg_dump_format_flag(),
+        run_format_note(&targets, args.format),
     );
 
     // Retention runs only AFTER a verified-successful backup, so a failed run
@@ -288,7 +459,122 @@ fn backup(args: &BackupArgs) -> Result<(), BackupError> {
     if let Some(keep) = args.keep {
         prune(&root, keep)?;
     }
+
+    // Offsite upload runs LAST, only after local verification + prune. A failure
+    // here is the split outcome (AC #2/#6): the local artifact stays intact and
+    // the command exits non-zero with an unambiguous message.
+    if let Some((offsite, client)) = upload_ctx {
+        let local_run_id = run_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // The REMOTE run id gains a globally-unique token (P2 #12) so concurrent
+        // same-second backups of this profile from different hosts never collide
+        // in the bucket; the local run directory keeps its #1595 `<timestamp>`.
+        let remote_id = remote_run_id(&local_run_id, &remote_run_token());
+        // Canonicalize the profile for the REMOTE key prefix (P2 #22) so upload,
+        // `db offsite list`, and restore all address the same `<canonical>/…`
+        // location regardless of alias/case spelling — while the LOCAL run dir
+        // keeps its raw #1595 `<profile>/<timestamp>` layout (used above).
+        let remote_profile = migrate::canonical_profile(&profile);
+        if let Err(detail) = upload_run(&offsite, &client, &run_dir, &remote_profile, &remote_id) {
+            let local_path = run_dir.display().to_string();
+            // #1743: raise an operator alert so an unattended/cron backup with
+            // [alerts] configured never fails its upload silently. Best-effort —
+            // never changes the exit code; the `?`-equivalent return below still
+            // exits non-zero with the same split-outcome message as before.
+            emit_offsite_upload_failure_alert(&local_path, &detail);
+            return Err(BackupError::OffsiteUploadFailed { local_path, detail });
+        }
+    }
     Ok(())
+}
+
+/// The format phrase in the completion line.
+///
+/// `--format` grades Postgres artifacts only. An all-SQLite run therefore reports
+/// `SQLite snapshot`, not a format it ignored. A mixed run names both.
+fn run_format_note(targets: &[ResolvedTarget], format: BackupFormat) -> String {
+    let sqlite = targets.iter().any(|t| t.backend == TargetBackend::Sqlite);
+    let postgres = targets.iter().any(|t| t.backend == TargetBackend::Postgres);
+    match (postgres, sqlite) {
+        (true, true) => format!("{} format + SQLite snapshot", format.pg_dump_format_flag()),
+        (false, true) => "SQLite snapshot".to_owned(),
+        _ => format!("{} format", format.pg_dump_format_flag()),
+    }
+}
+
+/// Best-effort operator alert for a failed offsite upload (#1743).
+///
+/// Discriminator (chosen design): fire on ANY upload failure when `[alerts]`
+/// channels are configured. Interactive users with no `[alerts]` destination
+/// build zero channels, so this is a no-op for them — the interactive case
+/// (message + non-zero exit) is unchanged. Loading the config here is
+/// acceptable: we are already on the failure path and about to exit non-zero.
+fn emit_offsite_upload_failure_alert(local_path: &str, detail: &str) {
+    let config = match autumn_web::config::AutumnConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  \u{26A0} offsite-upload-failed alert skipped: could not load config: {e}");
+            return;
+        }
+    };
+    let client = autumn_web::http::Client::from_config(&config.http.client);
+    let channels = crate::alert::configured_http_channels(&config.alerts, &client);
+    deliver_offsite_upload_alert(&channels, local_path, detail);
+}
+
+/// Build the `ScheduledTaskFailure` alert raised when an offsite upload fails.
+/// Pure (no I/O) so it can be asserted directly in tests.
+fn build_offsite_upload_alert(local_path: &str, detail: &str) -> Alert {
+    Alert::trigger(
+        AlertCondition::ScheduledTaskFailure,
+        "scheduled_task_failure:db-backup-offsite-upload",
+    )
+    .title("Offsite backup upload failed")
+    .summary(detail)
+    .detail("local_path", local_path)
+    .detail("error", detail)
+    .build()
+}
+
+/// Deliver the offsite-upload-failure alert through every configured channel on
+/// a short-lived current-thread runtime (mirrors `autumn alert test`).
+/// Best-effort: a per-channel delivery error is logged but never propagated, so
+/// alerting can NEVER change the command's exit code. A no-op when `channels`
+/// is empty. Takes `&[Arc<dyn AlertChannel>]` so a test can inject a capturing
+/// mock channel and assert the alert that a failed upload raises.
+fn deliver_offsite_upload_alert(
+    channels: &[Arc<dyn AlertChannel>],
+    local_path: &str,
+    detail: &str,
+) {
+    if channels.is_empty() {
+        return;
+    }
+    let alert = build_offsite_upload_alert(local_path, detail);
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!(
+                "  \u{26A0} offsite-upload-failed alert not sent: could not start runtime: {e}"
+            );
+            return;
+        }
+    };
+    runtime.block_on(async {
+        for channel in channels {
+            if let Err(error) = channel.deliver(&alert).await {
+                eprintln!(
+                    "  \u{26A0} offsite-upload-failed alert not delivered via {}: {error}",
+                    channel.name()
+                );
+            }
+        }
+    });
 }
 
 /// Dump every target into `run_dir`, verify each artifact, and write the
@@ -297,13 +583,13 @@ fn backup_into(
     run_dir: &Path,
     targets: &[ResolvedTarget],
     format: BackupFormat,
-    pg_dump: &Path,
+    pg_dump: Option<&Path>,
     tools: &PgTools,
     profile: &str,
 ) -> Result<(), BackupError> {
     let mut manifest_targets = Vec::with_capacity(targets.len());
     for target in targets {
-        let file_name = artifact_file_name(&target.label, format);
+        let file_name = artifact_file_name(&target.label, target.backend, format);
         let out_path = run_dir.join(&file_name);
         eprintln!(
             "\u{2500}\u{2500} backing up {} \u{2500}\u{2500}",
@@ -311,14 +597,32 @@ fn backup_into(
         );
 
         let db = parsed_db_name(&target.url);
-        run_pg_dump(pg_dump, &target.url, &out_path, format, &db)?;
-        verify_artifact(&out_path, format, &db, tools)?;
+        match target.backend {
+            TargetBackend::Postgres => {
+                // `pg_dump` is `Some` whenever any Postgres target is in the run
+                // (resolved in `backup` above), so this arm always has it.
+                let pg_dump = pg_dump.ok_or_else(|| BackupError::ToolMissing {
+                    tool: "pg_dump".to_owned(),
+                })?;
+                run_pg_dump(pg_dump, &target.url, &out_path, format, &db)?;
+            }
+            TargetBackend::Sqlite => {
+                sqlite_snapshot::snapshot(&target.url, &out_path).map_err(|e| {
+                    BackupError::SqliteFailed {
+                        op: "backup",
+                        detail: e.to_string(),
+                    }
+                })?;
+            }
+        }
+        verify_artifact(&out_path, target.backend, format, &db, tools)?;
         eprintln!("  \u{2713} {file_name} verified.");
 
         manifest_targets.push(ManifestTarget {
             label: target.label.clone(),
             file: file_name,
             database: db,
+            backend: target.backend.as_str().to_owned(),
         });
     }
 
@@ -598,10 +902,18 @@ fn run_pg_dump(
 /// * Plain: the file must be non-empty AND end with `pg_dump`'s completion marker.
 fn verify_artifact(
     path: &Path,
+    backend: TargetBackend,
     format: BackupFormat,
     db: &str,
     tools: &PgTools,
 ) -> Result<(), BackupError> {
+    // A SQLite artifact IS a database: grade it with `PRAGMA integrity_check`
+    // (issue #1909) rather than a Postgres archive reader.
+    if backend == TargetBackend::Sqlite {
+        return sqlite_snapshot::verify(path).map_err(|e| BackupError::IntegrityFailed {
+            detail: format!("{db}: {e}"),
+        });
+    }
     let len = std::fs::metadata(path)
         .map_err(BackupError::io(format!("stat {}", path.display())))?
         .len();
@@ -705,14 +1017,35 @@ fn verify_plain_dump(path: &Path, db: &str) -> Result<(), BackupError> {
 
 // ─── Restore ────────────────────────────────────────────────────────────────
 
-fn restore(args: &RestoreArgs) -> Result<(), BackupError> {
-    // Production guard — identical to `autumn db drop` (AC #4).
+pub(super) fn restore(args: &RestoreArgs) -> Result<(), BackupError> {
+    // Production guard — identical to `autumn db drop` (AC #4). This guards the
+    // RESTORE-TARGET profile (`--profile`), independent of any offsite source.
     let profile = migrate::effective_profile(args.profile.as_deref());
     super::guard_destructive(&profile, args.force).map_err(|_| BackupError::ProductionRefused {
         profile: profile.clone(),
     })?;
 
+    // Offsite restore (issue #1619): when `--offsite` is set or the artifact is
+    // an `offsite:<profile>/<ts|latest>` reference, download the run to a fresh
+    // temp dir and hand it to the SAME RestorePlan::discover path so the
+    // identical integrity-refusal + guard/`--force` protocol applies unchanged.
+    let artifact_str = args.artifact.to_string_lossy();
+    // When offsite is indicated (flag or `offsite:` prefix) we commit to the
+    // offsite path: a malformed reference is an error, never a silent fall
+    // through to a same-named local artifact. `None` means offsite was not
+    // indicated at all, so a normal local restore proceeds.
+    if let Some(oref) = resolve_offsite_ref(args.offsite, &artifact_str) {
+        return restore_from_offsite(args, &oref?);
+    }
+
     let plan = RestorePlan::discover(&args.artifact, args.shard.as_deref())?;
+    apply_restore_plan(&plan, args)
+}
+
+/// Verify every selected artifact, then restore each into its resolved database.
+/// Shared by local and offsite restore so both go through the identical
+/// verify-all-before-mutate-any protocol (AC #4).
+fn apply_restore_plan(plan: &RestorePlan, args: &RestoreArgs) -> Result<(), BackupError> {
     let format = plan.format;
     let entries = plan.select(args.shard.as_deref())?;
 
@@ -721,11 +1054,35 @@ fn restore(args: &RestoreArgs) -> Result<(), BackupError> {
     // with zero external tools on PATH (issue #1595).
     let tools = PgTools::locate_with_extra(managed_pg_data_dir());
 
+    // Refuse a backend mismatch before anything else (issue #1909). Each entry's
+    // mechanism comes from the MANIFEST, the database it writes to from the
+    // CONFIG, so restoring a SQLite run into a Postgres environment (or the
+    // reverse) would otherwise fail deep inside a driver with an unrelated
+    // message. Names labels and backends only — never a URL.
+    for (entry, url) in &targets {
+        let recorded = TargetBackend::from_manifest(&entry.backend);
+        let configured = TargetBackend::detect(url);
+        if recorded != configured {
+            return Err(BackupError::BadArtifact {
+                detail: format!(
+                    "the {:?} artifact is a {} backup, but the configured {:?} database is \
+                     {}.\n  Restore it against the backend it was taken from, or fix \
+                     database.primary_url for this profile.",
+                    entry.label,
+                    recorded.as_str(),
+                    entry.label,
+                    configured.as_str()
+                ),
+            });
+        }
+    }
+
     // Verify EVERY artifact before mutating ANY database (AC #4): refuse to
     // start a destructive restore we can't finish.
     for (entry, _url) in &targets {
         let db = format!("(artifact) {}", entry.label);
-        verify_artifact(&plan.dir.join(&entry.file), format, &db, &tools)?;
+        let backend = TargetBackend::from_manifest(&entry.backend);
+        verify_artifact(&plan.dir.join(&entry.file), backend, format, &db, &tools)?;
         eprintln!("  \u{2713} {} integrity verified.", entry.file);
     }
 
@@ -736,7 +1093,14 @@ fn restore(args: &RestoreArgs) -> Result<(), BackupError> {
         );
         let artifact = plan.dir.join(&entry.file);
         let db = parsed_db_name(url);
-        run_restore_one(&tools, url, &artifact, format, &db)?;
+        run_restore_one(
+            &tools,
+            url,
+            &artifact,
+            TargetBackend::from_manifest(&entry.backend),
+            format,
+            &db,
+        )?;
         eprintln!("  \u{2713} restored {}.", entry.label);
     }
 
@@ -749,9 +1113,18 @@ fn run_restore_one(
     tools: &PgTools,
     url: &str,
     artifact: &Path,
+    backend: TargetBackend,
     format: BackupFormat,
     db: &str,
 ) -> Result<(), BackupError> {
+    // A SQLite artifact replaces the data file it was taken from; no external
+    // tool, and no `--clean` equivalent needed (issue #1909).
+    if backend == TargetBackend::Sqlite {
+        return sqlite_snapshot::restore(artifact, url).map_err(|e| BackupError::SqliteFailed {
+            op: "restore",
+            detail: e.to_string(),
+        });
+    }
     match format {
         BackupFormat::Custom => {
             let pg_restore = tools.require("pg_restore")?;
@@ -855,12 +1228,13 @@ impl RestorePlan {
             // restore target from `--shard` or the filename convention (never
             // blindly `control`, which would corrupt the control DB with shard
             // data).
-            let format = infer_format_from_path(path).ok_or_else(|| BackupError::BadArtifact {
-                detail: format!(
-                    "{} is neither a run directory nor a .dump/.sql artifact",
-                    path.display()
-                ),
-            })?;
+            let (backend, format) =
+                infer_artifact_kind(path).ok_or_else(|| BackupError::BadArtifact {
+                    detail: format!(
+                        "{} is neither a run directory nor a .dump/.sql/.sqlite artifact",
+                        path.display()
+                    ),
+                })?;
             let dir = path
                 .parent()
                 .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
@@ -876,6 +1250,7 @@ impl RestorePlan {
                     label,
                     file,
                     database: String::new(),
+                    backend: backend.as_str().to_owned(),
                 }],
             });
         }
@@ -923,6 +1298,26 @@ fn dotenv_env() -> autumn_web::dotenv::DotenvOsEnv {
     }
 }
 
+/// Like [`dotenv_env`] but selects `.env.<profile>` for an explicit target
+/// profile (issue #1619). The offsite path resolves config + credentials under
+/// the run's profile (`--profile <p>` / `offsite:<p>/…`), so a profile-specific
+/// `.env.<p>` is honored even when the ambient shell profile differs — otherwise
+/// `autumn db backup --profile test --upload` from a dev/unset shell would miss
+/// `.env.test`-provided offsite settings and credentials.
+pub(super) fn dotenv_env_for_profile(profile: &str) -> autumn_web::dotenv::DotenvOsEnv {
+    // Normalize aliases/case to the app's resolved profile FIRST (P2 #20), so
+    // `--profile development` / `AUTUMN_ENV=PROD` selects `.env.dev` / `.env.prod`
+    // — the same file the running app reads — instead of a literal `.env.development`.
+    let profile = migrate::canonical_profile(profile);
+    match autumn_web::dotenv::os_env_with_dotenv_for_profile(&profile) {
+        Ok(env) => env,
+        Err(e) => {
+            eprintln!("  \u{274C} .env: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// The managed-Postgres published cluster URL, used as a *fallback* control URL
 /// for bundled/daemon/single-binary apps (issue #1595). Such deployments often
 /// have no `DATABASE_URL` in env or `autumn.toml`; the running cluster instead
@@ -960,6 +1355,35 @@ where
 
 /// Resolve the databases a backup run should capture, reusing the SAME
 /// resolution `autumn migrate` uses so the set matches the running app exactly.
+/// Every database a scrub must visit under `profile` — control plus each
+/// configured shard — as `(label, url)` pairs, resolved through the **same**
+/// path `backup`/`restore` use so a scrub can never miss a database a backup
+/// captured (issue #1602).
+///
+/// # Errors
+///
+/// Returns [`BackupError::NoUrl`] when no control URL can be resolved.
+pub(super) fn resolve_all_target_urls(
+    profile: Option<&str>,
+) -> Result<Vec<(String, String)>, BackupError> {
+    Ok(resolve_targets(profile, &TargetSelector::All)?
+        .into_iter()
+        .map(|t| (t.label, t.url))
+        .collect())
+}
+
+/// The profile a backup run directory was taken under, read from its
+/// `manifest.json`. `None` for a bare single-file artifact (which carries no
+/// manifest) or an unreadable/invalid manifest — callers treat absence as
+/// "unknown provenance", never as "safe".
+pub(super) fn artifact_source_profile(artifact: &Path) -> Option<String> {
+    artifact
+        .is_dir()
+        .then(|| read_manifest(artifact).ok())
+        .flatten()
+        .map(|m| m.profile)
+}
+
 fn resolve_targets(
     profile: Option<&str>,
     selector: &TargetSelector,
@@ -993,6 +1417,7 @@ fn build_targets(
         TargetSelector::ControlOnly => control
             .map(|url| {
                 vec![ResolvedTarget {
+                    backend: TargetBackend::detect(&url),
                     label: "control".to_owned(),
                     url,
                 }]
@@ -1008,12 +1433,14 @@ fn build_targets(
             Ok(vec![ResolvedTarget {
                 label: format!("shard:{name}"),
                 url: url.clone(),
+                backend: TargetBackend::detect(url),
             }])
         }
         TargetSelector::All => {
             let mut targets = Vec::new();
             if let Some(control_url) = control {
                 targets.push(ResolvedTarget {
+                    backend: TargetBackend::detect(&control_url),
                     label: "control".to_owned(),
                     url: control_url,
                 });
@@ -1022,6 +1449,7 @@ fn build_targets(
             }
             for (name, url) in shards {
                 targets.push(ResolvedTarget {
+                    backend: TargetBackend::detect(&url),
                     label: format!("shard:{name}"),
                     url,
                 });
@@ -1282,6 +1710,11 @@ struct ManifestTarget {
     /// The database name captured (credential-free; for humans).
     #[serde(default)]
     database: String,
+    /// Which backend produced this artifact: `"postgres"` or `"sqlite"`. An
+    /// absent field means `"postgres"`. Per target, not per run, so a mixed
+    /// topology restores each entry through the mechanism that wrote it.
+    #[serde(default)]
+    backend: String,
 }
 
 /// Self-describing metadata for a backup run. Written as `manifest.json`; the
@@ -1380,8 +1813,8 @@ fn create_unique_run_dir(root: &Path, base: &str) -> Result<PathBuf, BackupError
 }
 
 /// The artifact file name for one target and format.
-fn artifact_file_name(label: &str, format: BackupFormat) -> String {
-    let ext = format.extension();
+fn artifact_file_name(label: &str, backend: TargetBackend, format: BackupFormat) -> String {
+    let ext = backend.extension(format);
     if label == "control" {
         format!("control.{ext}")
     } else if let Some(name) = label.strip_prefix("shard:") {
@@ -1451,11 +1884,13 @@ fn single_file_target_label(file: &str, shard: Option<&str>) -> Result<String, B
     Ok("control".to_owned())
 }
 
-/// Infer a backup format from a file extension.
-fn infer_format_from_path(path: &Path) -> Option<BackupFormat> {
+/// Infer a bare artifact file's backend and (Postgres) format from its
+/// extension — the inverse of [`artifact_file_name`].
+fn infer_artifact_kind(path: &Path) -> Option<(TargetBackend, BackupFormat)> {
     match path.extension().and_then(|e| e.to_str()) {
-        Some("dump") => Some(BackupFormat::Custom),
-        Some("sql") => Some(BackupFormat::Plain),
+        Some("dump") => Some((TargetBackend::Postgres, BackupFormat::Custom)),
+        Some("sql") => Some((TargetBackend::Postgres, BackupFormat::Plain)),
+        Some("sqlite") => Some((TargetBackend::Sqlite, BackupFormat::default())),
         _ => None,
     }
 }
@@ -1497,6 +1932,1011 @@ fn exit_desc(code: Option<i32>) -> String {
 /// Current UTC instant (indirection kept tiny so tests can reason about naming).
 fn now_utc() -> chrono::DateTime<chrono::Utc> {
     chrono::Utc::now()
+}
+
+// ─── Offsite S3 upload / restore (issue #1619) ───────────────────────────────
+
+/// A resolved, ready-to-use offsite destination. Built from `[backup.offsite]`
+/// (via [`load_offsite`]) with the profile overlay + `AUTUMN_*` overrides
+/// already applied. Holds the app's `[storage.s3]` bucket/endpoint too so the
+/// distinct-destination guard (AC #3) can compare them without reloading config.
+struct ResolvedOffsite {
+    s3: S3Config,
+    prefix: String,
+    keep: Option<usize>,
+    allow_shared_bucket: bool,
+    access_key_id_env: Option<String>,
+    secret_access_key_env: Option<String>,
+    app_storage_bucket: Option<String>,
+    app_storage_endpoint: Option<String>,
+    /// The run's target profile — credentials are read from the `.env.<profile>`
+    /// overlay for THIS profile, matching the config read (issue #1619 P2 #6).
+    profile: String,
+}
+
+impl ResolvedOffsite {
+    /// Build the transfer client, enforcing the distinct-destination guard
+    /// (AC #3) and resolving credentials from the named env vars first, so a
+    /// misconfiguration fails fast before any transfer.
+    fn build_client(&self) -> Result<S3Client, BackupError> {
+        if !self.allow_shared_bucket
+            && destinations_conflict(
+                &self.s3.bucket,
+                self.s3.endpoint.as_deref(),
+                self.app_storage_bucket.as_deref(),
+                self.app_storage_endpoint.as_deref(),
+            )
+        {
+            return Err(BackupError::SharedBucketRefused {
+                bucket: self.s3.bucket.clone(),
+            });
+        }
+        let creds = self.resolve_credentials()?;
+        let client = S3Client::new(self.s3.clone(), creds).map_err(|e| BackupError::Offsite {
+            op: "connect",
+            detail: e.to_string(),
+        })?;
+        // Ops escape hatch: tune ONLY the multipart part size (bytes). This does
+        // NOT lower the multipart threshold, so shrinking the part size can never
+        // push a normal (sub-threshold) file into a multipart upload — it only
+        // changes how an already-multipart transfer is chunked. The client
+        // re-floors the value to S3's 5 MiB minimum.
+        Ok(match self.multipart_part_size_override() {
+            Some(bytes) => client.with_part_size(bytes),
+            None => client,
+        })
+    }
+
+    /// Read the `AUTUMN_OFFSITE_MULTIPART_PART_SIZE_BYTES` override (profile-aware,
+    /// so a `.env.<profile>` value is honored). A blank/unparseable value is
+    /// ignored (falls back to the client defaults).
+    fn multipart_part_size_override(&self) -> Option<u64> {
+        use autumn_web::config::Env as _;
+        let env = dotenv_env_for_profile(&self.profile);
+        env.var("AUTUMN_OFFSITE_MULTIPART_PART_SIZE_BYTES")
+            .ok()
+            .and_then(|v: String| v.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+    }
+
+    /// Resolve the access key / secret from the environment variables NAMED by
+    /// config. Credential *values* never appear in errors — only the var names.
+    fn resolve_credentials(&self) -> Result<S3Credentials, BackupError> {
+        // Read credentials from the SAME profile-specific `.env.<profile>` overlay
+        // the offsite config was resolved under (issue #1619 P2 #6), so a
+        // `.env.<profile>`-provided credential value is honored.
+        let env = dotenv_env_for_profile(&self.profile);
+        let access_key_id = read_credential_env(&env, self.access_key_id_env.as_deref())?;
+        let secret_access_key = read_credential_env(&env, self.secret_access_key_env.as_deref())?;
+        Ok(S3Credentials {
+            access_key_id,
+            secret_access_key,
+        })
+    }
+}
+
+/// Read a credential from the env var `var` names. Errors name only the VARIABLE
+/// (never a value). A `None`/blank config var name is itself an error.
+fn read_credential_env(
+    env: &dyn autumn_web::config::Env,
+    var: Option<&str>,
+) -> Result<String, BackupError> {
+    let var = var
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| BackupError::MissingCredentialEnv {
+            var: "(none configured)".to_owned(),
+        })?;
+    env.var(var)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| BackupError::MissingCredentialEnv {
+            var: var.to_owned(),
+        })
+}
+
+/// A leniently-loaded `[backup.offsite]` section: enough to learn `auto_upload`
+/// WITHOUT validating the bucket/credentials, so a plain local `autumn db backup`
+/// (no `--upload`, no `auto_upload`) never fails just because an incomplete
+/// offsite section exists. Call [`LoadedOffsite::resolve`] — only when an upload
+/// is actually requested — to get the validated, ready-to-use destination.
+struct LoadedOffsite {
+    offsite: autumn_web::config::OffsiteBackupConfig,
+    app_storage_bucket: Option<String>,
+    app_storage_endpoint: Option<String>,
+    /// The target profile this section was resolved under (issue #1619 P2 #6).
+    profile: String,
+}
+
+impl LoadedOffsite {
+    /// Validate and resolve into a ready-to-use [`ResolvedOffsite`]. This is the
+    /// STRICT step — bucket is required here — and must only run when uploading.
+    fn resolve(self) -> Result<ResolvedOffsite, BackupError> {
+        let Self {
+            offsite,
+            app_storage_bucket,
+            app_storage_endpoint,
+            profile,
+        } = self;
+        let bucket = offsite
+            .s3
+            .bucket
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| BackupError::OffsiteConfig {
+                detail: "backup.offsite.s3.bucket is required".to_owned(),
+            })?;
+        // Region is only meaningful for AWS + SigV4 scope; many S3-compatible
+        // endpoints ignore it. Default to us-east-1 when unset.
+        let region = offsite
+            .s3
+            .region
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .unwrap_or("us-east-1")
+            .to_owned();
+        let s3 = S3Config {
+            bucket,
+            region,
+            endpoint: offsite
+                .s3
+                .endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+                .map(str::to_owned),
+            force_path_style: offsite.s3.force_path_style,
+        };
+        Ok(ResolvedOffsite {
+            s3,
+            prefix: normalize_offsite_prefix(offsite.prefix.as_deref()),
+            keep: offsite.keep,
+            allow_shared_bucket: offsite.allow_shared_bucket,
+            access_key_id_env: offsite.s3.access_key_id_env,
+            secret_access_key_env: offsite.s3.secret_access_key_env,
+            app_storage_bucket,
+            app_storage_endpoint,
+            profile,
+        })
+    }
+}
+
+/// Decide whether a backup run should upload, reading ONLY the
+/// `[backup.offsite].auto_upload` bit — WITHOUT a full `AutumnConfig` load (no
+/// global validation, no encrypted-credentials decryption), so a local-only
+/// backup is never blocked by unrelated config/credentials issues (issue #1619
+/// P2 #8). Resolution matches the config layering: real env
+/// `AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD` → `.env.<profile>` → merged TOML
+/// `[backup.offsite].auto_upload` (base + `[profile.<p>]` overlay) → `false`.
+fn auto_upload_probe(profile: &str) -> bool {
+    use autumn_web::config::Env as _;
+    // Normalize aliases/case to the app's resolved profile (P2 #20) so both the
+    // dotenv overlay and the `[profile.<p>]` selection match what the app reads.
+    let profile = migrate::canonical_profile(profile);
+    // The profile-aware dotenv overlay covers BOTH the real env and `.env.<p>`
+    // (a real env var wins inside the overlay), matching P2 #6.
+    let env = dotenv_env_for_profile(&profile);
+    // Read `autumn.toml` from the config/manifest dir (AUTUMN_MANIFEST_DIR),
+    // matching where the full loader + the dotenv overlay look — so an installed/
+    // daemon launch with a different CWD still sees `auto_upload` (P2 #15).
+    let table = migrate::read_autumn_toml_table_with_profile_from_config_dir(Some(&profile));
+    auto_upload_from_sources(|k| env.var(k).ok(), table.as_ref())
+}
+
+/// Pure resolution of `auto_upload` from an env lookup + a merged TOML table.
+/// Env (real + `.env`) wins over TOML; default `false`. Separated so the
+/// precedence is unit-testable without touching the filesystem/process env.
+fn auto_upload_from_sources<F>(env_var: F, table: Option<&toml::Table>) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(raw) = env_var("AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD")
+        && let Some(b) = parse_bool_flag(&raw)
+    {
+        return b;
+    }
+    table
+        .and_then(|t| t.get("backup"))
+        .and_then(|v| v.get("offsite"))
+        .and_then(|v| v.get("auto_upload"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Parse a boolean env flag the same way the config loader's `parse_env_bool`
+/// does: `1`/`true` → true, `0`/`false` → false (case-insensitive, trimmed),
+/// anything else → `None` (ignored).
+fn parse_bool_flag(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Leniently resolve the `[backup.offsite]` destination for `profile` WITHOUT a
+/// full `AutumnConfig::load` — i.e. WITHOUT decrypting the app credential store
+/// (`config/credentials/<profile>.toml.enc`) or running app-wide validation, so
+/// offsite commands work on a minimal DR/recovery box that has only DB + offsite
+/// env vars and NO `AUTUMN_MASTER_KEY` (issue #1619 P2 #9). It reads only what
+/// offsite needs — the merged TOML (base + `[profile.<p>]`) plus real env and
+/// `.env.<profile>` overrides — for `[backup.offsite]` AND the `[storage.s3]`
+/// bucket/endpoint (the distinct-destination guard needs them).
+///
+/// `Ok(None)` when no offsite section is configured. NO bucket/cred validation
+/// here — that is deferred to [`LoadedOffsite::resolve`] so a local backup is
+/// never blocked by an incomplete offsite section.
+fn load_offsite(profile: &str) -> Result<Option<LoadedOffsite>, BackupError> {
+    // Normalize aliases/case to the app's resolved profile (P2 #20) so the dotenv
+    // overlay, the `[profile.<p>]` selection, and the stored profile (later reused
+    // for credential resolution) all match what the running app reads.
+    let profile = migrate::canonical_profile(profile);
+    // Real env + `.env.<profile>` overlay (profile-aware, P2 #6); merged TOML
+    // (base + `[profile.<p>]`) — neither decrypts credentials nor validates.
+    let env = dotenv_env_for_profile(&profile);
+    // Read `autumn.toml` from the config/manifest dir (AUTUMN_MANIFEST_DIR),
+    // matching the full loader + dotenv overlay — so an installed/daemon launch
+    // whose CWD differs from the config dir still finds the offsite destination
+    // (and enforces the distinct-bucket guard) instead of reporting it
+    // unconfigured (P2 #15).
+    let table = migrate::read_autumn_toml_table_with_profile_from_config_dir(Some(&profile));
+    resolve_loaded_offsite(table.as_ref(), &env, &profile)
+}
+
+/// Pure core of [`load_offsite`]: build the offsite view from a merged TOML table
+/// and an `Env`, applying `AUTUMN_*` overrides via the config crate's
+/// env-override machinery (which does NOT decrypt credentials or run global
+/// validation). Separated so the DR-box behavior is unit-testable without
+/// touching the filesystem / process env / credential store.
+fn resolve_loaded_offsite(
+    table: Option<&toml::Table>,
+    env: &dyn autumn_web::config::Env,
+    profile: &str,
+) -> Result<Option<LoadedOffsite>, BackupError> {
+    // Deserialize the merged TOML into AutumnConfig — plain `Deserialize`, so no
+    // credential decryption and no `validate()` (those live only in `load*`).
+    let mut cfg = match table {
+        Some(t) => {
+            let toml_str = toml::to_string(t).map_err(|e| BackupError::Offsite {
+                op: "config",
+                detail: e.to_string(),
+            })?;
+            toml::from_str::<autumn_web::config::AutumnConfig>(&toml_str).map_err(|e| {
+                BackupError::Offsite {
+                    op: "config",
+                    detail: e.to_string(),
+                }
+            })?
+        }
+        None => autumn_web::config::AutumnConfig::default(),
+    };
+    // Apply `AUTUMN_*` env overrides (incl. backup.offsite + storage.s3). This is
+    // pure field-setting — no decryption, no validation.
+    cfg.apply_env_overrides_with_env(env);
+
+    let Some(offsite) = cfg.backup.offsite else {
+        return Ok(None);
+    };
+    // Only treat the `[storage.s3]` bucket as the APP storage destination when the
+    // resolved storage backend is actually S3 (P2 #16). If the app runs on the
+    // local/disabled backend, a leftover `[storage.s3]` bucket is inert — it is
+    // not where the app writes blobs — so it must NOT trip the shared-bucket guard
+    // and force `allow_shared_bucket` for an offsite backup that happens to reuse
+    // that bucket name.
+    let storage_is_s3 = cfg.storage.backend == autumn_web::storage::StorageBackend::S3;
+    let (app_storage_bucket, app_storage_endpoint) = if storage_is_s3 {
+        (
+            cfg.storage
+                .s3
+                .bucket
+                .as_deref()
+                .map(str::trim)
+                .filter(|b| !b.is_empty())
+                .map(str::to_owned),
+            cfg.storage
+                .s3
+                .endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+                .map(str::to_owned),
+        )
+    } else {
+        (None, None)
+    };
+    Ok(Some(LoadedOffsite {
+        offsite: *offsite,
+        app_storage_bucket,
+        app_storage_endpoint,
+        profile: profile.to_owned(),
+    }))
+}
+
+/// Whether the offsite destination collides with the app's user-facing blob
+/// storage: same bucket AND same canonical endpoint authority. Pure for unit
+/// testing the AC #3 opt-in guard.
+pub fn destinations_conflict(
+    offsite_bucket: &str,
+    offsite_endpoint: Option<&str>,
+    app_bucket: Option<&str>,
+    app_endpoint: Option<&str>,
+) -> bool {
+    let Some(app_bucket) = app_bucket else {
+        return false;
+    };
+    app_bucket == offsite_bucket
+        && canonical_authority(offsite_endpoint, offsite_bucket)
+            == canonical_authority(app_endpoint, app_bucket)
+}
+
+/// Canonicalize an endpoint to a comparable `scheme://host[:non-default-port]`
+/// authority so spellings that address the SAME S3 service compare equal:
+///
+/// * `None`/empty (the AWS default endpoint) and any explicit `*.amazonaws.com`
+///   URL both collapse to `"aws"` — S3 bucket names are globally unique, so the
+///   same bucket name is the same bucket regardless of regional endpoint.
+/// * default ports (443/https, 80/http) are dropped so `host:443` == bare host.
+/// * a virtual-hosted `{bucket}.` host prefix is stripped so it compares equal
+///   to the path-style spelling of the same endpoint.
+///
+/// This prevents a genuinely shared bucket from slipping past the AC #3 guard
+/// because one side wrote the endpoint out explicitly and the other left it None.
+fn canonical_authority(endpoint: Option<&str>, bucket: &str) -> String {
+    let raw = endpoint.unwrap_or("").trim();
+    if raw.is_empty() {
+        return "aws".to_owned();
+    }
+    let with_scheme = if raw.contains("://") {
+        raw.to_owned()
+    } else {
+        format!("https://{raw}")
+    };
+    let Ok(url) = url::Url::parse(&with_scheme) else {
+        return raw.to_ascii_lowercase();
+    };
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    if host == "amazonaws.com" || host.ends_with(".amazonaws.com") {
+        return "aws".to_owned();
+    }
+    // Strip a virtual-hosted `{bucket}.` prefix so path-style and virtual-hosted
+    // spellings of the same endpoint compare equal.
+    let bucket_prefix = format!("{}.", bucket.to_ascii_lowercase());
+    let host = host.strip_prefix(&bucket_prefix).unwrap_or(&host);
+    let scheme = url.scheme().to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "https" => Some(443),
+        "http" => Some(80),
+        _ => None,
+    };
+    match url.port() {
+        Some(port) if Some(port) != default_port => format!("{scheme}://{host}:{port}"),
+        _ => format!("{scheme}://{host}"),
+    }
+}
+
+/// Normalize a configured key prefix: trim surrounding whitespace and slashes so
+/// object keys join cleanly (an empty prefix means "bucket root").
+fn normalize_offsite_prefix(prefix: Option<&str>) -> String {
+    prefix.unwrap_or("").trim().trim_matches('/').to_owned()
+}
+
+/// Join non-empty key segments with `/` (no leading/trailing slash).
+fn join_key(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .filter(|p| !p.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The object key for one file of a run: `{prefix}/{profile}/{run_id}/{file}`.
+fn offsite_object_key(prefix: &str, profile: &str, run_id: &str, file: &str) -> String {
+    join_key(&[prefix, profile, run_id, file])
+}
+
+/// A short, globally-unique token appended to the REMOTE run id so that two
+/// hosts backing up the SAME profile in the SAME second to the SAME
+/// bucket/prefix never produce colliding S3 keys (issue #1619 P2 #12). Without
+/// it, `create_unique_run_dir` only disambiguates within one host's filesystem,
+/// so cross-host same-second runs would overwrite/interleave each other's dumps
+/// and manifests and corrupt `latest`.
+///
+/// Derived from host + pid + wall-clock nanoseconds, hashed with the
+/// already-linked `sha2`/`hex` crates (no new dependency). It is NON-sensitive —
+/// pure entropy, no secret material. The LOCAL run-dir naming (issue #1595
+/// `<profile>/<timestamp>/`) is deliberately left unchanged; only the remote key
+/// gains the `-<token>` suffix.
+fn remote_run_token() -> String {
+    use sha2::{Digest, Sha256};
+    let host = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_default();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let mut hasher = Sha256::new();
+    hasher.update(host.as_bytes());
+    hasher.update([0]); // domain separator between host and pid
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(nanos.to_le_bytes());
+    // 8 hex chars (4 bytes): with the same-second timestamp already dominating
+    // the run id, a cross-host collision needs the same second AND a 32-bit token
+    // collision — negligible for the handful of hosts sharing one backup prefix.
+    hex::encode(&hasher.finalize()[..4])
+}
+
+/// Compose the globally-unique REMOTE run id from the LOCAL run id (a #1595
+/// `<timestamp>`) and a [`remote_run_token`]: `<timestamp>-<token>`. The
+/// timestamp still dominates the lexical sort, so `latest` (newest by timestamp)
+/// is unaffected and the token only tie-breaks same-second runs from different
+/// hosts — each a valid distinct backup, neither overwriting the other.
+fn remote_run_id(local_run_id: &str, token: &str) -> String {
+    format!("{local_run_id}-{token}")
+}
+
+/// The list prefix that enumerates every run for a profile (trailing slash so a
+/// `list-type=2` prefix match is scoped to this profile).
+fn offsite_profile_prefix(prefix: &str, profile: &str) -> String {
+    format!("{}/", join_key(&[prefix, profile]))
+}
+
+/// The list prefix for the files of a single run.
+fn offsite_run_prefix(prefix: &str, profile: &str, run_id: &str) -> String {
+    format!("{}/", join_key(&[prefix, profile, run_id]))
+}
+
+/// Upload every file of a completed run and verify each remote object matches
+/// the local file (AC #2), then run remote retention (AC #5). Returns a
+/// credential-safe failure detail string (the caller wraps it into the
+/// split-outcome error). Never mutates the local artifact.
+fn upload_run(
+    offsite: &ResolvedOffsite,
+    client: &S3Client,
+    run_dir: &Path,
+    profile: &str,
+    run_id: &str,
+) -> Result<(), String> {
+    eprintln!("\u{2500}\u{2500} offsite upload \u{2500}\u{2500}");
+    let mut files = list_run_files(run_dir).map_err(|e| e.to_string())?;
+    files.sort();
+    // Upload `manifest.json` LAST so the presence of a verified remote manifest
+    // implies the whole run uploaded (completeness marker for `latest`
+    // resolution). A stable sort keeps the artifact files in alphabetical order
+    // and moves the single manifest to the end.
+    files.sort_by_key(|f| f.as_str() == MANIFEST_FILE);
+    if files.is_empty() {
+        return Err("the completed run directory contains no files to upload".to_owned());
+    }
+    let mut written_keys: Vec<String> = Vec::new();
+    for file in &files {
+        let path = run_dir.join(file);
+        let key = offsite_object_key(&offsite.prefix, profile, run_id, file);
+        // `put_file_and_verify` now self-cleans the single key it just wrote on a
+        // verify failure (#1760). This run-level cleanup is still needed for the
+        // OTHER keys written EARLIER in the run: record every key up-front, then on
+        // ANY failure best-effort delete everything this run wrote — manifest first
+        // — so a run whose upload was reported FAILED never keeps a remote
+        // `manifest.json` and can't become `latest` or consume a retention slot
+        // (restores the P2 #2 invariant; #21).
+        written_keys.push(key.clone());
+        // Stream the file straight from disk (hash pre-pass + streamed body):
+        // a multi-GB dump is never read into memory.
+        if let Err(e) = client.put_file_and_verify(&key, &path) {
+            let detail = format!("{file}: {e}");
+            cleanup_failed_upload(client, &written_keys);
+            return Err(detail);
+        }
+        eprintln!("  \u{2713} uploaded + verified {file}");
+    }
+    eprintln!(
+        "\u{2713} Offsite upload verified: {} object(s) under {}",
+        files.len(),
+        offsite_run_prefix(&offsite.prefix, profile, run_id),
+    );
+
+    // Remote retention (AC #5): only after the just-uploaded run verified, and
+    // never removing that run. A retention error is loud but non-fatal — the
+    // verified offsite copy already exists.
+    if let Some(keep) = offsite.keep
+        && let Err(e) = prune_remote(offsite, client, profile, run_id, keep)
+    {
+        eprintln!("  \u{26A0} offsite retention skipped: {e}");
+    }
+    Ok(())
+}
+
+/// Best-effort removal of the objects a FAILED [`upload_run`] wrote, so a partial
+/// upload never leaves a remote `manifest.json` behind — which
+/// [`complete_remote_run_ids`] would otherwise count as a COMPLETE run for
+/// `latest`/retention (P2 #21). The manifest key is deleted FIRST so that even if
+/// a later delete fails, the completeness marker is already gone. Delete failures
+/// are swallowed: the caller surfaces the ORIGINAL upload/verify error.
+fn cleanup_failed_upload(client: &S3Client, written_keys: &[String]) {
+    for key in order_cleanup_keys(written_keys) {
+        let _ = client.delete_object(&key);
+    }
+}
+
+/// Order the keys a failed upload wrote for cleanup: the run's `manifest.json`
+/// FIRST (drop the completeness marker before anything else), then the rest in
+/// their written order. Pure for unit testing.
+fn order_cleanup_keys(written_keys: &[String]) -> Vec<String> {
+    let mut keys = written_keys.to_vec();
+    // `false` (manifest) sorts before `true` (everything else); stable sort keeps
+    // the remaining keys in their original order.
+    keys.sort_by_key(|k| !key_is_manifest(k));
+    keys
+}
+
+/// Whether an object key is a run's manifest (its final path component is
+/// [`MANIFEST_FILE`]).
+fn key_is_manifest(key: &str) -> bool {
+    key.rsplit('/').next() == Some(MANIFEST_FILE)
+}
+
+/// List the file names (not sub-directories) directly inside a run directory.
+fn list_run_files(run_dir: &Path) -> Result<Vec<String>, BackupError> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(run_dir)
+        .map_err(BackupError::io(format!("read {}", run_dir.display())))?
+    {
+        let entry = entry.map_err(BackupError::io(format!(
+            "read entry in {}",
+            run_dir.display()
+        )))?;
+        if entry.path().is_file() {
+            files.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    Ok(files)
+}
+
+/// Prune remote runs for a profile, keeping the newest `keep` COMPLETE runs and
+/// NEVER deleting the just-uploaded `keep_run_id`. Independent of the local
+/// `--keep`.
+///
+/// Retention is based ONLY on complete runs (those with a remote `manifest.json`,
+/// the same completeness source `resolve_latest_run` uses), so a partial/failed
+/// upload can't consume a keep slot and cause an older *complete* backup to be
+/// pruned. Incomplete/partial prefixes are left untouched here — deleting them
+/// could race a concurrent in-progress upload; GC of stale partial prefixes is a
+/// possible follow-up, out of scope for this change.
+fn prune_remote(
+    offsite: &ResolvedOffsite,
+    client: &S3Client,
+    profile: &str,
+    keep_run_id: &str,
+    keep: usize,
+) -> Result<(), String> {
+    let list_prefix = offsite_profile_prefix(&offsite.prefix, profile);
+    let objects = client
+        .list_objects_v2(&list_prefix)
+        .map_err(|e| e.to_string())?;
+    let run_ids = complete_remote_run_ids(&objects, &list_prefix);
+    let to_remove = plan_remote_pruning(&run_ids, keep, keep_run_id);
+    for run_id in &to_remove {
+        let run_prefix = offsite_run_prefix(&offsite.prefix, profile, run_id);
+        let run_objects = client
+            .list_objects_v2(&run_prefix)
+            .map_err(|e| e.to_string())?;
+        for obj in &run_objects {
+            client.delete_object(&obj.key).map_err(|e| e.to_string())?;
+        }
+        eprintln!("  \u{1F5D1} pruned remote backup {run_id}");
+    }
+    Ok(())
+}
+
+/// Extract the unique, sorted run-id (timestamp) segments from listed object
+/// keys under `list_prefix` (`{list_prefix}{run_id}/{file}`). Test-only: the
+/// live paths (`latest` resolution and retention) use the manifest-gated
+/// [`complete_remote_run_ids`] so partial runs never count.
+#[cfg(test)]
+fn remote_run_ids(objects: &[s3::S3Object], list_prefix: &str) -> Vec<String> {
+    let mut ids: Vec<String> = objects
+        .iter()
+        .filter_map(|o| o.key.strip_prefix(list_prefix))
+        .filter_map(|rest| rest.split('/').next())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// The unique, sorted run ids under `list_prefix` that have a remote
+/// `manifest.json` — i.e. COMPLETE runs. Because [`upload_run`] uploads the
+/// manifest last, a `--upload` that died partway leaves artifacts but no
+/// manifest, so its run id is excluded here. This keeps a partial failed upload
+/// from shadowing the last good backup when resolving `latest`.
+fn complete_remote_run_ids(objects: &[s3::S3Object], list_prefix: &str) -> Vec<String> {
+    let mut ids: Vec<String> = objects
+        .iter()
+        .filter_map(|o| o.key.strip_prefix(list_prefix))
+        .filter_map(|rest| {
+            let mut parts = rest.splitn(2, '/');
+            match (parts.next(), parts.next()) {
+                (Some(run_id), Some(file)) if !run_id.is_empty() && file == MANIFEST_FILE => {
+                    Some(run_id.to_owned())
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Pure remote-retention rule: given run ids sorted ascending, keep the newest
+/// `keep` and return the older ones to delete — but ALWAYS exclude
+/// `keep_run_id` (the just-uploaded run) from deletion, even if retention math
+/// would otherwise remove it. `keep == 0` is clamped to 1.
+fn plan_remote_pruning(sorted_run_ids: &[String], keep: usize, keep_run_id: &str) -> Vec<String> {
+    let keep = keep.max(1);
+    if sorted_run_ids.len() <= keep {
+        return Vec::new();
+    }
+    let remove_count = sorted_run_ids.len() - keep;
+    sorted_run_ids[..remove_count]
+        .iter()
+        .filter(|id| id.as_str() != keep_run_id)
+        .cloned()
+        .collect()
+}
+
+// ─── Offsite list (`autumn db offsite list`, AC #4) ──────────────────────────
+
+/// Entry point for `autumn db offsite list`. Prints a credential-safe message
+/// and exits non-zero on failure.
+pub fn run_offsite_list(profile: Option<&str>) {
+    eprintln!("\u{1F342} autumn db offsite list\n");
+    if let Err(e) = offsite_list(profile) {
+        eprintln!("\u{2717} {e}");
+        std::process::exit(1);
+    }
+}
+
+fn offsite_list(profile: Option<&str>) -> Result<(), BackupError> {
+    // Canonicalize so the list prefix matches the profile the upload wrote under
+    // (P2 #22): `list --profile production` and `--profile prod` both read `prod/`.
+    let profile = migrate::canonical_profile(&migrate::effective_profile(profile));
+    let offsite = load_offsite(&profile)?
+        .ok_or(BackupError::OffsiteNotConfigured)?
+        .resolve()?;
+    let client = offsite.build_client()?;
+    let list_prefix = offsite_profile_prefix(&offsite.prefix, &profile);
+    let objects = client
+        .list_objects_v2(&list_prefix)
+        .map_err(|e| BackupError::Offsite {
+            op: "list",
+            detail: e.to_string(),
+        })?;
+    let runs = group_offsite_objects(&objects, &list_prefix);
+    if runs.is_empty() {
+        eprintln!("  \u{2139} No offsite backups found for profile {profile:?}.");
+        return Ok(());
+    }
+    print!("{}", format_offsite_listing(&runs));
+    Ok(())
+}
+
+/// One offsite run, grouped for listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OffsiteRun {
+    run_id: String,
+    files: Vec<(String, u64)>,
+    total: u64,
+    /// Whether the run has a remote `manifest.json` (a complete upload). A run
+    /// missing it is a partial/failed upload and is flagged in the listing.
+    complete: bool,
+}
+
+/// Group listed objects (`{list_prefix}{run_id}/{file}`) into runs, sorted by
+/// run id ascending. A run is `complete` iff it has a `manifest.json` object.
+/// Pure for unit testing.
+fn group_offsite_objects(objects: &[s3::S3Object], list_prefix: &str) -> Vec<OffsiteRun> {
+    let mut map: std::collections::BTreeMap<String, OffsiteRun> = std::collections::BTreeMap::new();
+    for obj in objects {
+        let Some(rest) = obj.key.strip_prefix(list_prefix) else {
+            continue;
+        };
+        let mut parts = rest.splitn(2, '/');
+        let (Some(run_id), Some(file)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if run_id.is_empty() || file.is_empty() {
+            continue;
+        }
+        let run = map.entry(run_id.to_owned()).or_insert_with(|| OffsiteRun {
+            run_id: run_id.to_owned(),
+            files: Vec::new(),
+            total: 0,
+            complete: false,
+        });
+        run.files.push((file.to_owned(), obj.size));
+        run.total += obj.size;
+        if file == MANIFEST_FILE {
+            run.complete = true;
+        }
+    }
+    map.into_values().collect()
+}
+
+/// Render a run listing as a human table: timestamp, files (labels), size. An
+/// incomplete run (no remote manifest) is flagged so a partial failed upload is
+/// never mistaken for a restorable backup. Pure.
+fn format_offsite_listing(runs: &[OffsiteRun]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    // Column shows the FULL remote run id (`<timestamp>-<token>`, P2 #12) so an
+    // operator can copy it verbatim into `restore offsite:<profile>/<run id>`.
+    let _ = writeln!(out, "{:<28}  {:>10}  FILES", "RUN ID", "SIZE");
+    for run in runs {
+        let mut labels: Vec<&str> = run.files.iter().map(|(f, _)| f.as_str()).collect();
+        labels.sort_unstable();
+        let mut files = labels.join(", ");
+        if !run.complete {
+            files.push_str("  (INCOMPLETE — no manifest, not restorable)");
+        }
+        let _ = writeln!(
+            out,
+            "{:<28}  {:>10}  {}",
+            run.run_id,
+            human_size(run.total),
+            files,
+        );
+    }
+    out
+}
+
+/// A compact human byte size (KiB/MiB/GiB), for the listing table.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    #[allow(clippy::cast_precision_loss)]
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+// ─── Offsite restore (AC #4) ─────────────────────────────────────────────────
+
+/// A parsed offsite restore reference: which profile's run to pull, and which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OffsiteRef {
+    profile: String,
+    selector: OffsiteSelector,
+}
+
+/// How the run is chosen: newest, or an explicit timestamp/run id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OffsiteSelector {
+    Latest,
+    Exact(String),
+}
+
+/// Resolve an offsite reference when offsite restore is indicated. Returns:
+///
+/// * `None` — offsite is NOT indicated (no `--offsite` flag and no `offsite:`
+///   prefix); the caller routes to a normal LOCAL restore.
+/// * `Some(Ok(_))` — offsite is indicated and the reference parsed.
+/// * `Some(Err(_))` — offsite is indicated but the reference is malformed; the
+///   caller MUST surface the error and MUST NEVER fall through to local restore
+///   (otherwise `restore --offsite latest` could silently restore an unrelated
+///   local path named `latest` in the cwd).
+fn resolve_offsite_ref(flag: bool, artifact: &str) -> Option<Result<OffsiteRef, BackupError>> {
+    let has_prefix = artifact.starts_with("offsite:");
+    if !flag && !has_prefix {
+        return None;
+    }
+    Some(
+        parse_offsite_ref(artifact).ok_or_else(|| BackupError::InvalidOffsiteRef {
+            reference: artifact.to_owned(),
+        }),
+    )
+}
+
+/// Parse `offsite:<profile>/<timestamp|latest>` (the `offsite:` prefix is
+/// optional). Returns `None` when the shape is not `<profile>/<selector>`.
+fn parse_offsite_ref(s: &str) -> Option<OffsiteRef> {
+    let s = s.strip_prefix("offsite:").unwrap_or(s).trim();
+    let (profile, selector) = s.split_once('/')?;
+    let profile = profile.trim();
+    let selector = selector.trim();
+    if profile.is_empty() || selector.is_empty() {
+        return None;
+    }
+    let selector = if selector.eq_ignore_ascii_case("latest") {
+        OffsiteSelector::Latest
+    } else {
+        OffsiteSelector::Exact(selector.to_owned())
+    };
+    Some(OffsiteRef {
+        profile: profile.to_owned(),
+        selector,
+    })
+}
+
+/// Whether `name` is a single, plain filename component safe to `join` onto the
+/// download temp dir (P2 #13). Rejects anything that could escape the temp dir
+/// BEFORE manifest validation: a name is safe only when it contains no path
+/// separator (`/` OR `\` — `\` is a valid Unix filename byte but an S3 key
+/// written by a Windows run could carry a traversal like `..\..\evil`), is not
+/// `.`/`..`, is not absolute, and has no Windows drive/prefix. The
+/// `Component::Normal(c) if c == name` check is the robust cross-platform core;
+/// the explicit `\` reject covers the Unix case where `\` is not a separator.
+fn is_safe_leaf_name(name: &str) -> bool {
+    use std::path::{Component, Path};
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return false;
+    }
+    let p = Path::new(name);
+    p.components().count() == 1
+        && matches!(p.components().next(), Some(Component::Normal(c)) if c == name)
+}
+
+/// Download the referenced offsite run to a fresh temp dir and restore from it
+/// via the identical [`RestorePlan::discover`] path (AC #4). The temp dir is
+/// removed when the guard drops (after the restore completes or fails).
+fn restore_from_offsite(args: &RestoreArgs, oref: &OffsiteRef) -> Result<(), BackupError> {
+    // Canonicalize the profile so the REMOTE key prefix matches what upload wrote
+    // (P2 #22): `offsite:production/latest` reads the same `prod/…` prefix that
+    // `--profile production` uploaded under.
+    let profile = migrate::canonical_profile(&oref.profile);
+    let offsite = load_offsite(&profile)?
+        .ok_or(BackupError::OffsiteNotConfigured)?
+        .resolve()?;
+    let client = offsite.build_client()?;
+
+    let run_id = match &oref.selector {
+        OffsiteSelector::Exact(sel) => resolve_exact_run(&offsite, &client, &profile, sel)?,
+        OffsiteSelector::Latest => resolve_latest_run(&offsite, &client, &profile)?,
+    };
+    eprintln!("  \u{2139} restoring from offsite {profile}/{run_id}");
+
+    let run_prefix = offsite_run_prefix(&offsite.prefix, &profile, &run_id);
+    let objects = client
+        .list_objects_v2(&run_prefix)
+        .map_err(|e| BackupError::Offsite {
+            op: "list",
+            detail: e.to_string(),
+        })?;
+    if objects.is_empty() {
+        return Err(BackupError::BadArtifact {
+            detail: format!(
+                "no offsite backup found at {profile}/{run_id} (nothing under {run_prefix})"
+            ),
+        });
+    }
+
+    let temp =
+        tempfile::tempdir().map_err(BackupError::io("creating a temp dir for offsite restore"))?;
+    for obj in &objects {
+        let file = obj
+            .key
+            .strip_prefix(run_prefix.as_str())
+            .filter(|f| is_safe_leaf_name(f))
+            .ok_or_else(|| BackupError::Offsite {
+                op: "download",
+                detail: format!(
+                    "refusing offsite object with an unsafe key layout: {} (each object name \
+                     must be a single plain filename — no path separators, traversal, or drive \
+                     prefix)",
+                    obj.key
+                ),
+            })?;
+        // Stream the object straight to disk (constant memory), so a multi-GB
+        // dump is never buffered while downloading for restore.
+        let dest = temp.path().join(file);
+        let mut out = std::fs::File::create(&dest)
+            .map_err(BackupError::io(format!("creating downloaded {file}")))?;
+        client
+            .download_object(&obj.key, &mut out)
+            .map_err(|e| BackupError::Offsite {
+                op: "download",
+                detail: format!("{file}: {e}"),
+            })?;
+        eprintln!("  \u{2913} downloaded {file}");
+    }
+
+    // Hand the downloaded run to the SAME plan path so the identical
+    // integrity-refusal + restore protocol applies unchanged.
+    let plan = RestorePlan::discover(temp.path(), args.shard.as_deref())?;
+    apply_restore_plan(&plan, args)
+    // `temp` is dropped here, removing the downloaded artifacts.
+}
+
+/// Resolve an explicit offsite selector to a single complete remote run id
+/// (P2 #12). The selector may be a full remote run id (`<ts>-<token>`) or a bare
+/// `<ts>` timestamp (operator convenience, and the pre-token spelling): a
+/// complete run matches when it equals the selector or begins with
+/// `"{selector}-"`. Errors (never silently guesses) when nothing matches or when
+/// several do — the latter happens when two hosts backed up the same second, and
+/// the message lists the full run ids so the operator can re-run with one.
+fn resolve_exact_run(
+    offsite: &ResolvedOffsite,
+    client: &S3Client,
+    profile: &str,
+    selector: &str,
+) -> Result<String, BackupError> {
+    let list_prefix = offsite_profile_prefix(&offsite.prefix, profile);
+    let objects = client
+        .list_objects_v2(&list_prefix)
+        .map_err(|e| BackupError::Offsite {
+            op: "list",
+            detail: e.to_string(),
+        })?;
+    let run_ids = complete_remote_run_ids(&objects, &list_prefix);
+    match match_exact_remote_run(&run_ids, selector) {
+        Ok(id) => Ok(id),
+        Err(candidates) if candidates.is_empty() => Err(BackupError::BadArtifact {
+            detail: format!(
+                "no complete offsite backup matching {selector:?} for profile {profile:?}"
+            ),
+        }),
+        Err(candidates) => Err(BackupError::BadArtifact {
+            detail: format!(
+                "offsite reference {selector:?} is ambiguous for profile {profile:?}: it matches \
+                 {} runs ({}).\n  Re-run restore with the full run id (see `autumn db offsite list`).",
+                candidates.len(),
+                candidates.join(", "),
+            ),
+        }),
+    }
+}
+
+/// Pure selector match (P2 #12): from COMPLETE remote run ids, return the single
+/// one referred to by `selector` (a full `<ts>-<token>` id, or a bare `<ts>` that
+/// prefixes exactly one tokened id). `Ok(id)` on a unique match; `Err(matches)`
+/// otherwise — an empty vec means none, a multi-element vec means ambiguous.
+fn match_exact_remote_run(run_ids: &[String], selector: &str) -> Result<String, Vec<String>> {
+    let token_prefix = format!("{selector}-");
+    let matches: Vec<String> = run_ids
+        .iter()
+        .filter(|id| id.as_str() == selector || id.starts_with(&token_prefix))
+        .cloned()
+        .collect();
+    if let [only] = matches.as_slice() {
+        Ok(only.clone())
+    } else {
+        Err(matches)
+    }
+}
+
+/// Resolve the newest run id for a profile from the offsite listing.
+fn resolve_latest_run(
+    offsite: &ResolvedOffsite,
+    client: &S3Client,
+    profile: &str,
+) -> Result<String, BackupError> {
+    let list_prefix = offsite_profile_prefix(&offsite.prefix, profile);
+    let objects = client
+        .list_objects_v2(&list_prefix)
+        .map_err(|e| BackupError::Offsite {
+            op: "list",
+            detail: e.to_string(),
+        })?;
+    // Only consider COMPLETE runs (those with a remote manifest.json), so a
+    // partial/failed upload never shadows the last good backup.
+    complete_remote_run_ids(&objects, &list_prefix)
+        .into_iter()
+        .next_back() // sorted ascending; newest complete run is last
+        .ok_or_else(|| BackupError::BadArtifact {
+            detail: format!("no complete offsite backups found for profile {profile:?}"),
+        })
 }
 
 #[cfg(test)]
@@ -1541,16 +2981,29 @@ mod tests {
     #[test]
     fn artifact_file_name_distinguishes_control_and_shards() {
         assert_eq!(
-            artifact_file_name("control", BackupFormat::Custom),
+            artifact_file_name("control", TargetBackend::Postgres, BackupFormat::Custom),
             "control.dump"
         );
         assert_eq!(
-            artifact_file_name("shard:us_east", BackupFormat::Custom),
+            artifact_file_name(
+                "shard:us_east",
+                TargetBackend::Postgres,
+                BackupFormat::Custom
+            ),
             "shard-us_east.dump"
         );
         assert_eq!(
-            artifact_file_name("shard:us east", BackupFormat::Plain),
+            artifact_file_name(
+                "shard:us east",
+                TargetBackend::Postgres,
+                BackupFormat::Plain
+            ),
             "shard-us_east.sql"
+        );
+        // A SQLite target's artifact is a database file, whatever `--format` said.
+        assert_eq!(
+            artifact_file_name("control", TargetBackend::Sqlite, BackupFormat::Plain),
+            "control.sqlite"
         );
     }
 
@@ -1814,8 +3267,14 @@ mod tests {
         let archive = tmp.path().join("control.dump");
         std::fs::write(&archive, b"PGDMP synthetic archive").unwrap();
 
-        verify_artifact(&archive, BackupFormat::Custom, "app", &tools)
-            .expect("verify resolves the bundled pg_restore and accepts the TOC");
+        verify_artifact(
+            &archive,
+            TargetBackend::Postgres,
+            BackupFormat::Custom,
+            "app",
+            &tools,
+        )
+        .expect("verify resolves the bundled pg_restore and accepts the TOC");
     }
 
     #[test]
@@ -1952,17 +3411,298 @@ mod tests {
         assert_eq!(got, None);
     }
 
+    // ── Operator-blind columns in a backup artifact (issue #1771) ────────────
+
+    /// A real `autumn db backup` run over a database holding a
+    /// `#[confidential]` column must produce an artifact with no plaintext in
+    /// it.
+    ///
+    /// `autumn/tests/integration/confidential_red_team.rs` sweeps the same sink
+    /// with the `VACUUM INTO` statement this path runs. This test closes the
+    /// gap between "the statement" and "the command", through `backup_into`
+    /// itself — artifact naming, verification and manifest included.
+    #[test]
+    fn a_backup_artifact_holds_no_confidential_plaintext() {
+        use autumn_web::confidential::{FieldContext, RootKey};
+        use diesel::connection::SimpleConnection as _;
+        use diesel::{Connection as _, SqliteConnection};
+
+        const MARKER: &str = "AUTUMN-REDTEAM-MARKER-backup-artifact-lab-result";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("app.db");
+
+        // The key exists only in this test, standing in for the client.
+        let key = RootKey::generate();
+        let ctx = FieldContext::new("sealed_notes", "body", "user-42");
+        let sealed = key.seal(&ctx, MARKER).expect("seal");
+        let token = key.blind_index(&ctx, MARKER);
+
+        let mut conn = SqliteConnection::establish(db_path.to_str().unwrap()).expect("open");
+        conn.batch_execute(&format!(
+            "CREATE TABLE sealed_notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, \
+             body_bidx TEXT NOT NULL); \
+             INSERT INTO sealed_notes VALUES (1, '{}', '{}');",
+            sealed.as_envelope(),
+            token.as_token(),
+        ))
+        .expect("seed");
+        drop(conn);
+
+        let run_dir = tmp.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let targets = vec![ResolvedTarget {
+            label: "control".to_owned(),
+            url: format!("sqlite://{}", db_path.display()),
+            backend: TargetBackend::Sqlite,
+        }];
+        backup_into(
+            &run_dir,
+            &targets,
+            BackupFormat::default(),
+            None,
+            &PgTools::locate(),
+            "test",
+        )
+        .expect("a SQLite backup needs no external tool");
+
+        let artifact = run_dir.join(artifact_file_name(
+            "control",
+            TargetBackend::Sqlite,
+            BackupFormat::default(),
+        ));
+        let bytes = std::fs::read(&artifact).expect("read artifact");
+        assert!(
+            !bytes.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()),
+            "the backup artifact leaked the confidential plaintext"
+        );
+        // The sweep looked at a real dump: the envelope is in there.
+        assert!(
+            bytes
+                .windows(sealed.as_envelope().len())
+                .any(|w| w == sealed.as_envelope().as_bytes()),
+            "the backup artifact must hold the sealed column"
+        );
+    }
+
+    // ── SQLite backend dispatch (issue #1909) ──────────────────────────────
+
+    #[test]
+    fn target_backend_detects_sqlite_and_defaults_everything_else_to_postgres() {
+        for sqlite in ["sqlite:///var/lib/app.db", "sqlite:app.db", "file:app.db"] {
+            assert_eq!(
+                TargetBackend::detect(sqlite),
+                TargetBackend::Sqlite,
+                "{sqlite}"
+            );
+        }
+        for postgres in [
+            "postgres://u:p@h:5432/app",
+            "postgresql://h/app",
+            "host=db user=app sslmode=require",
+            // An unrecognized target keeps the historical Postgres path rather
+            // than being guessed at, mirroring `autumn migrate`'s rule.
+            "/var/lib/app.db",
+            "",
+        ] {
+            assert_eq!(
+                TargetBackend::detect(postgres),
+                TargetBackend::Postgres,
+                "{postgres:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_backend_defaults_to_postgres_for_pre_1909_artifacts() {
+        // A manifest written before #1909 has no `backend` field, so serde fills
+        // an empty string; it must restore through the Postgres path exactly as
+        // it always did.
+        let legacy: Manifest = serde_json::from_str(
+            r#"{"autumn_version":"0.6.0","created_at":"2026-07-10T04:05:06+00:00",
+                "profile":"prod","format":"custom",
+                "targets":[{"label":"control","file":"control.dump","database":"app"}]}"#,
+        )
+        .expect("a pre-#1909 manifest must still parse");
+        assert_eq!(legacy.targets[0].backend, "");
+        assert_eq!(
+            TargetBackend::from_manifest(&legacy.targets[0].backend),
+            TargetBackend::Postgres
+        );
+        assert_eq!(
+            TargetBackend::from_manifest("sqlite"),
+            TargetBackend::Sqlite
+        );
+        assert_eq!(
+            TargetBackend::from_manifest("SQLite"),
+            TargetBackend::Sqlite
+        );
+    }
+
+    /// The mismatch guard must refuse before anything is touched, and must name
+    /// the backends without ever quoting the URL (which carries a password).
+    #[test]
+    fn restoring_an_artifact_into_the_wrong_backend_is_refused_up_front() {
+        let entry = |backend: &str| ManifestTarget {
+            label: "control".to_owned(),
+            file: "control.sqlite".to_owned(),
+            database: "app".to_owned(),
+            backend: backend.to_owned(),
+        };
+        let url = "postgres://app:hunter2@db.example.com/app";
+        assert_ne!(
+            TargetBackend::from_manifest(&entry("sqlite").backend),
+            TargetBackend::detect(url),
+            "the guard's premise: a SQLite artifact against a Postgres URL"
+        );
+        // …and a legacy manifest (no backend field) against a Postgres URL must
+        // still agree, so the guard can never refuse an existing restore.
+        assert_eq!(
+            TargetBackend::from_manifest(&entry("").backend),
+            TargetBackend::detect(url)
+        );
+        // A legacy manifest against a SQLite URL is a real mismatch too.
+        assert_ne!(
+            TargetBackend::from_manifest(&entry("").backend),
+            TargetBackend::detect("sqlite://app.db")
+        );
+    }
+
+    #[test]
+    fn build_targets_classifies_a_sqlite_control_url() {
+        let targets = build_targets(
+            Some("sqlite://app.db".to_owned()),
+            Vec::new(),
+            &TargetSelector::All,
+        )
+        .expect("a lone sqlite control resolves");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].backend, TargetBackend::Sqlite);
+    }
+
+    #[test]
+    fn run_format_note_reports_the_snapshot_a_sqlite_run_actually_took() {
+        let sqlite = ResolvedTarget {
+            label: "control".to_owned(),
+            url: "sqlite://app.db".to_owned(),
+            backend: TargetBackend::Sqlite,
+        };
+        let postgres = ResolvedTarget {
+            label: "shard:east".to_owned(),
+            url: "postgres://h/east".to_owned(),
+            backend: TargetBackend::Postgres,
+        };
+        // `--format` grades Postgres artifacts only, so an all-SQLite run must not
+        // claim a `custom` format it ignored.
+        assert_eq!(
+            run_format_note(std::slice::from_ref(&sqlite), BackupFormat::Custom),
+            "SQLite snapshot"
+        );
+        assert_eq!(
+            run_format_note(std::slice::from_ref(&postgres), BackupFormat::Plain),
+            "plain format"
+        );
+        assert_eq!(
+            run_format_note(&[postgres, sqlite], BackupFormat::Custom),
+            "custom format + SQLite snapshot"
+        );
+    }
+
+    /// The whole `SQLite` backup → restore contract through `backup_into` and
+    /// `run_restore_one`, with **no Postgres client tools involved**: a `SQLite` app
+    /// on the zero-ops tier has none, so `pg_dump` is passed as `None` here exactly
+    /// as `backup` resolves it.
+    #[test]
+    fn sqlite_target_round_trips_through_backup_into_and_restore() {
+        use diesel::connection::SimpleConnection as _;
+        use diesel::{Connection as _, RunQueryDsl as _, sql_query};
+
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("app.db");
+        let url = format!("sqlite://{}", db.display());
+        {
+            let mut conn = diesel::SqliteConnection::establish(&db.to_string_lossy())
+                .expect("establish sqlite");
+            conn.batch_execute(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL); \
+                 INSERT INTO t (v) VALUES ('a'), ('b');",
+            )
+            .expect("seed");
+        }
+
+        let run_dir = dir.path().join("run");
+        std::fs::create_dir_all(&run_dir).expect("mkdir");
+        let targets = vec![ResolvedTarget {
+            label: "control".to_owned(),
+            url: url.clone(),
+            backend: TargetBackend::Sqlite,
+        }];
+        let tools = PgTools::with_dirs(Vec::new());
+        backup_into(
+            &run_dir,
+            &targets,
+            BackupFormat::Custom,
+            None,
+            &tools,
+            "prod",
+        )
+        .expect("a SQLite backup needs no pg_dump");
+
+        let artifact = run_dir.join("control.sqlite");
+        assert!(
+            artifact.is_file(),
+            "the artifact is a .sqlite database file"
+        );
+        let manifest = read_manifest(&run_dir).expect("manifest");
+        assert_eq!(manifest.targets[0].backend, "sqlite");
+        assert_eq!(manifest.targets[0].file, "control.sqlite");
+
+        // Simulate data loss, then restore.
+        {
+            let mut conn = diesel::SqliteConnection::establish(&db.to_string_lossy())
+                .expect("establish sqlite");
+            conn.batch_execute("DELETE FROM t;").expect("delete");
+        }
+        run_restore_one(
+            &tools,
+            &url,
+            &artifact,
+            TargetBackend::Sqlite,
+            BackupFormat::Custom,
+            "app",
+        )
+        .expect("a SQLite restore needs no pg_restore");
+
+        let mut conn =
+            diesel::SqliteConnection::establish(&db.to_string_lossy()).expect("establish sqlite");
+        let rows: Vec<Count> = sql_query("SELECT COUNT(*) AS n FROM t")
+            .load(&mut conn)
+            .expect("count");
+        assert_eq!(rows[0].n, 2, "the restore must bring the rows back");
+    }
+
     #[test]
     fn infer_format_from_extension() {
         assert_eq!(
-            infer_format_from_path(Path::new("control.dump")),
-            Some(BackupFormat::Custom)
+            infer_artifact_kind(Path::new("control.dump")),
+            Some((TargetBackend::Postgres, BackupFormat::Custom))
         );
         assert_eq!(
-            infer_format_from_path(Path::new("control.sql")),
-            Some(BackupFormat::Plain)
+            infer_artifact_kind(Path::new("control.sql")),
+            Some((TargetBackend::Postgres, BackupFormat::Plain))
         );
-        assert_eq!(infer_format_from_path(Path::new("control.txt")), None);
+        // A bare `.sqlite` artifact restores through the SQLite path (#1909).
+        assert_eq!(
+            infer_artifact_kind(Path::new("control.sqlite")),
+            Some((TargetBackend::Sqlite, BackupFormat::Custom))
+        );
+        assert_eq!(infer_artifact_kind(Path::new("control.txt")), None);
     }
 
     #[test]
@@ -2077,11 +3817,13 @@ mod tests {
                     label: "control".to_owned(),
                     file: "control.dump".to_owned(),
                     database: "app".to_owned(),
+                    backend: "postgres".to_owned(),
                 },
                 ManifestTarget {
                     label: "shard:east".to_owned(),
                     file: "shard-east.dump".to_owned(),
                     database: "east".to_owned(),
+                    backend: "postgres".to_owned(),
                 },
             ],
         };
@@ -2183,6 +3925,7 @@ mod tests {
                 label: "control".to_owned(),
                 file: "control.dump".to_owned(),
                 database: "app".to_owned(),
+                backend: "postgres".to_owned(),
             }],
         };
         write_manifest(tmp.path(), &manifest).unwrap();
@@ -2198,6 +3941,889 @@ mod tests {
         let s = e.to_string();
         assert!(s.contains("prod"));
         assert!(!s.contains("postgres://"));
+    }
+
+    // ─── Offsite (issue #1619) ───────────────────────────────────────────────
+
+    #[test]
+    fn offsite_object_key_joins_and_skips_empty_prefix() {
+        assert_eq!(
+            offsite_object_key("db", "prod", "20260710T040506Z", "control.dump"),
+            "db/prod/20260710T040506Z/control.dump"
+        );
+        // Empty prefix => key rooted at the bucket, no leading slash.
+        assert_eq!(
+            offsite_object_key("", "prod", "20260710T040506Z", "manifest.json"),
+            "prod/20260710T040506Z/manifest.json"
+        );
+    }
+
+    #[test]
+    fn normalize_offsite_prefix_trims_slashes() {
+        assert_eq!(normalize_offsite_prefix(Some("/db/backups/")), "db/backups");
+        assert_eq!(normalize_offsite_prefix(Some("  db  ")), "db");
+        assert_eq!(normalize_offsite_prefix(None), "");
+        assert_eq!(normalize_offsite_prefix(Some("")), "");
+    }
+
+    #[test]
+    fn offsite_profile_and_run_prefixes_are_scoped() {
+        assert_eq!(offsite_profile_prefix("db", "prod"), "db/prod/");
+        assert_eq!(offsite_profile_prefix("", "prod"), "prod/");
+        assert_eq!(
+            offsite_run_prefix("db", "prod", "20260710T040506Z"),
+            "db/prod/20260710T040506Z/"
+        );
+    }
+
+    #[test]
+    fn offsite_key_prefix_is_canonical_across_profile_spellings() {
+        // P2 #22: alias/case profile spellings must resolve to the SAME remote key
+        // prefix, so upload (`--profile production`), `db offsite list --profile
+        // prod`, and `restore offsite:prod/latest` all address `db/prod/…`.
+        for spelling in ["prod", "production", "PROD", "Production", "  prod  "] {
+            let p = migrate::canonical_profile(spelling);
+            assert_eq!(offsite_profile_prefix("db", &p), "db/prod/", "{spelling:?}");
+            assert_eq!(
+                offsite_run_prefix("db", &p, "r"),
+                "db/prod/r/",
+                "{spelling:?}"
+            );
+            assert_eq!(
+                offsite_object_key("db", &p, "r", "manifest.json"),
+                "db/prod/r/manifest.json",
+                "{spelling:?}"
+            );
+        }
+        // `prod` and `production` yield the identical prefix.
+        assert_eq!(
+            offsite_profile_prefix("db", &migrate::canonical_profile("prod")),
+            offsite_profile_prefix("db", &migrate::canonical_profile("production")),
+        );
+        // dev aliases collapse the same way.
+        assert_eq!(
+            offsite_profile_prefix("db", &migrate::canonical_profile("development")),
+            "db/dev/"
+        );
+    }
+
+    #[test]
+    fn destinations_conflict_requires_same_bucket_and_endpoint() {
+        // Same bucket + same endpoint => conflict.
+        assert!(destinations_conflict(
+            "shared",
+            Some("https://s3.example.test"),
+            Some("shared"),
+            Some("https://s3.example.test/"),
+        ));
+        // Same bucket but different endpoint => distinct.
+        assert!(!destinations_conflict(
+            "shared",
+            Some("https://offsite.test"),
+            Some("shared"),
+            Some("https://app.test"),
+        ));
+        // Different bucket => distinct.
+        assert!(!destinations_conflict(
+            "offsite",
+            Some("https://s3.example.test"),
+            Some("app"),
+            Some("https://s3.example.test"),
+        ));
+        // App storage not configured (no bucket) => never a conflict.
+        assert!(!destinations_conflict("offsite", None, None, None));
+        // Both AWS default endpoint (None) + same bucket => conflict.
+        assert!(destinations_conflict("shared", None, Some("shared"), None));
+    }
+
+    #[test]
+    fn destinations_conflict_normalizes_ports_and_aws_defaults() {
+        // `:443` vs bare host on https must compare equal (default port dropped).
+        assert!(destinations_conflict(
+            "shared",
+            Some("https://minio.example:443"),
+            Some("shared"),
+            Some("https://minio.example"),
+        ));
+        // `:80` vs bare host on http likewise.
+        assert!(destinations_conflict(
+            "shared",
+            Some("http://gw:80"),
+            Some("shared"),
+            Some("http://gw"),
+        ));
+        // Offsite None (AWS default) vs app spelled as the explicit regional AWS
+        // URL, same bucket => still a shared bucket (globally-unique name).
+        assert!(destinations_conflict(
+            "shared",
+            None,
+            Some("shared"),
+            Some("https://s3.us-east-1.amazonaws.com"),
+        ));
+        // ...and the virtual-hosted AWS spelling too.
+        assert!(destinations_conflict(
+            "shared",
+            None,
+            Some("shared"),
+            Some("https://shared.s3.us-east-1.amazonaws.com"),
+        ));
+        // A non-default port genuinely differs => distinct.
+        assert!(!destinations_conflict(
+            "shared",
+            Some("https://minio.example:9000"),
+            Some("shared"),
+            Some("https://minio.example"),
+        ));
+        // Virtual-hosted `{bucket}.` prefix vs path-style same host => equal.
+        assert!(destinations_conflict(
+            "shared",
+            Some("https://shared.minio.example"),
+            Some("shared"),
+            Some("https://minio.example"),
+        ));
+    }
+
+    #[test]
+    fn shared_bucket_refusal_message_is_credential_safe() {
+        let e = BackupError::SharedBucketRefused {
+            bucket: "shared".to_owned(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("shared"));
+        assert!(s.contains("allow_shared_bucket"));
+        assert!(!s.contains("secret"));
+    }
+
+    #[test]
+    fn missing_credential_env_names_only_the_variable() {
+        let e = BackupError::MissingCredentialEnv {
+            var: "OFFSITE_SECRET".to_owned(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("OFFSITE_SECRET"));
+        // Names the variable, never a value.
+        assert!(!s.contains("hunter2"));
+    }
+
+    #[test]
+    fn upload_failed_reports_split_outcome() {
+        let e = BackupError::OffsiteUploadFailed {
+            local_path: "/backups/prod/20260710T040506Z".to_owned(),
+            detail: "S3 put returned HTTP 403 (AccessDenied)".to_owned(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("Local backup OK at /backups/prod/20260710T040506Z"));
+        assert!(s.contains("OFFSITE UPLOAD FAILED"));
+        assert!(s.contains("intact"));
+    }
+
+    // ── #1743: failed offsite upload raises an operator alert ─────────────────
+
+    #[derive(Default)]
+    struct CapturingChannel {
+        received: Arc<std::sync::Mutex<Vec<Alert>>>,
+    }
+
+    impl AlertChannel for CapturingChannel {
+        fn name(&self) -> &'static str {
+            "capturing"
+        }
+        fn deliver<'a>(&'a self, alert: &'a Alert) -> autumn_web::alerts::AlertDeliveryFuture<'a> {
+            let received = Arc::clone(&self.received);
+            let cloned = alert.clone();
+            Box::pin(async move {
+                received.lock().expect("lock").push(cloned);
+                Ok(())
+            })
+        }
+    }
+
+    #[test]
+    fn build_offsite_upload_alert_is_scheduled_task_failure() {
+        let alert = build_offsite_upload_alert(
+            "/backups/prod/20260710T040506Z",
+            "S3 put returned HTTP 403 (AccessDenied)",
+        );
+        assert_eq!(alert.condition, AlertCondition::ScheduledTaskFailure);
+        assert_eq!(alert.title, "Offsite backup upload failed");
+        assert_eq!(alert.summary, "S3 put returned HTTP 403 (AccessDenied)");
+        assert_eq!(
+            alert.dedup_key,
+            "scheduled_task_failure:db-backup-offsite-upload"
+        );
+    }
+
+    #[test]
+    fn deliver_offsite_upload_alert_reaches_configured_channel() {
+        // Failure-injection: the upload-failure path delivers a
+        // ScheduledTaskFailure alert to every configured channel. A capturing
+        // mock channel records what a failed upload would raise.
+        let capture = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let channel = Arc::new(CapturingChannel {
+            received: Arc::clone(&capture),
+        });
+        let channels: Vec<Arc<dyn AlertChannel>> = vec![channel];
+
+        deliver_offsite_upload_alert(
+            &channels,
+            "/backups/prod/20260710T040506Z",
+            "S3 put returned HTTP 403 (AccessDenied)",
+        );
+
+        let delivered = {
+            let received = capture.lock().expect("lock");
+            received.clone()
+        };
+        assert_eq!(delivered.len(), 1, "exactly one alert must be delivered");
+        let alert = &delivered[0];
+        assert_eq!(alert.condition, AlertCondition::ScheduledTaskFailure);
+        assert_eq!(alert.title, "Offsite backup upload failed");
+        assert_eq!(alert.summary, "S3 put returned HTTP 403 (AccessDenied)");
+    }
+
+    #[test]
+    fn deliver_offsite_upload_alert_is_noop_without_channels() {
+        // Interactive case (no [alerts] configured → no channels): must be a
+        // no-op so behavior is unchanged. No panic, nothing delivered.
+        deliver_offsite_upload_alert(&[], "/backups/prod/run", "boom");
+    }
+
+    #[test]
+    fn remote_run_ids_extracts_unique_sorted_ids() {
+        let list_prefix = "db/prod/";
+        let objects = vec![
+            s3::S3Object {
+                key: "db/prod/20260710T010101Z/control.dump".to_owned(),
+                size: 1,
+            },
+            s3::S3Object {
+                key: "db/prod/20260710T010101Z/manifest.json".to_owned(),
+                size: 1,
+            },
+            s3::S3Object {
+                key: "db/prod/20260709T010101Z/control.dump".to_owned(),
+                size: 1,
+            },
+        ];
+        assert_eq!(
+            remote_run_ids(&objects, list_prefix),
+            vec!["20260709T010101Z".to_owned(), "20260710T010101Z".to_owned()]
+        );
+    }
+
+    #[test]
+    fn local_backup_does_not_validate_incomplete_offsite() {
+        // P2 #1: an incomplete [backup.offsite] (no bucket) must NOT block a plain
+        // local `autumn db backup`. The strict bucket check lives in resolve(),
+        // which the backup path only calls when an upload is actually requested.
+        let offsite = autumn_web::config::OffsiteBackupConfig::default();
+        assert!(offsite.s3.bucket.is_none(), "precondition: no bucket set");
+        let loaded = LoadedOffsite {
+            offsite,
+            app_storage_bucket: None,
+            app_storage_endpoint: None,
+            profile: "test".to_owned(),
+        };
+        // The strict validation is deferred to resolve() (only reached when
+        // uploading) — proving a local-only backup never hits it.
+        assert!(matches!(
+            loaded.resolve(),
+            Err(BackupError::OffsiteConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn auto_upload_probe_precedence_and_repro() {
+        // P2 #8: the upload decision reads ONLY `[backup.offsite].auto_upload`
+        // from env / .env / merged TOML — never a full config load / credential
+        // decryption. Pure `auto_upload_from_sources` proves the precedence.
+        let no_env = |_: &str| None;
+
+        // (a) REPRO: no offsite section, no env => false => NO upload, and (by
+        // construction) the decision needed no AutumnConfig load / cred decrypt.
+        assert!(!auto_upload_from_sources(no_env, None));
+        let empty: toml::Table = toml::Table::new();
+        assert!(!auto_upload_from_sources(no_env, Some(&empty)));
+
+        // (b) auto_upload=true via TOML [backup.offsite] triggers upload.
+        let toml_true: toml::Table =
+            toml::from_str("[backup.offsite]\nauto_upload = true\n").unwrap();
+        assert!(auto_upload_from_sources(no_env, Some(&toml_true)));
+
+        // (b) auto_upload=true via env (real env or .env.<profile>) triggers it,
+        // even with no TOML.
+        let env_true =
+            |k: &str| (k == "AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD").then(|| "true".to_owned());
+        assert!(auto_upload_from_sources(env_true, None));
+
+        // Env wins over TOML: env "false" overrides TOML true.
+        let env_false =
+            |k: &str| (k == "AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD").then(|| "false".to_owned());
+        assert!(!auto_upload_from_sources(env_false, Some(&toml_true)));
+
+        // A non-boolean env value is ignored, falling back to TOML.
+        let env_junk =
+            |k: &str| (k == "AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD").then(|| "yesplease".to_owned());
+        assert!(auto_upload_from_sources(env_junk, Some(&toml_true)));
+    }
+
+    #[test]
+    fn offsite_resolves_from_config_dir_table_not_cwd() {
+        // P2 #15: an installed/daemon launch keeps autumn.toml in the config dir
+        // (a different CWD). Reading from that dir — as the offsite loaders now do
+        // via read_autumn_toml_table_with_profile_from_config_dir — must surface
+        // both auto_upload and the offsite destination. Proven hermetically by
+        // reading a temp config dir directly (this test's CWD has no such file).
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("autumn.toml"),
+            "[backup.offsite]\n\
+             auto_upload = true\n\
+             prefix = \"db\"\n\
+             [backup.offsite.s3]\n\
+             bucket = \"offsite-bucket\"\n\
+             region = \"us-east-1\"\n\
+             endpoint = \"https://minio.example:9000\"\n\
+             force_path_style = true\n\
+             access_key_id_env = \"OFFSITE_KEY\"\n\
+             secret_access_key_env = \"OFFSITE_SECRET\"\n",
+        )
+        .unwrap();
+        let table = migrate::read_autumn_toml_table_with_profile_in(tmp.path(), Some("dev"));
+        // auto_upload is read from the config-dir table (env has nothing).
+        assert!(auto_upload_from_sources(|_| None, table.as_ref()));
+        // And the offsite destination resolves from that same table (no CWD file).
+        let env = autumn_web::config::MockEnv::new();
+        let loaded = resolve_loaded_offsite(table.as_ref(), &env, "dev").unwrap();
+        assert!(
+            loaded.is_some(),
+            "offsite must resolve from the config-dir autumn.toml"
+        );
+    }
+
+    #[test]
+    fn resolved_offsite_carries_target_profile_for_credentials() {
+        // P2 #6: the target profile threads through resolve() into
+        // ResolvedOffsite so credential resolution reads the SAME
+        // `.env.<profile>` overlay the config was loaded under.
+        let mut offsite = autumn_web::config::OffsiteBackupConfig::default();
+        offsite.s3.bucket = Some("offsite-bucket".to_owned());
+        offsite.s3.access_key_id_env = Some("OFFSITE_KEY".to_owned());
+        offsite.s3.secret_access_key_env = Some("OFFSITE_SECRET".to_owned());
+        let loaded = LoadedOffsite {
+            offsite,
+            app_storage_bucket: None,
+            app_storage_endpoint: None,
+            profile: "test".to_owned(),
+        };
+        let resolved = loaded.resolve().expect("bucket set, resolves");
+        assert_eq!(resolved.profile, "test");
+    }
+
+    #[test]
+    fn offsite_resolves_without_app_credential_store() {
+        // P2 #9: offsite destination resolves from TOML + env WITHOUT a full
+        // AutumnConfig::load — so NO credential decryption / AUTUMN_MASTER_KEY is
+        // needed. On current code this path went through load_with_env, which
+        // would fail on a DR box whose config/credentials/<p>.toml.enc can't be
+        // decrypted. `resolve_loaded_offsite` reads only the offsite + storage.s3
+        // config, never the credential store.
+        let table: toml::Table = toml::from_str(
+            "[backup.offsite]\nprefix = \"db\"\n\
+             [backup.offsite.s3]\nbucket = \"dr-bucket\"\nregion = \"us-east-1\"\n\
+             endpoint = \"https://minio.example:9000\"\nforce_path_style = true\n\
+             access_key_id_env = \"OFFSITE_KEY\"\nsecret_access_key_env = \"OFFSITE_SECRET\"\n",
+        )
+        .unwrap();
+        // Real env supplies the S3 credential VALUES; crucially there is NO
+        // AUTUMN_MASTER_KEY and no attempt to read a credential store.
+        let env = autumn_web::config::MockEnv::new()
+            .with("OFFSITE_KEY", "AKIA_DR")
+            .with("OFFSITE_SECRET", "shh");
+        let loaded = resolve_loaded_offsite(Some(&table), &env, "prod")
+            .expect("resolves without a credential store")
+            .expect("offsite section present");
+        let resolved = loaded.resolve().expect("bucket set");
+        assert_eq!(resolved.s3.bucket, "dr-bucket");
+        assert_eq!(resolved.profile, "prod");
+
+        // Env-only configuration (no TOML at all) also resolves.
+        let env2 = autumn_web::config::MockEnv::new()
+            .with("AUTUMN_BACKUP__OFFSITE__S3__BUCKET", "env-bucket");
+        let loaded2 = resolve_loaded_offsite(None, &env2, "prod")
+            .unwrap()
+            .expect("materialized from env");
+        assert_eq!(loaded2.offsite.s3.bucket.as_deref(), Some("env-bucket"));
+    }
+
+    #[test]
+    fn shared_bucket_guard_only_applies_when_storage_backend_is_s3() {
+        // P2 #16: a leftover `[storage.s3]` bucket that equals the offsite bucket
+        // must NOT trip the shared-bucket guard unless the app storage backend is
+        // actually S3. On backend=local/disabled the bucket is inert.
+        let env = autumn_web::config::MockEnv::new();
+        let make = |backend: &str| -> LoadedOffsite {
+            let table: toml::Table = toml::from_str(&format!(
+                "[storage]\nbackend = \"{backend}\"\n\
+                 [storage.s3]\nbucket = \"shared\"\nendpoint = \"https://minio.example:9000\"\n\
+                 [backup.offsite]\nprefix = \"db\"\n\
+                 [backup.offsite.s3]\nbucket = \"shared\"\nregion = \"us-east-1\"\n\
+                 endpoint = \"https://minio.example:9000\"\nforce_path_style = true\n"
+            ))
+            .unwrap();
+            resolve_loaded_offsite(Some(&table), &env, "prod")
+                .expect("resolves")
+                .expect("offsite section present")
+        };
+
+        // backend=local: the s3 bucket is NOT the app storage destination, so the
+        // guard input is empty and destinations_conflict cannot fire.
+        let local = make("local");
+        assert_eq!(local.app_storage_bucket, None);
+        assert!(!destinations_conflict(
+            "shared",
+            Some("https://minio.example:9000"),
+            local.app_storage_bucket.as_deref(),
+            local.app_storage_endpoint.as_deref(),
+        ));
+
+        // backend=disabled: same — inert `[storage.s3]`.
+        assert_eq!(make("disabled").app_storage_bucket, None);
+
+        // backend=s3: the bucket IS the app destination, so the guard fires and
+        // the offsite backup must opt in with allow_shared_bucket.
+        let s3 = make("s3");
+        assert_eq!(s3.app_storage_bucket.as_deref(), Some("shared"));
+        assert!(destinations_conflict(
+            "shared",
+            Some("https://minio.example:9000"),
+            s3.app_storage_bucket.as_deref(),
+            s3.app_storage_endpoint.as_deref(),
+        ));
+    }
+
+    #[test]
+    fn key_is_manifest_matches_only_the_run_manifest() {
+        assert!(key_is_manifest(
+            "db/prod/20260710T040506Z-abcd1234/manifest.json"
+        ));
+        assert!(!key_is_manifest(
+            "db/prod/20260710T040506Z-abcd1234/control.dump"
+        ));
+        // A file that merely contains the word is not the manifest.
+        assert!(!key_is_manifest("db/prod/r/not-manifest.json.dump"));
+    }
+
+    #[test]
+    fn order_cleanup_keys_deletes_manifest_first() {
+        // P2 #21: on a failed upload the run manifest must be removed FIRST so the
+        // completeness marker is gone even if a later delete fails — otherwise a
+        // failed run could still be counted `complete` for latest/retention.
+        let written = vec![
+            "db/prod/r/control.dump".to_owned(),
+            "db/prod/r/shard-a.dump".to_owned(),
+            "db/prod/r/manifest.json".to_owned(),
+        ];
+        let ordered = order_cleanup_keys(&written);
+        assert_eq!(ordered[0], "db/prod/r/manifest.json");
+        // The remaining (non-manifest) keys keep their written order.
+        assert_eq!(
+            &ordered[1..],
+            &[
+                "db/prod/r/control.dump".to_owned(),
+                "db/prod/r/shard-a.dump".to_owned()
+            ]
+        );
+
+        // And downstream: with the manifest deleted, complete_remote_run_ids no
+        // longer counts the run — so the failed run can't become `latest`.
+        let list_prefix = "db/prod/";
+        let after_cleanup = vec![s3::S3Object {
+            key: "db/prod/r/control.dump".to_owned(), // manifest was cleaned up
+            size: 10,
+        }];
+        assert!(complete_remote_run_ids(&after_cleanup, list_prefix).is_empty());
+    }
+
+    #[test]
+    fn complete_remote_run_ids_only_counts_runs_with_a_manifest() {
+        // P2 #2: a newer PARTIAL run (artifacts but no manifest.json) and an
+        // older COMPLETE run. `latest` must pick the older complete run.
+        let list_prefix = "db/prod/";
+        let objects = vec![
+            // Older, complete run.
+            s3::S3Object {
+                key: "db/prod/20260709T010101Z/control.dump".to_owned(),
+                size: 10,
+            },
+            s3::S3Object {
+                key: "db/prod/20260709T010101Z/manifest.json".to_owned(),
+                size: 1,
+            },
+            // Newer, partial run — died before uploading the (last) manifest.
+            s3::S3Object {
+                key: "db/prod/20260710T010101Z/control.dump".to_owned(),
+                size: 10,
+            },
+        ];
+        // The raw run ids include the partial newer run...
+        assert_eq!(
+            remote_run_ids(&objects, list_prefix),
+            vec!["20260709T010101Z".to_owned(), "20260710T010101Z".to_owned()]
+        );
+        // ...but only the complete (older) run is a candidate.
+        let complete = complete_remote_run_ids(&objects, list_prefix);
+        assert_eq!(complete, vec!["20260709T010101Z".to_owned()]);
+        // `latest` = newest COMPLETE run = the older run, not the partial newer one.
+        assert_eq!(
+            complete.into_iter().next_back().as_deref(),
+            Some("20260709T010101Z")
+        );
+    }
+
+    #[test]
+    fn remote_retention_counts_only_complete_runs() {
+        // P2 #3 (Codex scenario): keep=2 with complete runs A/B, a NEWER partial
+        // run C (no manifest), and the just-uploaded complete run D. Retention
+        // must count only complete runs — keep the newest 2 complete (D, B),
+        // prune the older complete A, and NEVER touch the partial C or D.
+        let list_prefix = "db/prod/";
+        let a = "20260701T000000Z"; // complete, oldest
+        let b = "20260702T000000Z"; // complete
+        let c = "20260703T000000Z"; // PARTIAL (no manifest), newer than B
+        let d = "20260704T000000Z"; // complete, just uploaded (newest)
+        let objects = vec![
+            s3::S3Object {
+                key: format!("{list_prefix}{a}/control.dump"),
+                size: 1,
+            },
+            s3::S3Object {
+                key: format!("{list_prefix}{a}/manifest.json"),
+                size: 1,
+            },
+            s3::S3Object {
+                key: format!("{list_prefix}{b}/control.dump"),
+                size: 1,
+            },
+            s3::S3Object {
+                key: format!("{list_prefix}{b}/manifest.json"),
+                size: 1,
+            },
+            // Partial C: artifact only, no manifest.
+            s3::S3Object {
+                key: format!("{list_prefix}{c}/control.dump"),
+                size: 1,
+            },
+            s3::S3Object {
+                key: format!("{list_prefix}{d}/control.dump"),
+                size: 1,
+            },
+            s3::S3Object {
+                key: format!("{list_prefix}{d}/manifest.json"),
+                size: 1,
+            },
+        ];
+
+        // Retention input = complete runs only (A, B, D) — the partial C is absent.
+        let complete = complete_remote_run_ids(&objects, list_prefix);
+        assert_eq!(
+            complete,
+            vec![a.to_owned(), b.to_owned(), d.to_owned()],
+            "partial run C must not count as a retention slot"
+        );
+
+        // keep=2, just-uploaded=D => prune only the oldest complete run A.
+        let to_remove = plan_remote_pruning(&complete, 2, d);
+        assert_eq!(to_remove, vec![a.to_owned()]);
+        // The partial C is NOT pruned (never a candidate), and D is never pruned.
+        assert!(!to_remove.contains(&c.to_owned()));
+        assert!(!to_remove.contains(&d.to_owned()));
+        // B survives (it's within the newest-2 complete).
+        assert!(!to_remove.contains(&b.to_owned()));
+    }
+
+    #[test]
+    fn upload_orders_manifest_last() {
+        // P2 #2(a): the manifest must upload last so its remote presence marks a
+        // complete run. Mirror upload_run's ordering.
+        let mut files = vec![
+            "manifest.json".to_owned(),
+            "shard-east.dump".to_owned(),
+            "control.dump".to_owned(),
+        ];
+        files.sort();
+        files.sort_by_key(|f| f.as_str() == MANIFEST_FILE);
+        assert_eq!(
+            files,
+            vec![
+                "control.dump".to_owned(),
+                "shard-east.dump".to_owned(),
+                "manifest.json".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn offsite_listing_flags_incomplete_runs() {
+        // P2 #2: an incomplete run (no manifest) is flagged in `db offsite list`.
+        let list_prefix = "db/prod/";
+        let objects = vec![s3::S3Object {
+            key: "db/prod/20260710T010101Z/control.dump".to_owned(),
+            size: 10,
+        }];
+        let runs = group_offsite_objects(&objects, list_prefix);
+        assert_eq!(runs.len(), 1);
+        assert!(!runs[0].complete);
+        let table = format_offsite_listing(&runs);
+        assert!(table.contains("INCOMPLETE"), "table was: {table}");
+    }
+
+    #[test]
+    fn is_safe_leaf_name_rejects_separators_and_traversal() {
+        // P2 #13: a downloaded offsite object name must be a single plain file.
+        for good in ["control.dump", "manifest.json", "shard-orders.dump"] {
+            assert!(is_safe_leaf_name(good), "{good:?} should be accepted");
+        }
+        for bad in [
+            "",
+            "a/b",
+            "a\\b",
+            "..\\..\\evil",
+            "../evil",
+            "C:\\evil",
+            "..",
+            ".",
+            "/abs",
+            "sub/manifest.json",
+        ] {
+            assert!(!is_safe_leaf_name(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn remote_run_token_is_eight_lowercase_hex() {
+        // P2 #12: the token is 8 hex chars derived from host/pid/time entropy.
+        let token = remote_run_token();
+        assert_eq!(token.len(), 8, "token was {token:?}");
+        assert!(
+            token
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "token must be lowercase hex: {token:?}"
+        );
+    }
+
+    #[test]
+    fn remote_run_id_appends_token_to_local_id() {
+        // P2 #12: remote id = <local timestamp>-<token>; the timestamp still leads
+        // so lexical sort (and thus `latest`) is unchanged.
+        let id = remote_run_id("20260710T040506Z", "deadbeef");
+        assert_eq!(id, "20260710T040506Z-deadbeef");
+        assert!(id.starts_with("20260710T040506Z"));
+    }
+
+    #[test]
+    fn match_exact_remote_run_resolves_by_full_id_and_timestamp() {
+        // P2 #12: complete remote run ids carry a token; a selector matches by
+        // full id OR by the bare timestamp when exactly one tokened id begins with it.
+        let ids: Vec<String> = ["20260709T010101Z-aaaa1111", "20260710T040506Z-bbbb2222"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        // Full id → itself.
+        assert_eq!(
+            match_exact_remote_run(&ids, "20260710T040506Z-bbbb2222").unwrap(),
+            "20260710T040506Z-bbbb2222"
+        );
+        // Bare timestamp uniquely prefixes one run → that run.
+        assert_eq!(
+            match_exact_remote_run(&ids, "20260710T040506Z").unwrap(),
+            "20260710T040506Z-bbbb2222"
+        );
+        // A timestamp with no matching run → Err(empty).
+        assert_eq!(
+            match_exact_remote_run(&ids, "20990101T000000Z").unwrap_err(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn match_exact_remote_run_errors_on_ambiguous_same_second() {
+        // Two hosts backed up the SAME second → two tokened ids share the <ts>.
+        // A bare-timestamp selector is ambiguous and must list both candidates.
+        let ids: Vec<String> = ["20260710T040506Z-aaaa1111", "20260710T040506Z-bbbb2222"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let err = match_exact_remote_run(&ids, "20260710T040506Z").unwrap_err();
+        assert_eq!(err.len(), 2);
+        assert!(err.contains(&"20260710T040506Z-aaaa1111".to_owned()));
+        assert!(err.contains(&"20260710T040506Z-bbbb2222".to_owned()));
+        // But the full id still resolves unambiguously.
+        assert_eq!(
+            match_exact_remote_run(&ids, "20260710T040506Z-aaaa1111").unwrap(),
+            "20260710T040506Z-aaaa1111"
+        );
+    }
+
+    #[test]
+    fn complete_remote_run_ids_sort_newest_last_with_tokens() {
+        // P2 #12: the <ts> dominates the lexical sort, so `latest` (newest) is the
+        // last element regardless of the token tiebreak.
+        let list_prefix = "db/prod/";
+        let objects = vec![
+            s3::S3Object {
+                key: "db/prod/20260710T040506Z-zzzz9999/manifest.json".to_owned(),
+                size: 1,
+            },
+            s3::S3Object {
+                key: "db/prod/20260711T040506Z-aaaa0000/manifest.json".to_owned(),
+                size: 1,
+            },
+        ];
+        let ids = complete_remote_run_ids(&objects, list_prefix);
+        assert_eq!(ids.last().unwrap(), "20260711T040506Z-aaaa0000");
+    }
+
+    #[test]
+    fn plan_remote_pruning_keeps_newest_and_never_the_just_uploaded() {
+        let runs: Vec<String> = ["r1", "r2", "r3", "r4", "r5"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        // Keep 2 => remove r1, r2, r3 (the 3 oldest). r5 is the just-uploaded.
+        assert_eq!(
+            plan_remote_pruning(&runs, 2, "r5"),
+            vec!["r1".to_owned(), "r2".to_owned(), "r3".to_owned()]
+        );
+        // keep >= len => remove nothing.
+        assert!(plan_remote_pruning(&runs, 5, "r5").is_empty());
+        // keep 0 clamps to 1 (never wipe everything).
+        assert_eq!(plan_remote_pruning(&runs, 0, "r5").len(), 4);
+    }
+
+    #[test]
+    fn plan_remote_pruning_excludes_just_uploaded_even_if_oldest() {
+        // Pathological: the just-uploaded run id sorts oldest (clock skew). It
+        // must STILL never be pruned.
+        let runs: Vec<String> = ["a", "b", "c"].iter().map(|s| (*s).to_owned()).collect();
+        // keep 1 => would remove a, b; but "a" is the just-uploaded => keep it.
+        assert_eq!(plan_remote_pruning(&runs, 1, "a"), vec!["b".to_owned()]);
+    }
+
+    #[test]
+    fn parse_offsite_ref_handles_latest_and_explicit() {
+        let latest = parse_offsite_ref("offsite:prod/latest").unwrap();
+        assert_eq!(latest.profile, "prod");
+        assert_eq!(latest.selector, OffsiteSelector::Latest);
+
+        // Case-insensitive "latest".
+        assert_eq!(
+            parse_offsite_ref("prod/LATEST").unwrap().selector,
+            OffsiteSelector::Latest
+        );
+
+        let exact = parse_offsite_ref("offsite:prod/20260710T040506Z").unwrap();
+        assert_eq!(exact.profile, "prod");
+        assert_eq!(
+            exact.selector,
+            OffsiteSelector::Exact("20260710T040506Z".to_owned())
+        );
+
+        // Missing pieces => None.
+        assert!(parse_offsite_ref("offsite:prod").is_none());
+        assert!(parse_offsite_ref("offsite:/latest").is_none());
+        assert!(parse_offsite_ref("prod/").is_none());
+    }
+
+    #[test]
+    fn resolve_offsite_ref_routes_local_only_when_not_indicated() {
+        // (c) A bare local path with neither flag nor prefix routes to LOCAL
+        // restore (None), unchanged.
+        assert!(resolve_offsite_ref(false, "backups/prod/20260710T040506Z").is_none());
+        assert!(resolve_offsite_ref(false, "latest").is_none());
+
+        // (d) Well-formed offsite refs parse (Some(Ok(_))).
+        let ok = resolve_offsite_ref(false, "offsite:prod/latest").unwrap();
+        assert_eq!(
+            ok.unwrap(),
+            OffsiteRef {
+                profile: "prod".to_owned(),
+                selector: OffsiteSelector::Latest,
+            }
+        );
+        let ok = resolve_offsite_ref(true, "prod/20260710T040506Z").unwrap();
+        assert_eq!(
+            ok.unwrap(),
+            OffsiteRef {
+                profile: "prod".to_owned(),
+                selector: OffsiteSelector::Exact("20260710T040506Z".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_offsite_ref_errors_on_malformed_when_indicated() {
+        // (a) `--offsite` with a malformed ref (no `<profile>/`) must ERROR, not
+        // fall through to a local artifact named `latest`.
+        let err = resolve_offsite_ref(true, "latest").unwrap().unwrap_err();
+        assert!(matches!(err, BackupError::InvalidOffsiteRef { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("latest"));
+        assert!(msg.contains("offsite:<profile>/<timestamp|latest>"));
+
+        // (b) `offsite:` prefix with a malformed body must ERROR too.
+        assert!(matches!(
+            resolve_offsite_ref(false, "offsite:prod").unwrap(),
+            Err(BackupError::InvalidOffsiteRef { .. })
+        ));
+        assert!(matches!(
+            resolve_offsite_ref(false, "offsite:/latest").unwrap(),
+            Err(BackupError::InvalidOffsiteRef { .. })
+        ));
+        // Flag set but empty positional => still an offsite error, not local.
+        assert!(matches!(
+            resolve_offsite_ref(true, "").unwrap(),
+            Err(BackupError::InvalidOffsiteRef { .. })
+        ));
+    }
+
+    #[test]
+    fn group_and_format_offsite_listing() {
+        let list_prefix = "db/prod/";
+        let objects = vec![
+            s3::S3Object {
+                key: "db/prod/20260710T040506Z/manifest.json".to_owned(),
+                size: 128,
+            },
+            s3::S3Object {
+                key: "db/prod/20260710T040506Z/control.dump".to_owned(),
+                size: 4096,
+            },
+            s3::S3Object {
+                key: "db/prod/20260709T040506Z/control.dump".to_owned(),
+                size: 2048,
+            },
+        ];
+        let runs = group_offsite_objects(&objects, list_prefix);
+        assert_eq!(runs.len(), 2);
+        // Sorted ascending by run id.
+        assert_eq!(runs[0].run_id, "20260709T040506Z");
+        assert_eq!(runs[1].run_id, "20260710T040506Z");
+        assert_eq!(runs[1].total, 128 + 4096);
+
+        let table = format_offsite_listing(&runs);
+        assert!(table.contains("RUN ID"));
+        assert!(table.contains("20260710T040506Z"));
+        assert!(table.contains("control.dump"));
+        assert!(table.contains("manifest.json"));
+    }
+
+    #[test]
+    fn human_size_scales_units() {
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(2048), "2.0 KiB");
+        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MiB");
     }
 
     /// Docker/live-DB round-trip (AC #5). Ignored by default; run with a live
@@ -2251,12 +4877,13 @@ mod tests {
         let targets = vec![ResolvedTarget {
             label: "control".to_owned(),
             url: url.clone(),
+            backend: TargetBackend::Postgres,
         }];
         backup_into(
             &run_dir,
             &targets,
             BackupFormat::Custom,
-            &pg_dump,
+            Some(&pg_dump),
             &tools,
             "dev",
         )
@@ -2272,8 +4899,15 @@ mod tests {
 
         // Restore.
         let artifact = run_dir.join("control.dump");
-        run_restore_one(&tools, &url, &artifact, BackupFormat::Custom, "dev")
-            .expect("restore succeeds");
+        run_restore_one(
+            &tools,
+            &url,
+            &artifact,
+            TargetBackend::Postgres,
+            BackupFormat::Custom,
+            "dev",
+        )
+        .expect("restore succeeds");
 
         // Row-level equality.
         let rows: Vec<Rt> = sql_query("SELECT id, name FROM backup_rt ORDER BY id")
