@@ -12213,6 +12213,32 @@ mod tests {
     }
 
     #[test]
+    fn status_never_renders_a_green_marker_for_an_unready_host() {
+        // #2273, end to end from the probe: curl's `000` (no answer) and a 503
+        // both render `⚠️`, and neither is drift.
+        let fleet = fleet_of(&["web-a", "web-b", "web-c"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        recorder = script_status(recorder, "web-a", "r1", "200", false);
+        recorder = script_status(recorder, "web-b", "r1", "503", false);
+        recorder = script_status(recorder, "web-c", "r1", "000", false);
+
+        let statuses = drive_status(&fleet, &recorder).expect("status reports");
+        let report = fleet::fleet_drift(&statuses);
+        assert!(!report.drifted(), "{:?}", report.state_drift);
+        let rendered = fleet::fleet_status_lines(&statuses, &report).join("\n");
+        let row = |host: &str| {
+            rendered
+                .lines()
+                .find(|line| line.contains(host))
+                .expect("every host has a row")
+        };
+        assert!(row("web-a").starts_with("  \u{2705}"), "{rendered}");
+        for host in ["web-b", "web-c"] {
+            assert!(row(host).starts_with("  \u{26A0}"), "{rendered}");
+        }
+    }
+
+    #[test]
     fn fleet_status_json_shape_is_stable_and_carries_no_secret() {
         // The repo's own skills are a first-class consumer of `--json`, so the field
         // names are a contract. Nothing here is derived from a shell line or a driver

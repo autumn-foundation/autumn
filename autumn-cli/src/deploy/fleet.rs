@@ -1260,8 +1260,8 @@ pub(crate) const MAINTENANCE_DOES_NOT_DRAIN_NOTE: &str = "maintenance mode does 
 
 /// Footer text for deployed hosts whose `/ready` answered with a non-2xx code
 /// (issue #2273).
-pub(crate) const NOT_READY_NOTE: &str = "a load balancer takes these hosts out of rotation. `--strict` does \
-     not count this as drift.";
+pub(crate) const NOT_READY_NOTE: &str = "a load balancer that checks `/ready` stops sending traffic to \
+     them. `--strict` does not count this as drift.";
 
 /// Footer text for deployed hosts whose `/ready` gave no answer (issue #2273).
 pub(crate) const READY_UNKNOWN_NOTE: &str = "the app can be down, or the probe failed (no `curl`, or a \
@@ -1315,31 +1315,30 @@ pub(crate) struct HostStatus {
     pub(crate) last_deploy: Option<exec::LastDeploy>,
 }
 
-/// What a host's `/ready` code tells the operator (issue #2273). It sets the row
-/// marker and a footer line. It is never drift.
+/// A problem with a deployed host's `/ready` answer (issue #2273). It sets the
+/// row marker and a footer line. It is never drift.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Readiness {
-    /// The host is unreachable or has no release, so there is no app to ask.
-    NotJudged,
-    /// A 2xx answer.
-    Ready,
-    /// A deployed host that answered with this non-2xx code.
+enum ReadyConcern {
+    /// The app answered with this non-2xx code.
     NotReady(u16),
-    /// A deployed host that gave no answer.
-    Unknown,
+    /// Nothing answered.
+    NoAnswer,
 }
 
 impl HostStatus {
-    /// The `/ready` verdict for this row. Only a reachable host with a deployed
-    /// release has an app to ask.
-    pub(crate) fn readiness(&self) -> Readiness {
+    /// The `/ready` problem on this host, if any. Only a reachable host with a
+    /// deployed release has an app to ask, so all other hosts give `None`.
+    ///
+    /// Only 2xx is ready. Autumn's `/ready` answers 200 or 503, so a 3xx comes
+    /// from something else on the port. The deploy gate (`curl -f`) accepts a 3xx.
+    fn ready_concern(&self) -> Option<ReadyConcern> {
         if !self.reachable || self.mode != Some(HostMode::Redeploy) {
-            return Readiness::NotJudged;
+            return None;
         }
         match self.ready_code {
-            Some(code) if (200..300).contains(&code) => Readiness::Ready,
-            Some(code) => Readiness::NotReady(code),
-            None => Readiness::Unknown,
+            Some(code) if (200..300).contains(&code) => None,
+            Some(code) => Some(ReadyConcern::NotReady(code)),
+            None => Some(ReadyConcern::NoAnswer),
         }
     }
 
@@ -1601,8 +1600,9 @@ fn status_row_cells(status: &HostStatus, report: &DriftReport) -> [String; 8] {
     ]
 }
 
-/// One status row's marker: `❌` unreachable, `⚠️` for drift, maintenance or a
-/// `/ready` that is not 2xx (issue #2273), else `✅`.
+/// The marker for one status row. `❌`: the host is unreachable. `⚠️`: the host
+/// has drift, maintenance is on, or `/ready` did not give a 2xx answer (issue
+/// #2273). `✅`: all other hosts.
 fn status_marker(status: &HostStatus, report: &DriftReport) -> &'static str {
     if !status.reachable {
         "\u{274C}"
@@ -1611,15 +1611,43 @@ fn status_marker(status: &HostStatus, report: &DriftReport) -> &'static str {
         .iter()
         .any(|(host, _)| *host == status.host)
         || status.maintenance == exec::MaintenanceStatus::On
-        || matches!(
-            status.readiness(),
-            Readiness::NotReady(_) | Readiness::Unknown
-        )
+        || status.ready_concern().is_some()
     {
         "\u{26A0}\u{FE0F} "
     } else {
         "\u{2705}"
     }
+}
+
+/// The footer lines for deployed hosts with a `/ready` problem (issue #2273).
+/// Hosts that answered with a code share one line, and hosts with no answer
+/// share another.
+fn readiness_footer_lines(hosts: &[HostStatus]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut not_ready: Vec<String> = Vec::new();
+    let mut no_answer: Vec<&str> = Vec::new();
+    for status in hosts {
+        match status.ready_concern() {
+            Some(ReadyConcern::NotReady(code)) => {
+                not_ready.push(format!("{} ({code})", status.host));
+            }
+            Some(ReadyConcern::NoAnswer) => no_answer.push(status.host.as_str()),
+            None => {}
+        }
+    }
+    if !not_ready.is_empty() {
+        lines.push(format!(
+            "  \u{26A0}\u{FE0F}  `/ready` is not 2xx on {}: {NOT_READY_NOTE}",
+            not_ready.join(", "),
+        ));
+    }
+    if !no_answer.is_empty() {
+        lines.push(format!(
+            "  \u{26A0}\u{FE0F}  no `/ready` answer from {}: {READY_UNKNOWN_NOTE}",
+            no_answer.join(", "),
+        ));
+    }
+    lines
 }
 
 /// The `deploy status` table: one aligned row per host, then the verdict.
@@ -1629,8 +1657,8 @@ fn status_marker(status: &HostStatus, report: &DriftReport) -> &'static str {
 /// about how a host row looks (plan §7.3).
 ///
 /// Readiness and maintenance are deliberately SEPARATE columns; see
-/// [`MAINTENANCE_DOES_NOT_DRAIN_NOTE`]. A `/ready` that is not 2xx sets the
-/// marker, not drift; see [`Readiness`].
+/// [`MAINTENANCE_DOES_NOT_DRAIN_NOTE`]. A `/ready` answer that is not 2xx, or no
+/// answer, changes the marker. It is not drift. See [`ReadyConcern`].
 pub(crate) fn fleet_status_lines(hosts: &[HostStatus], report: &DriftReport) -> Vec<String> {
     let cells: Vec<[String; 8]> = hosts
         .iter()
@@ -1728,30 +1756,7 @@ pub(crate) fn fleet_status_lines(hosts: &[HostStatus], report: &DriftReport) -> 
     for (host, reason) in &report.state_drift {
         lines.push(format!("  \u{26A0}\u{FE0F}  {host}: {reason}"));
     }
-    let not_ready: Vec<String> = hosts
-        .iter()
-        .filter_map(|status| match status.readiness() {
-            Readiness::NotReady(code) => Some(format!("{} ({code})", status.host)),
-            _ => None,
-        })
-        .collect();
-    if !not_ready.is_empty() {
-        lines.push(format!(
-            "  \u{26A0}\u{FE0F}  `/ready` is not 2xx on {}: {NOT_READY_NOTE}",
-            not_ready.join(", "),
-        ));
-    }
-    let ready_unknown: Vec<&str> = hosts
-        .iter()
-        .filter(|status| status.readiness() == Readiness::Unknown)
-        .map(|status| status.host.as_str())
-        .collect();
-    if !ready_unknown.is_empty() {
-        lines.push(format!(
-            "  \u{26A0}\u{FE0F}  `/ready` gave no answer on {}: {READY_UNKNOWN_NOTE}",
-            ready_unknown.join(", "),
-        ));
-    }
+    lines.extend(readiness_footer_lines(hosts));
     // AC-6's third fact carries its own limits, printed where it is read rather
     // than only in the guide — a column whose scope is misread is worse than no
     // column. Only when there is a reachable host, so an all-unreachable report
@@ -4071,32 +4076,33 @@ mod tests {
         );
     }
 
-    /// The table row for `host`. Rows come right after the title line, so a
-    /// footer line that names the same host never matches.
-    fn status_row<'a>(lines: &'a [String], rows: usize, host: &str) -> &'a str {
-        lines[1..=rows]
-            .iter()
+    /// The table row for `host`. Rows come before every footer line.
+    fn status_row<'a>(rendered: &'a str, host: &str) -> &'a str {
+        rendered
+            .lines()
             .find(|line| line.contains(host))
             .expect("every host has a row")
     }
 
+    /// The `⚠️` marker slot at the start of a row, not a `⚠️` in a drift cell.
+    const WARN_ROW: &str = "  \u{26A0}\u{FE0F} ";
+
     #[test]
     fn a_host_whose_ready_is_not_2xx_never_renders_a_green_marker() {
-        // #2273: a load balancer takes a host out of rotation when `/ready` is not
-        // 2xx. A green marker on that row tells the operator the opposite.
+        // #2273: a load balancer that checks `/ready` stops sending traffic to a
+        // host that is not 2xx. A green marker on that row tells the operator the
+        // opposite.
         let mut unready = status("web-b", Some("r1"));
         unready.ready_code = Some(503);
         let rows = [status("web-a", Some("r1")), unready];
         let report = fleet_drift(&rows);
-        let lines = fleet_status_lines(&rows, &report);
-        let rendered = lines.join("\n");
+        let rendered = fleet_status_lines(&rows, &report).join("\n");
 
-        let web_b = status_row(&lines, rows.len(), "web-b");
+        let web_b = status_row(&rendered, "web-b");
         assert!(web_b.contains("ready 503"), "{rendered}");
-        assert!(!web_b.contains('\u{2705}'), "{rendered}");
-        assert!(web_b.contains('\u{26A0}'), "{rendered}");
+        assert!(web_b.starts_with(WARN_ROW), "{rendered}");
         assert!(
-            status_row(&lines, rows.len(), "web-a").contains('\u{2705}'),
+            status_row(&rendered, "web-a").contains('\u{2705}'),
             "a ready host keeps its green marker:\n{rendered}"
         );
         assert!(
@@ -4113,13 +4119,11 @@ mod tests {
         silent.ready_code = None;
         let rows = [status("web-a", Some("r1")), silent];
         let report = fleet_drift(&rows);
-        let lines = fleet_status_lines(&rows, &report);
-        let rendered = lines.join("\n");
+        let rendered = fleet_status_lines(&rows, &report).join("\n");
 
-        let web_b = status_row(&lines, rows.len(), "web-b");
+        let web_b = status_row(&rendered, "web-b");
         assert!(web_b.contains("ready ?"), "{rendered}");
-        assert!(!web_b.contains('\u{2705}'), "{rendered}");
-        assert!(web_b.contains('\u{26A0}'), "{rendered}");
+        assert!(web_b.starts_with(WARN_ROW), "{rendered}");
         assert!(
             rendered.contains(READY_UNKNOWN_NOTE),
             "the footer says the CLI could not tell:\n{rendered}"
@@ -4136,23 +4140,23 @@ mod tests {
         no_content.ready_code = Some(204);
         let rows = [no_content];
         let report = fleet_drift(&rows);
-        let lines = fleet_status_lines(&rows, &report);
-        let rendered = lines.join("\n");
+        let rendered = fleet_status_lines(&rows, &report).join("\n");
         assert!(
-            status_row(&lines, rows.len(), "web-a").contains('\u{2705}'),
+            status_row(&rendered, "web-a").contains('\u{2705}'),
             "{rendered}"
         );
         assert!(!rendered.contains(NOT_READY_NOTE), "{rendered}");
     }
 
     #[test]
-    fn readiness_is_not_judged_on_a_host_with_nothing_deployed() {
-        // A host with no release has no app to answer `/ready`. The existing
-        // "no release deployed" footer covers it, so no readiness footer shows.
+    fn readiness_is_not_judged_on_an_empty_or_unreachable_host() {
+        // A host with no release has no app to answer `/ready`, and the
+        // "no release deployed" footer covers it. An unreachable host has its own
+        // `❌` row, so the report stays about the outage.
         let mut empty = status("web-a", None);
         empty.mode = Some(HostMode::First);
         empty.ready_code = None;
-        let rows = [empty];
+        let rows = [empty, HostStatus::unreachable("web-b")];
         let report = fleet_drift(&rows);
         let rendered = fleet_status_lines(&rows, &report).join("\n");
         assert!(!rendered.contains(READY_UNKNOWN_NOTE), "{rendered}");
@@ -4162,7 +4166,7 @@ mod tests {
     #[test]
     fn an_unready_host_is_not_drift() {
         // #2273: readiness changes during a normal drain or start-up. `--strict`
-        // alerts on drift from cron, so readiness must not page anyone.
+        // runs from cron and sends an alert on drift. Readiness must not send one.
         let mut unready = status("web-b", Some("r1"));
         unready.ready_code = Some(503);
         let mut silent = status("web-c", Some("r1"));
