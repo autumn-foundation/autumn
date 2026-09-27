@@ -2040,7 +2040,7 @@ impl RequestBuilder {
     }
 
     /// How many attempts the retry policy allows for this request.
-    fn max_attempts(&self, suppress_retries: bool) -> u32 {
+    const fn max_attempts(&self, suppress_retries: bool) -> u32 {
         if suppress_retries {
             1
         } else if is_idempotent_method(&self.method) || !self.retry_policy.retry_idempotent_only {
@@ -2536,10 +2536,10 @@ async fn serve_sim_host(
     request: &RequestBuilder,
     url: reqwest::Url,
 ) -> Result<Response, ClientError> {
-    let target = match url.query() {
-        Some(query) => format!("{}?{query}", url.path()),
-        None => url.path().to_owned(),
-    };
+    let target = url.query().map_or_else(
+        || url.path().to_owned(),
+        |query| format!("{}?{query}", url.path()),
+    );
     let mut builder = axum::http::Request::builder()
         .method(request.method.clone())
         .uri(target);

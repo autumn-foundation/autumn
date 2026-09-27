@@ -29,7 +29,7 @@ use crate::entropy::{Entropy, SeededEntropy};
 
 /// Salt `XOR`ed into the sim seed for the shuffler stream, so it is
 /// independent of the app entropy, chaos and crash streams.
-pub(crate) const SHUFFLE_STREAM_SALT: u64 = 0x5_11F7_1E5E_ED00_u64;
+pub const SHUFFLE_STREAM_SALT: u64 = 0x5_11F7_1E5E_ED00_u64;
 
 /// One in this many poll decisions holds a future back for a round.
 const SKIP_ONE_IN: u64 = 4;
@@ -39,7 +39,7 @@ const SKIP_ONE_IN: u64 = 4;
 const MAX_CONSECUTIVE_SKIPS: u8 = 3;
 
 /// The seeded decision stream for one shuffler call.
-pub(crate) fn stream(seed: u64, call: u64) -> Arc<dyn Entropy> {
+pub fn stream(seed: u64, call: u64) -> Arc<dyn Entropy> {
     let derived = SeededEntropy::new(seed ^ SHUFFLE_STREAM_SALT).derive_uuid(call.to_le_bytes());
     let bytes: [u8; 8] = derived.as_bytes()[..8]
         .try_into()
@@ -49,7 +49,7 @@ pub(crate) fn stream(seed: u64, call: u64) -> Arc<dyn Entropy> {
 
 /// Seeded skip decision with a cap on consecutive skips.
 fn should_skip(rng: &dyn Entropy, skips: &mut u8) -> bool {
-    if *skips < MAX_CONSECUTIVE_SKIPS && rng.next_u64() % SKIP_ONE_IN == 0 {
+    if *skips < MAX_CONSECUTIVE_SKIPS && rng.next_u64().is_multiple_of(SKIP_ONE_IN) {
         *skips += 1;
         true
     } else {
@@ -59,7 +59,7 @@ fn should_skip(rng: &dyn Entropy, skips: &mut u8) -> bool {
 }
 
 /// Runs futures concurrently and polls them in a seeded order.
-pub(crate) struct Interleave<F: Future> {
+pub struct Interleave<F: Future> {
     ops: Vec<Option<Pin<Box<F>>>>,
     outputs: Vec<Option<F::Output>>,
     skips: Vec<u8>,
@@ -67,7 +67,7 @@ pub(crate) struct Interleave<F: Future> {
 }
 
 impl<F: Future> Interleave<F> {
-    pub(crate) fn new(ops: Vec<F>, rng: Arc<dyn Entropy>) -> Self {
+    pub fn new(ops: Vec<F>, rng: Arc<dyn Entropy>) -> Self {
         let len = ops.len();
         Self {
             ops: ops.into_iter().map(|op| Some(Box::pin(op))).collect(),
@@ -127,14 +127,14 @@ impl<F: Future> Future for Interleave<F> {
 }
 
 /// A task that can yield before a poll, from the seeded stream.
-pub(crate) struct Shuffled<F> {
+pub struct Shuffled<F> {
     op: Pin<Box<F>>,
     skips: u8,
     rng: Arc<dyn Entropy>,
 }
 
 impl<F> Shuffled<F> {
-    pub(crate) fn new(op: F, rng: Arc<dyn Entropy>) -> Self {
+    pub fn new(op: F, rng: Arc<dyn Entropy>) -> Self {
         Self {
             op: Box::pin(op),
             skips: 0,

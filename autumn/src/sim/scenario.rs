@@ -109,7 +109,6 @@ pub fn run_fuzz_input(bytes: &[u8]) {
 
 /// The proptest strategy the sweep draws op sequences from.
 #[cfg(feature = "sim-testing")]
-#[must_use]
 pub fn ops_strategy() -> impl proptest::strategy::Strategy<Value = Vec<Op>> {
     proptest::collection::vec(proptest::arbitrary::any::<Op>(), 1..=MAX_OPS)
 }

@@ -380,6 +380,7 @@ mod sharding_commit_hooks;
 mod sharding_integration;
 mod signed_webhooks;
 mod sim_advance_to;
+mod sim_ambient_clock;
 mod sim_chaos_clock_skew_monotonic;
 mod sim_clock_drain;
 #[cfg(feature = "collab")]

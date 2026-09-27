@@ -208,6 +208,7 @@ impl SimNet {
                 latency,
                 fault,
             });
+            drop(state);
             (latency, fault)
         };
         if !latency.is_zero() {

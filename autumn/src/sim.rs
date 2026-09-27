@@ -250,6 +250,10 @@ pub struct Sim {
     /// stream from the seed and this count. Atomic so `&self` stays `Sync`.
     shuffle_calls: std::sync::atomic::AtomicU64,
 
+    /// Keeps the virtual clock installed as this thread's ambient clock
+    /// (issue #2967) while the sim lives. See [`crate::time::ambient_now`].
+    _ambient: crate::time::AmbientGuard,
+
     /// How many times [`mount`](Sim::mount) has run. The first mount seeds the
     /// app's entropy from [`seed`](Sim::seed); each restart derives a new seed
     /// from it, so a restarted process does not replay the crashed one's ids.
@@ -273,10 +277,13 @@ impl Sim {
             .timestamp_opt(SIM_EPOCH_UNIX_SECS, 0)
             .single()
             .unwrap_or_else(|| Utc.timestamp_nanos(0));
+        let clock = SimClock::new(TickingClock::starting_at(epoch));
+        let ambient = crate::time::install_ambient(Arc::new(clock.ticking()));
         Self {
             seed,
             rng: SimRng::new(seed),
-            clock: SimClock::new(TickingClock::starting_at(epoch)),
+            clock,
+            _ambient: ambient,
             chaos: Chaos::default(),
             chaos_state: None,
             app: SimApp::default(),

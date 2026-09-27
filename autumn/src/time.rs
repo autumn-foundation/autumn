@@ -476,10 +476,115 @@ impl ClockSource for TickingClock {
 /// [`AppState::monotonic`](crate::state::AppState::monotonic),
 /// [`Clock::monotonic`], or `clock.monotonic()` on a threaded-in
 /// `Arc<dyn ClockSource>` — because only those follow a virtual clock under a
-/// [`#[sim_test]`](crate::sim_test). This function never does.
+/// [`#[sim_test]`](crate::sim_test). This function never does; for a reading
+/// that follows a running `Sim`, use [`ambient_monotonic`].
 #[must_use]
 pub fn monotonic_now() -> MonotonicInstant {
     SystemClock.monotonic()
+}
+
+// ── Ambient clock ─────────────────────────────────────────────────────────────
+//
+// Framework code with no clock handle in scope used to read the OS clock
+// directly, which a `Sim` cannot control (issue #2967). The ambient clock is
+// the fix: a `Sim` installs its virtual clock for its own thread while it
+// lives, and the `ambient_*` helpers read it. The sim runtime is a
+// current-thread runtime, so every task it polls runs on that thread. Other
+// threads, and code that runs with no `Sim`, see the system clock.
+
+thread_local! {
+    /// The clocks installed on this thread, newest last, with their ids.
+    static AMBIENT: std::cell::RefCell<Vec<(u64, Arc<dyn ClockSource>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Ids for [`install_ambient`] entries.
+static NEXT_AMBIENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Removes its clock from the ambient stack when dropped.
+#[derive(Debug)]
+pub(crate) struct AmbientGuard {
+    id: u64,
+}
+
+impl Drop for AmbientGuard {
+    fn drop(&mut self) {
+        // `try_with`: a guard dropped during thread teardown finds no stack.
+        let _ = AMBIENT.try_with(|stack| {
+            stack.borrow_mut().retain(|(id, _)| *id != self.id);
+        });
+    }
+}
+
+/// Make `clock` the ambient clock of this thread until the guard drops. The
+/// newest installed clock wins, so a nested `Sim` shadows an outer one.
+pub(crate) fn install_ambient(clock: Arc<dyn ClockSource>) -> AmbientGuard {
+    let id = NEXT_AMBIENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    AMBIENT.with(|stack| stack.borrow_mut().push((id, clock)));
+    AmbientGuard { id }
+}
+
+/// Run `read` on the ambient clock, or on [`SystemClock`] when none is set.
+fn with_ambient<T>(read: impl FnOnce(&dyn ClockSource) -> T) -> T {
+    let clock = AMBIENT
+        .try_with(|stack| stack.borrow().last().map(|(_, clock)| Arc::clone(clock)))
+        .ok()
+        .flatten();
+    match clock {
+        Some(clock) => read(clock.as_ref()),
+        None => read(&SystemClock),
+    }
+}
+
+/// A [`ClockSource`] that reads the ambient clock: the running
+/// [`Sim`](crate::sim::Sim)'s virtual clock on this thread, else the system
+/// clock.
+///
+/// Use it where framework code needs a clock but has none in scope. Prefer
+/// the app's injected clock ([`AppState::clock`](crate::state::AppState::clock),
+/// the [`Clock`] extractor) wherever one is reachable.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AmbientClock;
+
+impl ClockSource for AmbientClock {
+    fn now(&self) -> DateTime<Utc> {
+        ambient_now()
+    }
+
+    fn monotonic(&self) -> MonotonicInstant {
+        ambient_monotonic()
+    }
+}
+
+/// The ambient wall-clock time. Replaces `Utc::now()` where no clock is in
+/// scope. See [`AmbientClock`].
+#[must_use]
+pub fn ambient_now() -> DateTime<Utc> {
+    with_ambient(ClockSource::now)
+}
+
+/// The ambient monotonic instant. Replaces `Instant::now()` for elapsed time
+/// where no clock is in scope. See [`AmbientClock`].
+#[must_use]
+pub fn ambient_monotonic() -> MonotonicInstant {
+    with_ambient(ClockSource::monotonic)
+}
+
+/// The ambient monotonic instant as a [`std::time::Instant`], for code that
+/// stores or passes `Instant`s. See [`AmbientClock`].
+///
+/// Measure with `ambient_instant().saturating_duration_since(start)`, not
+/// `start.elapsed()`: `elapsed` reads the OS clock.
+#[must_use]
+pub fn ambient_instant() -> std::time::Instant {
+    *MONOTONIC_ORIGIN + ambient_monotonic().since_origin()
+}
+
+/// The ambient wall-clock time as a [`std::time::SystemTime`]. Replaces
+/// `SystemTime::now()` where no clock is in scope. See [`AmbientClock`].
+#[must_use]
+pub fn ambient_system_time() -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + clock_unix_duration(&AmbientClock)
 }
 
 /// Compute the current Unix timestamp in seconds from the given clock.
