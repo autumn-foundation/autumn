@@ -29,6 +29,9 @@
 #      `[dependencies.web]` + `package = "autumn-web"`, `web.package = "…"`) —
 #      a rename splits the crate name away from the `features` list, so the
 #      manifest is read twice and the aliases resolved before the rules run.
+#      Quoted keys are normalized before the rules run: `"autumn-web" = { … }`,
+#      `[dependencies."autumn-web"]`, and `"autumn-web".features = [ … ]` are
+#      all spellings cargo accepts (issue #2569).
 #   2. No `[features]` entry forwards `autumn-web/sqlite` / `autumn-cli/sqlite`
 #      unless the entry is ITSELF named `sqlite` AND the manifest belongs to one
 #      of those two crates. That single exception is autumn-cli's own opt-in
@@ -125,6 +128,23 @@ scan_manifest() {
     # with the quotes normalized rather than writing every pattern twice.
     function normalize_quotes(s) { gsub(SQ, "\"", s); return s }
 
+    # A TOML key may be quoted — `"autumn-web" = { … }`,
+    # `"autumn-web".features = [ … ]`, `[dependencies."autumn-web"]` — and
+    # cargo accepts every spelling. The rules anchor on unquoted keys, so
+    # hand them one spelling: strip the key-quoting from the entry ahead of
+    # the first `=`. Only the key is touched — quotes inside the value stay
+    # significant to the value patterns (`"sqlite"`, `package = "autumn-web"`,
+    # the `"dep/sqlite"` forwarding paths).
+    function unquote_key(entry,   i, key, tail) {
+      i = index(entry, "=")
+      if (i == 0) return entry
+      key = substr(entry, 1, i - 1)
+      tail = substr(entry, i)
+      gsub(SQ, "", key)
+      gsub(/"/, "", key)
+      return key tail
+    }
+
     # ── Entry assembly ───────────────────────────────────────────────────
     #
     # Joins a logical entry that spans lines — a `features` array written one
@@ -137,14 +157,23 @@ scan_manifest() {
         pending = pending " " line
         if (!balanced(pending)) return ""
         entry = pending; pending = ""
-        return entry
+        return unquote_key(entry)
       }
       gsub(/^[ \t]+|[ \t]+$/, "", line)
       if (line == "") return ""
-      if (line ~ /^\[/) { section = line; return "" }   # a header ends any entry
+      if (line ~ /^\[/) {
+        # A header ends any entry. It carries no string values, so every
+        # quote in it is key-quoting (`[dependencies."autumn-web"]`,
+        # `[target."cfg(unix)".dependencies]`); strip them so the section
+        # matchers work off one spelling.
+        section = line
+        gsub(SQ, "", section)
+        gsub(/"/, "", section)
+        return ""
+      }
       if (!balanced(line)) { pending = line; entry_line = FNR; return "" }
       entry_line = FNR
-      return line
+      return unquote_key(line)
     }
 
     function is_dep_table() {
@@ -461,6 +490,26 @@ web.package = "autumn-web"
 web.features = ["sqlite"]
 EOF
   check_fail "renamed dependency in dotted form" renamed_dotted
+
+  # TOML allows a dependency key to be quoted, and cargo accepts it — every
+  # dependency-edge rule anchors on an unquoted key, so these sailed through.
+  make_case quoted_key <<'EOF'
+[dependencies]
+"autumn-web" = { version = "0.7", features = ["sqlite"] }
+EOF
+  check_fail "quoted dependency key" quoted_key
+
+  make_case quoted_section <<'EOF'
+[dependencies."autumn-web"]
+features = ["sqlite"]
+EOF
+  check_fail "quoted section-form dependency table" quoted_section
+
+  make_case quoted_dotted <<'EOF'
+[dependencies]
+"autumn-web".features = ["sqlite"]
+EOF
+  check_fail "quoted dotted-key dependency form" quoted_dotted
 
   make_case renamed_unrelated <<'EOF'
 [dependencies.store]

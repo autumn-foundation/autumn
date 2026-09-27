@@ -102,6 +102,29 @@ step "./scripts/check-plugin-surface.sh   (self-test + plugin API contract; no t
 step "./scripts/check-sqlite-unification.sh   (self-test + manifest gate; no toolchain)"
 ./scripts/check-sqlite-unification.sh
 
+# --- 1e. Example binary-name collision gate (issues #2690/#2691) ---------------
+# Mirrors ci.yml `lint` job: `./scripts/check-example-bin-names.sh`. Same
+# shape as the gates above — seconds, no toolchain, self-testing — and it
+# covers the one invariant the compile legs cannot report on their own: two
+# members producing the same binary file name only breaks the Windows
+# linker (LNK1104, issue #2639), intermittently, so without a manifest gate
+# the reintroduction passes every other check. The script enumerates explicit
+# [[bin]] AND auto-discovered src/bin targets (#2690 corrected the old
+# "explicit disables autobins" assumption).
+step "./scripts/check-example-bin-names.sh   (self-test + manifest gate; no toolchain)"
+./scripts/check-example-bin-names.sh
+
+# --- 1f. Changelog fragment gate ---------------------------------------------
+# Mirrors ci.yml `migration-guides` job:
+# `./scripts/check-changelog-fragments.sh`. Same shape as the gates above —
+# seconds, no toolchain, self-testing. It is here because the thing it catches
+# is cheapest to fix before the push: a release note written into CHANGELOG.md
+# instead of its own `changelog.d/` file, which is the line every other open PR
+# also edits.
+step "./scripts/check-changelog-fragments.sh   (self-test + changelog notes; no toolchain)"
+./scripts/check-changelog-fragments.sh --self-test >/dev/null
+./scripts/check-changelog-fragments.sh
+
 # --- 2. Formatting -----------------------------------------------------------
 # Mirrors ci.yml `lint` job: `cargo fmt --all -- --check`.
 step "cargo fmt --all -- --check"
@@ -133,7 +156,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 # `--all-targets` form.
 step "cargo clippy -p autumn-web --features \"<gated request-path set>\" --lib -- -D warnings"
 cargo clippy -p autumn-web \
-  --features "ws,mail,offline-sync,redis,markdown,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme" \
+  --features "ws,mail,offline-sync,collab,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme" \
   --lib -- -D warnings
 
 step "cargo clippy -p autumn-web --features \"plugin-sandbox,test-support\" --lib -- -D warnings"

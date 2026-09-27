@@ -22,6 +22,8 @@
 //! [media.storage]
 //! backend = "s3"
 //! bucket = "${MEDIA_BUCKET}"
+//! # Required for a generic (non-Tigris) S3 backend.
+//! public_base_url = "https://cdn.example.com/media"
 //! ```
 
 use std::collections::HashMap;
@@ -102,6 +104,21 @@ pub enum MediaConfigError {
          media.storage.secret_access_key must both be set, or neither"
     )]
     MissingS3Credential,
+    /// `[media.storage].backend = "s3"` on a generic (non-Tigris) endpoint with
+    /// no `public_base_url`.
+    ///
+    /// Mirrors [`MediaError::MissingPublicBaseUrl`](crate::MediaError::MissingPublicBaseUrl)
+    /// so boot-time validation rejects exactly what
+    /// [`MediaStorage::from_config`](crate::MediaStorage::from_config) would
+    /// reject on first use. `bucket` is a configuration value, not a secret.
+    #[error(
+        "media.storage.public_base_url is required for a generic (non-Tigris) \
+         S3 backend (bucket `{bucket}`): set it to the bucket's public base URL"
+    )]
+    MissingPublicBaseUrl {
+        /// The S3 bucket configured without a resolvable public base.
+        bucket: String,
+    },
     /// `[media].room_max_participants` was `0` or exceeded the hard cap of
     /// [`DEFAULT_ROOM_MAX_PARTICIPANTS`] (mesh rooms have no SFU).
     #[error(
@@ -418,8 +435,10 @@ impl MediaConfig {
     /// Returns [`MediaConfigError::InvalidRoomMaxParticipants`] when the mesh
     /// room cap is `0` or above [`DEFAULT_ROOM_MAX_PARTICIPANTS`],
     /// [`MediaConfigError::MissingBucket`] when the S3 backend is selected
-    /// without a bucket, and [`MediaConfigError::MissingS3Credential`] when
-    /// exactly one of the access-key / secret-key pair is set.
+    /// without a bucket, [`MediaConfigError::MissingS3Credential`] when
+    /// exactly one of the access-key / secret-key pair is set, and
+    /// [`MediaConfigError::MissingPublicBaseUrl`] when a generic (non-Tigris)
+    /// S3 backend has no `public_base_url`.
     pub fn validate(&self) -> Result<(), MediaConfigError> {
         let max = self.room_max_participants;
         if max == 0 || max > DEFAULT_ROOM_MAX_PARTICIPANTS {
@@ -431,13 +450,22 @@ impl MediaConfig {
         if self.storage.backend != MediaStorageBackend::S3 {
             return Ok(());
         }
-        if non_empty(self.storage.bucket.as_deref()).is_none() {
+        let Some(bucket) = non_empty(self.storage.bucket.as_deref()) else {
             return Err(MediaConfigError::MissingBucket);
-        }
+        };
         let has_key = non_empty(self.storage.access_key_id.as_deref()).is_some();
         let has_secret = non_empty(self.storage.secret_access_key.as_deref()).is_some();
         if has_key != has_secret {
             return Err(MediaConfigError::MissingS3Credential);
+        }
+        // Same rule as `MediaStorage::from_config`, applied at boot instead of
+        // at first upload: only a Tigris endpoint has a derivable public base.
+        if non_empty(self.storage.public_base_url.as_deref()).is_none()
+            && !crate::storage::is_tigris_endpoint(self.storage.endpoint_url.as_deref())
+        {
+            return Err(MediaConfigError::MissingPublicBaseUrl {
+                bucket: bucket.to_owned(),
+            });
         }
         Ok(())
     }
@@ -1192,9 +1220,80 @@ mod tests {
 
     #[test]
     fn validate_accepts_s3_with_bucket_and_no_creds() {
+        // No credentials is fine (the ambient AWS chain resolves them); the
+        // public base is what a generic S3 backend must still declare.
         let mut config = MediaConfig::default();
         config.storage.backend = MediaStorageBackend::S3;
         config.storage.bucket = Some("b".to_owned());
+        config.storage.public_base_url = Some("https://cdn.example.com".to_owned());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_generic_s3_without_public_base_url() {
+        // A generic S3 backend has no derivable public base — deriving one from
+        // an arbitrary private endpoint would advertise wrong URLs, so config
+        // validation fails fast rather than leaving it to first upload.
+        let mut config = MediaConfig::default();
+        config.storage.backend = MediaStorageBackend::S3;
+        config.storage.bucket = Some("b".to_owned());
+        for endpoint in [
+            None,                                             // AWS SDK default endpoint
+            Some("https://s3.amazonaws.com"),                 // AWS
+            Some("https://account.r2.cloudflarestorage.com"), // R2
+            Some("http://minio.internal:9000"),               // MinIO
+        ] {
+            config.storage.endpoint_url = endpoint.map(ToOwned::to_owned);
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(MediaConfigError::MissingPublicBaseUrl { ref bucket }) if bucket == "b"
+                ),
+                "endpoint {endpoint:?} must require an explicit public_base_url"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_tigris_s3_without_public_base_url() {
+        // The arroyo/Tigris path derives `https://{bucket}.t3.tigrisfiles.io/…`,
+        // so it needs no explicit base.
+        let mut config = MediaConfig::default();
+        config.storage.backend = MediaStorageBackend::S3;
+        config.storage.bucket = Some("b".to_owned());
+        for endpoint in ["https://t3.storage.dev", "https://b.tigrisfiles.io"] {
+            config.storage.endpoint_url = Some(endpoint.to_owned());
+            assert!(config.validate().is_ok(), "{endpoint} is a Tigris endpoint");
+        }
+    }
+
+    #[test]
+    fn validate_matches_media_storage_from_config_on_the_public_base_rule() {
+        // Parity guard: `validate` must not accept a config the storage
+        // constructor then rejects at runtime (the whole point of validating).
+        let mut config = MediaConfig::default();
+        config.storage.backend = MediaStorageBackend::S3;
+        config.storage.bucket = Some("b".to_owned());
+        for endpoint in [
+            None,
+            Some("https://s3.amazonaws.com"),
+            Some("https://t3.storage.dev"),
+        ] {
+            config.storage.endpoint_url = endpoint.map(ToOwned::to_owned);
+            assert_eq!(
+                config.validate().is_ok(),
+                crate::storage::MediaStorage::from_config(&config.storage).is_ok(),
+                "validate and MediaStorage::from_config disagree for {endpoint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_local_backend_without_public_base_url() {
+        // The rule is S3-only: the local backend has a served-path default.
+        let mut config = MediaConfig::default();
+        config.storage.backend = MediaStorageBackend::Local;
+        config.storage.public_base_url = None;
         assert!(config.validate().is_ok());
     }
 
@@ -1205,6 +1304,7 @@ mod tests {
         config.storage.bucket = Some("b".to_owned());
         config.storage.access_key_id = Some("key".to_owned());
         config.storage.secret_access_key = Some("secret".to_owned());
+        config.storage.public_base_url = Some("https://cdn.example.com".to_owned());
         assert!(config.validate().is_ok());
     }
 

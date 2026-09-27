@@ -45,7 +45,7 @@ autumn upgrade - app-code migrations 0.5.0 -> 0.6.0
 Migrations in range (2):
   manual  0.6.0-tenancy-jwt-secret-secretstring  `TenancyConfig::jwt_secret` is now a `secrecy::SecretString`
           https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/migrations/0.6.0.md#security-tenancyconfigjwt_secret-is-now-a-secrecysecretstring
-  auto    0.6.0-repository-with-pool-untracked  repository constructor `with_pool` is renamed to `with_pool_untracked`
+  review  0.6.0-repository-with-pool-untracked  repository constructor `with_pool` is renamed to `with_pool_untracked`
           https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/migrations/0.6.0.md#repository-with_pool-is-renamed-to-with_pool_untracked
 
 Preview (nothing is written without --apply):
@@ -57,6 +57,12 @@ src/repositories.rs (2 sites)
 @@ line 18 @@
 -    let repo = PgCommentRepository::with_pool(pool.clone());
 +    let repo = PgCommentRepository::with_pool_untracked(pool.clone());
+
+Review - rewritten, but read each of these before committing:
+  src/repositories.rs:12  0.6.0-repository-with-pool-untracked (rewritten - confirm the new call is what you meant)
+      https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/migrations/0.6.0.md#repository-with_pool-is-renamed-to-with_pool_untracked
+  src/repositories.rs:18  0.6.0-repository-with-pool-untracked (rewritten - confirm the new call is what you meant)
+      https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/migrations/0.6.0.md#repository-with_pool-is-renamed-to-with_pool_untracked
 
 Manual - not rewritten; read the guide section:
   (whole change)  0.6.0-tenancy-jwt-secret-secretstring (no machine-applyable rewrite)

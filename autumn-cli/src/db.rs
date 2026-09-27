@@ -38,6 +38,11 @@ pub mod scrub;
 /// production guard ([`guard_destructive`]) verbatim.
 pub mod replica;
 
+/// Online-safe `SQLite` snapshot/restore behind `autumn db backup` /
+/// `autumn db restore` on the `SQLite` tier (issue #1909). A submodule so it
+/// sits beside the Postgres [`backup`] path it dispatches from.
+pub mod sqlite_snapshot;
+
 /// `autumn db retention` — report, dry-run, and on-demand purge of the
 /// unified data-retention policy for framework-owned data (issue #1605).
 /// A submodule for namespacing only: it drives the app binary rather than
@@ -349,7 +354,13 @@ pub fn quote_literal(value: &str) -> String {
 }
 
 /// Minimal percent-decoding for a URL path segment (database name).
-fn decode_percent(segment: &str) -> String {
+///
+/// Duplicated byte-for-byte in `test_cmd::decode_percent`, which must derive
+/// the same name from the same URL so the `db`/`migrate` and `test` paths
+/// agree on which database they're operating on. The two are pinned equal by
+/// `test_cmd::tests::decode_percent_matches_db_decode_percent`; if you change
+/// this decoding, change that copy too or the test will fail.
+pub fn decode_percent(segment: &str) -> String {
     let bytes = segment.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

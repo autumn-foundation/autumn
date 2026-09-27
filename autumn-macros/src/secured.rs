@@ -112,9 +112,10 @@ fn parse_scope_array(expr: &Expr) -> syn::Result<Vec<String>> {
 }
 
 #[allow(clippy::too_many_lines)]
-// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
-// but keeps the owned `TokenStream` signature every macro entry point in
-// this crate shares (and the proc-macro boundary in `lib.rs` requires).
+// `item` is only ever borrowed via
+// `param_helpers::split_leading_items_and_reject_incompatible` now, but
+// keeps the owned `TokenStream` signature every macro entry point in this
+// crate shares (and the proc-macro boundary in `lib.rs` requires).
 #[allow(clippy::needless_pass_by_value)]
 pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let SecuredArgs { roles, scopes } = match parse_secured_args(attr) {
@@ -122,27 +123,11 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error(),
     };
 
-    let (leading_items, mut input_fn) = match crate::parse::split_leading_items_and_fn(&item) {
-        Ok(v) => v,
-        Err(err) => return err,
-    };
-
-    if input_fn.sig.asyncness.is_none() {
-        return syn::Error::new_spanned(
-            input_fn.sig.fn_token,
-            "#[secured] can only be applied to async functions",
-        )
-        .to_compile_error();
-    }
-
-    // `#[secured]` written below `#[static_get]`/`#[ws]` — including under an
-    // alias those macros' own by-name attribute scan cannot see — is caught
-    // here instead, once this guard's own macro is the one running (Codex
-    // review on #2513, tenth finding). See
-    // `param_helpers::STATIC_ROUTE_HANDLER_MARKER`'s doc comment.
-    if let Some(err) = crate::param_helpers::reject_if_incompatible_route_marker(&input_fn) {
-        return err;
-    }
+    let (leading_items, mut input_fn) =
+        match crate::param_helpers::split_leading_items_and_reject_incompatible(&item, "secured") {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
 
     // An attribute sharing #[authorize]'s argument grammar under a different
     // name is refused rather than guessed at — see
@@ -239,18 +224,7 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // replay-ownership, nor both claim it).
     let owns_replay = should_own_replay(&input_fn);
     let replay_check = if owns_replay {
-        quote! {
-            let __autumn_idempotency_replay = parts
-                .extensions
-                .get::<::autumn_web::idempotency::IdempotencyReplayResponse>()
-                .cloned()
-                .map(::autumn_web::reexports::axum::extract::Extension);
-            if let ::core::option::Option::Some(__autumn_response) =
-                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
-            {
-                return ::core::result::Result::Err(__autumn_response);
-            }
-        }
+        crate::idempotency_guard::owned_replay_check_tokens()
     } else {
         quote! {}
     };
@@ -277,27 +251,8 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     );
 
-    let original_body = &input_fn.block;
-    let original_response = match &input_fn.sig.output {
-        syn::ReturnType::Default => quote! {
-            let __autumn_inner: () = (async move #original_body).await;
-            ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
-        },
-        // Avoid `let x: T = …` when T contains `impl Trait` at any depth.
-        // Rust rejects `impl Trait` in local variable type annotations; drop
-        // the annotation and let type inference handle it instead.
-        syn::ReturnType::Type(_, ty) if crate::param_helpers::type_contains_impl_trait(ty) => {
-            quote! {
-                ::autumn_web::reexports::axum::response::IntoResponse::into_response(
-                    (async move #original_body).await
-                )
-            }
-        }
-        syn::ReturnType::Type(_, ty) => quote! {
-            let __autumn_inner: #ty = (async move #original_body).await;
-            ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
-        },
-    };
+    let original_response =
+        crate::param_helpers::build_original_response(&input_fn.block, &input_fn.sig.output);
 
     // Insert the gate as the FIRST parameter — ahead of every other
     // extractor, including any earlier-inserted guard gate (which then
@@ -344,6 +299,27 @@ mod tests {
         assert_eq!(
             generated,
             include_str!("../testdata/secured_golden.txt").trim_end()
+        );
+    }
+
+    /// Characterization test (Echo refactor, clone class: the
+    /// `split_leading_items_and_fn` + asyncness-check + marker-check preamble
+    /// shared byte-for-byte with `step_up`/`throttle`/`authorize`): pins the
+    /// exact async-required message so factoring the preamble into
+    /// `param_helpers` cannot silently change it or misattribute it to the
+    /// wrong attribute name.
+    #[test]
+    fn secured_rejects_sync_functions_with_the_attribute_named_in_the_message() {
+        let generated = secured_macro(
+            quote! { "admin" },
+            quote! {
+                fn sync_handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("#[secured] can only be applied to async functions"),
+            "should emit the exact async-required message naming #[secured]:\n{generated}"
         );
     }
 
@@ -455,21 +431,21 @@ mod tests {
     #[test]
     fn parses_empty() {
         let a = parse_secured_args(quote! {}).unwrap();
-        assert!(a.roles.is_empty());
-        assert!(a.scopes.is_empty());
+        assert_eq!(a.roles, [] as [String; 0]);
+        assert_eq!(a.scopes, [] as [String; 0]);
     }
 
     #[test]
     fn parses_roles_only() {
         let a = parse_secured_args(quote! { "admin", "editor" }).unwrap();
         assert_eq!(a.roles, vec!["admin", "editor"]);
-        assert!(a.scopes.is_empty());
+        assert_eq!(a.scopes, [] as [String; 0]);
     }
 
     #[test]
     fn parses_scopes_only() {
         let a = parse_secured_args(quote! { scopes = ["posts:read", "posts:write"] }).unwrap();
-        assert!(a.roles.is_empty());
+        assert_eq!(a.roles, [] as [String; 0]);
         assert_eq!(a.scopes, vec!["posts:read", "posts:write"]);
     }
 
@@ -483,6 +459,17 @@ mod tests {
     #[test]
     fn rejects_unknown_key() {
         assert!(parse_secured_args(quote! { foo = ["x"] }).is_err());
+    }
+
+    /// `#[secured(policy = "…")]` is not a form this macro has ever accepted,
+    /// but it read like one: five doc sites (two of them `ignore`d rustdoc
+    /// fences, which are never compiled) told readers to write it. The grammar
+    /// is bare role literals and/or `scopes = [...]`; a `policy` key lands on
+    /// the catch-all arm and fails the build. Pinned so the spelling cannot
+    /// come back looking supported.
+    #[test]
+    fn rejects_policy_key() {
+        assert!(parse_secured_args(quote! { policy = "reports.read" }).is_err());
     }
 
     #[test]

@@ -118,7 +118,7 @@ proc-macro2 = { workspace = true, features = ["span-locations"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
-tokio-postgres-rustls = "0.13"
+tokio-postgres-rustls = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 toml = { workspace = true }
 toml_edit = { workspace = true }
@@ -132,6 +132,16 @@ directories = "6.0.0"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 nix = { version = "0.31.2", features = ["fs", "signal", "socket", "user"] }
+
+# Windows daemon lifecycle (#1639). The workspace forbids `unsafe`, so both of
+# these are chosen for having a safe surface: `sysinfo` supplies the process
+# primitives the Unix arms get from `nix` (liveness, start time, terminate, and
+# the parent links the process-tree sweep walks), and `windows-service` wraps the
+# Service Control Manager — registration with boot start and crash-restart
+# failure actions, plus the control-handler dispatcher a service process runs.
+[target.'cfg(windows)'.dependencies]
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+windows-service = "0.8"
 
 [dev-dependencies]
 # `form` (urlencoded bodies) is needed by the generated-app e2e gates that drive

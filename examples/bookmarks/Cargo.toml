@@ -35,6 +35,14 @@ example-e2e = { path = "../../example-e2e" }
 #   cargo test -p bookmarks --features system-tests --test smoke -- --include-ignored
 system-tests = ["autumn-web/system-tests"]
 
+[[bin]]
+# Crate-unique binary name (autumn #2639): two example crates shipping a bin
+# target named `seed` collide at link time on Windows (LNK1104). The source
+# stays at the conventional `src/bin/seed.rs` so `autumn seed` keeps finding
+# it; only the target name is prefixed.
+name = "bookmarks-seed"
+path = "src/bin/seed.rs"
+
 [[test]]
 name = "smoke"
 path = "tests/system/smoke.rs"

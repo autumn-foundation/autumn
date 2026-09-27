@@ -823,3 +823,88 @@ fn constrained_scaffold_cargo_checks() {
         String::from_utf8_lossy(&check.stderr),
     );
 }
+
+/// Onramp: the literal `docs/guide/generators.md` "Five commands to a
+/// working CRUD app" example — `Post title:String body:Text published:bool`,
+/// no flags — must build with none of three specific warnings that used to
+/// come straight out of the generator: an unused `serde_json` import, an
+/// unused `Update{Model}` import, and an unused `is_nullable_form_field`
+/// parameter (every field in this exact command is required, so the
+/// nullable-field match compiles to a bare `false`). None of those three is a
+/// hard `cargo check` failure on its own, but the generated project's own
+/// `.github/workflows/ci.yml.tmpl` runs `cargo clippy --all-targets -- -D
+/// warnings`, so a brand-new user's first push after following the
+/// documented tutorial verbatim landed on red CI from code they never wrote
+/// themselves.
+///
+/// This asserts on the three warning strings themselves rather than running
+/// with `RUSTFLAGS=-D warnings` or `cargo clippy`: this test patches
+/// `autumn-web` to the in-tree path (the only way to compile the fix before
+/// it is published), and a path dependency does NOT get the registry
+/// dependency's cap-lints treatment a real published-crate build gets — so a
+/// blanket `-D warnings` here would also fail on `autumn-web`'s own
+/// pre-existing, unrelated warnings, which a real user building against
+/// crates.io never sees. `clippy` additionally needs a `clippy` component
+/// this job's toolchain step does not request. The two clippy-only lints
+/// this same fix also covers (`clone_on_copy`, `default_constructed_unit_structs`)
+/// were verified locally against a real `cargo clippy --all-targets -D
+/// warnings` run rather than harnessed here — see
+/// `docs/reports/2026-09-23-onramp-scaffold-clippy-clean.md`.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn documented_scaffold_example_builds_without_warnings() {
+    use std::fmt::Write as _;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "quickstart-warnings-app"]);
+    let project = tmp.path().join("quickstart-warnings-app");
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:Text",
+            "published:bool",
+        ],
+    );
+
+    let cargo_toml_path = project.join("Cargo.toml");
+    let mut content = fs::read_to_string(&cargo_toml_path).unwrap();
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let autumn_web = workspace_root.join("autumn");
+    let _ = write!(
+        content,
+        "\n[patch.crates-io]\nautumn-web = {{ path = \"{}\" }}\n",
+        autumn_web.display().to_string().replace('\\', "/")
+    );
+    fs::write(&cargo_toml_path, content).unwrap();
+
+    let check = Command::new("cargo")
+        .args(["check", "--all-targets"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on the documented scaffold example failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    for needle in [
+        "unused import: `autumn_web::reexports::serde_json`",
+        "unused import: `UpdatePost`",
+        "unused variable: `name`",
+    ] {
+        assert!(
+            !stderr.contains(needle),
+            "the documented scaffold example must not warn `{needle}`:\n{stderr}"
+        );
+    }
+}

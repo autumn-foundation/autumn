@@ -164,35 +164,21 @@ fn build_check_call(max_age_tokens: &TokenStream) -> TokenStream {
 
 /// Expand the `#[step_up]` / `#[step_up(max_age = "Nm")]` attribute.
 #[allow(clippy::too_many_lines)]
-// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
-// but keeps the owned `TokenStream` signature every macro entry point in
-// this crate shares (and the proc-macro boundary in `lib.rs` requires).
+// `item` is only ever borrowed via
+// `param_helpers::split_leading_items_and_reject_incompatible` now, but
+// keeps the owned `TokenStream` signature every macro entry point in this
+// crate shares (and the proc-macro boundary in `lib.rs` requires).
 #[allow(clippy::needless_pass_by_value)]
 pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let max_age_opt = match parse_step_up_args(attr) {
         Ok(v) => v,
         Err(err) => return err.to_compile_error(),
     };
-    let (leading_items, mut input_fn) = match crate::parse::split_leading_items_and_fn(&item) {
-        Ok(v) => v,
-        Err(err) => return err,
-    };
-    if input_fn.sig.asyncness.is_none() {
-        return syn::Error::new_spanned(
-            input_fn.sig.fn_token,
-            "#[step_up] can only be applied to async functions",
-        )
-        .to_compile_error();
-    }
-
-    // `#[step_up]` written below `#[static_get]`/`#[ws]` — including under an
-    // alias those macros' own by-name attribute scan cannot see — is caught
-    // here instead, once this guard's own macro is the one running (Codex
-    // review on #2513, tenth finding). See
-    // `param_helpers::STATIC_ROUTE_HANDLER_MARKER`'s doc comment.
-    if let Some(err) = crate::param_helpers::reject_if_incompatible_route_marker(&input_fn) {
-        return err;
-    }
+    let (leading_items, mut input_fn) =
+        match crate::param_helpers::split_leading_items_and_reject_incompatible(&item, "step_up") {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
 
     // An attribute sharing #[authorize]'s argument grammar under a different
     // name is refused rather than guessed at — see
@@ -238,18 +224,7 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // than re-executing the handler.
     let owns_replay = should_own_replay(&input_fn);
     let replay_check = if owns_replay {
-        quote! {
-            let __autumn_idempotency_replay = parts
-                .extensions
-                .get::<::autumn_web::idempotency::IdempotencyReplayResponse>()
-                .cloned()
-                .map(::autumn_web::reexports::axum::extract::Extension);
-            if let ::core::option::Option::Some(__autumn_response) =
-                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
-            {
-                return ::core::result::Result::Err(__autumn_response);
-            }
-        }
+        crate::idempotency_guard::owned_replay_check_tokens()
     } else {
         quote! {
             let __autumn_idempotency_replay = parts
@@ -289,27 +264,8 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     );
 
-    let original_body = input_fn.block.clone();
-    let original_response = match &input_fn.sig.output {
-        syn::ReturnType::Default => quote! {
-            let __autumn_inner: () = (async move #original_body).await;
-            ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
-        },
-        // Avoid `let x: T = …` when T contains `impl Trait` at any depth.
-        // Rust rejects `impl Trait` in local variable type annotations; drop
-        // the annotation and let type inference handle it instead.
-        syn::ReturnType::Type(_, ty) if crate::param_helpers::type_contains_impl_trait(ty) => {
-            quote! {
-                ::autumn_web::reexports::axum::response::IntoResponse::into_response(
-                    (async move #original_body).await
-                )
-            }
-        }
-        syn::ReturnType::Type(_, ty) => quote! {
-            let __autumn_inner: #ty = (async move #original_body).await;
-            ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
-        },
-    };
+    let original_response =
+        crate::param_helpers::build_original_response(&input_fn.block, &input_fn.sig.output);
 
     // Insert the gate as the FIRST parameter — ahead of every other
     // extractor, including any earlier-inserted guard gate (which then
@@ -644,6 +600,38 @@ mod tests {
         assert!(
             !generated.contains("__replay_response"),
             "must defer replay-ownership while #[authorize] is still pending:\n{generated}"
+        );
+    }
+
+    #[test]
+    fn owns_replay_when_unguarded() {
+        let generated = step_up_macro(
+            quote! {},
+            quote! {
+                async fn handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("__replay_response"),
+            "an otherwise-unguarded step-up handler's gate must own replay-serving:\n{generated}"
+        );
+    }
+
+    #[test]
+    fn defers_replay_to_an_earlier_gate_when_stacked() {
+        // Simulate `#[secured]` having already expanded and inserted its own
+        // gate parameter ahead of `#[step_up]`'s.
+        let generated = step_up_macro(
+            quote! {},
+            quote! {
+                async fn handler(_g: __AutumnSecuredGate_handler) -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("__replay_response"),
+            "must defer replay-ownership to the earlier-inserted gate:\n{generated}"
         );
     }
 

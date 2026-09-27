@@ -943,6 +943,54 @@ async fn a_plugin_without_the_render_capability_fills_no_slot() {
     assert_eq!(plugin.render_slot("order-summary", &[]).await, None);
 }
 
+#[tokio::test]
+async fn the_tenant_a_render_hooks_kv_write_lands_under_is_the_callers_own() {
+    // `the_tenant_a_mounted_plugin_binds_to_is_the_requests_own` (above) is
+    // the only proof in this suite that `CURRENT_TENANT` reaches a capability
+    // call correctly — and it only ever drives that call through `serve`. The
+    // 2026-09-14 Keystone cross-tenant-key-derivation memo
+    // (docs/reports/2026-09-14-keystone-tenant-scoped-key-gap.md) named the
+    // gap this closes: `render_slot` reads `CURRENT_TENANT` through its own,
+    // independent capture (`plugin.rs:291-298`), separate from `serve`'s
+    // (`plugin.rs:579-587`), and nothing in this file drove a capability call
+    // from *inside* a render hook to prove that second capture folds the
+    // tenant in too. It does — delete `render_slot`'s own `CURRENT_TENANT`
+    // read and this is the only test in the suite that would notice.
+    let store = MemoryKvStore::new();
+    let plugin = Arc::new(
+        SandboxedPlugin::from_artifact(&pack(&full_manifest(), guests::RENDER_KV_WRITE))
+            .expect("loads")
+            .with_services(CapabilityServices {
+                kv: Some(Arc::clone(&store) as Arc<dyn KvStore>),
+                ..CapabilityServices::none()
+            }),
+    );
+
+    for tenant in ["alpha", "beta"] {
+        let plugin = Arc::clone(&plugin);
+        let fragment = autumn_web::tenancy::with_tenant(tenant.to_owned(), async move {
+            plugin.render_slot("order-summary", &[]).await
+        })
+        .await;
+        assert_eq!(fragment.as_deref(), Some("<p>ok</p>"), "{tenant}");
+    }
+
+    let keys = store.keys();
+    assert_eq!(
+        keys.len(),
+        2,
+        "one key per tenant, not one shared: {keys:?}"
+    );
+    // Derived, not spelled — see the sibling `serve`-side test above for why.
+    for tenant in ["alpha", "beta"] {
+        let segment = format!(":{}:", tenant_segment(Some(tenant)));
+        assert!(
+            keys.iter().any(|key| key.contains(&segment)),
+            "{tenant}: {keys:?}"
+        );
+    }
+}
+
 // ── The mounted plugin still serves ──────────────────────────────────────
 
 #[tokio::test]

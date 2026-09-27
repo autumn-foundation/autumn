@@ -922,8 +922,9 @@ concurrently during drain but is not awaited at shutdown.
 ### WebSocket drain contract
 
 Every `#[ws]` handler that uses `WithShutdown` receives a `CancellationToken`
-that is cancelled at phase 4. Handlers should send a close frame on
-cancellation:
+that is cancelled at phase 4. `#[ws]` is behind the non-default `ws` feature
+(`features = ["ws"]`); see [WebSockets](websockets.md). Handlers should send a
+close frame on cancellation:
 
 ```rust
 #[ws("/chat")]

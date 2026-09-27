@@ -219,9 +219,10 @@ fn build_spec_tokens(attrs: &ThrottleAttrs) -> TokenStream {
 
 /// Expand the `#[throttle(...)]` attribute.
 #[allow(clippy::too_many_lines)]
-// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
-// but keeps the owned `TokenStream` signature every macro entry point in
-// this crate shares (and the proc-macro boundary in `lib.rs` requires).
+// `item` is only ever borrowed via
+// `param_helpers::split_leading_items_and_reject_incompatible` now, but
+// keeps the owned `TokenStream` signature every macro entry point in this
+// crate shares (and the proc-macro boundary in `lib.rs` requires).
 #[allow(clippy::needless_pass_by_value)]
 pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_throttle_args(attr) {
@@ -229,27 +230,11 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error(),
     };
 
-    let (leading_items, mut input_fn) = match crate::parse::split_leading_items_and_fn(&item) {
-        Ok(v) => v,
-        Err(err) => return err,
-    };
-
-    if input_fn.sig.asyncness.is_none() {
-        return syn::Error::new_spanned(
-            input_fn.sig.fn_token,
-            "#[throttle] can only be applied to async functions",
-        )
-        .to_compile_error();
-    }
-
-    // `#[throttle]` written below `#[static_get]`/`#[ws]` — including under
-    // an alias those macros' own by-name attribute scan cannot see — is
-    // caught here instead, once this guard's own macro is the one running
-    // (Codex review on #2513, tenth finding). See
-    // `param_helpers::STATIC_ROUTE_HANDLER_MARKER`'s doc comment.
-    if let Some(err) = crate::param_helpers::reject_if_incompatible_route_marker(&input_fn) {
-        return err;
-    }
+    let (leading_items, mut input_fn) =
+        match crate::param_helpers::split_leading_items_and_reject_incompatible(&item, "throttle") {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
 
     // An attribute sharing #[authorize]'s argument grammar under a different
     // name is refused rather than guessed at — see
@@ -269,18 +254,7 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // replay-ownership, nor both claim it).
     let owns_replay = should_own_replay(&input_fn);
     let replay_check = if owns_replay {
-        quote! {
-            let __autumn_idempotency_replay = parts
-                .extensions
-                .get::<::autumn_web::idempotency::IdempotencyReplayResponse>()
-                .cloned()
-                .map(::autumn_web::reexports::axum::extract::Extension);
-            if let ::core::option::Option::Some(__autumn_response) =
-                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
-            {
-                return ::core::result::Result::Err(__autumn_response);
-            }
-        }
+        crate::idempotency_guard::owned_replay_check_tokens()
     } else {
         quote! {}
     };
@@ -381,6 +355,11 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     );
 
+    // NOT `param_helpers::build_original_response` (which `secured`/
+    // `step_up`/`authorize` share): this match has an extra
+    // `should_stringify_primitive_output` arm below that the other three
+    // don't need. Deliberate divergence, not an omission — see that arm's
+    // comment.
     let original_body = input_fn.block.clone();
     let original_response = match &input_fn.sig.output {
         syn::ReturnType::Default => quote! {

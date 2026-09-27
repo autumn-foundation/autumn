@@ -43,6 +43,8 @@ use diesel;
 // via `db`), so this import is used on both builds.
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+#[cfg(not(feature = "sqlite"))]
+use diesel_async::pooled_connection::RecyclingMethod;
 /// The deadpool connection pool Autumn's database seam produces.
 ///
 /// Re-exported so a plugin implementing
@@ -1350,6 +1352,35 @@ pub(crate) fn sqlite_replication_active() -> bool {
     SQLITE_REPLICATION_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Build the manager config for a Postgres pool.
+///
+/// Uses [`RecyclingMethod::Fast`]. Every checkout already runs `SET
+/// statement_timeout`: see [`Db::checkout`] and the `#[repository]`-generated
+/// acquire path. That statement is a round trip to Postgres. It already
+/// proves the connection is alive. Deadpool's default `Verified` method
+/// sends a second, redundant `SELECT 1` to prove the same thing. `Fast`
+/// removes that extra round trip. A dead connection still fails fast — at
+/// the `SET statement_timeout` call, not at the pool's own ping. (issue
+/// #2485)
+///
+/// Also plugs in a TLS setup callback when the URL asks for TLS: diesel-async's
+/// default establish path hardcodes `NoTls`, which cannot satisfy
+/// `sslmode=require`. `sslmode` absent/`disable`/`prefer` keeps the default
+/// (`NoTls`) path, so existing configurations behave exactly as before. See
+/// [`tls`] for the full posture table.
+#[cfg(not(feature = "sqlite"))]
+fn pg_manager_config(
+    url: &str,
+) -> diesel_async::pooled_connection::ManagerConfig<AsyncPgConnection> {
+    let mut config = diesel_async::pooled_connection::ManagerConfig::<AsyncPgConnection>::default();
+    config.recycling_method = RecyclingMethod::Fast;
+    let posture = tls::TlsPosture::from_database_url(url);
+    if posture != tls::TlsPosture::Off {
+        config.custom_setup = tls::setup_callback(posture);
+    }
+    config
+}
+
 fn build_pool(
     url: &str,
     pool_size: usize,
@@ -1385,21 +1416,9 @@ fn build_pool(
     #[cfg(not(feature = "sqlite"))]
     {
         let timeout = Duration::from_secs(connect_timeout_secs);
-        // When the URL's `sslmode` asks for TLS, plug a rustls-backed connector
-        // into the pool via a custom setup callback — diesel-async's default
-        // establish path hardcodes `NoTls`, which cannot satisfy
-        // `sslmode=require` at all. `sslmode` absent/`disable`/`prefer` keeps the
-        // default (NoTls) path, so existing configurations behave exactly as
-        // before. See [`tls`] for the full posture table.
-        let manager = match tls::TlsPosture::from_database_url(url) {
-            tls::TlsPosture::Off => AsyncDieselConnectionManager::<AsyncPgConnection>::new(url),
-            posture => {
-                let mut config =
-                    diesel_async::pooled_connection::ManagerConfig::<AsyncPgConnection>::default();
-                config.custom_setup = tls::setup_callback(posture);
-                AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(url, config)
-            }
-        };
+        let config = pg_manager_config(url);
+        let manager =
+            AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(url, config);
         Ok(Pool::builder(manager)
             .max_size(pool_size.max(1))
             .wait_timeout(Some(timeout))
@@ -2519,6 +2538,20 @@ where
 /// Connection type managed by the deadpool pool.
 pub type PooledConnection = diesel_async::pooled_connection::deadpool::Object<RuntimeConnection>;
 
+/// Prove a pooled connection is actually alive, not merely checked out.
+///
+/// `pg_manager_config` sets `RecyclingMethod::Fast`, so `pool.get()` alone
+/// can return a stale connection without proving it is alive (issue #2485).
+/// A health/readiness probe that only checks out and drops a connection
+/// would then report a dead primary or replica as reachable. Run this on a
+/// fresh checkout so the probe itself proves liveness, not the pool.
+pub(crate) async fn probe_connection_alive(
+    conn: &mut PooledConnection,
+) -> Result<(), diesel::result::Error> {
+    use diesel_async::SimpleAsyncConnection as _;
+    conn.batch_execute("SELECT 1").await
+}
+
 struct TxDepthGuard<'a> {
     depth: &'a mut usize,
     poisoned: &'a mut bool,
@@ -2550,6 +2583,11 @@ impl Drop for TxDepthGuard<'_> {
 /// `database.url` are absent),
 /// requests that use `Db` will receive a `503 Service Unavailable`
 /// response.
+///
+/// A handler that also takes a body extractor (`Form`, `Json`, `Multipart`,
+/// ...) should take [`LazyDb`] instead. `Db` checks out a connection before
+/// axum reads the body. It holds that connection for as long as the client
+/// takes to send the body.
 ///
 /// # Examples
 ///
@@ -3328,33 +3366,72 @@ impl RequestDbContext {
     }
 }
 
-/// A database checkout that has been *prepared* but not *taken*.
+/// A database checkout that is *prepared* but not yet *taken*.
 ///
-/// [`Db`] is a `FromRequestParts` extractor, so axum runs it before the final
-/// `FromRequest` extractor reads the request body. A handler taking both
-/// therefore holds a pooled connection for as long as the client takes to send
-/// its body — and the client controls that. A handful of slow-body requests can
-/// pin `pool_size` connections and starve unrelated database work, with no
-/// request timeout configured by default to stop them.
+/// `Db` is a `FromRequestParts` extractor. Axum runs it before the
+/// `FromRequest` body extractor (`Form`, `Json`, `Multipart`, ...). A handler
+/// that takes `Db` before a body extractor holds a pooled connection for as
+/// long as the client takes to send its body. The client controls that
+/// delay. A few slow uploads can pin every connection in `pool_size` and
+/// stop all other database work.
 ///
-/// This captures what the checkout needs from the request parts — statement
-/// timeout, route key, metrics, interceptors, clock — and takes the connection
-/// only when [`DeferredDb::checkout`] is awaited, which the handler does after
-/// the body is in hand.
+/// `LazyDb` fixes this. Use it instead of `Db` in a handler that also takes a
+/// body extractor, in the same argument position:
 ///
-/// `pub(crate)` deliberately: the general answer is a lazy `Db` for every
-/// handler (#2264), and shipping a second public extractor would make that
-/// harder to land rather than easier.
-pub(crate) struct DeferredDb {
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+///
+/// #[post("/comments")]
+/// async fn post_comment(
+///     lazy_db: LazyDb,
+///     axum::extract::Form(form): axum::extract::Form<CommentForm>,
+/// ) -> AutumnResult<&'static str> {
+///     let mut db = lazy_db.checkout().await?;
+///     save_comment(&mut db, &form.body).await?;
+///     Ok("posted")
+/// }
+///
+/// # #[derive(serde::Deserialize)]
+/// # struct CommentForm { body: String }
+/// # async fn save_comment(_db: &mut Db, _body: &str) -> AutumnResult<()> { Ok(()) }
+/// ```
+///
+/// Axum still runs `LazyDb::from_request_parts` before the body is read. But
+/// extraction only records what a checkout will need: the pool handle,
+/// statement timeout, route key, metrics, interceptors, clock. No connection
+/// is taken until the handler calls [`LazyDb::checkout`], after the body
+/// extractor has already run.
+///
+/// That guarantee assumes the body extractor actually reads the body during
+/// extraction — true for `Form` and `Json`, which buffer the whole body
+/// before the handler runs. It is **not** true for [`Multipart`]: extracting
+/// it does not read anything, and each field only streams in as the handler
+/// calls [`Multipart::next_field`] and reads from the returned field. Calling
+/// `checkout()` before that loop, the way the example above calls it right
+/// after a `Form` extractor, checks out a connection and then holds it for
+/// the loop's whole duration — exactly the pinning `LazyDb` exists to avoid.
+/// Call `checkout()` only after every field this handler needs has been
+/// fully read (buffered to memory or staged to disk), not before the loop
+/// that reads them.
+///
+/// [`Multipart`]: crate::extract::Multipart
+/// [`Multipart::next_field`]: crate::extract::Multipart::next_field
+pub struct LazyDb {
     pool: Pool<RuntimeConnection>,
     ctx: RequestDbContext,
     #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
     capture_gap: Option<std::sync::Arc<str>>,
 }
 
-impl DeferredDb {
-    /// Take the connection. Called once the request body has been read.
-    pub(crate) async fn checkout(self) -> Result<Db, AutumnError> {
+impl LazyDb {
+    /// Take the connection. Call this once the request body has been read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutumnError`] when the pool cannot hand out a connection —
+    /// the same failure [`Db`]'s own extractor would return, just reported
+    /// here instead of at extraction time.
+    pub async fn checkout(self) -> Result<Db, AutumnError> {
         let result = Db::checkout(DbCheckoutParams {
             pool: &self.pool,
             pool_name: "primary",
@@ -3378,7 +3455,7 @@ impl DeferredDb {
     }
 }
 
-impl<S> FromRequestParts<S> for DeferredDb
+impl<S> FromRequestParts<S> for LazyDb
 where
     S: DbState + Send + Sync,
 {
@@ -4356,6 +4433,25 @@ mod tests {
 
     // ── Pool creation tests ──────────────────────────────────────
 
+    // `#[repository]`-generated code and `Db::checkout` already run `SET
+    // statement_timeout` on every acquire (a round trip to Postgres). That
+    // round trip already proves the connection is alive, so the pool must
+    // not pay for a second one via deadpool's default `Verified` recycling
+    // (issue #2485).
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn pg_manager_config_uses_fast_recycling_without_tls() {
+        let config = pg_manager_config("postgres://user:pass@localhost/app");
+        assert!(matches!(config.recycling_method, RecyclingMethod::Fast));
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn pg_manager_config_uses_fast_recycling_with_tls() {
+        let config = pg_manager_config("postgres://user:pass@localhost/app?sslmode=require");
+        assert!(matches!(config.recycling_method, RecyclingMethod::Fast));
+    }
+
     #[tokio::test]
     async fn default_pool_provider_respects_url_config() {
         let config = DatabaseConfig {
@@ -5157,6 +5253,45 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// #2264: `Db` is a `FromRequestParts` extractor. Axum runs it before a
+    /// body extractor (`Form`, `Json`, ...) reads the request body. A handler
+    /// that takes both holds a pooled connection for as long as the client
+    /// takes to send its body.
+    ///
+    /// `LazyDb` must not touch the pool during extraction. It defers the
+    /// checkout to `LazyDb::checkout`, called once the body is already read.
+    /// The pool here can never complete a checkout (`test_urls::unreachable`).
+    /// So `Db` extraction fails right away, while `LazyDb` extraction still
+    /// succeeds. Only its later `checkout()` call sees the same failure.
+    #[tokio::test]
+    async fn lazy_db_extraction_does_not_check_out_a_connection() {
+        use axum::http::Request;
+
+        let config = DatabaseConfig {
+            url: Some(crate::test_urls::unreachable("lazy-db-no-checkout")),
+            connect_timeout_secs: 1,
+            ..Default::default()
+        };
+        let pool = create_pool(&config).unwrap().unwrap();
+        let state = TestReadState { primary: pool };
+
+        let (mut parts, ()) = Request::builder().body(()).unwrap().into_parts();
+        assert!(
+            Db::from_request_parts(&mut parts, &state).await.is_err(),
+            "sanity check: the eager extractor must fail against a pool \
+             that can never complete a checkout"
+        );
+
+        let (mut parts, ()) = Request::builder().body(()).unwrap().into_parts();
+        let lazy = LazyDb::from_request_parts(&mut parts, &state)
+            .await
+            .expect("LazyDb must extract without touching the pool");
+        assert!(
+            lazy.checkout().await.is_err(),
+            "the checkout failure is deferred, not avoided"
+        );
     }
 
     #[tokio::test]
@@ -6438,9 +6573,10 @@ pub(crate) fn establish_migration_connection(
 /// *immediately* with `SQLITE_BUSY`, and `auto_migrate_sqlite` exits the process.
 /// With the timeout, migration statements WAIT up to 5s for the lock to clear
 /// instead of aborting; diesel migrations are idempotent, so a migrator that
-/// waits and then finds migrations already applied is fine. Only `busy_timeout`
-/// is set here — NOT `foreign_keys`/`journal_mode`, because `foreign_keys = ON`
-/// can break table-recreating migrations.
+/// waits and then finds migrations already applied is fine.
+///
+/// Only `busy_timeout` is set here — NOT `foreign_keys`/`journal_mode`, because
+/// `foreign_keys = ON` can break table-recreating migrations.
 ///
 /// # Errors
 ///

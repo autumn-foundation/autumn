@@ -69,6 +69,13 @@ autumn_web::app()
     .await;
 ```
 
+You do not have to write that pair by hand. `autumn generate policy Post` emits
+this `Policy` and its companion `Scope` for an existing model and registers both
+on the builder — owner-or-admin rules when the model has a `user_id`,
+`author_id`, or `owner_id` column, and a `SECURITY TODO`-marked authentication
+check when it does not. See
+[`autumn generate policy`](generators.md#autumn-generate-policy).
+
 `PolicyContext` carries the resolved [`Session`](authentication.md#the-session-api), the
 authenticated user id (when any), the active role set, and a clone of the
 database pool so policies can consult related rows. The trait is

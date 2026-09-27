@@ -32,10 +32,13 @@ pub mod proxy;
 
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
+use autumn_web::alerts::{Alert, AlertChannel, AlertCondition};
 use autumn_web::config::{AutumnConfig, DeployConfig, Env};
 use proxy::ProxyController;
+use serde::Deserialize;
 
 /// Bounded timeout for the SSH-reachability preflight probe. Kept short so the
 /// check fails fast on an unreachable host instead of hanging on a dropped SYN.
@@ -187,6 +190,13 @@ pub struct FleetHalt {
     /// debris (an unwritten `shared/proxy-options` marker in particular) outlives
     /// the rollback and fails the NEXT deploy closed.
     pub degraded: Vec<(String, &'static str)>,
+    /// Hosts whose first deploy was torn down, but whose proxy route removal
+    /// failed (issue #2270), with the step label. Also present in `torn_down`
+    /// (the app really is gone), but named here TOO so an API caller or an
+    /// alert built from this struct — not just the console table — can tell a
+    /// clean compensation apart from one whose public port may still answer
+    /// 502 until it is redeployed or the route is removed by hand.
+    pub route_removal_failed: Vec<(String, &'static str)>,
     /// Hosts the fleet deliberately did NOT roll back, with the reason.
     pub manual: Vec<(String, &'static str)>,
 }
@@ -307,6 +317,55 @@ pub struct ResolvedDeployConfig {
     /// Whether this deploy may install the reverse-proxy binary on a host that has
     /// none (`[deploy] install_proxy`, default `true`; issue #1607, AC-1).
     pub install_proxy: bool,
+    /// Release-relative path of the `SQLite` data file, when the app is on the
+    /// `SQLite` tier and its `[database]` URL names a RELATIVE file (issue
+    /// #1909).
+    ///
+    /// A slot unit's `WorkingDirectory` is the release dir, so a relative
+    /// `sqlite://./app.db` resolves INSIDE the release — a new release would
+    /// start against an empty database and the old release's file would be
+    /// pruned away with its directory. When this is `Some`, the deploy keeps the
+    /// real file in [`Self::shared_data_dir`] and links each release at this
+    /// path (see [`crate::deploy::exec::sqlite_data_link_op`]).
+    ///
+    /// [`SqliteDataPlacement::None`] for a Postgres app;
+    /// [`SqliteDataPlacement::Persistent`] for a `SQLite` app whose URL is
+    /// already an absolute path outside the releases dir, which is verified on
+    /// the host but never relocated. Set by
+    /// [`Self::with_sqlite_data_placement`]; [`Self::resolve`] leaves it
+    /// `None`, since it grades `[deploy]` and never reads `[database]`.
+    pub sqlite_data: SqliteDataPlacement,
+    /// Basenames this deploy writes into the release dir (the app binary and the
+    /// uploaded config manifests). A relative `SQLite` data file may not collide
+    /// with one: the data link is created first, so `scp` would follow it and
+    /// truncate the database (#2589 item 11).
+    ///
+    /// Empty on [`Self::resolve`], which grades `[deploy]` alone. The real deploy
+    /// path fills it via [`Self::with_release_payloads`]; the refusal in
+    /// [`classify_sqlite_data_file`] also applies a filesystem-independent rule,
+    /// so an empty list never leaves the common names unguarded.
+    pub release_payloads: Vec<String>,
+}
+
+/// What a deploy must do to keep the app's `SQLite` data file (issue #1909).
+///
+/// ONE value rather than two `Option` fields, so the two managed states cannot
+/// both be set: they are decided by a single [`classify_sqlite_data_file`] call.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SqliteDataPlacement {
+    /// Nothing for the deploy to manage: a Postgres app, or a refused config
+    /// that preflight already failed.
+    #[default]
+    None,
+    /// A release-relative file. The real file is kept in `shared/data` and each
+    /// release is linked at the path the app resolves.
+    Relative(String),
+    /// An absolute, operator-managed file. There is nothing to relocate, but the
+    /// deploy still VERIFIES on the host that it is not inside the releases
+    /// directory: a symlinked `app_dir` is invisible to the local lexical check,
+    /// which would grade a file under `releases/` durable while retention
+    /// deletes it (#2589 item 13).
+    Persistent(String),
 }
 
 /// Canonicalize a deploy profile string to the value the app's runtime resolver
@@ -426,7 +485,43 @@ impl ResolvedDeployConfig {
             tls_enabled: cfg.tls.enabled,
             tls_host,
             install_proxy: cfg.install_proxy,
+            sqlite_data: SqliteDataPlacement::None,
+            release_payloads: Vec::new(),
         })
+    }
+
+    /// Attach the `SQLite` data-file placement this deploy must honor (issue
+    /// #1909). See [`SqliteDataPlacement`].
+    #[must_use]
+    pub fn with_sqlite_data_placement(mut self, placement: SqliteDataPlacement) -> Self {
+        self.sqlite_data = placement;
+        self
+    }
+
+    /// Attach the basenames this deploy uploads into the release dir. See
+    /// [`Self::release_payloads`].
+    #[must_use]
+    pub fn with_release_payloads(mut self, payloads: Vec<String>) -> Self {
+        self.release_payloads = payloads;
+        self
+    }
+
+    /// The release-relative data file, when the deploy manages one.
+    #[must_use]
+    pub fn relative_sqlite_data_file(&self) -> Option<&str> {
+        match &self.sqlite_data {
+            SqliteDataPlacement::Relative(rel) => Some(rel),
+            SqliteDataPlacement::None | SqliteDataPlacement::Persistent(_) => None,
+        }
+    }
+
+    /// The absolute operator-managed data file, when there is one to verify.
+    #[must_use]
+    pub fn persistent_sqlite_data_file(&self) -> Option<&str> {
+        match &self.sqlite_data {
+            SqliteDataPlacement::Persistent(path) => Some(path),
+            SqliteDataPlacement::None | SqliteDataPlacement::Relative(_) => None,
+        }
     }
 
     /// Persistent per-app dir shared across releases (holds the secret env
@@ -479,6 +574,64 @@ impl ResolvedDeployConfig {
             self.shared_dir(),
             autumn_web::maintenance::MAINTENANCE_FLAG_BASENAME
         )
+    }
+
+    /// Persistent directory holding the `SQLite` data file across releases
+    /// (issue #1909).
+    ///
+    /// It sits under `shared/` for the reason the maintenance flag does: `shared/`
+    /// survives cutovers, rollbacks and pruning, and both slots see it. A release
+    /// dir is the opposite — replaced on every deploy, deleted by retention. The
+    /// directory itself is created by the data-link op, not by `prepare-dirs`.
+    #[must_use]
+    pub fn shared_data_dir(&self) -> String {
+        format!("{}/data", self.shared_dir())
+    }
+
+    /// Absolute path of the persistent `SQLite` data file, or `None` when this
+    /// app has none to keep (Postgres, or an already-absolute `SQLite` path).
+    #[must_use]
+    pub fn shared_sqlite_data_file(&self) -> Option<String> {
+        self.relative_sqlite_data_file()
+            .map(|rel| format!("{}/{rel}", self.shared_data_dir()))
+    }
+
+    /// The `SQLite` database this deploy MANAGES inside `shared/data`, whichever
+    /// way it was configured (issue #1909, #2589 round 20).
+    ///
+    /// BOTH placements can land there: a relative path is kept there by
+    /// construction, and an absolute one may name it outright. The deploy creates
+    /// that directory and guards what lives in it, so both need the same
+    /// treatment — keying the adoption marker on the relative case alone left an
+    /// absolute database with no marker, no missing-volume refusal, and a
+    /// `mkdir -p` that recreated its mount point underneath it.
+    ///
+    /// `None` for a database outside `shared/data`: that one is the operator's,
+    /// and the deploy neither creates its directory nor guards it.
+    #[must_use]
+    pub fn managed_sqlite_data_file(&self) -> Option<String> {
+        if let Some(shared) = self.shared_sqlite_data_file() {
+            return Some(shared);
+        }
+        let path = lexically_normalized(self.persistent_sqlite_data_file()?);
+        within(&path, &lexically_normalized(&self.shared_data_dir())).then_some(path)
+    }
+
+    /// Marker recording that the shared `SQLite` database has been seen to exist
+    /// (issue #1909, #2589 item 17).
+    ///
+    /// It lives in `shared/`, **never** in `shared/data`: the state it exists to
+    /// detect is `shared/data` being an unavailable mount, and a marker inside
+    /// that mount would disappear with it and report the very "never created"
+    /// answer it is there to refute.
+    ///
+    /// Absent means the database has never been established, so a missing file is
+    /// a genuine first deploy. Present means it must be there, so a missing file
+    /// is a fault — an unmounted volume — and the deploy stops rather than
+    /// creating a fresh database and orphaning the original.
+    #[must_use]
+    pub fn sqlite_data_marker_file(&self) -> String {
+        format!("{}/sqlite-data-adopted", self.shared_dir())
     }
 }
 
@@ -1633,13 +1786,13 @@ pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployEr
         // deploy profile — not the operator's ambient/dev config. Reload here.
         // `check`/`rollback` deliberately do NOT load the media config.
         DeployAction::Check => run_check(
-            &load_runtime_config(&resolved)?,
+            &load_runtime_config(&resolved.profile)?,
             &resolved,
             &targets,
             host_list.len(),
         ),
         DeployAction::Rollback => run_rollback(
-            &load_runtime_config(&resolved)?,
+            &load_runtime_config(&resolved.profile)?,
             &resolved,
             &targets,
             host_list.len(),
@@ -1656,7 +1809,13 @@ pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployEr
             // production setting must not take it offline mid-incident. See
             // `status_public_port`.
             let port = status_public_port(&resolved)?;
-            run_status(&port, &resolved.profile, &fleet, options)
+            run_status(
+                &port,
+                &resolved.app_name,
+                &resolved.profile,
+                &fleet,
+                options,
+            )
         }
         DeployAction::MaintenanceOn | DeployAction::MaintenanceOff => {
             let fleet = ResolvedFleet::resolve(&deploy_cfg, &resolve_project_name())
@@ -1683,7 +1842,7 @@ pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployEr
         DeployAction::Up => {
             let (media_cfg, ffmpeg_bin) = load_media_host_config(&resolved)?;
             run_up(
-                &load_runtime_config(&resolved)?,
+                &load_runtime_config(&resolved.profile)?,
                 &resolved,
                 &targets,
                 host_list.len(),
@@ -1932,7 +2091,10 @@ impl<E: Env> Env for ForcedProfileEnv<E> {
 ///
 /// The chicken-and-egg here: the ambient load in [`run`] learns the deploy
 /// profile (`resolved.profile`), and this reload then resolves the full config
-/// under it. The `.env.<profile>` overlay is selected via
+/// under it. Takes the RAW profile string rather than the whole
+/// [`ResolvedDeployConfig`] — that field is all this needs, and issue #2267's
+/// alert path reloads by profile alone, with no `ResolvedDeployConfig` at
+/// hand. The `.env.<profile>` overlay is selected via
 /// [`autumn_web::dotenv::os_env_with_dotenv_for_profile_using`], fed a
 /// [`ForcedProfileEnv`] gating base that reports `AUTUMN_DOTENV=1` so a non-dev
 /// deploy profile still loads `.env.<profile>` (dotenv auto-load is otherwise
@@ -1940,14 +2102,14 @@ impl<E: Env> Env for ForcedProfileEnv<E> {
 /// profile ([`canonicalize_deploy_profile`]) so a `[deploy] profile` alias like
 /// `production` still reads `.env.prod` (matching `AutumnConfig::load()`), not
 /// `.env.production`. A second [`ForcedProfileEnv`] wrapper forces `AUTUMN_ENV`
-/// to the RAW `resolved.profile` so the loader layers `[profile.<profile>]` /
+/// to the RAW profile so the loader layers `[profile.<profile>]` /
 /// `autumn-<profile>.toml` on top with the operator's exact spelling. Real OS
 /// env vars still win over `.env` (the
 /// overlay only fills gaps), and the dotenv profile-selector-key exclusion still
 /// strips `AUTUMN_ENV`/`AUTUMN_PROFILE`/`AUTUMN_IS_DEBUG` from any `.env` file,
 /// matching `AutumnConfig::load()`.
-fn load_runtime_config(resolved: &ResolvedDeployConfig) -> Result<AutumnConfig, DeployError> {
-    let forced = deploy_profile_env_overlay(&resolved.profile)?;
+fn load_runtime_config(profile: &str) -> Result<AutumnConfig, DeployError> {
+    let forced = deploy_profile_env_overlay(profile)?;
     // Lenient unknown top-level roots (#2063): keep strict validation of the
     // core sections the CLI knows while accepting plugin-owned roots (e.g.
     // `[media]`) as opaque — app boot stays the authoritative strict gate.
@@ -1992,7 +2154,7 @@ struct StatusPort {
 /// upload runtime VALUES (the signing secret, the DB URL), so an invalid config
 /// must stop them. `plan` never loads the runtime config at all.
 fn status_public_port(resolved: &ResolvedDeployConfig) -> Result<StatusPort, DeployError> {
-    let loaded = load_runtime_config(resolved);
+    let loaded = load_runtime_config(&resolved.profile);
     status_public_port_with(&manifest_project_dirs(), &resolved.profile, loaded)
 }
 
@@ -2160,6 +2322,305 @@ fn resolve_writable_db_url(db: &autumn_web::config::DatabaseConfig) -> Option<&s
         .or_else(|| db.shards.first().map(|shard| shard.primary_url.as_str()))
 }
 
+/// The release-relative `SQLite` data-file path this deploy must keep persistent,
+/// or `None` when there is none (issue #1909).
+///
+/// Only the [`SqliteDataFile::Relative`] case needs relocating. An absolute path
+/// already survives a release swap, but is still carried through as
+/// [`SqliteDataPlacement::Persistent`] so the deploy can verify on the HOST that
+/// it is outside the releases dir — a symlinked `app_dir` defeats the local
+/// lexical check (#2589 item 13). A refused configuration is caught by
+/// [`grade_sqlite_data_persistence`] before any remote command runs.
+fn sqlite_data_placement(
+    config: &AutumnConfig,
+    resolved: &ResolvedDeployConfig,
+) -> SqliteDataPlacement {
+    match classify_sqlite_data_file(resolve_writable_db_url(&config.database), resolved) {
+        SqliteDataFile::Relative(rel) => SqliteDataPlacement::Relative(rel),
+        SqliteDataFile::Persistent(path) => SqliteDataPlacement::Persistent(path),
+        // A refused config never reaches the op builders: preflight fails first.
+        SqliteDataFile::NotSqlite | SqliteDataFile::Refused(_) => SqliteDataPlacement::None,
+    }
+}
+
+/// How a `SQLite` app's configured data file relates to the deploy layout
+/// (issue #1909).
+///
+/// See [`classify_sqlite_data_file`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqliteDataFile {
+    /// Not a `SQLite` app — nothing to persist.
+    NotSqlite,
+    /// A relative path, which resolves inside the release dir. The deploy keeps
+    /// the real file under `shared/data` and links each release at this path.
+    Relative(String),
+    /// An absolute path the deploy does not manage — outside the app dir, or in
+    /// its persistent `shared/`. Already release-independent, so the deploy
+    /// leaves it exactly where the operator put it.
+    Persistent(String),
+    /// A configuration a deploy cannot make durable. Carries the operator-facing
+    /// reason.
+    Refused(String),
+}
+
+/// Classify the writable database URL a deploy would ship (issue #1909).
+///
+/// Each refusal names a configuration whose data cannot survive a deploy.
+/// Preflight catches it before any remote command runs, not after the first
+/// cutover.
+#[must_use]
+pub fn classify_sqlite_data_file(url: Option<&str>, cfg: &ResolvedDeployConfig) -> SqliteDataFile {
+    let Some(url) = url.map(str::trim).filter(|u| !u.is_empty()) else {
+        return SqliteDataFile::NotSqlite;
+    };
+    if autumn_web::config::DatabaseBackend::detect(url)
+        != Some(autumn_web::config::DatabaseBackend::Sqlite)
+    {
+        return SqliteDataFile::NotSqlite;
+    }
+    let Some(path) = autumn_web::replication::database_file(url) else {
+        return SqliteDataFile::Refused(
+            "the configured SQLite database is IN-MEMORY, so it cannot survive a deploy \
+             (or a restart). Point `[database] url` at a file, e.g. \
+             sqlite:///srv/autumn/<app>/shared/data/app.db"
+                .to_owned(),
+        );
+    };
+    // A deploy addresses paths as text — in a systemd unit, in a shell line — so
+    // one it cannot render is one it cannot ship. `file:app%FF.db` decodes to such
+    // a name.
+    let Some(raw) = path.to_str().map(str::to_owned) else {
+        return SqliteDataFile::Refused(format!(
+            "the configured SQLite database path ({}) is not valid UTF-8, so a deploy \
+             cannot address it. Rename the file.",
+            path.display()
+        ));
+    };
+    // Normalize BEFORE any containment check: a lexical prefix compare on
+    // `/srv/app/shared/../releases/r1/app.db` would call it durable, while the
+    // kernel resolves it into `releases/`, where retention deletes it.
+    let text = lexically_normalized(&raw);
+    let app_dir = lexically_normalized(&cfg.app_dir);
+    // FAIL CLOSED on the one input that makes every rule below undecidable: a
+    // non-absolute app dir. It gates BOTH branches, not just the absolute one.
+    //
+    // For an absolute database it decided containment, and falling through
+    // graded a file under `releases/` durable while retention deletes it. For a
+    // RELATIVE database it decides the link TARGET: `sqlite_data_link_op` points
+    // the release at `{app_dir}/shared/data/<file>`, so a relative `app_dir`
+    // makes that target resolve beneath the release dir instead of the SSH
+    // working directory, and the migration opens a dangling link (#2589 item
+    // 16). One guard, above the split, because the answer is the same on both
+    // sides — placing it on one branch only is what left the other open.
+    if !app_dir.starts_with('/') {
+        return SqliteDataFile::Refused(format!(
+            "the deploy's app directory ({}) is not an absolute path, so where the \
+             SQLite database {text} would live cannot be decided. Set `[deploy] \
+             app_dir` to an absolute path.",
+            cfg.app_dir
+        ));
+    }
+    if text.starts_with('/') {
+        // Anything the deploy itself manages is transient — `releases/` is
+        // replaced every deploy and pruned by retention, and `current` is just a
+        // symlink into it. Only `shared/` survives, so only `shared/` is a
+        // durable place inside the app dir. A path outside the app dir is the
+        // operator's own and is left alone.
+        //
+        // `app_dir` is normalized too, not just the database path: `[deploy]
+        // app_dir = "/srv/autumn/tmp/../myapp"` names the same directory as
+        // `/srv/autumn/myapp`, and comparing the raw spelling would miss a
+        // database sitting in the releases dir it resolves to.
+        // `shared/data`, not all of `shared/`. `shared/` survives a release swap,
+        // but the deploy OWNS it: `autumn.env`, `live-slot`, `previous-release`,
+        // `proxy-options`, `last-deploy`, the maintenance flag and the adoption
+        // marker are all written there, and a database configured at one of those
+        // paths is truncated by the deploy that writes it —
+        // `sqlite:///…/shared/autumn.env` passed every containment check and was
+        // then overwritten by `write-env` before the migration.
+        //
+        // A closed namespace rather than a list of reserved names: enumerating
+        // the control files would have to be revisited every time one is added,
+        // which is the failure mode this whole grader keeps hitting.
+        let shared_data = lexically_normalized(&cfg.shared_data_dir());
+        if within(&text, &app_dir) && !within(&text, &shared_data) {
+            return SqliteDataFile::Refused(format!(
+                "the configured SQLite database {text} lives inside the deploy's own app \
+                 directory ({app_dir}), where only {} is yours: `releases/` is replaced on \
+                 every deploy and deleted by release retention, `current` is a symlink into \
+                 it, and the rest of `shared/` holds deploy state files that would \
+                 overwrite the database. Move the file to {}, or outside {app_dir} \
+                 altogether.",
+                cfg.shared_data_dir(),
+                cfg.shared_data_dir()
+            ));
+        }
+        return SqliteDataFile::Persistent(text);
+    }
+    // A relative path is resolved against the slot unit's `WorkingDirectory`,
+    // which is the release dir. Normalization above already removed `.` and
+    // resolved `..`; what is left must still name a file INSIDE the release dir,
+    // so a leading `..` (which normalization keeps, having nothing to cancel it
+    // against) and an empty path are both refused.
+    if text.is_empty() || text == ".." || text.starts_with("../") {
+        return SqliteDataFile::Refused(format!(
+            "the configured SQLite database path {text:?} does not name a file inside the \
+             release directory it is resolved against, so a deploy cannot keep it durable. \
+             Use a plain relative name (sqlite://app.db) or an absolute path."
+        ));
+    }
+    // The data link is created BEFORE the release payloads are uploaded, and
+    // `scp` writes THROUGH a symlink. So a relative database whose path is also a
+    // payload path has its link made first and is then truncated by the upload —
+    // the migration finds an ELF or a TOML file where the database was, after the
+    // data is already gone (#2589 item 11). Refused here, before any remote
+    // command runs, rather than detected on the host after the loss.
+    if let Some(payload) = collides_with_release_payload(&text, cfg) {
+        return SqliteDataFile::Refused(format!(
+            "the configured SQLite database {text} is also a file this deploy uploads \
+             into the release directory ({payload}), which would overwrite the database \
+             on the first deploy. Rename the database, or move it under a \
+             subdirectory (sqlite://data/app.db)."
+        ));
+    }
+    SqliteDataFile::Relative(text)
+}
+
+/// The release payload a relative `SQLite` data file collides with, if any.
+///
+/// Two sources, deliberately: the names this particular deploy would upload
+/// ([`ResolvedDeployConfig::release_payloads`]), plus a filesystem-independent
+/// rule for the app binary and the `autumn*.toml` manifest family. The second is
+/// not redundant — the payload list is empty for a bare
+/// [`ResolvedDeployConfig::resolve`], and a database named `autumn.toml` must be
+/// refused even on a project that has no `autumn.toml` YET, since adding one
+/// later would start truncating it.
+fn collides_with_release_payload(text: &str, cfg: &ResolvedDeployConfig) -> Option<String> {
+    // The FIRST path component, not the whole path. Every payload is written flat
+    // in the release root, but `scp <local> <release>/myapp` with a DIRECTORY at
+    // `<release>/myapp` writes *into* it — so `sqlite://myapp/myapp` has
+    // `link-data` create `myapp/` and put the database link at `myapp/myapp`,
+    // which is exactly where the upload then lands, following the link and
+    // replacing the database with the binary. Requiring the whole path to equal a
+    // payload missed that entirely (a single component is just the one-segment
+    // case of this rule).
+    let text = text.split('/').next().filter(|c| !c.is_empty())?;
+    if text == cfg.app_name {
+        return Some(format!("the {} binary", cfg.app_name));
+    }
+    // `rsplit_once`, not `ends_with(".toml")`: the latter trips clippy's
+    // case-insensitive-extension lint, and folding case would be wrong anyway —
+    // the uploader always writes the lowercase spelling, and the target is POSIX.
+    let is_manifest = text == "autumn.toml"
+        || (text.starts_with("autumn-")
+            && text.len() > "autumn-.toml".len()
+            && text.rsplit_once('.').is_some_and(|(_, ext)| ext == "toml"));
+    if is_manifest {
+        return Some(format!("the config manifest {text}"));
+    }
+    cfg.release_payloads
+        .iter()
+        .find(|payload| payload.as_str() == text)
+        .map(|payload| format!("the uploaded file {payload}"))
+}
+
+/// Collapse `.` and `..` lexically, and normalize separators.
+///
+/// Deliberately a STRING walk, not `std::path`: the path names a file on the
+/// deploy TARGET, which is always a POSIX host, while `std::path` follows the
+/// host this CLI runs on. On Windows `Path::new("/var/lib/app.db").is_absolute()`
+/// is false, so every containment rule below would grade a Linux absolute path as
+/// a relative one — `autumn deploy check` from a Windows workstation would
+/// misjudge the target it is about to deploy to.
+///
+/// Lexical, not `canonicalize`: this process cannot stat the target. That is
+/// enough for the containment rules — it closes the `shared/../releases` hole —
+/// and a symlink on the host that defeats it would defeat any check made here.
+///
+/// Collapsing `..` is safe here because `SQLite` collapses it too, in its own
+/// VFS, BEFORE calling `open(2)`. The deploy therefore links only the collapsed
+/// path — `data/nested/../app.db` creates `data`, not `data/nested` — and the app
+/// still opens the file the deploy linked. Raw `open(2)` would NOT: POSIX
+/// resolution needs `data/nested` to exist. So this is load-bearing on `SQLite`'s
+/// behaviour, not the kernel's. Re-check it before supporting a VFS that does not
+/// normalize lexically.
+///
+/// Total: every path normalizes. An absolute path cannot climb out (POSIX
+/// defines `/..` as `/`), and a relative one keeps a leading `..` for the caller
+/// to refuse. The old `Option` implied a failure mode that does not exist, and
+/// the caller's `unwrap_or_default()` on it graded a database durable.
+fn lexically_normalized(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut names: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            // An empty segment is a repeated or trailing `/`.
+            "" | "." => {}
+            ".." => {
+                // A leading `..` on a RELATIVE path has nothing to cancel and is
+                // kept, so the caller can refuse it.
+                //
+                // On an ABSOLUTE path it is simply dropped: POSIX defines `/..`
+                // as `/`, so `/../srv/app` names `/srv/app` and cannot escape.
+                // Returning `None` here instead made a real `app_dir` spelling
+                // ungradable, and the caller then graded a database in the
+                // releases dir as durable while retention deletes it.
+                if names.last().is_some_and(|name| *name != "..") {
+                    names.pop();
+                } else if !absolute {
+                    names.push("..");
+                }
+            }
+            name => names.push(name),
+        }
+    }
+    let joined = names.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    }
+}
+
+/// Whether `path` is `root` itself or sits under it. Compares whole path
+/// components, so `/srv/app/releases-archive` is not "under" `/srv/app/releases`.
+fn within(path: &str, root: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    path == root || path.starts_with(&format!("{root}/"))
+}
+
+/// Preflight grader for `SQLite` data-file durability (issue #1909).
+///
+/// Only emitted for a `SQLite` app, so a Postgres deploy's preflight report is
+/// unchanged.
+#[must_use]
+pub fn grade_sqlite_data_persistence(
+    url: Option<&str>,
+    cfg: &ResolvedDeployConfig,
+) -> Option<PreflightCheck> {
+    match classify_sqlite_data_file(url, cfg) {
+        SqliteDataFile::NotSqlite => None,
+        SqliteDataFile::Relative(rel) => Some(PreflightCheck::pass(
+            "sqlite_data_file",
+            format!(
+                "SQLite data file kept in {}/{rel} across releases",
+                cfg.shared_data_dir()
+            ),
+        )),
+        SqliteDataFile::Persistent(path) => Some(PreflightCheck::pass(
+            "sqlite_data_file",
+            format!("SQLite data file {path} is outside the releases directory"),
+        )),
+        SqliteDataFile::Refused(detail) => Some(PreflightCheck::fail(
+            "sqlite_data_file",
+            detail,
+            "Set `[database] url` to a path a deploy can keep: a plain relative name \
+             (sqlite://app.db, kept under the app's shared/data dir) or an absolute path \
+             outside the releases directory",
+        )),
+    }
+}
+
 /// Collect all preflight graders for the resolved config against the loaded
 /// runtime configuration.
 ///
@@ -2198,7 +2659,7 @@ fn collect_project_preflight(
         || config.database.primary_url.is_some()
         || config.database.replica_url.is_some()
         || config.database.has_shards();
-    vec![
+    let mut checks = vec![
         // Grade the signing secret against the SAME profile that will be written
         // to the host env file (`AUTUMN_ENV=<resolved.profile>`, default `prod`),
         // not the local CLI runtime profile (`config.profile`, dev/None on a dev
@@ -2237,7 +2698,14 @@ fn collect_project_preflight(
                 .unwrap_or(autumn_web::config::DatabaseBackend::Postgres),
             Path::new(MIGRATIONS_DIR),
         ),
-    ]
+    ];
+    // Only a SQLite app gets this row, so a Postgres deploy's report is
+    // byte-identical to pre-#1909.
+    checks.extend(grade_sqlite_data_persistence(
+        resolve_writable_db_url(&config.database),
+        resolved,
+    ));
+    checks
 }
 
 /// Preflight for a whole fleet: `ssh_reachability` **per host**, then the three
@@ -2369,6 +2837,20 @@ fn report_preflight(checks: &[PreflightCheck]) -> usize {
     failed
 }
 
+/// Refuse the rollout if any preflight check failed (issue #1621, AC-7).
+///
+/// `run_up` calls this right after `collect_fleet_preflight`, before it
+/// builds any executor. A failing host stops the rollout before it
+/// touches a server. Split into its own function so a test can drive
+/// this exact decision with no disk and no network (issue #2269).
+fn refuse_if_preflight_failed(checks: &[PreflightCheck]) -> Result<(), DeployError> {
+    let failed = report_preflight(checks);
+    if failed > 0 {
+        return Err(DeployError::PreflightFailed(failed));
+    }
+    Ok(())
+}
+
 /// Run the preflight over EVERY configured host and report it (issue #1621, AC-7).
 ///
 /// `hosts` is the ordered target list from [`deploy_host_list`]. With more than one
@@ -2472,8 +2954,9 @@ fn print_media_plan(media_cfg: &media::MediaMtxHostConfig) {
         println!("  {}. [{}]", i + 1, op.label());
     }
     println!(
-        "\nMediaMTX doctor checks at `deploy up`: {}, {}, {}, {}, {}",
+        "\nMediaMTX doctor checks at `deploy up`: {}, {}, {}, {}, {}, {}",
         media::CHECK_MEDIAMTX_PORTS_DISTINCT,
+        media::CHECK_MEDIAMTX_PORTS_MATCH_BASES,
         media::CHECK_FFMPEG_PREFLIGHT,
         media::CHECK_MEDIAMTX_BINARY,
         media::CHECK_RECORDINGS_DIR_WRITABLE,
@@ -2487,8 +2970,9 @@ fn print_media_plan(media_cfg: &media::MediaMtxHostConfig) {
 }
 
 /// Grade the media host with the fail-closed, **non-mutating** doctor checks
-/// (`FFmpeg` preflight, `MediaMTX` binary, recordings dir writable, ports
-/// distinct/available) and abort the deploy on any **blocking** failure — so a
+/// (`FFmpeg` preflight, `MediaMTX` binary, recordings dir writable/creatable,
+/// ports distinct/available, ports matching the app's base URLs) and abort the
+/// deploy on any **blocking** failure — so a
 /// host that cannot serve media fails fast BEFORE the app deploy touches
 /// anything. A **deferred** check (an env/interpolation-indirected
 /// `[media.ffmpeg] bin` the deployed service resolves from its own runtime
@@ -2776,6 +3260,29 @@ fn locate_manifest_uploads(resolved: &ResolvedDeployConfig) -> Vec<exec::Manifes
     manifest_uploads_in(&manifest_project_dirs(), &resolved.profile)
 }
 
+/// Every basename this deploy writes into the release directory (#2589 item 11).
+///
+/// The app binary plus the uploaded manifests — including a capacity contract
+/// under whatever name the config gives it, which no static rule could predict.
+/// `collides_with_release_payload` refuses a relative `SQLite` data file that
+/// matches one, because the data link is made first and `scp` writes through it.
+///
+/// `config` is unused today and taken anyway: it is the value that decides the
+/// manifest set, and threading it now keeps the signature honest if the payload
+/// list ever stops being derivable from `resolved` alone.
+fn release_payload_basenames(
+    _config: &AutumnConfig,
+    resolved: &ResolvedDeployConfig,
+) -> Vec<String> {
+    let mut names = vec![resolved.app_name.clone()];
+    names.extend(
+        locate_manifest_uploads(resolved)
+            .into_iter()
+            .map(|upload| upload.remote_basename),
+    );
+    names
+}
+
 /// Format the operator-facing preflight line for the config-manifest upload
 /// (#1952). Pure/testable: either a LOUD no-manifest warning (kills the previous
 /// silent-defaults footgun) or a confirming line naming the uploaded file(s).
@@ -2860,68 +3367,65 @@ fn validate_public_port(public_port: u16) -> Result<(), String> {
     Ok(())
 }
 
-/// Refuse a concurrent `server.port` change on the **redeploy** path, BEFORE any op
-/// runs — so the live release keeps serving (#2073).
+/// Detect a concurrent `server.port` change on the **redeploy** path, BEFORE any op
+/// runs (issue #2073, Option C).
 ///
 /// The reboot-durability upgrade (#2070) makes every redeploy refresh the shared
 /// kamal-proxy unit and, when that unit changed, restart `kamal-proxy run` and
 /// re-register the still-live upstream. Both the restart's public bind and the
-/// re-register's DERIVED loopback target are correct ONLY when the public port is
-/// unchanged: if the operator changed `server.port` since the live release was
-/// deployed, the restart would rebind a different public port and the re-register
-/// would aim at a port nothing listens on, stranding `:80` mid-cutover. Rather than
-/// try to sequence a live-safe port move here (Option C, #2073), refuse the deploy
-/// at pre-flight with an actionable message.
+/// re-register's DERIVED loopback target are correct ONLY when computed from the
+/// port the live release was ACTUALLY deployed under — so a detected change must
+/// resolve to a [`exec::PublicPortMove`] the caller threads through every op
+/// (phases 1-3 run against `old_port`, never `new_port`) rather than a value that
+/// silently drifts mid-cutover.
 ///
 /// The comparison is sourced from the INSTALLED proxy unit's `--http-port` (captured
 /// by [`exec::probe_deploy_state`]), which is the ground truth of what the running
 /// proxy actually binds:
 ///
 ///   - [`exec::InstalledProxyPort::Absent`] → no installed unit, i.e. a first-deploy
-///     shape (the durability refresh writes it fresh). Nothing to conflict with →
-///     allowed. (This branch only runs when `current` is a symlink, so this is the
-///     rare shape where the proxy unit is missing but a release symlink exists.)
+///     shape (the durability refresh writes it fresh at the requested port).
+///     Nothing to move → `Ok(None)`. (This branch only runs when `current` is a
+///     symlink, so this is the rare shape where the proxy unit is missing but a
+///     release symlink exists.)
 ///   - [`exec::InstalledProxyPort::Port`] equal to the requested port → unchanged
-///     redeploy (the common durability-upgrade path) → allowed.
-///   - [`exec::InstalledProxyPort::Port`] DIFFERENT from the requested port → refuse,
-///     naming old vs new port and the two-deploy operator sequence.
+///     redeploy (the common durability-upgrade path) → `Ok(None)`.
+///   - [`exec::InstalledProxyPort::Port`] DIFFERENT from the requested port →
+///     `Ok(Some(PublicPortMove { old_port, new_port }))`.
 ///   - [`exec::InstalledProxyPort::Unreadable`] → the unit is present but its
-///     `--http-port` couldn't be read/parsed, so we can't prove the port is unchanged
-///     → **fail closed** (refuse) rather than risk a mid-cutover bind failure.
-fn refuse_concurrent_public_port_change(
+///     `--http-port` couldn't be read/parsed, so we can't prove which port (if any)
+///     needs moving → **fail closed** (refuse) rather than risk a mid-cutover bind
+///     failure.
+fn resolve_public_port_move(
     installed: &exec::InstalledProxyPort,
     new_public_port: u16,
-) -> Result<(), String> {
+) -> Result<Option<exec::PublicPortMove>, String> {
     match installed {
         // No installed proxy unit — first-deploy shape; the durability refresh writes
-        // it fresh at the requested port, so there is nothing to conflict with.
-        exec::InstalledProxyPort::Absent => Ok(()),
+        // it fresh at the requested port, so there is nothing to move.
+        exec::InstalledProxyPort::Absent => Ok(None),
         // Unchanged public port — the common redeploy / durability-upgrade path.
-        exec::InstalledProxyPort::Port(current) if *current == new_public_port => Ok(()),
-        exec::InstalledProxyPort::Port(current) => Err(format!(
-            "Changing server.port on an existing deployment isn't supported here yet \
-             (the installed kamal-proxy is on port {current}, config requests \
-             {new_public_port}): first redeploy with server.port unchanged (adopts the \
-             reboot-durability upgrade), then change the port in a separate deploy. \
-             Tracked in #2073."
-        )),
+        exec::InstalledProxyPort::Port(current) if *current == new_public_port => Ok(None),
+        exec::InstalledProxyPort::Port(old_port) => Ok(Some(exec::PublicPortMove {
+            old_port: *old_port,
+            new_port: new_public_port,
+        })),
         // Fail closed: the unit is present but its --http-port is unreadable, so we
-        // cannot prove the public port is unchanged — refuse rather than risk the
-        // durability restart rebinding a different port and stranding `:80`.
+        // cannot prove whether the public port needs moving — refuse rather than risk
+        // the durability restart rebinding the wrong port and stranding `:80`.
         exec::InstalledProxyPort::Unreadable => Err(format!(
             "Cannot verify the installed kamal-proxy's HTTP port before a redeploy \
              (its systemd unit is present but its `--http-port` could not be read), so \
              a concurrent server.port change (config requests {new_public_port}) cannot \
              be ruled out and is refused to avoid stranding public traffic mid-cutover. \
-             Re-provision the host (or repair the kamal-proxy unit) and retry. Live-safe \
-             server.port changes are tracked in #2073."
+             Re-provision the host (or repair the kamal-proxy unit) and retry."
         )),
     }
 }
 
 /// Pre-flight refuse for an UNPROVABLE `shared/proxy-options` marker on the redeploy
-/// path (issue #2074), mirroring [`refuse_concurrent_public_port_change`]'s
-/// `Unreadable` fail-closed arm.
+/// path (issue #2074), mirroring [`resolve_public_port_move`]'s `Unreadable`
+/// fail-closed arm.
 ///
 /// The durability-refresh re-register (#2070/#2071) re-registers the still-live OLD
 /// release; #2074 preserves that release's own TLS/host by reading them back from the
@@ -3158,6 +3662,14 @@ fn run_up(
 ) -> Result<(), DeployError> {
     eprintln!("\u{1F342} autumn deploy up\n");
 
+    // Attach the SQLite data-file contract (#1909) BEFORE the fleet is built, so
+    // every host's config carries it and every host links the same path. A
+    // Postgres app resolves `None` and nothing below changes.
+    let resolved = &resolved
+        .clone()
+        .with_release_payloads(release_payload_basenames(config, resolved))
+        .with_sqlite_data_placement(sqlite_data_placement(config, resolved));
+
     // The rollout targets, in declaration order. A single-host config resolves to
     // a one-host fleet whose only element IS today's `resolved`, so everything
     // below is the pre-#1621 sequence at N = 1.
@@ -3167,10 +3679,7 @@ fn run_up(
     // host is graded here, so an unreachable host in position 3 is reported before
     // host 1 is touched.
     let checks = collect_fleet_preflight(config, &fleet, configured_host_count);
-    let failed = report_preflight(&checks);
-    if failed > 0 {
-        return Err(DeployError::PreflightFailed(failed));
-    }
+    refuse_if_preflight_failed(&checks)?;
 
     let binary = resolve_release_binary(resolved)?;
     let env_file = build_env_file(config, resolved);
@@ -3198,6 +3707,8 @@ fn run_up(
 
     run_up_with(
         &FleetUpInput {
+            app_name: &resolved.app_name,
+            profile: &resolved.profile,
             fleet: &fleet,
             proxy: &proxy,
             checks: &checks,
@@ -3264,6 +3775,14 @@ struct FleetDatabaseFacts {
 /// is what makes the loop testable: nothing here reads the clock, the filesystem,
 /// or a socket.
 struct FleetUpInput<'a, P: ProxyController> {
+    /// The app's stable name (e.g. `"myapp"`, from `Cargo.toml`). A halt
+    /// alert's dedup key includes this (issue #2267), so two different apps
+    /// sharing one alert destination never fold into one incident.
+    app_name: &'a str,
+    /// The TARGET deploy profile (e.g. `"prod"`). A halt reloads `[alerts]`
+    /// under this profile (issue #2267), never the operator's ambient shell
+    /// profile.
+    profile: &'a str,
     /// The rollout targets, in order. Never empty.
     fleet: &'a ResolvedFleet,
     /// The proxy controller. kamal-proxy is PER HOST (it binds that host's public
@@ -3336,6 +3855,9 @@ struct HostProbeState {
     /// Whether this host has no usable reverse-proxy binary and this deploy must
     /// install one as the FIRST op of that host's turn (issue #1607, AC-1).
     needs_proxy_install: bool,
+    /// A concurrent `server.port` change to apply AFTER the cutover (issue #2073,
+    /// Option C phase 4) — `None` on a first deploy or an unchanged redeploy port.
+    port_move: Option<exec::PublicPortMove>,
 }
 
 /// Whether this host's deploy may prepare the target by installing a missing proxy
@@ -3443,21 +3965,22 @@ where
             reregister_options: input.proxy.proxy_service_options(),
             banner: "first deploy".to_owned(),
             needs_proxy_install,
+            // No installed proxy at all — nothing to move.
+            port_move: None,
         }),
         exec::DeployMode::Redeploy { live_slot } => {
-            // Pre-flight refuse (#2073): the reboot-durability restart-refresh (#2070)
-            // re-execs `kamal-proxy run` on the public port and re-registers the
-            // still-live upstream at its derived loopback port — both correct only while
-            // the public port is unchanged. If the operator changed `server.port` since
-            // the live release was deployed, that restart would rebind a different public
-            // port and the re-register would aim at a dead loopback port, stranding `:80`
-            // mid-cutover with no auto-recovery. Refuse here, before any op runs, sourced
-            // from the installed proxy unit's `--http-port` captured in the deploy-start
-            // probe, so the live release keeps serving. A live-safe port change is future
-            // work. No installed unit means a first deploy and is allowed; an unreadable
-            // unit fails closed.
-            refuse_concurrent_public_port_change(&probe.installed_proxy_port, input.public_port)
-                .map_err(|message| DeployError::Config(scoped(message)))?;
+            // Detect a concurrent `server.port` change (#2073, Option C) BEFORE any op
+            // runs, sourced from the installed proxy unit's `--http-port` captured in
+            // the deploy-start probe. When present, every op through the drain of the
+            // old release plans against `port_move.old_port` — the port the live
+            // release was ACTUALLY deployed under — never the newly requested one; the
+            // move itself is a separate, later phase (see `run_up_with`). No installed
+            // unit means a first-deploy shape and resolves to `None`; an unreadable
+            // unit fails closed (a move can't be proven safe).
+            let port_move =
+                resolve_public_port_move(&probe.installed_proxy_port, input.public_port)
+                    .map_err(|message| DeployError::Config(scoped(message)))?;
+            let effective_public_port = port_move.map_or(input.public_port, |m| m.old_port);
             // Pre-flight refuse (#2074): if the `shared/proxy-options` marker is present
             // but unreadable, we cannot prove the OLD release's TLS/host, so a concurrent
             // `deploy.tls.host` change can't be safely preserved across the durability
@@ -3476,17 +3999,19 @@ where
                 exec::ProxyOptionsMarker::Options(old) => old.clone(),
                 _ => input.proxy.proxy_service_options(),
             };
-            // Reconcile the (possibly stale) live-slot marker against the live
-            // proxy before choosing the candidate slot. On an UNAMBIGUOUS
-            // proxy-vs-marker disagreement the proxy is authoritative (so the
-            // candidate takes the genuinely-idle slot and never restarts the live
-            // one); on any absent/unclear proxy signal this is exactly the
-            // marker-based behavior as before (#1938, fail-safe).
+            // Reconcile the (possibly stale) live-slot marker against the live proxy
+            // before choosing the candidate slot — against `effective_public_port`,
+            // the port the proxy is ACTUALLY installed on, so a concurrent
+            // `server.port` change never makes this look for a slot the proxy never
+            // registered. On an UNAMBIGUOUS proxy-vs-marker disagreement the proxy is
+            // authoritative (so the candidate takes the genuinely-idle slot and never
+            // restarts the live one); on any absent/unclear proxy signal this is
+            // exactly the marker-based behavior as before (#1938, fail-safe).
             let reconcile = exec::reconcile_live_slot(
                 live_slot,
                 &probe.proxy_list,
                 &cfg.service_name,
-                input.public_port,
+                effective_public_port,
             );
             if let Some(warn) = &reconcile.warn {
                 // Loud + observable: drift is surfaced, not silently papered over.
@@ -3494,11 +4019,17 @@ where
                 // reports operator-facing state via eprintln! throughout.)
                 eprintln!("\u{26A0}\u{FE0F}  {}", scoped(warn.clone()));
             }
-            let slots = exec::SlotPlan::redeploy(input.public_port, reconcile.live_slot);
-            let banner = format!(
+            let slots = exec::SlotPlan::redeploy(effective_public_port, reconcile.live_slot);
+            let mut banner = format!(
                 "zero-downtime redeploy ({} \u{2192} {})",
                 slots.live_slot, slots.candidate_slot
             );
+            if let Some(mv) = port_move {
+                banner = format!(
+                    "{banner}, then moving server.port {} \u{2192} {}",
+                    mv.old_port, mv.new_port
+                );
+            }
             Ok(HostProbeState {
                 mode: fleet::HostMode::from_deploy_mode(&probe.mode),
                 slots,
@@ -3506,6 +4037,7 @@ where
                 reregister_options,
                 banner,
                 needs_proxy_install,
+                port_move,
             })
         }
     }
@@ -3682,11 +4214,20 @@ where
         // already cut over is left behind.
         // Repair the drifted marker as an early op — before the cutover's
         // record-previous-release reads it — so the on-disk marker matches the proxy
-        // truth even if the rest of the deploy is interrupted.
+        // truth even if the rest of the deploy is interrupted. Uses `state.slots
+        // .public_port` — the EFFECTIVE public port `probe_host_for_up` planned this
+        // host's slots from (the OLD port across a detected `server.port` move,
+        // #2073) — never `input.public_port` (the newly requested one): the repair
+        // must persist the port the live release ACTUALLY binds, not one derived
+        // from a port that has not taken effect yet.
         if state.repair {
             ops.insert(
                 0,
-                exec::live_slot_marker_repair_op(cfg, state.slots.live_slot, input.public_port),
+                exec::live_slot_marker_repair_op(
+                    cfg,
+                    state.slots.live_slot,
+                    state.slots.public_port,
+                ),
             );
         }
         // Host preparation goes in AFTER the repair insert so it ends up ahead of
@@ -3711,6 +4252,9 @@ where
         // leaves them behind and the next `deploy up` wrongly takes the redeploy
         // path with nothing serving.
         let teardown = match host_plan.mode {
+            // This is the pre-go-live path — its failure boundary IS the health-
+            // gated `proxy-route` op, so a failure here means the route was never
+            // established. There is nothing to deregister (issue #2270).
             fleet::HostMode::First => {
                 exec::first_deploy_teardown_ops(cfg, input.release_id, &state.slots)
             }
@@ -3745,6 +4289,84 @@ where
 
         match result {
             Ok(()) => {
+                // Option C phase 4 (#2073): the cutover just landed on the OLD public
+                // port (phases 1-3 planned against it deliberately), so a detected
+                // `server.port` change moves the proxy's public listener now, AFTER
+                // the release is live and the old one has drained — its own failure
+                // boundary, with its own rollback to `old_port` on failure.
+                if let Some(mv) = state.port_move {
+                    let options = input.proxy.proxy_service_options();
+                    let rebind_ops = exec::public_port_rebind_ops(
+                        cfg,
+                        input.proxy,
+                        input.release_id,
+                        state.slots.candidate_port,
+                        &options,
+                        mv.new_port,
+                    );
+                    let rollback_ops = exec::public_port_rebind_ops(
+                        cfg,
+                        input.proxy,
+                        input.release_id,
+                        state.slots.candidate_port,
+                        &options,
+                        mv.old_port,
+                    );
+                    if let Err(rebind_err) = exec::execute_public_port_rebind(
+                        &rebind_ops,
+                        &rollback_ops,
+                        mv.old_port,
+                        mv.new_port,
+                        executor,
+                    ) {
+                        if single {
+                            return Err(DeployError::Exec(rebind_err.to_string()));
+                        }
+                        match rebind_err {
+                            // The release is live and reachable at the OLD port — a
+                            // recoverable, traffic-healthy degradation (exactly what
+                            // `Degraded` means elsewhere), so the rollout continues
+                            // past it like every other post-cutover housekeeping
+                            // failure.
+                            exec::PublicPortRebindError::RolledBack { .. } => {
+                                outcomes[index] = fleet::HostOutcome::Degraded {
+                                    label: "public-port-rebind",
+                                };
+                                degraded.push((host_plan.host.clone(), "public-port-rebind"));
+                                eprintln!(
+                                    "\u{26A0}\u{FE0F}  [{}/{total} {}] serving {} \u{2014} \
+                                     {rebind_err}\n",
+                                    index + 1,
+                                    host_plan.host,
+                                    input.release_id,
+                                );
+                                continue;
+                            }
+                            // The proxy's public bind is now unknown — unlike a
+                            // `Degraded` host this one may NOT be reachable, so it
+                            // must never be reported as "traffic is fine" (that is
+                            // `Degraded`'s fixed summary text) and must never be
+                            // auto-compensated by an ordinary proxy-flip rollback,
+                            // which could target a proxy that is not even listening.
+                            // `Manual` is the existing "needs a human, do not touch"
+                            // outcome (mirrors `AmbiguousMarkers`) — halt rather than
+                            // roll forward.
+                            exec::PublicPortRebindError::RollbackFailed { .. } => {
+                                outcomes[index] = fleet::HostOutcome::Manual {
+                                    reason: fleet::MANUAL_PUBLIC_PORT_UNKNOWN,
+                                };
+                                eprintln!(
+                                    "\n\u{274C} rollout halted at {} (`public-port-rebind`) \
+                                     \u{2014} the remaining hosts were not touched \u{2014} \
+                                     {rebind_err}\n",
+                                    host_plan.host,
+                                );
+                                halt = Some((host_plan.host.clone(), "public-port-rebind"));
+                                break;
+                            }
+                        }
+                    }
+                }
                 outcomes[index] = fleet::HostOutcome::Serving;
                 if !single {
                     if host_plan.migrate == exec::MigrateStep::Run {
@@ -3809,13 +4431,13 @@ where
         for line in fleet::fleet_summary_lines(&plan, &outcomes, input.release_id) {
             eprintln!("{line}");
         }
-        return Err(fleet_halted(
-            &plan,
-            &outcomes,
-            &degraded,
-            failed_host,
-            failed_step,
-        ));
+        let error = fleet_halted(&plan, &outcomes, &degraded, failed_host, failed_step);
+        // #2267: send a #1610 alert for the halt. This is best-effort. It
+        // does not change `error` below.
+        if let DeployError::FleetHalted(ref halt) = error {
+            emit_fleet_halted_alert(halt, input.app_name, input.profile);
+        }
+        return Err(error);
     }
 
     // App deploy is committed on every host here: the cutovers succeeded and there
@@ -3995,19 +4617,29 @@ where
 /// Remove ONE host's just-completed FIRST deploy (issue #1621, §4.7).
 ///
 /// A first deploy has no `shared/previous-release` marker, so there is nothing to
-/// roll back to: the honest compensation is the first-deploy teardown, which stops
-/// the slot unit, removes this run's release dir, and clears the `current` symlink
-/// and slot markers — leaving the host in the nothing-installed state that makes
-/// the next `deploy up` correctly take the First path again.
+/// roll back to. The honest compensation is the first-deploy teardown: stop the
+/// slot unit, remove this run's release dir, clear the `current` symlink and
+/// slot markers, and record `torn down` — [`exec::first_deploy_teardown_ops`],
+/// unchanged since #1621. This leaves the host in the nothing-installed state
+/// that makes the next `deploy up` correctly take the First path again.
 ///
 /// Driven through [`exec::run_ops`], not `run_teardown`: at fleet scale a silently
 /// swallowed cleanup failure is how a host ends up half-removed with nobody told.
 ///
-/// **Known residue:** [`ProxyController`] has no deregister op, so this host's
-/// kamal-proxy still holds a route for the service pointing at the stopped slot —
-/// its public port answers 502 rather than refusing the connection until it is
-/// deployed again. Removing the route needs a new controller method (and its own
-/// exact-vector tests); the state table names the host so this is never a surprise.
+/// The proxy route is removed as its OWN, SEPARATE step, only once the app
+/// teardown above has fully SUCCEEDED (issue #2270), so its public port refuses
+/// connections instead of answering 502. Splitting it out like this — rather
+/// than folding it into the same op list — is deliberate: a transport failure
+/// (the local `ssh` launch itself dying) carries NO op label at all, so if the
+/// route removal shared a list with the app teardown, that shape of failure
+/// could never be told apart from one on an EARLIER, not-yet-attempted step.
+/// Run alone, ANY failure here — a real remote error or a labelless transport
+/// one — can only mean one thing: the app is confirmed gone (the first call
+/// already returned `Ok`) and only the route is in question. That is reported
+/// as its own outcome, [`fleet::HostOutcome::CompensatedTeardownRouteFailed`],
+/// never the generic [`fleet::HostOutcome::CompensationFailed`] ("still on the
+/// new release, roll it back" — untrue here, and impossible: a first deploy has
+/// no previous release to roll back to).
 fn compensate_teardown<E, P>(
     cfg: &ResolvedDeployConfig,
     input: &FleetUpInput<'_, P>,
@@ -4018,18 +4650,30 @@ where
     E: exec::DeployExecutor,
     P: ProxyController,
 {
-    let ops = exec::first_deploy_teardown_ops(cfg, input.release_id, slots);
-    match exec::run_ops(&ops, executor) {
+    let app_ops = exec::first_deploy_teardown_ops(cfg, input.release_id, slots);
+    if let Err(err) = exec::run_ops(&app_ops, executor) {
+        let failed_step = fleet::failed_step_label(&err);
+        eprintln!(
+            "\u{274C} [{}] removing the first deploy FAILED at `{failed_step}` \u{2014} this \
+             host is still on {}. The remaining hosts are still compensated.",
+            cfg.host.as_deref().unwrap_or_default(),
+            input.release_id,
+        );
+        return fleet::HostOutcome::CompensationFailed { failed_step };
+    }
+
+    let deregister = input.proxy.deregister_op(&cfg.service_name);
+    match exec::run_ops(&[deregister], executor) {
         Ok(()) => fleet::HostOutcome::CompensatedTeardown,
         Err(err) => {
             let failed_step = fleet::failed_step_label(&err);
             eprintln!(
-                "\u{274C} [{}] removing the first deploy FAILED at `{failed_step}` \u{2014} this \
-                 host is still on {}. The remaining hosts are still compensated.",
+                "\u{26A0}\u{FE0F}  [{}] removed the first deploy, but its proxy route removal \
+                 FAILED at `{failed_step}` \u{2014} its public port may still answer 502 until it \
+                 is redeployed or the route is removed by hand.",
                 cfg.host.as_deref().unwrap_or_default(),
-                input.release_id,
             );
-            fleet::HostOutcome::CompensationFailed { failed_step }
+            fleet::HostOutcome::CompensatedTeardownRouteFailed { failed_step }
         }
     }
 }
@@ -4041,6 +4685,353 @@ fn manual_outcome(cfg: &ResolvedDeployConfig, reason: &'static str) -> fleet::Ho
         eprintln!("{line}");
     }
     fleet::HostOutcome::Manual { reason }
+}
+
+// ── #2267: send a #1610 alert on a halted rollout or on drift ───────────────
+//
+// AC-6 of #1621 asks for this. Do not make the operator poll a non-zero exit
+// code for it. Follow the `db::backup` pattern from issue #1743: load the
+// config, build the same channels `autumn alert test` uses, and deliver
+// directly. This is best-effort. It never changes the command's exit code.
+
+/// Build alert channels from `alerts`/`http`, already resolved.
+///
+/// Check `[alerts] enabled` first, the master switch (review finding on
+/// #2267: a disabled config with transport credentials left in place must
+/// send nothing). `is_active()` checks `enabled` AND a set destination.
+/// Return an empty list when either check fails. An empty list is a no-op
+/// downstream.
+fn alert_channels_for(
+    alerts: &autumn_web::alerts::AlertConfig,
+    http: &autumn_web::config::HttpConfig,
+) -> Vec<Arc<dyn AlertChannel>> {
+    if !alerts.is_active() {
+        return Vec::new();
+    }
+    let client = autumn_web::http::Client::from_config(&http.client);
+    crate::alert::configured_http_channels(alerts, &client)
+}
+
+/// Read `[alerts]` and `[http]` from the raw project TOML layers alone — no
+/// env-var overlay yet (the caller applies one — see
+/// [`apply_alert_env_overrides`]), no full [`AutumnConfig`] deserialize.
+/// Mirrors [`declared_server_port_in`]'s own merge of base `autumn.toml` ←
+/// inline `[profile.<name>]` ← `autumn-<profile>.toml`.
+///
+/// Review finding on #2267: [`load_runtime_config`] can fail on a section
+/// this command does not even use (a bad `[scheduler]`/`[database]` value),
+/// the exact case [`status_public_port`] already degrades gracefully for
+/// the port. Without this, that same failure would ALSO silence a valid
+/// `[alerts]` destination — exactly the incident an operator most needs to
+/// hear about. Deserializing only `alerts`/`http` out of the merged TOML
+/// ignores every other top-level key, so a bad value there can not break
+/// this the way it breaks the full `AutumnConfig` deserialize.
+fn declared_alert_config_in(
+    dirs: &[PathBuf],
+    profile_raw: &str,
+) -> Option<(
+    autumn_web::alerts::AlertConfig,
+    autumn_web::config::HttpConfig,
+)> {
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct AlertsHttpTomlRoot {
+        alerts: autumn_web::alerts::AlertConfig,
+        http: autumn_web::config::HttpConfig,
+    }
+
+    let mut merged = toml::Value::Table(toml::map::Map::new());
+    let base_toml: Option<toml::Value> = first_dir_with_file(dirs, "autumn.toml")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| toml::from_str::<toml::Value>(&text).ok());
+    let canonical = canonicalize_deploy_profile(profile_raw);
+    if let Some(base) = &base_toml {
+        deep_merge_toml(&mut merged, base.clone());
+        for name in profile_inline_lookup_names(&canonical) {
+            if let Some(section) = profile_section_from_base_toml(base, name) {
+                deep_merge_toml(&mut merged, section);
+            }
+        }
+    }
+    for name in autumn_web::config::profile_override_file_lookup_names(&canonical, profile_raw) {
+        let Some(path) = first_dir_with_file(dirs, &format!("autumn-{name}.toml")) else {
+            continue;
+        };
+        // Review finding on #2267: an unreadable or malformed override file
+        // must fail this whole read, not be silently skipped in favor of
+        // the base/inline config. A `[profile.prod]` override exists to
+        // CHANGE or disable a destination — silently falling back to a
+        // lower-priority layer could page using a destination the override
+        // was meant to replace.
+        let text = std::fs::read_to_string(&path).ok()?;
+        let overlay: toml::Value = toml::from_str(&text).ok()?;
+        deep_merge_toml(&mut merged, overlay);
+        break;
+    }
+
+    // Review finding on #2267: `strict_config` hard-fails `load_runtime_config`
+    // on a typo'd key inside `[alerts]`/`[http]` (e.g. `enabeld` for
+    // `enabled`) — the exact scenario landing here. Plain deserialize
+    // ignores an unrecognized field silently, which would default a
+    // mistyped `enabled` switch back to `true`. Reject it instead, using
+    // the SAME schema the primary path checks against.
+    if merged_alerts_or_http_has_unknown_key(&merged) {
+        return None;
+    }
+
+    let root: AlertsHttpTomlRoot = merged.try_into().ok()?;
+    Some((root.alerts, root.http))
+}
+
+/// Whether `merged` has an unrecognized key under `alerts` or `http`.
+///
+/// Reuses [`AutumnConfig::validate_toml`]/[`AutumnConfig::get_schema_keys`]
+/// — the same schema check `strict_config` runs on the primary path —
+/// filtered to `alerts`/`http` paths only, so an unrelated unknown
+/// top-level root (a plugin-owned table) is never mistaken for our own
+/// error.
+fn merged_alerts_or_http_has_unknown_key(merged: &toml::Value) -> bool {
+    let Ok(toml_str) = toml::to_string(merged) else {
+        return false;
+    };
+    let schema = AutumnConfig::get_schema_keys();
+    AutumnConfig::validate_toml(&toml_str, &schema)
+        .iter()
+        .any(|(path, _)| {
+            path == "alerts"
+                || path.starts_with("alerts.")
+                || path == "http"
+                || path.starts_with("http.")
+        })
+}
+
+/// Load `[alerts]` under the TARGET deploy profile. Build its channels.
+///
+/// Review finding on #2267: the ambient ("ambient" means the operator's
+/// shell) profile can differ from the deploy profile, so a plain
+/// `AutumnConfig::load()` can miss a production-only destination or send a
+/// production incident to a dev one. Use [`load_runtime_config`] instead —
+/// the same forced-profile load `run` uses for `check`/`rollback`/`up`. On
+/// failure, fall back to [`declared_alert_config_in`] rather than giving up:
+/// see its own doc for why and its narrower limitation.
+fn deploy_alert_channels_for_profile(profile: &str) -> Vec<Arc<dyn AlertChannel>> {
+    if let Ok(config) = load_runtime_config(profile) {
+        return alert_channels_for(&config.alerts, &config.http);
+    }
+    let Some((alerts, http)) = declared_alert_config_in(&manifest_project_dirs(), profile) else {
+        eprintln!("  \u{26A0} alert skipped: could not load configuration for profile {profile}");
+        return Vec::new();
+    };
+    // Review finding on #2267: the TOML-only fallback above must still see
+    // `AUTUMN_ALERTS__*`/`AUTUMN_HTTP__*` env overrides, or a destination
+    // set only via env var (the documented, recommended way to supply a
+    // secret) gets nothing here, and an `AUTUMN_ALERTS__ENABLED=false`
+    // meant to silence a TOML-configured destination is ignored.
+    //
+    // If the `.env.<profile>` overlay itself fails to build (unreadable or
+    // malformed), fall back to bare OS env rather than skipping the env
+    // layer outright (review finding on #2267): real OS env vars are the
+    // HIGHEST-priority layer regardless of `.env.<profile>`, so an
+    // `AUTUMN_ALERTS__ENABLED=false` set directly in the process
+    // environment must still apply even when the dotenv file can not be
+    // read. Only the lower-priority `.env.<profile>` layer is lost here.
+    let (alerts, http) = match deploy_profile_env_overlay(profile) {
+        Ok(env) => apply_alert_env_overrides(alerts, http, &env),
+        Err(_) => apply_alert_env_overrides(alerts, http, &autumn_web::config::OsEnv),
+    };
+    alert_channels_for(&alerts, &http)
+}
+
+/// Apply the same `AUTUMN_ALERTS__*`/`AUTUMN_HTTP__*` env overrides the
+/// primary [`load_runtime_config`] path applies (issue #2267 review).
+///
+/// Reuses [`AutumnConfig::apply_env_overrides_with_env`] verbatim on a
+/// scratch value — the exact method `AutumnConfig::load_with_env` itself
+/// calls — so this can never drift from the primary path's env semantics.
+/// Every OTHER section of the scratch value is a throwaway default; only
+/// `alerts`/`http` are read back out.
+fn apply_alert_env_overrides(
+    alerts: autumn_web::alerts::AlertConfig,
+    http: autumn_web::config::HttpConfig,
+    env: &dyn Env,
+) -> (
+    autumn_web::alerts::AlertConfig,
+    autumn_web::config::HttpConfig,
+) {
+    let mut scratch = AutumnConfig {
+        alerts: Box::new(alerts),
+        http,
+        ..AutumnConfig::default()
+    };
+    scratch.apply_env_overrides_with_env(env);
+    (*scratch.alerts, scratch.http)
+}
+
+/// Send `alert` to every channel in `channels`.
+///
+/// Use a short-lived runtime, like `autumn alert test` does. Log a failed
+/// delivery. Do not stop for it. This must never change the command's exit
+/// code. Do nothing when `channels` is empty. This happens when `[alerts]`
+/// has no channel set.
+fn deliver_alert(channels: &[Arc<dyn AlertChannel>], alert: &Alert) {
+    if channels.is_empty() {
+        return;
+    }
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("  \u{26A0} alert not sent: could not start async runtime: {e}");
+            return;
+        }
+    };
+    runtime.block_on(async {
+        for channel in channels {
+            if let Err(error) = channel.deliver(alert).await {
+                eprintln!(
+                    "  \u{26A0} alert not delivered via {}: {error}",
+                    channel.name()
+                );
+            }
+        }
+    });
+}
+
+/// Join host names into one alert-detail value. Return an empty string for
+/// an empty list — for example, when no host was torn down.
+fn join_hosts(hosts: &[String]) -> String {
+    hosts.join(", ")
+}
+
+/// Join `(host, reason)` pairs into one alert-detail value.
+fn join_host_reasons(pairs: &[(String, &'static str)]) -> String {
+    pairs
+        .iter()
+        .map(|(host, reason)| format!("{host}: {reason}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Build the alert for a halted fleet rollout (issue #2267, AC-6 of #1621).
+///
+/// This is a pure function. It does no I/O. So a test can call it directly.
+/// It reuses the `ScheduledTaskFailure` condition. It does not add a new
+/// `AlertCondition` variant. Issue #1743 made the same choice for a failed
+/// backup upload. A halted rollout is also a task the framework runs, and
+/// it did not finish.
+///
+/// Every field on `halt` is a host name or a fixed operation label (see
+/// [`FleetHalt`]). So this alert can never carry a shell line or a raw
+/// driver error.
+///
+/// Its dedup key includes `app_name` and `profile`, so a halt on staging
+/// and a halt on production never merge into one incident, and neither do
+/// two different apps' `prod` halts, even when they share a `PagerDuty`
+/// routing key (review findings on #2267 — matches [`build_drift_alert`]'s
+/// existing scoping, extended with the app name).
+///
+/// Sets its own `where_to_look` (review finding on #2267): the
+/// `ScheduledTaskFailure` default is `/actuator/tasks`, an app runtime
+/// endpoint with no fleet or rollout data. `autumn deploy status` is the
+/// command that shows the fleet's actual state.
+fn build_fleet_halted_alert(halt: &FleetHalt, app_name: &str, profile: &str) -> Alert {
+    Alert::trigger(
+        AlertCondition::ScheduledTaskFailure,
+        format!("scheduled_task_failure:deploy-fleet-halted:{app_name}:{profile}"),
+    )
+    .title("Fleet rollout halted")
+    .summary(halt.to_string())
+    .where_to_look("autumn deploy status")
+    .detail("app_name", app_name)
+    .detail("profile", profile)
+    .detail("failed_host", halt.failed_host.clone())
+    .detail("failed_step", halt.failed_step)
+    .detail("rolled_back", join_hosts(&halt.rolled_back))
+    .detail("torn_down", join_hosts(&halt.torn_down))
+    .detail("still_on_new", join_hosts(&halt.still_on_new))
+    .detail("degraded", join_host_reasons(&halt.degraded))
+    .detail(
+        "route_removal_failed",
+        join_host_reasons(&halt.route_removal_failed),
+    )
+    .detail("manual", join_host_reasons(&halt.manual))
+    .build()
+}
+
+/// Send an alert for a halted fleet rollout (issue #2267, AC-6 of #1621).
+///
+/// Loads `[alerts]` under `profile`, the TARGET deploy profile — not the
+/// operator's ambient shell profile. This runs on any halt, if `[alerts]`
+/// names a channel there. If no channel is set, this does nothing. So an
+/// operator with no alert channel sees the same behavior as before. They
+/// see a message and a non-zero exit.
+fn emit_fleet_halted_alert(halt: &FleetHalt, app_name: &str, profile: &str) {
+    let channels = deploy_alert_channels_for_profile(profile);
+    deliver_alert(
+        &channels,
+        &build_fleet_halted_alert(halt, app_name, profile),
+    );
+}
+
+/// Write a one-line summary of a [`fleet::DriftReport`] for an alert.
+fn drift_alert_summary(report: &fleet::DriftReport) -> String {
+    let mut parts = Vec::new();
+    if report.version_drift {
+        parts.push(format!(
+            "{} known release(s) are live at once",
+            report.known_releases().len()
+        ));
+    }
+    if !report.state_drift.is_empty() {
+        parts.push(format!(
+            "{} host(s) have state drift",
+            report.state_drift.len()
+        ));
+    }
+    parts.join("; ")
+}
+
+/// Build the alert for drift found by `deploy status --strict` (issue #2267,
+/// AC-6 of #1621).
+///
+/// This is a pure function. It does no I/O. Its dedup key includes
+/// `app_name` and `profile`, so drift on staging and drift on production
+/// never merge into one alert, and neither do two different apps' `prod`
+/// drift (review finding on #2267).
+///
+/// It carries the same reason strings `fleet::fleet_drift` already prints —
+/// never a raw driver error. So it needs no secrets check beyond what
+/// `DriftReport` already gives.
+///
+/// Sets its own `where_to_look`, same reason as [`build_fleet_halted_alert`]
+/// (review finding on #2267).
+fn build_drift_alert(report: &fleet::DriftReport, app_name: &str, profile: &str) -> Alert {
+    Alert::trigger(
+        AlertCondition::ScheduledTaskFailure,
+        format!("scheduled_task_failure:deploy-drift:{app_name}:{profile}"),
+    )
+    .title("Fleet drift detected")
+    .summary(drift_alert_summary(report))
+    .where_to_look("autumn deploy status")
+    .detail("app_name", app_name)
+    .detail("profile", profile)
+    .detail("version_drift", report.version_drift.to_string())
+    .detail("state_drift", join_host_reasons(&report.state_drift))
+    .build()
+}
+
+/// Send an alert for drift found by `deploy status --strict` (issue #2267,
+/// AC-6 of #1621). This is the cron path in `docs/guide/fleet-deploys.md`.
+///
+/// Loads `[alerts]` under `profile`, the TARGET deploy profile — not the
+/// operator's ambient shell profile. This does nothing if `[alerts]` has no
+/// channel set there. The caller must call this only in `--strict` mode. A
+/// plain `deploy status` check must never page anyone.
+fn emit_drift_alert(report: &fleet::DriftReport, app_name: &str, profile: &str) {
+    let channels = deploy_alert_channels_for_profile(profile);
+    deliver_alert(&channels, &build_drift_alert(report, app_name, profile));
 }
 
 /// Build the typed halt error from the recorded per-host outcomes (issue #1621,
@@ -4085,13 +5076,26 @@ fn fleet_halted(
         torn_down: named(|o| {
             matches!(
                 o,
-                fleet::HostOutcome::TornDown { .. } | fleet::HostOutcome::CompensatedTeardown
+                fleet::HostOutcome::TornDown { .. }
+                    | fleet::HostOutcome::CompensatedTeardown
+                    | fleet::HostOutcome::CompensatedTeardownRouteFailed { .. }
             )
         }),
         // Shared with the summary table's own list, so the halt error and the state
         // table can never disagree about which hosts are still forward.
         still_on_new: named(fleet::HostOutcome::on_new_release),
         degraded: degraded.to_vec(),
+        route_removal_failed: plan
+            .hosts
+            .iter()
+            .zip(outcomes)
+            .filter_map(|(host, outcome)| match outcome {
+                fleet::HostOutcome::CompensatedTeardownRouteFailed { failed_step } => {
+                    Some((host.host.clone(), *failed_step))
+                }
+                _ => None,
+            })
+            .collect(),
         manual: plan
             .hosts
             .iter()
@@ -4128,6 +5132,15 @@ fn run_rollback(
     configured_host_count: usize,
 ) -> Result<(), DeployError> {
     eprintln!("\u{1F342} autumn deploy rollback\n");
+
+    // Same SQLite data-file contract as `up` (#1909): a rollback target deployed
+    // BEFORE the data file was adopted into `shared/` holds no file at that path
+    // any more, so the rolled-back release is re-linked at it rather than
+    // starting against a fresh, empty database.
+    let resolved = &resolved
+        .clone()
+        .with_release_payloads(release_payload_basenames(config, resolved))
+        .with_sqlite_data_placement(sqlite_data_placement(config, resolved));
 
     // The rollback targets, in declaration order. A single-host config (either
     // spelling) resolves to a one-host fleet whose only element IS today's
@@ -4598,6 +5611,7 @@ fn warn_degraded_port(port: &StatusPort, profile: &str, continues: &str) {
 
 fn run_status(
     port: &StatusPort,
+    app_name: &str,
     profile: &str,
     fleet: &ResolvedFleet,
     options: &DeployOptions,
@@ -4634,6 +5648,10 @@ fn run_status(
         }
     }
     if options.strict && report.drifted() {
+        // #2267: send a #1610 alert for the drift. This runs only in
+        // `--strict` mode. An interactive `deploy status` must not page
+        // anyone.
+        emit_drift_alert(&report, app_name, profile);
         return Err(DeployError::DriftDetected);
     }
     Ok(())
@@ -4830,10 +5848,30 @@ fn maintenance_one_host<E: exec::DeployExecutor>(
     };
 
     let mut ops: Vec<exec::DeployOp> = Vec::new();
-    if on {
+    // The index the shared write lands at: a failure at or before it means the
+    // host was NOT changed (fail closed); a failure after it means the shared
+    // flag landed but the running unit's own file did not.
+    let shared_index = if on {
         // Shared (authoritative) flag first: a #1621 unit reacts within 500 ms of
         // this single write, so the window starts closing even if the write below
         // fails (amendment A2).
+        //
+        // #2280: the shared flag's parent (`{app_dir}/shared`) only comes into
+        // existence during `prepare-dirs` on a deploy, so a host that has NEVER
+        // been deployed has no shared dir yet — and scp does not create
+        // destination parents, so the write fails and the
+        // `AppliedSharedOnly` success path (keyed on exactly this host shape) is
+        // unreachable. mkdir -p ahead of the write, mirroring
+        // `maintenance-prepare-live-flag-dir` below. It goes AHEAD of the write,
+        // not in its place, to keep the amendment-A2 ordering: the shared flag is
+        // still written first.
+        if let Some(parent) = remote_parent_dir(&shared) {
+            ops.push(exec::DeployOp::Run(exec::RemoteCommand::new(
+                "maintenance-prepare-shared-flag-dir",
+                format!("mkdir -p {}", exec::shell_quote(parent)),
+            )));
+        }
+        let shared_index = ops.len();
         ops.push(exec::DeployOp::WriteFile {
             label: "maintenance-write-shared",
             contents: exec::FileContents::Plain(body.to_owned()),
@@ -4863,31 +5901,35 @@ fn maintenance_one_host<E: exec::DeployExecutor>(
                 mode: Some(0o600),
             });
         }
+        shared_index
     } else {
         // `rm -f` both paths in one op: absent files are the NORMAL case for at
         // least one of them (a host has either the new unit or the old), so a
-        // missing file must never fail the `off`.
+        // missing file must never fail the `off`. No mkdir needed: `rm -f` does
+        // not care that the parent does not exist.
         let mut paths = exec::shell_quote(&shared);
         if let Some(path) = &live_path {
             paths.push(' ');
             paths.push_str(&exec::shell_quote(path));
         }
+        let shared_index = ops.len();
         ops.push(exec::DeployOp::Run(exec::RemoteCommand::new(
             "maintenance-clear",
             format!("rm -f {paths}"),
         )));
-    }
+        shared_index
+    };
 
     for (index, op) in ops.iter().enumerate() {
         if exec::run_ops(std::slice::from_ref(op), executor).is_err() {
             // The op label is known HERE regardless of the error's shape (an
             // upload failure carries no label), so the report can always name the
             // step without quoting the error.
+            // A failure at or before the shared write leaves the host genuinely
+            // UNCHANGED; failing anything after it means the shared flag landed
+            // but the running unit's own file did not.
             let failed_step = op.label();
-            // Op 0 is the shared path in both directions, so failing it leaves the
-            // host genuinely UNCHANGED; failing anything after it means the shared
-            // flag landed but the running unit's own file did not.
-            return if index == 0 {
+            return if index <= shared_index {
                 fleet::MaintenanceOutcome::Failed { failed_step }
             } else {
                 fleet::MaintenanceOutcome::LiveUnitUnchanged { failed_step }
@@ -5105,63 +6147,229 @@ mod tests {
     }
 
     #[test]
-    fn redeploy_refuses_a_concurrent_server_port_change() {
-        // #2073 pre-flight refuse. The installed proxy unit binds port 80; the operator
-        // now redeploys with `server.port = 8080` — a concurrent public-port change the
-        // durability restart-refresh (#2070) can't perform live-safely, so it is refused
-        // BEFORE any op runs, naming old vs new port and the two-deploy sequence.
-        let err = refuse_concurrent_public_port_change(&exec::InstalledProxyPort::Port(80), 8080)
-            .expect_err("a changed server.port must be refused on the redeploy path");
-        assert!(
-            err.contains("80") && err.contains("8080"),
-            "the refuse message must name the installed (80) and requested (8080) ports: {err}",
-        );
-        assert!(
-            err.contains("server.port unchanged") && err.contains("#2073"),
-            "the refuse message must spell out the operator sequence and reference the \
-             tracking issue: {err}",
-        );
+    fn redeploy_detects_a_concurrent_server_port_change() {
+        // #2073 Option C. The installed proxy unit binds port 80; the operator now
+        // redeploys with `server.port = 8080` — resolved to a `PublicPortMove` rather
+        // than refused, naming old vs new port for the caller's later phase-4 rebind.
+        let mv = resolve_public_port_move(&exec::InstalledProxyPort::Port(80), 8080)
+            .expect("a changed server.port must resolve, not error")
+            .expect("a changed server.port must be detected as a move");
+        assert_eq!(mv.old_port, 80);
+        assert_eq!(mv.new_port, 8080);
     }
 
     #[test]
     fn redeploy_allows_an_unchanged_server_port() {
         // The common durability-upgrade path: the installed unit's `--http-port` equals
-        // the requested port, so the redeploy proceeds (the restart re-execs on the SAME
+        // the requested port, so there is no move (the restart re-execs on the SAME
         // port, no collision, derived == actual live port).
-        assert!(
-            refuse_concurrent_public_port_change(&exec::InstalledProxyPort::Port(80), 80).is_ok(),
-            "an unchanged-port redeploy must be allowed",
+        assert_eq!(
+            resolve_public_port_move(&exec::InstalledProxyPort::Port(80), 80),
+            Ok(None),
+            "an unchanged-port redeploy must resolve to no move",
         );
         // And with a non-default port that also happens to match.
-        assert!(
-            refuse_concurrent_public_port_change(&exec::InstalledProxyPort::Port(3000), 3000)
-                .is_ok(),
-            "an unchanged non-default port must also be allowed",
+        assert_eq!(
+            resolve_public_port_move(&exec::InstalledProxyPort::Port(3000), 3000),
+            Ok(None),
+            "an unchanged non-default port must also resolve to no move",
         );
     }
 
     #[test]
     fn redeploy_fails_closed_on_an_unreadable_installed_port() {
         // The installed unit is present but its `--http-port` couldn't be read/parsed,
-        // so we cannot prove the public port is unchanged — refuse (fail closed) rather
-        // than risk the durability restart rebinding a different port and stranding `:80`.
-        let err = refuse_concurrent_public_port_change(&exec::InstalledProxyPort::Unreadable, 80)
+        // so we cannot prove which port (if any) needs moving — refuse (fail closed)
+        // rather than risk the durability restart rebinding the wrong port and
+        // stranding `:80`.
+        let err = resolve_public_port_move(&exec::InstalledProxyPort::Unreadable, 80)
             .expect_err("an unreadable installed proxy port must fail closed");
         assert!(
-            err.contains("could not be read") && err.contains("#2073"),
-            "the fail-closed message must explain the unreadable unit and reference the \
-             tracking issue: {err}",
+            err.contains("could not be read"),
+            "the fail-closed message must explain the unreadable unit: {err}",
         );
     }
 
     #[test]
     fn redeploy_allows_when_no_proxy_unit_is_installed() {
         // No installed proxy unit at all is a first-deploy shape (the durability refresh
-        // writes it fresh at the requested port) — nothing to conflict with, so the
-        // refuse guard passes regardless of the requested port.
+        // writes it fresh at the requested port) — nothing to move, regardless of the
+        // requested port.
+        assert_eq!(
+            resolve_public_port_move(&exec::InstalledProxyPort::Absent, 8080),
+            Ok(None),
+            "an absent installed proxy unit must resolve to no move",
+        );
+    }
+
+    #[test]
+    fn redeploy_moves_the_public_port_after_the_cutover_drains_the_old_release() {
+        // #2073 Option C end-to-end: the installed proxy binds port 80, the config
+        // requests `FLEET_PUBLIC_PORT` (3000). The cutover itself must plan entirely
+        // against the OLD port 80 (live slot blue = 81, candidate slot green = 82 —
+        // no collision with the still-live release), and the public-port move must
+        // land strictly AFTER the old release drains.
+        let fleet = fleet_of(&["web-a"]);
+        let probe = "redeploy:blue\t81\n\
+             ---autumn-kamal-proxy-list---\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 80\n"
+            .to_owned();
+        let recorder = fleet::test_support::FleetRecorder::new()
+            .script("web-a", "proxy-compat-probe", compatible_deploy_help())
+            .script("web-a", "detect-current", probe)
+            .script("web-a", "probe-release-dir", "absent");
+        let fixture = FleetFixture::new();
+
+        run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect("a redeploy with a changed server.port succeeds (Option C)");
+
+        let labels = recorder.run_labels_for("web-a");
+        let drain = labels
+            .iter()
+            .position(|l| *l == "drain-old")
+            .expect("the cutover drains the old release");
+        // "proxy-restart-if-changed" runs TWICE: once as the cutover's OWN
+        // durability-refresh call (a no-op through the unchanged OLD port), and once
+        // as the phase-4 rebind. Both are unconditionally-present ops — the op
+        // itself always runs; only its INNER shell script decides whether to
+        // actually restart.
+        let restarts: Vec<usize> = labels
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| **l == "proxy-restart-if-changed")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            restarts.len(),
+            2,
+            "one restart-if-changed from the cutover's own durability refresh, one \
+             from the phase-4 public-port rebind: {labels:?}"
+        );
         assert!(
-            refuse_concurrent_public_port_change(&exec::InstalledProxyPort::Absent, 8080).is_ok(),
-            "an absent installed proxy unit must not trigger the refuse",
+            restarts[0] < drain,
+            "the durability-refresh restart-if-changed runs at the HEAD of the \
+             cutover, before the old release ever drains: {labels:?}"
+        );
+        assert!(
+            restarts[1] > drain,
+            "the public-port move must run strictly AFTER the old release drains: \
+             {labels:?}"
+        );
+
+        // The phase-4 re-register targets loopback 82 — the candidate's OWN port,
+        // derived from the OLD public port (80 + green's +2) — now under the NEW
+        // public port.
+        let restart_shells: Vec<String> = recorder
+            .calls_for("web-a")
+            .iter()
+            .filter_map(|c| match c {
+                exec::test_support::RecordedCall::Run { label, shell }
+                    if *label == "proxy-restart-if-changed" =>
+                {
+                    Some(shell.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(restart_shells.len(), 2);
+        assert!(
+            restart_shells[1].contains("--target '127.0.0.1:82'"),
+            "phase 4 re-registers the candidate's OWN loopback port: {}",
+            restart_shells[1],
+        );
+    }
+
+    #[test]
+    fn a_public_port_rebind_failure_degrades_the_host_and_continues_the_rollout() {
+        // #2073 Option C, fleet path: web-a's phase-4 rebind fails once (its FORWARD
+        // restart, the label's 2nd occurrence — the 1st is the cutover's own
+        // durability-refresh call, an unrelated no-op) but the rollback to the old
+        // port succeeds. Traffic stays healthy at the old port, so the rollout
+        // continues past web-a onto web-b.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let probe_a = "redeploy:blue\t81\n\
+             ---autumn-kamal-proxy-list---\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 80\n"
+            .to_owned();
+        let recorder = fleet::test_support::FleetRecorder::new()
+            .script("web-a", "proxy-compat-probe", compatible_deploy_help())
+            .script("web-a", "detect-current", probe_a)
+            .script("web-a", "probe-release-dir", "absent")
+            .fail_on_occurrence("web-a", "proxy-restart-if-changed", 2);
+        let recorder = script_redeploy(recorder, "web-b");
+        let fixture = FleetFixture::new();
+
+        run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect("a rolled-back port move degrades a host but never halts the rollout");
+
+        let labels_a = recorder.run_labels_for("web-a");
+        assert_eq!(
+            labels_a
+                .iter()
+                .filter(|l| **l == "proxy-restart-if-changed")
+                .count(),
+            3,
+            "one no-op from the cutover's own durability refresh, one FAILING phase-4 \
+             forward attempt, one SUCCEEDING phase-4 rollback attempt: {labels_a:?}"
+        );
+        // The rollout continued past web-a's degradation onto web-b.
+        assert!(
+            recorder.run_labels_for("web-b").contains(&"drain-old"),
+            "web-b must still be deployed after web-a degrades: {:?}",
+            recorder.run_labels_for("web-b")
+        );
+    }
+
+    #[test]
+    fn a_public_port_rebind_double_failure_halts_the_rollout_as_manual() {
+        // #2073 Option C, fleet path: web-a's phase-4 rebind fails AND its own
+        // rollback ALSO fails (occurrences 2 and 3 of the label — occurrence 1, the
+        // cutover's own durability-refresh call, still succeeds so the cutover
+        // itself lands normally). The proxy's public bind on web-a is now unknown,
+        // so the rollout halts rather than rolling forward onto web-b, and web-a is
+        // reported `Manual` — never `Degraded` (which would falsely claim "traffic
+        // is fine").
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let probe_a = "redeploy:blue\t81\n\
+             ---autumn-kamal-proxy-list---\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 80\n"
+            .to_owned();
+        let recorder = fleet::test_support::FleetRecorder::new()
+            .script("web-a", "proxy-compat-probe", compatible_deploy_help())
+            .script("web-a", "detect-current", probe_a)
+            .script("web-a", "probe-release-dir", "absent")
+            .fail_on_occurrence("web-a", "proxy-restart-if-changed", 2)
+            .fail_on_occurrence("web-a", "proxy-restart-if-changed", 3);
+        let recorder = script_redeploy(recorder, "web-b");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a doubly-failed port move must halt the rollout");
+
+        let halt = fleet_halt_of(&err);
+        assert_eq!(halt.failed_host, "web-a");
+        assert_eq!(halt.failed_step, "public-port-rebind");
+        assert_eq!(
+            halt.manual,
+            vec![("web-a".to_owned(), fleet::MANUAL_PUBLIC_PORT_UNKNOWN)],
+            "web-a must be reported Manual (needs a human), never Degraded, which \
+             would falsely claim traffic is fine"
+        );
+        assert!(
+            halt.degraded.is_empty(),
+            "web-a's unknown public bind must not be counted as a healthy degradation: \
+             {:?}",
+            halt.degraded,
+        );
+        // web-b was graded (the fleet-wide probe phase runs before any host is
+        // mutated) but never MUTATED — the halt happened at the first host.
+        assert!(
+            recorder
+                .run_labels_for("web-b")
+                .iter()
+                .all(|l| READ_ONLY_PROBES.contains(l)),
+            "web-b must not be mutated once the rollout halts at web-a: {:?}",
+            recorder.run_labels_for("web-b")
         );
     }
 
@@ -5485,6 +6693,578 @@ mod tests {
     /// results and the assertions below are about SCOPE, not grading.
     fn preflight_config() -> AutumnConfig {
         AutumnConfig::default()
+    }
+
+    // ── SQLite data-file persistence (issue #1909) ─────────────────────────
+
+    fn deploy_cfg() -> ResolvedDeployConfig {
+        ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                host: Some("203.0.113.10".to_owned()),
+                ..DeployConfig::default()
+            },
+            "myapp",
+        )
+        .expect("deploy config resolves")
+    }
+
+    #[test]
+    fn classify_sqlite_data_file_separates_relative_absolute_and_not_sqlite() {
+        let cfg = deploy_cfg();
+        // A relative path resolves against the slot unit's WorkingDirectory (the
+        // release dir), so it is the case the deploy has to relocate.
+        for relative in ["sqlite://app.db", "sqlite://./app.db", "sqlite:data/app.db"] {
+            assert!(
+                matches!(
+                    classify_sqlite_data_file(Some(relative), &cfg),
+                    SqliteDataFile::Relative(_)
+                ),
+                "{relative}"
+            );
+        }
+        // Spellings that name the same file normalize to one `ln -s` target.
+        for spelling in ["sqlite://./app.db", "sqlite://app.db"] {
+            assert_eq!(
+                classify_sqlite_data_file(Some(spelling), &cfg),
+                SqliteDataFile::Relative("app.db".to_owned()),
+                "{spelling}"
+            );
+        }
+        for spelling in [
+            "sqlite://data/app.db",
+            "sqlite://data//app.db",
+            "sqlite://data/./app.db",
+            "sqlite://data/nested/../app.db",
+        ] {
+            assert_eq!(
+                classify_sqlite_data_file(Some(spelling), &cfg),
+                SqliteDataFile::Relative("data/app.db".to_owned()),
+                "{spelling}"
+            );
+        }
+        // A `file:` URI is percent-decoded, because that is what SQLite opens.
+        assert_eq!(
+            classify_sqlite_data_file(Some("file:app%20data.db?mode=rwc"), &cfg),
+            SqliteDataFile::Relative("app data.db".to_owned())
+        );
+        // An absolute path outside the app dir already survives a deploy.
+        assert_eq!(
+            classify_sqlite_data_file(Some("sqlite:///var/lib/myapp/app.db"), &cfg),
+            SqliteDataFile::Persistent("/var/lib/myapp/app.db".to_owned())
+        );
+        // …as does one the operator put in the deploy's own persistent dir.
+        assert_eq!(
+            classify_sqlite_data_file(Some("sqlite:///srv/autumn/myapp/shared/data/app.db"), &cfg),
+            SqliteDataFile::Persistent("/srv/autumn/myapp/shared/data/app.db".to_owned())
+        );
+        // Postgres and an unconfigured URL are not this grader's business.
+        for other in [Some("postgres://u:p@h/app"), Some("   "), None] {
+            assert_eq!(
+                classify_sqlite_data_file(other, &cfg),
+                SqliteDataFile::NotSqlite,
+                "{other:?}"
+            );
+        }
+    }
+
+    /// The deploy target is always a POSIX host, so path grading must not follow
+    /// the host this CLI runs on. `std::path` would: on Windows
+    /// `Path::new("/srv/app.db").is_absolute()` is false, so every absolute
+    /// target would be graded as a relative one and `autumn deploy check` from a
+    /// Windows workstation would misjudge the Linux host it deploys to.
+    #[test]
+    fn path_grading_uses_posix_rules_on_every_host() {
+        assert_eq!(
+            lexically_normalized("/srv/autumn/myapp/shared/../releases/r1/app.db"),
+            "/srv/autumn/myapp/releases/r1/app.db"
+        );
+        assert_eq!(
+            lexically_normalized("./data//nested/../app.db"),
+            "data/app.db"
+        );
+        // POSIX defines `/..` as `/`, so an ABSOLUTE path cannot climb out —
+        // `/a/../..` is `/`. Returning `None` here made a real `app_dir`
+        // spelling ungradable and the caller then called a database in the
+        // releases dir durable.
+        assert_eq!(
+            lexically_normalized("/a/../.."),
+            "/",
+            "an absolute path cannot climb above the root"
+        );
+        assert_eq!(
+            lexically_normalized("/../srv/autumn/myapp"),
+            "/srv/autumn/myapp",
+            "a leading `..` on an absolute path is dropped, as POSIX does"
+        );
+        assert_eq!(lexically_normalized("../app.db"), "../app.db");
+        assert_eq!(lexically_normalized("."), "");
+        // A leading `/` means absolute here, whatever the host says.
+        assert!(
+            lexically_normalized("/var/lib/app.db").starts_with('/'),
+            "a POSIX absolute path must stay absolute"
+        );
+    }
+
+    #[test]
+    fn classify_sqlite_data_file_refuses_what_a_deploy_cannot_keep() {
+        let cfg = deploy_cfg();
+        // In-memory: gone at the next restart, deploy or no deploy.
+        let memory = classify_sqlite_data_file(Some("sqlite::memory:"), &cfg);
+        let SqliteDataFile::Refused(detail) = memory else {
+            panic!("an in-memory database must be refused, got {memory:?}");
+        };
+        assert!(detail.contains("IN-MEMORY"), "{detail}");
+
+        // Anything the deploy manages is transient: `releases/` is pruned by
+        // retention, and `current` is only a symlink into it — a path through
+        // `current` is inside the live release dir, whatever it looks like.
+        for inside in [
+            "sqlite:///srv/autumn/myapp/releases/20260714T120000Z/app.db",
+            "sqlite:///srv/autumn/myapp/current/app.db",
+            "sqlite:///srv/autumn/myapp/app.db",
+        ] {
+            let got = classify_sqlite_data_file(Some(inside), &cfg);
+            let SqliteDataFile::Refused(detail) = got else {
+                panic!("{inside} must be refused, got {got:?}");
+            };
+            assert!(
+                detail.contains("/srv/autumn/myapp") && detail.contains("shared/data"),
+                "the refusal must name the problem and the fix: {detail}"
+            );
+        }
+        // …but a sibling path that merely SHARES the prefix is fine.
+        assert!(matches!(
+            classify_sqlite_data_file(Some("sqlite:///srv/autumn/myapp-staging/app.db"), &cfg),
+            SqliteDataFile::Persistent(_)
+        ));
+
+        // `..` must be resolved BEFORE the containment check: this one reads as
+        // `shared/` lexically but the kernel resolves it into `releases/`.
+        let sneaky = classify_sqlite_data_file(
+            Some("sqlite:///srv/autumn/myapp/shared/../releases/r1/app.db"),
+            &cfg,
+        );
+        let SqliteDataFile::Refused(detail) = sneaky else {
+            panic!("a path that resolves into releases/ must be refused, got {sneaky:?}");
+        };
+        assert!(
+            detail.contains("/srv/autumn/myapp/releases/r1/app.db"),
+            "the refusal must name the RESOLVED path: {detail}"
+        );
+        // The mirror image: a `..` that resolves back OUT of the app dir is fine,
+        // and the normalized text is what the deploy uses.
+        assert_eq!(
+            classify_sqlite_data_file(
+                Some("sqlite:///srv/autumn/myapp/../shared-data/app.db"),
+                &cfg
+            ),
+            SqliteDataFile::Persistent("/srv/autumn/shared-data/app.db".to_owned())
+        );
+        // An absolute path cannot climb above the root: POSIX resolves
+        // `/../../app.db` to `/app.db`, which is outside the app dir and so is
+        // the operator's own file, left alone.
+        assert_eq!(
+            classify_sqlite_data_file(Some("sqlite:///../../app.db"), &cfg),
+            SqliteDataFile::Persistent("/app.db".to_owned())
+        );
+
+        // A run of spaces mid-sentence means a `\\` continuation was dropped when
+        // the message was written (same guard as `DeployError`'s own).
+        for refused in [
+            "sqlite::memory:",
+            "sqlite:///srv/autumn/myapp/current/app.db",
+            "sqlite://..",
+        ] {
+            if let SqliteDataFile::Refused(detail) = classify_sqlite_data_file(Some(refused), &cfg)
+            {
+                assert!(!detail.contains("   "), "{refused}: {detail}");
+            }
+        }
+
+        // A relative path must name a FILE inside the release dir: `..` climbs out
+        // of it, and a `.`-only path names the directory itself, which the link op
+        // would then try to replace.
+        for bad in [
+            "sqlite://../../app.db",
+            "sqlite://.",
+            "sqlite://./",
+            "sqlite://data/../..",
+        ] {
+            let got = classify_sqlite_data_file(Some(bad), &cfg);
+            assert!(
+                matches!(got, SqliteDataFile::Refused(_)),
+                "{bad} must be refused, got {got:?}"
+            );
+        }
+    }
+
+    /// `[deploy] app_dir` can carry lexical aliases too. Comparing the raw
+    /// spelling would let a database sitting in the releases dir it resolves to
+    /// pass as durable, and release retention would then delete it.
+    /// `/..` is `/` in POSIX, so an `app_dir` spelled `/../srv/autumn/myapp`
+    /// names `/srv/autumn/myapp` and must grade exactly like it.
+    ///
+    /// The normalizer used to return `None` for that spelling and the caller
+    /// `unwrap_or_default()`ed it, which skipped the containment check and fell
+    /// through to `Persistent` — calling a database in the releases dir durable
+    /// while release retention deletes it.
+    #[test]
+    fn an_app_dir_that_starts_above_root_still_grades_containment() {
+        let aliased = ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                host: Some("203.0.113.10".to_owned()),
+                app_dir: Some("/../srv/autumn/myapp".to_owned()),
+                ..DeployConfig::default()
+            },
+            "myapp",
+        )
+        .expect("resolves");
+        // Inside the releases dir the alias resolves to: refused, not "durable".
+        let inside = classify_sqlite_data_file(
+            Some("sqlite:///srv/autumn/myapp/releases/r1/app.db"),
+            &aliased,
+        );
+        assert!(
+            matches!(inside, SqliteDataFile::Refused(_)),
+            "a database in the releases dir must be refused, got: {inside:?}"
+        );
+        // The shared dir is still durable through the same alias.
+        assert!(
+            matches!(
+                classify_sqlite_data_file(
+                    Some("sqlite:///srv/autumn/myapp/shared/data/app.db"),
+                    &aliased,
+                ),
+                SqliteDataFile::Persistent(_)
+            ),
+            "the shared dir must stay durable through the aliased app dir"
+        );
+        // And a path genuinely outside is still the operator's own.
+        assert!(
+            matches!(
+                classify_sqlite_data_file(Some("sqlite:///var/lib/app.db"), &aliased),
+                SqliteDataFile::Persistent(_)
+            ),
+            "a path outside the app dir is left alone"
+        );
+    }
+
+    /// An app dir that cannot be graded must FAIL CLOSED. Grading it durable is
+    /// the dangerous direction: it is the answer that lets a deploy delete the
+    /// database it just called safe.
+    #[test]
+    fn an_ungradable_app_dir_refuses_rather_than_claiming_durability() {
+        let relative = ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                host: Some("203.0.113.10".to_owned()),
+                app_dir: Some("srv/autumn/myapp".to_owned()),
+                ..DeployConfig::default()
+            },
+            "myapp",
+        )
+        .expect("resolves");
+        let graded = classify_sqlite_data_file(
+            Some("sqlite:///srv/autumn/myapp/releases/r1/app.db"),
+            &relative,
+        );
+        assert!(
+            matches!(graded, SqliteDataFile::Refused(_)),
+            "a non-absolute app dir must refuse, never grade Persistent: {graded:?}"
+        );
+    }
+
+    #[test]
+    fn classify_sqlite_data_file_normalizes_the_app_dir_as_well() {
+        let aliased = ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                host: Some("203.0.113.10".to_owned()),
+                app_dir: Some("/srv/autumn/tmp/../myapp/".to_owned()),
+                ..DeployConfig::default()
+            },
+            "myapp",
+        )
+        .expect("resolves");
+
+        let inside = classify_sqlite_data_file(
+            Some("sqlite:///srv/autumn/myapp/releases/r1/app.db"),
+            &aliased,
+        );
+        let SqliteDataFile::Refused(detail) = inside else {
+            panic!("a database in the resolved releases dir must be refused, got {inside:?}");
+        };
+        assert!(
+            detail.contains("/srv/autumn/myapp"),
+            "the refusal must name the RESOLVED app dir: {detail}"
+        );
+        // The deploy's own persistent dir still passes, aliased spelling or not.
+        assert!(matches!(
+            classify_sqlite_data_file(
+                Some("sqlite:///srv/autumn/myapp/shared/data/app.db"),
+                &aliased
+            ),
+            SqliteDataFile::Persistent(_)
+        ));
+        // …and a path genuinely outside it is still the operator's own.
+        assert!(matches!(
+            classify_sqlite_data_file(Some("sqlite:///var/lib/myapp/app.db"), &aliased),
+            SqliteDataFile::Persistent(_)
+        ));
+    }
+
+    /// A relative database whose path is also a file the deploy uploads into the
+    /// release dir is refused (#2589 item 11).
+    ///
+    /// `link-data` runs before the uploads and `scp` writes THROUGH a symlink, so
+    /// the link is made first and the upload truncates the operator's database.
+    /// The migration then finds an ELF or a TOML file where the database was,
+    /// after the data is already gone. Preflight refuses it before any remote
+    /// command runs.
+    #[test]
+    fn classify_sqlite_data_file_refuses_a_collision_with_a_release_payload() {
+        let cfg = deploy_cfg().with_release_payloads(vec!["prod.lock".to_owned()]);
+
+        for (url, expected) in [
+            // The app binary, uploaded at `<release>/<app_name>`.
+            ("sqlite://myapp", "myapp binary"),
+            // The manifest family, matched by shape rather than by enumeration:
+            // a database named `autumn.toml` must be refused on a project that
+            // has no `autumn.toml` YET, since adding one starts truncating it.
+            ("sqlite://autumn.toml", "autumn.toml"),
+            ("sqlite://autumn-prod.toml", "autumn-prod.toml"),
+            ("sqlite://autumn-Production.toml", "autumn-Production.toml"),
+            // And whatever else this particular deploy uploads — a capacity
+            // contract carries an arbitrary configured name that no static rule
+            // could predict.
+            ("sqlite://prod.lock", "prod.lock"),
+        ] {
+            let got = classify_sqlite_data_file(Some(url), &cfg);
+            let SqliteDataFile::Refused(detail) = got else {
+                panic!("{url} collides with a release payload but was graded {got:?}");
+            };
+            assert!(
+                detail.contains(expected),
+                "{url}: the refusal must name what it collides with: {detail}"
+            );
+        }
+
+        // A normalized spelling collides just the same.
+        assert!(matches!(
+            classify_sqlite_data_file(Some("sqlite://./autumn.toml"), &cfg),
+            SqliteDataFile::Refused(_)
+        ));
+
+        // Every payload is written FLAT in the release root, so a subdirectory
+        // cannot collide — and that is the fix the refusal points the operator at.
+        for safe in [
+            "sqlite://app.db",
+            "sqlite://data/myapp",
+            "sqlite://data/autumn.toml",
+            "sqlite://autumn.db",
+            "sqlite://autumn-prod.db",
+            // Not the manifest shape: no name between the prefix and the suffix.
+            "sqlite://autumn-.toml",
+        ] {
+            assert!(
+                matches!(
+                    classify_sqlite_data_file(Some(safe), &cfg),
+                    SqliteDataFile::Relative(_)
+                ),
+                "{safe} cannot collide with a release payload and must be kept"
+            );
+        }
+    }
+
+    /// The deploy owns `shared/` — only `shared/data` is the app's (#2589 round 18).
+    ///
+    /// `shared/` survives a release swap, which is why it was allowed, but the
+    /// deploy writes its own state files there: `autumn.env` (the SECRET env
+    /// file), `live-slot`, `previous-release`, `proxy-options`, `last-deploy`,
+    /// the maintenance flag and the adoption marker. A database configured at one
+    /// of those paths passed every containment check and was then truncated by
+    /// the deploy step that writes it, before the migration ran.
+    ///
+    /// Asserted as a CLOSED namespace rather than a list of reserved names: a
+    /// list would need revisiting every time a control file is added, which is
+    /// the failure mode this grader kept hitting.
+    #[test]
+    fn classify_sqlite_data_file_refuses_deploy_owned_paths_under_shared() {
+        let cfg = deploy_cfg();
+        for owned in [
+            "sqlite:///srv/autumn/myapp/shared/autumn.env",
+            "sqlite:///srv/autumn/myapp/shared/live-slot",
+            "sqlite:///srv/autumn/myapp/shared/previous-release",
+            "sqlite:///srv/autumn/myapp/shared/proxy-options",
+            "sqlite:///srv/autumn/myapp/shared/last-deploy",
+            "sqlite:///srv/autumn/myapp/shared/sqlite-data-adopted",
+            // Anything else the deploy might put there later, without this test
+            // or the grader needing to learn its name.
+            "sqlite:///srv/autumn/myapp/shared/some-future-state-file",
+            "sqlite:///srv/autumn/myapp/shared/app.db",
+        ] {
+            let got = classify_sqlite_data_file(Some(owned), &cfg);
+            let SqliteDataFile::Refused(detail) = got else {
+                panic!("{owned} is a deploy-owned path but graded {got:?}");
+            };
+            assert!(
+                detail.contains("/srv/autumn/myapp/shared/data"),
+                "{owned}: the refusal must name where the database may live: {detail}"
+            );
+        }
+
+        // `shared/data` itself, and anything under it, is still the app's.
+        for ours in [
+            "sqlite:///srv/autumn/myapp/shared/data/app.db",
+            "sqlite:///srv/autumn/myapp/shared/data/nested/app.db",
+        ] {
+            assert!(
+                matches!(
+                    classify_sqlite_data_file(Some(ours), &cfg),
+                    SqliteDataFile::Persistent(_)
+                ),
+                "{ours} must still be kept"
+            );
+        }
+        // …and so is anything genuinely outside the app dir.
+        assert!(matches!(
+            classify_sqlite_data_file(Some("sqlite:///var/lib/myapp/app.db"), &cfg),
+            SqliteDataFile::Persistent(_)
+        ));
+    }
+
+    /// A payload as the FIRST path component, not only as the whole path
+    /// (#2589 round 18).
+    ///
+    /// `scp <local> <release>/myapp` writes *into* `<release>/myapp` when a
+    /// directory is there. So `sqlite://myapp/myapp` has `link-data` create
+    /// `myapp/` and put the database link at `myapp/myapp` — exactly where the
+    /// upload lands, following the link and replacing the database with the
+    /// binary. The earlier rule returned `None` for every path containing `/`.
+    #[test]
+    fn classify_sqlite_data_file_refuses_a_payload_as_a_leading_component() {
+        let cfg = deploy_cfg().with_release_payloads(vec!["prod.lock".to_owned()]);
+
+        for url in [
+            "sqlite://myapp/myapp",
+            "sqlite://myapp/app.db",
+            "sqlite://myapp/nested/app.db",
+            "sqlite://autumn.toml/app.db",
+            "sqlite://autumn-prod.toml/app.db",
+            "sqlite://prod.lock/app.db",
+            // The single-component case is just this rule with one segment.
+            "sqlite://myapp",
+            // And a spelling that normalizes onto one.
+            "sqlite://./myapp/app.db",
+        ] {
+            assert!(
+                matches!(
+                    classify_sqlite_data_file(Some(url), &cfg),
+                    SqliteDataFile::Refused(_)
+                ),
+                "{url}: a release payload as the leading component is written through"
+            );
+        }
+
+        // A directory that is NOT a payload is still fine, at any depth.
+        for safe in [
+            "sqlite://data/app.db",
+            "sqlite://data/myapp",
+            "sqlite://data/autumn.toml",
+            "sqlite://myapp.db",
+        ] {
+            assert!(
+                matches!(
+                    classify_sqlite_data_file(Some(safe), &cfg),
+                    SqliteDataFile::Relative(_)
+                ),
+                "{safe} cannot collide and must be kept"
+            );
+        }
+    }
+
+    /// A relative `app_dir` is refused for a RELATIVE database too, not just an
+    /// absolute one (#2589 item 16).
+    ///
+    /// The guard that decides containment for an absolute database also decides
+    /// the LINK TARGET for a relative one: `sqlite_data_link_op` points the
+    /// release at `{app_dir}/shared/data/<file>`, so a relative `app_dir` makes
+    /// that target resolve beneath the release directory instead of the SSH
+    /// working directory. The migration then opens a dangling link and the deploy
+    /// fails after it has already touched the host.
+    #[test]
+    fn classify_sqlite_data_file_refuses_a_relative_app_dir_on_both_branches() {
+        let relative_dir = ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                host: Some("203.0.113.10".to_owned()),
+                app_dir: Some("myapp".to_owned()),
+                ..DeployConfig::default()
+            },
+            "myapp",
+        )
+        .expect("resolves");
+
+        for url in [
+            // The branch the guard was originally written for…
+            "sqlite:///var/lib/myapp/app.db",
+            // …and the one it was missing.
+            "sqlite://app.db",
+            "sqlite://data/app.db",
+        ] {
+            let got = classify_sqlite_data_file(Some(url), &relative_dir);
+            let SqliteDataFile::Refused(detail) = got else {
+                panic!("a relative app_dir makes {url} undecidable, but it graded {got:?}");
+            };
+            assert!(
+                detail.contains("myapp") && detail.contains("absolute"),
+                "{url}: the refusal must name the app dir and the fix: {detail}"
+            );
+        }
+
+        // A Postgres app is unaffected: the app dir is never consulted.
+        assert!(matches!(
+            classify_sqlite_data_file(Some("postgres://localhost/app"), &relative_dir),
+            SqliteDataFile::NotSqlite
+        ));
+    }
+
+    /// A deploy addresses paths as text, so one it cannot render it cannot ship.
+    /// `file:app%FF.db` decodes to exactly such a name.
+    #[cfg(unix)]
+    #[test]
+    fn classify_sqlite_data_file_refuses_a_non_utf8_path() {
+        let got = classify_sqlite_data_file(Some("file:app%FF.db"), &deploy_cfg());
+        let SqliteDataFile::Refused(detail) = got else {
+            panic!("a non-UTF-8 path must be refused, got {got:?}");
+        };
+        assert!(detail.contains("not valid UTF-8"), "{detail}");
+    }
+
+    #[test]
+    fn sqlite_data_persistence_grader_is_emitted_only_for_a_sqlite_app() {
+        let cfg = deploy_cfg();
+
+        // A Postgres deploy's preflight report must be byte-identical to
+        // pre-#1909: no extra row at all.
+        assert!(grade_sqlite_data_persistence(Some("postgres://h/app"), &cfg).is_none());
+        assert!(grade_sqlite_data_persistence(None, &cfg).is_none());
+
+        let pass = grade_sqlite_data_persistence(Some("sqlite://app.db"), &cfg)
+            .expect("a SQLite app is graded");
+        assert_eq!(pass.name, "sqlite_data_file");
+        assert!(pass.passed, "a relative path is kept, not refused");
+        assert!(
+            pass.detail.contains("/srv/autumn/myapp/shared/data/app.db"),
+            "the pass must name where the file is kept: {}",
+            pass.detail
+        );
+
+        for refused in [
+            "sqlite::memory:",
+            "sqlite:///srv/autumn/myapp/current/app.db",
+        ] {
+            let fail =
+                grade_sqlite_data_persistence(Some(refused), &cfg).expect("a SQLite app is graded");
+            assert!(!fail.passed, "{refused} must fail preflight");
+        }
     }
 
     #[test]
@@ -7670,7 +9450,9 @@ mod tests {
         "Usage:\n  kamal-proxy deploy SERVICE [flags]\n\nFlags:\n  \
          --target host:port\n  --health-check-path string\n  --host strings\n  \
          --tls\n  --deploy-timeout duration\n  --drain-timeout duration\n  \
-         --force\n"
+         --force\n\
+         ---autumn-kamal-proxy-remove-help---\
+         Usage:\n  kamal-proxy remove SERVICE [flags]\n"
     }
 
     fn fleet_manifests() -> Vec<exec::ManifestUpload> {
@@ -7985,6 +9767,8 @@ mod tests {
             fleet: &'a ResolvedFleet,
         ) -> FleetUpInput<'a, proxy::KamalProxyController> {
             FleetUpInput {
+                profile: "prod",
+                app_name: "myapp",
                 fleet,
                 proxy: &self.proxy,
                 checks: &[],
@@ -8014,6 +9798,8 @@ mod tests {
             fleet: &'a ResolvedFleet,
         ) -> FleetUpInput<'a, proxy::KamalProxyController> {
             FleetUpInput {
+                profile: "prod",
+                app_name: "myapp",
                 auto_rollback: false,
                 ..self.input(fleet)
             }
@@ -8135,6 +9921,367 @@ mod tests {
                 "FleetHalted must never carry `{secret}`: {rendered}"
             );
         }
+    }
+
+    // ── #2267: a halted rollout or drift sends a #1610 operator alert ───────
+
+    #[derive(Default)]
+    struct CapturingChannel {
+        received: Arc<std::sync::Mutex<Vec<Alert>>>,
+    }
+
+    impl AlertChannel for CapturingChannel {
+        fn name(&self) -> &'static str {
+            "capturing"
+        }
+        fn deliver<'a>(&'a self, alert: &'a Alert) -> autumn_web::alerts::AlertDeliveryFuture<'a> {
+            let received = Arc::clone(&self.received);
+            let cloned = alert.clone();
+            Box::pin(async move {
+                received.lock().expect("lock").push(cloned);
+                Ok(())
+            })
+        }
+    }
+
+    fn sample_halt() -> FleetHalt {
+        FleetHalt {
+            failed_host: "web-b".to_owned(),
+            failed_step: "migrate",
+            rolled_back: vec!["web-a".to_owned()],
+            torn_down: vec![],
+            still_on_new: vec![],
+            degraded: vec![("web-a".to_owned(), "prune")],
+            route_removal_failed: vec![],
+            manual: vec![("web-c".to_owned(), fleet::MANUAL_AMBIGUOUS_MARKERS)],
+        }
+    }
+
+    #[test]
+    fn alert_channels_for_respects_the_enabled_master_switch() {
+        // Review finding on #2267: `[alerts] enabled = false` must silence a
+        // deploy alert, even when a transport is still configured.
+        let alerts = autumn_web::alerts::AlertConfig {
+            enabled: false,
+            pagerduty_routing_key: Some("R0123".to_owned()),
+            ..Default::default()
+        };
+        let http = autumn_web::config::HttpConfig::default();
+
+        assert!(
+            alert_channels_for(&alerts, &http).is_empty(),
+            "a disabled [alerts] config must build no channel"
+        );
+    }
+
+    #[test]
+    fn alert_channels_for_builds_channels_when_active() {
+        let alerts = autumn_web::alerts::AlertConfig {
+            enabled: true,
+            pagerduty_routing_key: Some("R0123".to_owned()),
+            ..Default::default()
+        };
+        let http = autumn_web::config::HttpConfig::default();
+
+        assert_eq!(
+            alert_channels_for(&alerts, &http).len(),
+            1,
+            "an enabled [alerts] config with a destination must build a channel"
+        );
+    }
+
+    #[test]
+    fn deploy_alert_channels_for_profile_is_empty_without_a_configured_destination() {
+        // No fixture project directory is set up for this test, so the
+        // profile load resolves to defaults (or fails) either way — this
+        // must never panic, and with no [alerts] destination it must
+        // deliver nothing.
+        assert!(deploy_alert_channels_for_profile("prod").is_empty());
+    }
+
+    #[test]
+    fn declared_alert_config_in_reads_the_target_profile_section() {
+        // Review finding on #2267: this fallback must resolve the SAME
+        // target-profile layering `load_runtime_config` would, so a
+        // production-only destination is still found on this path too.
+        let dir = tempfile::TempDir::new().expect("temp project dir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[deploy]\nhost = \"deploy.example.test\"\n\n\
+             [profile.prod.alerts]\npagerduty_routing_key = \"R0123\"\n",
+        )
+        .expect("write autumn.toml");
+
+        let (alerts, _http) = declared_alert_config_in(&[dir.path().to_path_buf()], "prod")
+            .expect("the merged [alerts] subtree deserializes");
+
+        assert_eq!(alerts.pagerduty_routing_key.as_deref(), Some("R0123"));
+    }
+
+    #[test]
+    fn declared_alert_config_in_ignores_an_unrelated_bad_section() {
+        // The exact failure this fallback exists for: a malformed OTHER
+        // section must not stop `[alerts]` from being read.
+        let dir = tempfile::TempDir::new().expect("temp project dir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[deploy]\nhost = \"deploy.example.test\"\n\n\
+             [scheduler]\nbackend = 12345\n\n\
+             [alerts]\npagerduty_routing_key = \"R0123\"\n",
+        )
+        .expect("write autumn.toml");
+
+        let (alerts, _http) = declared_alert_config_in(&[dir.path().to_path_buf()], "prod")
+            .expect("a bad [scheduler] value must not break the [alerts] read");
+
+        assert_eq!(alerts.pagerduty_routing_key.as_deref(), Some("R0123"));
+    }
+
+    #[test]
+    fn declared_alert_config_in_fails_closed_on_an_unreadable_profile_override() {
+        // Review finding on #2267: a malformed `autumn-prod.toml` must fail
+        // this whole read, not be silently skipped in favor of the
+        // base/inline config -- that could page using a destination the
+        // profile override was meant to change or disable.
+        let dir = tempfile::TempDir::new().expect("temp project dir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[deploy]\nhost = \"deploy.example.test\"\n\n\
+             [alerts]\npagerduty_routing_key = \"base-key\"\n",
+        )
+        .expect("write autumn.toml");
+        std::fs::write(dir.path().join("autumn-prod.toml"), "not valid toml")
+            .expect("write autumn-prod.toml");
+
+        assert!(
+            declared_alert_config_in(&[dir.path().to_path_buf()], "prod").is_none(),
+            "a malformed profile override file must fail closed, not fall back to base config"
+        );
+    }
+
+    #[test]
+    fn declared_alert_config_in_fails_closed_on_an_unknown_alerts_key() {
+        // Review finding on #2267: `strict_config` would hard-fail
+        // `load_runtime_config` on a typo'd `[alerts]` key (`enabeld` for
+        // `enabled`), landing here. Plain deserialize would silently drop
+        // it and default the switch back to `true` -- exactly the
+        // operator's mistyped attempt to turn it off.
+        let dir = tempfile::TempDir::new().expect("temp project dir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[deploy]\nhost = \"deploy.example.test\"\n\n\
+             [alerts]\nenabeld = false\npagerduty_routing_key = \"R0123\"\n",
+        )
+        .expect("write autumn.toml");
+
+        assert!(
+            declared_alert_config_in(&[dir.path().to_path_buf()], "prod").is_none(),
+            "a typo'd [alerts] key must fail closed, not silently default enabled back to true"
+        );
+    }
+
+    #[test]
+    fn apply_alert_env_overrides_reads_autumn_alerts_env_vars() {
+        // Review finding on #2267: a destination set ONLY via env var (the
+        // documented, recommended way to supply a secret) must still fire
+        // on the TOML-only degraded-status fallback.
+        use autumn_web::config::MockEnv;
+        let alerts = autumn_web::alerts::AlertConfig::default();
+        let http = autumn_web::config::HttpConfig::default();
+        let env = MockEnv::new().with("AUTUMN_ALERTS__PAGERDUTY_ROUTING_KEY", "R9999");
+
+        let (alerts, _http) = apply_alert_env_overrides(alerts, http, &env);
+
+        assert_eq!(alerts.pagerduty_routing_key.as_deref(), Some("R9999"));
+    }
+
+    #[test]
+    fn apply_alert_env_overrides_can_disable_a_toml_configured_destination() {
+        // The other half of the same finding: AUTUMN_ALERTS__ENABLED=false
+        // must still silence a destination the TOML-only read already found.
+        use autumn_web::config::MockEnv;
+        let alerts = autumn_web::alerts::AlertConfig {
+            pagerduty_routing_key: Some("R0123".to_owned()),
+            ..Default::default()
+        };
+        let http = autumn_web::config::HttpConfig::default();
+        let env = MockEnv::new().with("AUTUMN_ALERTS__ENABLED", "false");
+
+        let (alerts, _http) = apply_alert_env_overrides(alerts, http, &env);
+
+        assert!(!alerts.is_active());
+    }
+
+    #[test]
+    fn build_fleet_halted_alert_is_scheduled_task_failure() {
+        let alert = build_fleet_halted_alert(&sample_halt(), "myapp", "production");
+        assert_eq!(alert.condition, AlertCondition::ScheduledTaskFailure);
+        assert_eq!(alert.title, "Fleet rollout halted");
+        assert_eq!(
+            alert.dedup_key,
+            "scheduled_task_failure:deploy-fleet-halted:myapp:production"
+        );
+        assert!(
+            alert.summary.contains("web-b") && alert.summary.contains("migrate"),
+            "the alert must name the failing host and step: {}",
+            alert.summary
+        );
+        assert_eq!(
+            alert.where_to_look, "autumn deploy status",
+            "review finding on #2267: must not point at the /actuator/tasks default"
+        );
+    }
+
+    #[test]
+    fn build_fleet_halted_alert_is_scoped_to_profile_for_dedup() {
+        // Review finding on #2267: a halt on staging and a halt on
+        // production must never merge into one incident, even sharing one
+        // PagerDuty routing key.
+        let staging = build_fleet_halted_alert(&sample_halt(), "myapp", "staging");
+        let production = build_fleet_halted_alert(&sample_halt(), "myapp", "production");
+
+        assert_ne!(staging.dedup_key, production.dedup_key);
+    }
+
+    #[test]
+    fn build_fleet_halted_alert_is_scoped_to_app_name_for_dedup() {
+        // Review finding on #2267: two different apps sharing one alert
+        // destination must never fold their `prod` halts into one incident.
+        let app_one = build_fleet_halted_alert(&sample_halt(), "app-one", "production");
+        let app_two = build_fleet_halted_alert(&sample_halt(), "app-two", "production");
+
+        assert_ne!(app_one.dedup_key, app_two.dedup_key);
+    }
+
+    #[test]
+    fn build_fleet_halted_alert_carries_only_host_names_and_static_labels() {
+        // This check matches `FleetHalted`'s own secrets check. This
+        // alert comes only from its fields, so it can carry no more.
+        let alert = build_fleet_halted_alert(&sample_halt(), "myapp", "production");
+        let rendered = format!("{alert:?}");
+        for secret in [
+            "postgres://",
+            "topsecret",
+            "AUTUMN_SECURITY__SIGNING_SECRET",
+            "systemd-run",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "a fleet-halted alert must never carry `{secret}`: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn deliver_fleet_halted_alert_reaches_configured_channel() {
+        let capture = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let channel = Arc::new(CapturingChannel {
+            received: Arc::clone(&capture),
+        });
+        let channels: Vec<Arc<dyn AlertChannel>> = vec![channel];
+
+        deliver_alert(
+            &channels,
+            &build_fleet_halted_alert(&sample_halt(), "myapp", "production"),
+        );
+
+        let delivered = capture.lock().expect("lock").clone();
+        assert_eq!(delivered.len(), 1, "exactly one alert must be delivered");
+        assert_eq!(delivered[0].condition, AlertCondition::ScheduledTaskFailure);
+    }
+
+    #[test]
+    fn deliver_alert_is_noop_without_channels() {
+        // No `[alerts]` set means no channels. This must not panic. It
+        // must deliver nothing and change no behavior.
+        deliver_alert(
+            &[],
+            &build_fleet_halted_alert(&sample_halt(), "myapp", "production"),
+        );
+    }
+
+    #[test]
+    fn build_drift_alert_is_scheduled_task_failure_scoped_to_profile() {
+        let report = fleet::DriftReport {
+            releases: vec![
+                ("web-a".to_owned(), fleet::ReleaseId::Known("r1".to_owned())),
+                ("web-b".to_owned(), fleet::ReleaseId::Known("r2".to_owned())),
+            ],
+            version_drift: true,
+            state_drift: vec![("web-b".to_owned(), fleet::DRIFT_HOST_NOT_DEPLOYED)],
+        };
+
+        let alert = build_drift_alert(&report, "myapp", "production");
+
+        assert_eq!(alert.condition, AlertCondition::ScheduledTaskFailure);
+        assert_eq!(alert.title, "Fleet drift detected");
+        assert_eq!(
+            alert.dedup_key,
+            "scheduled_task_failure:deploy-drift:myapp:production"
+        );
+        assert!(
+            alert.summary.contains("release"),
+            "version drift must be named in the summary: {}",
+            alert.summary
+        );
+        assert_eq!(
+            alert.where_to_look, "autumn deploy status",
+            "review finding on #2267: must not point at the /actuator/tasks default"
+        );
+    }
+
+    #[test]
+    fn build_drift_alert_is_scoped_to_profile_for_dedup() {
+        // Drift on staging and drift on production must stay two alerts.
+        let report = fleet::DriftReport {
+            releases: vec![],
+            version_drift: false,
+            state_drift: vec![("web-a".to_owned(), fleet::DRIFT_LIVE_SLOT_MARKER)],
+        };
+
+        let staging = build_drift_alert(&report, "myapp", "staging");
+        let production = build_drift_alert(&report, "myapp", "production");
+
+        assert_ne!(staging.dedup_key, production.dedup_key);
+    }
+
+    #[test]
+    fn build_drift_alert_is_scoped_to_app_name_for_dedup() {
+        // Review finding on #2267: two different apps sharing one alert
+        // destination must never fold their `prod` drift into one incident.
+        let report = fleet::DriftReport {
+            releases: vec![],
+            version_drift: false,
+            state_drift: vec![("web-a".to_owned(), fleet::DRIFT_LIVE_SLOT_MARKER)],
+        };
+
+        let app_one = build_drift_alert(&report, "app-one", "production");
+        let app_two = build_drift_alert(&report, "app-two", "production");
+
+        assert_ne!(app_one.dedup_key, app_two.dedup_key);
+    }
+
+    #[test]
+    fn deliver_drift_alert_reaches_configured_channel() {
+        let capture = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let channel = Arc::new(CapturingChannel {
+            received: Arc::clone(&capture),
+        });
+        let channels: Vec<Arc<dyn AlertChannel>> = vec![channel];
+        let report = fleet::DriftReport {
+            releases: vec![],
+            version_drift: false,
+            state_drift: vec![("web-a".to_owned(), fleet::DRIFT_LIVE_SLOT_MARKER)],
+        };
+
+        deliver_alert(&channels, &build_drift_alert(&report, "myapp", "staging"));
+
+        let delivered = capture.lock().expect("lock").clone();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(
+            delivered[0].dedup_key,
+            "scheduled_task_failure:deploy-drift:myapp:staging"
+        );
     }
 
     #[test]
@@ -8571,6 +10718,9 @@ mod tests {
             "teardown-candidate-dir",
             "teardown-current-symlink",
             "teardown-slot-markers",
+            // Issue #2270: the proxy route must go too, or the public port keeps
+            // answering 502 with nothing live behind it.
+            "proxy-deregister",
         ] {
             assert!(
                 web_a.contains(&teardown),
@@ -8597,6 +10747,160 @@ mod tests {
         assert!(
             halt.still_on_new.is_empty(),
             "nothing may be left on the new release"
+        );
+    }
+
+    #[test]
+    fn a_completed_first_deploy_compensation_removes_the_proxy_route() {
+        // Issue #2270: a completed first deploy that the fleet compensates has a
+        // LIVE proxy route (unlike the pre-go-live path, which never reaches
+        // `proxy-route`). The compensating teardown must remove it, socket-pinned
+        // like every other kamal-proxy invocation — as its OWN step, AFTER the
+        // app teardown (including the advisory `teardown-last-deploy` write) has
+        // fully succeeded, so a transport failure on the route step alone can
+        // never be confused with one on an earlier, not-yet-attempted step.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        recorder = script_first_deploy(recorder, "web-a");
+        recorder = script_redeploy(recorder, "web-b").fail("web-b", "readiness-gate");
+        let fixture = FleetFixture::new();
+
+        run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a mid-rollout failure must halt the rollout");
+
+        let calls = recorder.calls_for("web-a");
+        let labels: Vec<&str> = calls
+            .iter()
+            .filter_map(|call| match call {
+                exec::test_support::RecordedCall::Run { label, .. } => Some(*label),
+                exec::test_support::RecordedCall::Upload { .. } => None,
+            })
+            .collect();
+        let deregister_at = labels
+            .iter()
+            .position(|l| *l == "proxy-deregister")
+            .expect("the compensated first deploy must deregister the proxy route");
+        let last_deploy_at = labels
+            .iter()
+            .position(|l| *l == "teardown-last-deploy")
+            .expect("the teardown must still record its result");
+        assert!(
+            last_deploy_at < deregister_at,
+            "the app teardown, marker write included, must fully finish BEFORE the \
+             separate route-removal step starts: {labels:?}"
+        );
+
+        let shell = calls
+            .iter()
+            .find_map(|call| match call {
+                exec::test_support::RecordedCall::Run { label, shell }
+                    if *label == "proxy-deregister" =>
+                {
+                    Some(shell.as_str())
+                }
+                _ => None,
+            })
+            .expect("proxy-deregister ran");
+        assert_eq!(shell, "env -u XDG_RUNTIME_DIR kamal-proxy remove 'myapp'");
+    }
+
+    #[test]
+    fn a_failed_deregister_reports_its_own_outcome_not_a_generic_compensation_failure() {
+        // Issue #2270: when the proxy-deregister op itself fails, every op before
+        // it in `first_deploy_teardown_ops` already ran — the app is genuinely
+        // gone, only the route is stuck. This must NOT read as
+        // `CompensationFailed` ("still serving, roll it back"): that is both
+        // untrue (nothing is serving) and impossible (a first deploy has no
+        // previous release `autumn deploy rollback` could target).
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        recorder = script_first_deploy(recorder, "web-a").fail("web-a", "proxy-deregister");
+        recorder = script_redeploy(recorder, "web-b").fail("web-b", "readiness-gate");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a mid-rollout failure must halt the rollout");
+
+        let halt = fleet_halt_of(&err);
+        assert_eq!(
+            halt.torn_down,
+            vec!["web-a".to_owned()],
+            "the app is gone, so this host is torn down, not still forward"
+        );
+        assert!(
+            !halt.still_on_new.contains(&"web-a".to_owned()),
+            "a failed deregister must never be told to `rollback` a host with \
+             nothing installed: {:?}",
+            halt.still_on_new
+        );
+        assert!(
+            !halt.manual.iter().any(|(host, _)| host == "web-a"),
+            "this is not a declined-automatically case: {:?}",
+            halt.manual
+        );
+        // Codex review: this must be named in its OWN field too, not just the
+        // console table, so an alert built from `FleetHalt` can tell a clean
+        // compensation apart from one whose route may still 502.
+        assert_eq!(
+            halt.route_removal_failed,
+            vec![("web-a".to_owned(), "proxy-deregister")],
+            "the route-removal failure must be preserved in a dedicated field: {:?}",
+            halt.route_removal_failed
+        );
+
+        // The marker write is part of the (separate, already-run) app-teardown
+        // call, so it lands regardless of the later deregister failure — no
+        // special-casing needed here, unlike the earlier design this replaced.
+        let calls = recorder.calls_for("web-a");
+        let last_deploy_writes: Vec<&str> = calls
+            .iter()
+            .filter_map(|call| match call {
+                exec::test_support::RecordedCall::Run { label, shell }
+                    if *label == "teardown-last-deploy" =>
+                {
+                    Some(shell.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        let last = *last_deploy_writes
+            .last()
+            .expect("the marker must still be recorded despite the deregister failure");
+        assert!(
+            last.contains("'torn down'") && !last.contains("'deployed'"),
+            "a fully torn-down host must not report a successful deploy: {last}"
+        );
+    }
+
+    #[test]
+    fn a_dropped_transport_on_deregister_still_reads_as_torn_down() {
+        // Issue #2270 (Codex review): a transport failure (the local `ssh`
+        // launch itself dying) carries NO op label — `failed_step_label` always
+        // reports it as `"ssh-transport"`, never `"proxy-deregister"`. Splitting
+        // the route removal into its OWN call (rather than string-matching a
+        // label inside one shared op list) means this still can only mean "the
+        // app teardown already succeeded and the separate route call failed",
+        // whatever shape that failure takes.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        recorder =
+            script_first_deploy(recorder, "web-a").transport_fail("web-a", "proxy-deregister");
+        recorder = script_redeploy(recorder, "web-b").fail("web-b", "readiness-gate");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a mid-rollout failure must halt the rollout");
+
+        let halt = fleet_halt_of(&err);
+        assert_eq!(
+            halt.torn_down,
+            vec!["web-a".to_owned()],
+            "a dropped transport on the route step alone must not read as still forward"
+        );
+        assert!(
+            !halt.still_on_new.contains(&"web-a".to_owned()),
+            "must never suggest `rollback` a host with nothing installed: {:?}",
+            halt.still_on_new
         );
     }
 
@@ -9110,6 +11414,8 @@ mod tests {
         let recorder = fleet::test_support::FleetRecorder::new();
         let fixture = FleetFixture::new();
         let input = FleetUpInput {
+            profile: "prod",
+            app_name: "myapp",
             db: FleetDatabaseFacts {
                 sqlite: true,
                 ..FleetDatabaseFacts::default()
@@ -9193,6 +11499,85 @@ mod tests {
     }
 
     #[test]
+    fn up_refuses_the_whole_fleet_when_one_host_fails_preflight() {
+        // #2269 (#1621 AC-7 follow-up). `run_up_with` assumes checks are
+        // already graded; it never re-checks them. The real gate is
+        // `refuse_if_preflight_failed`, called by `run_up` before any
+        // executor is built. This test drives that gate directly, then
+        // calls `run_up_with` only on success. Mirrors
+        // `preflight_failure_aborts_before_any_executor_call` (exec.rs) one
+        // level up.
+        //
+        // This alone cannot prove `run_up` still calls the gate before the
+        // hand-off — `and_then` short-circuits regardless. See
+        // `up_calls_the_preflight_gate_before_handing_off_to_run_up_with`
+        // right below, which asserts that ordering in `run_up`'s own source.
+        let fleet = fleet_of(&["web-a", "web-b", "web-c"]);
+        let checks = vec![
+            PreflightCheck::pass("signing_secret", "ok"),
+            PreflightCheck::fail("ssh_reachability", "unreachable", "check the network")
+                .scoped(Some("web-b".to_owned())),
+        ];
+        let recorder = fleet::test_support::FleetRecorder::new();
+        let fixture = FleetFixture::new();
+        let executor_builds = std::cell::Cell::new(0_usize);
+
+        let err = refuse_if_preflight_failed(&checks)
+            .and_then(|()| {
+                run_up_with(&fixture.input(&fleet), |cfg| {
+                    executor_builds.set(executor_builds.get() + 1);
+                    Ok(recorder.executor(cfg))
+                })
+            })
+            .expect_err("a failing host must refuse the whole rollout");
+
+        assert!(
+            matches!(err, DeployError::PreflightFailed(1)),
+            "expected PreflightFailed(1), got {err:?}"
+        );
+        assert_eq!(
+            executor_builds.get(),
+            0,
+            "no executor may be built for any host when preflight fails"
+        );
+        assert!(
+            recorder.mutating(&[]).is_empty(),
+            "a refused fleet must run NO remote command at all, probes included: {:?}",
+            recorder.mutating(&[])
+        );
+    }
+
+    #[test]
+    fn up_calls_the_preflight_gate_before_handing_off_to_run_up_with() {
+        // #2269. The test above proves the GATE refuses correctly, but it
+        // composes `refuse_if_preflight_failed` and `run_up_with` by hand — it
+        // cannot prove `run_up` itself still calls them in that order. This
+        // checks the SOURCE order inside `run_up`, mirroring
+        // `media_provisioning_is_deferred_past_app_cutover_in_up`: a refactor
+        // that moved the gate after the `run_up_with` hand-off, or dropped it,
+        // fails this test even though the gate function still works on its
+        // own.
+        let src = include_str!("deploy.rs");
+        let up_body = src
+            .split("fn run_up(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn run_rollback(").next())
+            .expect("run_up body present");
+
+        let gate_at = up_body
+            .find("refuse_if_preflight_failed(&checks)")
+            .expect("the preflight gate call present on the up path");
+        let handoff_at = up_body
+            .find("run_up_with(")
+            .expect("the run_up_with hand-off present on the up path");
+
+        assert!(
+            gate_at < handoff_at,
+            "run_up must call the preflight gate BEFORE handing off to run_up_with",
+        );
+    }
+
+    #[test]
     fn the_refusals_grade_the_configured_topology_not_the_narrowed_rollout() {
         // #1621 (§4.8). `--only` narrows which hosts a run TOUCHES; it does not
         // change the topology. A three-host sqlite fleet is just as broken when one
@@ -9202,6 +11587,8 @@ mod tests {
         let recorder = fleet::test_support::FleetRecorder::new();
         let fixture = FleetFixture::new();
         let input = FleetUpInput {
+            profile: "prod",
+            app_name: "myapp",
             configured_host_count: 3,
             db: FleetDatabaseFacts {
                 sqlite: true,
@@ -9367,6 +11754,8 @@ mod tests {
         let recorder = script_redeploy(fleet::test_support::FleetRecorder::new(), "web-b");
         let fixture = FleetFixture::new();
         let input = FleetUpInput {
+            profile: "prod",
+            app_name: "myapp",
             configured_host_count: 3,
             ..fixture.input(&fleet)
         };
@@ -9404,6 +11793,8 @@ mod tests {
             .fail("web-b", "readiness-gate");
         let fixture = FleetFixture::new();
         let input = FleetUpInput {
+            profile: "prod",
+            app_name: "myapp",
             configured_host_count: 3,
             ..fixture.input(&fleet)
         };
@@ -9431,6 +11822,8 @@ mod tests {
             .script("web-b", "probe-release-dir", "present");
         let fixture = FleetFixture::new();
         let input = FleetUpInput {
+            profile: "prod",
+            app_name: "myapp",
             configured_host_count: 3,
             ..fixture.input(&narrowed)
         };
@@ -10068,6 +12461,64 @@ mod tests {
                 .run_labels_for("web-a")
                 .contains(&"maintenance-prepare-live-flag-dir"),
             "no running unit means no second flag dir to prepare"
+        );
+    }
+
+    #[test]
+    fn fleet_maintenance_on_prepares_the_shared_flag_dir_before_uploading() {
+        // #2280: `prepare-dirs` (which creates `{app_dir}/shared`) only runs during
+        // a deploy, so on a never-deployed host the shared flag's parent does not
+        // exist — and scp does not create destination parents, so the very first
+        // `maintenance on` failed and the `AppliedSharedOnly` success path keyed on
+        // exactly this host shape was unreachable. The dir is created up front,
+        // BEFORE the shared write (amendment A2: the shared flag is still written
+        // first, so a #1621 unit reacts within 500 ms of the write itself).
+        let fleet = fleet_of(&["web-a"]);
+        let recorder = fleet::test_support::FleetRecorder::new().script(
+            "web-a",
+            "detect-current",
+            "first\n---autumn-kamal-proxy-list---\n",
+        );
+
+        drive_maintenance(
+            &fleet,
+            &recorder,
+            DeployAction::MaintenanceOn,
+            Some(&MaintenanceOnArgs::default()),
+        )
+        .expect("a shared-only write is a success, not a failure");
+
+        let calls = recorder.calls_for("web-a");
+        let mkdir_pos = calls
+            .iter()
+            .position(|call| {
+                matches!(
+                    call,
+                    exec::test_support::RecordedCall::Run { label, shell }
+                        if *label == "maintenance-prepare-shared-flag-dir"
+                            && shell.contains("mkdir -p")
+                            && shell.contains("/srv/autumn/myapp/shared")
+                )
+            })
+            .expect("the shared flag's parent must be created before the upload");
+        let upload_pos = calls
+            .iter()
+            .position(|call| {
+                matches!(
+                    call,
+                    exec::test_support::RecordedCall::Upload { remote_path, .. }
+                        if remote_path == MAINTENANCE_SHARED_PATH
+                )
+            })
+            .expect("the shared flag is uploaded");
+        assert!(
+            mkdir_pos < upload_pos,
+            "the shared dir is created BEFORE the shared flag is written"
+        );
+        assert_eq!(
+            upload_paths(&recorder, "web-a"),
+            vec![MAINTENANCE_SHARED_PATH.to_owned()],
+            "only the shared flag can be written without a resolvable release"
         );
     }
 

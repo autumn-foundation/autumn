@@ -78,6 +78,7 @@ database is its own business, and it happens later:
 | `autumn-media-plugin` | `media_rooms`, `media_room_participants` | its `migrations/20260720000000_media_rooms` — **you** apply it, and only if you set `[media] room_store_backend = "db"` |
 | `autumn-search` | `autumn_search_documents`, `autumn_search_deletes` | created at runtime by the Postgres engine (`CREATE TABLE IF NOT EXISTS`) the first time it starts |
 | `autumn-admin-plugin` | none of its own | reads framework-owned tables that `autumn-web`'s own migrations create |
+| `autumn-billing` | `billing_customers`, `billing_subscriptions`, `billing_invoices`, `billing_events`, `billing_dunning` | its `migrations/20260910203829_billing_mirror`, registered through `plugin_migrations` so the app's normal migration run applies it |
 | `autumn-cache-redis` | none | entries live in Redis |
 | `autumn-storage-s3` | none | blobs live in the bucket |
 
@@ -270,6 +271,7 @@ run.
 | `autumn-storage-s3` | S3-backed object storage | [Storage](./guide/storage.md) |
 | `autumn-cache-redis` | Redis-backed shared cache | [Cache stampede](./guide/cache-stampede.md) |
 | `autumn-search` | Keyword **and** vector search with lifecycle-synced indexes | [Search](./guide/search.md) |
+| `autumn-billing` | Stripe subscriptions: checkout, portal, webhook mirror, plan gate, dunning | [Billing](./guide/billing.md) |
 
 ## Trust model: native plugins are full-trust
 
@@ -580,6 +582,11 @@ plugin `autumn-plugin-example 0.6.2` supports autumn-web 0.6, but this applicati
   → pin the framework the plugin supports: autumn-web = "0.6"
   → or, to boot anyway while you sort it out, set AUTUMN_PLUGIN_CONTRACT=warn
 ```
+
+<!-- version-pin-allow: autumn-web = "0.6" — inside the reproduced
+     plugin-contract panic text. The old line is what makes the example an
+     incompatible pairing, and the pin is the message's own remediation line,
+     not a dependency the reader adds. -->
 
 The last line is the escape hatch. Cargo has already proven the app and the
 plugin link one `autumn-web` — otherwise there would be two copies and a

@@ -7956,8 +7956,17 @@ fn generated_owner_searchable_scaffold_cargo_checks() {
     // The repository carries `owner = author_id` (→ the macro's scoped codegen).
     let repo = fs::read_to_string(project.join("src/repositories/post.rs")).unwrap();
     assert!(
-        repo.contains(", owner = author_id)"),
+        repo.contains(", owner = author_id"),
         "owner-scoped searchable repository must carry `owner = author_id`:\n{repo}"
+    );
+    // Warden 2026-09-13: `owner = <col>` alone does not gate the generated
+    // `api = "..."` CRUD routes (`#[repository]` now refuses that combination
+    // at compile time) — the scaffold must also wire in the `PostPolicy` it
+    // already generates and registers on the app.
+    assert!(
+        repo.contains(", policy = PostPolicy)")
+            && repo.contains("use crate::policies::post::PostPolicy;"),
+        "owner-scoped repository must also carry `policy = ...` or it no longer compiles:\n{repo}"
     );
 
     // The owner-scoped /search + index call ONLY the scoped methods — never the
@@ -8018,8 +8027,15 @@ fn generated_nullable_owner_searchable_scaffold_cargo_checks() {
 
     let repo = fs::read_to_string(project.join("src/repositories/note.rs")).unwrap();
     assert!(
-        repo.contains(", owner = user_id)"),
+        repo.contains(", owner = user_id"),
         "nullable-owner searchable repository must carry `owner = user_id`:\n{repo}"
+    );
+    // Warden 2026-09-13: same requirement as the non-nullable owner case —
+    // `owner = ...` alone does not gate `api = "..."`'s CRUD routes.
+    assert!(
+        repo.contains(", policy = NotePolicy)")
+            && repo.contains("use crate::policies::note::NotePolicy;"),
+        "nullable-owner repository must also carry `policy = ...` or it no longer compiles:\n{repo}"
     );
     let routes = fs::read_to_string(project.join("src/routes/notes.rs")).unwrap();
     assert!(

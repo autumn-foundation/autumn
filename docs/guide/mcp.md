@@ -415,6 +415,16 @@ so the call runs as that verified principal. The `Cookie` and `X-CSRF-Token`
 headers are forwarded too, so session-based `#[secured]` routes and
 CSRF-protected writes behave identically to a direct call.
 
+The example below uses `InMemoryApiTokenStore`, which keeps tokens in the
+process and seeds them in code. To manage an agent's token from the CLI
+instead — `autumn token issue <principal> --scope <scope>`, and `revoke` /
+`rotate` to take it back — the app must read the same `api_tokens` table the
+CLI writes, which means mounting
+[`DbApiTokenStore`](../../autumn/src/auth.rs) in place of the in-memory one.
+A token issued by the CLI is invisible to an in-memory store, so verification
+answers `401`. See
+[API tokens](authentication.md#issuing-listing-rotating-and-revoking-api-tokens).
+
 To put a tool behind token auth, register the route inside a `scoped` group
 carrying the `RequireApiToken` layer. The scope keeps the route in the
 registry (so MCP can derive the tool) *and* applies the layer (so every call —
@@ -487,11 +497,16 @@ CORS `allowed_origins`:
 
 - A request with **no `Origin`** header (curl, SDKs, server-side agents) is
   allowed — non-browser callers aren't subject to DNS rebinding.
-- A request whose `Origin` **isn't** in `cors.allowed_origins` (or `*`) gets
-  **403 Forbidden** before any parsing or dispatch.
+- A request whose `Origin` is **the same origin as the request's own host**, where
+  that host is a trusted host, is allowed without an allowlist entry — a browser
+  client served by the app itself is already covered.
+- Otherwise the `Origin` must be in `cors.allowed_origins` (or the list must hold
+  `*`); anything else gets **403 Forbidden** before any parsing or dispatch.
 
-So to allow a browser-based MCP client from `https://app.example.com`, add that
-origin to your CORS config; agent clients need no configuration.
+So it is specifically a **cross-origin** browser MCP client — one served from
+somewhere other than the app — that needs its origin added to your CORS config
+([CORS and Cross-Origin Requests](cors.md)); a same-origin browser client and an
+agent client both need no configuration.
 
 ---
 

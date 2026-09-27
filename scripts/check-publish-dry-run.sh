@@ -32,7 +32,10 @@ die() {
 
 # Publishable crates in dependency order.
 CRATES=(
+  autumn-macros-support
   autumn-macros
+  autumn-macros-model
+  autumn-macros-repository
   autumn-schema-core
   autumn-edge
   autumn-web
@@ -42,6 +45,7 @@ CRATES=(
   autumn-storage-s3
   autumn-cache-redis
   autumn-search
+  autumn-billing
 )
 
 # Assets that MUST appear in a crate's packaged file list. `--list` does not

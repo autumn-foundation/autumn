@@ -629,6 +629,13 @@ mod tests {
     ///   outside this monorepo, the same category of divergence as `Cargo.toml`.
     ///
     /// …and `static/css/app.css` is a Tailwind build artefact, not a source file.
+    ///
+    /// A Ledger profiling harness (`tests/*_profile.rs`, e.g.
+    /// `tests/permalink_search_ancestry_batch_profile.rs`) is the same
+    /// category as `tests/system/smoke.rs`: workspace-internal measurement
+    /// tooling that needs `testcontainers`/`testcontainers-modules` wired into
+    /// the in-repo example's `Cargo.toml` (excluded above) but has no meaning
+    /// to a scaffolded app, which never gets that wiring.
     fn assert_starter_matches_example(starter: &'static Dir<'static>, project_name: &'static str) {
         let contents = load_from_embedded(starter).unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
@@ -692,7 +699,10 @@ mod tests {
                     .unwrap()
                     .to_string_lossy()
                     .replace('\\', "/");
-                if rel == "static/css/app.css" || rel == "tests/system/smoke.rs" {
+                if rel == "static/css/app.css"
+                    || rel == "tests/system/smoke.rs"
+                    || (rel.starts_with("tests/") && rel.ends_with("_profile.rs"))
+                {
                     continue;
                 }
                 assert!(

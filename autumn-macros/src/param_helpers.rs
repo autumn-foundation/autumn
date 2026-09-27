@@ -20,6 +20,7 @@
 //!   `#[secured]` then runs on the modified function, sees the
 //!   existing parameters, and skips re-injection.
 
+use quote::quote;
 use syn::ItemFn;
 
 /// Return `true` when `func` already has a parameter bound to a
@@ -226,6 +227,69 @@ pub fn reject_if_incompatible_route_marker(func: &ItemFn) -> Option<proc_macro2:
         );
     }
     None
+}
+
+/// Shared preamble for every pre-body gate macro (`#[secured]`, `#[step_up]`,
+/// `#[throttle]`, `#[authorize]`): split `item` into its leading items and
+/// the function the attribute is attached to, reject a non-async function
+/// with `#[{attr_name}] can only be applied to async functions`, then reject
+/// a function [`reject_if_incompatible_route_marker`] already flags as
+/// incompatible. Every one of the four macros ran this exact sequence
+/// independently (co-changed together in #1668 and #2628 — the latter added
+/// the identical 7-line marker-check call to three of them in one commit);
+/// `attr_name` is the only thing that ever varied between the copies.
+pub fn split_leading_items_and_reject_incompatible(
+    item: &proc_macro2::TokenStream,
+    attr_name: &str,
+) -> Result<(proc_macro2::TokenStream, ItemFn), proc_macro2::TokenStream> {
+    let (leading_items, input_fn) = crate::parse::split_leading_items_and_fn(item)?;
+    if input_fn.sig.asyncness.is_none() {
+        return Err(syn::Error::new_spanned(
+            input_fn.sig.fn_token,
+            format!("#[{attr_name}] can only be applied to async functions"),
+        )
+        .to_compile_error());
+    }
+    if let Some(err) = reject_if_incompatible_route_marker(&input_fn) {
+        return Err(err);
+    }
+    Ok((leading_items, input_fn))
+}
+
+/// Build the `original_response` binding shared byte-for-byte by
+/// `#[secured]`, `#[step_up]` and `#[authorize]`: await the handler's
+/// original body, then convert it to a `Response` — binding it to the
+/// handler's own declared return type unless that type contains `impl
+/// Trait` anywhere (see [`type_contains_impl_trait`]'s doc comment for why).
+///
+/// `#[throttle]` does NOT share this helper: it also stringifies a bare
+/// primitive return type (`should_stringify_primitive_output`), a case the
+/// other three don't have — a deliberate divergence, not an omission, so
+/// throttle keeps its own copy rather than taking a mode flag here.
+pub fn build_original_response(
+    original_body: &syn::Block,
+    output: &syn::ReturnType,
+) -> proc_macro2::TokenStream {
+    match output {
+        syn::ReturnType::Default => quote! {
+            let __autumn_inner: () = (async move #original_body).await;
+            ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+        },
+        // Avoid `let x: T = …` when T contains `impl Trait` at any depth.
+        // Rust rejects `impl Trait` in local variable type annotations; drop
+        // the annotation and let type inference handle it instead.
+        syn::ReturnType::Type(_, ty) if type_contains_impl_trait(ty) => {
+            quote! {
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                    (async move #original_body).await
+                )
+            }
+        }
+        syn::ReturnType::Type(_, ty) => quote! {
+            let __autumn_inner: #ty = (async move #original_body).await;
+            ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
+        },
+    }
 }
 
 /// Test-only helper: pull the `fn` named `name` out of a macro's generated

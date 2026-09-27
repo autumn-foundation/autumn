@@ -1,10 +1,12 @@
 //! `autumn seed` -- run the project's seed binary to populate the database.
 //!
-//! Delegates to `cargo run --bin seed` after:
+//! Delegates to `cargo run --bin <seed-bin>` after:
 //!   1. Verifying `src/bin/seed.rs` exists.
-//!   2. Blocking a `--count`/`--model` fake-seed request against a
+//!   2. Resolving the seed binary's *target name* from `cargo metadata` (the
+//!      target may be renamed, e.g. `todo-app-seed`; autumn #2639).
+//!   3. Blocking a `--count`/`--model` fake-seed request against a
 //!      `prod`/`production` profile unless `--yes-i-mean-prod` is given.
-//!   3. Checking for pending migrations via the diesel CLI.
+//!   4. Checking for pending migrations via the diesel CLI.
 //!
 //! The seed binary receives the active profile through the `AUTUMN_ENV`
 //! environment variable, matching how the rest of the framework resolves
@@ -61,6 +63,61 @@ fn resolve_fake_request(
 /// Returns `true` if the seed binary source file exists at `path`.
 fn seed_binary_exists_at(path: &Path) -> bool {
     path.is_file()
+}
+
+/// Resolve the seed binary's cargo target name for a project.
+///
+/// The convention is that the seed binary's source lives at
+/// `<project_dir>/src/bin/seed.rs`, but its *target name* may differ from
+/// `seed` (e.g. `todo-app-seed` after autumn #2639 renamed colliding example
+/// targets). This finds the bin target whose `src_path` is the seed source
+/// and returns its name, so `cargo run --bin` invokes the right target.
+/// Returns `None` when cargo metadata cannot be read or no such target exists;
+/// callers fall back to the conventional `seed` name.
+fn resolve_seed_bin_name(project_dir: &Path, package: Option<&str>) -> Option<String> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--format-version=1", "--no-deps"])
+        .current_dir(project_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    seed_bin_name_from_metadata(&metadata, project_dir, package)
+}
+
+/// Pure core of [`resolve_seed_bin_name`]: given parsed `cargo metadata --no-deps`
+/// output, find the bin target whose source is `<project_dir>/src/bin/seed.rs`.
+fn seed_bin_name_from_metadata(
+    metadata: &serde_json::Value,
+    project_dir: &Path,
+    package: Option<&str>,
+) -> Option<String> {
+    let seed_src = project_dir.join("src/bin/seed.rs");
+    let packages = metadata["packages"].as_array()?;
+    let pkg = match package {
+        Some(name) => packages.iter().find(|p| p["name"].as_str() == Some(name))?,
+        None => packages.iter().find(|p| {
+            p["manifest_path"]
+                .as_str()
+                .and_then(|manifest| Path::new(manifest).parent())
+                .is_some_and(|dir| dir == project_dir)
+        })?,
+    };
+    pkg["targets"].as_array()?.iter().find_map(|t| {
+        let is_bin = t["kind"]
+            .as_array()
+            .is_some_and(|kinds| kinds.iter().any(|k| k == "bin"));
+        let src_matches = t["src_path"]
+            .as_str()
+            .is_some_and(|src| Path::new(src) == seed_src);
+        if is_bin && src_matches {
+            t["name"].as_str().map(str::to_owned)
+        } else {
+            None
+        }
+    })
 }
 
 /// Guard against accidentally mass-inserting faked rows into a production
@@ -283,8 +340,15 @@ pub fn run(
 
     eprintln!("  Running seed binary...\n");
 
+    // The seed binary's *target* name need not be `seed`: projects may rename
+    // the target (autumn #2639 renamed colliding example `seed` targets to
+    // `<crate>-seed`) while keeping the conventional `src/bin/seed.rs` path.
+    // Resolve the real target name from cargo metadata; fall back to `seed`
+    // when metadata is unreadable.
+    let seed_bin =
+        resolve_seed_bin_name(&project_dir, package).unwrap_or_else(|| "seed".to_owned());
     let mut cmd = Command::new("cargo");
-    cmd.args(["run", "--bin", "seed"]);
+    cmd.args(["run", "--bin", &seed_bin]);
     if let Some(pkg) = package {
         cmd.args(["--package", pkg]);
     }
@@ -491,6 +555,79 @@ mod tests {
         std::fs::create_dir_all(&seed_dir).unwrap();
         // seed_dir is a directory, not a file
         assert!(!seed_binary_exists_at(&seed_dir));
+    }
+
+    // ── seed_bin_name_from_metadata ───────────────────────────────────────
+
+    fn seed_metadata() -> serde_json::Value {
+        serde_json::json!({
+            "packages": [
+                {
+                    "name": "todo-app",
+                    "manifest_path": "/projects/todo-app/Cargo.toml",
+                    "targets": [
+                        { "name": "todo-app-seed", "kind": ["bin"], "src_path": "/projects/todo-app/src/bin/seed.rs" },
+                        { "name": "todo-app", "kind": ["bin"], "src_path": "/projects/todo-app/src/main.rs" }
+                    ]
+                },
+                {
+                    "name": "other",
+                    "manifest_path": "/projects/other/Cargo.toml",
+                    "targets": [
+                        { "name": "seed", "kind": ["bin"], "src_path": "/projects/other/src/bin/seed.rs" }
+                    ]
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn seed_bin_name_resolves_renamed_target_by_src_path() {
+        // Regression for autumn #2639: the target name may differ from `seed`.
+        let name =
+            seed_bin_name_from_metadata(&seed_metadata(), Path::new("/projects/todo-app"), None);
+        assert_eq!(name.as_deref(), Some("todo-app-seed"));
+    }
+
+    #[test]
+    fn seed_bin_name_resolves_conventional_seed_target() {
+        let name =
+            seed_bin_name_from_metadata(&seed_metadata(), Path::new("/projects/other"), None);
+        assert_eq!(name.as_deref(), Some("seed"));
+    }
+
+    #[test]
+    fn seed_bin_name_package_filter_selects_the_package() {
+        // With --package, run() resolves project_dir to the package's own
+        // directory via find_package_dir, so pass that directory here.
+        let name = seed_bin_name_from_metadata(
+            &seed_metadata(),
+            Path::new("/projects/todo-app"),
+            Some("todo-app"),
+        );
+        assert_eq!(name.as_deref(), Some("todo-app-seed"));
+    }
+
+    #[test]
+    fn seed_bin_name_returns_none_when_project_has_no_seed_target() {
+        let name =
+            seed_bin_name_from_metadata(&seed_metadata(), Path::new("/projects/missing"), None);
+        assert_eq!(name, None);
+    }
+
+    #[test]
+    fn seed_bin_name_ignores_non_bin_seed_target() {
+        let metadata = serde_json::json!({
+            "packages": [{
+                "name": "lib-only",
+                "manifest_path": "/projects/lib-only/Cargo.toml",
+                "targets": [
+                    { "name": "seed", "kind": ["lib"], "src_path": "/projects/lib-only/src/bin/seed.rs" }
+                ]
+            }]
+        });
+        let name = seed_bin_name_from_metadata(&metadata, Path::new("/projects/lib-only"), None);
+        assert_eq!(name, None);
     }
 
     // ── resolve_database_url_with_env ──────────────────────────────────────

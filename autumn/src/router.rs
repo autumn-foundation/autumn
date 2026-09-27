@@ -495,7 +495,16 @@ pub fn try_build_probe_only_router(
         mount_probe_endpoints(axum::Router::<AppState>::new(), config, &no_user_routes);
     let router = mount_actuator_endpoints(router, config, &mounted_probe_paths)?;
     let router = router.with_state(state);
-    Ok(apply_startup_barrier(router, config, &barrier_state))
+    let router = apply_startup_barrier(router, config, &barrier_state);
+    // A worker builds this router instead of the full one, and `run()` serves
+    // it over the same listener — the mTLS listener included. It never calls
+    // `apply_middleware`, so mirror the route-level certificate requirement
+    // (#1640) here, or a `required_paths` prefix covering `/actuator/` holds on
+    // a web replica and not on a worker.
+    if let Some(require_client_cert) = build_client_cert_requirement_layer(config) {
+        return Ok(router.layer(require_client_cert));
+    }
+    Ok(router)
 }
 
 /// Prepared MCP exposure carried through `build_router_pre_state`: the mount
@@ -764,7 +773,7 @@ fn build_router_pre_state(
 
     // Dev request inspector: mount UI and apply recording middleware.
     // Only active when profile = "dev"; returns 404 for all other profiles.
-    let is_dev_profile = matches!(config.profile.as_deref(), Some("dev" | "development"));
+    let is_dev_profile = crate::config::profile_is_dev(config.profile.as_deref());
     if is_dev_profile {
         // Capture the matched route pattern for the dev error overlay.
         // Applied as a route_layer so MatchedPath is already set when this runs.
@@ -777,11 +786,15 @@ fn build_router_pre_state(
         let inspector_path = config.dev.inspector_path.clone();
         let threshold = config.dev.inspector_n_plus_one_threshold;
 
-        // Mount the inspector UI routes.
-        router = router.merge(crate::inspector::inspector_router(
-            buf.clone(),
-            &inspector_path,
-        ));
+        // Mount the inspector UI routes. They merge after `apply_middleware`,
+        // so they do not inherit its layers. Mirror the mTLS route requirement
+        // (#1640) onto them, or a `required_paths` prefix that covers the
+        // inspector path promises a 403 it does not deliver.
+        let mut inspector = crate::inspector::inspector_router(buf.clone(), &inspector_path);
+        if let Some(require_client_cert) = build_client_cert_requirement_layer(config) {
+            inspector = inspector.layer(require_client_cert);
+        }
+        router = router.merge(inspector);
         tracing::debug!(
             path = %inspector_path,
             "Mounted dev request inspector"
@@ -884,7 +897,7 @@ fn build_router_pre_state(
                 cors: config.cors.clone(),
                 // The same-origin shortcut is gated on the app's trusted-Host
                 // policy so it can't be abused for DNS rebinding.
-                trusted_hosts: TrustedHostPolicy::from_config(config),
+                trusted_hosts: TrustedHostPolicy::from_config_with_state(config, state),
                 tenant_header,
                 // Forward the configured CSRF header (default `x-csrf-token`) so
                 // customized CsrfConfig::token_header deployments work via MCP.
@@ -920,6 +933,16 @@ fn build_router_pre_state(
             // allow-list read the proxy-resolved identity instead of a spoofable raw
             // `X-Forwarded-For`.
             mcp_router = mcp_router.layer(build_maintenance_layer(config, state));
+            // mTLS route requirement (#1640), mirroring the layer
+            // `apply_middleware` installs for direct routes. The `/mcp` router
+            // merges after that layer, so an operator who puts the MCP mount
+            // itself under `required_paths` would otherwise find `initialize`,
+            // `tools/list` and `tools/call` answering an uncertified client
+            // while the prefix promised a 403. The `tools/call` replay is
+            // guarded separately, through the dispatch clone.
+            if let Some(require_client_cert) = build_client_cert_requirement_layer(config) {
+                mcp_router = mcp_router.layer(require_client_cert);
+            }
             // Admission control / load shedding (#1006), mirroring the layer
             // `apply_middleware` installs for direct routes (see the comment
             // there). The `/mcp` router is merged after that layer, so without
@@ -1458,6 +1481,13 @@ fn collect_framework_get_paths(config: &AutumnConfig) -> std::collections::HashS
     if config.stories.enabled {
         claimed.insert(crate::stories::STORIES_PATH.to_owned());
         claimed.insert("/_stories/{slug}".to_owned());
+        // The Active search / Autocomplete / Infinite feed stories' live
+        // demo backends (review follow-up — these three were missing from
+        // the preflight, so a colliding OpenAPI/MCP mount here would panic
+        // in `router.merge` instead of surfacing the typed collision error).
+        claimed.insert("/_stories/demo/search".to_owned());
+        claimed.insert("/_stories/demo/tags/search".to_owned());
+        claimed.insert("/_stories/demo/posts/feed".to_owned());
     }
     // The default unsubscribe endpoint merges a GET (+POST) at `UNSUBSCRIBE_PATH`
     // before the late-merged OpenAPI/MCP routers, so reserve it too — otherwise an
@@ -2925,6 +2955,31 @@ fn is_idempotency_transparent_app_layer(registered: &crate::app::CustomLayerRegi
         || registered.type_id
             == std::any::TypeId::of::<crate::session::SessionLayer<crate::session::MemoryStore>>()
         || is_i18n_bundle_extension_layer(registered.type_id)
+        || is_edge_fallthrough_sentinel_strip_layer(registered.type_id)
+}
+
+/// The origin-only layer that strips the edge lane's internal fallthrough
+/// sentinel header (issue #2244, `autumn::app::StripEdgeFallthroughSentinelLayer`).
+///
+/// It only ever removes one framework-owned response header — it never reads
+/// or branches on caller identity, session, or tenant — so it cannot change
+/// which cached response an idempotency replay serves. `app()` registers it
+/// through the ordinary `AppBuilder::layer` path (like any other custom
+/// layer), which is why it needs this same-shaped allowance as
+/// `SessionLayer` and the i18n bundle extension: otherwise every app built
+/// with the `edge` feature on would force fail-closed idempotency, whether
+/// or not it ever calls `with_edge_kv`.
+///
+/// Matched by `TypeId`, not a name: a bespoke crate-private type, unlike a
+/// name (even a function's), cannot collide with a user's own middleware.
+#[cfg(feature = "edge")]
+fn is_edge_fallthrough_sentinel_strip_layer(type_id: std::any::TypeId) -> bool {
+    type_id == std::any::TypeId::of::<crate::app::StripEdgeFallthroughSentinelLayer>()
+}
+
+#[cfg(not(feature = "edge"))]
+const fn is_edge_fallthrough_sentinel_strip_layer(_type_id: std::any::TypeId) -> bool {
+    false
 }
 
 #[cfg(feature = "i18n")]
@@ -3485,6 +3540,35 @@ where
 
 /// Build the CSRF layer, or `None` when CSRF is disabled.
 ///
+/// The mTLS route-requirement layer (#1640), or `None` when no route declares
+/// one.
+///
+/// `None` whenever `[server.tls.client_auth]` is absent, its mode is `off`, or
+/// it lists no `required_paths` — the three cases in which the layer would have
+/// nothing to enforce. Built here (rather than at the serve boundary) so it
+/// sits inside the router; see the call site for why that matters.
+#[cfg(feature = "tls")]
+fn build_client_cert_requirement_layer(
+    config: &crate::config::AutumnConfig,
+) -> Option<crate::tls::client_auth::RequireClientCertLayer> {
+    let client_auth = config.server.tls.as_ref()?.client_auth.as_ref()?;
+    if !client_auth.mode.requests_certificate() || client_auth.required_paths.is_empty() {
+        return None;
+    }
+    Some(crate::tls::client_auth::RequireClientCertLayer::for_paths(
+        client_auth.required_paths.clone(),
+    ))
+}
+
+/// The `tls`-less build has no client certificates to require, so the slot is
+/// always empty. `Identity` only names a type for `option_layer`'s `None` arm.
+#[cfg(not(feature = "tls"))]
+const fn build_client_cert_requirement_layer(
+    _config: &crate::config::AutumnConfig,
+) -> Option<tower::layer::util::Identity> {
+    None
+}
+
 /// Split out of [`apply_csrf_middleware`] so the layer can join the composed
 /// ingress stack rather than costing its own nesting level (issue #2193).
 fn build_csrf_layer(
@@ -4024,6 +4108,7 @@ fn build_shadow_layer(
         // pages, failure capsules, and now the recorded divergence samples.
         let mut filter_parameters = config.log.filter_parameters.clone();
         filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
+        filter_parameters.extend(crate::confidential::registered_confidential_column_names());
         let filter = Arc::new(crate::log::filter::ParameterFilter::new(
             &filter_parameters,
             &config.log.unfilter_parameters,
@@ -4935,7 +5020,7 @@ fn apply_middleware(
     // Redis-backed rate limiter — that must not run on the way to a fail-fast `Err`.
     let submit_token_layer = build_submit_token_layer(config, is_production)?;
     let (body_limit, upload_config) = build_upload_layers(config);
-    let trusted_host_policy = TrustedHostPolicy::from_config(config);
+    let trusted_host_policy = TrustedHostPolicy::from_config_with_state(config, state);
     let (rate_limit_layer, rate_limit_principal_keying) = build_rate_limit_layers(config, state);
     let inner_stack = (
         // Insert UploadConfig into extensions so the Multipart extractor can
@@ -4971,6 +5056,18 @@ fn apply_middleware(
         // is not masked by CSRF's missing-token `403`, and a clear
         // `400 invalid _method` outranks "missing CSRF".
         crate::middleware::method_override::MethodOverrideRejectionLayer,
+        // mTLS route requirement (#1640). INSIDE the router, not at the
+        // `axum::serve` boundary beside `ClientIdentityLayer`, for two reasons:
+        // the MCP dispatch clone is taken from the finished router, so a
+        // `tools/call` replaying into an mTLS-only route must traverse this
+        // check; and a rejection here flows through the rest of the response
+        // stack (access log, request id, security headers, Problem Details)
+        // instead of bypassing it. Inner to rate limiting and load shedding, so
+        // an uncertified prober is throttled like any other client, and outer
+        // to CSRF, so a connection with no certificate never reaches a token
+        // check it cannot pass anyway. `None` — and so free — for every app
+        // that declares no `required_paths`.
+        tower::util::option_layer(build_client_cert_requirement_layer(config)),
         tower::util::option_layer(build_bot_protection_layer(config)),
         tower::util::option_layer(build_csrf_layer(config, signing_keys_opt.clone())),
         // Inner to the CSRF layer so CSRF is validated first on the request
@@ -5050,6 +5147,8 @@ fn apply_middleware(
         // `[log] filter_parameters` list governs both.
         let mut capture_filter_parameters = config.log.filter_parameters.clone();
         capture_filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
+        capture_filter_parameters
+            .extend(crate::confidential::registered_confidential_column_names());
         let capture_filter = Arc::new(crate::log::filter::ParameterFilter::new(
             &capture_filter_parameters,
             &config.log.unfilter_parameters,
@@ -5090,6 +5189,8 @@ fn apply_middleware(
     // enter the context output.
     let mut log_context_filter_parameters = config.log.filter_parameters.clone();
     log_context_filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
+    log_context_filter_parameters
+        .extend(crate::confidential::registered_confidential_column_names());
     let log_context_filter = Arc::new(crate::log::filter::ParameterFilter::new(
         &log_context_filter_parameters,
         &config.log.unfilter_parameters,
@@ -5211,10 +5312,12 @@ fn apply_middleware(
     #[cfg(not(feature = "db"))]
     let ryw_layer = tower::layer::util::Identity::new();
 
-    let is_dev = config
-        .profile
-        .as_deref()
-        .map_or(cfg!(debug_assertions), |p| p == "dev");
+    // Must agree with `is_dev_profile` above (the request inspector's own
+    // gate) on what "dev" means: both derive it from
+    // `crate::config::profile_is_dev`, which fails closed on an unset
+    // profile rather than falling back to `cfg!(debug_assertions)` — see its
+    // doc comment for why that fallback was a dev-overlay disclosure bug.
+    let is_dev = crate::config::profile_is_dev(config.profile.as_deref());
 
     // Error page filter: renders HTML error pages for browser requests.
     // Always registered (uses default renderer if no custom one is provided).
@@ -5231,6 +5334,7 @@ fn apply_middleware(
         // values never leak through logs even if an app forgets to list them.
         let mut filter_parameters = config.log.filter_parameters.clone();
         filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
+        filter_parameters.extend(crate::confidential::registered_confidential_column_names());
         let renderer = error_page_renderer.unwrap_or_else(error_pages::default_renderer);
         let error_page_filter = crate::middleware::error_page_filter::ErrorPageFilter {
             renderer,
@@ -5286,7 +5390,8 @@ fn apply_middleware(
     //   [user layers, non-static build — ONE slot however many are registered] ->
     //   UploadConfig -> BodyLimit -> WebhookReplayCleanup -> LoadShed ->
     //   Maintenance -> RateLimitPrincipal -> RateLimit ->
-    //   MethodOverrideRejection -> BotProtection -> CSRF -> SubmitToken ->
+    //   MethodOverrideRejection -> RequireClientCert (mTLS, #1640) ->
+    //   BotProtection -> CSRF -> SubmitToken ->
     //   TrustedHost -> CORS -> [asset cache-control] -> handler
     // Everything from `Compression` through `CORS` is ONE `Router::layer` call:
     // the merged tuple below. `NormalizeBody` is a body-type adapter with no
@@ -5624,6 +5729,75 @@ pub fn try_build_router_with_static(
     )
 }
 
+/// Partition `custom_layers` for the static render path (#2405).
+///
+/// Returns `(session_scoped, drained)`:
+/// - `session_scoped`: layers that must stay on the inner (pre-layer) router —
+///   the i18n ambient-locale layer, which reads the session and therefore
+///   cannot run outside the static-first middleware (see #1384), and the i18n
+///   bundle `Extension`, which `Locale::from_request_parts` reads the bundle
+///   from exclusively. The build drops the drained set outright, so draining
+///   the bundle would make translated `#[static_get]` handlers write
+///   translation keys into `dist`. The extension inserts no headers and
+///   rewrites nothing, so keeping it does not disturb the recorded
+///   `Content-Type`.
+/// - `drained`: everything else — the user layers the SSG serve path applies
+///   outside the static-first middleware, to the cached response, at request
+///   time.
+///
+/// Both the static build (`App::run_build_mode`) and ISR regeneration render
+/// through the pre-layer router, so the recorded `Content-Type` and the body
+/// on disk are the handler's own. Recording the post-layer output instead
+/// double-applies the layers — once at generation, once per request — and,
+/// because ISR's type guard sees the pre-layer response, refuses every
+/// regeneration for an app with a `Content-Type`-rewriting layer, freezing
+/// the route until the next build.
+#[cfg(feature = "i18n")]
+pub fn partition_custom_layers_for_static_render(
+    custom_layers: Vec<crate::app::CustomLayerRegistration>,
+) -> (
+    Vec<crate::app::CustomLayerRegistration>,
+    Vec<crate::app::CustomLayerRegistration>,
+) {
+    // #1384: the ambient-locale layer must not drain out with the rest. It runs
+    // `Locale::from_request_parts`, whose session step reads the signed session,
+    // and everything drained here is applied outside the static-first middleware
+    // — that is, outside `SessionLayer`. Out there the session extension does not
+    // exist yet, so a locale persisted by the documented `set_locale_in_session`
+    // switcher would be invisible and content would resolve from
+    // `Accept-Language` instead, disagreeing with the UI chrome on the same page.
+    // A handler that deliberately takes no `Locale` argument — the point of the
+    // feature — never runs an extractor later to correct it.
+    //
+    // The i18n bundle `Extension` stays with it. `Locale::from_request_parts`
+    // obtains the bundle exclusively from the request extension that
+    // `install_i18n_bundle_layer` installs as a custom layer; the build drops
+    // the drained set, and without the extension the locale would carry no
+    // bundle, so `t()` would return the raw translation keys into the
+    // pre-rendered output. Registration order (Extension outermost) is
+    // preserved by the stable `partition`, so the ambient layer still reads
+    // the bundle exactly as on the fully-dynamic path.
+    let keep_type_ids = [
+        std::any::TypeId::of::<crate::i18n::AmbientLocaleLayer>(),
+        std::any::TypeId::of::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
+    ];
+    custom_layers
+        .into_iter()
+        .partition(|r| keep_type_ids.contains(&r.type_id))
+}
+
+/// The same partition with the `i18n` feature off: nothing is session-scoped,
+/// so every custom layer drains.
+#[cfg(not(feature = "i18n"))]
+pub const fn partition_custom_layers_for_static_render(
+    custom_layers: Vec<crate::app::CustomLayerRegistration>,
+) -> (
+    Vec<crate::app::CustomLayerRegistration>,
+    Vec<crate::app::CustomLayerRegistration>,
+) {
+    (Vec::new(), custom_layers)
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn try_build_router_with_static_inner(
     route_list: Vec<Route>,
@@ -5700,34 +5874,20 @@ pub fn try_build_router_with_static_inner(
     );
     let custom_layers = std::mem::take(&mut ctx.custom_layers);
 
-    // #1384: the ambient-locale layer must not drain out with the rest. It runs
-    // `Locale::from_request_parts`, whose session step reads the signed session,
-    // and everything drained here is applied outside the static-first middleware
-    // — that is, outside `SessionLayer`. Out there the session extension does not
-    // exist yet, so a locale persisted by the documented `set_locale_in_session`
-    // switcher would be invisible and content would resolve from
-    // `Accept-Language` instead, disagreeing with the UI chrome on the same page.
-    // A handler that deliberately takes no `Locale` argument — the point of the
-    // feature — never runs an extractor later to correct it.
-    //
-    // Putting it back on the inner router's context lands it in
-    // `apply_middleware`'s merged tuple, which is inside `session_layer` on both
-    // this path and the fully-dynamic one. The bundle `Extension` still drains
-    // out and stays outer, so the layer can read it.
-    //
-    // Shadowed rather than mutated in place: with the `i18n` feature off this
-    // block vanishes, and a `let mut` the remaining code never reassigns fails
-    // `-D warnings` in every non-unified build (`-p autumn-web`, the sqlite
-    // lane). A `--workspace` build hides that, because another member turns
-    // `i18n` on and Cargo unifies it.
-    #[cfg(feature = "i18n")]
-    let custom_layers = {
-        let (session_scoped, outside): (Vec<_>, Vec<_>) = custom_layers
-            .into_iter()
-            .partition(|r| r.type_id == std::any::TypeId::of::<crate::i18n::AmbientLocaleLayer>());
-        ctx.custom_layers = session_scoped;
-        outside
-    };
+    // The ambient-locale layer stays on the inner router's context, which
+    // lands it in `apply_middleware`'s merged tuple — inside `session_layer`
+    // on both this path and the fully-dynamic one. The i18n bundle
+    // `Extension` stays on the inner router too: the build drops the drained
+    // set outright, and `Locale::from_request_parts` reads the bundle from
+    // that extension exclusively, so draining it would leave translated
+    // `#[static_get]` handlers writing translation keys into `dist`. The
+    // partition is stable, so registration order (Extension outermost) is
+    // preserved and the ambient layer still reads the bundle. Shared with
+    // the static build (`App::run_build_mode`), which renders through the
+    // same pre-layer composition — see
+    // [`partition_custom_layers_for_static_render`].
+    let (session_scoped, custom_layers) = partition_custom_layers_for_static_render(custom_layers);
+    ctx.custom_layers = session_scoped;
 
     // Pre-static gate layers (AppBuilder::static_gate) are likewise extracted
     // and applied OUTSIDE the static-first middleware (the outermost layer of
@@ -5930,6 +6090,23 @@ pub fn try_build_router_with_static_inner(
         static_gate_layers,
         "Pre-static gate (outside static middleware)",
     );
+
+    // mTLS route requirement (#1640), a SECOND time. The copy inside
+    // `inner_router` covers dynamic routes and the MCP dispatch clone, but the
+    // static-first middleware above answers a manifest hit from disk without
+    // ever calling that router — so a pre-rendered page under a
+    // `required_paths` prefix would be served to an uncertified client while
+    // the posture manifest reported `mtls_required: true`. Applied here, beside
+    // the pre-static gates and for the same reason they are: a cached page must
+    // not outrank the check that guards it.
+    //
+    // Applying it twice is harmless: on a rejection this outer copy
+    // short-circuits, so the inner one never runs and the counter moves once;
+    // on a pass both are no-ops. Inner to `SecurityHeadersLayer` below, like the
+    // gates, so the 403 carries the same headers every other response does.
+    if let Some(require_client_cert) = build_client_cert_requirement_layer(config) {
+        router = router.layer(require_client_cert);
+    }
 
     // Security headers are applied OUTERMOST so they wrap both cached pages and
     // any gate short-circuit response. This is the SINGLE application for the
@@ -6840,6 +7017,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A worker builds the probe-only router and serves it over the same
+    /// listener, so a `required_paths` prefix must hold there too. Without the
+    /// requirement layer, `/actuator/jobs` answered an uncertified client on a
+    /// worker while a web replica returned 403 for the same prefix.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn a_worker_actuator_under_a_required_path_still_demands_a_certificate() {
+        let mut config = AutumnConfig::default();
+        config.server.tls = Some(crate::config::TlsConfig {
+            cert_path: Some("cert.pem".into()),
+            key_path: Some("key.pem".into()),
+            reload_interval_secs: 60,
+            handshake_timeout_secs: 10,
+            acme: None,
+            client_auth: Some(crate::config::ClientAuthConfig {
+                mode: crate::config::ClientAuthMode::Optional,
+                ca_bundle_path: Some("client-ca.pem".into()),
+                crl_path: None,
+                required_paths: vec!["/actuator/".to_owned()],
+                reload_interval_secs: 60,
+            }),
+        });
+
+        let app = try_build_probe_only_router(&config, test_state())
+            .expect("probe-only router should build");
+
+        // No `Arc<ClientIdentity>` extension: no verified certificate.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a worker actuator under a required_paths prefix must demand a certificate"
+        );
+
+        // A verified client still reaches it, so the guard has not simply
+        // broken the worker actuator.
+        let identity = std::sync::Arc::new(crate::tls::client_auth::ClientIdentity::new_for_test(
+            "svc-ops",
+            Vec::new(),
+        ));
+        let mut request = Request::builder()
+            .uri("/actuator/info")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(identity);
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_ne!(response.status(), StatusCode::FORBIDDEN);
+
+        // A probe outside the prefix is untouched: an orchestrator that cannot
+        // present a certificate still supervises the process.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(config.health.live_path.as_str())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::FORBIDDEN);
     }
 
     /// Worker-role (#1613) probe-only router: exposes the framework probes and
@@ -10058,6 +10306,44 @@ enabled = true
         ));
     }
 
+    #[cfg(all(feature = "openapi", feature = "maud"))]
+    #[tokio::test]
+    async fn try_build_router_rejects_openapi_path_on_story_gallery_demo_route() {
+        // Review follow-up: the Active search / Autocomplete / Infinite feed
+        // stories' live demo backends merge GETs the same way the index/detail
+        // routes above do, but were missing from the preflight reservation —
+        // an OpenAPI mount here would panic in `router.merge` instead of
+        // surfacing this typed collision.
+        let mut config = AutumnConfig::default();
+        config.stories.enabled = true;
+        let openapi = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
+            .openapi_json_path("/_stories/demo/search");
+        let ctx = RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
+            declared_routes: Vec::new(),
+            custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
+            error_page_renderer: None,
+            session_store: None,
+            openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
+        };
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx).expect_err(
+            "story gallery demo search path should be reserved while stories are enabled",
+        );
+        assert!(matches!(
+            err,
+            RouterBuildError::OpenApiPathCollision {
+                field: "openapi_json_path",
+                ref path,
+            } if path == "/_stories/demo/search"
+        ));
+    }
+
     #[cfg(feature = "openapi")]
     #[test]
     fn try_build_router_rejects_openapi_path_on_dev_live_reload() {
@@ -11177,6 +11463,77 @@ enabled = true
         let mut config = AutumnConfig::default();
         config.compression.enabled = true;
         config
+    }
+
+    /// A cached SSG page must not outrank the mTLS requirement that guards it
+    /// (#1640).
+    ///
+    /// The static-first middleware answers a manifest hit from disk without
+    /// ever calling the inner router, so the copy of `RequireClientCertLayer`
+    /// that lives in the inner router's stack never runs on that path. Without
+    /// a second copy outside the static cache, an uncertified client is served
+    /// the pre-rendered page while the posture manifest reports
+    /// `mtls_required: true`.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn a_cached_ssg_page_under_a_required_path_still_demands_a_certificate() {
+        let tmp = create_ssg_dist(&[("/internal/report", "report.html", b"<h1>secret</h1>")]);
+        let dist = tmp.path().join("dist");
+
+        let mut config = AutumnConfig::default();
+        config.server.tls = Some(crate::config::TlsConfig {
+            cert_path: Some("cert.pem".into()),
+            key_path: Some("key.pem".into()),
+            reload_interval_secs: 60,
+            handshake_timeout_secs: 10,
+            acme: None,
+            client_auth: Some(crate::config::ClientAuthConfig {
+                mode: crate::config::ClientAuthMode::Optional,
+                ca_bundle_path: Some("client-ca.pem".into()),
+                crl_path: None,
+                required_paths: vec!["/internal/".to_owned()],
+                reload_interval_secs: 60,
+            }),
+        });
+
+        let router = try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+            .expect("router builds");
+
+        // No `Arc<ClientIdentity>` extension: this request arrived over a
+        // connection with no verified certificate.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/report")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a cached page under a required_paths prefix must still demand a certificate"
+        );
+
+        // A verified client gets the cached page, so the guard has not simply
+        // broken static serving.
+        let identity = std::sync::Arc::new(crate::tls::client_auth::ClientIdentity::new_for_test(
+            "svc-reports",
+            Vec::new(),
+        ));
+        let mut request = Request::builder()
+            .uri("/internal/report")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(identity);
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"<h1>secret</h1>");
     }
 
     /// A manifest-backed HTML page is gzip-compressed when the client accepts
@@ -13821,6 +14178,71 @@ mod trusted_host_tests {
         }
     }
 
+    // ----------------------------------------------------------------------
+    // #2405: the static render path drains user layers (#2405)
+    // ----------------------------------------------------------------------
+
+    /// A plain user layer must drain out of the static render entirely: the
+    /// build and ISR regeneration both render through the pre-layer router,
+    /// so the recorded Content-Type and the body on disk are the handler's
+    /// own.
+    #[test]
+    fn static_render_partition_drains_user_layers() {
+        let (kept, drained) =
+            partition_custom_layers_for_static_render(vec![redirect_gate_registration()]);
+        assert!(
+            kept.is_empty(),
+            "user layers must not survive the static-render drain"
+        );
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].type_name, "redirect_gate");
+    }
+
+    /// The ambient-locale layer reads the session, so it must stay on the
+    /// inner (pre-layer) router even though every other custom layer drains
+    /// (#1384). The i18n bundle `Extension` must stay too:
+    /// `Locale::from_request_parts` reads the bundle from that extension
+    /// exclusively, and the static build drops the drained set outright, so
+    /// draining it would make translated `#[static_get]` handlers write raw
+    /// translation keys into `dist`. Only the `TypeId`s matter to the
+    /// partition.
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn static_render_partition_keeps_the_ambient_locale_layer() {
+        let ambient = crate::app::CustomLayerRegistration {
+            type_id: std::any::TypeId::of::<crate::i18n::AmbientLocaleLayer>(),
+            type_name: "ambient_locale",
+            layer: tower::util::BoxCloneSyncServiceLayer::new(axum::middleware::from_fn(
+                |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                    next.run(req).await
+                },
+            )),
+        };
+        let bundle_ext = crate::app::CustomLayerRegistration {
+            type_id: std::any::TypeId::of::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
+            type_name: "i18n_bundle_extension",
+            layer: tower::util::BoxCloneSyncServiceLayer::new(axum::middleware::from_fn(
+                |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                    next.run(req).await
+                },
+            )),
+        };
+        let (kept, drained) = partition_custom_layers_for_static_render(vec![
+            redirect_gate_registration(),
+            bundle_ext,
+            ambient,
+        ]);
+        assert_eq!(
+            kept.len(),
+            2,
+            "the ambient-locale layer and the i18n bundle extension must stay"
+        );
+        assert_eq!(kept[0].type_name, "i18n_bundle_extension");
+        assert_eq!(kept[1].type_name, "ambient_locale");
+        assert_eq!(drained.len(), 1, "the user layer must drain");
+        assert_eq!(drained[0].type_name, "redirect_gate");
+    }
+
     /// Create a minimal dist dir with `manifest.json` mapping `/` → an
     /// `index.html` containing the marker text, and return the temp handle
     /// plus the dist path.
@@ -14598,6 +15020,18 @@ pub struct TrustedHostPolicy {
     allow_any: bool,
     allow_missing_host: bool,
     probe_bypass_paths: Arc<std::collections::HashSet<String>>,
+    /// Where a hostname that no static rule matches is looked up (#2657).
+    ///
+    /// A tenant's connected hostname is never in `[security.trusted_hosts]
+    /// hosts` — that is the point of the feature — so without this the
+    /// trusted-host layer answers `400 Invalid Host header` before tenancy
+    /// resolution runs, and custom domains work only with `hosts = ["*"]`.
+    ///
+    /// Read late, not captured, because the registry is published at bind
+    /// time, after the router is built. `None` for a policy built without a
+    /// state (the MCP unit tests); an app that does not enable custom domains
+    /// publishes no registry, so the lookup finds nothing.
+    custom_domains: Option<crate::state::LateExtensions>,
 }
 
 impl TrustedHostPolicy {
@@ -14626,6 +15060,20 @@ impl TrustedHostPolicy {
             allow_any,
             allow_missing_host: !is_production,
             probe_bypass_paths: Arc::new(probe_bypass_paths),
+            custom_domains: None,
+        }
+    }
+
+    /// [`from_config`](Self::from_config), plus the app state that publishes
+    /// the custom-domain registry (#2657).
+    ///
+    /// Every ingress policy is built this way. The state is read per request,
+    /// so a domain connected — or offboarded — while the app runs takes effect
+    /// without a restart.
+    pub(crate) fn from_config_with_state(config: &AutumnConfig, state: &AppState) -> Self {
+        Self {
+            custom_domains: Some(state.late_extensions()),
+            ..Self::from_config(config)
         }
     }
 
@@ -14644,7 +15092,7 @@ impl TrustedHostPolicy {
         if self.allow_any {
             return true;
         }
-        self.rules.iter().any(|rule| {
+        let matches_rule = self.rules.iter().any(|rule| {
             rule.strip_prefix('.').map_or_else(
                 || host == rule,
                 |suffix| {
@@ -14654,6 +15102,21 @@ impl TrustedHostPolicy {
                             .is_some_and(|prefix| prefix.ends_with('.'))
                 },
             )
+        });
+        matches_rule || self.is_connected_domain(host)
+    }
+
+    /// Is `host` a tenant custom domain this deployment serves right now?
+    ///
+    /// Only after the static rules miss, so the common path stays a slice
+    /// comparison. Only a *servable* (`active`) domain passes, which is the
+    /// rule SNI already applies at the handshake: a registration stuck at
+    /// `pending_dns` must not become a way past host validation.
+    fn is_connected_domain(&self, host: &str) -> bool {
+        self.custom_domains.as_ref().is_some_and(|extensions| {
+            extensions
+                .get::<Arc<crate::custom_domain::CustomDomainRegistry>>()
+                .is_some_and(|registry| registry.is_servable(host))
         })
     }
 }

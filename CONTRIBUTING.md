@@ -54,6 +54,42 @@ changes — see CLAUDE.md "CI test sharding" for the two cases that do matter
 (renaming a `compile_fail.rs` test function, and what branch protection should
 require).
 
+## Changelog notes
+
+A release note does **not** go into `CHANGELOG.md`. It goes into its own file:
+
+```
+changelog.d/<slug>.md
+```
+
+Every PR used to write its note to the top of the `## [Unreleased]` section.
+That is the same few lines every other open PR writes to, so every PR
+conflicted with every other PR, and the conflict was never about the code. A
+fragment is a file of its own, which two PRs never both edit.
+
+A fragment holds the markdown the section holds — a `### <Kind>` heading and
+its bullets:
+
+```markdown
+### Added
+
+- **money:** typed `Money<C>` and an enforced double-entry ledger
+  (issue #1837). `Money<Usd>` plus `Money<Eur>` does not compile.
+```
+
+Write one for a change a user of the framework can see. Skip it for an
+internal refactor that changes nothing on the outside.
+
+A breaking entry keeps the `**Breaking:**` marker and links its migration
+guide, `docs/migrations/next.md`. The migration-guide gate reads the fragments
+together with the changelog, so a break without a guide fails the PR that makes
+it, not the release that ships it.
+
+`./scripts/check-changelog-fragments.sh` gates the shape, and fails a PR that
+edits `CHANGELOG.md`. `./scripts/update-changelog.sh` folds the fragments into
+the changelog when a release is cut. See
+[`changelog.d/README.md`](changelog.d/README.md).
+
 ## Generator conformance gate
 
 Autumn's headline DX promise is that `autumn new` and `autumn generate` emit
@@ -183,13 +219,20 @@ a panic there would take down the very request they exist to record), and the
 sandboxed-plugin runtime (`autumn/src/plugin_sandbox/host.rs`, `wire.rs`,
 `plugin.rs`: they run an artifact the operator explicitly did not audit, and the
 lane's whole promise is that nothing a hostile guest does can abort the host
-process). These are the files listed in the `REQUEST_PATH_MODULES` array in
+process), and the generated-UI pipeline (`autumn/src/constela/*`: it parses,
+validates, evaluates and renders a document a language model wrote, so every
+panic in it is reachable by whoever can shape that model's prompt — an
+out-of-range index there is a 500 on demand, not an injection, but just as much
+a vulnerability). These are the files listed in the `REQUEST_PATH_MODULES` array in
 `scripts/check-panic-gate.sh`, each entry carrying the Cargo feature that gates
 its `mod` declaration.
 
 **Honest scoping — the manifest is the *enforced* subset, not the whole request
-path.** The 37 modules are the files the gate enforces today, not a claim that
-they are the *only* per-request code. Other unambiguously per-request or
+path.** The modules in that array are the files the gate enforces today, not a
+claim that they are the *only* per-request code. (Stated without a count on
+purpose: the manifest grows every time a batch is audited, and a number written
+here goes stale the first time it does — `check-panic-gate.sh` prints the live
+one on every run.) Other unambiguously per-request or
 framework-owned modules are **not yet gated** and still contain production-path
 panics — known examples include `router.rs`, `etag.rs`, `security/rate_limit.rs`,
 `security/headers.rs`, `sse.rs`, and the `csrf` / `negotiate` / `range` /

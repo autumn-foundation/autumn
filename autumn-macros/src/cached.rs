@@ -1104,7 +1104,7 @@ mod tests {
         // The repository is recorded as a PATH, not as a guessed model name:
         // the model comes from the repository's own `__AUTUMN_MODEL_NAME`.
         assert_eq!(derived_repositories(&f), vec!["PgPostRepository"]);
-        assert!(derived_models(&f).is_empty());
+        assert_eq!(derived_models(&f), [] as [String; 0]);
         assert!(!derive_dependencies(&f).unresolved_repository);
     }
 
@@ -1182,7 +1182,7 @@ mod tests {
             }
         };
         assert_eq!(derived_models(&f), vec!["Post".to_string()]);
-        assert!(derived_repositories(&f).is_empty());
+        assert_eq!(derived_repositories(&f), [] as [String; 0]);
     }
 
     #[test]

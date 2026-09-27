@@ -521,6 +521,7 @@ malformed annotation, or a grant key it will not silently drop.
 | `agent_authority_outbound_alias_dynamic_url` | `named("stripe").post(&url)` with a URL the analysis cannot read | `macro` — an alias names the *host*, so it cannot rescue an unreadable path; refused with or without one |
 | `agent_authority_job_not_listed` | free-function `enqueue("wire_transfer", …)` | `E0080` — a job outlives its request, so it is part of the envelope |
 | `agent_authority_opaque_helper` | helper handed a tracked handle | `macro` — never assumed effect-free; names the hatch |
+| `agent_authority_lazy_db_checkout_opaque_helper` | helper handed the `Db` from `LazyDb::checkout()` | `macro` — the checked-out `Db` is tracked exactly like a plain `Db` parameter (#2264) |
 | `agent_authority_opaque_associated_helper` | `Billing::wipe(&repo)` | `macro` — an uppercase path is not framework surface; the helper can write what the grant refuses |
 | `agent_authority_bad_attr` | `#[agent_operable]` with no `grant = ...` | `macro` — one diagnostic, and no marker for a grant never named |
 | `agent_authority_blank_effect_reason` | `#[agent_effect(none, reason = "   ")]` | `macro` — the reason is what makes the assertion reviewable |

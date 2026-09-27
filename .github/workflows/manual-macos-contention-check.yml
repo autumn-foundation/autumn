@@ -29,7 +29,16 @@ jobs:
   # https://docs.github.com/en/actions/learn-github-actions/contexts#context-availability.
   # Compute the exact-length matrix here instead, so choosing 5 samples
   # dispatches 5 fresh VMs, not 20 with 15 short-circuited.
+  #
+  # #2594: this workflow is dispatch-only, but GitHub records a failed run on
+  # every push (the `plan` step then has no `inputs` to evaluate and exits 1).
+  # Guard on the event so anything but a manual dispatch skips cleanly instead
+  # of failing — and, more importantly, can never reach the `macos-latest`
+  # steps below and burn real macOS minutes unasked. The root cause (why a
+  # dispatch-only workflow is evaluated on push at all — likely an org-level
+  # required-workflow configuration) still wants a look in org settings.
   plan:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
@@ -50,6 +59,9 @@ jobs:
 
   # Job id must stay "test" to reuse ci.yml's cache entry.
   test:
+    # #2594: belt-and-braces with the `plan` guard above — this job must never
+    # run except on a manual dispatch.
+    if: github.event_name == 'workflow_dispatch'
     needs: plan
     strategy:
       fail-fast: false

@@ -20,15 +20,20 @@ MSYS, no Git Bash required.
 | `autumn setup` | Downloads the checksum-verified `tailwindcss-windows-x64.exe`. |
 | `autumn dev` | Edit/rebuild/reload works natively; the reload stops the app cooperatively so shutdown hooks (managed Postgres teardown) run. |
 | `autumn test` | Delegates to `cargo test`, which is first-class on Windows. |
-| `autumn serve (foreground)` | Builds and runs the app in the foreground, binding TCP per config. |
-| `managed Postgres` | Boots and shuts down cleanly under `autumn dev` and a direct binary run. Note `autumn serve --bundled-pg` implies `--daemon`, so *that* entry point is Tier 2. |
+| `autumn serve (foreground)` | Builds and runs the app in the foreground, binding TCP per config. A console-control stop (a supervisor, or Windows shutting down) drains it the way SIGTERM does on Unix. |
+| `autumn serve --daemon / stop / status / restart` | Runs natively (#1639). The daemon binds its configured TCP address and records it in `serve.addr`; `stop` drains cooperatively before force-killing. State lives under `%LOCALAPPDATA%`. |
+| `autumn serve install-service / uninstall-service` | Registers the daemon as a Windows service that starts at boot and restarts after a crash. Needs an elevated (Administrator) shell, like any service registration. |
+| `managed Postgres` | Boots and shuts down cleanly under `autumn dev`, `autumn serve --daemon` and a direct binary run. |
 | `autumn deploy check / plan` | Local-only: `plan` renders the unit and step list, `check` grades the config and probes SSH reachability with a portable TCP connect. Validate a deploy config here before running it from WSL2. |
 
 Tier 1 is a **gate, not an aspiration**: `.github/workflows/ci.yml` runs a
 `windows-tier1` job on `windows-latest` that walks the whole journey — scaffold
 → `doctor` → `setup` → a dev-loop edit/rebuild/reload → managed Postgres boot
-and clean shutdown — on every pull request into `trunk-dev`. If a change breaks
-a Tier 1 command on Windows, that job goes red before the change merges.
+and clean shutdown → the daemon lifecycle (start, status, a served request, a
+graceful stop that completes an in-flight request, restart) → service
+registration, crash restart and removal — on every pull request into
+`trunk-dev`. If a change breaks a Tier 1 command on Windows, that job goes red
+before the change merges.
 
 ### Four Windows details worth knowing
 
@@ -68,12 +73,11 @@ rustflags = ["-Clink-arg=/DEBUG:LongSymbolTruncate"]
 
 ### Three other Windows details worth knowing
 
-**Managed Postgres has two native entry points, and one that is not.**
-`autumn dev` and running the built binary directly both boot and cleanly stop a
-managed cluster on native Windows. `autumn serve --bundled-pg` does not, because
-`--bundled-pg` implies `--daemon` — and the daemon lifecycle is Tier 2. Use
-`autumn dev` on Windows, or run the daemon under WSL2. The cluster's data dir
-resolves under `%LOCALAPPDATA%` unless you set `AUTUMN_MANAGED_PG_DATA_DIR`.
+**Managed Postgres boots and stops cleanly through every native entry point.**
+`autumn dev`, `autumn serve --bundled-pg` (which implies `--daemon`) and running
+the built binary directly all provision the cluster and shut it down through the
+app's `on_shutdown` hook. The cluster's data dir resolves under `%LOCALAPPDATA%`
+unless you set `AUTUMN_MANAGED_PG_DATA_DIR`.
 
 **`autumn new` writes `config/master.key` without an owner-only mode.** On Unix
 the scaffolder creates it `0600`; Windows has no equivalent in that code path
@@ -109,13 +113,12 @@ saying the hooks may not have run.** Degraded, but never silent.
 
 ## Tier 2 — supported via WSL2
 
-These are built on Unix primitives — domain sockets, POSIX signals, `ssh`, file
-modes, bash. On native Windows they **fail fast** with an error naming this
-policy; they are fully supported inside [WSL2](https://learn.microsoft.com/windows/wsl/install).
+These are built on Unix primitives — `ssh`, file modes, bash. On native Windows
+they **fail fast** with an error naming this policy; they are fully supported
+inside [WSL2](https://learn.microsoft.com/windows/wsl/install).
 
 | Command | Why, and what to do |
 | --- | --- |
-| `autumn serve --daemon / stop / status / restart` | The daemon lifecycle is built on Unix domain sockets and POSIX signals; run it inside WSL2. |
 | `autumn deploy up / rollback / status / maintenance` | These reach the host over `ssh`/`sh`, and `up`/`rollback`/`maintenance` stage secrets with Unix file modes; run them inside WSL2. |
 | `scripts/*.sh contributor gates` | The contributor gate scripts are bash; run them inside WSL2. |
 | `SystemTest browser tests` | Chromium version probing is satisfied by file existence on Windows (#1456); the browser suites themselves are gated behind the `system-tests` feature and are exercised on Linux. |
@@ -131,15 +134,20 @@ command there. Foreground `autumn serve` and the whole Tier 1 journey keep
 working natively on the Windows side either way — WSL2 is an addition, not a
 migration.
 
-### Why the daemon is not ported
+### The daemon used to be here
 
-`autumn serve --daemon` supervises the app through a Unix domain control socket
-and POSIX signals, with process groups for reaping supervised children. Windows
-has analogues — named pipes, job objects, Windows Services — but adopting them
-is a different lifecycle model, not a port; [the daemon guide](./daemon.md)
-already places Windows Service registration out of scope for the same reason.
-WSL2 gives Windows developers the exact Linux behaviour the daemon is designed
-against, which is also the environment it runs in when deployed.
+Until #1639 the daemon lifecycle was Tier 2, on the grounds that it is built on
+Unix domain sockets and POSIX signals. WSL2 was a fine answer for a *developer*
+and a poor one for an *operator*: it is unavailable or prohibited on many
+Windows Server installs, and it gives no boot-time start and no crash
+supervision.
+
+It is now Tier 1, with the same observable contract on both platforms and a
+`windows-latest` CI job that walks it end to end. The differences are the ones
+the platforms force, and they are documented in
+[the daemon guide](./daemon.md#windows): a Windows daemon binds its configured
+TCP address rather than a Unix socket, `stop` requests the drain through a file
+rather than `SIGTERM`, and state is protected by an ACL rather than `0600`.
 
 ## `autumn doctor` tells you where you stand
 
@@ -148,8 +156,9 @@ tiers by command name and flags the platform-specific prerequisites:
 
 ```text
 ✓ platform_support — windows: Tier 1 (native) — autumn new, autumn doctor, ...
-                     Tier 2 (WSL2), run these from a WSL2 shell — autumn serve
-                     --daemon / stop / status / restart, ... Prerequisites:
+                     autumn serve --daemon / stop / status / restart, ...
+                     Tier 2 (WSL2), run these from a WSL2 shell — autumn deploy
+                     up / rollback / status / maintenance, ... Prerequisites:
                      autumn generate auth --passkeys needs OpenSSL via vcpkg
                      with VCPKG_ROOT set ... Policy: docs/guide/platform-support.md
 ```
@@ -166,6 +175,11 @@ check passes too, noting simply that every journey is native.
 - **`autumn generate auth --passkeys`** needs OpenSSL. On Windows install it
   through `vcpkg` and set `VCPKG_ROOT` so the build can find it — see
   [the generators guide](./generators.md).
+- **`autumn serve install-service` / `uninstall-service`** need an elevated
+  (Administrator) shell, like any Windows service registration. `autumn doctor`'s
+  `daemon_service` check says so when the shell you are in cannot register one —
+  and also reports whether a daemon or a registered service is currently running
+  for this project.
 
 ## Known issues and their tiers
 
@@ -186,8 +200,6 @@ check passes too, noting simply that every journey is native.
 
 ## Out of scope
 
-- Native Windows daemon lifecycle or Windows Service registration — WSL2 is
-  the answer for that slice.
 - Rewriting the bash contributor gate scripts in `scripts/` — contributor
   tooling stays Tier 2.
 - Windows as a **production deploy target**. Autumn deploys to Linux servers.

@@ -205,7 +205,92 @@ pub enum TlsError {
         /// Underlying rustls error.
         source: rustls::Error,
     },
+    /// The mTLS client-CA bundle could not be read (issue #1640).
+    #[error("failed to read the mTLS client CA bundle `{path}`: {source}")]
+    ReadClientCa {
+        /// Path that failed to read.
+        path: PathBuf,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+    /// The mTLS client-CA bundle is not parseable PEM.
+    #[error("failed to parse a PEM certificate in the mTLS client CA bundle `{path}`: {source}")]
+    ParseClientCa {
+        /// Path whose PEM failed to parse.
+        path: PathBuf,
+        /// Underlying PEM parse error.
+        source: rustls_pki_types::pem::Error,
+    },
+    /// The mTLS client-CA bundle contains no certificate.
+    #[error(
+        "no CAs found in the mTLS client CA bundle `{path}` (expected at least one PEM \
+         CERTIFICATE block)"
+    )]
+    NoClientCas {
+        /// Path that contained no certificate.
+        path: PathBuf,
+    },
+    /// A certificate in the bundle (at 1-based `position`) is not usable as a
+    /// trust anchor.
+    #[error(
+        "CA #{position} in the mTLS client CA bundle `{path}` is not a valid trust anchor: {source}"
+    )]
+    InvalidClientCa {
+        /// Bundle path.
+        path: PathBuf,
+        /// 1-based position of the offending certificate in the bundle.
+        position: usize,
+        /// Underlying rustls error.
+        source: Box<rustls::Error>,
+    },
+    /// The mTLS revocation list could not be read.
+    #[error("failed to read the mTLS revocation list `{path}`: {source}")]
+    ReadCrl {
+        /// Path that failed to read.
+        path: PathBuf,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+    /// The mTLS revocation list is not parseable PEM.
+    #[error("failed to parse a PEM block in the mTLS revocation list `{path}`: {source}")]
+    ParseCrl {
+        /// Path whose PEM failed to parse.
+        path: PathBuf,
+        /// Underlying PEM parse error.
+        source: rustls_pki_types::pem::Error,
+    },
+    /// The mTLS revocation list contains no CRL.
+    #[error("no revocation list found in `{path}` (expected at least one PEM X509 CRL block)")]
+    NoCrls {
+        /// Path that contained no CRL.
+        path: PathBuf,
+    },
+    /// A CRL in the file (at 1-based `position`) is not valid DER.
+    #[error("CRL #{position} in `{path}` is malformed: {detail}")]
+    ParseCrlDer {
+        /// Revocation-list path.
+        path: PathBuf,
+        /// 1-based position of the offending CRL in the file.
+        position: usize,
+        /// Human-readable parse detail.
+        detail: String,
+    },
+    /// Building the rustls client-certificate verifier failed.
+    #[error("failed to build the mTLS client certificate verifier: {source}")]
+    BuildClientVerifier {
+        /// Underlying rustls error.
+        source: rustls::server::VerifierBuilderError,
+    },
+    /// A verified peer certificate could not be parsed into an identity.
+    #[error("failed to parse the verified client certificate: {detail}")]
+    ParsePeerCert {
+        /// Human-readable parse detail.
+        detail: String,
+    },
 }
+
+/// Mutual-TLS client-certificate verification (issue #1640).
+pub mod client_auth;
 
 /// The `ring` crypto provider used for all inbound TLS. Built once per call;
 /// callers that build many configs should cache the returned `Arc`.
@@ -451,6 +536,9 @@ impl ResolvesServerCert for ReloadableCertResolver {
 /// Build the rustls [`ServerConfig`](rustls::ServerConfig) that terminates
 /// inbound TLS, backed by `resolver` so the certificate stays swappable.
 ///
+/// Advertises ALPN `[b"h2", b"http/1.1"]` (#2321) so browsers negotiate
+/// HTTP/2; ALPN-less and http/1.1-only clients are unaffected.
+///
 /// # Errors
 ///
 /// Returns [`TlsError::BuildConfig`] if rustls rejects the chosen protocol
@@ -466,7 +554,8 @@ pub fn build_server_config(
 ///
 /// The custom-domain path (#1635) serves a per-SNI resolver rather than the
 /// single swappable certificate, so the listener takes the resolver as a trait
-/// object; everything else about the config is identical.
+/// object; everything else about the config is identical — including the
+/// ALPN `[b"h2", b"http/1.1"]` advertisement (#2321).
 ///
 /// # Errors
 ///
@@ -476,12 +565,111 @@ pub fn build_server_config_with_resolver(
     provider: Arc<CryptoProvider>,
     resolver: Arc<dyn ResolvesServerCert>,
 ) -> Result<Arc<rustls::ServerConfig>, TlsError> {
-    let config = rustls::ServerConfig::builder_with_provider(provider)
+    build_server_config_with_client_auth(provider, resolver, None)
+}
+
+/// [`build_server_config_with_resolver`], additionally verifying client
+/// certificates against `client_verifier` (issue #1640).
+///
+/// `None` takes the identical `with_no_client_auth()` path as before, so a
+/// deployment with no `[server.tls.client_auth]` section handshakes exactly as
+/// it did under #1603 — apart from the ALPN `[b"h2", b"http/1.1"]`
+/// advertisement (#2321), which both arms set identically.
+///
+/// # Errors
+///
+/// Returns [`TlsError::BuildConfig`] if rustls rejects the chosen protocol
+/// versions for the provider.
+pub fn build_server_config_with_client_auth(
+    provider: Arc<CryptoProvider>,
+    resolver: Arc<dyn ResolvesServerCert>,
+    client_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+) -> Result<Arc<rustls::ServerConfig>, TlsError> {
+    let builder = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .map_err(|source| TlsError::BuildConfig { source })?
-        .with_no_client_auth()
-        .with_cert_resolver(resolver);
+        .map_err(|source| TlsError::BuildConfig { source })?;
+    let mut config = match client_verifier {
+        Some(verifier) => {
+            let mut config = builder
+                .with_client_cert_verifier(verifier)
+                .with_cert_resolver(resolver);
+            // Turn OFF session resumption for a client-authenticating listener.
+            //
+            // rustls restores a resumed connection's `peer_certificates` from
+            // the stored session and never calls the verifier again
+            // (`server/tls13.rs`, `server/tls12.rs`). So a client whose CA was
+            // rotated out — or whose certificate was just added to the CRL —
+            // would keep reconnecting on a resumed session until it expired,
+            // and would keep presenting a verified-looking identity to
+            // handlers. That is the one hole a swap-the-verifier design cannot
+            // close by swapping, because the check it swaps is not run.
+            //
+            // The cost is a full handshake per connection, which is the right
+            // trade for a listener whose whole purpose is deciding who may
+            // connect. Server-only TLS keeps resumption untouched.
+            config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+            config.send_tls13_tickets = 0;
+            config
+        }
+        None => builder.with_no_client_auth().with_cert_resolver(resolver),
+    };
+    // Advertise ALPN (#2321). Without an `alpn_protocols` list rustls
+    // completes the handshake with no protocol selected, so a browser (or
+    // `curl --http2`) never sends the HTTP/2 preface and the serve path's
+    // h2 half — `hyper_util::server::conn::auto` already speaks it — stays
+    // dead code in practice. `h2` first, then `http/1.1`: ALPN-less and
+    // http/1.1-only clients are unaffected, and a client offering only `h2`
+    // negotiates it. Both TLS modes funnel through here (static
+    // `[server.tls]` and the ACME path, #1608), as do both client-auth arms
+    // above, so the advertisement is identical everywhere.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(Arc::new(config))
+}
+
+/// Connection info for a request served over the mTLS-capable HTTPS listener
+/// (issue #1640).
+///
+/// axum's `into_make_service_with_connect_info::<C>` requires `C:
+/// Connected<IncomingStream>`; this carries the peer `SocketAddr` — so the rest
+/// of the serve stack behaves exactly as on plain TCP — plus the verified
+/// client identity, when the handshake produced one.
+///
+/// The identity is parsed once per *connection*, not per request.
+#[derive(Clone, Debug)]
+pub struct TlsConnectInfo {
+    /// The peer's TCP address, identical to the plain-TCP path's connect info.
+    pub peer: std::net::SocketAddr,
+    /// The verified client identity, when the peer presented a certificate that
+    /// passed verification. Always `None` on a listener with client auth off.
+    pub client: Option<Arc<client_auth::ClientIdentity>>,
+}
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TlsListener>>
+    for TlsConnectInfo
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, TlsListener>) -> Self {
+        let peer = *stream.remote_addr();
+        // rustls exposes the peer chain only after a successful handshake, so
+        // anything here has already passed the configured verifier — the parse
+        // turns a verified certificate into a usable identity, it does not
+        // decide trust.
+        let client = stream
+            .io()
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(<[rustls_pki_types::CertificateDer<'_>]>::first)
+            .and_then(|leaf| match client_auth::ClientIdentity::from_der(leaf) {
+                Ok(identity) => Some(Arc::new(identity)),
+                Err(e) => {
+                    // Verified but unparseable: drop the identity rather than
+                    // fabricate one. Routes that require mTLS then reject.
+                    tracing::warn!(peer = %peer, error = %e, "could not parse the verified client certificate");
+                    None
+                }
+            });
+        Self { peer, client }
+    }
 }
 
 /// Upper bound on TLS handshakes running concurrently at any instant.
@@ -639,11 +827,17 @@ async fn run_acceptor(
                     let _ = tx.send((tls, peer)).await;
                 }
                 Ok(Err(e)) => {
-                    tracing::debug!(
-                        peer = %peer,
-                        error = %e,
-                        "TLS handshake failed; dropping connection"
-                    );
+                    // An mTLS client-certificate rejection is an operator-facing
+                    // event: counted by reason and logged at warn, rate-limited
+                    // (#1640). Everything else keeps #1603's quiet debug line.
+                    // The client sees only the standard TLS alert either way.
+                    if !client_auth::record_handshake_rejection(&e, peer) {
+                        tracing::debug!(
+                            peer = %peer,
+                            error = %e,
+                            "TLS handshake failed; dropping connection"
+                        );
+                    }
                 }
                 Err(_elapsed) => {
                     tracing::debug!(peer = %peer, "TLS handshake timed out");
@@ -1294,5 +1488,100 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         let second = load_certified_key(&cert, &key, &provider, now()).unwrap();
         resolver.store(Arc::clone(&second));
         assert!(Arc::ptr_eq(&resolver.current(), &second));
+    }
+
+    // Regression (#2321): `build_server_config` never set `alpn_protocols`,
+    // so rustls completed the handshake with no protocol selected and every
+    // browser silently fell back to HTTP/1.1 — even though the serve path's
+    // `hyper_util::server::conn::auto` already speaks h2 once the client
+    // sends the preface. The fix advertises `h2` first, then `http/1.1`:
+    // ALPN-less and http/1.1-only clients are unaffected.
+    #[test]
+    fn server_config_advertises_h2_then_http11_alpn() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = write_temp(dir.path(), "c.pem", CERT_PEM);
+        let key = write_temp(dir.path(), "k.pem", KEY_PEM);
+        let provider = crypto_provider();
+        let certified = load_certified_key(&cert, &key, &provider, now()).unwrap();
+        let config =
+            build_server_config(provider, Arc::new(ReloadableCertResolver::new(certified)))
+                .expect("server config builds");
+        assert_eq!(
+            config.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            "the static [server.tls] path must advertise h2 first, then http/1.1"
+        );
+    }
+
+    // The ACME path (#1608) funnels through `build_server_config_with_resolver`
+    // and the client-auth path (#1640) takes a different `match` arm, so pin
+    // the ALPN on both entry points rather than assuming the shared funnel.
+    #[test]
+    fn server_config_with_resolver_and_client_auth_advertise_the_same_alpn() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = write_temp(dir.path(), "c.pem", CERT_PEM);
+        let key = write_temp(dir.path(), "k.pem", KEY_PEM);
+        let provider = crypto_provider();
+        let certified = load_certified_key(&cert, &key, &provider, now()).unwrap();
+        let expected = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        let via_resolver = build_server_config_with_resolver(
+            Arc::clone(&provider),
+            Arc::new(ReloadableCertResolver::new(Arc::clone(&certified)))
+                as Arc<dyn ResolvesServerCert>,
+        )
+        .expect("resolver config builds");
+        assert_eq!(
+            via_resolver.alpn_protocols, expected,
+            "the resolver (ACME) entry point must advertise the same ALPN"
+        );
+
+        // rustls refuses to build a client verifier with zero trust anchors
+        // (`NoRootAnchors`) even in `Optional` mode, so load the client CA
+        // fixture instead of an empty store — the anchors are irrelevant to
+        // the ALPN assertion below; only the `Some(verifier)` arm matters.
+        let ca = write_temp(
+            dir.path(),
+            "ca.pem",
+            include_str!("../tests/fixtures/tls/client/ca.cert.pem"),
+        );
+        let verifier = client_auth::build_client_verifier(
+            client_auth::load_client_roots(&ca).expect("client roots load"),
+            vec![],
+            crate::config::ClientAuthMode::Optional,
+            Arc::clone(&provider),
+        )
+        .expect("client verifier builds");
+        let via_client_auth = build_server_config_with_client_auth(
+            provider,
+            Arc::new(ReloadableCertResolver::new(certified)) as Arc<dyn ResolvesServerCert>,
+            Some(verifier),
+        )
+        .expect("client-auth config builds");
+        assert_eq!(
+            via_client_auth.alpn_protocols, expected,
+            "the client-auth arm must advertise the same ALPN"
+        );
+    }
+
+    // Regression (Codex P1 on PR #2780): advertising `h2` in ALPN is only
+    // safe while the serve stack can actually speak HTTP/2. `axum::serve`
+    // runs every connection through
+    // `hyper_util::server::conn::auto::Builder`, whose H2 arm is compiled
+    // out unless hyper-util's `http2` feature is enabled (via `axum/http2`
+    // in the workspace Cargo.toml). Without it, a client that negotiates
+    // `h2` gets "HTTP/2 is not supported" and the connection dies instead
+    // of serving — the advertisement becomes a breakage, not an upgrade.
+    //
+    // `Builder::http2()` exists only under hyper-util's `http2` feature,
+    // so this test fails to COMPILE if the feature is ever dropped: that is
+    // the point. The dev-dependency deliberately does not enable `http2`
+    // itself (see the workspace Cargo.toml), so only `axum/http2` keeps
+    // this green.
+    #[test]
+    fn serve_stack_speaks_http2() {
+        let mut builder =
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+        let _ = builder.http2();
     }
 }

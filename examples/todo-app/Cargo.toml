@@ -6,7 +6,7 @@ publish = false
 default-run = "todo-app"
 
 [[bin]]
-name = "seed"
+name = "todo-app-seed"
 path = "src/bin/seed.rs"
 
 [features]
