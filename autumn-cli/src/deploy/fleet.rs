@@ -1193,10 +1193,10 @@ pub(crate) const DRIFT_PROXY_PORT_MISMATCH: &str =
 /// State drift: this host claims a promoted release its `current` symlink could
 /// not be resolved to (issue #1621, review round 2).
 ///
-/// The probe shell tests `[ -L current ]`, which succeeds for a symlink whose
-/// target cannot be canonicalized, so such a host reports `HostMode::Redeploy`
-/// while `readlink -f` yields nothing and the release reads back
-/// [`ReleaseId::Unknown`]. That combination is not "we have not looked" — it is a
+/// The probe shell tests `[ -L current ]`, which also succeeds for a dangling
+/// symlink, so such a host reports `HostMode::Redeploy`. The probe names a
+/// release only when `current` resolves to a directory directly in `releases/`
+/// (#2277), so the release reads back [`ReleaseId::Unknown`]. That combination is not "we have not looked" — it is a
 /// host that says it is serving a release nobody can name, which is exactly the
 /// unprovable state this feature fails closed on.
 ///
@@ -1206,7 +1206,7 @@ pub(crate) const DRIFT_PROXY_PORT_MISMATCH: &str =
 /// host records an unresolvable directory as its rollback target — the rollback
 /// then refuses (`probe_rollback_target_dir` fails closed) instead of working.
 pub(crate) const DRIFT_RELEASE_UNREADABLE: &str = "this host has a `current` symlink but the release it points at could not be read (a broken \
-     symlink or a missing releases dir) — repair it before the next deploy, which would record \
+     symlink, a target outside the releases dir, or a missing releases dir) — repair it before the next deploy, which would record \
      that unresolvable target as this host's rollback point";
 
 /// State drift: this host's live slot unit could not be read, so the CLI cannot
@@ -3844,9 +3844,9 @@ mod tests {
 
     #[test]
     fn a_deployed_host_whose_release_is_unreadable_is_state_drift() {
-        // #1621 review round 2. `[ -L current ]` succeeds for a symlink whose target
-        // cannot be canonicalized, so such a host reports `Redeploy` while `readlink
-        // -f` yields nothing and the release reads back `Unknown`. That combination
+        // #1621 review round 2. `[ -L current ]` succeeds for a dangling symlink, so
+        // such a host reports `Redeploy` while the probe names no release (#2277)
+        // and the release reads back `Unknown`. That combination
         // used to produce ONLY the footer line explicitly labelled "reported, not
         // counted as drift", so `deploy status --strict` exited 0 on a host with
         // actionable marker damage — and the next deploy's `commit-markers` copies

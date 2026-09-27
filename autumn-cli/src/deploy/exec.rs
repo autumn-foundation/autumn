@@ -2384,8 +2384,9 @@ pub struct DeployProbe {
     /// The release dir the host's `current` symlink resolves to (#1621, AC-6); its
     /// basename is the deployed release id ([`release_id_from_dir`]).
     ///
-    /// `None` when the symlink is absent, dangling, or the probe output predates
-    /// this section — reported as "unknown", never guessed. `deploy status` and the
+    /// `None` when the symlink is absent or dangling, when its target is not a
+    /// directory directly in `releases/` (#2277), or when the probe output
+    /// predates this section. It is "unknown", never guessed. `deploy status` and the
     /// fleet `maintenance` fan-out read it; the rollout path ignores it.
     pub current_release_dir: Option<String>,
 }
@@ -2473,6 +2474,9 @@ pub fn probe_deploy_state(
     cfg: &ResolvedDeployConfig,
     exec: &impl DeployExecutor,
 ) -> Result<DeployProbe, DeployExecError> {
+    // The last section prints `current`'s target only when it is a directory
+    // directly in `releases/`. GNU `readlink -f` also resolves a dangling link
+    // (#2277), so the result must be checked.
     let shell = format!(
         "if [ -L {current} ]; then printf 'redeploy:'; cat {marker} 2>/dev/null || printf '{blue}'; \
          else printf 'first'; fi; \
@@ -2484,8 +2488,10 @@ pub fn probe_deploy_state(
          printf '\\n{opts_delim}\\n'; \
          cat {opts_marker} 2>/dev/null || true; \
          printf '\\n{current_delim}\\n'; \
-         readlink -f {current} 2>/dev/null || true",
+         d=$(readlink -f {current} 2>/dev/null) && r=$(readlink -f {releases} 2>/dev/null) \
+         && [ -d \"$d\" ] && [ \"${{d%/*}}\" = \"$r\" ] && printf '%s' \"$d\" || true",
         current = shell_quote(&cfg.current_symlink()),
+        releases = shell_quote(&cfg.releases_dir()),
         marker = shell_quote(&live_slot_marker(cfg)),
         blue = SLOT_BLUE,
         delim = PROXY_LIST_DELIM,
@@ -6828,6 +6834,156 @@ mod tests {
             probe.current_release_dir.is_none(),
             "an empty current section is unknown, not an empty release id"
         );
+    }
+
+    /// Run the real `detect-current` shell against a local `app_dir` and parse
+    /// its output (#2277).
+    #[cfg(target_os = "linux")]
+    fn probe_local_app_dir(app_dir: &Path) -> (ResolvedDeployConfig, DeployProbe) {
+        let mut cfg = resolved();
+        cfg.app_dir = app_dir.to_str().expect("utf-8 temp dir").to_owned();
+        let render = RecordingExecutor::new();
+        probe_deploy_state(&cfg, &render).expect("probe renders");
+        let shell = render.shell_for("detect-current").expect("probe ran");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&shell)
+            .output()
+            .expect("run probe shell");
+        assert!(
+            out.status.success(),
+            "probe shell must not fail: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+        let replay = RecordingExecutor::new().with_stdout("detect-current", stdout);
+        let probe = probe_deploy_state(&cfg, &replay).expect("probe parses");
+        (cfg, probe)
+    }
+
+    /// Make `{root}/{name}` with `releases/r1` (a dir) and `releases/file` (a
+    /// file), and link `current` to `target`.
+    #[cfg(target_os = "linux")]
+    fn app_dir_with_current(root: &Path, name: &str, target: &Path) -> std::path::PathBuf {
+        let app = root.join(name);
+        std::fs::create_dir_all(app.join("releases/r1")).expect("mk release");
+        std::fs::write(app.join("releases/file"), b"").expect("mk file");
+        std::os::unix::fs::symlink(target, app.join("current")).expect("link current");
+        app
+    }
+
+    // Linux-only: it runs the probe shell with GNU `readlink -f` and makes
+    // symlinks with `std::os::unix::fs`. The deploy target is Ubuntu.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_names_a_release_only_when_current_resolves_to_a_release_dir() {
+        // #2277: `readlink -f` resolves a dangling link, so the probe named a
+        // release that is not installed. Only a dir directly in `releases/` is a
+        // release. Mode detection must not change.
+        let tree = tempfile::tempdir().expect("temp dir");
+        let root = tree.path();
+        let outside = root.join("outside/r9");
+        std::fs::create_dir_all(&outside).expect("mk outside dir");
+
+        let rows: [(&str, &Path, Option<&str>); 6] = [
+            ("relative", Path::new("releases/r1"), Some("r1")),
+            ("dangling", Path::new("releases/gone"), None),
+            ("outside", &outside, None),
+            ("file", Path::new("releases/file"), None),
+            ("releases-root", Path::new("releases"), None),
+            ("nested", Path::new("releases/r1/."), Some("r1")),
+        ];
+        for (name, target, want) in rows {
+            let (_, probe) = probe_local_app_dir(&app_dir_with_current(root, name, target));
+            assert!(
+                matches!(probe.mode, DeployMode::Redeploy { .. }),
+                "{name}: `[ -L current ]` still decides the mode"
+            );
+            assert_eq!(
+                probe
+                    .current_release_dir
+                    .as_deref()
+                    .and_then(release_id_from_dir),
+                want,
+                "{name}: {:?}",
+                probe.current_release_dir
+            );
+        }
+
+        // An absolute link into the tree resolves.
+        let abs = root.join("absolute");
+        let (_, probe) = probe_local_app_dir(&app_dir_with_current(
+            root,
+            "absolute",
+            &abs.join("releases/r1"),
+        ));
+        assert_eq!(
+            probe
+                .current_release_dir
+                .as_deref()
+                .and_then(release_id_from_dir),
+            Some("r1")
+        );
+
+        // A symlinked `app_dir` is not drift: both sides resolve the same way.
+        let real = app_dir_with_current(root, "real", Path::new("releases/r1"));
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).expect("link app dir");
+        let (_, probe) = probe_local_app_dir(&alias);
+        assert_eq!(
+            probe
+                .current_release_dir
+                .as_deref()
+                .and_then(release_id_from_dir),
+            Some("r1"),
+            "a symlinked app dir still names its release"
+        );
+
+        // A symlinked `releases/` dir is not drift either.
+        let store = root.join("store");
+        std::fs::create_dir_all(store.join("r2")).expect("mk store release");
+        let linked = root.join("linked");
+        std::fs::create_dir_all(&linked).expect("mk app dir");
+        std::os::unix::fs::symlink(&store, linked.join("releases")).expect("link releases");
+        std::os::unix::fs::symlink("releases/r2", linked.join("current")).expect("link current");
+        let (_, probe) = probe_local_app_dir(&linked);
+        assert_eq!(
+            probe
+                .current_release_dir
+                .as_deref()
+                .and_then(release_id_from_dir),
+            Some("r2"),
+            "a symlinked releases dir still names its release"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dangling_current_is_state_drift_end_to_end() {
+        // #2277: probe shell → `HostStatus` → `fleet_drift`. A dangling `current`
+        // must be `DRIFT_RELEASE_UNREADABLE`, so `deploy status --strict` fails.
+        use super::super::fleet::{DRIFT_RELEASE_UNREADABLE, HostStatus, ReleaseId, fleet_drift};
+
+        let tree = tempfile::tempdir().expect("temp dir");
+        let app = app_dir_with_current(tree.path(), "app", Path::new("releases/gone"));
+        let (cfg, deploy) = probe_local_app_dir(&app);
+        let probe = HostStatusProbe {
+            deploy,
+            ready_code: Some(200),
+            shared_maintenance_flag: false,
+            maintenance: MaintenanceStatus::Off,
+            maintenance_flag_source: MaintenanceFlagSource::Shared,
+            last_deploy: None,
+        };
+        let status = HostStatus::from_probe(&cfg, 3000, &probe);
+        assert_eq!(status.release, ReleaseId::Unknown, "no release is named");
+
+        let report = fleet_drift(&[status]);
+        assert_eq!(
+            report.state_drift,
+            vec![("203.0.113.10".to_owned(), DRIFT_RELEASE_UNREADABLE)]
+        );
+        assert!(report.drifted(), "`--strict` must exit non-zero");
     }
 
     /// Full five-section `detect-current` stdout for a redeploy host on `release`.

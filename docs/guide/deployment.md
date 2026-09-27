@@ -1067,7 +1067,8 @@ Two kinds of drift are reported, and they are deliberately separate:
   marker is unreadable (the next deploy of that host will refuse); the installed
   proxy unit binds a different public port than `[server] port` configures; no
   release is deployed on this host while the rest of the fleet is serving one;
-  the host has a `current` symlink but the release behind it could not be read;
+  the host has a `current` symlink but the release behind it could not be read
+  (the link is dangling, or its target is not a directory in `releases/`);
   and the two maintenance-probe reasons —
 
   - `the live slot unit could not be read, so which maintenance flag file this
