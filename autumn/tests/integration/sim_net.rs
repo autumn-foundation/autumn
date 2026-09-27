@@ -185,3 +185,25 @@ async fn sim_net_reaches_clients_built_in_state_initializers(mut sim: Sim) {
     );
     assert_eq!(call(&sim, "/pay-stored").await, "ok: charged");
 }
+
+#[sim_test]
+async fn sim_net_latency_past_the_request_timeout_is_a_timeout(mut sim: Sim) {
+    // The default request timeout is 30 s, below this 60 s latency.
+    let net = SimNet::new()
+        .host("payments", payments())
+        .latency(Duration::from_secs(60), Duration::from_secs(60));
+    sim.net(net.clone());
+    sim.build(TestApp::new().routes(routes![pay]));
+    let body = call(&sim, "/pay").await;
+    assert!(body.contains("timed out"), "{body}");
+    let events = net.events();
+    assert!(!events.is_empty());
+    for event in &events {
+        assert_eq!(event.fault, NetFault::TimedOut, "{events:?}");
+        assert_eq!(
+            event.latency,
+            Duration::from_secs(30),
+            "the time that passed"
+        );
+    }
+}

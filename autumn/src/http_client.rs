@@ -2161,7 +2161,7 @@ impl RequestBuilder {
         host: &str,
         url: &reqwest::Url,
     ) -> Result<Response, SimAttemptError> {
-        net.transmit(host)
+        net.transmit(host, self.retry_policy.request_timeout)
             .await
             .map_err(|fault| SimAttemptError::Transient(format!("request to {host} {fault}")))?;
         match (net.service(host), self.mock.as_ref()) {

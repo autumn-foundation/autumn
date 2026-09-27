@@ -61,6 +61,9 @@ pub enum NetFault {
     Dropped,
     /// The host was partitioned, so the attempt failed at once.
     Partitioned,
+    /// The latency passed the client's `request_timeout`. The event's latency
+    /// is the timeout, the time that actually passed. The client retries it.
+    TimedOut,
 }
 
 impl std::fmt::Display for NetFault {
@@ -69,6 +72,7 @@ impl std::fmt::Display for NetFault {
             Self::None => "delivered",
             Self::Dropped => "dropped",
             Self::Partitioned => "partitioned",
+            Self::TimedOut => "timed out",
         })
     }
 }
@@ -145,8 +149,8 @@ impl SimNet {
         self
     }
 
-    /// Delay each attempt by a seeded time in `[min, max]`, in whole
-    /// milliseconds. A `max` below `min` is raised to `min`.
+    /// Delay each attempt by a seeded time in `[min, max]`, to the
+    /// nanosecond. A `max` below `min` is raised to `min`.
     #[must_use]
     pub fn latency(self, min: Duration, max: Duration) -> Self {
         self.lock().latency = (min, max.max(min));
@@ -189,8 +193,13 @@ impl SimNet {
     }
 
     /// Send one attempt to `host`: record it, wait its latency, and return the
-    /// fault, if any.
-    pub(crate) async fn transmit(&self, host: &str) -> Result<(), NetFault> {
+    /// fault, if any. A latency above `timeout` becomes a
+    /// [`NetFault::TimedOut`] that waits only the timeout.
+    pub(crate) async fn transmit(
+        &self,
+        host: &str,
+        timeout: Option<Duration>,
+    ) -> Result<(), NetFault> {
         let (latency, fault) = {
             let mut state = self.lock();
             let seq = state.events.len() as u64;
@@ -207,6 +216,12 @@ impl SimNet {
                 )
             } else {
                 (sample_latency(state.latency, latency_draw), NetFault::None)
+            };
+            let (latency, fault) = match timeout {
+                Some(limit) if fault != NetFault::Partitioned && latency > limit => {
+                    (limit, NetFault::TimedOut)
+                }
+                _ => (latency, fault),
             };
             state.events.push(NetEvent {
                 seq,
@@ -231,12 +246,13 @@ impl SimNet {
     }
 }
 
-/// A latency in `[min, max]`, in whole milliseconds, from `draw`.
+/// A latency in `[min, max]`, to the nanosecond, from `draw`. Bounds past
+/// `u64::MAX` nanoseconds (about 584 years) are capped there.
 fn sample_latency((min, max): (Duration, Duration), draw: u64) -> Duration {
-    let min_ms = u64::try_from(min.as_millis()).unwrap_or(u64::MAX);
-    let max_ms = u64::try_from(max.as_millis()).unwrap_or(u64::MAX);
-    let span = max_ms.saturating_sub(min_ms).saturating_add(1);
-    Duration::from_millis(min_ms.saturating_add(draw % span))
+    let min_ns = u64::try_from(min.as_nanos()).unwrap_or(u64::MAX);
+    let max_ns = u64::try_from(max.as_nanos()).unwrap_or(u64::MAX);
+    let span = max_ns.saturating_sub(min_ns).saturating_add(1);
+    Duration::from_nanos(min_ns.saturating_add(draw % span))
 }
 
 #[cfg(test)]
@@ -255,6 +271,37 @@ mod tests {
     }
 
     #[test]
+    fn sub_millisecond_latency_is_kept() {
+        let fixed = (Duration::from_micros(500), Duration::from_micros(500));
+        assert_eq!(sample_latency(fixed, 12_345), Duration::from_micros(500));
+        let range = (Duration::from_micros(1500), Duration::from_micros(2500));
+        for draw in [0, 1, 999, 1000, 1_000_000, u64::MAX] {
+            let latency = sample_latency(range, draw);
+            assert!(latency >= range.0 && latency <= range.1, "{latency:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_latency_past_the_timeout_is_recorded_as_a_timeout() {
+        let net = SimNet::new().latency(Duration::from_secs(60), Duration::from_secs(60));
+        let limit = Duration::from_secs(30);
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            net.transmit("h", Some(limit)).await,
+            Err(NetFault::TimedOut)
+        );
+        assert_eq!(start.elapsed(), limit, "only the timeout passes");
+        let events = net.events();
+        assert_eq!(events[0].fault, NetFault::TimedOut);
+        assert_eq!(events[0].latency, limit);
+        assert_eq!(
+            net.transmit("h", None).await,
+            Ok(()),
+            "no timeout, no fault"
+        );
+    }
+
+    #[test]
     fn max_below_min_is_raised() {
         let net = SimNet::new().latency(Duration::from_millis(9), Duration::from_millis(1));
         assert_eq!(
@@ -267,9 +314,9 @@ mod tests {
     async fn partition_fails_at_once_and_heal_restores() {
         let net = SimNet::new();
         net.partition("a");
-        assert_eq!(net.transmit("a").await, Err(NetFault::Partitioned));
+        assert_eq!(net.transmit("a", None).await, Err(NetFault::Partitioned));
         net.heal("a");
-        assert_eq!(net.transmit("a").await, Ok(()));
+        assert_eq!(net.transmit("a", None).await, Ok(()));
         let faults: Vec<_> = net.events().iter().map(|event| event.fault).collect();
         assert_eq!(faults, vec![NetFault::Partitioned, NetFault::None]);
     }
@@ -282,7 +329,7 @@ mod tests {
                 .latency(Duration::ZERO, Duration::from_millis(30));
             net.reseed(seed);
             for _ in 0..32 {
-                let _ = net.transmit("h").await;
+                let _ = net.transmit("h", None).await;
             }
             net.events()
         };
