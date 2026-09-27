@@ -1138,8 +1138,11 @@ async fn a_hard_delete_refuses_a_subtree_with_a_reply_on_another_record() {
         .expect_err("the cascade would cross into another record");
     assert_eq!(err.status().as_u16(), 422, "{err}");
     let message = err.to_string();
-    assert!(message.contains("another record"), "{message}");
-    assert!(message.contains(&foreign.id.to_string()), "{message}");
+    assert!(message.contains("not on this record"), "{message}");
+    assert!(
+        message.contains(&format!("reply {} ", foreign.id)),
+        "{message}"
+    );
 
     assert_eq!(counter(&mut conn, "cmt_hards", mine).await, 2);
     assert_eq!(counter(&mut conn, "cmt_hards", other).await, 2);
@@ -1149,6 +1152,21 @@ async fn a_hard_delete_refuses_a_subtree_with_a_reply_on_another_record() {
         .expect("count")
         .count;
     assert_eq!(remaining, 4, "a refused delete removes nothing");
+
+    // Repair the edge as the message says. The delete then succeeds.
+    diesel::sql_query("UPDATE cmt_hard_comments SET parent_id = NULL WHERE id = $1")
+        .bind::<BigInt, _>(foreign.id)
+        .execute(&mut conn)
+        .await
+        .expect("repair the edge");
+    assert_eq!(
+        repo.delete_comment(mine, root.id)
+            .await
+            .expect("delete after repair"),
+        2
+    );
+    assert_eq!(counter(&mut conn, "cmt_hards", mine).await, 0);
+    assert_eq!(counter(&mut conn, "cmt_hards", other).await, 2);
 }
 
 /// Issue #2275, soft path: a soft delete fires no cascade.

@@ -835,7 +835,7 @@ pub async fn add_comment(
 ///   record of the same model.
 /// - `422` on the hard-delete path (`soft_delete = false`) when the subtree is
 ///   too deep for the walk, or has a reply on another record. The cascade
-///   would remove rows the counter does not see. Nothing is removed.
+///   would remove rows the counter does not see. The call removes nothing.
 /// - Any database error.
 pub async fn delete_comment(
     conn: &mut RuntimeConnection,
@@ -1461,8 +1461,8 @@ async fn insert_comment(
 /// comments with raw Diesel can. Without the predicate one parent's counter
 /// would absorb the whole span.
 ///
-/// The hard-delete cascade is not confined to the record. So that path refuses
-/// a subtree with a reply that the walk did not reach (#2275).
+/// The hard-delete cascade can go past the record. Thus the hard-delete path
+/// refuses a subtree with a reply that the walk did not reach (#2275).
 async fn delete_subtree(
     conn: &mut RuntimeConnection,
     spec: &CommentableSpec,
@@ -1554,9 +1554,9 @@ async fn delete_subtree(
         .join(", ");
 
     // Issue #2275. The walk stops at the record, but the `parent_id` cascade
-    // does not. It would remove a reply that is not in `ids`, so the count is
-    // too low and that reply's record keeps a counter that is too high. The
-    // framework cannot write such an edge, so refuse the delete.
+    // does not. The cascade would remove a reply that is not in `ids`. Then the
+    // returned count is too low, and the counter on that reply's record stays
+    // too high. The framework cannot write such an edge, so refuse the delete.
     if !spec.soft_delete {
         let escaped: Option<CommentIdRow> = diesel::sql_query(format!(
             "SELECT {pk} AS id FROM {comments} \
@@ -1569,9 +1569,9 @@ async fn delete_subtree(
         if let Some(escaped) = escaped {
             let escaped = escaped.id;
             return Err(AutumnError::unprocessable_msg(format!(
-                "comment {comment_id} has reply {escaped} on another record. This hard delete \
-                 would cascade into that record and leave its comment counter wrong. Repair \
-                 the parent of comment {escaped}, then delete again."
+                "comment {comment_id} cannot be hard-deleted. Its reply {escaped} is not on this \
+                 record, and the cascade would delete it. Set the parent_id of comment \
+                 {escaped} to NULL or to a comment on its own record. Then delete again."
             )));
         }
     }
