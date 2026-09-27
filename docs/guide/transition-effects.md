@@ -144,6 +144,21 @@ Open that transaction with a helper that hands you the `AsyncPgConnection` the m
 
 ---
 
+## Try it in the wiki example
+
+[`examples/wiki`](../../examples/wiki) wires a synchronous `on` effect onto its
+`Page::status` state machine (`src/models.rs`): the `draft -> published` and
+`published -> archived` edges each declare `on = "record_publish_revision"` /
+`on = "record_archive_revision"`, inherent `async fn(&self, conn)` methods that
+append the audit `Revision` row. The `POST /pages/{slug}/transitions/status`
+handler (`src/routes/pages.rs`) drives `transition_status_to_on_conn` inside a
+`Db::tx_with` transaction and persists the returned status on the same
+connection, so the status change and its audit row commit — or roll back —
+atomically. Publish or archive a page from its show page and check its **History**
+to see the effect-written revision.
+
+---
+
 ## See also
 
 - [Typed lifecycles](lifecycle.md)

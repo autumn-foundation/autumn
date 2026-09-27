@@ -2,14 +2,14 @@
 //!
 //! This module gives occasionally-connected apps (the primary consumer is
 //! the in-process Tauri mobile shell, issue #1508) a local, in-process
-//! SQLite store plus a sync engine that reconciles it with a remote Autumn
-//! app backed by PostgreSQL.
+//! `SQLite` store plus a sync engine that reconciles it with a remote Autumn
+//! app backed by `PostgreSQL`.
 //!
 //! # Architecture
 //!
 //! - [`SyncStore`] — the local store. App data lives in it as JSON payloads
 //!   keyed by `(collection, pk)`. Every write also journals a pending change
-//!   in the same SQLite transaction (write-through change tracking), and
+//!   in the same `SQLite` transaction (write-through change tracking), and
 //!   deletes are recorded as tombstone rows so they replicate.
 //! - [`SyncEngine`] — the client sync loop: push pending changes, then pull
 //!   rows newer than the local cursor. At-least-once with server-side

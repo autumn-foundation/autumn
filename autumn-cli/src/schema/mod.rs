@@ -13,13 +13,18 @@
 //! `autumn schema` group.
 
 pub mod diff;
+pub mod doctor;
+pub mod introspect;
+pub mod migrate;
 pub mod parse;
 pub mod snapshot;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use autumn_schema_core::Backend;
+use autumn_schema_core::{Backend, Column, Table};
 
+use diff::{MigrationPlan, SchemaChange};
 use parse::parse_models_path;
 use snapshot::{SNAPSHOT_DEFAULT_PATH, SchemaSnapshot};
 
@@ -101,6 +106,55 @@ pub enum SchemaAction {
         #[arg(long)]
         allow_destructive: bool,
     },
+    /// Introspect the configured Postgres database and write a canonical,
+    /// dialect-tagged snapshot of its live shape — the DB-derived diff baseline.
+    ///
+    /// Read-only w.r.t. the database (only catalog reads). Unlike `snapshot`
+    /// (which derives the baseline from the declared `#[model]` structs), `pull`
+    /// derives it from the live database, so a brownfield schema — or a schema
+    /// that drifted from the models — is captured exactly as it exists. Postgres
+    /// only in this slice; a `SQLite` URL is refused with a clear message.
+    Pull {
+        /// Config profile whose database URL to introspect (defaults to the
+        /// ambient profile resolution the other CLI commands use).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Where to write the snapshot. Defaults to `.autumn/schema-snapshot.json`.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// Override the dialect tag / apply-path selection. Defaults to the
+        /// backend implied by the resolved database URL.
+        #[arg(long, value_enum)]
+        backend: Option<BackendArg>,
+        /// Print what would change without writing the snapshot file.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Apply pending migration files against the configured database.
+    ///
+    /// Does NOT modify the checked-in schema snapshot: the baseline advances at
+    /// generation time via `schema diff --write-migration`, so this command only
+    /// applies pending migrations. Provider-locked against the snapshot's dialect;
+    /// the destructive-change guards ran at diff time, so migration files apply
+    /// verbatim here.
+    Migrate {
+        /// Config profile whose database URL to apply against (defaults to the
+        /// ambient profile resolution the other CLI commands use).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+    },
+    /// Read-only diagnosis of the declarative-schema state: filesystem, snapshot,
+    /// model drift, backend provider-lock, and pending migrations. Exits
+    /// non-zero when any check is an actionable error.
+    Doctor {
+        /// Config profile whose database URL to probe (defaults to the ambient
+        /// profile resolution the other CLI commands use).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Emit the checks as JSON instead of the aligned text report.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Run an `autumn schema` action. Prints to stdout on success; on error, writes
@@ -130,6 +184,14 @@ pub fn run(action: SchemaAction) {
             name.as_deref(),
             allow_destructive,
         ),
+        SchemaAction::Pull {
+            profile,
+            out,
+            backend,
+            dry_run,
+        } => run_pull(profile.as_deref(), out.as_deref(), backend, dry_run),
+        SchemaAction::Migrate { profile } => migrate::run_migrate(profile.as_deref()),
+        SchemaAction::Doctor { profile, json } => doctor::run_doctor(profile.as_deref(), json),
     };
     if let Err(message) = result {
         eprintln!("error: {message}");
@@ -144,6 +206,31 @@ const fn map_detected_backend(detected: autumn_web::config::DatabaseBackend) -> 
         autumn_web::config::DatabaseBackend::Postgres => Backend::Postgres,
         autumn_web::config::DatabaseBackend::Sqlite => Backend::Sqlite,
     }
+}
+
+/// Resolve the schema-command backend for an explicit `--profile`, from the
+/// already profile-resolved primary database `url`.
+///
+/// When a URL is configured its scheme is authoritative
+/// ([`DatabaseBackend::detect`](autumn_web::config::DatabaseBackend::detect)),
+/// so `--profile <name>` selects the apply path / provider-lock of the database
+/// it actually acts against; only when no URL is configured does it fall back to
+/// the profile-aware project default
+/// ([`crate::generate::detect_backend_for_profile`]). Shared by `schema migrate`
+/// and `schema doctor` so the two commands can never derive the backend
+/// inconsistently for the same profile. With `profile == None` the resolution is
+/// unchanged from the ambient behavior.
+fn backend_for_url(project_root: &Path, profile: Option<&str>, url: Option<&str>) -> Backend {
+    url.and_then(autumn_web::config::DatabaseBackend::detect)
+        .map_or_else(
+            || {
+                map_detected_backend(crate::generate::detect_backend_for_profile(
+                    project_root,
+                    profile,
+                ))
+            },
+            map_detected_backend,
+        )
 }
 
 /// Resolve the default models source when `--from` is omitted: the app's
@@ -167,6 +254,24 @@ fn resolve_default_models_path(project_root: &Path) -> Result<PathBuf, String> {
         dir.display(),
         file.display()
     ))
+}
+
+/// Resolve the declarative models source only when it actually exists.
+///
+/// Mirrors [`resolve_default_models_path`]'s `src/models` dir → `src/models.rs`
+/// file precedence, but returns `None` (not an error) when neither is present —
+/// so callers that must degrade gracefully on absence (the `migrate` snapshot
+/// refresh, `doctor`'s drift check) share one resolver instead of duplicating it.
+pub fn existing_models_path(project_root: &Path) -> Option<PathBuf> {
+    let dir = project_root.join("src").join("models");
+    if dir.is_dir() {
+        return Some(dir);
+    }
+    let file = project_root.join("src").join("models.rs");
+    if file.is_file() {
+        return Some(file);
+    }
+    None
 }
 
 /// Whether the `snapshot` command requires the current directory to be the
@@ -275,6 +380,272 @@ fn run_snapshot(
     Ok(())
 }
 
+/// Introspect the configured Postgres database and write (or, with `--dry-run`,
+/// describe) a canonical, dialect-tagged snapshot of its live shape.
+///
+/// This is the DB-introspection counterpart to `snapshot` (which derives the
+/// baseline from the declared models). The resolution order — project root, then
+/// the profile-resolved database URL, then the URL-implied backend (honoring a
+/// `--backend` override) — mirrors `schema migrate` / `schema doctor`, so the
+/// three commands can never derive the backend inconsistently for one profile.
+///
+/// Both backends are supported: a resolved `SQLite` backend introspects via
+/// `introspect::introspect_sqlite` on the `sqlite` build (and is refused loudly on
+/// a default Postgres-only build). Before writing, a **provider-lock** guard refuses
+/// to clobber an existing snapshot tagged for another backend.
+fn run_pull(
+    profile: Option<&str>,
+    out: Option<&Path>,
+    backend: Option<BackendArg>,
+    dry_run: bool,
+) -> Result<(), String> {
+    let project_root = std::env::current_dir()
+        .map_err(|e| format!("failed to resolve the current directory: {e}"))?;
+    pull_at(&project_root, profile, out, backend, dry_run)
+}
+
+/// The body of [`run_pull`], taking an explicit `project_root` so the wiring is
+/// testable without mutating the process CWD (mirrors `diff_at` / `migrate_at`).
+fn pull_at(
+    project_root: &Path,
+    profile: Option<&str>,
+    out: Option<&Path>,
+    backend: Option<BackendArg>,
+    dry_run: bool,
+) -> Result<(), String> {
+    crate::generate::ensure_project_root(project_root)
+        .map_err(|_| crate::generate::GenerateError::NotInProject.to_string())?;
+
+    // Resolve the write/primary database URL exactly as the other schema commands
+    // do, honoring an explicit `--profile`.
+    let url = crate::migrate::resolve_primary_url(profile).ok_or_else(|| {
+        "no database URL configured — set AUTUMN_DATABASE__URL or DATABASE_URL, or add a \
+         [database] primary_url to autumn.toml"
+            .to_string()
+    })?;
+
+    // Backend from the SAME profile-resolved context as the URL (its scheme is
+    // authoritative), honoring an explicit `--backend` override.
+    let backend: Backend = backend.map_or_else(
+        || backend_for_url(project_root, profile, Some(url.as_str())),
+        Backend::from,
+    );
+
+    let out_path = out.map_or_else(
+        || project_root.join(SNAPSHOT_DEFAULT_PATH),
+        Path::to_path_buf,
+    );
+
+    // PROVIDER-LOCK: refuse to overwrite an existing snapshot tagged for another
+    // backend (mirrors `ensure_backend_matches` / the doctor provider-lock check).
+    // A missing or unreadable-as-absent snapshot is fine — this is the first
+    // baseline. The existing tables also serve as the `--dry-run` diff baseline.
+    let existing = load_existing_snapshot(&out_path);
+    if let Some(existing) = &existing
+        && existing.backend != backend
+    {
+        return Err(format!(
+            "refusing to overwrite the existing snapshot at {} (backend {:?}) with a {:?} pull \
+             — the snapshot is provider-locked to {:?}. Point --out elsewhere or remove the \
+             mismatched snapshot first.",
+            out_path.display(),
+            existing.backend,
+            backend,
+            existing.backend
+        ));
+    }
+
+    // Introspect the live database into the IR, dispatching on the resolved
+    // backend. Each arm references only its own connection type — the SQLite arm is
+    // compiled only under the `sqlite` backend-flip (see `introspect_sqlite`); a
+    // default (Postgres) build that somehow resolves a SQLite backend fails loudly
+    // rather than silently mis-introspecting.
+    let tables = match backend {
+        Backend::Postgres => introspect::introspect_postgres(&url).map_err(|e| e.to_string())?,
+        #[cfg(feature = "sqlite")]
+        Backend::Sqlite => introspect::introspect_sqlite(&url).map_err(|e| e.to_string())?,
+        #[cfg(not(feature = "sqlite"))]
+        Backend::Sqlite => {
+            return Err(
+                "`autumn schema pull` detected a SQLite backend, but this CLI build targets \
+                 Postgres only. Rebuild with `--features sqlite` to introspect a SQLite \
+                 database (the sqlite backend-flip must never be co-built with the default \
+                 Postgres backend). No snapshot was written."
+                    .to_string(),
+            );
+        }
+    };
+    let snapshot = SchemaSnapshot::new(backend, tables);
+
+    if dry_run {
+        report_pull_dry_run(&snapshot, existing.as_ref(), &out_path);
+        return Ok(());
+    }
+
+    // A file that is present on disk but did not load (`existing` is `None` while
+    // the path exists) is corrupt/unreadable-as-absent — a non-dry-run pull is
+    // about to replace it. Tell the user rather than silently clobber it. An
+    // absent snapshot stays silent (it exists nowhere to overwrite); a readable
+    // but backend-mismatched snapshot never reaches here (provider-lock refused
+    // above).
+    if existing.is_none() && out_path.exists() {
+        eprintln!(
+            "note: existing snapshot at {} was unreadable; replacing it.",
+            out_path.display()
+        );
+    }
+
+    snapshot::write_snapshot(&out_path, &snapshot).map_err(|e| e.to_string())?;
+    println!(
+        "pulled schema snapshot for {} table(s) from the database to {}",
+        snapshot.tables.len(),
+        out_path.display()
+    );
+    Ok(())
+}
+
+/// Load the snapshot at `path` for the pull's provider-lock / dry-run baseline.
+/// A missing OR unreadable file is treated as **absent** (`Ok(None)`) — a pull
+/// establishes a fresh baseline, so a corrupt prior file is not fatal — but a
+/// backend-mismatched *readable* snapshot still surfaces to the provider-lock
+/// caller (it loaded fine; only its backend disagrees).
+fn load_existing_snapshot(path: &Path) -> Option<SchemaSnapshot> {
+    snapshot::load_snapshot(path).ok()
+}
+
+/// Print what a `--dry-run` pull would change between the existing snapshot
+/// (baseline) and the freshly-pulled tables, without writing anything.
+///
+/// Drift is computed BIDIRECTIONALLY (via [`doctor::compute_db_schema_drift`]) so
+/// the dry-run never under-reports: the forward plan is what pulling would change
+/// in the snapshot, but a manually-dropped default / FK / CHECK in the live DB is
+/// invisible to the forward pass (a desired `None` is "retained") and only surfaces
+/// in the reverse plan. The report is built by the pure [`format_pull_dry_run_report`]
+/// so it can be unit-tested without any I/O.
+fn report_pull_dry_run(
+    pulled: &SchemaSnapshot,
+    existing: Option<&SchemaSnapshot>,
+    out_path: &Path,
+) {
+    match existing {
+        None => {
+            println!(
+                "--dry-run: no existing snapshot at {} — would create a new baseline with {} \
+                 table(s) from the database.",
+                out_path.display(),
+                pulled.tables.len()
+            );
+        }
+        Some(existing) => {
+            let drift = doctor::compute_db_schema_drift(&existing.tables, &pulled.tables);
+            print!(
+                "{}",
+                format_pull_dry_run_report(&drift.forward, &drift.reverse, out_path)
+            );
+        }
+    }
+}
+
+/// Format the `--dry-run` report body for a snapshot that already exists, from the
+/// pre-computed bidirectional plans. Pure (no I/O) so it is unit-testable.
+///
+/// The report ALWAYS surfaces both directions independently:
+///
+/// * The **forward** plan — the structural changes a real pull would apply to the
+///   snapshot (added/dropped columns, type changes, index adds/drops, …) — is
+///   printed via [`diff::describe_plan`] whenever it is non-empty.
+/// * The **reverse-only** removals — a default / foreign key / CHECK the snapshot
+///   still carries but the live DB has dropped, which the forward pass structurally
+///   cannot express (a desired `None` is "retained", never a drop) — are ALWAYS
+///   named, phrased as removals, INDEPENDENT of whether the forward plan had
+///   changes. Without this a pull that both adds a column AND drops a default would
+///   report only the added column and silently omit that pulling also removes the
+///   default from the snapshot.
+///
+/// Structural adds/drops already in the forward plan are never re-listed here — only
+/// the asymmetric [`reverse_only_removals`] facets are surfaced from the reverse
+/// plan, so nothing is double-counted. When BOTH directions are empty the snapshot
+/// is up to date.
+fn format_pull_dry_run_report(
+    forward: &MigrationPlan,
+    reverse: &MigrationPlan,
+    out_path: &Path,
+) -> String {
+    use std::fmt::Write as _;
+
+    let removals = reverse_only_removals(reverse);
+    if forward.is_empty() && removals.is_empty() {
+        return format!(
+            "--dry-run: the snapshot at {} is up to date — the database matches it.\n",
+            out_path.display()
+        );
+    }
+
+    let mut out = String::new();
+    if !forward.is_empty() {
+        let _ = writeln!(
+            out,
+            "--dry-run: the database differs from the snapshot at {} — {} change(s) would be \
+             captured (nothing written):",
+            out_path.display(),
+            forward.changes.len()
+        );
+        out.push_str(&diff::describe_plan(forward));
+    }
+    if !removals.is_empty() {
+        let _ = writeln!(
+            out,
+            "--dry-run: pulling would also remove from the snapshot at {}: {} (nothing written).",
+            out_path.display(),
+            removals.join(", ")
+        );
+    }
+    out
+}
+
+/// The reverse-plan changes that represent a facet present in the snapshot but
+/// **dropped from the live DB** — the asymmetric removals the forward pass cannot
+/// emit (`diff_column` treats a desired `None` as "unknown, retained", never a
+/// drop). Rendered as human-readable removal phrases for the dry-run report.
+///
+/// Only genuine removals are surfaced, so a facet that merely *changed* value (and
+/// is therefore already captured by the forward plan) is never double-counted:
+///
+/// * [`SchemaChange::SetDefault`] with `from: None` — the reverse baseline (the DB)
+///   had no default at all, so the snapshot's default was dropped. A reverse
+///   `SetDefault` whose `from` is `Some` is a value *change* the forward plan
+///   already reports and is skipped here.
+/// * [`SchemaChange::AddForeignKey`] / [`SchemaChange::AddForeignKeyToExistingColumn`]
+///   — a foreign key the snapshot carries that the DB dropped (the reverse pass
+///   only ever emits these when the DB-side column had no FK; a *retarget* surfaces
+///   as `ForeignKeyChange` in BOTH directions and is not listed here).
+/// * [`SchemaChange::AddCheck`] — a CHECK constraint the snapshot carries that the
+///   DB dropped (checks are name-keyed add-only, so a reverse `AddCheck` is always a
+///   removal).
+fn reverse_only_removals(reverse: &MigrationPlan) -> Vec<String> {
+    reverse
+        .changes
+        .iter()
+        .filter_map(|change| match change {
+            SchemaChange::SetDefault {
+                table,
+                column,
+                from: None,
+                ..
+            } => Some(format!("default on `{table}.{column}`")),
+            SchemaChange::AddForeignKey { table, column, .. }
+            | SchemaChange::AddForeignKeyToExistingColumn { table, column } => {
+                Some(format!("foreign key on `{table}.{column}`"))
+            }
+            SchemaChange::AddCheck { table, check } => Some(format!(
+                "CHECK `{}` on `{table}`",
+                check.name.as_deref().unwrap_or("(unnamed)")
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Diff the declared models against the checked-in snapshot baseline and either
 /// print the pending migration or write it as a diesel `up.sql`/`down.sql` pair.
 ///
@@ -368,7 +739,10 @@ fn diff_at(
     }
 
     // (e) Diff (pure) then guard (policy).
-    let opts = diff::DiffOptions { allow_destructive };
+    let opts = diff::DiffOptions {
+        allow_destructive,
+        ..Default::default()
+    };
     let plan = diff::diff_schema(&baseline.tables, &desired, opts);
     if plan.is_empty() {
         println!("No schema changes — models match the snapshot baseline.");
@@ -376,8 +750,12 @@ fn diff_at(
     }
     diff::guard_plan(&plan, opts).map_err(|e| e.to_string())?;
 
-    let up = diff::emit_up_sql(&plan).map_err(|e| e.to_string())?;
-    let down = diff::emit_down_sql(&plan).map_err(|e| e.to_string())?;
+    // The SQLite table-recreate path needs each affected table's full desired (up)
+    // / baseline (down) shape, which the per-change deltas don't carry; thread them
+    // in via the context. Postgres ignores it (identical output).
+    let ctx = diff::SchemaContext::from_tables(&desired.tables, &baseline.tables);
+    let up = diff::emit_up_sql_with_context(&plan, &ctx).map_err(|e| e.to_string())?;
+    let down = diff::emit_down_sql_with_context(&plan, &ctx).map_err(|e| e.to_string())?;
 
     if !write_migration {
         print!("{}", diff::describe_plan(&plan));
@@ -389,12 +767,166 @@ fn diff_at(
     let ts = crate::generate::timestamp_now();
     let suffix = crate::generate::naming::snake(name.unwrap_or("schema_update"));
     let dir = write_migration_dir(project_root, &ts, &suffix, &up, &down)?;
+
+    // (g) Advance the checked-in snapshot to the state this migration converges
+    // the database on. The snapshot now moves at GENERATION time (here), not at
+    // apply time — `schema migrate` only applies files. The target is the guarded
+    // `plan` PROJECTED onto the baseline (not `desired.tables` wholesale), so a
+    // change the guard reduced or refused is never baked into the baseline: the
+    // snapshot tracks exactly what the emitted SQL produces. A plain `schema diff`
+    // (no `--write-migration`) returned above (step e), so it never reaches here
+    // and never touches the snapshot.
+    //
+    // The migration files and the checked-in snapshot must advance together: if
+    // the snapshot write fails (read-only dir, full disk, ...) after the
+    // migration is on disk, retrying `schema diff --write-migration` would
+    // regenerate the same SQL as a second migration (baseline never advanced)
+    // and applying both would fail on duplicate DDL. Roll the migration dir back
+    // on a snapshot-write failure so the pre-command state is left intact.
+    let target_tables = project_plan_target(&baseline.tables, &plan);
+    if let Err(e) =
+        snapshot::write_snapshot(&snapshot_path, &SchemaSnapshot::new(backend, target_tables))
+    {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(e.to_string());
+    }
+
     println!(
         "wrote migration {} ({} change(s))",
         dir.display(),
         plan.changes.len()
     );
+    println!("advanced schema snapshot at {}", snapshot_path.display());
     Ok(())
+}
+
+/// Project the guarded migration `plan` onto the `baseline` tables to compute the
+/// state the database will be in once the migration applies — the new snapshot
+/// baseline `schema diff --write-migration` advances to.
+///
+/// Each [`SchemaChange`] carries the full desired objects/values (they come from
+/// the desired state), so applying them onto a clone of the baseline is verbatim
+/// and convergent: the result equals what the emitted `up.sql` produces. This is
+/// deliberately NOT a snapshot of `desired.tables` wholesale — the guard may have
+/// reduced or refused parts of the delta, and the snapshot must track only what
+/// the migration actually does. Table order is irrelevant here: `write_snapshot`
+/// re-sorts tables by name canonically.
+fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
+    // Name-keyed working set cloned from the baseline.
+    let mut tables: BTreeMap<String, Table> = baseline
+        .iter()
+        .map(|t| (t.name.clone(), t.clone()))
+        .collect();
+
+    // Exhaustive match with NO wildcard arm: a future `SchemaChange` variant
+    // forces a compile error here rather than silently mis-projecting the target.
+    for change in &plan.changes {
+        match change {
+            SchemaChange::CreateTable(table) => {
+                tables.insert(table.name.clone(), table.clone());
+            }
+            SchemaChange::DropTable(table) => {
+                tables.remove(&table.name);
+            }
+            SchemaChange::AddColumn { table, column } => {
+                if let Some(t) = tables.get_mut(table) {
+                    t.columns.push(column.clone());
+                }
+            }
+            SchemaChange::DropColumn { table, column } => {
+                if let Some(t) = tables.get_mut(table) {
+                    t.columns.retain(|c| c.name != column.name);
+                    // Postgres `ALTER TABLE … DROP COLUMN` automatically drops any
+                    // index (and the constraint it backs) that depends on the
+                    // column. Ordinary model-managed indexes on the column already
+                    // carry an explicit `DropIndex` in this plan; this ALSO prunes
+                    // the RETAINED (`definition`-carrying) expression / partial /
+                    // constraint-owned indexes that have NO `DropIndex` — otherwise
+                    // the projected snapshot would claim an index the database just
+                    // cascade-dropped and every subsequent `schema doctor` /
+                    // `pull --dry-run` would report false, perpetual drift. Uses
+                    // the same dependency test the down emitter uses to restore
+                    // these indexes on rollback, so projection and rollback agree.
+                    t.indexes
+                        .retain(|i| !diff::index_depends_on_column(i, &column.name, plan.backend));
+                }
+            }
+            SchemaChange::AlterColumnType {
+                table, column, to, ..
+            } => {
+                if let Some(c) = column_mut(&mut tables, table, column) {
+                    c.ty = to.clone();
+                }
+            }
+            SchemaChange::SetNotNull { table, column } => {
+                if let Some(c) = column_mut(&mut tables, table, column) {
+                    c.nullable = false;
+                }
+            }
+            SchemaChange::DropNotNull { table, column } => {
+                if let Some(c) = column_mut(&mut tables, table, column) {
+                    c.nullable = true;
+                }
+            }
+            SchemaChange::SetDefault {
+                table, column, to, ..
+            } => {
+                if let Some(c) = column_mut(&mut tables, table, column) {
+                    c.default = Some(to.clone());
+                }
+            }
+            SchemaChange::AddForeignKey {
+                table,
+                column,
+                foreign_key,
+            } => {
+                if let Some(c) = column_mut(&mut tables, table, column) {
+                    c.references = Some(foreign_key.clone());
+                }
+            }
+            SchemaChange::AddIndex { table, index } => {
+                if let Some(t) = tables.get_mut(table) {
+                    t.indexes.push(index.clone());
+                }
+            }
+            SchemaChange::DropIndex { table, index } => {
+                if let Some(t) = tables.get_mut(table) {
+                    t.indexes.retain(|i| i.name != index.name);
+                }
+            }
+            SchemaChange::AddCheck { table, check } => {
+                if let Some(t) = tables.get_mut(table) {
+                    t.checks.push(check.clone());
+                }
+            }
+            // The non-emittable marker variants: `guard_plan` refuses these before
+            // we get here (a guarded plan never carries one), so projecting them is
+            // a no-op — never a panic.
+            SchemaChange::PrimaryKeyChange { .. }
+            | SchemaChange::ForeignKeyChange { .. }
+            | SchemaChange::IdentityChange { .. }
+            | SchemaChange::DropTableBlockedByInboundFk { .. }
+            | SchemaChange::AlterColumnTypeBlockedByFk { .. }
+            | SchemaChange::AddForeignKeyToExistingColumn { .. }
+            | SchemaChange::CreateTableBlockedBySkippedField { .. } => {}
+        }
+    }
+
+    tables.into_values().collect()
+}
+
+/// Find a mutable column by name within a named table in the working set — the
+/// column-facet helper [`project_plan_target`] uses to apply the `Alter*` /
+/// `Set*` / `Drop*Null` column changes. Returns `None` when the table or column
+/// is absent (a guarded plan never carries such a change, so a miss is a no-op).
+fn column_mut<'a>(
+    tables: &'a mut BTreeMap<String, Table>,
+    table: &str,
+    column: &str,
+) -> Option<&'a mut Column> {
+    tables
+        .get_mut(table)
+        .and_then(|t| t.columns.iter_mut().find(|c| c.name == column))
 }
 
 /// Write a `migrations/<ts>_<suffix>/{up,down}.sql` pair, creating the leaf
@@ -540,7 +1072,7 @@ mod tests {
     {{
       "name": "posts",
       "columns": [
-        {{ "name": "id", "ty": "Int64", "nullable": false, "primary_key": true, "unique": false, "default": null, "references": null }},
+        {{ "name": "id", "ty": "Int64", "nullable": false, "primary_key": true, "unique": false, "default": null, "references": null, "serial": "BigSerial" }},
         {{ "name": "title", "ty": "Text", "nullable": false, "primary_key": false, "unique": false, "default": null, "references": null }},
         {{ "name": "created_at", "ty": "Timestamp", "nullable": false, "primary_key": false, "unique": false, "default": "Now", "references": null }}
       ],
@@ -604,8 +1136,12 @@ mod tests {
 
     #[test]
     fn diff_no_op_writes_nothing() {
-        // Models match the snapshot → no-op → no migration directory.
+        // Models match the snapshot → no-op → no migration directory AND the
+        // checked-in snapshot is left byte-for-byte unchanged (a no-op diff must
+        // not advance the baseline).
         let root = scaffold_project(POST_MODEL, &posts_snapshot("Postgres"));
+        let snapshot_path = root.path().join(".autumn/schema-snapshot.json");
+        let before = std::fs::read_to_string(&snapshot_path).expect("snapshot before");
         diff_at(
             root.path(),
             None,
@@ -619,6 +1155,11 @@ mod tests {
         assert!(
             !root.path().join("migrations").exists(),
             "a no-op must not create a migrations directory"
+        );
+        let after = std::fs::read_to_string(&snapshot_path).expect("snapshot after");
+        assert_eq!(
+            before, after,
+            "a no-op diff must leave the snapshot byte-for-byte unchanged"
         );
     }
 
@@ -667,6 +1208,226 @@ mod tests {
         assert!(
             down.contains("ALTER TABLE posts DROP COLUMN body;"),
             "down: {down}"
+        );
+
+        // The checked-in snapshot ADVANCED to the plan's target state: it now
+        // carries the `body` column the migration adds. Load it back and check.
+        let snapshot_path = root.path().join(".autumn/schema-snapshot.json");
+        let advanced = snapshot::load_snapshot(&snapshot_path).expect("load advanced snapshot");
+        let posts = advanced
+            .tables
+            .iter()
+            .find(|t| t.name == "posts")
+            .expect("posts table in advanced snapshot");
+        assert!(
+            posts.columns.iter().any(|c| c.name == "body"),
+            "advanced snapshot must contain the new `body` column: {:?}",
+            posts.columns.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+    }
+
+    // The migration files and the checked-in snapshot must advance together
+    // (Codex P1): if the snapshot write fails after `write_migration_dir` has
+    // already left a complete migration on disk, the baseline never advances, so
+    // retrying `schema diff --write-migration` regenerates the same SQL as a
+    // SECOND migration and applying both fails on duplicate DDL. `diff_at` rolls
+    // the migration dir back on a snapshot-write failure. Reproduce that failure
+    // portably by making the snapshot's parent dir (`.autumn`) read-only so the
+    // earlier snapshot LOAD still succeeds but `write_snapshot`'s tempfile
+    // create+rename cannot, then assert the command errors and left no migration.
+    #[cfg(unix)]
+    #[test]
+    fn write_migration_rolls_back_on_snapshot_write_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Add a `body` column the snapshot lacks → a non-empty plan that would
+        // write a migration and then advance the snapshot.
+        let models = r#"
+            #[autumn_web::model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                pub title: String,
+                pub body: Option<String>,
+            }
+        "#;
+        let root = scaffold_project(models, &posts_snapshot("Postgres"));
+        let autumn_dir = root.path().join(".autumn");
+
+        // Make the snapshot's parent directory read-only so a new tempfile cannot
+        // be created in it (the earlier read of the existing snapshot still works).
+        std::fs::set_permissions(&autumn_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod .autumn read-only");
+
+        // Skipped when the process can bypass the permission bits (e.g. running as
+        // root, where a read-only dir is still writable), which would otherwise
+        // make this non-deterministic — mirrors `classify_unreadable_dir_is_an_error`.
+        let can_still_write = tempfile::NamedTempFile::new_in(&autumn_dir).is_ok();
+        if can_still_write {
+            std::fs::set_permissions(&autumn_dir, std::fs::Permissions::from_mode(0o755))
+                .expect("restore chmod");
+            return;
+        }
+
+        let result = diff_at(
+            root.path(),
+            None,
+            None,
+            Some(BackendArg::Pg),
+            true,
+            Some("add_body"),
+            false,
+        );
+
+        // Restore permissions so the tempdir can be cleaned up (and the migrations
+        // assertion below can read the dir regardless of outcome).
+        std::fs::set_permissions(&autumn_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("restore chmod");
+
+        // (a) The command surfaced the snapshot-write failure as an error.
+        assert!(
+            result.is_err(),
+            "a snapshot-write failure must surface as an error, got: {result:?}"
+        );
+
+        // (b) The just-created migration was rolled back: no migration directory
+        // is left behind, so a retry regenerates a single migration (not a second).
+        let migrations = root.path().join("migrations");
+        let leftover: Vec<_> = std::fs::read_dir(&migrations)
+            .map(|rd| {
+                rd.map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            leftover.is_empty(),
+            "the migration dir must be rolled back on a snapshot-write failure, found: {leftover:?}"
+        );
+    }
+
+    /// The core drift scenario from #2041: `schema diff --write-migration`
+    /// advances the snapshot to the GENERATED plan's target, so a later,
+    /// still-ungenerated model edit diffs on top of it (only the *new* delta),
+    /// never re-generating the already-generated change.
+    #[test]
+    #[allow(clippy::too_many_lines)] // linear scenario reads clearest end-to-end
+    fn write_migration_advances_snapshot_so_later_edits_diff_on_top() {
+        // Change A: add `body`. Baseline is the posts(id,title,created_at) snapshot.
+        let models_a = r#"
+            #[autumn_web::model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                pub title: String,
+                pub body: Option<String>,
+            }
+        "#;
+        let root = scaffold_project(models_a, &posts_snapshot("Postgres"));
+        let snapshot_path = root.path().join(".autumn/schema-snapshot.json");
+
+        // Generate change A. The snapshot advances to include `body`.
+        diff_at(
+            root.path(),
+            None,
+            None,
+            Some(BackendArg::Pg),
+            true,
+            Some("add_body"),
+            false,
+        )
+        .expect("write migration A ok");
+
+        let after_a = snapshot::load_snapshot(&snapshot_path).expect("load snapshot after A");
+        let posts_a = after_a
+            .tables
+            .iter()
+            .find(|t| t.name == "posts")
+            .expect("posts after A");
+        assert!(
+            posts_a.columns.iter().any(|c| c.name == "body"),
+            "snapshot advanced to include `body`"
+        );
+        // The not-yet-added `draft` column is NOT in the snapshot yet.
+        assert!(
+            !posts_a.columns.iter().any(|c| c.name == "draft"),
+            "snapshot must not contain the not-yet-added `draft` column"
+        );
+
+        // Convergence: re-running with the SAME models is now a no-op — no second
+        // migration directory is written (the snapshot already matches).
+        diff_at(
+            root.path(),
+            None,
+            None,
+            Some(BackendArg::Pg),
+            true,
+            Some("add_body_again"),
+            false,
+        )
+        .expect("second (converged) diff ok");
+        let dir_count = std::fs::read_dir(root.path().join("migrations"))
+            .expect("read migrations")
+            .count();
+        assert_eq!(
+            dir_count, 1,
+            "a converged re-run must not write a second migration"
+        );
+
+        // Now edit the models to add `draft` on top of the already-generated
+        // `body`. Because the snapshot advanced to change A, the next diff
+        // generates ONLY `draft` — proving the baseline moved to the plan target,
+        // not that it stayed at the original baseline.
+        std::fs::write(
+            root.path().join("src").join("models.rs"),
+            r#"
+                #[autumn_web::model(managed)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                    pub body: Option<String>,
+                    pub draft: Option<String>,
+                }
+            "#,
+        )
+        .expect("edit models to add draft");
+
+        diff_at(
+            root.path(),
+            None,
+            None,
+            Some(BackendArg::Pg),
+            true,
+            Some("add_draft"),
+            false,
+        )
+        .expect("write migration B (draft) ok");
+
+        // Exactly two migration dirs; the newest carries `draft` but NOT `body`.
+        let mut names: Vec<String> = std::fs::read_dir(root.path().join("migrations"))
+            .expect("read migrations")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 2, "two migration dirs now: {names:?}");
+        let draft_dir = names
+            .iter()
+            .find(|n| n.ends_with("_add_draft"))
+            .expect("add_draft dir");
+        let up = std::fs::read_to_string(
+            root.path()
+                .join("migrations")
+                .join(draft_dir)
+                .join("up.sql"),
+        )
+        .expect("draft up.sql");
+        assert!(
+            up.contains("draft"),
+            "the second migration still generates `draft`: {up}"
+        );
+        assert!(
+            !up.contains("body"),
+            "the second migration must NOT re-generate the already-added `body`: {up}"
         );
     }
 
@@ -958,6 +1719,61 @@ mod tests {
         );
     }
 
+    /// Findings 2 & 3 (#2036): the schema-command backend derives from the
+    /// profile-resolved URL when one is configured (its scheme is authoritative),
+    /// and only falls back to the project default when no URL is present — so
+    /// `--profile <name>` picks the apply path / provider-lock of the database it
+    /// acts against, not the ambient project default.
+    #[test]
+    fn backend_for_url_prefers_url_scheme_over_project_default() {
+        // A tempdir with no config → the project default is Postgres.
+        let root = tempfile::tempdir().expect("tempdir");
+        // A configured SQLite URL is authoritative regardless of that default.
+        assert_eq!(
+            backend_for_url(root.path(), None, Some("sqlite://app.db")),
+            Backend::Sqlite
+        );
+        // A configured Postgres URL likewise.
+        assert_eq!(
+            backend_for_url(root.path(), None, Some("postgres://u@h/db")),
+            Backend::Postgres
+        );
+        // No URL → falls back to the profile-aware project default (Postgres here).
+        assert_eq!(backend_for_url(root.path(), None, None), Backend::Postgres);
+    }
+
+    #[test]
+    fn existing_models_path_prefers_dir_then_file_then_none() {
+        let root = tempfile::tempdir().expect("tempdir");
+        assert!(existing_models_path(root.path()).is_none());
+
+        let src = root.path().join("src");
+        std::fs::create_dir_all(&src).expect("mkdir src");
+        let file = src.join("models.rs");
+        std::fs::write(&file, "").expect("write file");
+        assert_eq!(existing_models_path(root.path()), Some(file));
+
+        let dir = src.join("models");
+        std::fs::create_dir_all(&dir).expect("mkdir models");
+        assert_eq!(existing_models_path(root.path()), Some(dir));
+    }
+
+    #[test]
+    fn load_existing_snapshot_absent_and_corrupt_are_none_valid_is_some() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = root.path().join("snap.json");
+        // Missing file → treated as absent (fresh baseline).
+        assert!(load_existing_snapshot(&path).is_none());
+        // Corrupt/unreadable-as-absent → also None (a pull re-establishes it).
+        std::fs::write(&path, "{ not json").expect("write corrupt");
+        assert!(load_existing_snapshot(&path).is_none());
+        // A valid snapshot loads and surfaces its backend to the provider-lock.
+        let snap = SchemaSnapshot::new(Backend::Sqlite, Vec::new());
+        snapshot::write_snapshot(&path, &snap).expect("write valid");
+        let loaded = load_existing_snapshot(&path).expect("some");
+        assert_eq!(loaded.backend, Backend::Sqlite);
+    }
+
     #[test]
     fn default_resolver_errors_when_neither_exists() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -967,6 +1783,241 @@ mod tests {
         assert!(
             err.contains("--from"),
             "error tells the user to pass --from"
+        );
+    }
+
+    // -- Part A: `project_plan_target` prunes column-dependent retained indexes --
+
+    /// A `posts(id, email)` table carrying a RETAINED expression/constraint index
+    /// on `email` (a `definition`-carrying index with NO paired `DropIndex`, the
+    /// shape `schema pull` preserves for a brownfield `UNIQUE`/expression index).
+    fn users_table_with_email_unique_index() -> Table {
+        use autumn_schema_core::{ColumnType, Index};
+        let mut id = Column::new("id".to_string(), ColumnType::Int64);
+        id.primary_key = true;
+        let email = Column::new("email".to_string(), ColumnType::Text);
+        let mut table = Table::new("users", Backend::Postgres);
+        table.managed = true;
+        table.primary_key = vec!["id".to_string()];
+        table.columns = vec![id, email];
+        table.indexes = vec![Index {
+            name: "users_email_key".to_string(),
+            columns: vec!["email".to_string()],
+            unique: true,
+            // A constraint-owned unique index, retained verbatim by `schema pull`.
+            definition: Some("CREATE UNIQUE INDEX users_email_key ON users (email)".to_string()),
+            is_partial: false,
+            key_columns: Vec::new(),
+        }];
+        table
+    }
+
+    fn drop_email_plan() -> MigrationPlan {
+        use autumn_schema_core::{Column, ColumnType};
+        MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::DropColumn {
+                table: "users".to_string(),
+                column: Column::new("email".to_string(), ColumnType::Text),
+            }],
+        }
+    }
+
+    #[test]
+    fn project_plan_target_prunes_retained_index_depending_on_dropped_column() {
+        // Dropping `email` cascade-drops the retained unique index in Postgres, so
+        // the projected snapshot must contain NEITHER the column NOR the index —
+        // otherwise `doctor` / `pull --dry-run` would report false perpetual drift.
+        let baseline = vec![users_table_with_email_unique_index()];
+        let projected = project_plan_target(&baseline, &drop_email_plan());
+        let users = projected
+            .iter()
+            .find(|t| t.name == "users")
+            .expect("users table retained");
+        assert!(
+            users.columns.iter().all(|c| c.name != "email"),
+            "dropped column must be gone: {:?}",
+            users.columns
+        );
+        assert!(
+            users.indexes.is_empty(),
+            "retained index depending on the dropped column must be pruned: {:?}",
+            users.indexes
+        );
+    }
+
+    #[test]
+    fn project_plan_target_keeps_retained_index_on_unrelated_column() {
+        use autumn_schema_core::{Column, ColumnType, Index};
+        // A retained expression index on `handle`; a DropColumn of the UNRELATED
+        // `email` must leave it intact (no over-pruning).
+        let mut table = Table::new("users", Backend::Postgres);
+        table.managed = true;
+        let mut id = Column::new("id".to_string(), ColumnType::Int64);
+        id.primary_key = true;
+        table.primary_key = vec!["id".to_string()];
+        table.columns = vec![
+            id,
+            Column::new("email".to_string(), ColumnType::Text),
+            Column::new("handle".to_string(), ColumnType::Text),
+        ];
+        table.indexes = vec![Index {
+            name: "users_lower_handle_idx".to_string(),
+            columns: vec!["handle".to_string()],
+            unique: false,
+            definition: Some(
+                "CREATE INDEX users_lower_handle_idx ON users (lower(handle))".to_string(),
+            ),
+            is_partial: false,
+            key_columns: Vec::new(),
+        }];
+        let projected = project_plan_target(&[table], &drop_email_plan());
+        let users = projected
+            .iter()
+            .find(|t| t.name == "users")
+            .expect("users table");
+        assert_eq!(
+            users.indexes.len(),
+            1,
+            "an index on an unrelated column must survive: {:?}",
+            users.indexes
+        );
+        assert_eq!(users.indexes[0].name, "users_lower_handle_idx");
+    }
+
+    #[test]
+    fn project_plan_target_false_drift_regression_is_clean() {
+        // Snapshot = the projected target (post-Part-A). The live DB (like
+        // Postgres) also lacks the cascade-dropped column AND index. The
+        // authoritative drift check must then report Clean — proving the false
+        // perpetual drift is gone.
+        let baseline = vec![users_table_with_email_unique_index()];
+        let snapshot = project_plan_target(&baseline, &drop_email_plan());
+
+        // The database after `ALTER TABLE users DROP COLUMN email` cascades:
+        // no `email` column, no dependent index.
+        let mut db_users = users_table_with_email_unique_index();
+        db_users.columns.retain(|c| c.name != "email");
+        db_users.indexes.clear();
+        let db = vec![db_users];
+
+        let drift = doctor::compute_db_schema_drift(&snapshot, &db);
+        assert!(
+            drift.is_clean(),
+            "projected snapshot must match the cascade-dropped DB (no false drift); \
+             forward={:?} reverse={:?}",
+            drift.forward.changes,
+            drift.reverse.changes
+        );
+    }
+
+    // -- `pull --dry-run` report formatting (pure) ---------------------------
+
+    /// A `posts(id BIGINT PK, created_at TIMESTAMP [default])` table. `default`
+    /// controls the `created_at` default; `extra` adds a trailing `TEXT` column.
+    fn dry_run_posts(default: Option<autumn_schema_core::ColumnDefault>, extra: bool) -> Table {
+        use autumn_schema_core::{Column, ColumnType};
+        let mut id = Column::new("id".to_string(), ColumnType::Int64);
+        id.primary_key = true;
+        let mut created_at = Column::new("created_at".to_string(), ColumnType::Timestamp);
+        created_at.default = default;
+        let mut table = Table::new("posts", Backend::Postgres);
+        table.managed = true;
+        table.primary_key = vec!["id".to_string()];
+        table.columns = vec![id, created_at];
+        if extra {
+            table
+                .columns
+                .push(Column::new("extra".to_string(), ColumnType::Text));
+        }
+        table
+    }
+
+    #[test]
+    fn dry_run_report_surfaces_reverse_only_removal_alongside_forward_change() {
+        // Snapshot: posts(id, created_at DEFAULT now()). Live DB: added an `extra`
+        // column AND dropped the `created_at` default. The forward plan catches the
+        // added column; the reverse-only pass must still surface the dropped
+        // default — the two must both appear, not just the forward change.
+        let snapshot = vec![dry_run_posts(
+            Some(autumn_schema_core::ColumnDefault::Now),
+            false,
+        )];
+        let db = vec![dry_run_posts(None, true)];
+        let drift = doctor::compute_db_schema_drift(&snapshot, &db);
+
+        // Precondition: the forward plan is non-empty (the added column) so we are
+        // exercising the "both directions non-empty" path, not the old fallback.
+        assert!(
+            !drift.forward.is_empty(),
+            "forward plan should carry the added column: {:?}",
+            drift.forward.changes
+        );
+
+        let report = format_pull_dry_run_report(
+            &drift.forward,
+            &drift.reverse,
+            Path::new(".autumn/schema-snapshot.json"),
+        );
+
+        assert!(
+            report.contains("ADD COLUMN posts.extra"),
+            "dry-run report must include the forward added-column change:\n{report}"
+        );
+        assert!(
+            report.contains("pulling would also remove from the snapshot")
+                && report.contains("default on `posts.created_at`"),
+            "dry-run report must ALSO surface the reverse-only dropped default even though a \
+             forward change exists:\n{report}"
+        );
+    }
+
+    #[test]
+    fn dry_run_report_reverse_only_removal_with_empty_forward() {
+        // Only a dropped default (no forward change) — the reverse-only removal must
+        // still be surfaced (never a false "up to date").
+        let snapshot = vec![dry_run_posts(
+            Some(autumn_schema_core::ColumnDefault::Now),
+            false,
+        )];
+        let db = vec![dry_run_posts(None, false)];
+        let drift = doctor::compute_db_schema_drift(&snapshot, &db);
+        assert!(
+            drift.forward.is_empty(),
+            "forward pass must miss the dropped default"
+        );
+
+        let report = format_pull_dry_run_report(
+            &drift.forward,
+            &drift.reverse,
+            Path::new(".autumn/schema-snapshot.json"),
+        );
+        assert!(
+            report.contains("default on `posts.created_at`"),
+            "dry-run report must surface the reverse-only dropped default:\n{report}"
+        );
+        assert!(
+            !report.contains("is up to date"),
+            "a dropped default is drift, never 'up to date':\n{report}"
+        );
+    }
+
+    #[test]
+    fn dry_run_report_clean_when_both_directions_empty() {
+        let snapshot = vec![dry_run_posts(
+            Some(autumn_schema_core::ColumnDefault::Now),
+            false,
+        )];
+        let db = snapshot.clone();
+        let drift = doctor::compute_db_schema_drift(&snapshot, &db);
+        let report = format_pull_dry_run_report(
+            &drift.forward,
+            &drift.reverse,
+            Path::new(".autumn/schema-snapshot.json"),
+        );
+        assert!(
+            report.contains("is up to date"),
+            "identical snapshot/DB must report up to date:\n{report}"
         );
     }
 }
