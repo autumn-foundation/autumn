@@ -107,7 +107,9 @@ each week. It skips a sandboxed listing, because it cannot fetch the
 artifact. For a sandboxed listing, run
 `autumn plugin inspect <file>.autumn-plugin --format json > hello.json`, then
 `autumn plugin index record --inspect hello.json`. This copies the
-capabilities and the artifact digest from the artifact.
+capabilities and the artifact digest from the artifact. For a new version of a
+listed artifact, run `inspect` with `--against <old>.autumn-plugin`. If the new
+version asks for more authority, `record` flags the listing.
 
 The job uploads the `plugin-index-reports` artifact. It holds one report per
 listing and `index.toml`: the index with the reports already recorded.

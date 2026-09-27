@@ -675,6 +675,30 @@ pub fn pinned_version(version: &str) -> String {
     format!("={version}")
 }
 
+/// Refuse when the app already declares `crate_name` at a requirement other
+/// than the verified `pinned` one. The trust review vouches for that version
+/// only.
+///
+/// # Errors
+///
+/// A message naming both requirements. No file is changed.
+pub fn check_existing_pin(manifest: &str, crate_name: &str, pinned: &str) -> Result<(), String> {
+    if !install::dependency_present(manifest, crate_name) {
+        return Ok(());
+    }
+    match install::declared_dependency_version(manifest, crate_name) {
+        Some(declared) if declared == pinned => Ok(()),
+        declared => Err(format!(
+            "Cargo.toml already declares `{crate_name}`{}, but the index verified `{pinned}`. \
+             Set `{crate_name} = \"{pinned}\"` or remove the entry, then re-run. No files were changed.",
+            declared.map_or_else(
+                || " from a path or git source".to_owned(),
+                |v| format!(" = \"{v}\"")
+            )
+        )),
+    }
+}
+
 /// Load the index ([`index::OVERRIDE_ENV`] or the bundled copy) and refuse
 /// one that breaks an admission rule: its trust labels cannot be shown.
 ///
@@ -813,6 +837,12 @@ pub fn run_add(opts: &AddOptions<'_>) -> i32 {
         // A listed crate installs the version the index verified. No
         // crates.io lookup, so this works with `--offline`.
         (Resolved::Community(crate_name), Some(version)) => {
+            let manifest =
+                std::fs::read_to_string(install::manifest_path(opts.root)).unwrap_or_default();
+            if let Err(err) = check_existing_pin(&manifest, crate_name, &version) {
+                eprintln!("autumn plugin add: {err}");
+                return 1;
+            }
             install::plan_add_community(opts.root, crate_name, &version)
         }
         (Resolved::Community(crate_name), None) => {
@@ -1855,6 +1885,19 @@ mod tests {
         let err = gate_listing(&listing, Some(RELEASE)).unwrap_err();
         assert!(err.contains(">=0.8, <0.10"), "{err}");
         assert!(!err.contains("re-verification"), "{err}");
+    }
+
+    /// An existing requirement other than the verified pin is refused.
+    #[test]
+    fn an_existing_unpinned_requirement_is_refused() {
+        let manifest = "[package]\nname = \"x\"\n\n[dependencies]\nautumn-plugin-x = \"0.4\"\n";
+        let err = check_existing_pin(manifest, "autumn-plugin-x", "=0.3.0").unwrap_err();
+        assert!(err.contains("0.4") && err.contains("=0.3.0"), "{err}");
+        let path = "[dependencies]\nautumn-plugin-x = { path = \"../x\" }\n";
+        assert!(check_existing_pin(path, "autumn-plugin-x", "=0.3.0").is_err());
+        let pinned = "[dependencies]\nautumn-plugin-x = \"=0.3.0\"\n";
+        assert!(check_existing_pin(pinned, "autumn-plugin-x", "=0.3.0").is_ok());
+        assert!(check_existing_pin("[dependencies]\n", "autumn-plugin-x", "=0.3.0").is_ok());
     }
 
     /// A listed community crate is pinned to its verified version.

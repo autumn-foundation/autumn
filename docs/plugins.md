@@ -153,7 +153,9 @@ Unlisted (not in the plugin index, not verified):
 changes a file. Then:
 
 - A listed community crate installs at the version the index verified,
-  pinned with `=`. There is no crates.io lookup, so `--offline` works.
+  pinned with `=`. There is no crates.io lookup, so `--offline` works. If
+  `Cargo.toml` already names the crate at another requirement, the command
+  refuses and changes no file.
 - A listing that failed re-verification is refused, with the reason. It is
   also refused when the app's `autumn-web` version is not a plain version.
 - A sandboxed listing is not wired. The command prints the review steps

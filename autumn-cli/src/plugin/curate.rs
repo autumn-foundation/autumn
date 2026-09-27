@@ -159,6 +159,24 @@ pub struct InspectReport {
     pub loads: bool,
     /// The route-conformance report.
     pub conformance: ConformanceReport,
+    /// What the artifact asks for beyond the one named by `--against`.
+    #[serde(default)]
+    pub upgrade: Option<serde_json::Value>,
+}
+
+impl InspectReport {
+    /// Whether `--against` found new authority: any non-empty list in the
+    /// delta. Read generically, so a field added later still counts.
+    #[must_use]
+    pub fn needs_consent(&self) -> bool {
+        self.upgrade.as_ref().is_some_and(|delta| {
+            delta.as_object().is_some_and(|fields| {
+                fields
+                    .values()
+                    .any(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+            })
+        })
+    }
 }
 
 /// Write an `autumn plugin inspect --format json` result into a sandboxed
@@ -190,6 +208,11 @@ pub fn apply_inspect(
     let mut failed = Vec::new();
     if !report.loads {
         failed.push("load".to_owned());
+    }
+    // `inspect --against` exits 1 when the artifact grows its authority. A
+    // listing must not vouch for a grant nobody consented to.
+    if report.needs_consent() {
+        failed.push("upgrade-consent".to_owned());
     }
     failed.extend(
         report
@@ -730,7 +753,25 @@ mod tests {
                 checks: vec![check("installability", CheckStatus::Pass)],
                 contract: None,
             },
+            upgrade: None,
         }
+    }
+
+    /// `inspect --against` refuses an artifact that grows its authority.
+    /// `record` must not turn that refusal into a listing.
+    #[test]
+    fn an_upgrade_that_needs_consent_is_flagged() {
+        let mut l = sandboxed();
+        let mut r = inspect(true);
+        r.upgrade = Some(serde_json::json!({"added_capabilities": ["kv"], "added_hosts": []}));
+        let t = apply_inspect(&mut l, &r, "0.7.0", "2026-10-01").expect("apply");
+        assert_eq!(t, Transition::Flagged);
+        assert!(l.note.contains("upgrade-consent"), "{}", l.note);
+
+        let mut r = inspect(true);
+        r.upgrade = Some(serde_json::json!({"added_capabilities": [], "added_hosts": []}));
+        let t = apply_inspect(&mut sandboxed(), &r, "0.7.0", "2026-10-01").expect("apply");
+        assert_eq!(t, Transition::Listed);
     }
 
     /// AC 1: a sandboxed listing's manifest comes from the artifact.
