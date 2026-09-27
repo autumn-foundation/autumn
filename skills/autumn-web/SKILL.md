@@ -767,7 +767,8 @@ probe IS the referential check: an unknown/soft-deleted/foreign-tenant parent
 is `404`, a `reply_to` on a different record or past `max_depth` is `422`, and
 `comment_count` moves via the counter-cache primitive in the **same
 transaction**. `delete_comment` is idempotent and decrements by the rows it
-actually removed. **Like `react()`, these take their own pooled connection —
+actually removed. With `soft_delete = false` it refuses (`422`) a subtree that
+has a reply on another record. **Like `react()`, these take their own pooled connection —
 never hold a `Db` extractor across the call.**
 
 Mount the routes ONCE for the whole app; the registry dispatches on the type

@@ -1181,10 +1181,7 @@ async fn a_soft_delete_leaves_a_reply_on_another_record_live() {
         .await
         .expect("graft across records");
 
-    assert_eq!(
-        repo.delete_comment(mine, root.id).await.expect("delete"),
-        1
-    );
+    assert_eq!(repo.delete_comment(mine, root.id).await.expect("delete"), 1);
     assert_eq!(counter(&mut conn, "cmt_posts", mine).await, 0);
     assert_eq!(counter(&mut conn, "cmt_posts", other).await, 1);
     assert_eq!(
