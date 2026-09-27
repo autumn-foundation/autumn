@@ -1,7 +1,7 @@
 # autumn-schema-core
 
 Canonical, dialect-independent schema IR + type mappings for the
-[Autumn](https://github.com/madmax983/autumn) web framework.
+[Autumn](https://github.com/autumn-foundation/autumn) web framework.
 
 This is a **leaf** crate: it depends only on `serde` and pulls in neither
 `diesel`, `syn`, nor `autumn-web`, so both `autumn-macros` and `autumn-cli` can

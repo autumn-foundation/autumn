@@ -1,1 +1,30 @@
 msrv = "1.88.0"
+
+# ── Determinism seam gate (issue #1797) ──────────────────────────────────────
+# Bans reading time / minting ids off the framework's injected seams, so a
+# `#[sim_test]` replays byte-for-byte from its seed. See CONTRIBUTING.md
+# "Determinism seam gate" and scripts/check-determinism-gate.sh.
+#
+# POLARITY (deliberately inverted from the panic gate): `disallowed_methods` is
+# warn-by-default and this file is workspace-global with no level control, so
+# populating this array would otherwise arm the lint in all 24 workspace members
+# at once — hundreds of pre-existing sites, in crates (examples, the CLI's code
+# generators) that are not part of the determinism story at all. Instead
+# `[workspace.lints.clippy] disallowed_methods = "allow"` in the root Cargo.toml
+# grandfathers everything, and a module opts IN by carrying the
+# `autumn-determinism-gate:` header. The gate script enforces that the manifest
+# only ever grows.
+#
+# NEVER add a crate-local clippy.toml: clippy resolves its config from the
+# nearest ancestor of CARGO_MANIFEST_DIR and stops there, so a crate-local file
+# SHADOWS this one entirely — silently disarming this ban and dropping the MSRV
+# pin with no diagnostic. check-determinism-gate.sh fails if one appears.
+#
+# `reason` strings are the error message a contributor sees, so each one names
+# the replacement rather than just saying no.
+disallowed-methods = [
+  { path = "std::time::Instant::now", reason = "measure elapsed time through the injected clock: state.monotonic(), the Clock extractor's .monotonic(), or clock.monotonic() on an Arc<dyn ClockSource>, then MonotonicInstant::saturating_duration_since. std::time::Instant is NOT virtualized by tokio's paused clock, so this reads the real machine clock even inside a #[sim_test]. For a deadline whose counterparty is tokio::time::sleep, use tokio::time::Instant. With no clock reachable at all, use autumn_web::time::monotonic_now(). (#1797)" },
+  { path = "chrono::Utc::now", reason = "read the injected wall clock: state.clock().now(), or the Clock extractor in a handler. (#1797)" },
+  { path = "std::time::SystemTime::now", reason = "use autumn_web::time::clock_unix_secs(clock) / clock_unix_duration(clock), which read the injected clock. (#1797)" },
+  { path = "uuid::Uuid::new_v4", reason = "mint ids through the injected entropy source: state.entropy().uuid_v4(), or the Rng extractor in a handler. (#1797)" },
+]

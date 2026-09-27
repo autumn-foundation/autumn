@@ -44,6 +44,51 @@ pub enum Backend {
     Sqlite,
 }
 
+/// A `SQLite` **type-affinity class** — the five storage-affinity buckets `SQLite`
+/// assigns a column from its declared type (`SQLite` docs §3.1).
+///
+/// Because `SQLite` stores only the declared-type string, distinct IR
+/// [`ColumnType`]s that the emitter renders to the same declared type share an
+/// affinity class and are indistinguishable after a pull; the diff compares by this
+/// class on the `SQLite` backend (see [`ColumnType::sqlite_affinity`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqliteAffinity {
+    /// Declared type contains `INT` (e.g. `INTEGER`, `BIGINT`).
+    Integer,
+    /// Declared type contains `CHAR`, `CLOB`, or `TEXT`.
+    Text,
+    /// Declared type contains `BLOB`, or is empty.
+    Blob,
+    /// Declared type contains `REAL`, `FLOA`, or `DOUB`.
+    Real,
+    /// Anything else (e.g. `NUMERIC`, `DECIMAL`) — the ambiguous catch-all.
+    Numeric,
+}
+
+/// Compute the `SQLite` type-affinity class of a declared-type string.
+///
+/// Follows `SQLite`'s canonical affinity-determination algorithm (docs §3.1),
+/// matched in order (case-insensitively): contains `INT` →
+/// [`Integer`](SqliteAffinity::Integer); contains `CHAR`/`CLOB`/`TEXT` →
+/// [`Text`](SqliteAffinity::Text); contains `BLOB` or empty →
+/// [`Blob`](SqliteAffinity::Blob); contains `REAL`/`FLOA`/`DOUB` →
+/// [`Real`](SqliteAffinity::Real); otherwise [`Numeric`](SqliteAffinity::Numeric).
+#[must_use]
+pub fn sqlite_affinity(declared_type: &str) -> SqliteAffinity {
+    let t = declared_type.to_ascii_uppercase();
+    if t.contains("INT") {
+        SqliteAffinity::Integer
+    } else if t.contains("CHAR") || t.contains("CLOB") || t.contains("TEXT") {
+        SqliteAffinity::Text
+    } else if t.is_empty() || t.contains("BLOB") {
+        SqliteAffinity::Blob
+    } else if t.contains("REAL") || t.contains("FLOA") || t.contains("DOUB") {
+        SqliteAffinity::Real
+    } else {
+        SqliteAffinity::Numeric
+    }
+}
+
 /// A logical, dialect-independent column type.
 ///
 /// This is the canonical vocabulary the IR speaks in; the concrete Rust type,
@@ -82,6 +127,15 @@ pub enum ColumnType {
     /// PG `JSONB` / `SQLite` `TEXT`. Conventionally nullable (`Option<Blob>`); the
     /// bytes themselves live in the configured storage backend.
     Attachment,
+    /// Arbitrary structured data — PG `JSONB` / `SQLite` `TEXT` (issue #1341).
+    /// Unlike [`Attachment`](Self::Attachment), maps directly to bare
+    /// `serde_json::Value` (no wrapper struct): diesel itself already
+    /// implements `FromSql`/`ToSql<Jsonb, Pg>` **and** `<Json, Sqlite>` for
+    /// `serde_json::Value`, so no `autumn-web` conversion code is needed on
+    /// either backend. On `SQLite` the column is `TEXT` via diesel's `Json`
+    /// sql-type specifically — not diesel's `Jsonb` sql-type on `SQLite`,
+    /// which uses a proprietary binary encoding rather than plain-text JSON.
+    Json,
     /// An exact-precision decimal — PG `NUMERIC(precision, scale)` / `SQLite`
     /// `TEXT` (`SQLite`'s `NUMERIC` affinity would coerce to a lossy float, so the
     /// value round-trips through `rust_decimal`'s text form instead). Defaults to
@@ -101,6 +155,23 @@ pub enum ColumnType {
         /// The allowed variant labels, in declaration order.
         variants: Vec<String>,
     },
+    /// A Postgres type outside Autumn's mapped surface, **preserved verbatim** by
+    /// database introspection (`autumn schema pull`) so an unmappable column is
+    /// never silently dropped from the snapshot IR.
+    ///
+    /// This variant is **introspection/snapshot-only**: it records the raw
+    /// Postgres type name (e.g. `inet`, `citext`, `macaddr`) exactly as read from
+    /// the catalog. [`sql_type`](Self::sql_type) emits `pg_type` verbatim (on both
+    /// backends), so a pulled snapshot round-trips the raw type. It is deliberately
+    /// **not** intended for Rust codegen in this slice — [`rust_type`](Self::rust_type)
+    /// and [`diesel_type`](Self::diesel_type) return a safe `String`/`Text`
+    /// sentinel rather than a faithful mapping (an opaque type has no known Rust
+    /// representation), and there is no forward DSL / `#[model]` source that
+    /// produces it.
+    Opaque {
+        /// The raw Postgres type name (`udt_name`), preserved exactly.
+        pg_type: String,
+    },
 }
 
 impl ColumnType {
@@ -114,7 +185,10 @@ impl ColumnType {
     #[must_use]
     pub fn rust_type(&self) -> String {
         match self {
-            Self::Text | Self::Enum { .. } => "String",
+            // `Opaque` is introspection-only and has no known Rust representation,
+            // so it shares the `String` storage-fallback sentinel (it is not
+            // intended for Rust codegen in this slice — never panics).
+            Self::Text | Self::Enum { .. } | Self::Opaque { .. } => "String",
             Self::Int32 => "i32",
             Self::Int64 => "i64",
             Self::Bool => "bool",
@@ -125,9 +199,31 @@ impl ColumnType {
             Self::TimestampTz => "chrono::DateTime<chrono::Utc>",
             Self::Bytes => "Vec<u8>",
             Self::Attachment => "autumn_web::storage::Blob",
+            Self::Json => "serde_json::Value",
             Self::Decimal { .. } => "rust_decimal::Decimal",
         }
         .to_owned()
+    }
+
+    /// [`rust_type`](Self::rust_type) for `backend` (issue #1924).
+    ///
+    /// Mirrors `dsl::FieldKind::rust_type_for`. Postgres is byte-for-byte
+    /// [`rust_type`](Self::rust_type); on `SQLite`, [`Uuid`](Self::Uuid) and
+    /// [`Decimal`](Self::Decimal) render `autumn-web`'s `TEXT`-backed newtypes,
+    /// because `uuid::Uuid` and `rust_decimal::Decimal` are foreign to
+    /// `autumn-web` and diesel blanket-implements `AsExpression` for every
+    /// `Expression`, leaving no crate that could give them a `SQLite`
+    /// conversion.
+    #[must_use]
+    pub fn rust_type_for(&self, backend: Backend) -> String {
+        match backend {
+            Backend::Postgres => self.rust_type(),
+            Backend::Sqlite => match self {
+                Self::Uuid => "autumn_web::db::sqlite_types::SqliteUuid".to_owned(),
+                Self::Decimal { .. } => "autumn_web::db::sqlite_types::SqliteDecimal".to_owned(),
+                _ => self.rust_type(),
+            },
+        }
     }
 
     /// The diesel `table!` schema type token for `backend`.
@@ -141,7 +237,9 @@ impl ColumnType {
     pub const fn diesel_type(&self, backend: Backend) -> &'static str {
         match backend {
             Backend::Postgres => match self {
-                Self::Text | Self::Enum { .. } => "Text",
+                // `Opaque` shares the `Text` diesel sentinel (introspection-only,
+                // not intended for diesel codegen).
+                Self::Text | Self::Enum { .. } | Self::Opaque { .. } => "Text",
                 Self::Int32 => "Int4",
                 Self::Int64 => "Int8",
                 Self::Bool => "Bool",
@@ -151,25 +249,33 @@ impl ColumnType {
                 Self::Timestamp => "Timestamp",
                 Self::TimestampTz => "Timestamptz",
                 Self::Bytes => "Bytea",
-                Self::Attachment => "Jsonb",
+                Self::Attachment | Self::Json => "Jsonb",
                 Self::Decimal { .. } => "Numeric",
             },
             Backend::Sqlite => match self {
+                // `Opaque` shares the `Text` diesel sentinel (introspection-only).
                 Self::Text
                 | Self::Uuid
                 | Self::Attachment
                 | Self::Decimal { .. }
-                | Self::Enum { .. } => "Text",
+                | Self::Enum { .. }
+                | Self::Opaque { .. } => "Text",
                 Self::Int32 => "Int4",
                 Self::Int64 => "Int8",
                 Self::Bool => "Bool",
                 Self::Float32 => "Float4",
                 Self::Float64 => "Float8",
                 // `NaiveDateTime` -> core, ungated `Timestamp` (compiles).
-                // `DateTime<Utc>` -> nominal `Timestamp` for documentation only;
-                // it is rejected at generate time (see `sqlite_has_diesel_conversion`).
-                Self::Timestamp | Self::TimestampTz => "Timestamp",
+                Self::Timestamp => "Timestamp",
+                // `DateTime<Utc>` -> diesel's SQLite `TimestamptzSqlite` (issue
+                // #1924); its `sqlite`+`chrono` conversion resolves through the
+                // app's `autumn-web` sqlite feature.
+                Self::TimestampTz => "TimestamptzSqlite",
                 Self::Bytes => "Binary",
+                // Diesel's own `Json` sql-type — not `Text` (no built-in
+                // `serde_json::Value` conversion) and not `Jsonb` (SQLite's
+                // proprietary binary encoding). See the `Json` variant's doc.
+                Self::Json => "Json",
             },
         }
     }
@@ -195,8 +301,10 @@ impl ColumnType {
                 Self::Timestamp => "TIMESTAMP".to_owned(),
                 Self::TimestampTz => "TIMESTAMPTZ".to_owned(),
                 Self::Bytes => "BYTEA".to_owned(),
-                Self::Attachment => "JSONB".to_owned(),
+                Self::Attachment | Self::Json => "JSONB".to_owned(),
                 Self::Decimal { precision, scale } => format!("NUMERIC({precision},{scale})"),
+                // Preserved verbatim: the raw Postgres type name round-trips.
+                Self::Opaque { pg_type } => pg_type.clone(),
             },
             Backend::Sqlite => match self {
                 Self::Text
@@ -204,35 +312,59 @@ impl ColumnType {
                 | Self::Timestamp
                 | Self::TimestampTz
                 | Self::Attachment
+                | Self::Json
                 | Self::Decimal { .. }
                 | Self::Enum { .. } => "TEXT".to_owned(),
                 Self::Int32 | Self::Int64 | Self::Bool => "INTEGER".to_owned(),
                 Self::Float32 | Self::Float64 => "REAL".to_owned(),
                 Self::Bytes => "BLOB".to_owned(),
+                // Preserved verbatim (an `Opaque` is only ever produced by
+                // Postgres introspection, but the arm is emitted on both backends
+                // for exhaustiveness and never loses the raw type name).
+                Self::Opaque { pg_type } => pg_type.clone(),
             },
         }
+    }
+
+    /// The `SQLite` **type-affinity class** of this column type, derived from the
+    /// declared type the emitter renders on `SQLite` ([`sql_type`](Self::sql_type)
+    /// with [`Backend::Sqlite`]) via [`sqlite_affinity`].
+    ///
+    /// Because `SQLite` stores only the declared-type STRING (and applies affinity
+    /// rules), the emitter collapses several distinct IR types onto the same
+    /// declared type — `Int32`/`Int64`/`Bool` → `INTEGER`, `Float32`/`Float64` →
+    /// `REAL`, `Text`/`Uuid`/`Timestamp`/`TimestampTz`/`Decimal`/`Attachment`/`Enum`
+    /// → `TEXT`, `Bytes` → `BLOB` — so a pulled `SQLite` snapshot cannot recover the
+    /// original variant. The diff uses THIS class (not exact [`ColumnType`]
+    /// equality) on the `SQLite` backend so a matching model↔pull round-trips clean
+    /// while a genuine class change (e.g. `INTEGER`→`TEXT`) still drifts. Deriving it
+    /// from the rendered declared type keeps it automatically consistent with
+    /// whatever the emitter produces.
+    #[must_use]
+    pub fn sqlite_affinity(&self) -> SqliteAffinity {
+        sqlite_affinity(&self.sql_type(Backend::Sqlite))
     }
 
     /// Whether this type's rendered Rust model type has a working diesel
     /// `FromSql`/`ToSql` on diesel's `SQLite` backend in a generated app's feature
     /// set (diesel `sqlite` + `chrono`, without `uuid`/`numeric`).
     ///
-    /// Mirrors `dsl::FieldKind::sqlite_has_diesel_conversion`: `false` for
-    /// [`Uuid`](Self::Uuid), [`Attachment`](Self::Attachment),
-    /// [`Decimal`](Self::Decimal), [`TimestampTz`](Self::TimestampTz), and
-    /// [`Enum`](Self::Enum) (all rejected at generate time on `SQLite`, issue
-    /// #1924); `true` for every other type — including [`Timestamp`](Self::Timestamp)
-    /// via the core, ungated diesel `Timestamp` sql-type.
+    /// Mirrors `dsl::FieldKind::sqlite_has_diesel_conversion`: `true` for every
+    /// mapped type as of issue #1924 — [`Timestamp`](Self::Timestamp) via the
+    /// core, ungated diesel `Timestamp` sql-type, [`TimestampTz`](Self::TimestampTz)
+    /// via diesel's `SQLite` `TimestamptzSqlite`, [`Attachment`](Self::Attachment)
+    /// via `autumn-web`'s local `Blob` `Text`/`Sqlite` conversion,
+    /// [`Uuid`](Self::Uuid) and [`Decimal`](Self::Decimal) via `autumn-web`'s
+    /// `TEXT`-backed newtypes (see [`ColumnType::rust_type_for`]),
+    /// [`Enum`](Self::Enum) via the app-local `Text`/`Sqlite` impls the model
+    /// generator emits, and [`Json`](Self::Json) via diesel's own
+    /// `FromSql`/`ToSql<Json, Sqlite> for serde_json::Value` (issue #1341).
+    ///
+    /// Only [`Opaque`](Self::Opaque) is `false`: it is introspection-only and
+    /// carries a raw Postgres type name with no known diesel conversion.
     #[must_use]
     pub const fn sqlite_has_diesel_conversion(&self) -> bool {
-        !matches!(
-            self,
-            Self::Uuid
-                | Self::Attachment
-                | Self::Decimal { .. }
-                | Self::TimestampTz
-                | Self::Enum { .. }
-        )
+        !matches!(self, Self::Opaque { .. })
     }
 
     /// Inverse of the Postgres mapping: resolve a Postgres `udt_name` (the
@@ -245,9 +377,10 @@ impl ColumnType {
     /// error rather than silently dropping a column. Two types are deliberately
     /// unsupported even though the forward mapping produces them:
     ///
-    /// - **`jsonb` → `None`**: although [`Attachment`](Self::Attachment) forward-maps
-    ///   to `JSONB`, the inverse is ambiguous — a brownfield `jsonb` column is
-    ///   usually arbitrary application JSON, not an Autumn `Blob`, and
+    /// - **`jsonb` → `None`**: although [`Attachment`](Self::Attachment) (and,
+    ///   since issue #1341, [`Json`](Self::Json) too) forward-maps to `JSONB`,
+    ///   the inverse is ambiguous — a brownfield `jsonb` column could be
+    ///   arbitrary application JSON, an Autumn `Blob`, or a `Json` field, and
     ///   introspection cannot tell them apart.
     /// - **`numeric` → `None`**: a bare `numeric` `udt_name` carries no
     ///   precision/scale, so it cannot be reconstructed into a
@@ -271,6 +404,112 @@ impl ColumnType {
         }
     }
 
+    /// The centralized database-introspection inverse used by `autumn schema
+    /// pull`: resolve a Postgres `udt_name` plus its catalog `numeric_precision`
+    /// / `numeric_scale` (only meaningful for `numeric`/`decimal`) to a
+    /// [`ColumnType`] that is **always** produced — an unmappable type is
+    /// preserved as [`Opaque`](Self::Opaque) rather than dropped.
+    ///
+    /// Resolution order:
+    ///
+    /// 0. A **length-limited character type** — `varchar` (`character varying`) or
+    ///    `bpchar` (`character`/`char`) **with** a `character_maximum_length` — is
+    ///    preserved as [`Opaque`](Self::Opaque) carrying `varchar(n)` / `char(n)`
+    ///    so the DB-enforced length limit survives recreation rather than being
+    ///    flattened to an unconstrained `TEXT`. An unbounded `varchar` (length
+    ///    `None`, or `text`, which never carries a length) falls through to `Text`.
+    /// 1. [`from_pg_udt`](Self::from_pg_udt) — the shared mapped surface
+    ///    (`text`/`int4`/`int8`/`bool`/`float4`/`float8`/`uuid`/`timestamp`/
+    ///    `timestamptz`/`bytea`).
+    /// 2. `numeric` / `decimal` **with** an in-`u8`-range precision (and scale)
+    ///    available → [`Decimal`](Self::Decimal). A bare `numeric` with no
+    ///    precision carries no `(p, s)` to reconstruct, so it falls through to
+    ///    `Opaque` rather than guessing; and an out-of-range precision/scale (a
+    ///    valid Postgres `NUMERIC(1000, 0)` or a negative scale that does not fit
+    ///    the `u8` fields) is likewise preserved as [`Opaque`](Self::Opaque) with a
+    ///    faithfully-reconstructed `numeric(...)` type string rather than silently
+    ///    clamped to `NUMERIC(255, 0)`.
+    /// 3. `jsonb` → [`Attachment`](Self::Attachment). Autumn only ever emits
+    ///    `jsonb` for an [`Attachment`](Self::Attachment) column, so a pulled
+    ///    `jsonb` column is round-tripped as an attachment. (This is the
+    ///    deliberate introspection counterpart to
+    ///    [`from_pg_udt`](Self::from_pg_udt) returning `None` for `jsonb` — that
+    ///    inverse is used by the model-scaffolding `db pull`, which must not
+    ///    guess `Blob` for arbitrary brownfield JSON; the declarative-schema
+    ///    `schema pull` instead prioritises a clean round-trip of Autumn-owned
+    ///    tables.)
+    /// 4. Anything else → [`Opaque`](Self::Opaque) carrying the raw `udt`, so the
+    ///    column is never silently lost.
+    #[must_use]
+    pub fn from_pg_introspection(
+        udt: &str,
+        numeric_precision: Option<i32>,
+        numeric_scale: Option<i32>,
+        character_maximum_length: Option<i32>,
+    ) -> Self {
+        // Fail-closed floor for length-limited character types. `VARCHAR(32)` and
+        // `CHAR(2)` report `udt_name` `varchar` / `bpchar`, which `from_pg_udt`
+        // otherwise collapses to `Text`, silently dropping the DB-enforced length
+        // limit (recreation would emit an unconstrained `TEXT`). When a length
+        // modifier is present, preserve the column verbatim as `Opaque` carrying a
+        // valid Postgres type string (`Opaque`'s `sql_type` emits `pg_type`
+        // unchanged), checked BEFORE the `from_pg_udt` mapped return. An unbounded
+        // `varchar` (or `text`, which never carries a length) has `None` here and
+        // maps to `Text` exactly as before.
+        if let Some(length) = character_maximum_length {
+            match udt {
+                "varchar" => {
+                    return Self::Opaque {
+                        pg_type: format!("varchar({length})"),
+                    };
+                }
+                "bpchar" => {
+                    return Self::Opaque {
+                        pg_type: format!("char({length})"),
+                    };
+                }
+                _ => {}
+            }
+        }
+        if let Some(mapped) = Self::from_pg_udt(udt) {
+            return mapped;
+        }
+        if matches!(udt, "numeric" | "decimal")
+            && let Some(precision) = numeric_precision
+        {
+            // Map to `Decimal` ONLY when both precision and scale fit the `u8`
+            // fields — never silently clamp an out-of-range `NUMERIC(1000, 0)` (or
+            // a negative/oversized scale) down to `NUMERIC(255, 0)`. An out-of-
+            // range value is instead preserved as `Opaque` with a faithfully-
+            // reconstructed type string, so the down migration re-adds the true
+            // type verbatim (`Opaque`'s `sql_type` emits `pg_type` unchanged).
+            let precision_u8 = u8::try_from(precision).ok().filter(|&p| p >= 1);
+            let scale_u8 = numeric_scale.map_or(Some(0), |scale| u8::try_from(scale).ok());
+            if let (Some(precision), Some(scale)) = (precision_u8, scale_u8) {
+                return Self::Decimal { precision, scale };
+            }
+            return Self::Opaque {
+                pg_type: match numeric_scale {
+                    None | Some(0) => format!("numeric({precision})"),
+                    Some(scale) => format!("numeric({precision},{scale})"),
+                },
+            };
+        }
+        // Deliberately unchanged by issue #1341: a `json`/`jsonb` field ALSO
+        // forward-maps to `jsonb` now, deepening rather than resolving this
+        // ambiguity (see `from_pg_udt`'s doc). `schema pull` prioritises a
+        // clean round-trip of the common case (an Autumn-managed table's
+        // attachment column) over guessing at a brownfield column's intent;
+        // resolving the ambiguity is out of this issue's forward-generation
+        // scope.
+        if udt == "jsonb" {
+            return Self::Attachment;
+        }
+        Self::Opaque {
+            pg_type: udt.to_owned(),
+        }
+    }
+
     /// Inverse of [`ColumnType::rust_type`]: resolve a Rust type token (as it
     /// would appear in a `#[model]` struct) back to a [`ColumnType`]. Intended
     /// for the slice-2 `syn`-backed parser, so it is **tolerant of leading path
@@ -283,6 +522,21 @@ impl ColumnType {
     /// enum renders as its concrete `PascalCase` type name, not `String`, and
     /// its variant set cannot be recovered from a bare type token — so an enum
     /// type resolves to `None`.
+    ///
+    /// [`Json`](Self::Json) is the one exception to the leaf-matching rule
+    /// above: `Value` is common enough as a bare identifier (unlike the
+    /// domain-specific `Blob`/`Decimal`/`Uuid`/`NaiveDateTime`) that an
+    /// unrelated hand-written type sharing the name would otherwise be
+    /// misclassified as JSON — and this function only ever sees the type
+    /// token as written in the struct field, never the file's `use`
+    /// declarations, so even a *bare* `Value` can't be safely resolved to a
+    /// crate without that import context. Only the exact `serde_json::Value`
+    /// path resolves to `Json` (an optional leading `::` — an absolute path —
+    /// is tolerated); a bare `Value` (however it was imported) or any other
+    /// qualified path (`domain::Value`, `my_crate::sub::Value`) resolves to
+    /// `None`. The DSL/scaffold generator is unaffected — it always emits
+    /// the fully-qualified `serde_json::Value` in generated model structs
+    /// (see [`Self::rust_type`]), never a bare `Value`.
     #[must_use]
     pub fn from_rust_type(rust: &str) -> Option<Self> {
         // Normalise away all whitespace so `DateTime < Utc >` and
@@ -294,6 +548,22 @@ impl ColumnType {
         if normalized.contains("DateTime<") {
             return Some(Self::TimestampTz);
         }
+        // See the doc comment above: `Value` is too generic a bare name to
+        // safely leaf-match through an arbitrary path — and with no `use`
+        // context available here, even a bare `Value` can't be told apart
+        // from an unrelated same-named type — so only the fully-qualified
+        // `serde_json::Value` path is accepted, checked against the full
+        // normalised string rather than falling through to the
+        // `rsplit("::")` leaf split below. An optional leading `::` (an
+        // absolute path, `::serde_json::Value`, sometimes written to avoid
+        // shadowing by a local module of the same name) is stripped first —
+        // this doesn't reopen the ambiguity the exact match exists for,
+        // since `::domain::Value` still normalises to `domain::Value` and
+        // correctly falls through to `None` below.
+        let unprefixed = normalized.strip_prefix("::").unwrap_or(normalized.as_str());
+        if unprefixed == "serde_json::Value" {
+            return Some(Self::Json);
+        }
 
         // Take the final `::`-separated segment (path-tolerant); a token with no
         // path (`String`, `Vec<u8>`) is returned unchanged.
@@ -302,17 +572,34 @@ impl ColumnType {
             .next()
             .unwrap_or(normalized.as_str());
         match leaf {
-            "String" => Some(Self::Text),
+            // `Translated` is a `#[translatable]` per-locale container (issue
+            // #1384): its storage is a plain `TEXT` column holding a JSON
+            // object, so the declarative lane manages it exactly like any other
+            // text column. Without it here the parser skips the column and the
+            // diff refuses to emit `CREATE TABLE` for the whole model.
+            // `CollabText` is a `#[collaborative]` CRDT document (issue #1806);
+            // like `Translated` its storage is a plain `TEXT` column holding
+            // JSON, so the declarative lane manages it as a text column.
+            "String" | "Translated" | "CollabText" => Some(Self::Text),
             "i32" => Some(Self::Int32),
             "i64" => Some(Self::Int64),
             "bool" => Some(Self::Bool),
             "f32" => Some(Self::Float32),
             "f64" => Some(Self::Float64),
-            "Uuid" => Some(Self::Uuid),
+            // `SqliteUuid`/`SqliteDecimal` are the `TEXT`-backed newtypes a
+            // SQLite app's model renders instead of the foreign `uuid::Uuid` /
+            // `rust_decimal::Decimal` (issue #1924). They are the same column,
+            // so they must resolve to the same `ColumnType` — otherwise the
+            // declarative lane skips the column and every snapshot, diff and
+            // generated `CREATE TABLE` silently omits it.
+            "Uuid" | "SqliteUuid" => Some(Self::Uuid),
             "NaiveDateTime" => Some(Self::Timestamp),
             "Vec<u8>" => Some(Self::Bytes),
             "Blob" => Some(Self::Attachment),
-            "Decimal" => Some(Self::Decimal {
+            // The declared precision and scale do not survive into the Rust
+            // type on either backend, so both resolve to the same default the
+            // DSL's bare `decimal` token uses.
+            "Decimal" | "SqliteDecimal" => Some(Self::Decimal {
                 precision: 12,
                 scale: 2,
             }),
@@ -330,8 +617,15 @@ impl ColumnType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IdKind {
     /// `BIGSERIAL PRIMARY KEY` (PG) / `INTEGER PRIMARY KEY AUTOINCREMENT`
-    /// (`SQLite`) — a sequential auto-increment integer.
+    /// (`SQLite`) — a sequential auto-increment 64-bit integer.
     BigSerial,
+    /// `SERIAL PRIMARY KEY` (PG) / `INTEGER PRIMARY KEY AUTOINCREMENT`
+    /// (`SQLite`) — a sequential auto-increment 32-bit integer. The model DSL
+    /// never produces this (its `#[id]` is always `BigSerial` or `Uuid`); it
+    /// exists so a **brownfield** `SERIAL PRIMARY KEY` (int4) column introspected
+    /// by `schema pull` recreates as `SERIAL` (auto-increment) rather than a plain
+    /// `INTEGER PRIMARY KEY` that silently loses the sequence.
+    Serial,
     /// `UUID PRIMARY KEY DEFAULT gen_random_uuid()` (PG) / `TEXT PRIMARY KEY`
     /// (`SQLite`) — a non-enumerable UUID.
     Uuid,
@@ -343,6 +637,7 @@ impl IdKind {
     pub const fn rust_type(self) -> &'static str {
         match self {
             Self::BigSerial => "i64",
+            Self::Serial => "i32",
             Self::Uuid => "uuid::Uuid",
         }
     }
@@ -353,6 +648,7 @@ impl IdKind {
     pub const fn diesel_type(self, backend: Backend) -> &'static str {
         match (self, backend) {
             (Self::BigSerial, _) => "Int8",
+            (Self::Serial, _) => "Int4",
             (Self::Uuid, Backend::Postgres) => "Uuid",
             (Self::Uuid, Backend::Sqlite) => "Text",
         }
@@ -364,11 +660,51 @@ impl IdKind {
     pub const fn pk_sql(self, backend: Backend) -> &'static str {
         match (self, backend) {
             (Self::BigSerial, Backend::Postgres) => "BIGSERIAL PRIMARY KEY",
-            (Self::BigSerial, Backend::Sqlite) => "INTEGER PRIMARY KEY AUTOINCREMENT",
+            (Self::Serial, Backend::Postgres) => "SERIAL PRIMARY KEY",
+            (Self::BigSerial | Self::Serial, Backend::Sqlite) => {
+                "INTEGER PRIMARY KEY AUTOINCREMENT"
+            }
             (Self::Uuid, Backend::Postgres) => "UUID PRIMARY KEY DEFAULT gen_random_uuid()",
             (Self::Uuid, Backend::Sqlite) => "TEXT PRIMARY KEY",
         }
     }
+}
+
+/// Distinguishes an owned-sequence auto-increment integer primary key from a
+/// plain, manually-assigned integer primary key of the same storage width.
+///
+/// Without this marker a `BIGINT PRIMARY KEY` (a plain, manually-assigned id) and
+/// a `BIGSERIAL` (an owned-sequence auto-increment id) both land in the IR as
+/// `Column { ty: Int64, primary_key: true, default: None }` — indistinguishable —
+/// so `schema pull` / `schema diff` could not tell a brownfield plain-int PK from
+/// a generated serial id. It is populated **symmetrically** by the model parser
+/// (for a convention `BigSerial` id) and by database introspection (only when the
+/// pulled column genuinely owns its sequence), so a model↔database diff of matching
+/// schemas stays empty while a genuine plain-`BIGINT PK` vs `BIGSERIAL` mismatch
+/// surfaces as drift. See [`Column::serial`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SerialKind {
+    /// `SERIAL` (int4) — an owned-sequence auto-increment 32-bit id. Only ever
+    /// produced by brownfield introspection (the model `#[id]` is always
+    /// `BigSerial` or `Uuid`).
+    Serial,
+    /// `BIGSERIAL` (int8) — an owned-sequence auto-increment 64-bit id, the Autumn
+    /// model `#[id]` convention. On `SQLite` this is an `INTEGER PRIMARY KEY
+    /// AUTOINCREMENT` column.
+    BigSerial,
+    /// A **plain**, manually-assigned single-column integer primary key with **no**
+    /// owned sequence — a genuine `INTEGER`/`BIGINT PRIMARY KEY` (Postgres) or a
+    /// non-`AUTOINCREMENT` `INTEGER PRIMARY KEY` (`SQLite`). Emitted **only** by
+    /// database introspection.
+    ///
+    /// It is deliberately distinct from `None`: `None` means the marker is *unknown*
+    /// — a snapshot written before this field existed (serde default) — whereas
+    /// `Plain` is an **explicit** "introspected, and it genuinely owns no sequence"
+    /// signal. The diff treats `None` on either side as compatible (never drift), so
+    /// a legacy snapshot keeps round-tripping clean; a `Plain` vs `BigSerial`
+    /// mismatch (both explicit) still surfaces as real drift. The model parser never
+    /// emits `Plain` (its `#[id]` is always `BigSerial` or `Uuid`).
+    Plain,
 }
 
 /// A foreign-key relationship carried by a [`Column`] (see [`Column::references`]).
@@ -419,6 +755,24 @@ pub struct Column {
     pub default: Option<ColumnDefault>,
     /// The foreign-key relationship, if this column is a `references` column.
     pub references: Option<ForeignKey>,
+    /// The auto-increment id-generation strategy of an owned-sequence integer
+    /// primary key, distinguishing a generated `SERIAL`/`BIGSERIAL` id from a plain
+    /// manually-assigned `INTEGER`/`BIGINT` primary key of the same storage width
+    /// (see [`SerialKind`]). `None` for every non-serial column — including a
+    /// plain-int PK with no owned sequence. Populated symmetrically by the model
+    /// parser and by database introspection so a matching model↔database diff stays
+    /// empty. Defaults to `None` and is skipped when serializing, so snapshots
+    /// written before this field existed stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<SerialKind>,
+    /// A preserved `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` clause — the
+    /// verbatim `identity_generation` (`"ALWAYS"` / `"BY DEFAULT"`) of a Postgres
+    /// identity column — so an identity column round-trips through `schema pull`
+    /// instead of flattening to a plain integer column. `None` for every
+    /// non-identity column. Defaults to `None` and is skipped when serializing, so
+    /// pre-existing snapshots stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
 }
 
 impl Column {
@@ -434,6 +788,8 @@ impl Column {
             unique: false,
             default: None,
             references: None,
+            serial: None,
+            identity: None,
         }
     }
 }
@@ -447,6 +803,63 @@ pub struct Index {
     pub columns: Vec<String>,
     /// Whether the index enforces uniqueness.
     pub unique: bool,
+    /// The verbatim `CREATE [UNIQUE] INDEX …` statement for an index that
+    /// cannot be represented by plain columns alone — an expression index
+    /// (e.g. `lower(email)`) or a partial index (`WHERE …`). When `Some`, the
+    /// emitter renders this definition verbatim instead of building
+    /// `CREATE INDEX … (columns)`, and the diff compares indexes by this text
+    /// rather than by `columns`. `None` for ordinary column indexes, which keeps
+    /// their serialized JSON byte-identical to snapshots written before this
+    /// field existed (see the `#[serde(default, skip_serializing_if)]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<String>,
+    /// Whether the index carries a `WHERE` predicate (a **partial** index). A
+    /// partial unique index only enforces uniqueness for the rows matching its
+    /// predicate, so it must NOT be treated as satisfying a model `#[unique]`
+    /// (which demands table-wide uniqueness). Introspection sets this from
+    /// `pg_index.indpred IS NOT NULL`; the model parser never emits a partial
+    /// index. Defaults to `false` and is skipped when serializing so ordinary
+    /// indexes stay byte-identical to pre-existing snapshots.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_partial: bool,
+    /// The index's real **key** columns, in key order — the columns whose values
+    /// uniqueness is enforced over — EXCLUDING any non-key `INCLUDE` columns, and
+    /// **empty** when any key position is an expression (e.g. `lower(email)`). It
+    /// is distinct from [`columns`](Self::columns): for a `definition`-carrying
+    /// index `columns` is the full dependency set (key + `INCLUDE` + expression- +
+    /// predicate-referenced columns, used for cascade detection), whereas
+    /// `key_columns` is only what the index's uniqueness is keyed on. Populated by
+    /// introspection for `definition`-carrying indexes; for a plain simple index it
+    /// is left empty (its key columns are exactly `columns`, so recording them again
+    /// would be redundant JSON noise). An empty `key_columns` on an
+    /// expression/`definition` index deliberately signals "no plain key column set"
+    /// so such an index cannot satisfy a model `#[unique]`. Defaults to empty and is
+    /// skipped when serializing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_columns: Vec<String>,
+}
+
+/// `serde` `skip_serializing_if` helper: whether a bool is `false` (so a
+/// default-`false` flag is omitted from the serialized form).
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+impl Index {
+    /// Construct an ordinary column index (no raw `definition`), the common case
+    /// for both the model parser and simple introspected indexes.
+    #[must_use]
+    pub fn new(name: impl Into<String>, columns: Vec<String>, unique: bool) -> Self {
+        Self {
+            name: name.into(),
+            columns,
+            unique,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
+        }
+    }
 }
 
 /// A `CHECK` constraint on a [`Table`] (e.g. the closed-set constraint an
@@ -538,6 +951,7 @@ mod tests {
             ColumnType::TimestampTz,
             ColumnType::Bytes,
             ColumnType::Attachment,
+            ColumnType::Json,
             ColumnType::Decimal {
                 precision: 12,
                 scale: 2,
@@ -552,7 +966,9 @@ mod tests {
     fn rust_type_mapping_is_exhaustive_and_exact() {
         for ct in all_column_types() {
             let expected = match &ct {
-                ColumnType::Text | ColumnType::Enum { .. } => "String",
+                // `Opaque` shares the `String` sentinel; `all_column_types()`
+                // never yields it, but the match must stay exhaustive.
+                ColumnType::Text | ColumnType::Enum { .. } | ColumnType::Opaque { .. } => "String",
                 ColumnType::Int32 => "i32",
                 ColumnType::Int64 => "i64",
                 ColumnType::Bool => "bool",
@@ -563,6 +979,7 @@ mod tests {
                 ColumnType::TimestampTz => "chrono::DateTime<chrono::Utc>",
                 ColumnType::Bytes => "Vec<u8>",
                 ColumnType::Attachment => "autumn_web::storage::Blob",
+                ColumnType::Json => "serde_json::Value",
                 ColumnType::Decimal { .. } => "rust_decimal::Decimal",
             };
             assert_eq!(ct.rust_type(), expected, "rust_type for {ct:?}");
@@ -583,6 +1000,7 @@ mod tests {
             (ColumnType::TimestampTz, "Timestamptz"),
             (ColumnType::Bytes, "Bytea"),
             (ColumnType::Attachment, "Jsonb"),
+            (ColumnType::Json, "Jsonb"),
             (
                 ColumnType::Decimal {
                     precision: 12,
@@ -617,9 +1035,13 @@ mod tests {
             (ColumnType::Float64, "Float8"),
             (ColumnType::Uuid, "Text"),
             (ColumnType::Timestamp, "Timestamp"),
-            (ColumnType::TimestampTz, "Timestamp"),
+            (ColumnType::TimestampTz, "TimestamptzSqlite"),
             (ColumnType::Bytes, "Binary"),
             (ColumnType::Attachment, "Text"),
+            // Diesel's own `Json` sql-type — distinct from both `Text` (no
+            // built-in `serde_json::Value` conversion) and `Jsonb` (SQLite's
+            // proprietary binary encoding). See the `Json` variant's doc.
+            (ColumnType::Json, "Json"),
             (
                 ColumnType::Decimal {
                     precision: 12,
@@ -657,6 +1079,7 @@ mod tests {
             (ColumnType::TimestampTz, "TIMESTAMPTZ"),
             (ColumnType::Bytes, "BYTEA"),
             (ColumnType::Attachment, "JSONB"),
+            (ColumnType::Json, "JSONB"),
             (
                 ColumnType::Enum {
                     variants: vec!["a".into()],
@@ -687,6 +1110,7 @@ mod tests {
             (ColumnType::TimestampTz, "TEXT"),
             (ColumnType::Bytes, "BLOB"),
             (ColumnType::Attachment, "TEXT"),
+            (ColumnType::Json, "TEXT"),
             (
                 ColumnType::Enum {
                     variants: vec!["a".into()],
@@ -700,6 +1124,47 @@ mod tests {
                 expected,
                 "sqlite sql_type for {ct:?}"
             );
+        }
+    }
+
+    #[test]
+    fn sqlite_affinity_of_declared_type_follows_the_canonical_algorithm() {
+        for (decl, expected) in [
+            ("INTEGER", SqliteAffinity::Integer),
+            ("BIGINT", SqliteAffinity::Integer),
+            ("TINYINT", SqliteAffinity::Integer),
+            ("VARCHAR(255)", SqliteAffinity::Text),
+            ("CLOB", SqliteAffinity::Text),
+            ("TEXT", SqliteAffinity::Text),
+            ("", SqliteAffinity::Blob),
+            ("BLOB", SqliteAffinity::Blob),
+            ("REAL", SqliteAffinity::Real),
+            ("FLOAT", SqliteAffinity::Real),
+            ("DOUBLE PRECISION", SqliteAffinity::Real),
+            ("NUMERIC", SqliteAffinity::Numeric),
+            ("DECIMAL(10,2)", SqliteAffinity::Numeric),
+            ("BOOLEAN", SqliteAffinity::Numeric),
+        ] {
+            assert_eq!(sqlite_affinity(decl), expected, "affinity of {decl:?}");
+        }
+    }
+
+    #[test]
+    fn column_type_sqlite_affinity_class_collapses_the_emitter_groups() {
+        use SqliteAffinity::{Blob, Integer, Real, Text};
+        for (ct, expected) in [
+            (ColumnType::Int32, Integer),
+            (ColumnType::Int64, Integer),
+            (ColumnType::Bool, Integer),
+            (ColumnType::Float32, Real),
+            (ColumnType::Float64, Real),
+            (ColumnType::Text, Text),
+            (ColumnType::Uuid, Text),
+            (ColumnType::Timestamp, Text),
+            (ColumnType::TimestampTz, Text),
+            (ColumnType::Bytes, Blob),
+        ] {
+            assert_eq!(ct.sqlite_affinity(), expected, "affinity class of {ct:?}");
         }
     }
 
@@ -719,17 +1184,12 @@ mod tests {
         assert_eq!(d.sql_type(Backend::Postgres), "NUMERIC(8,4)");
     }
 
+    /// Issue #1924 gave `Uuid`, `Decimal` and `Enum` working `SQLite`
+    /// conversions, so only the introspection-only `Opaque` lacks one.
     #[test]
     fn sqlite_diesel_conversion_flags() {
         for ct in all_column_types() {
-            let expected = !matches!(
-                ct,
-                ColumnType::Uuid
-                    | ColumnType::Attachment
-                    | ColumnType::Decimal { .. }
-                    | ColumnType::TimestampTz
-                    | ColumnType::Enum { .. }
-            );
+            let expected = !matches!(ct, ColumnType::Opaque { .. });
             assert_eq!(
                 ct.sqlite_has_diesel_conversion(),
                 expected,
@@ -768,9 +1228,189 @@ mod tests {
     }
 
     #[test]
+    fn from_pg_introspection_maps_the_shared_surface() {
+        // Every type the shared `from_pg_udt` maps resolves identically here.
+        for (udt, expected) in [
+            ("text", ColumnType::Text),
+            ("varchar", ColumnType::Text),
+            ("bpchar", ColumnType::Text),
+            ("int4", ColumnType::Int32),
+            ("int8", ColumnType::Int64),
+            ("bool", ColumnType::Bool),
+            ("float4", ColumnType::Float32),
+            ("float8", ColumnType::Float64),
+            ("uuid", ColumnType::Uuid),
+            ("timestamp", ColumnType::Timestamp),
+            ("timestamptz", ColumnType::TimestampTz),
+            ("bytea", ColumnType::Bytes),
+        ] {
+            assert_eq!(
+                ColumnType::from_pg_introspection(udt, None, None, None),
+                expected,
+                "from_pg_introspection for {udt}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_pg_introspection_numeric_with_precision_is_decimal() {
+        assert_eq!(
+            ColumnType::from_pg_introspection("numeric", Some(12), Some(2), None),
+            ColumnType::Decimal {
+                precision: 12,
+                scale: 2
+            }
+        );
+        // `decimal` alias, and a scale that defaults to 0 when NULL.
+        assert_eq!(
+            ColumnType::from_pg_introspection("decimal", Some(8), None, None),
+            ColumnType::Decimal {
+                precision: 8,
+                scale: 0
+            }
+        );
+        // A bare `numeric` with no precision cannot be reconstructed → Opaque.
+        assert_eq!(
+            ColumnType::from_pg_introspection("numeric", None, None, None),
+            ColumnType::Opaque {
+                pg_type: "numeric".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn from_pg_introspection_out_of_range_numeric_is_opaque_not_clamped() {
+        // A valid Postgres `NUMERIC(1000, 0)` does not fit the `u8` Decimal fields;
+        // it must be preserved as `Opaque` carrying the true type string, NOT
+        // silently clamped to `NUMERIC(255, 0)`.
+        assert_eq!(
+            ColumnType::from_pg_introspection("numeric", Some(1000), Some(0), None),
+            ColumnType::Opaque {
+                pg_type: "numeric(1000)".to_owned()
+            }
+        );
+        // An out-of-range precision with a non-zero scale keeps both.
+        assert_eq!(
+            ColumnType::from_pg_introspection("numeric", Some(1000), Some(500), None),
+            ColumnType::Opaque {
+                pg_type: "numeric(1000,500)".to_owned()
+            }
+        );
+        // A negative scale does not fit `u8` → preserved verbatim, not clamped.
+        assert_eq!(
+            ColumnType::from_pg_introspection("numeric", Some(10), Some(-2), None),
+            ColumnType::Opaque {
+                pg_type: "numeric(10,-2)".to_owned()
+            }
+        );
+        // In-range values are unaffected (round-trip parity).
+        assert_eq!(
+            ColumnType::from_pg_introspection("numeric", Some(12), Some(2), None),
+            ColumnType::Decimal {
+                precision: 12,
+                scale: 2
+            }
+        );
+    }
+
+    #[test]
+    fn from_pg_introspection_length_limited_char_types_are_opaque() {
+        // `VARCHAR(32)` / `CHAR(2)` report `udt_name` `varchar` / `bpchar`, which
+        // `from_pg_udt` would otherwise flatten to `Text`, dropping the length
+        // limit. With a length modifier present they are preserved verbatim as
+        // `Opaque` carrying valid Postgres DDL, checked before the mapped return.
+        assert_eq!(
+            ColumnType::from_pg_introspection("varchar", None, None, Some(32)),
+            ColumnType::Opaque {
+                pg_type: "varchar(32)".to_owned()
+            }
+        );
+        assert_eq!(
+            ColumnType::from_pg_introspection("bpchar", None, None, Some(2)),
+            ColumnType::Opaque {
+                pg_type: "char(2)".to_owned()
+            }
+        );
+        // An unbounded `varchar` (length `None`) and `text` (never length-carrying)
+        // behave exactly as before → `Text`.
+        assert_eq!(
+            ColumnType::from_pg_introspection("varchar", None, None, None),
+            ColumnType::Text
+        );
+        assert_eq!(
+            ColumnType::from_pg_introspection("text", None, None, None),
+            ColumnType::Text
+        );
+    }
+
+    #[test]
+    fn from_pg_introspection_jsonb_is_attachment() {
+        assert_eq!(
+            ColumnType::from_pg_introspection("jsonb", None, None, None),
+            ColumnType::Attachment
+        );
+    }
+
+    #[test]
+    fn from_pg_introspection_unknown_types_are_preserved_opaque() {
+        for udt in ["inet", "citext", "macaddr", "tsvector", "point"] {
+            assert_eq!(
+                ColumnType::from_pg_introspection(udt, None, None, None),
+                ColumnType::Opaque {
+                    pg_type: udt.to_owned()
+                },
+                "unmapped {udt} must be preserved as Opaque"
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_sql_type_round_trips_the_raw_name_verbatim() {
+        let ct = ColumnType::from_pg_introspection("inet", None, None, None);
+        // The raw Postgres type name is emitted verbatim on both backends, so a
+        // pulled snapshot never loses the type.
+        assert_eq!(ct.sql_type(Backend::Postgres), "inet");
+        assert_eq!(ct.sql_type(Backend::Sqlite), "inet");
+        // The codegen sentinels are safe (introspection-only, never panics).
+        assert_eq!(ct.rust_type(), "String");
+        assert_eq!(ct.diesel_type(Backend::Postgres), "Text");
+        assert!(!ct.sqlite_has_diesel_conversion());
+    }
+
+    /// The `SQLite` newtypes must resolve to the same `ColumnType` as the types
+    /// they wrap (issue #1924). Without this the declarative lane drops every
+    /// `Uuid`/`decimal` column of a `SQLite` app from its snapshots and diffs.
+    #[test]
+    fn from_rust_type_maps_the_sqlite_newtypes_like_the_types_they_wrap() {
+        for (wrapper, plain) in [
+            ("autumn_web::db::sqlite_types::SqliteUuid", "uuid::Uuid"),
+            (
+                "autumn_web::db::sqlite_types::SqliteDecimal",
+                "rust_decimal::Decimal",
+            ),
+        ] {
+            assert_eq!(
+                ColumnType::from_rust_type(wrapper),
+                ColumnType::from_rust_type(plain),
+                "`{wrapper}` must resolve like `{plain}`"
+            );
+            assert!(ColumnType::from_rust_type(wrapper).is_some());
+        }
+    }
+
+    #[test]
     fn from_rust_type_happy_and_path_tolerant() {
         // Bare tokens.
         assert_eq!(ColumnType::from_rust_type("String"), Some(ColumnType::Text));
+        // #1384: a translatable container is TEXT storage, path-tolerant.
+        assert_eq!(
+            ColumnType::from_rust_type("Translated"),
+            Some(ColumnType::Text)
+        );
+        assert_eq!(
+            ColumnType::from_rust_type("autumn_web::i18n::Translated"),
+            Some(ColumnType::Text)
+        );
         assert_eq!(ColumnType::from_rust_type("i32"), Some(ColumnType::Int32));
         assert_eq!(ColumnType::from_rust_type("i64"), Some(ColumnType::Int64));
         assert_eq!(ColumnType::from_rust_type("bool"), Some(ColumnType::Bool));
@@ -804,11 +1444,47 @@ mod tests {
                 scale: 2
             })
         );
+        assert_eq!(
+            ColumnType::from_rust_type("serde_json::Value"),
+            Some(ColumnType::Json)
+        );
         // Whitespace tolerance around the generic.
         assert_eq!(
             ColumnType::from_rust_type("chrono::DateTime < chrono::Utc >"),
             Some(ColumnType::TimestampTz)
         );
+    }
+
+    #[test]
+    fn from_rust_type_value_leaf_match_is_scoped_to_serde_json() {
+        // Unlike `Blob`/`Decimal`/`Uuid`, `Value` is not leaf-matched through an
+        // arbitrary path — only the exact `serde_json::Value` path resolves to
+        // `Json`. An unrelated hand-written type sharing the name must not be
+        // misclassified as JSON (Codex review finding on #1341).
+        assert_eq!(ColumnType::from_rust_type("domain::Value"), None);
+        assert_eq!(ColumnType::from_rust_type("my_crate::sub::Value"), None);
+        assert_eq!(ColumnType::from_rust_type("crate::Value"), None);
+        // A bare `Value` is ALSO rejected now (a follow-up Codex finding):
+        // this function only sees the type token, never the file's `use`
+        // declarations, so a bare `Value` imported via `use domain::Value;`
+        // is indistinguishable from one imported via `use serde_json::Value;`.
+        // Only the fully-qualified path is unambiguous.
+        assert_eq!(ColumnType::from_rust_type("Value"), None);
+    }
+
+    #[test]
+    fn from_rust_type_accepts_an_absolute_serde_json_value_path() {
+        // `::serde_json::Value` (a leading `::`, an absolute path — sometimes
+        // written defensively to avoid shadowing by a local module of the
+        // same name) is valid Rust and must still resolve to `Json`. This
+        // doesn't reopen the `Value` collision risk: `::domain::Value` still
+        // normalises to `domain::Value`, which correctly stays `None`
+        // (Codex review finding on #1341).
+        assert_eq!(
+            ColumnType::from_rust_type("::serde_json::Value"),
+            Some(ColumnType::Json)
+        );
+        assert_eq!(ColumnType::from_rust_type("::domain::Value"), None);
     }
 
     #[test]
@@ -820,6 +1496,7 @@ mod tests {
     #[test]
     fn id_kind_rust_type() {
         assert_eq!(IdKind::BigSerial.rust_type(), "i64");
+        assert_eq!(IdKind::Serial.rust_type(), "i32");
         assert_eq!(IdKind::Uuid.rust_type(), "uuid::Uuid");
     }
 
@@ -834,6 +1511,14 @@ mod tests {
             "INTEGER PRIMARY KEY AUTOINCREMENT"
         );
         assert_eq!(
+            IdKind::Serial.pk_sql(Backend::Postgres),
+            "SERIAL PRIMARY KEY"
+        );
+        assert_eq!(
+            IdKind::Serial.pk_sql(Backend::Sqlite),
+            "INTEGER PRIMARY KEY AUTOINCREMENT"
+        );
+        assert_eq!(
             IdKind::Uuid.pk_sql(Backend::Postgres),
             "UUID PRIMARY KEY DEFAULT gen_random_uuid()"
         );
@@ -844,6 +1529,8 @@ mod tests {
     fn id_kind_diesel_type_both_backends() {
         assert_eq!(IdKind::BigSerial.diesel_type(Backend::Postgres), "Int8");
         assert_eq!(IdKind::BigSerial.diesel_type(Backend::Sqlite), "Int8");
+        assert_eq!(IdKind::Serial.diesel_type(Backend::Postgres), "Int4");
+        assert_eq!(IdKind::Serial.diesel_type(Backend::Sqlite), "Int4");
         assert_eq!(IdKind::Uuid.diesel_type(Backend::Postgres), "Uuid");
         assert_eq!(IdKind::Uuid.diesel_type(Backend::Sqlite), "Text");
     }
@@ -872,6 +1559,9 @@ mod tests {
             name: "posts_author_idx".to_owned(),
             columns: vec!["author_id".to_owned()],
             unique: false,
+            definition: None,
+            is_partial: false,
+            key_columns: Vec::new(),
         });
         table.checks.push(CheckConstraint {
             name: Some("posts_status_check".to_owned()),
@@ -893,6 +1583,8 @@ mod tests {
         let col = Column::new("name", ColumnType::Text);
         assert!(!col.nullable && !col.primary_key && !col.unique);
         assert!(col.default.is_none() && col.references.is_none());
+        // The serial / identity markers default to absent (a plain column).
+        assert!(col.serial.is_none() && col.identity.is_none());
 
         let table = Table::new("widgets", Backend::Sqlite);
         assert!(table.managed);
@@ -901,5 +1593,39 @@ mod tests {
 
         let schema = Schema::new(Backend::Sqlite);
         assert!(schema.tables.is_empty());
+    }
+
+    #[test]
+    fn serial_and_identity_markers_are_serde_backward_compatible() {
+        // A plain column (both markers absent) serializes WITHOUT the new keys, so
+        // snapshots written before the fields existed stay byte-identical.
+        let plain = Column::new("id", ColumnType::Int64);
+        let json = serde_json::to_string(&plain).expect("serialize");
+        assert!(
+            !json.contains("serial") && !json.contains("identity"),
+            "absent markers must be omitted from the serialized form: {json}"
+        );
+
+        // A pre-existing snapshot JSON with neither key deserializes to `None`.
+        let legacy = r#"{"name":"id","ty":"Int64","nullable":false,"primary_key":true,"unique":false,"default":null,"references":null}"#;
+        let back: Column = serde_json::from_str(legacy).expect("deserialize legacy");
+        assert!(back.serial.is_none() && back.identity.is_none());
+
+        // A populated marker round-trips.
+        let mut serial_id = Column::new("id", ColumnType::Int64);
+        serial_id.primary_key = true;
+        serial_id.serial = Some(SerialKind::BigSerial);
+        let mut identity_col = Column::new("n", ColumnType::Int64);
+        identity_col.identity = Some("ALWAYS".to_owned());
+        for col in [&serial_id, &identity_col] {
+            let json = serde_json::to_string(col).expect("serialize");
+            let back: Column = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(*col, back);
+        }
+        assert!(
+            serde_json::to_string(&serial_id)
+                .unwrap()
+                .contains("BigSerial")
+        );
     }
 }

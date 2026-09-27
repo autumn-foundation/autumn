@@ -727,3 +727,403 @@ mod meta_extra_tests {
         );
     }
 }
+
+// ── Route-level SEO defaults via `seo(...)` attribute (#1182) ─────────────────
+
+/// End-to-end coverage for declaring SEO defaults on the route attribute and
+/// refining them inside the handler through the [`SeoMeta`] extractor.
+#[cfg(feature = "maud")]
+mod route_level_defaults_tests {
+    use autumn_web::seo::{SeoMeta, SeoRouteDefaults};
+    use autumn_web::test::TestApp;
+    use autumn_web::{Markup, get, html, routes, static_get};
+
+    // A route whose SEO metadata is fully declared on the attribute. The
+    // handler does nothing but render what it was handed.
+    #[get(
+        "/about",
+        seo(title = "About • My Blog", description = "Learn about us")
+    )]
+    async fn about(seo: SeoMeta) -> Markup {
+        html! { head { (seo.render()) } }
+    }
+
+    // The issue's motivating example: a static default (`og_type`) declared on
+    // the attribute, dynamic fields filled in by the handler.
+    #[get("/posts/{slug}", seo(og_type = "article"))]
+    async fn show_post(seo: SeoMeta) -> Markup {
+        let seo = seo.title("Hello World • Blog").description("An excerpt");
+        html! { head { (seo.render()) } }
+    }
+
+    // Handler-level overrides must win over the attribute defaults.
+    #[get(
+        "/override",
+        seo(title = "Attribute Title", description = "Attribute desc")
+    )]
+    async fn overridden(seo: SeoMeta) -> Markup {
+        html! { head { (seo.title("Handler Title").render()) } }
+    }
+
+    // No `seo(...)` on the attribute: the extractor must still resolve, to an
+    // empty builder, rather than rejecting the request.
+    #[get("/bare")]
+    async fn bare(seo: SeoMeta) -> Markup {
+        html! { head { (seo.render()) } "bare-ok" }
+    }
+
+    // Every supported key, so the attribute surface is pinned by a test.
+    #[get(
+        "/full",
+        seo(
+            title = "Full Title",
+            description = "Full description",
+            canonical = "https://example.com/full",
+            og_title = "Full OG Title",
+            og_description = "Full OG description",
+            og_image = "https://example.com/og.png",
+            og_type = "website",
+            og_url = "https://example.com/full-og",
+            twitter_card = "summary_large_image",
+            twitter_title = "Full Twitter Title",
+            twitter_description = "Full Twitter description",
+            twitter_image = "https://example.com/twitter.png",
+            robots = "noindex"
+        )
+    )]
+    async fn full(seo: SeoMeta) -> Markup {
+        html! { head { (seo.render()) } }
+    }
+
+    // `#[static_get]` must honour the same attribute so pre-rendered pages
+    // carry correct meta tags.
+    #[static_get(
+        "/static-about",
+        seo(title = "Static About", description = "Static desc")
+    )]
+    async fn static_about(seo: SeoMeta) -> Markup {
+        html! { head { (seo.render()) } }
+    }
+
+    // A page that asks not to be indexed must not be advertised in the sitemap
+    // the framework generates for it.
+    #[static_get("/thanks", seo(title = "Thanks", robots = "noindex, nofollow"))]
+    async fn thanks(seo: SeoMeta) -> Markup {
+        html! { head { (seo.render()) } }
+    }
+
+    #[test]
+    fn static_meta_carries_declared_defaults_for_sitemap_filtering() {
+        let indexable = __autumn_static_meta_static_about();
+        assert_eq!(indexable.seo.title, Some("Static About"));
+        assert_eq!(indexable.seo.robots, None);
+
+        let excluded = __autumn_static_meta_thanks();
+        assert_eq!(excluded.seo.robots, Some("noindex, nofollow"));
+    }
+
+    #[tokio::test]
+    async fn noindex_route_still_renders_its_robots_tag() {
+        // Excluding the page from sitemap.xml must not stop the page itself
+        // from telling crawlers not to index it.
+        let client = TestApp::new().routes(routes![thanks]).build();
+        let body = client.get("/thanks").send().await.assert_ok().text();
+        assert!(
+            body.contains(r#"name="robots" content="noindex, nofollow""#),
+            "a noindex route should still emit its robots meta tag; got:\n{body}"
+        );
+        assert!(
+            body.contains("<title>Thanks</title>"),
+            "other declared keys should still render; got:\n{body}"
+        );
+    }
+
+    // Attribute defaults must survive alongside other route attribute keys.
+    #[get("/mixed", name = "mixed_helper", seo(title = "Mixed Title"))]
+    async fn mixed(seo: SeoMeta) -> Markup {
+        html! { head { (seo.render()) } }
+    }
+
+    #[tokio::test]
+    async fn attribute_defaults_reach_the_handler() {
+        let client = TestApp::new().routes(routes![about]).build();
+        let body = client.get("/about").send().await.assert_ok().text();
+        assert!(
+            body.contains("<title>About • My Blog</title>"),
+            "attribute title should render; got:\n{body}"
+        );
+        assert!(
+            body.contains(r#"content="Learn about us""#),
+            "attribute description should render; got:\n{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_refines_attribute_defaults() {
+        let client = TestApp::new().routes(routes![show_post]).build();
+        let body = client.get("/posts/hello").send().await.assert_ok().text();
+        assert!(
+            body.contains(r#"property="og:type" content="article""#),
+            "attribute og_type should survive handler refinement; got:\n{body}"
+        );
+        assert!(
+            body.contains("<title>Hello World • Blog</title>"),
+            "handler-supplied title should render; got:\n{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_override_wins_over_attribute_default() {
+        let client = TestApp::new().routes(routes![overridden]).build();
+        let body = client.get("/override").send().await.assert_ok().text();
+        assert!(
+            body.contains("<title>Handler Title</title>"),
+            "handler override should win; got:\n{body}"
+        );
+        assert!(
+            !body.contains("Attribute Title"),
+            "overridden attribute title must not leak; got:\n{body}"
+        );
+        assert!(
+            body.contains(r#"content="Attribute desc""#),
+            "untouched attribute keys should survive an override of a sibling key; got:\n{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn extractor_is_infallible_without_route_defaults() {
+        let client = TestApp::new().routes(routes![bare]).build();
+        let body = client.get("/bare").send().await.assert_ok().text();
+        assert!(
+            body.contains("bare-ok"),
+            "a route without seo(...) must still serve; got:\n{body}"
+        );
+        assert!(
+            !body.contains("<title>"),
+            "an empty SeoMeta must render nothing; got:\n{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_supported_key_round_trips() {
+        let client = TestApp::new().routes(routes![full]).build();
+        let body = client.get("/full").send().await.assert_ok().text();
+        for expected in [
+            "<title>Full Title</title>",
+            r#"name="description" content="Full description""#,
+            r#"name="robots" content="noindex""#,
+            r#"rel="canonical" href="https://example.com/full""#,
+            r#"property="og:title" content="Full OG Title""#,
+            r#"property="og:description" content="Full OG description""#,
+            r#"property="og:image" content="https://example.com/og.png""#,
+            r#"property="og:type" content="website""#,
+            r#"property="og:url" content="https://example.com/full-og""#,
+            r#"name="twitter:card" content="summary_large_image""#,
+            r#"name="twitter:title" content="Full Twitter Title""#,
+            r#"name="twitter:description" content="Full Twitter description""#,
+            r#"name="twitter:image" content="https://example.com/twitter.png""#,
+        ] {
+            assert!(body.contains(expected), "missing {expected}; got:\n{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn static_get_supports_route_level_defaults() {
+        let client = TestApp::new().routes(routes![static_about]).build();
+        let body = client.get("/static-about").send().await.assert_ok().text();
+        assert!(
+            body.contains("<title>Static About</title>"),
+            "static_get attribute title should render; got:\n{body}"
+        );
+        assert!(
+            body.contains(r#"content="Static desc""#),
+            "static_get attribute description should render; got:\n{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn seo_composes_with_other_route_attribute_keys() {
+        let client = TestApp::new().routes(routes![mixed]).build();
+        let body = client.get("/mixed").send().await.assert_ok().text();
+        assert!(
+            body.contains("<title>Mixed Title</title>"),
+            "seo(...) must compose with name = \"...\"; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn route_info_records_declared_defaults() {
+        let route = __autumn_route_info_about();
+        assert_eq!(route.seo.title, Some("About • My Blog"));
+        assert_eq!(route.seo.description, Some("Learn about us"));
+        assert_eq!(route.seo.og_type, None);
+        assert!(!route.seo.is_empty());
+    }
+
+    #[test]
+    fn route_info_records_empty_defaults_without_attribute() {
+        let route = __autumn_route_info_bare();
+        assert_eq!(route.seo, SeoRouteDefaults::EMPTY);
+        assert!(route.seo.is_empty());
+    }
+
+    #[test]
+    fn route_defaults_convert_into_a_builder_via_from() {
+        let defaults = SeoRouteDefaults::EMPTY
+            .with_title("About")
+            .with_og_type("website");
+        let meta: SeoMeta = defaults.into();
+        assert_eq!(meta, SeoMeta::new().title("About").og_type("website"));
+    }
+}
+
+// ── Route-level SEO defaults: isolation and escaping (#1182) ─────────────────
+//
+// The design rests on the defaults being scoped to exactly one route's own
+// `MethodRouter`. These tests pin that boundary from the outside, so a refactor
+// that reached for `Router::layer` (or dropped a mounting path) fails loudly
+// instead of silently leaking — or silently losing — meta tags.
+#[cfg(feature = "maud")]
+mod route_level_defaults_isolation_tests {
+    use autumn_web::seo::SeoMeta;
+    use autumn_web::test::TestApp;
+    use autumn_web::{Markup, get, html, post, routes};
+
+    #[get("/tagged", seo(title = "Tagged Page"))]
+    async fn tagged(seo: SeoMeta) -> Markup {
+        html! { head { (seo.render()) } "tagged" }
+    }
+
+    #[get("/untagged")]
+    async fn untagged(seo: SeoMeta) -> Markup {
+        html! { head { (seo.render()) } "untagged" }
+    }
+
+    // Same path, different verbs: only the GET leg declares `seo(...)`.
+    #[get("/shared", seo(title = "Shared GET"))]
+    async fn shared_get(seo: SeoMeta) -> Markup {
+        html! { head { (seo.render()) } "shared-get" }
+    }
+
+    #[post("/shared")]
+    async fn shared_post(seo: SeoMeta) -> Markup {
+        html! { head { (seo.render()) } "shared-post" }
+    }
+
+    // Scoped groups mount through a separate code path from `.routes(...)`.
+    #[get("/dashboard", seo(title = "Dashboard • App"))]
+    async fn dashboard(seo: SeoMeta) -> Markup {
+        html! { head { (seo.render()) } "dashboard" }
+    }
+
+    #[tokio::test]
+    async fn defaults_do_not_leak_to_sibling_routes() {
+        let client = TestApp::new().routes(routes![tagged, untagged]).build();
+
+        let tagged_body = client.get("/tagged").send().await.assert_ok().text();
+        assert!(
+            tagged_body.contains("<title>Tagged Page</title>"),
+            "declaring route should render its title; got:\n{tagged_body}"
+        );
+
+        let untagged_body = client.get("/untagged").send().await.assert_ok().text();
+        assert!(
+            !untagged_body.contains("<title>"),
+            "a sibling route in the same app must not inherit the defaults; got:\n{untagged_body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn defaults_do_not_leak_across_verbs_on_one_path() {
+        let client = TestApp::new()
+            .routes(routes![shared_get, shared_post])
+            .build();
+
+        let get_body = client.get("/shared").send().await.assert_ok().text();
+        assert!(
+            get_body.contains("<title>Shared GET</title>"),
+            "the declaring verb should render its title; got:\n{get_body}"
+        );
+
+        let post_body = client.post("/shared").send().await.assert_ok().text();
+        assert!(
+            post_body.contains("shared-post"),
+            "the sibling verb should still serve; got:\n{post_body}"
+        );
+        assert!(
+            !post_body.contains("<title>"),
+            "a sibling verb merged onto the same path must not inherit the defaults; \
+             got:\n{post_body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_group_routes_receive_their_defaults() {
+        // Scoped groups are mounted by `mount_scoped_groups`, not
+        // `group_and_mount_routes`. Because the extractor is infallible, a
+        // missed mounting path shows up as silently absent meta tags rather
+        // than an error — so it needs its own test.
+        let client = TestApp::new()
+            .scoped(
+                "/admin",
+                tower::layer::util::Identity::new(),
+                routes![dashboard],
+            )
+            .build();
+
+        let body = client
+            .get("/admin/dashboard")
+            .send()
+            .await
+            .assert_ok()
+            .text();
+        assert!(
+            body.contains("<title>Dashboard • App</title>"),
+            "a scoped route must receive its declared seo(...) defaults; got:\n{body}"
+        );
+    }
+}
+
+// ── SeoMeta::render() escaping ───────────────────────────────────────────────
+
+/// Route-level defaults can only ever hold `&'static str` literals, but the
+/// documented idiom is for handlers to layer *dynamic* values (a post title, a
+/// URL slug) on top of them. That makes escaping part of this feature's
+/// contract, so pin it.
+#[cfg(feature = "maud")]
+mod render_escaping_tests {
+    use super::*;
+
+    #[test]
+    fn title_escapes_markup() {
+        let rendered = SeoMeta::new()
+            .title("</title><script>alert(1)</script>")
+            .render()
+            .into_string();
+        assert!(
+            !rendered.contains("<script>"),
+            "title must not emit raw markup; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("&lt;script&gt;"),
+            "title should be escaped; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn attribute_values_escape_quotes_and_markup() {
+        let rendered = SeoMeta::new()
+            .description("a \" b < c > d & e")
+            .canonical("https://example.com/?a=1&b=2")
+            .render()
+            .into_string();
+        assert!(
+            !rendered.contains("content=\"a \" b"),
+            "an embedded quote must not break out of the attribute; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("&quot;") && rendered.contains("&lt;") && rendered.contains("&amp;"),
+            "attribute values should be escaped; got:\n{rendered}"
+        );
+    }
+}

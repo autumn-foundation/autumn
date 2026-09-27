@@ -1,0 +1,5 @@
+error: this attribute's arguments match #[authorize]'s grammar ("action", resource = Type[, from = ident]) under a different name, which Autumn cannot resolve: a proc-macro attribute never sees `use` aliases, so this could be #[authorize] reached through `use ::autumn_web::authorize as ...;`, or an unrelated attribute that happens to share its shape -- and guessing either way is unsafe for idempotency-replay handling. Spell it `#[authorize(...)]` by its real name if that's what this is, or rename the other attribute so its argument shape no longer collides.
+  --> tests/compile-fail/authorize_ambiguous_shape_alias_behind_cfg_attr.rs:27:1
+   |
+27 | #[cfg_attr(all(), authz("update", resource = Note))]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
