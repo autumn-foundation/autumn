@@ -164,6 +164,9 @@ pub struct InspectReport {
     /// What the artifact asks for beyond the one named by `--against`.
     #[serde(default)]
     pub upgrade: Option<serde_json::Value>,
+    /// What each granted capability is scoped to.
+    #[serde(default)]
+    pub grants: index::Grants,
 }
 
 impl InspectReport {
@@ -207,6 +210,18 @@ pub fn apply_inspect(
             listing.name
         ));
     }
+    // Replacing a recorded artifact needs a consent check against it. Without
+    // `--against` the report has no delta, and new authority would pass.
+    let replacing = !listing.artifact_sha256.is_empty()
+        && report.artifact_sha256.as_deref() != Some(listing.artifact_sha256.as_str());
+    if replacing && report.upgrade.is_none() {
+        return Err(format!(
+            "`{}` records artifact sha256 {}, and this report is for other bytes. Run \
+             `autumn plugin inspect <new>.autumn-plugin --against <recorded>.autumn-plugin \
+             --format json` and record that",
+            listing.name, listing.artifact_sha256
+        ));
+    }
     let mut failed = Vec::new();
     if !report.loads {
         failed.push("load".to_owned());
@@ -235,6 +250,7 @@ pub fn apply_inspect(
         digest.clone_into(&mut listing.artifact_sha256);
         report.version.clone_into(&mut listing.version);
         listing.capabilities.clone_from(&report.capabilities);
+        listing.grants.clone_from(&report.grants);
     }
     let failed = (!failed.is_empty()).then(|| failed.join(", "));
     Ok(transition(listing, failed.as_deref(), against, date))
@@ -315,6 +331,22 @@ pub fn write_listing(src: &str, listing: &Listing) -> Result<String, String> {
         table["capabilities"] = value(listing.capabilities.iter().collect::<Array>());
     }
     set_or_remove(table, "artifact_sha256", &listing.artifact_sha256);
+    if listing.grants.is_empty() {
+        table.remove("grants");
+    } else {
+        let mut grants = toml_edit::Table::new();
+        for (key, list) in [
+            ("hosts", &listing.grants.hosts),
+            ("tables", &listing.grants.tables),
+            ("job_types", &listing.grants.job_types),
+            ("slots", &listing.grants.slots),
+        ] {
+            if !list.is_empty() {
+                grants[key] = value(list.iter().collect::<Array>());
+            }
+        }
+        table["grants"] = Item::Table(grants);
+    }
     let run = &listing.conformance;
     let conformance = table
         .get_mut("conformance")
@@ -761,7 +793,9 @@ mod tests {
                 checks: vec![check("installability", CheckStatus::Pass)],
                 contract: None,
             },
-            upgrade: None,
+            // A baseline with nothing new: the new artifact asks for no more.
+            upgrade: Some(serde_json::json!({"added_capabilities": []})),
+            grants: index::Grants::default(),
         }
     }
 
@@ -784,6 +818,37 @@ mod tests {
             plugins: vec![l],
         };
         assert!(index::validate(&one).is_empty());
+    }
+
+    /// A new artifact must be compared with the recorded one: without
+    /// `--against` there is no consent check, so `record` refuses it.
+    #[test]
+    fn a_new_artifact_without_a_baseline_is_refused() {
+        let mut l = sandboxed();
+        let before = l.clone();
+        let mut no_baseline = inspect(true);
+        no_baseline.upgrade = None;
+        let err = apply_inspect(&mut l, &no_baseline, "0.7.0", "2026-10-01").unwrap_err();
+        assert!(err.contains("--against"), "{err}");
+        assert_eq!(l, before, "a refusal changes nothing");
+
+        // The same digest needs no baseline: nothing changed.
+        let mut same = inspect(true);
+        same.upgrade = None;
+        same.artifact_sha256 = Some(l.artifact_sha256.clone());
+        assert!(apply_inspect(&mut l, &same, "0.7.0", "2026-10-01").is_ok());
+    }
+
+    /// AC 6: the scoped grants are recorded, not only capability names.
+    #[test]
+    fn an_inspect_pass_records_the_scoped_grants() {
+        let mut l = sandboxed();
+        let mut r = inspect(true);
+        r.grants.hosts = vec!["api.example.com".to_owned()];
+        r.grants.tables = vec!["notes".to_owned()];
+        apply_inspect(&mut l, &r, "0.7.0", "2026-10-01").expect("apply");
+        assert_eq!(l.grants.hosts, ["api.example.com"]);
+        assert_eq!(l.grants.tables, ["notes"]);
     }
 
     /// A failed inspect keeps the artifact that was consented to.

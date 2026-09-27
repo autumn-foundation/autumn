@@ -109,6 +109,35 @@ pub struct Conformance {
     pub reason: String,
 }
 
+/// The manifest's `[grants]` lists, as `autumn plugin inspect` prints them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Grants {
+    /// Hostnames `http-outbound` may call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+    /// Logical tables `db` owns.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tables: Vec<String>,
+    /// Job types `jobs` may enqueue.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub job_types: Vec<String>,
+    /// Render slots `render` may fill.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slots: Vec<String>,
+}
+
+impl Grants {
+    /// Whether no list holds anything.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.hosts.is_empty()
+            && self.tables.is_empty()
+            && self.job_types.is_empty()
+            && self.slots.is_empty()
+    }
+}
+
 /// One plugin in the index.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -140,6 +169,9 @@ pub struct Listing {
     /// `autumn plugin inspect` prints it. Sandboxed only.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub artifact_sha256: String,
+    /// What each sandboxed capability is scoped to. Sandboxed only.
+    #[serde(default, skip_serializing_if = "Grants::is_empty")]
+    pub grants: Grants,
     /// The listing state.
     pub status: Status,
     /// Why the listing is not [`Status::Listed`]. Empty otherwise.
@@ -343,10 +375,27 @@ impl Listing {
     pub fn trust_label(&self) -> String {
         match self.trust {
             Trust::Native => FULL_TRUST_LABEL.to_owned(),
-            Trust::Sandboxed => format!(
-                "sandboxed: capability manifest grants {}",
-                self.capabilities.join(", ")
-            ),
+            Trust::Sandboxed => {
+                let mut label = format!(
+                    "sandboxed: capability manifest grants {}",
+                    self.capabilities.join(", ")
+                );
+                let scopes: Vec<String> = [
+                    ("hosts", &self.grants.hosts),
+                    ("tables", &self.grants.tables),
+                    ("job types", &self.grants.job_types),
+                    ("render slots", &self.grants.slots),
+                ]
+                .into_iter()
+                .filter(|(_, list)| !list.is_empty())
+                .map(|(what, list)| format!("{what} {}", list.join(", ")))
+                .collect();
+                if !scopes.is_empty() {
+                    label.push_str("; scoped to ");
+                    label.push_str(&scopes.join("; "));
+                }
+                label
+            }
         }
     }
 
@@ -451,6 +500,17 @@ fn check_text(listing: &Listing, out: &mut Vec<String>) {
                 .capabilities
                 .iter()
                 .map(|c| ("capabilities", c.as_str())),
+        )
+        .chain(
+            [
+                &listing.grants.hosts,
+                &listing.grants.tables,
+                &listing.grants.job_types,
+                &listing.grants.slots,
+            ]
+            .into_iter()
+            .flatten()
+            .map(|g| ("grants", g.as_str())),
         );
     for (field, value) in fields.into_iter().chain(lists) {
         if value.chars().any(is_unsafe_char) {
@@ -588,6 +648,9 @@ fn check_trust(listing: &Listing, out: &mut Vec<String>) {
         Trust::Native if !digest.is_empty() => {
             out.push("`artifact_sha256` is for a sandboxed listing only".to_owned());
         }
+        Trust::Native if !listing.grants.is_empty() => {
+            out.push("`grants` is for a sandboxed listing only".to_owned());
+        }
         Trust::Native | Trust::Sandboxed => {}
     }
     for name in &listing.capabilities {
@@ -701,6 +764,7 @@ mod tests {
             trust: Trust::Native,
             capabilities: vec![],
             artifact_sha256: String::new(),
+            grants: Grants::default(),
             status: Status::Listed,
             note: String::new(),
             prefix: String::new(),
@@ -1032,6 +1096,28 @@ mod tests {
         listing.capabilities = vec!["http-request".to_owned()];
         listing.artifact_sha256 = "ab".repeat(32);
         assert!(validate(&index_of(vec![listing])).is_empty());
+    }
+
+    /// Grants scope a sandboxed capability; a native plugin has none.
+    #[test]
+    fn grants_are_for_sandboxed_listings_only() {
+        let mut native = community();
+        native.grants.hosts = vec!["api.example.com".to_owned()];
+        let text = messages(&validate(&index_of(vec![native])));
+        assert!(text.contains("grants"), "{text}");
+    }
+
+    #[test]
+    fn a_sandboxed_label_names_its_scoped_grants() {
+        let mut listing = community();
+        listing.trust = Trust::Sandboxed;
+        listing.capabilities = vec!["http-outbound".to_owned()];
+        listing.grants.hosts = vec!["api.example.com".to_owned()];
+        assert!(
+            listing.trust_label().contains("hosts api.example.com"),
+            "{}",
+            listing.trust_label()
+        );
     }
 
     /// AC 6: the manifest shown is bound to reviewed bytes.
