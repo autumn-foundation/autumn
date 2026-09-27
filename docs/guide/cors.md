@@ -28,9 +28,10 @@ to `dev` (`["*"]`, CORS open). So the usual pairing is a permissive dev machine
 and a closed production deploy — but a release binary run locally is closed too,
 and `AUTUMN_ENV` overrides all of it.
 
-Don't infer which you got. The app names its active profile in the startup
-banner, and logs `CORS enabled` with the origin list whenever the layer is
-actually installed.
+Don't infer which you got — ask the app. `AUTUMN_SHOW_CONFIG=1` (or
+`autumn dev --show-config`) logs the resolved configuration at startup, including
+the active profile and the middleware actually installed. That report is off
+unless you ask for it.
 
 To list them, in `autumn.toml`:
 
@@ -170,12 +171,19 @@ A missing `Access-Control-Allow-Origin` does **not** tell you which of two
 different problems you have, because both look identical in devtools: the layer
 may not be installed (`allowed_origins` is empty), or it may be installed and
 the request's `Origin` may simply not match any entry — an exact match on
-scheme, host and port, so a differing port or `http` vs `https` misses. Autumn
-distinguishes them for you in the startup log: when the layer is installed it
-logs `CORS enabled` with the origin list and the credentials flag, and the
-startup banner lists `CORS` among the active middleware. No such line means
-`allowed_origins` is empty; a line whose list does not contain the origin your
-browser is actually sending means the allowlist is the problem.
+scheme, host and port, so a differing port or `http` vs `https` misses.
+
+To tell them apart, make the app state its own configuration rather than reading
+the absence of a header: boot with `AUTUMN_SHOW_CONFIG=1` (or
+`autumn dev --show-config`) and the startup report lists the middleware actually
+installed and the resolved `[cors]` values. If `CORS` is absent from that list,
+`allowed_origins` is empty; if it is present but its origins do not include the
+one your browser is sending, the allowlist is the problem.
+
+There is also a `CORS enabled` line carrying the origin list and the credentials
+flag, logged when the layer is installed — but treat its presence as evidence and
+its **absence as inconclusive**: it is emitted at `INFO`, so a `log.level` above
+`INFO` suppresses it on a perfectly working configuration.
 
 A malformed entry is a third way to miss: an origin that will not parse as a
 header value is dropped with a `CORS: ignoring malformed allowed_origin`
