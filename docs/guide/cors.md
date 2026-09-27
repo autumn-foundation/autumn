@@ -16,8 +16,14 @@ changes nothing.
 
 ## Quick start: enable CORS
 
-CORS is **off by default**. Turn it on by listing the origins allowed to call
-you, in `autumn.toml`:
+**Which default you get depends on the profile**, and the difference is the thing
+this page exists to warn about. Autumn's base default is an empty origin list, so
+CORS is off — but the `dev` profile seeds `allowed_origins = ["*"]`, and `dev` is
+the profile you get when neither `AUTUMN_ENV` nor `AUTUMN_PROFILE` is set. So on
+your own machine CORS is already on and permissive, while under `prod` it is off
+until you list origins yourself.
+
+To list them, in `autumn.toml`:
 
 ```toml
 [cors]
@@ -37,10 +43,10 @@ JSON API: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`, with
 
 ## Allowed origins, and the empty default
 
-`allowed_origins` is the switch. When it is **empty — the default — the CORS
-middleware is not installed at all**: no `Access-Control-*` header is sent on
-any response, and a cross-origin browser call fails no matter what the other
-four keys say.
+`allowed_origins` is the switch. When it is **empty — the base default, and what
+`prod` leaves in place — the CORS middleware is not installed at all**: no
+`Access-Control-*` header is sent on any response, and a cross-origin browser
+call fails no matter what the other four keys say.
 
 Two profile smart defaults act on this key, and they differ:
 
@@ -79,16 +85,27 @@ allow_credentials = true
    fetch("https://api.example.com/me", { credentials: "include" })
    ```
 
-3. **The cookie must be sendable cross-site.** Autumn's session cookie defaults
-   to `session.same_site = "Lax"`, and a `Lax` cookie is not sent on a
-   cross-site `fetch` at all — so this combination silently yields an
-   unauthenticated request even with the two above in place. A cross-site
-   session needs:
+3. **The cookie must be sendable — which depends on *site*, not origin.** This
+   condition applies to some callers and not others, and the distinction is easy
+   to miss: `SameSite` is evaluated on the registrable domain, so
+   `https://app.example.com` calling `https://api.example.com` is cross-**origin**
+   but still same-**site**. Autumn's session cookie defaults to
+   `session.same_site = "Lax"`, and a `Lax` cookie *is* sent on a same-site
+   request — so for a deployment like that one, conditions 1 and 2 are the whole
+   job and there is nothing to change here.
+
+   Only a genuinely cross-**site** caller — a different registrable domain, say
+   `https://app.partner.com` calling `https://api.example.com` — is refused by a
+   `Lax` cookie, silently and with no error anywhere. That case, and only that
+   case, needs:
 
    ```toml
    [session]
    same_site = "None"
    ```
+
+   Check which one you have before reaching for it: `None` gives up a real
+   defense, and a same-site deployment does not need it.
 
    Browsers honor `None` only on a `Secure` cookie, and `session.secure` is
    already `true` by default, so there is nothing to flip. `Secure` constrains
@@ -102,9 +119,9 @@ allow_credentials = true
    cross-site session works locally but stops working on a deployed host served
    over plain HTTP, that exemption is the difference.
 
-   That is a real loosening of CSRF protection — `SameSite` is a defense you are
-   giving up — so prefer putting both the app and its front-end on one origin
-   (a reverse proxy, a path prefix) over reaching for `None`. See
+   `SameSite=None` is a real loosening of CSRF protection, so prefer a same-site
+   deployment (two subdomains of one domain) or a single origin behind a reverse
+   proxy over reaching for it. See
    [Authentication](authentication.md) for the rest of the session cookie's
    settings.
 
