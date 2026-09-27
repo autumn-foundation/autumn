@@ -899,35 +899,33 @@ surprises:
 
   Stderr text only; the failure and its exit code are unchanged.
 
-- **A failed single-host deploy now names a migrated schema (#2276).** This is
-  the one deliberate break of the byte-identical single-host output. If the
-  deploy fails after `migrate` and before the cutover, the candidate is torn
+- **A failed single-host deploy now names a migrated schema (#2276).** A deploy
+  can fail at or after `migrate` and before the cutover. The candidate is torn
   down, but the migration stays applied. The error now has one more line:
 
   ```
-  ⚠️  the migration that already ran was NOT rolled back — the binaries went back
-  and the schema did not; confirm the previous release still fits the migrated
-  schema (`autumn migrate status`)
+  ⚠️  any migration that ran was NOT rolled back. The previous release now runs
+  on the migrated schema. Make sure that it works with that schema.
   ```
 
-  A *first* deploy leaves nothing serving, so it gets a different line:
+  A failed *first* deploy leaves no release serving, so it gets this line:
 
   ```
-  ⚠️  the migration that already ran was NOT rolled back — nothing is serving and
-  the schema has moved; re-run `autumn deploy up` (it skips an applied migration)
+  ⚠️  any migration that ran was NOT rolled back. No release is serving. Fix the
+  cause, then run `autumn deploy up` again.
   ```
 
-  The line uses the same rules as the fleet's
-  [schema notes](#the-three-schema-notes-on-the-fleet-state-summary). A failure
-  before `migrate` (an upload, say) adds no line. A failure after the cutover
-  adds no line, because the new release serves on the new schema. The ops, the
-  exit code and the first line of the error do not change.
+  The fleet's [schema notes](#the-three-schema-notes-on-the-fleet-state-summary)
+  use the same rules. A failure before `migrate` (for example, a failed upload)
+  adds no line. A failure after the cutover adds no line, because the new
+  release runs on the new schema. The remote commands, the exit code and the
+  first line of the error do not change.
 
 One further change is invisible on a single host and listed only for
 completeness: a post-cutover failure is now wrapped in an error type that records
 which step it landed on, so the fleet driver can decide whether that host may be
-auto-rolled-back. Its `Display` delegates to the wrapped error verbatim, so the
-single-host path prints byte-for-byte what it printed before.
+auto-rolled-back. Its `Display` delegates to the wrapped error verbatim, so a
+post-cutover failure prints the same message as before.
 
 `autumn deploy --help` was also rewritten, and `up`/`rollback` gained `--only`
 and `--no-rollback`; no existing flag changed meaning.

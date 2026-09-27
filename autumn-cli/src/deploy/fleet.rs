@@ -821,14 +821,13 @@ pub(crate) fn schema_moved(plan: &FleetPlan, outcomes: &[HostOutcome]) -> bool {
     })
 }
 
-/// Single-host note: a redeploy rolled back after `migrate` (#2276).
-pub(crate) const SINGLE_HOST_SCHEMA_AHEAD_NOTE: &str = "the migration that already ran was NOT rolled back — the binaries went back and the \
-     schema did not; confirm the previous release still fits the migrated schema \
-     (`autumn migrate status`)";
+/// Single-host note: a redeploy rolled back at or after `migrate` (#2276).
+pub(crate) const SINGLE_HOST_SCHEMA_AHEAD_NOTE: &str = "any migration that ran was NOT rolled back. The previous release now runs on the \
+     migrated schema. Make sure that it works with that schema.";
 
-/// Single-host note: a first deploy torn down after `migrate` (#2276).
-pub(crate) const SINGLE_HOST_FIRST_DEPLOY_SCHEMA_NOTE: &str = "the migration that already ran was NOT rolled back — nothing is serving and the schema \
-     has moved; re-run `autumn deploy up` (it skips an applied migration)";
+/// Single-host note: a first deploy torn down at or after `migrate` (#2276).
+pub(crate) const SINGLE_HOST_FIRST_DEPLOY_SCHEMA_NOTE: &str = "any migration that ran was NOT rolled back. No release is serving. Fix the cause, then \
+     run `autumn deploy up` again.";
 
 /// The schema note for a failed single-host deploy (#2276).
 ///
