@@ -1,0 +1,5 @@
+error: #[contract_checked] found no `CatalogClient` call in `show` to check. The client has to arrive as a parameter (`catalog: CatalogClient`), a typed `let`, or `CatalogClient::new(…)`, and be called through that name — one reached through a struct field or an index is not visible here.
+ --> tests/compile-fail/wire_contract_checked_client_not_found.rs:7:29
+  |
+7 | #[contract_checked(client = CatalogClient)]
+  |                             ^^^^^^^^^^^^^
