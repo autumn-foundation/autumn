@@ -11,6 +11,7 @@
 
 #![cfg(feature = "db")]
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -258,9 +259,8 @@ async fn cancelled_acquire_does_not_leak_lock() {
 
 /// Cancellation safety on the *release* path (P1, issue #1387): if a
 /// `release()` future is dropped while `pg_advisory_unlock` is still in-flight
-/// — here by wrapping it in a zero-duration `tokio::time::timeout`, which polls
-/// the unlock query once (it returns `Pending` on the first DB round-trip) and
-/// then cancels — the still-checked-out session must be force-closed rather than
+/// — here by polling it exactly once by hand and dropping it without polling
+/// again — the still-checked-out session must be force-closed rather than
 /// recycled into the pool while it could still be holding the advisory lock. We
 /// prove the lock did not leak by re-acquiring it from a fresh connection.
 #[tokio::test]
@@ -271,17 +271,38 @@ async fn cancelled_release_does_not_leak_lock() {
     let lock = Lock::new(pool.clone(), "test-cancel-release");
     let guard = lock.lock().await.expect("acquire should succeed");
 
-    // Cancel the release while the unlock query is still awaiting: the first
-    // poll dispatches `pg_advisory_unlock` (Pending on the DB round-trip), then
-    // the already-elapsed zero timeout drops the future. Dropping it runs the
-    // internal release guard's `Drop`, which force-closes the session so the
-    // advisory lock is released instead of riding a recycled connection back
-    // into the pool.
-    let cancelled = tokio::time::timeout(Duration::ZERO, guard.release()).await;
+    // Cancel the release while the unlock query is still awaiting. This used
+    // to race a `Duration::ZERO` `tokio::time::timeout` against the real
+    // `pg_advisory_unlock` round-trip on the theory that a zero-duration
+    // timer always wins — but `Timeout::poll` polls the wrapped future
+    // *before* checking the timer, so whenever the query happened to
+    // resolve within that same first poll (fast local testcontainer,
+    // scheduler already ran the connection's background driver task) the
+    // timeout never fired and the future was never actually cancelled
+    // mid-flight. Measured at 1/30 same-commit reruns (CI issue: this test
+    // was `--skip`-listed in `ci.yml` for exactly this flake, with no
+    // tracking issue).
+    //
+    // Poll the future by hand instead: this has no timing dependency at
+    // all. Asserting `Poll::Pending` on the very first poll *is* the proof
+    // the query had not completed yet (a real network round-trip cannot
+    // resolve synchronously on its first poll), and dropping the
+    // still-pinned future then cancels it deterministically at exactly that
+    // point — no race with anything.
+    let mut release_future = Box::pin(guard.release());
+    let waker = futures::task::noop_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
     assert!(
-        cancelled.is_err(),
-        "the release should have been cancelled by the zero-duration timeout"
+        release_future.as_mut().poll(&mut cx).is_pending(),
+        "the first poll of release() should not resolve synchronously — \
+         pg_advisory_unlock always requires a real network round-trip"
     );
+    // `release_future` is a `Pin<Box<_>>`, so this actually drops the
+    // suspended future in place (a stack-pinned `Pin<&mut _>` from
+    // `futures::pin_mut!` would NOT: dropping the reference is a no-op and
+    // the owned future would live on, undropped, until the enclosing scope
+    // ends — silently defeating the whole point of this test).
+    drop(release_future);
 
     // The lock must be genuinely free: a fresh handle on a new pooled
     // connection must be able to acquire it.

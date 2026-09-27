@@ -194,25 +194,120 @@ fn form_inputs_carry_matching_html5_constraints() {
         );
     }
 
+    // The constrained fields route through the typed `a11y::TextField`
+    // primitive (#1706), so the HTML5 constraints are typed builder calls
+    // (`.minlength(3u32)`) rather than raw `<input>` attributes; the rendered
+    // element/attributes/values are unchanged, only their source spelling.
     assert!(
-        routes.contains("minlength=\"3\" maxlength=\"120\""),
+        routes.contains(".minlength(3u32).maxlength(120u32)"),
         "title must render minlength/maxlength:\n{routes}"
     );
     assert!(
-        routes.contains("type=\"email\""),
+        routes.contains(".input_type(\"email\")"),
         "contact must render type=email:\n{routes}"
     );
     assert!(
-        routes.contains("type=\"url\""),
+        routes.contains(".input_type(\"url\")"),
         "homepage must render type=url:\n{routes}"
     );
     assert!(
-        routes.contains("type=\"number\"") && routes.contains("min=\"0\" max=\"130\""),
+        routes.contains(".input_type(\"number\")") && routes.contains(".min(\"0\").max(\"130\")"),
         "age must render type=number with min/max:\n{routes}"
     );
     assert!(
-        routes.contains("maxlength=\"200\""),
+        routes.contains(".maxlength(200u32)"),
         "bio must render maxlength:\n{routes}"
+    );
+}
+
+/// A `String`/`Text` length bound above `u32::MAX` is meaningless for an HTML
+/// length attribute (which fits a `u32`) and would otherwise reach the typed
+/// `a11y::TextField::maxlength(u32)` codegen as an overflowing `u32` literal
+/// that fails to compile the generated app. The generator rejects it up front
+/// at DSL parse time with an actionable message naming the `u32::MAX` limit.
+#[test]
+fn length_bound_above_u32_max_is_rejected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "validate-large-len-app"]);
+    let project = tmp.path().join("validate-large-len-app");
+    let output = run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Doc",
+            "title:String{max=5000000000}",
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "a >u32::MAX length bound must fail the scaffold"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("4294967295"),
+        "the error must name the u32::MAX limit:\n{stderr}"
+    );
+}
+
+/// A length bound exactly at `u32::MAX` is the largest bound that still fits an
+/// HTML length attribute, so it is accepted and emits a plain `u32` literal.
+#[test]
+fn length_bound_at_u32_max_is_accepted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "validate-max-len-app"]);
+    let project = tmp.path().join("validate-max-len-app");
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Doc",
+            "title:String{max=4294967295}",
+        ],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/docs.rs")).unwrap();
+    let title_input = slice_text_field(&routes, "title");
+    assert!(
+        title_input.contains(".maxlength(4294967295u32)"),
+        "a bound at u32::MAX must emit a plain u32 literal:\n{title_input}"
+    );
+}
+
+/// The explicit `--validate name=length:...` form renders solely to the
+/// server-side `#[validate(length(...))]` derive, which the `validator` crate
+/// accepts as a `u64`. Unlike the DSL inline `{max=…}` constraint, it never
+/// populates `FieldConstraints`, so it never reaches the HTML5 length attribute
+/// or the typed `a11y::TextField::maxlength(u32)` codegen. A bound above
+/// `u32::MAX` is therefore legitimate here and must be emitted verbatim rather
+/// than rejected (the `u32` guard belongs only to the DSL/HTML5 path).
+#[test]
+fn explicit_validate_length_bound_above_u32_max_is_accepted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "validate-server-len-app"]);
+    let project = tmp.path().join("validate-server-len-app");
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Doc",
+            "title:String",
+            "--validate",
+            "title=length:max=5000000000",
+        ],
+    );
+    let model = fs::read_to_string(project.join("src/models/doc.rs")).unwrap();
+    assert!(
+        model.contains("#[validate(length(max = 5000000000))]"),
+        "a server-side length bound above u32::MAX must be emitted verbatim:\n{model}"
+    );
+    // It must NOT reach the typed `u32` maxlength builder (that path is fed by
+    // the DSL inline constraint, not the explicit `--validate` form).
+    let routes = fs::read_to_string(project.join("src/routes/docs.rs")).unwrap();
+    assert!(
+        !routes.contains(".maxlength("),
+        "explicit --validate length must not emit an HTML5 maxlength builder:\n{routes}"
     );
 }
 
@@ -230,17 +325,19 @@ fn constrained_float_fields_keep_step_any() {
         &["generate", "scaffold", "Reading", "ratio:f64{min=0,max=1}"],
     );
     let routes = fs::read_to_string(project.join("src/routes/readings.rs")).unwrap();
+    // Routed through `a11y::TextField` (#1706): a `number` input built via
+    // `TextField::new("ratio").input_type("number")` rather than a raw `<input>`.
+    let ratio_input = slice_text_field(&routes, "ratio");
     assert!(
-        routes.contains("type=\"number\" id=\"ratio\""),
-        "the constrained float must render as a number input:\n{routes}"
+        ratio_input.contains(".input_type(\"number\")"),
+        "the constrained float must render as a number input:\n{ratio_input}"
     );
-    let ratio_input = slice_input(&routes, "id=\"ratio\" name=\"ratio\"");
     // Float bounds are canonicalized to valid float literals (`0` -> `0.0`), so
-    // the HTML5 attributes carry the decimal form too.
+    // the typed builder calls carry the decimal form too.
     assert!(
-        ratio_input.contains("min=\"0.0\"")
-            && ratio_input.contains("max=\"1.0\"")
-            && ratio_input.contains("step=\"any\""),
+        ratio_input.contains(".min(\"0.0\")")
+            && ratio_input.contains(".max(\"1.0\")")
+            && ratio_input.contains(".step(\"any\")"),
         "constrained float must carry min/max AND step=any:\n{ratio_input}"
     );
 }
@@ -251,29 +348,33 @@ fn required_only_on_non_nullable_constrained_fields() {
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
 
     // The non-nullable `title` input keeps the browser-native required signal;
-    // the nullable `bio` input must NOT (leaving it blank is valid).
-    let title_input = slice_input(&routes, "id=\"title\" name=\"title\"");
+    // the nullable `bio` input must NOT (leaving it blank is valid). Both route
+    // through `a11y::TextField` (#1706), so `required`/`aria-required` are the
+    // typed `.required().aria_required()` builder calls.
+    let title_input = slice_text_field(&routes, "title");
     assert!(
-        title_input.contains("required aria-required=\"true\""),
+        title_input.contains(".required().aria_required()"),
         "non-nullable title must be required:\n{title_input}"
     );
-    let bio_input = slice_input(&routes, "id=\"bio\" name=\"bio\"");
+    let bio_input = slice_text_field(&routes, "bio");
     assert!(
         !bio_input.contains("required"),
         "nullable bio must not be required:\n{bio_input}"
     );
 }
 
-/// Slice from an input's id/name marker to the terminating `;` so a
-/// field-scoped attribute assertion doesn't accidentally match a sibling.
-fn slice_input<'a>(routes: &'a str, marker: &str) -> &'a str {
+/// Slice a routed `a11y::TextField` call's field-specific builder calls: from
+/// the `TextField::new("field")` marker up to the shared `.class(` skeleton, so
+/// a field-scoped assertion doesn't accidentally match a sibling. The
+/// input-type/value/constraint/`required` builders all precede `.class(`.
+fn slice_text_field<'a>(routes: &'a str, field: &str) -> &'a str {
+    let marker = format!("TextField::new(\"{field}\")");
     let start = routes
-        .find(marker)
+        .find(&marker)
         .unwrap_or_else(|| panic!("missing {marker} in:\n{routes}"));
-    let end = routes[start..]
-        .find(';')
-        .map_or(routes.len(), |rel| start + rel);
-    &routes[start..end]
+    let rest = &routes[start..];
+    let end = rest.find(".class(").unwrap_or(rest.len());
+    &rest[..end]
 }
 
 #[test]
@@ -283,7 +384,7 @@ fn preserved_value_binding_survives_422_rerender() {
     // The appended control re-fills its value from the changeset, so a 422
     // re-render keeps what the user typed.
     assert!(
-        routes.contains("value=(changeset.field_value(\"title\").unwrap_or_default())"),
+        routes.contains(".value(changeset.field_value(\"title\").unwrap_or_default())"),
         "constrained inputs must re-fill from the changeset:\n{routes}"
     );
 }
@@ -309,15 +410,26 @@ fn text_columns_render_constrained_textarea_not_input() {
     );
     let routes = fs::read_to_string(project.join("src/routes/articles.rs")).unwrap();
 
-    // Both text columns are excised from the derived render and re-appended.
+    // Both text columns are excised from the derived render and re-appended,
+    // routed through the typed accessible `a11y::TextArea` primitive (#1933) —
+    // never a raw `<textarea>`, and never the single-line `a11y::TextField`
+    // (the multi-line control must stay a textarea).
     for field in ["body", "notes"] {
         assert!(
             routes.contains(&format!(".exclude(\"{field}\")")),
             "{field} must be excluded from the derived render:\n{routes}"
         );
         assert!(
-            routes.contains(&format!("textarea id=\"{field}\" name=\"{field}\"")),
-            "{field} must render a <textarea>:\n{routes}"
+            routes.contains(&format!("autumn_web::a11y::TextArea::new(\"{field}\")")),
+            "{field} must render through a11y::TextArea:\n{routes}"
+        );
+        assert!(
+            !routes.contains(&format!("textarea id=\"{field}\" name=\"{field}\"")),
+            "{field} must no longer emit a raw <textarea>:\n{routes}"
+        );
+        assert!(
+            !routes.contains(&format!("TextField::new(\"{field}\")")),
+            "the multi-line {field} must be a TextArea, not a single-line TextField:\n{routes}"
         );
     }
 
@@ -328,20 +440,22 @@ fn text_columns_render_constrained_textarea_not_input() {
         "body must not render a single-line text input:\n{routes}"
     );
 
-    // The non-nullable `body` carries the length rules + required, and its
-    // value is the element's text content, not a `value=` attribute.
-    let body_attrs = slice_textarea_attrs(&routes, "textarea id=\"body\" name=\"body\"");
+    // The non-nullable `body` carries the length rules + required as typed
+    // builder calls, and its value is the element's text content — TextArea
+    // renders `.value(...)` between `<textarea>…</textarea>`, not a `value=`
+    // attribute.
+    let body_attrs = slice_textarea_attrs(&routes, "body");
     assert!(
-        body_attrs.contains("minlength=\"10\"") && body_attrs.contains("maxlength=\"5000\""),
-        "body textarea must carry minlength/maxlength:\n{body_attrs}"
+        body_attrs.contains(".minlength(10u32)") && body_attrs.contains(".maxlength(5000u32)"),
+        "body textarea must carry minlength/maxlength builder calls:\n{body_attrs}"
     );
     assert!(
-        body_attrs.contains("required aria-required=\"true\""),
+        body_attrs.contains(".required().aria_required()"),
         "non-nullable body textarea must be required:\n{body_attrs}"
     );
     assert!(
-        routes.contains("(changeset.field_value(\"body\").unwrap_or_default())"),
-        "body textarea must re-fill from the changeset:\n{routes}"
+        body_attrs.contains(".value(changeset.field_value(\"body\").unwrap_or_default())"),
+        "body textarea must re-fill its value from the changeset:\n{body_attrs}"
     );
     assert!(
         !routes.contains("value=(changeset.field_value(\"body\")"),
@@ -349,9 +463,9 @@ fn text_columns_render_constrained_textarea_not_input() {
     );
 
     // The nullable `notes` keeps only its maxlength — no required, no minlength.
-    let notes_attrs = slice_textarea_attrs(&routes, "textarea id=\"notes\" name=\"notes\"");
+    let notes_attrs = slice_textarea_attrs(&routes, "notes");
     assert!(
-        notes_attrs.contains("maxlength=\"1000\""),
+        notes_attrs.contains(".maxlength(1000u32)"),
         "notes textarea must carry maxlength:\n{notes_attrs}"
     );
     assert!(
@@ -381,35 +495,43 @@ fn text_email_and_url_render_typed_input_not_textarea() {
     );
     let routes = fs::read_to_string(project.join("src/routes/contacts.rs")).unwrap();
 
+    // A `Text{email}`/`Text{url}` field routes through `a11y::TextField`
+    // (#1706): a typed single-line input via `TextField::new(...)` +
+    // `.input_type("email"|"url")`, never a raw `<input>` or a `<textarea>`.
+    let email_input = slice_text_field(&routes, "email_addr");
     assert!(
-        routes.contains("type=\"email\" id=\"email_addr\""),
-        "a Text{{email}} field must render a typed email input:\n{routes}"
+        email_input.contains(".input_type(\"email\")"),
+        "a Text{{email}} field must render a typed email input:\n{email_input}"
     );
+    let site_input = slice_text_field(&routes, "site");
     assert!(
-        routes.contains("type=\"url\" id=\"site\""),
-        "a Text{{url}} field must render a typed url input:\n{routes}"
+        site_input.contains(".input_type(\"url\")"),
+        "a Text{{url}} field must render a typed url input:\n{site_input}"
     );
     // Neither may be a <textarea> (which can't carry type=email/url).
     assert!(
         !routes.contains("textarea id=\"email_addr\"") && !routes.contains("textarea id=\"site\""),
         "type-dependent Text controls must not be textareas:\n{routes}"
     );
-    // The 422 value is carried via the `value=` attribute (input, not content).
+    // The 422 value is carried via the input's `.value(...)` (input, not
+    // textarea content), routed through `a11y::TextField` (#1706).
     assert!(
-        routes.contains("value=(changeset.field_value(\"email_addr\").unwrap_or_default())"),
-        "the typed input must re-fill via a value= attribute:\n{routes}"
+        routes.contains(".value(changeset.field_value(\"email_addr\").unwrap_or_default())"),
+        "the typed input must re-fill via a value builder call:\n{routes}"
     );
 }
 
-/// Slice a textarea's field-specific attributes: from the `id`/`name` marker
-/// up to the shared `class=` skeleton, so an assertion can't match a sibling
-/// control's attributes.
-fn slice_textarea_attrs<'a>(routes: &'a str, marker: &str) -> &'a str {
+/// Slice a routed `a11y::TextArea` call's field-specific builder calls: from
+/// the `TextArea::new("field")` marker up to the shared `.class(` skeleton, so
+/// a field-scoped assertion doesn't accidentally match a sibling. The
+/// value/constraint/`required` builders all precede `.class(`.
+fn slice_textarea_attrs<'a>(routes: &'a str, field: &str) -> &'a str {
+    let marker = format!("TextArea::new(\"{field}\")");
     let start = routes
-        .find(marker)
+        .find(&marker)
         .unwrap_or_else(|| panic!("missing {marker} in:\n{routes}"));
     let rest = &routes[start..];
-    let end = rest.find("class=").unwrap_or(rest.len());
+    let end = rest.find(".class(").unwrap_or(rest.len());
     &rest[..end]
 }
 
@@ -443,44 +565,58 @@ fn live_validation_forms_carry_html5_constraints() {
     );
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
 
-    // The string length constraint on the htmx-validated `title` input.
+    // Issue #1951: the constrained fields now route through the typed
+    // `a11y::TextField`/`TextArea` primitives, so the HTML5 constraints are
+    // typed builder calls (`.minlength(3u32)`), not raw attributes. The title
+    // input carries its length rule via the `TextField` primitive.
     assert!(
-        routes.contains("minlength=\"3\" maxlength=\"120\""),
-        "title must render minlength/maxlength in live-validation mode:\n{routes}"
+        routes.contains("autumn_web::a11y::TextField::new(\"title\")")
+            && routes.contains(".minlength(3u32).maxlength(120u32)"),
+        "title must render minlength/maxlength via the TextField primitive in live-validation mode:\n{routes}"
     );
-    // Typed inputs (email/url) instead of a bare text input.
+    // Typed inputs (email/url) instead of a bare text input — now via
+    // `.input_type(..)` on the primitive.
     assert!(
-        routes.contains("type=\"email\" id=\"contact\""),
-        "contact must render type=email in live-validation mode:\n{routes}"
+        routes.contains("autumn_web::a11y::TextField::new(\"contact\")")
+            && routes.contains(".input_type(\"email\")"),
+        "contact must render type=email via the TextField primitive in live-validation mode:\n{routes}"
     );
     assert!(
-        routes.contains("type=\"url\" id=\"homepage\""),
-        "homepage must render type=url in live-validation mode:\n{routes}"
+        routes.contains("autumn_web::a11y::TextField::new(\"homepage\")")
+            && routes.contains(".input_type(\"url\")"),
+        "homepage must render type=url via the TextField primitive in live-validation mode:\n{routes}"
     );
-    // Numeric min/max on the number input.
+    // Numeric min/max on the number input (numerics take no htmx path, so no
+    // `.hx(..)` — but they still route through `TextField`).
     assert!(
-        routes.contains("type=\"number\"") && routes.contains("min=\"0\" max=\"130\""),
-        "age must render type=number with min/max in live-validation mode:\n{routes}"
+        routes.contains("autumn_web::a11y::TextField::new(\"age\")")
+            && routes.contains(".input_type(\"number\")")
+            && routes.contains(".min(\"0\").max(\"130\")"),
+        "age must render type=number with min/max via the TextField primitive in live-validation mode:\n{routes}"
     );
-    // A constrained `Text` column becomes a <textarea> carrying its length rule.
+    // A constrained `Text` column becomes a `TextArea` primitive carrying its
+    // length rule.
     assert!(
-        routes.contains("textarea id=\"notes\" name=\"notes\"")
-            && routes.contains("maxlength=\"500\""),
-        "constrained Text `notes` must render a <textarea> with maxlength:\n{routes}"
+        routes.contains("autumn_web::a11y::TextArea::new(\"notes\")")
+            && routes.contains(".maxlength(500u32)"),
+        "constrained Text `notes` must render an a11y::TextArea with maxlength:\n{routes}"
     );
-    // The nullable `bio` keeps its maxlength.
+    // The nullable `bio` keeps its maxlength via the primitive.
     assert!(
-        routes.contains("maxlength=\"200\""),
-        "bio must render maxlength in live-validation mode:\n{routes}"
+        routes.contains("autumn_web::a11y::TextField::new(\"bio\")")
+            && routes.contains(".maxlength(200u32)"),
+        "bio must render maxlength via the TextField primitive in live-validation mode:\n{routes}"
     );
 
-    // The htmx inline-validation wiring survives on a constrained validated
-    // input (real-time validation still works alongside the static constraints),
-    // and its swap wrapper marker is present.
+    // Issue #1951: the htmx inline-validation wiring survives on a constrained
+    // validated input, now threaded through the primitive's `.hx()` escape
+    // hatch (real-time validation still works alongside the static
+    // constraints), and its swap wrapper marker stays a raw attribute on the
+    // wrapper `<div>`.
     assert!(
-        routes.contains("hx-post=(paths::validate_title())")
+        routes.contains(".hx(\"post\", paths::validate_title())")
             && routes.contains("data-autumn-field-wrapper=\"title\""),
-        "the constrained title input must keep its htmx inline-validation wiring (via typed path helper):\n{routes}"
+        "the constrained title input must keep its htmx inline-validation wiring (via `.hx()` + typed path helper):\n{routes}"
     );
 
     // Issue #1360 (finding F): the inline-validation POST `hx-include`s the whole
@@ -488,10 +624,11 @@ fn live_validation_forms_carry_html5_constraints() {
     // the first field validation would consume the token on the guarded
     // `/validate/...` route, and the real create submit would replay the
     // validation fragment instead of running the mutation. The htmx input must
-    // drop the token via `hx-params`, while the real create form keeps it.
+    // drop the token via `hx-params` (now `.hx("params", ..)`), while the real
+    // create form keeps it.
     assert!(
-        routes.contains("hx-params=\"not _submit_token\""),
-        "live-validation inputs must drop _submit_token from the inline POST:\n{routes}"
+        routes.contains(".hx(\"params\", \"not _submit_token\")"),
+        "live-validation inputs must drop _submit_token from the inline POST via `.hx()`:\n{routes}"
     );
     assert!(
         routes.contains("submit_token_input(submit_token.as_ref(), submit_field.as_ref())"),
@@ -502,11 +639,11 @@ fn live_validation_forms_carry_html5_constraints() {
     // swapped-in field doesn't drop the client-side attributes on first change.
     let validate_title = slice_fn(&routes, "pub async fn validate_title(");
     assert!(
-        validate_title.contains("minlength=\"3\" maxlength=\"120\""),
+        validate_title.contains(".minlength(3u32).maxlength(120u32)"),
         "the validate_title fragment must also carry the HTML5 constraints:\n{validate_title}"
     );
     assert!(
-        !validate_title.contains("type=\"email\""),
+        !validate_title.contains(".input_type(\"email\")"),
         "sanity: the validate_title slice must be bounded to its own handler:\n{validate_title}"
     );
 }
@@ -685,4 +822,89 @@ fn constrained_scaffold_cargo_checks() {
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr),
     );
+}
+
+/// Onramp: the literal `docs/guide/generators.md` "Five commands to a
+/// working CRUD app" example — `Post title:String body:Text published:bool`,
+/// no flags — must build with none of three specific warnings that used to
+/// come straight out of the generator: an unused `serde_json` import, an
+/// unused `Update{Model}` import, and an unused `is_nullable_form_field`
+/// parameter (every field in this exact command is required, so the
+/// nullable-field match compiles to a bare `false`). None of those three is a
+/// hard `cargo check` failure on its own, but the generated project's own
+/// `.github/workflows/ci.yml.tmpl` runs `cargo clippy --all-targets -- -D
+/// warnings`, so a brand-new user's first push after following the
+/// documented tutorial verbatim landed on red CI from code they never wrote
+/// themselves.
+///
+/// This asserts on the three warning strings themselves rather than running
+/// with `RUSTFLAGS=-D warnings` or `cargo clippy`: this test patches
+/// `autumn-web` to the in-tree path (the only way to compile the fix before
+/// it is published), and a path dependency does NOT get the registry
+/// dependency's cap-lints treatment a real published-crate build gets — so a
+/// blanket `-D warnings` here would also fail on `autumn-web`'s own
+/// pre-existing, unrelated warnings, which a real user building against
+/// crates.io never sees. `clippy` additionally needs a `clippy` component
+/// this job's toolchain step does not request. The two clippy-only lints
+/// this same fix also covers (`clone_on_copy`, `default_constructed_unit_structs`)
+/// were verified locally against a real `cargo clippy --all-targets -D
+/// warnings` run rather than harnessed here — see
+/// `docs/reports/2026-09-23-onramp-scaffold-clippy-clean.md`.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn documented_scaffold_example_builds_without_warnings() {
+    use std::fmt::Write as _;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "quickstart-warnings-app"]);
+    let project = tmp.path().join("quickstart-warnings-app");
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:Text",
+            "published:bool",
+        ],
+    );
+
+    let cargo_toml_path = project.join("Cargo.toml");
+    let mut content = fs::read_to_string(&cargo_toml_path).unwrap();
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let autumn_web = workspace_root.join("autumn");
+    let _ = write!(
+        content,
+        "\n[patch.crates-io]\nautumn-web = {{ path = \"{}\" }}\n",
+        autumn_web.display().to_string().replace('\\', "/")
+    );
+    fs::write(&cargo_toml_path, content).unwrap();
+
+    let check = Command::new("cargo")
+        .args(["check", "--all-targets"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on the documented scaffold example failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    for needle in [
+        "unused import: `autumn_web::reexports::serde_json`",
+        "unused import: `UpdatePost`",
+        "unused variable: `name`",
+    ] {
+        assert!(
+            !stderr.contains(needle),
+            "the documented scaffold example must not warn `{needle}`:\n{stderr}"
+        );
+    }
 }
