@@ -169,7 +169,7 @@ where
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    tracing::warn!(%error, "edge identity infrastructure failure; falling through to origin")
+                    tracing::warn!(%error, "edge identity infrastructure failure; falling through to origin");
                 }
             }
             inner.call(request).await

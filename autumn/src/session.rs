@@ -696,10 +696,10 @@ pub(crate) fn session_id_from_headers(
     cookie_name: &str,
     signing_keys: Option<&crate::security::config::ResolvedSigningKeys>,
 ) -> Option<String> {
-    match signing_keys {
-        Some(keys) => verified_session_id(headers, cookie_name, keys),
-        None => get_cookie(headers, cookie_name),
-    }
+    signing_keys.map_or_else(
+        || get_cookie(headers, cookie_name),
+        |keys| verified_session_id(headers, cookie_name, keys),
+    )
 }
 
 /// Fuzzing seam: exercise the cookie-header parser plus the signed-session
