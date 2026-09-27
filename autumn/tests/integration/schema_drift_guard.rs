@@ -6,23 +6,28 @@
 //!
 //! # Coverage scope (important)
 //!
-//! `schema_leaf_paths()` is derived by the `SchemaDeserializer`, which only
-//! descends into structs defined in `config.rs` itself. External-module config
-//! types (e.g. `SecurityConfig`, `AuthConfig`, `SessionConfig`) appear in the
-//! snapshot only as single-segment *root* leaves (`security`, `auth`, …) — their
-//! nested fields are NOT in the snapshot. This is deliberate: `get_schema_keys`
-//! is shared with the strict unknown-key validator, so widening it would change
-//! runtime validation behavior.
+//! `schema_leaf_paths()` is derived by the `SchemaDeserializer`, which recurses
+//! into every derived-`Deserialize` struct it reaches, regardless of the module
+//! the type is declared in. External-module config types (e.g. `SecurityConfig`,
+//! `AuthConfig`, `SessionConfig`) therefore expose their nested fields in the
+//! snapshot just like config.rs-internal types. (Before the #1890 adaptive
+//! multi-pass walk, sections declared after a walk-aborting field — the
+//! `database.statement_timeout` duration, or the seq/map-only `jobs.queues`
+//! visitor — appeared only as single-segment *root* leaves; that was an artifact
+//! of the abort, not of their module.) `get_schema_keys` is shared with the
+//! strict unknown-key validator, so these nested external keys are now covered by
+//! strict validation too (warn-first during the #1890 rollout).
 //!
 //! Consequences for the registered deprecated keys, which live in external
 //! modules (`security.rate_limit.*`):
-//!   * Removal of the whole `security` section IS caught here (the root leaf
-//!     disappears and the registry-root check below fires).
+//!   * Removal of the whole `security` section IS caught here (its root and
+//!     child leaves disappear and the registry-root check below fires).
 //!   * Removal of an individual external *leaf* (e.g. the `trusted_proxies`
-//!     field) is NOT visible to this snapshot. That case is instead guarded by
-//!     the honored-value integration tests in `tests/config_deprecation.rs`,
-//!     which access the fields directly (deletion breaks compilation) and assert
-//!     each registered key still loads and still emits its WARN.
+//!     field) is now visible to this snapshot as well, and remains additionally
+//!     guarded by the honored-value integration tests in
+//!     `tests/config_deprecation.rs`, which access the fields directly (deletion
+//!     breaks compilation) and assert each registered key still loads and still
+//!     emits its WARN.
 //!
 //! # Regenerating the snapshot
 //!
@@ -63,6 +68,17 @@ const fn feature_gated_roots() -> [(bool, &'static str); 6] {
         (cfg!(feature = "reporting"), "reporting"),
         (cfg!(feature = "maud"), "stories"),
     ]
+}
+
+/// Feature-gated NESTED keys (not whole root sections). `auth` is always
+/// present, but its `webauthn` subtree only compiles under the `webauthn`
+/// feature, so when that feature is off these snapshot leaves are legitimately
+/// absent from `schema_leaf_paths()` — exclude by prefix rather than failing.
+/// Keep in sync with `config.rs`'s `#[cfg(feature = "...")]` nested fields —
+/// [`feature_gated_leaf_prefixes_match_config_when_enabled`] below self-checks
+/// this list whenever a listed feature happens to be enabled.
+const fn feature_gated_leaf_prefixes() -> [(bool, &'static str); 1] {
+    [(cfg!(feature = "webauthn"), "auth.webauthn")]
 }
 
 const SNAPSHOT_PATH: &str = concat!(
@@ -116,15 +132,27 @@ fn schema_keys_snapshot_guard() {
         .filter(|(enabled, _)| !enabled)
         .map(|(_, root)| root)
         .collect();
+    let disabled_leaf_prefixes: Vec<&str> = feature_gated_leaf_prefixes()
+        .into_iter()
+        .filter(|(enabled, _)| !enabled)
+        .map(|(_, prefix)| prefix)
+        .collect();
 
     // Keys in snapshot but absent from current schema without a registry
     // entry, excluding root sections whose gating feature isn't compiled
-    // into this test binary (see module docs).
+    // into this test binary, and nested subtrees whose gating feature is off
+    // (e.g. `auth.webauthn.*` under the always-present `auth` root — see module
+    // docs and `feature_gated_leaf_prefixes`).
     let removed_without_deprecation: Vec<&str> = snapshot
         .iter()
         .filter(|k| !current.contains(k.as_str()))
         .filter(|k| !registry.contains(k.as_str()))
         .filter(|k| !disabled_roots.contains(k.split('.').next().unwrap_or(k.as_str())))
+        .filter(|k| {
+            !disabled_leaf_prefixes
+                .iter()
+                .any(|p| k.as_str() == *p || k.strip_prefix(p).is_some_and(|r| r.starts_with('.')))
+        })
         .map(String::as_str)
         .collect();
 
@@ -200,6 +228,35 @@ fn feature_gated_roots_mapping_matches_config_when_enabled() {
     );
 }
 
+/// Self-check for [`feature_gated_leaf_prefixes`]: whenever a listed feature
+/// happens to be enabled in this build (e.g. via `--all-features`, or workspace
+/// feature unification with `cargo test --workspace`), its mapped nested prefix
+/// must actually appear in the compiled schema. Catches the prefix list going
+/// stale (a feature renamed, or the nested field renamed/removed) instead of
+/// silently letting a real removal slip past the guard above as "expected".
+#[test]
+fn feature_gated_leaf_prefixes_match_config_when_enabled() {
+    let current = AutumnConfig::schema_leaf_paths();
+    let stale: Vec<&str> = feature_gated_leaf_prefixes()
+        .into_iter()
+        .filter(|(enabled, _)| *enabled)
+        .map(|(_, prefix)| prefix)
+        .filter(|prefix| {
+            !current.iter().any(|k| {
+                k.as_str() == *prefix || k.strip_prefix(*prefix).is_some_and(|r| r.starts_with('.'))
+            })
+        })
+        .collect();
+
+    assert!(
+        stale.is_empty(),
+        "feature_gated_leaf_prefixes() in this file is stale: these features are enabled in \
+         this build but their mapped nested prefix is missing from the compiled schema: \
+         {stale:?}\nUpdate the mapping to match config.rs's current \
+         #[cfg(feature = \"...\")] nested fields.",
+    );
+}
+
 // ── unit: schema_leaf_paths content ───────────────────────────────────────────
 
 #[test]
@@ -210,17 +267,18 @@ fn schema_leaf_paths_contains_known_paths() {
         leaves.contains("server.port"),
         "server.port must be a schema leaf"
     );
-    // External-module types appear only as root leaves (see module docs); the
-    // deep `security.rate_limit.*` keys are intentionally NOT here — they are
-    // honored-checked in tests/config_deprecation.rs.
+    // External-module types now descend too (the #1890 adaptive walk no longer
+    // aborts before them), so both the bare `security` root leaf AND its nested
+    // fields appear in the schema.
     assert!(
         leaves.contains("security"),
         "security must appear as a root-level schema leaf"
     );
     assert!(
-        !leaves.contains("security.rate_limit.trusted_proxies"),
-        "external-module leaves are not in the schema snapshot by design; \
-         if this changed, revisit the guard's coverage assumptions"
+        leaves.contains("security.rate_limit.trusted_proxies"),
+        "external-module leaves now descend into the schema after the #1890 \
+         adaptive-walker fix; if this vanished, the walk is aborting before \
+         [security] again"
     );
 }
 
@@ -246,6 +304,10 @@ fn deploy_child_keys_are_strictly_validated() {
         "deploy.service_name",
         "deploy.readiness_timeout_secs",
         "deploy.keep_releases",
+        // #1621: the fleet host list. Without this leaf a typo like
+        // `[deploy] hots = [...]` is silently ignored and the operator deploys to
+        // nothing (or, worse, to the stale single `host`).
+        "deploy.hosts",
     ] {
         assert!(
             leaves.contains(key),
@@ -260,5 +322,327 @@ fn deploy_child_keys_are_strictly_validated() {
     assert!(
         errors.iter().any(|(path, _)| path == "deploy.app_dr"),
         "a bogus [deploy] child key must be rejected by strict validation, got: {errors:?}"
+    );
+
+    // #1621: a near-miss of the new fleet key is flagged too — adding a list-typed
+    // leaf must not open a hole in the strict walk.
+    let hosts_typo =
+        AutumnConfig::validate_toml("[deploy]\nhots = [\"web-1.example.com\"]\n", &schema);
+    assert!(
+        hosts_typo.iter().any(|(path, _)| path == "deploy.hots"),
+        "a typo of the [deploy] hosts key must be rejected by strict validation, \
+         got: {hosts_typo:?}"
+    );
+    // ...while the correctly-spelled fleet list is accepted.
+    let hosts_ok =
+        AutumnConfig::validate_toml("[deploy]\nhosts = [\"web-1.example.com\"]\n", &schema);
+    assert!(
+        hosts_ok.is_empty(),
+        "[deploy] hosts must be accepted by strict validation, got: {hosts_ok:?}"
+    );
+}
+
+/// Regression guard for the `[cluster]` field ordering (issue #1762).
+///
+/// Same landmine as `deploy_child_keys_are_strictly_validated`: the strict
+/// unknown-key validator only descends into a config.rs-internal section
+/// declared *before* `database`, because `DatabaseConfig`'s `deserialize_with`
+/// duration field aborts the `SchemaDeserializer` walk. `[cluster]` carries a
+/// shared secret and a bind address — a silently-accepted typo there is a node
+/// that never joins, or joins something it should not. If someone moves
+/// `cluster` below `database`, its child keys vanish from the schema and this
+/// fails.
+#[test]
+fn cluster_child_keys_are_strictly_validated() {
+    let leaves = AutumnConfig::schema_leaf_paths();
+    for key in [
+        "cluster.enabled",
+        "cluster.secret",
+        "cluster.cluster_name",
+        "cluster.bind_addr",
+        "cluster.advertise_addr",
+        "cluster.seed_peers",
+        "cluster.node_id",
+        "cluster.push_interval_ms",
+        "cluster.suspicion_timeout_ms",
+    ] {
+        assert!(
+            leaves.contains(key),
+            "{key} must be a schema leaf so strict validation descends into [cluster]; \
+             if this fails, `cluster` was likely moved below `database` in AutumnConfig"
+        );
+    }
+
+    // End-to-end: the strict validator flags an unknown child key under [cluster].
+    let schema = AutumnConfig::get_schema_keys();
+    let errors =
+        AutumnConfig::validate_toml("[cluster]\nseed_peer = [\"127.0.0.1:7946\"]\n", &schema);
+    assert!(
+        errors.iter().any(|(path, _)| path == "cluster.seed_peer"),
+        "a bogus [cluster] child key must be rejected by strict validation, got: {errors:?}"
+    );
+}
+
+/// Regression guard for the `[metrics]` field ordering.
+///
+/// Same landmine as `deploy_child_keys_are_strictly_validated` and its
+/// siblings: strict unknown-key validation only descends into a section the
+/// `SchemaDeserializer` walk actually reaches, and `DatabaseConfig`'s
+/// `deserialize_with` duration field aborts that walk. A silently-accepted
+/// typo here is the worst shape this section has: the operator raised a cap
+/// *because* `autumn_metrics_series_dropped_total` was climbing, the app boots
+/// clean, and the cap they meant to raise is still at its default while the
+/// samples keep being dropped. If someone moves `metrics` below `database`,
+/// this fails.
+#[test]
+fn metrics_child_keys_are_strictly_validated() {
+    let leaves = AutumnConfig::schema_leaf_paths();
+    for key in [
+        "metrics.max_series_per_metric",
+        "metrics.max_instruments",
+        "metrics.max_labels_per_series",
+    ] {
+        assert!(
+            leaves.contains(key),
+            "{key} must be a schema leaf so strict validation descends into [metrics]; \
+             if this fails, `metrics` was likely moved below `database` in AutumnConfig"
+        );
+    }
+
+    let schema = AutumnConfig::get_schema_keys();
+    let errors = AutumnConfig::validate_toml("[metrics]\nmax_serie_per_metric = 500\n", &schema);
+    assert!(
+        errors
+            .iter()
+            .any(|(path, _)| path == "metrics.max_serie_per_metric"),
+        "a bogus [metrics] child key must be rejected by strict validation, got: {errors:?}"
+    );
+
+    let ok = AutumnConfig::validate_toml(
+        "[metrics]\nmax_series_per_metric = 500\nmax_instruments = 512\n\
+         max_labels_per_series = 12\n",
+        &schema,
+    );
+    assert!(
+        ok.is_empty(),
+        "a well-formed [metrics] section must be accepted, got: {ok:?}"
+    );
+}
+
+/// Regression guard for the `[shadow]` field ordering (issue #1653).
+///
+/// Same landmine as `deploy_child_keys_are_strictly_validated` and
+/// `cluster_child_keys_are_strictly_validated`: strict unknown-key validation
+/// only descends into a section the `SchemaDeserializer` walk actually reaches.
+/// A silently-accepted typo here is a mirror that never runs (`targt`), or one
+/// that mirrors far more traffic than the operator meant (`sample_rat` leaving
+/// the 1.0 default in place against production volume). If someone moves
+/// `shadow` below `database` and the walk stops reaching it, this fails.
+#[test]
+fn shadow_child_keys_are_strictly_validated() {
+    let leaves = AutumnConfig::schema_leaf_paths();
+    for key in [
+        "shadow.enabled",
+        "shadow.target",
+        "shadow.sample_rate",
+        "shadow.routes",
+        "shadow.timeout_ms",
+        "shadow.max_in_flight",
+        "shadow.max_body_bytes",
+        "shadow.max_records",
+        "shadow.max_sample_bytes",
+    ] {
+        assert!(
+            leaves.contains(key),
+            "{key} must be a schema leaf so strict validation descends into [shadow]; \
+             if this fails, `shadow` was likely moved below `database` in AutumnConfig"
+        );
+    }
+
+    let schema = AutumnConfig::get_schema_keys();
+    let errors =
+        AutumnConfig::validate_toml("[shadow]\ntargt = \"http://127.0.0.1:9091\"\n", &schema);
+    assert!(
+        errors.iter().any(|(path, _)| path == "shadow.targt"),
+        "a bogus [shadow] child key must be rejected by strict validation, got: {errors:?}"
+    );
+
+    let ok = AutumnConfig::validate_toml(
+        "[shadow]\nenabled = true\ntarget = \"http://127.0.0.1:9091\"\nsample_rate = 0.1\n",
+        &schema,
+    );
+    assert!(
+        ok.is_empty(),
+        "a well-formed [shadow] section must be accepted, got: {ok:?}"
+    );
+}
+
+/// #1890: config.rs-internal sections declared AFTER `database` used to vanish
+/// from the derived schema because the `statement_timeout` duration field
+/// aborted the `SchemaDeserializer` walk. The tolerant `deserialize_any` probe
+/// keeps the walk descending, so these sections now expose their child keys and
+/// the strict validator can flag typos in them.
+#[test]
+fn post_database_sections_are_now_schema_covered() {
+    let schema = AutumnConfig::get_schema_keys();
+    // Roots confirmed (from the regenerated snapshot) to be config.rs-internal
+    // structs that expand to child keys after the fix.
+    for root in ["log", "cache", "jobs", "telemetry"] {
+        assert!(
+            schema.get(root).is_some_and(|k| !k.is_empty()),
+            "[{root}] must have child keys after the #1890 fix; empty means the walk aborted before it"
+        );
+    }
+    let errors = AutumnConfig::validate_toml("[log]\nnot_a_real_key = true\n", &schema);
+    assert!(
+        errors.iter().any(|(p, _)| p == "log.not_a_real_key"),
+        "a bogus [log] child key must be flagged now, got: {errors:?}"
+    );
+}
+
+/// #1890 (follow-up): `jobs.queues` uses a seq/map-only visitor
+/// (`JobQueuesConfig`) that rejected the scalar `deserialize_any` probe and
+/// aborted the walk at `jobs.queues`, dropping every section declared AFTER
+/// `[jobs]` from the derived schema. The adaptive multi-pass walk escalates that
+/// path to a map probe (empty map → visitor yields an empty config → no abort),
+/// so the walk continues and enumerates the later sections. This asserts those
+/// post-`jobs` sections now expose child keys and are strictly validated.
+#[test]
+fn post_jobs_sections_are_now_schema_covered() {
+    let schema = AutumnConfig::get_schema_keys();
+    // Config.rs-internal, always-on roots declared after `[jobs]`, confirmed
+    // from the regenerated snapshot to expand to child keys once the walk stops
+    // aborting at `jobs.queues`.
+    for root in [
+        "scheduler",
+        "resilience",
+        "seo",
+        "dev",
+        "compression",
+        "backup",
+    ] {
+        assert!(
+            schema.get(root).is_some_and(|k| !k.is_empty()),
+            "[{root}] must have child keys after the adaptive-walker fix; empty means the walk still aborts before it (see #1890 / jobs.queues)"
+        );
+    }
+    // `jobs` sub-structs declared after the `jobs.queues` abort point are covered too.
+    assert!(
+        schema.get("jobs.redis").is_some_and(|k| !k.is_empty()),
+        "jobs.redis must descend now that jobs.queues no longer aborts the walk"
+    );
+    // `jobs.queues` itself stays present, as a leaf (dynamic queue names, no
+    // fixed child keys — we intentionally do not descend into it).
+    assert!(
+        AutumnConfig::schema_leaf_paths().contains("jobs.queues"),
+        "jobs.queues must remain in the schema as a leaf"
+    );
+    // End-to-end: the reviewer's example — a bogus deep key under [resilience]
+    // is flagged now that the walk reaches [resilience].
+    let errors = AutumnConfig::validate_toml("[resilience]\nnot_a_real_key = true\n", &schema);
+    assert!(
+        errors.iter().any(|(p, _)| p == "resilience.not_a_real_key"),
+        "a bogus [resilience] child key must be flagged now, got: {errors:?}"
+    );
+}
+
+#[test]
+fn manual_schema_sections_are_registered() {
+    let schema = autumn_web::config::AutumnConfig::get_schema_keys();
+    // Walker-opaque untagged scalar-or-table sections must still expose their
+    // table fields so strict validation descends (see MANUAL_SCHEMA_SECTIONS).
+    let tz = schema
+        .get("time_zone")
+        .expect("time_zone must be in schema");
+    assert!(
+        tz.contains("identifier") && tz.contains("sources"),
+        "time_zone table fields must be registered, got: {tz:?}"
+    );
+    // End-to-end: a typo under [time_zone] is now flagged (was silently accepted).
+    let errors = autumn_web::config::AutumnConfig::validate_toml(
+        "[time_zone]\nidentifer = \"UTC\"\n",
+        &schema,
+    );
+    assert!(
+        errors.iter().any(|(p, _)| p == "time_zone.identifer"),
+        "a bogus [time_zone] child key must be flagged now, got: {errors:?}"
+    );
+}
+
+#[test]
+fn dynamic_key_sections_are_not_strict_validated() {
+    // Flatten maps and HashMap<String,_> config sections have ARBITRARY valid
+    // child keys the schema walker can't enumerate (e.g. OAuth2 provider names
+    // like `github` under [auth.oauth2], or hosts under
+    // [resilience.circuit_breaker.hosts]). They deserialize via
+    // SchemaDeserializer::deserialize_map, which registers NO schema entry, so
+    // `schema.get(path)` is None and validate_toml_table skips their children —
+    // no false-positive "unknown key". This guards against a future change that
+    // would give these a restrictive schema entry and break valid configs.
+    let schema = autumn_web::config::AutumnConfig::get_schema_keys();
+
+    // Always-present dynamic sections must have NO restrictive schema entry.
+    for dynamic in ["resilience.circuit_breaker.hosts", "jobs.queues"] {
+        let entry = schema.get(dynamic);
+        assert!(
+            entry.is_none(),
+            "{dynamic} is a dynamic-key section and must NOT have a restrictive \
+             schema entry (that would false-positive valid child keys); got {entry:?}",
+        );
+    }
+    // End-to-end: valid dynamic child keys are accepted (no unknown-key error).
+    let errors = autumn_web::config::AutumnConfig::validate_toml(
+        "[resilience.circuit_breaker.hosts.api]\nopen_duration_secs = 5\n",
+        &schema,
+    );
+    assert!(
+        errors
+            .iter()
+            .all(|(p, _)| !p.starts_with("resilience.circuit_breaker.hosts")),
+        "valid keys under a dynamic map section must not be flagged; got {errors:?}"
+    );
+}
+
+#[cfg(feature = "oauth2")]
+#[test]
+fn flattened_oauth2_providers_are_not_flagged() {
+    // Regression guard for the reviewer's exact example: [auth.oauth2.<name>] is
+    // a valid provider via `OAuth2Config::providers` (`#[serde(flatten)]`), so it
+    // must NOT be reported as an unknown key (which would hard-fail under
+    // strict_config_enforce_all).
+    let schema = autumn_web::config::AutumnConfig::get_schema_keys();
+    let entry = schema.get("auth.oauth2");
+    assert!(
+        entry.is_none(),
+        "auth.oauth2 is a flatten map and must have no restrictive schema entry; got {entry:?}",
+    );
+    let errors = autumn_web::config::AutumnConfig::validate_toml(
+        "[auth.oauth2.github]\nclient_id = \"x\"\nclient_secret = \"y\"\n",
+        &schema,
+    );
+    assert!(
+        errors.iter().all(|(p, _)| !p.starts_with("auth.oauth2")),
+        "flattened OAuth2 provider keys must not be flagged as unknown; got {errors:?}"
+    );
+}
+
+#[cfg(feature = "http-client")]
+#[test]
+fn http_client_base_urls_map_is_not_flagged() {
+    let schema = autumn_web::config::AutumnConfig::get_schema_keys();
+    let entry = schema.get("http.client.base_urls");
+    assert!(
+        entry.is_none(),
+        "http.client.base_urls is a HashMap and must have no restrictive schema entry; got {entry:?}",
+    );
+    let errors = autumn_web::config::AutumnConfig::validate_toml(
+        "[http.client.base_urls]\nstripe = \"https://api.stripe.com\"\n",
+        &schema,
+    );
+    assert!(
+        errors
+            .iter()
+            .all(|(p, _)| !p.starts_with("http.client.base_urls")),
+        "arbitrary base_urls map keys must not be flagged; got {errors:?}"
     );
 }

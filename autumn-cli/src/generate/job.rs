@@ -18,6 +18,8 @@ use super::naming::{pascal, snake};
 use super::schema_edit::{
     add_jobs_registration_to_app, add_mod_declaration, augment_registered_jobs, update_main_rs,
 };
+use autumn_web::config::DatabaseBackend;
+
 use super::{GenerateError, ensure_project_root, read_or_empty};
 
 /// Cargo dependencies always required by generated job files.
@@ -34,13 +36,24 @@ const JOB_DEPS_CHRONO: (&str, &str) = ("chrono", "{ version = \"0.4\", features 
 /// `f.rust_type()` (`"rust_decimal::Decimal"`) always has a matching
 /// Cargo.toml entry, the same way `JOB_DEPS_UUID`/`JOB_DEPS_CHRONO` already
 /// do for `uuid::Uuid`/`chrono` fields.
-const JOB_DEPS_DECIMAL: (&str, &str) = (
-    "rust_decimal",
-    "{ version = \"1\", features = [\"db-diesel2-postgres\", \"serde\"] }",
-);
+///
+/// Backend-aware for the same reason `model.rs`'s is (issue #1924): asking a
+/// `SQLite` app for `rust_decimal`'s *Postgres* diesel feature is wrong, and the
+/// two generators share one `rust_decimal` line.
+const fn job_deps_decimal(backend: DatabaseBackend) -> (&'static str, &'static str) {
+    (
+        "rust_decimal",
+        match backend {
+            DatabaseBackend::Postgres => {
+                "{ version = \"1\", features = [\"db-diesel2-postgres\", \"serde\"] }"
+            }
+            DatabaseBackend::Sqlite => "{ version = \"1\", features = [\"serde\"] }",
+        },
+    )
+}
 
 /// Build the complete dep list for a job based on which field types are used.
-fn job_deps(fields: &[Field]) -> Vec<(&'static str, &'static str)> {
+fn job_deps(fields: &[Field], backend: DatabaseBackend) -> Vec<(&'static str, &'static str)> {
     let mut deps: Vec<(&str, &str)> = JOB_DEPS_BASE.to_vec();
     if fields.iter().any(|f| matches!(f.kind, FieldKind::Uuid)) {
         deps.push(JOB_DEPS_UUID);
@@ -52,7 +65,7 @@ fn job_deps(fields: &[Field]) -> Vec<(&'static str, &'static str)> {
         deps.push(JOB_DEPS_CHRONO);
     }
     if fields.iter().any(|f| f.kind.is_decimal()) {
-        deps.push(JOB_DEPS_DECIMAL);
+        deps.push(job_deps_decimal(backend));
     }
     deps
 }
@@ -73,12 +86,34 @@ pub fn plan_job(project_root: &Path, name: &str, fields: &[String]) -> Result<Pl
 
     // Attachment fields require the `storage` autumn-web feature and are not
     // meaningful as job arguments (pass a storage key or file ID instead).
-    for field in &parsed_fields {
+    // `parse_fields` builds `parsed_fields` from `fields` one-to-one with no
+    // skips, so `fields[i]` is the token that produced `parsed_fields[i]` — the
+    // refusals below can echo what the user actually typed.
+    for (i, field) in parsed_fields.iter().enumerate() {
         if matches!(field.kind, FieldKind::Attachment) {
             return Err(GenerateError::InvalidField {
                 token: format!("{}:Attachment", field.name),
                 reason: "Attachment fields are not supported in job args structs; \
                          pass a storage key (String) or file ID (i64) instead"
+                    .into(),
+            });
+        }
+        // Issue #1340: at-rest column encryption is a `#[model]` concern. A job
+        // args struct is a serde payload serialized into the queue, not a
+        // database column, so `#[encrypted]` has nothing to attach to — and
+        // silently dropping the modifier would hand back a plaintext argument
+        // the author believed was protected.
+        if field.is_encrypted() {
+            return Err(GenerateError::InvalidField {
+                // Echo the token the user typed rather than synthesizing one:
+                // `notes:Text{encrypted:deterministic}` must not be reported
+                // back as `notes:String{encrypted}`.
+                token: fields[i].clone(),
+                reason: "the `encrypted` modifier applies to model columns, not job arguments: \
+                         job args are serialized into the queue payload, not stored in a \
+                         column, so there is no `#[model]` field for `#[encrypted]` to attach \
+                         to. Declare the encrypted column with `generate model`/`generate \
+                         scaffold` and pass the record's id as the job argument instead."
                     .into(),
             });
         }
@@ -146,6 +181,8 @@ pub fn plan_job(project_root: &Path, name: &str, fields: &[String]) -> Result<Pl
     });
 
     // ── Cargo.toml: ensure serde (always) plus uuid/chrono/decimal if used ──
+    // The decimal dep's features are backend-specific (issue #1924).
+    let backend = super::detect_backend(project_root);
     if parsed_fields.iter().any(|f| f.kind.is_decimal()) {
         let existing_cargo_toml = read_or_empty(&project_root.join("Cargo.toml"));
         // Job args structs only derive Serialize/Deserialize (no Diesel
@@ -158,13 +195,13 @@ pub fn plan_job(project_root: &Path, name: &str, fields: &[String]) -> Result<Pl
             &mut plan,
             &existing_cargo_toml,
             "rust_decimal",
-            &["db-diesel2-postgres", "serde"],
+            super::model::decimal_dep_features(backend),
         );
     }
     super::model::plan_cargo_deps(
         &mut plan,
         project_root,
-        &job_deps(&parsed_fields),
+        &job_deps(&parsed_fields, backend),
         &project_root.join("src/jobs"),
     );
 
@@ -959,5 +996,28 @@ async fn main() {
         assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
         assert!(plan.warnings[0].contains("rust_decimal"));
         assert!(plan.warnings[0].contains("db-diesel2-postgres"));
+    }
+
+    // ── `{encrypted}` is not a `generate job` token (issue #1340) ───────────
+
+    /// R9: a job args struct is a serde payload, not a database column — there
+    /// is no `#[model]` for `#[encrypted]` to attach to, and the args are
+    /// serialized into the job queue. Refuse rather than silently drop the
+    /// modifier and hand back a plaintext argument.
+    #[test]
+    fn job_args_reject_the_encrypted_modifier() {
+        let tmp = project_with_main("fn main() {}\n");
+        let err = plan_job(
+            tmp.path(),
+            "SendWelcomeEmail",
+            &["api_token:String{encrypted}".into()],
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("encrypted"), "must name the modifier: {msg}");
+        assert!(
+            msg.contains("generate model") || msg.contains("generate scaffold"),
+            "must point at where the modifier belongs: {msg}"
+        );
     }
 }

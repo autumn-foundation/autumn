@@ -1,0 +1,17 @@
+$ cargo test -p autumn-web --test integration_tests idempotency_tenant_scope
+
+test integration::idempotency_tenant_scope::header_tenancy_does_not_replay_across_tenants ... ok
+test integration::idempotency_tenant_scope::same_tenant_retry_still_replays ... ok
+test integration::idempotency_tenant_scope::session_tenancy_public_path_alias_stays_tenantless ... ok
+test integration::idempotency_tenant_scope::session_tenancy_alias_uses_finalized_tenant_after_switch ... ok
+test integration::idempotency_tenant_scope::subdomain_tenancy_does_not_replay_across_tenants ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 1786 filtered out; finished in 0.01s
+
+$ cargo test -p autumn-web --test integration_tests idempotency   # full suite
+
+test result: ok. 66 passed; 0 failed; 0 ignored; 0 measured; 1725 filtered out; finished in 0.92s
+
+$ cargo fmt --all
+$ cargo clippy -p autumn-web --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5m 45s

@@ -1,0 +1,127 @@
+# autumn-media-plugin
+
+`autumn-media-plugin` adds live-streaming media to an `autumn-web` application.
+It packages the two primitives an interactive streaming product needs:
+
+- **Broadcast** — one creator ingests (RTMP / WHIP / browser WebRTC) and a
+  fan-out audience watches over low-latency WebRTC/WHEP with an HLS fallback,
+  backed by `MediaMTX`; recordings become VODs plus clip/highlight encodes.
+- **Room** — a small **mesh** (no SFU) multi-participant call, capped by
+  `room_max_participants` (default `6`).
+
+## Installation
+
+```bash
+autumn plugin add autumn-media-plugin
+```
+
+One command adds the dependency at a version compatible with your app's
+`autumn-web`, mounts the plugin in your `autumn_web::app()` builder chain, and
+prints any configuration still needed. It is safe to re-run, and it refuses —
+before touching any file — to install into an app on an incompatible
+`autumn-web` version. See [docs/plugins.md](https://github.com/autumn-foundation/autumn/blob/main/docs/plugins.md#installing-a-plugin).
+
+### Manual install
+
+If you would rather wire it yourself (or `autumn plugin add` could not find your
+builder chain and printed these lines for you):
+
+```toml
+[dependencies]
+autumn-web = "0.7"
+autumn-media-plugin = "0.7"
+```
+
+## `[media]` configuration
+
+The plugin is configured by a `[media]` section in your Autumn profile:
+
+```toml
+[media]
+room_max_participants  = 6           # hard cap, mesh, no SFU (1..=6)
+room_token_ttl_seconds = 300         # room session-token lifetime
+# room_namespace       = "tenant-a"  # optional MediaMTX path namespace
+
+[media.mediamtx]
+api_base            = "http://127.0.0.1:9997"
+rtmp_base           = "rtmp://127.0.0.1:1935/live"
+hls_base            = "http://127.0.0.1:8888"
+hls_probe_base      = "http://mediamtx:8888"     # falls back to hls_base
+webrtc_base         = "http://127.0.0.1:8889"
+playback_base       = "http://127.0.0.1:9996"
+playback_probe_base = "http://mediamtx:9996"     # falls back to playback_base
+
+[media.ffmpeg]
+bin = "/usr/bin/ffmpeg"
+
+[media.storage]
+backend           = "s3"             # local | s3   (default: local)
+bucket            = "${MEDIA_BUCKET}"
+endpoint_url      = "https://t3.storage.dev"
+region            = "auto"
+access_key_id     = "${MEDIA_S3_KEY}"
+secret_access_key = "${MEDIA_S3_SECRET}"
+public_base_url   = "https://cdn.example.com/media"  # required unless endpoint_url is Tigris
+key_prefix        = "media"
+force_path_style  = false
+
+[media.recording]
+retention_days = 14                  # 0 disables the sweep
+```
+
+`${VAR}` placeholders resolve from the environment, and
+`AUTUMN_MEDIA__<TABLE>__<FIELD>` variables override individual leaves.
+
+## Mounting
+
+Autumn resolves config *after* `Plugin::build` runs, so the plugin cannot read
+`[media]` itself. Resolve a `MediaConfig` up front and pass it in — the same
+`from_config(&cfg) -> …` pattern `autumn-storage-s3` uses:
+
+```rust,ignore
+use autumn_media_plugin::{prelude::*, MediaPlugin};
+
+let media = MediaConfig::from_autumn_toml("autumn.toml")?;
+media.validate()?;
+
+autumn_web::app()
+    .plugin(MediaPlugin::new().config(media).with_broadcast().with_rooms())
+    .run()
+    .await;
+```
+
+### Migrating from Arroyo
+
+`MediaConfig::from_arroyo_env()` maps an existing Arroyo deployment's `ARROYO_*`
+(and `AWS_*` / `BUCKET_NAME`) environment onto a `MediaConfig`, so an operator
+changes nothing when adopting the plugin.
+
+## Room routes
+
+`with_rooms()` nests five routes under the API prefix (default `/api/media`) and
+installs a `RoomService` on `AppState`:
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/api/media/rooms` | Create a room. |
+| `POST` | `/api/media/rooms/{room_id}/join` | Join; returns a session token and mesh WHIP/WHEP targets. |
+| `POST` | `/api/media/rooms/{room_id}/leave` | Leave. |
+| `POST` | `/api/media/rooms/{room_id}/heartbeat` | Hold the seat: refresh liveness, renew the token expiry. |
+| `GET`  | `/api/media/rooms/{room_id}` | Member-gated roster (`Authorization: Bearer <token>`). |
+
+These routes ship **no authentication or rate limiting**. Mount them behind your
+application's own middleware.
+
+A background reaper reclaims seats and rooms that go quiet. A client holds its
+seat by sending a heartbeat, or by polling the roster, on any interval under the
+idle TTL (default 15 minutes). Room state lives in process memory by default;
+set `room_store_backend = "db"` for a shared store that survives restarts and is
+safe across processes.
+
+## Status
+
+**Usable.** Broadcast (ingest, playback URLs, recording, retention), the encode
+workflows, the `MediaMTX` transport client, mesh rooms, and the
+`from_arroyo_env` shim all ship. See
+[docs/guide/media.md](https://github.com/autumn-foundation/autumn/blob/main/docs/guide/media.md)
+for the full guide.

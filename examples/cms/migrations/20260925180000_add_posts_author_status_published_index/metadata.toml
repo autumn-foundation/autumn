@@ -1,0 +1,4 @@
+# `CREATE/DROP INDEX CONCURRENTLY` cannot run inside a transaction block;
+# this tells diesel_migrations to run this migration's up.sql/down.sql
+# outside the transaction it otherwise wraps every migration in.
+run_in_transaction = false
