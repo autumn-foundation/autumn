@@ -404,6 +404,10 @@ pub fn render_list_json(rows: &[ListRow], app_version: Option<&str>) -> String {
                     "kind": l.trust,
                     "label": l.trust_label(),
                     "capabilities": l.capabilities,
+                    "artifact_sha256": (!l.artifact_sha256.is_empty()).then_some(&l.artifact_sha256),
+                    "grants": l.grants,
+                    "quotas": l.quotas,
+                    "limits": l.limits,
                 })),
                 "conformance": row.listing.as_ref().map(|l| &l.conformance),
                 "note": row.listing.as_ref().map(|l| l.note.clone()),
@@ -689,6 +693,17 @@ pub fn pinned_version(version: &str) -> String {
 ///
 /// A message naming both requirements. No file is changed.
 pub fn check_existing_pin(manifest: &str, crate_name: &str, pinned: &str) -> Result<(), String> {
+    // crates.io treats `-`/`_` and case as one name, so a variant key is the
+    // same crate. A second key would be a duplicate dependency.
+    if let Some(key) = install::declared_dependency_key(manifest, crate_name)
+        && key != crate_name
+    {
+        return Err(format!(
+            "Cargo.toml declares this crate as `{}`. Rename the key to `{crate_name}`, then \
+             re-run. No files were changed.",
+            index::sanitize(&key)
+        ));
+    }
     if !install::dependency_present(manifest, crate_name) {
         return Ok(());
     }
@@ -1750,6 +1765,10 @@ mod tests {
         hello.name = "autumn-plugin-hello".to_owned();
         hello.trust = index::Trust::Sandboxed;
         hello.capabilities = vec!["http-request".to_owned()];
+        hello.artifact_sha256 = "ef".repeat(32);
+        hello.grants.hosts = vec!["api.example.com".to_owned()];
+        hello.quotas.insert("kv_reads".to_owned(), 7);
+        hello.limits.insert("fuel".to_owned(), 9);
         let mut broken = flagged_on(RELEASE);
         broken.name = "autumn-plugin-broken".to_owned();
         let mut plugin_index = bundled();
@@ -1769,6 +1788,10 @@ mod tests {
         assert_eq!(feed["tier"], "experimental");
         assert_eq!(feed["experimental_surfaces"][0], "x");
         let hello = find("autumn-plugin-hello");
+        assert_eq!(hello["trust"]["artifact_sha256"], "ef".repeat(32));
+        assert_eq!(hello["trust"]["grants"]["hosts"][0], "api.example.com");
+        assert_eq!(hello["trust"]["quotas"]["kv_reads"], 7);
+        assert_eq!(hello["trust"]["limits"]["fuel"], 9);
         assert_eq!(hello["trust"]["kind"], "sandboxed");
         assert_eq!(hello["trust"]["capabilities"][0], "http-request");
         let broken = find("autumn-plugin-broken");
@@ -1935,6 +1958,11 @@ mod tests {
                 "{alt}"
             );
         }
+        // A crates.io-equivalent spelling is the same crate: a second key
+        // would be a duplicate dependency.
+        let variant = "[dependencies]\nautumn_plugin_X = \"=0.3.0\"\n";
+        let err = check_existing_pin(variant, "autumn-plugin-x", "=0.3.0").unwrap_err();
+        assert!(err.contains("autumn_plugin_X"), "{err}");
         // A key renamed to another package compiles that package.
         let renamed = "[dependencies]\nautumn-plugin-x = { package = \"other-crate\", version = \"=0.3.0\" }\n";
         assert!(check_existing_pin(renamed, "autumn-plugin-x", "=0.3.0").is_err());

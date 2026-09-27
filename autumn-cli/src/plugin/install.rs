@@ -336,6 +336,20 @@ pub fn declared_dependency_version(manifest: &str, crate_name: &str) -> Option<S
     }
 }
 
+/// The `[dependencies]` key that names `crate_name` as crates.io does:
+/// case and `-`/`_` do not count. `None` when no key does.
+#[must_use]
+pub fn declared_dependency_key(manifest: &str, crate_name: &str) -> Option<String> {
+    let table = toml::from_str::<toml::Table>(manifest).ok()?;
+    let want = canonical(crate_name);
+    table
+        .get("dependencies")?
+        .as_table()?
+        .keys()
+        .find(|key| canonical(key) == want)
+        .cloned()
+}
+
 /// Whether `manifest` takes `crate_name` from somewhere other than its
 /// crates.io release: a `path`, `git` or `registry` key on its
 /// `[dependencies]` entry, or a `package` key naming another crate.

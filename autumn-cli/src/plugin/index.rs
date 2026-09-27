@@ -177,6 +177,10 @@ pub struct Listing {
     /// them. Sandboxed only.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub quotas: BTreeMap<String, u32>,
+    /// The per-request resource limits the manifest declares (fuel, memory,
+    /// body sizes, timeouts, concurrency). Sandboxed only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub limits: BTreeMap<String, u64>,
     /// The listing state.
     pub status: Status,
     /// Why the listing is not [`Status::Listed`]. Empty otherwise.
@@ -413,6 +417,21 @@ impl Listing {
                     .collect();
                 if !changed.is_empty() {
                     label.push_str("; quotas ");
+                    label.push_str(&changed.join(", "));
+                }
+                let defaults = autumn_web::plugin_sandbox::ResourceLimits::default();
+                let changed: Vec<String> = defaults
+                    .fields()
+                    .into_iter()
+                    .filter_map(|(key, default)| {
+                        self.limits
+                            .get(key)
+                            .filter(|v| u128::from(**v) != default)
+                            .map(|v| format!("{key}={v}"))
+                    })
+                    .collect();
+                if !changed.is_empty() {
+                    label.push_str("; limits ");
                     label.push_str(&changed.join(", "));
                 }
                 label
@@ -680,12 +699,21 @@ fn check_trust(listing: &Listing, out: &mut Vec<String>) {
         Trust::Native if !listing.quotas.is_empty() => {
             out.push("`quotas` is for a sandboxed listing only".to_owned());
         }
+        Trust::Native if !listing.limits.is_empty() => {
+            out.push("`limits` is for a sandboxed listing only".to_owned());
+        }
         Trust::Native | Trust::Sandboxed => {}
     }
     let known = autumn_web::plugin_sandbox::CapabilityQuotas::default().fields();
     for key in listing.quotas.keys() {
         if !known.iter().any(|(k, _)| k == key) {
             out.push(format!("`{key}` is not a sandbox quota"));
+        }
+    }
+    let known = autumn_web::plugin_sandbox::ResourceLimits::default().fields();
+    for key in listing.limits.keys() {
+        if !known.iter().any(|(k, _)| k == key) {
+            out.push(format!("`{key}` is not a sandbox resource limit"));
         }
     }
     for name in &listing.capabilities {
@@ -801,6 +829,7 @@ mod tests {
             artifact_sha256: String::new(),
             grants: Grants::default(),
             quotas: BTreeMap::new(),
+            limits: BTreeMap::new(),
             status: Status::Listed,
             note: String::new(),
             prefix: String::new(),
@@ -1171,6 +1200,32 @@ mod tests {
         listing.quotas.insert("warp_drives".to_owned(), 1);
         let text = messages(&validate(&index_of(vec![listing])));
         assert!(text.contains("warp_drives"), "{text}");
+    }
+
+    /// Limits: sandboxed only, known names only, and the label names the
+    /// ones that differ from the default.
+    #[test]
+    fn limits_are_validated_and_labelled() {
+        let mut native = community();
+        native.limits.insert("fuel".to_owned(), 1);
+        let text = messages(&validate(&index_of(vec![native])));
+        assert!(text.contains("limits"), "{text}");
+
+        let mut listing = community();
+        listing.trust = Trust::Sandboxed;
+        listing.capabilities = vec!["kv".to_owned()];
+        listing.artifact_sha256 = "ab".repeat(32);
+        listing.limits.insert("warp".to_owned(), 1);
+        let text = messages(&validate(&index_of(vec![listing.clone()])));
+        assert!(text.contains("warp"), "{text}");
+
+        listing.limits.clear();
+        listing.limits.insert("fuel".to_owned(), 7);
+        assert!(
+            listing.trust_label().contains("fuel=7"),
+            "{}",
+            listing.trust_label()
+        );
     }
 
     /// The label names quotas that differ from the sandbox default.

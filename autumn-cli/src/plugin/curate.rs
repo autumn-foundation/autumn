@@ -195,6 +195,9 @@ pub struct InspectReport {
     /// The per-request quotas the manifest declares.
     #[serde(default)]
     pub quotas: std::collections::BTreeMap<String, u32>,
+    /// The per-request resource limits the manifest declares.
+    #[serde(default)]
+    pub limits: std::collections::BTreeMap<String, u64>,
 }
 
 impl InspectReport {
@@ -298,6 +301,7 @@ pub fn apply_inspect(
         listing.capabilities.clone_from(&report.capabilities);
         listing.grants.clone_from(&report.grants);
         listing.quotas.clone_from(&report.quotas);
+        listing.limits.clone_from(&report.limits);
     }
     let failed = (!failed.is_empty()).then(|| failed.join(", "));
     Ok(transition(listing, failed.as_deref(), against, date))
@@ -402,6 +406,16 @@ pub fn write_listing(src: &str, listing: &Listing) -> Result<String, String> {
             quotas[key.as_str()] = value(i64::from(*v));
         }
         table["quotas"] = Item::Table(quotas);
+    }
+    if listing.limits.is_empty() {
+        table.remove("limits");
+    } else {
+        let mut limits = toml_edit::Table::new();
+        for (key, v) in &listing.limits {
+            // TOML integers are i64; a limit past that is written as the max.
+            limits[key.as_str()] = value(i64::try_from(*v).unwrap_or(i64::MAX));
+        }
+        table["limits"] = Item::Table(limits);
     }
     let run = &listing.conformance;
     let conformance = table
@@ -886,6 +900,7 @@ mod tests {
             upgrade: Some(serde_json::json!({"added_capabilities": []})),
             grants: index::Grants::default(),
             quotas: std::collections::BTreeMap::new(),
+            limits: std::collections::BTreeMap::new(),
         }
     }
 
@@ -953,6 +968,16 @@ mod tests {
         let mut r = inspect(true);
         r.conformance.plugin_name = "autumn-plugin-other".to_owned();
         assert!(apply_inspect(&mut sandboxed(), &r, "0.7.0", "2026-10-01").is_err());
+    }
+
+    /// A raised resource limit is authority too.
+    #[test]
+    fn an_inspect_pass_records_the_limits() {
+        let mut l = sandboxed();
+        let mut r = inspect(true);
+        r.limits.insert("fuel".to_owned(), 1_000);
+        apply_inspect(&mut l, &r, "0.7.0", "2026-10-01").expect("apply");
+        assert_eq!(l.limits.get("fuel"), Some(&1_000));
     }
 
     /// A raised quota is authority: the approved ceilings are recorded.
@@ -1045,6 +1070,7 @@ mod tests {
         let mut r = inspect(true);
         r.grants.hosts = vec!["api.example.com".to_owned()];
         r.quotas.insert("kv_reads".to_owned(), 500);
+        r.limits.insert("fuel".to_owned(), 1_000);
         apply_inspect(&mut l, &r, "0.7.0", "2026-10-01").expect("apply");
         let out = write_listing(&src, &l).expect("write");
         let parsed = index::parse(&out).expect("parse");

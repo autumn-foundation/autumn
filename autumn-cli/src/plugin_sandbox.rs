@@ -140,6 +140,9 @@ pub struct Report {
     pub grants: ReportGrants,
     /// The per-request capability quotas the manifest declares.
     pub quotas: std::collections::BTreeMap<String, u32>,
+    /// The per-request resource limits the manifest declares: fuel, memory,
+    /// body sizes, timeout and concurrency. A raised one is new authority.
+    pub limits: std::collections::BTreeMap<String, u64>,
     /// Classes of authority this build denies unconditionally.
     pub denied: Vec<String>,
     /// The routes it serves.
@@ -270,6 +273,12 @@ impl Report {
                 .fields()
                 .into_iter()
                 .map(|(field, value)| (field.to_owned(), value))
+                .collect(),
+            limits: manifest
+                .limits
+                .fields()
+                .into_iter()
+                .map(|(field, value)| (field.to_owned(), u64::try_from(value).unwrap_or(u64::MAX)))
                 .collect(),
             // Only the classes this build cannot grant *at all*, minus anything
             // this manifest was actually granted. A screen that printed "no
@@ -735,6 +744,9 @@ job_types = ["reindex"]
             serde_json::from_str(&report.to_json().expect("json")).expect("parses");
         assert_eq!(value["grants"]["hosts"][0], "api.example.com");
         assert!(value["quotas"]["outbound_calls"].is_number());
+        // Resource limits are authority too (#1625): a reviewer diffs them.
+        assert!(value["limits"]["fuel"].is_number());
+        assert!(value["limits"]["max_concurrency"].is_number());
     }
 
     #[test]

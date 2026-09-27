@@ -30,3 +30,7 @@
   keeps `--plugin-name`. `route-attribution` skips when no route carries
   either name (a cache or search plugin). The JSON report carries the declared
   `contract`.
+- **`autumn plugin inspect --format json` (#1625):** the report carries the
+  manifest's resource `limits` (fuel, memory, body sizes, timeout,
+  concurrency). The plugin index records them with the capabilities, grants
+  and quotas of a sandboxed listing.
