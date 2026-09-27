@@ -159,3 +159,29 @@ async fn sim_net_falls_back_to_http_mocks(mut sim: Sim) {
     sim.build(app);
     assert_eq!(call(&sim, "/pay-named").await, "ok: \"mocked\"");
 }
+
+/// A client that a state initializer built and stored.
+#[derive(Clone)]
+struct StoredClient(Client);
+
+#[get("/pay-stored")]
+async fn pay_stored(State(state): State<AppState>) -> String {
+    let client = state.extension::<StoredClient>().expect("stored").0.clone();
+    match client.get("http://payments/charge").send().await {
+        Ok(response) => format!("ok: {}", response.text()),
+        Err(error) => format!("error: {error}"),
+    }
+}
+
+#[sim_test]
+async fn sim_net_reaches_clients_built_in_state_initializers(mut sim: Sim) {
+    sim.net(SimNet::new().host("payments", payments()));
+    sim.build(
+        TestApp::new()
+            .routes(routes![pay_stored])
+            .state_initializer(|state| {
+                state.insert_extension(StoredClient(Client::from_state(state)));
+            }),
+    );
+    assert_eq!(call(&sim, "/pay-stored").await, "ok: charged");
+}

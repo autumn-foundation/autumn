@@ -550,12 +550,11 @@ and `channels.rs`. Their clock reads are migrated. The manifest grows
 monotonically and never shrinks (`MODULE_COUNT_FLOOR`); do not read a module's
 absence from it as a promise that it is on-seam.
 
-Known-open gaps, named rather than hidden:
+Sites that cannot reach the app clock, named rather than hidden:
 
-- **`db::run_instrumented`** is a published `pub` function taking no state, so
-  threading a clock in would break the public API. Its `Instant::now()` carries a
-  per-site `#[allow]` with that reason; the instant never escapes (only
-  `elapsed_ms` does) and the framework has no caller of its own.
+- **`db::run_instrumented`** is a published `pub` function taking no state. It
+  times the query on `time::AmbientClock` (issue #2967), so a running `Sim`
+  controls it with no API change.
 - **`#[repository]`-generated writes** read `time::ambient_now()` (issue #2967).
   The generated repository holds only a pool, so it cannot reach the app's
   clock, but the ambient clock follows a running `Sim`.

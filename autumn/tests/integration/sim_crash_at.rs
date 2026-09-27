@@ -89,6 +89,7 @@ async fn sim_crash_at_kills_a_request_mid_handler(mut sim: Sim) {
 
     // Sweep every await of the request until it completes.
     let mut index = 0;
+    let mut crashed_mid_handler = false;
     loop {
         let before = steps.0.load(Ordering::SeqCst);
         let outcome = crash_at(index, sim.client().get("/two-step").send()).await;
@@ -98,8 +99,28 @@ async fn sim_crash_at_kills_a_request_mid_handler(mut sim: Sim) {
         }
         let ran = steps.0.load(Ordering::SeqCst) - before;
         assert!(ran <= 1, "a crash before the second step leaves it undone");
+        crashed_mid_handler |= ran == 1;
         index += 1;
         assert!(index < 64, "the request completes within 64 awaits");
     }
-    assert!(index >= 1, "the handler suspends at least once");
+    assert!(
+        crashed_mid_handler,
+        "one crash point sits between the two handler steps"
+    );
+}
+
+#[sim_test]
+async fn sim_crash_at_counts_the_same_awaits_under_interleave(sim: Sim) {
+    let (a, b) = (AtomicU64::new(0), AtomicU64::new(0));
+    // `b` wakes often, which polls the whole interleave again. `a` must still
+    // crash at its own second await.
+    let outcomes = sim
+        .interleave(vec![
+            crash_at(1, three_steps(&a)),
+            crash_at(9, three_steps(&b)),
+        ])
+        .await;
+    assert_eq!(outcomes[0], CrashOutcome::Crashed { await_index: 1 });
+    assert_eq!(a.load(Ordering::SeqCst), 2, "steps before await 1 only");
+    assert_eq!(outcomes[1], CrashOutcome::Completed(3));
 }

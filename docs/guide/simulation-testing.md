@@ -114,7 +114,8 @@ sim.run_to_idle().await; // drain everything the advance released
   scheduler ticks, durable repository commit hooks — until the runtime is
   quiescent. It does **not** fast-forward to a future timer; pair it with
   `advance` for "jump to the next interesting instant, then settle what fired."
-  If work still runs at the end of the drain (for example, a job that enqueues
+  The drain runs 1024 rounds, then stops at 64 quiet rounds in a row. If it
+  sees no such quiet run within 2048 rounds (for example, a job that enqueues
   itself again), `run_to_idle` panics with a `sim drain stall` message and the
   seed. `Sim::try_run_to_idle` returns the `SimStall` instead.
 - [`Sim::advance_to`] / [`Sim::advance_to_local`] jump to a specific
@@ -404,12 +405,15 @@ advances while a task waits on something outside the runtime, such as a lock
 that a test on another thread holds, or real I/O. So arm it only where sim
 tests run one at a time (`--test-threads=1`) and do no real I/O. A busy loop
 that never parks keeps the runtime from advancing, so the watchdog does not
-detect it; an `always!` invariant is the tool for that. Autumn's own CI arms the watchdog on its single-threaded `sim_` step.
+detect it; an `always!` invariant is the tool for that. Autumn's own CI arms
+the watchdog on its single-threaded `sim_` step.
 
 ### Crash at any await
 
 `crash_at(index, op)` runs `op` and drops it at its `index`-th suspension
-point (an await that returns `Pending`). The work before that point stays
+point (an await that returns `Pending`). A re-poll with no new wake does not
+count, so the index is the same inside `Sim::interleave`. The work before that
+point stays
 done. The work after it never runs. Then call `sim.kill()` and
 `sim.restart(app)` to model the process dying there.
 
@@ -470,28 +474,31 @@ let log = net.events(); // one NetEvent per attempt
 ```
 
 - Latency is seeded, in virtual time. A drop fails the attempt after its
-  latency, like a reset connection. The client's retry policy applies.
+  latency. The client's retry policy applies: attempts, backoff, 429
+  `Retry-After`, 502-504 retries and `request_timeout`.
 - A host with no router falls back to the app's `http_mock`s. A host with
   neither is an error. No call reaches the real network.
 - The same seed records the same `events()`.
 
 Only a `Client` built from the app state (the `Client` extractor or
-`Client::from_state`) uses the network. Like http mocks, it does not use the
-process-global circuit breaker.
+`Client::from_state`) uses the network, and only after `sim.net(..)`. It needs
+the `http-client` feature. Like http mocks, a sim call skips the process-global
+circuit breaker, the SSRF checks, `pin_to` and redirect following.
 
 ### Fuzzing the shared scenario
 
-The `sim-sweep` bin and the `sim_ops` cargo-fuzz target drive one `Op`
-vocabulary, in `autumn_web::sim::scenario`. Random seeds and coverage-guided
-search then look for the same bugs, and a failure found by one replays in the
-other: `scenario::ops_to_bytes` encodes a shrunk sweep failure as a fuzz input.
+Autumn's `sim-sweep` bin and its `sim_ops` cargo-fuzz target drive one `Op`
+vocabulary. Random seeds and coverage-guided search then look at the same
+state space. An op sequence moves between them: encode a shrunk sweep failure
+as a fuzz input, and decode a fuzz crash into ops for a test.
 
 ```bash
 cargo +nightly fuzz run sim_ops
 ```
 
-Copy this shape for your own scenario: one `Op` type, a proptest strategy for
-the sweep, and a byte decoder for the fuzz target.
+The built-in scenario is correct by design, so both are smoke checks of the
+harness. For your own app, use the same shape: one `Op` type, a proptest
+strategy for the sweep, and a byte decoder for a fuzz target.
 
 ---
 
@@ -585,7 +592,7 @@ non-vacuity check rather than a sweep.
 | Framework-minted IDs (job IDs, request IDs, idempotency keys, sessions) | Seeded from `sim.seed` via the `Entropy` seam |
 | Database | **Boundary** — real in-process SQLite, fault-injected at the connection level via `Chaos` (by probability) or `FaultPlan` (by checkout ordinal), not simulated at the SQL-dialect level |
 | Framework code with no clock in scope | Virtual, through the ambient clock (`time::ambient_now` and its siblings) |
-| Outbound HTTP through `http_client::Client` | Simulated by `SimNet`: in-process hosts, seeded latency and drops, partitions |
+| Outbound HTTP through `http_client::Client` | Simulated by `SimNet` after `sim.net(..)`: in-process hosts, seeded latency and drops, partitions |
 | Task-poll order | Tokio's order, or seeded with `Sim::interleave` / `Sim::spawn` |
 | Other third-party network (SMTP, LLM calls) | **Boundary** — mocked/fault-injected via `Chaos`/`sim::llm`, not simulated |
 

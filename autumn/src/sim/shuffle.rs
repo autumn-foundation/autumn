@@ -96,9 +96,11 @@ impl<F: Future> Future for Interleave<F> {
                 .expect("pick is at most `last`, which is a usize");
             order.swap(last, pick);
         }
+        // Hold back at most one op per round, so the round still polls the
+        // rest and the runtime can go idle soon.
         let mut skipped = false;
         for index in order {
-            if should_skip(this.rng.as_ref(), &mut this.skips[index]) {
+            if !skipped && should_skip(this.rng.as_ref(), &mut this.skips[index]) {
                 skipped = true;
                 continue;
             }

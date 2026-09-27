@@ -1,8 +1,8 @@
 ### Breaking Changes
 
-- **Breaking:** `http_client::ClientError` gains a `SimNetwork` variant for
-  faults from the simulated network (issue #2967). An exhaustive `match` needs
-  an arm for it ([migration guide](docs/migrations/next.md)).
+- **Breaking:** `http_client::ClientError` is `#[non_exhaustive]` and gains a
+  `SimNetwork` variant for faults from the simulated network (issue #2967). A
+  `match` needs a `_` arm ([migration guide](docs/migrations/next.md)).
 - **Breaking:** `sim::SimClock` and `sim::SimApp` are no longer public. No
   public API returned them (issue #2967,
   [migration guide](docs/migrations/next.md)).
@@ -35,5 +35,10 @@
   runs at the end of the drain, for example a job that enqueues itself again.
   Before, it stopped silently (issue #2967,
   [migration guide](docs/migrations/next.md)).
+- **sim-testing:** inside a `Sim`, framework code with no clock in scope
+  (about 55 modules, and `#[repository]` soft-delete stamps) reads the sim's
+  virtual clock. Outside a `Sim`, nothing changes. The `SignedWebhook`
+  timestamp check and the outbound webhook `t=` timestamp read the app clock
+  (issue #2967, [migration guide](docs/migrations/next.md)).
 - **ci:** the single-threaded `sim_` step arms the liveness watchdog
   (`AUTUMN_SIM_LIVENESS_BUDGET_SECS`) (issue #2967).

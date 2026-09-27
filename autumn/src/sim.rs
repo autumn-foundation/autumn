@@ -52,6 +52,12 @@
 //! - **Deadlocks.** With `AUTUMN_SIM_LIVENESS_BUDGET_SECS` set, a `#[sim_test]`
 //!   whose tasks all park panics with its replay line instead of hanging. See
 //!   [`__with_liveness_budget`] for the limits.
+//! - **Phase 2 (issue #2967).** `Sim::net` routes outbound HTTP through a
+//!   seeded `SimNet`. [`Sim::interleave`] and [`Sim::spawn`] reorder ready work
+//!   from the seed. [`crash_at`] drops an operation at any await.
+//!   [`Sim::try_run_to_idle`] reports a drain that does not settle. Framework
+//!   code with no clock in scope reads [`crate::time::ambient_now`] and its
+//!   siblings, which follow the sim clock.
 //!
 //! The clock and app handles inside a `Sim` are crate-private:
 //!
@@ -250,9 +256,12 @@ pub struct Sim {
     /// stream from the seed and this count. Atomic so `&self` stays `Sync`.
     shuffle_calls: std::sync::atomic::AtomicU64,
 
-    /// Keeps the virtual clock installed as this thread's ambient clock
-    /// (issue #2967) while the sim lives. See [`crate::time::ambient_now`].
-    _ambient: crate::time::AmbientGuard,
+    /// The clock installed as this thread's ambient clock (issue #2967). See
+    /// [`crate::time::ambient_now`].
+    ambient: Arc<AmbientSimClock>,
+
+    /// Keeps [`ambient`](Self::ambient) installed while the sim lives.
+    _ambient_guard: crate::time::AmbientGuard,
 
     /// How many times [`mount`](Sim::mount) has run. The first mount seeds the
     /// app's entropy from [`seed`](Sim::seed); each restart derives a new seed
@@ -278,12 +287,18 @@ impl Sim {
             .single()
             .unwrap_or_else(|| Utc.timestamp_nanos(0));
         let clock = SimClock::new(TickingClock::starting_at(epoch));
-        let ambient = crate::time::install_ambient(Arc::new(clock.ticking()));
+        let ambient_clock = Arc::new(AmbientSimClock {
+            wall: std::sync::RwLock::new(Arc::new(clock.ticking())),
+            ticking: clock.ticking(),
+            tokio_origin: std::sync::OnceLock::new(),
+        });
+        let ambient_guard = crate::time::install_ambient(ambient_clock.clone());
         Self {
             seed,
             rng: SimRng::new(seed),
             clock,
-            _ambient: ambient,
+            ambient: ambient_clock,
+            _ambient_guard: ambient_guard,
             chaos: Chaos::default(),
             chaos_state: None,
             app: SimApp::default(),
@@ -421,14 +436,20 @@ impl Sim {
         let app = match &self.net {
             Some(net) => {
                 net.reseed(mount_seed);
-                let net = net.clone();
-                app.state_initializer(move |state| state.insert_extension(net))
+                app.with_sim_net(net.clone())
             }
             None => app,
         };
         // When chaos is active, install its deterministic hooks (which also own
         // the clock so a skew wrapper can be applied); otherwise the build is
         // byte-for-byte the pre-W5 path — just the virtual clock.
+        // The ambient wall clock matches the app clock, skewed or not.
+        *self
+            .ambient
+            .wall
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            chaos::wall_clock(&self.chaos, self.seed, self.clock.ticking());
         let app = if self.chaos.is_active() {
             let state = chaos::ChaosState::new(self.seed, &self.chaos);
             self.chaos_state = Some(Arc::clone(&state));
@@ -894,9 +915,11 @@ impl Sim {
     ///
     /// # Errors
     ///
-    /// Returns [`SimStall`] when a job ran, a scheduled tick fired, a commit
-    /// hook drained or the task count changed in the last
-    /// `STALL_WINDOW` of the `MAX_DRAIN_STEPS` rounds.
+    /// Returns [`SimStall`] when the drain never sees 64 quiet rounds in a row
+    /// within 2048 rounds. A round is quiet when no job starts, no scheduled
+    /// tick fires, no commit hook drains and the task count does not change.
+    /// A single long-running job, or a task that loops without spawning,
+    /// does not count as work.
     pub async fn try_run_to_idle(&self) -> Result<(), SimStall> {
         // Real-time leak guard (no-op unless `strict_wall_clock` is enabled):
         // sample a REAL instant at entry and enforce the budget before
@@ -913,8 +936,15 @@ impl Sim {
             .try_client()
             .and_then(|client| crate::db::DbState::pool(client.state()).cloned());
 
-        let mut last_progress = None;
-        for step in 0..MAX_DRAIN_STEPS {
+        // Run the full `MAX_DRAIN_STEPS`. Then stop at the first
+        // `STALL_WINDOW` quiet rounds in a row; work that ends late still
+        // settles. Work that never goes quiet is a stall.
+        let mut quiet_rounds = 0;
+        let mut rounds = 0;
+        while rounds < MAX_DRAIN_STEPS
+            || (quiet_rounds < STALL_WINDOW && rounds < MAX_DRAIN_STEPS * 2)
+        {
+            rounds += 1;
             let before = drain_fingerprint();
             // One yield lets each currently-ready spawned task take a step; a
             // zero-duration timer advance flushes any timers registered for the
@@ -941,19 +971,21 @@ impl Sim {
                 }
             }
 
-            if drain_fingerprint() != before {
-                last_progress = Some(step);
+            if drain_fingerprint() == before {
+                quiet_rounds += 1;
+            } else {
+                quiet_rounds = 0;
             }
         }
 
         self.enforce_wall_clock_budget(guard_start);
-        match last_progress {
-            Some(step) if step >= MAX_DRAIN_STEPS - STALL_WINDOW => Err(SimStall {
+        if quiet_rounds < STALL_WINDOW {
+            return Err(SimStall {
                 seed: self.seed,
-                steps: MAX_DRAIN_STEPS,
-            }),
-            _ => Ok(()),
+                steps: rounds,
+            });
         }
+        Ok(())
     }
 }
 
@@ -1088,9 +1120,8 @@ pub async fn __with_liveness_budget<F: std::future::Future>(
 /// its handler to completion under the single-threaded paused runtime.
 const MAX_DRAIN_STEPS: usize = 1024;
 
-/// The last rounds of a drain that must see no work. Work in this window means
-/// the drain did not settle, and [`Sim::try_run_to_idle`] reports a
-/// [`SimStall`].
+/// Quiet rounds in a row that settle a drain after `MAX_DRAIN_STEPS`. A drain
+/// that does not reach them by twice `MAX_DRAIN_STEPS` is a [`SimStall`].
 const STALL_WINDOW: usize = 64;
 
 /// Default real wall-clock budget for the `strict_wall_clock` leak guard
@@ -1316,6 +1347,41 @@ impl SimClock {
     /// target.
     pub(crate) fn now(&self) -> DateTime<Utc> {
         crate::time::ClockSource::now(&self.inner)
+    }
+}
+
+/// The clock a `Sim` installs as its thread's ambient clock (issue #2967).
+///
+/// Wall time is the sim clock, so it moves only on [`Sim::advance`]. Elapsed
+/// time follows tokio's paused clock, which [`Sim::advance`] also moves, and
+/// which moves by itself when every task waits on a timer. So a deadline read
+/// from the ambient clock and a `tokio::time::sleep` stay on one timeline, and
+/// a wait loop that sleeps until its deadline ends.
+struct AmbientSimClock {
+    /// The sim clock, or its chaos-skewed view once a skewed app mounts.
+    wall: std::sync::RwLock<Arc<dyn crate::time::ClockSource>>,
+    /// The unskewed sim clock, read when no runtime runs.
+    ticking: TickingClock,
+    /// Tokio's instant at the first elapsed-time read inside the runtime.
+    tokio_origin: std::sync::OnceLock<tokio::time::Instant>,
+}
+
+impl crate::time::ClockSource for AmbientSimClock {
+    fn now(&self) -> DateTime<Utc> {
+        self.wall
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .now()
+    }
+
+    fn monotonic(&self) -> crate::time::MonotonicInstant {
+        if tokio::runtime::Handle::try_current().is_err() {
+            // No runtime, so no paused clock to follow.
+            return crate::time::ClockSource::monotonic(&self.ticking);
+        }
+        let now = tokio::time::Instant::now();
+        let origin = *self.tokio_origin.get_or_init(|| now);
+        crate::time::MonotonicInstant::from_origin_elapsed(now.saturating_duration_since(origin))
     }
 }
 

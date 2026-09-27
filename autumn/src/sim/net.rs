@@ -10,7 +10,9 @@
 //!   an error. No call reaches the real network.
 //! - **Seeded faults.** [`SimNet::latency`] delays each attempt by a seeded
 //!   amount of virtual time. [`SimNet::drop_rate`] drops a seeded share of
-//!   attempts. The client's retry policy applies, as it does on a real network.
+//!   attempts. The client's retry policy applies: attempts and backoff, 429
+//!   `Retry-After`, 502-504 retries and the per-attempt `request_timeout`. A
+//!   drop is retried like a real connect or timeout error.
 //! - **Partitions.** [`SimNet::partition`] cuts a host off until
 //!   [`SimNet::heal`]. Call them while the test runs.
 //!
@@ -32,8 +34,11 @@
 //!
 //! Only calls through `http_client::Client` built from the app state (the
 //! `Client` extractor or `Client::from_state`) see the network. A client made
-//! with `Client::new()` does not. The process-global circuit breaker is not
-//! used, as with http mocks.
+//! with `Client::new()` does not. Needs the `http-client` feature.
+//!
+//! As with http mocks, a sim call skips the process-global circuit breaker,
+//! the SSRF address checks, `pin_to` and redirect following. A host router's
+//! `3xx` comes back as the response.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -51,7 +56,8 @@ pub(crate) const NET_STREAM_SALT: u64 = 0x4E37_5EED_4E37_5EED;
 pub enum NetFault {
     /// The attempt was delivered.
     None,
-    /// The attempt was lost after its latency, like a reset connection.
+    /// The attempt was lost after its latency. The client retries it like a
+    /// connect or timeout error.
     Dropped,
     /// The host was partitioned, so the attempt failed at once.
     Partitioned,

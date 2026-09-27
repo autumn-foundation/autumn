@@ -39,7 +39,7 @@ async fn sim_ambient_clock_reads_virtual_time(sim: Sim) {
 
 #[sim_test]
 async fn sim_ambient_clock_is_restored_when_the_sim_drops(sim: Sim) {
-    let inner = Sim::from_seed(sim.seed + 1);
+    let inner = Sim::from_seed(sim.seed.wrapping_add(1));
     inner.advance(HOUR).await;
     assert_eq!(
         ambient_now(),
@@ -62,4 +62,18 @@ fn sim_ambient_clock_outside_a_sim_is_the_system_clock() {
         ambient_now() >= before,
         "real time again after the sim drops"
     );
+}
+
+#[sim_test]
+async fn sim_ambient_clock_deadline_follows_tokio_sleeps(_sim: Sim) {
+    // No `Sim::advance`: the paused runtime moves itself to each sleep's end.
+    // An ambient deadline must see that time, or this loop never ends.
+    let deadline = ambient_instant() + Duration::from_secs(5);
+    let mut rounds = 0;
+    while ambient_instant() < deadline {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        rounds += 1;
+        assert!(rounds <= 5, "the deadline passed after 5 sleeps");
+    }
+    assert_eq!(rounds, 5);
 }

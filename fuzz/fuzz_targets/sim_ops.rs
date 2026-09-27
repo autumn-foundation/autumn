@@ -4,13 +4,14 @@
 //! Drives the same `Op` vocabulary as the `sim-sweep` proptest sweep, so
 //! coverage-guided search can find op sequences that random seeds miss.
 //!
-//! Layout of the input bytes:
-//!   [seed:8 little-endian][op:3]...
-//! Each op is a tag byte (even: deposit, odd: withdraw) and a little-endian
-//! `u16` amount. See `autumn::sim::scenario::ops_from_bytes`.
+//! Layout of the input bytes: `[op:3]...`. Each op is a tag byte (even:
+//! deposit, odd: withdraw) and a little-endian `u16` amount. See
+//! `autumn::sim::scenario::ops_from_bytes`.
 //!
-//! A crash is an `always!` invariant break. Encode a shrunk sweep failure with
-//! `autumn::sim::scenario::ops_to_bytes` to replay it here.
+//! A crash is an `always!` invariant break. The demo scenario is correct by
+//! design, so this target is a smoke check and must stay green. Encode a
+//! shrunk sweep failure with `autumn::sim::scenario::ops_to_bytes` to replay
+//! it here.
 
 use libfuzzer_sys::fuzz_target;
 

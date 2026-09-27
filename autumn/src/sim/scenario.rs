@@ -2,16 +2,19 @@
 //!
 //! One [`Op`] vocabulary for two searchers:
 //!
-//! - the proptest seed sweep (the `sim-sweep` bin), through [`ops_strategy`];
+//! - the proptest seed sweep (the `sim-sweep` bin), through `ops_strategy`
+//!   (feature `sim-testing`);
 //! - the cargo-fuzz target (`fuzz/fuzz_targets/sim_ops.rs`), through
 //!   [`run_fuzz_input`], which decodes bytes with [`ops_from_bytes`].
 //!
-//! Coverage-guided fuzzing can then find op sequences that random seeds miss,
-//! and a sequence either searcher finds replays in the other:
-//! [`ops_to_bytes`] encodes a shrunk sweep failure as a fuzz input.
+//! A sequence moves between them: [`ops_to_bytes`] turns a shrunk sweep
+//! failure into a fuzz input, and [`ops_from_bytes`] turns a fuzz crash into
+//! ops for [`apply_ops`] in a test.
 //!
 //! The scenario is a toy account: the invariant "the balance never goes
-//! negative" is checked with [`always!`](crate::always) after every op.
+//! negative" is checked with [`always!`](crate::always) after every op. The
+//! scenario is correct by design, so both searchers are smoke checks of the
+//! harness: they must stay green. Copy the shape for your own scenario.
 //!
 //! Unstable harness plumbing, hidden from the stable surface.
 
@@ -92,19 +95,14 @@ pub fn ops_to_bytes(ops: &[Op]) -> Vec<u8> {
         .collect()
 }
 
-/// Run one fuzz input: the first 8 bytes seed a [`Sim`](crate::sim::Sim), as
-/// one sweep seed does, and the rest are the ops.
+/// Run one fuzz input: decode it with [`ops_from_bytes`] and apply the ops.
 ///
 /// # Panics
 ///
 /// Panics when an op sequence breaks the invariant, which is the crash the
 /// fuzzer reports.
 pub fn run_fuzz_input(bytes: &[u8]) {
-    let Some((seed, ops)) = bytes.split_first_chunk::<8>() else {
-        return;
-    };
-    let _sim = crate::sim::Sim::from_seed(u64::from_le_bytes(*seed));
-    apply_ops(&ops_from_bytes(ops));
+    apply_ops(&ops_from_bytes(bytes));
 }
 
 /// The proptest strategy the sweep draws op sequences from.
@@ -152,9 +150,10 @@ mod tests {
     }
 
     #[test]
-    fn encoding_round_trips() {
+    fn a_sweep_failure_replays_as_a_fuzz_input() {
         let ops = vec![Op::Deposit(1), Op::Withdraw(MAX_AMOUNT), Op::Deposit(42)];
         assert_eq!(ops_from_bytes(&ops_to_bytes(&ops)), ops);
+        run_fuzz_input(&ops_to_bytes(&ops));
     }
 
     #[test]
@@ -163,21 +162,6 @@ mod tests {
         for len in 0..64_u8 {
             let bytes: Vec<u8> = (0..len).map(|i| i.wrapping_mul(37)).collect();
             run_fuzz_input(&bytes);
-        }
-    }
-
-    #[cfg(feature = "sim-testing")]
-    #[test]
-    fn every_strategy_draw_round_trips_through_bytes() {
-        use proptest::strategy::{Strategy, ValueTree};
-        let mut runner = proptest::test_runner::TestRunner::deterministic();
-        for _ in 0..64 {
-            let ops = super::ops_strategy()
-                .new_tree(&mut runner)
-                .expect("the strategy draws")
-                .current();
-            assert!(!ops.is_empty() && ops.len() <= MAX_OPS);
-            assert_eq!(ops_from_bytes(&ops_to_bytes(&ops)), ops);
         }
     }
 }

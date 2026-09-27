@@ -493,25 +493,37 @@ pub fn monotonic_now() -> MonotonicInstant {
 // threads, and code that runs with no `Sim`, see the system clock.
 
 thread_local! {
-    /// The clocks installed on this thread, newest last, with their ids.
-    static AMBIENT: std::cell::RefCell<Vec<(u64, Arc<dyn ClockSource>)>> =
+    /// The clocks installed on this thread, newest last, with a liveness flag.
+    static AMBIENT: std::cell::RefCell<Vec<AmbientEntry>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Ids for [`install_ambient`] entries.
-static NEXT_AMBIENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// One installed ambient clock.
+struct AmbientEntry {
+    /// Cleared when the guard drops, on any thread.
+    alive: Arc<std::sync::atomic::AtomicBool>,
+    clock: Arc<dyn ClockSource>,
+}
 
 /// Removes its clock from the ambient stack when dropped.
+///
+/// The guard may drop on another thread (a `Sim` can move). The cleared flag
+/// then makes the install thread skip the entry, and prune it on its next
+/// read.
 #[derive(Debug)]
 pub(crate) struct AmbientGuard {
-    id: u64,
+    alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for AmbientGuard {
     fn drop(&mut self) {
+        self.alive
+            .store(false, std::sync::atomic::Ordering::Release);
         // `try_with`: a guard dropped during thread teardown finds no stack.
         let _ = AMBIENT.try_with(|stack| {
-            stack.borrow_mut().retain(|(id, _)| *id != self.id);
+            if let Ok(mut stack) = stack.try_borrow_mut() {
+                stack.retain(|entry| !Arc::ptr_eq(&entry.alive, &self.alive));
+            }
         });
     }
 }
@@ -519,15 +531,25 @@ impl Drop for AmbientGuard {
 /// Make `clock` the ambient clock of this thread until the guard drops. The
 /// newest installed clock wins, so a nested `Sim` shadows an outer one.
 pub(crate) fn install_ambient(clock: Arc<dyn ClockSource>) -> AmbientGuard {
-    let id = NEXT_AMBIENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    AMBIENT.with(|stack| stack.borrow_mut().push((id, clock)));
-    AmbientGuard { id }
+    let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    AMBIENT.with(|stack| {
+        stack.borrow_mut().push(AmbientEntry {
+            alive: Arc::clone(&alive),
+            clock,
+        });
+    });
+    AmbientGuard { alive }
 }
 
 /// Run `read` on the ambient clock, or on [`SystemClock`] when none is set.
 fn with_ambient<T>(read: impl FnOnce(&dyn ClockSource) -> T) -> T {
     let clock = AMBIENT
-        .try_with(|stack| stack.borrow().last().map(|(_, clock)| Arc::clone(clock)))
+        .try_with(|stack| {
+            let mut stack = stack.try_borrow_mut().ok()?;
+            // Prune entries whose guard dropped on another thread.
+            stack.retain(|entry| entry.alive.load(std::sync::atomic::Ordering::Acquire));
+            stack.last().map(|entry| Arc::clone(&entry.clock))
+        })
         .ok()
         .flatten();
     match clock {
@@ -539,6 +561,10 @@ fn with_ambient<T>(read: impl FnOnce(&dyn ClockSource) -> T) -> T {
 /// A [`ClockSource`] that reads the ambient clock: the running
 /// [`Sim`](crate::sim::Sim)'s virtual clock on this thread, else the system
 /// clock.
+///
+/// Under a `Sim`, wall time is the sim clock, and elapsed time
+/// ([`ambient_monotonic`], [`ambient_instant`]) follows tokio's paused clock.
+/// So an ambient deadline and a `tokio::time::sleep` stay on one timeline.
 ///
 /// Use it where framework code needs a clock but has none in scope. Prefer
 /// the app's injected clock ([`AppState::clock`](crate::state::AppState::clock),
@@ -815,5 +841,32 @@ mod tests {
         let pre_epoch = Utc.with_ymd_and_hms(1969, 12, 31, 23, 59, 59).unwrap();
         let clock = FixedClock::at(pre_epoch);
         assert_eq!(clock_unix_duration(&clock), std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn ambient_clock_is_installed_nested_and_removed() {
+        let pinned = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let later = Utc.with_ymd_and_hms(2021, 1, 1, 0, 0, 0).unwrap();
+        let outer = install_ambient(Arc::new(FixedClock::at(pinned)));
+        assert_eq!(ambient_now(), pinned);
+        let inner = install_ambient(Arc::new(FixedClock::at(later)));
+        assert_eq!(ambient_now(), later, "the newest clock wins");
+        drop(inner);
+        assert_eq!(ambient_now(), pinned);
+        drop(outer);
+        assert!(ambient_now() > later, "the system clock again");
+    }
+
+    #[test]
+    fn ambient_guard_dropped_on_another_thread_uninstalls() {
+        let pinned = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let guard = install_ambient(Arc::new(FixedClock::at(pinned)));
+        assert_eq!(ambient_now(), pinned);
+        std::thread::spawn(move || drop(guard)).join().unwrap();
+        assert_ne!(
+            ambient_now(),
+            pinned,
+            "the entry is skipped once its guard drops"
+        );
     }
 }

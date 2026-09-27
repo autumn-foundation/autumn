@@ -68,6 +68,10 @@ use serde::de::DeserializeOwned;
 // ── Error ────────────────────────────────────────────────────────────────────
 
 /// Errors produced by [`Client`] and [`RequestBuilder`].
+///
+/// `#[non_exhaustive]`: match it with a `_` arm, so a new variant is not a
+/// breaking change.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     /// An underlying `reqwest` transport error.
@@ -148,7 +152,8 @@ pub enum ClientError {
     #[error("{0}")]
     PinNotAllowedWithSsrfSafe(&'static str),
     /// The simulated network ([`crate::sim::SimNet`], issue #2967) failed the
-    /// call: a drop, a partition, or a host it does not know.
+    /// call: a drop, a partition, a timeout, a host it does not know, or a
+    /// request or response it could not build.
     #[error("simulated network: {0}")]
     SimNetwork(String),
 }
@@ -1997,13 +2002,7 @@ impl RequestBuilder {
 
                     // 429 → honour Retry-After and retry if attempts remain.
                     if status.as_u16() == 429 && attempt + 1 < max_attempts {
-                        let mut sleep_delay =
-                            parse_retry_after(&headers).unwrap_or(Duration::from_secs(1));
-                        sleep_delay = sleep_delay.min(self.retry_policy.max_retry_after);
-                        if let Some(req_timeout) = self.retry_policy.request_timeout {
-                            sleep_delay = sleep_delay.min(req_timeout);
-                        }
-                        tokio::time::sleep(sleep_delay).await;
+                        tokio::time::sleep(self.retry_after_delay(&headers)).await;
                         continue;
                     }
 
@@ -2093,8 +2092,18 @@ impl RequestBuilder {
         })
     }
 
-    /// Send through the simulated network (issue #2967), with the same
-    /// attempts and backoff as the real retry loop.
+    /// The wait before a retry after a 429: `Retry-After`, capped by the policy.
+    fn retry_after_delay(&self, headers: &HeaderMap) -> Duration {
+        let mut delay = parse_retry_after(headers).unwrap_or(Duration::from_secs(1));
+        delay = delay.min(self.retry_policy.max_retry_after);
+        if let Some(req_timeout) = self.retry_policy.request_timeout {
+            delay = delay.min(req_timeout);
+        }
+        delay
+    }
+
+    /// Send through the simulated network (issue #2967), with the attempts,
+    /// backoff, 429 handling and per-attempt timeout of the real retry loop.
     async fn send_sim(self, net: &crate::sim::SimNet) -> Result<Response, ClientError> {
         let url = reqwest::Url::parse(&self.url)
             .map_err(|error| ClientError::InvalidUrl(format!("{}: {error}", self.url)))?;
@@ -2109,27 +2118,61 @@ impl RequestBuilder {
                 tokio::time::sleep(Duration::from_millis(100 * (1_u64 << exp))).await;
             }
             let last = attempt + 1 == max_attempts;
-            if let Err(fault) = net.transmit(&host).await {
-                if last {
-                    return Err(ClientError::SimNetwork(format!(
-                        "request to {host} {fault}"
-                    )));
+            let exchange = self.sim_attempt(net, &host, &url);
+            let outcome = match self.retry_policy.request_timeout {
+                Some(limit) => {
+                    tokio::time::timeout(limit, exchange)
+                        .await
+                        .unwrap_or_else(|_elapsed| {
+                            Err(SimAttemptError::Transient(format!(
+                                "request to {host} timed out after {limit:?}"
+                            )))
+                        })
                 }
+                None => exchange.await,
+            };
+            let response = match outcome {
+                Ok(response) => response,
+                // A drop or a timeout is transient, like a real connect or
+                // timeout error, so it is retried.
+                Err(SimAttemptError::Transient(_)) if !last => continue,
+                Err(SimAttemptError::Transient(message)) => {
+                    return Err(ClientError::SimNetwork(message));
+                }
+                Err(SimAttemptError::Fatal(error)) => return Err(error),
+            };
+            if response.status.as_u16() == 429 && !last {
+                tokio::time::sleep(self.retry_after_delay(&response.headers)).await;
                 continue;
             }
-            let response = match (net.service(&host), self.mock.as_ref()) {
-                (Some(router), _) => serve_sim_host(router, &self, url.clone()).await?,
-                (None, Some(mock)) => self.mock_response(mock)?,
-                (None, None) => {
-                    return Err(ClientError::SimNetwork(format!("no sim host named {host}")));
-                }
-            };
             if is_retryable_status(response.status.as_u16()) && !last {
                 continue;
             }
             return Ok(response);
         }
         unreachable!("the sim retry loop returns on its last attempt")
+    }
+
+    /// One attempt through the simulated network: the network, then the host
+    /// router or the http mocks.
+    async fn sim_attempt(
+        &self,
+        net: &crate::sim::SimNet,
+        host: &str,
+        url: &reqwest::Url,
+    ) -> Result<Response, SimAttemptError> {
+        net.transmit(host)
+            .await
+            .map_err(|fault| SimAttemptError::Transient(format!("request to {host} {fault}")))?;
+        match (net.service(host), self.mock.as_ref()) {
+            (Some(router), _) => serve_sim_host(router, self, url.clone())
+                .await
+                .map_err(SimAttemptError::Fatal),
+            (None, Some(mock)) => self.mock_response(mock).map_err(SimAttemptError::Fatal),
+            (None, None) => Err(SimAttemptError::Fatal(ClientError::SimNetwork(format!(
+                "no sim host named {host}"
+            )))),
+        }
     }
 
     /// `true` when any security-hardening option requires the custom send path.
@@ -2538,6 +2581,14 @@ fn breaker_for_url(
 
 // ── Custom send-path helpers (redirect / pin / SSRF-safe) ─────────────────────
 
+/// Why one simulated attempt failed.
+enum SimAttemptError {
+    /// A drop, a partition or a timeout: retried while attempts remain.
+    Transient(String),
+    /// Not retried.
+    Fatal(ClientError),
+}
+
 /// Serve one request from a simulated host's router (issue #2967).
 async fn serve_sim_host(
     router: axum::Router,
@@ -2551,6 +2602,13 @@ async fn serve_sim_host(
     let mut builder = axum::http::Request::builder()
         .method(request.method.clone())
         .uri(target);
+    if !request.extra_headers.contains_key(reqwest::header::HOST) {
+        let authority = match url.port() {
+            Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
+            None => url.host_str().unwrap_or_default().to_owned(),
+        };
+        builder = builder.header(reqwest::header::HOST, authority);
+    }
     for (name, value) in &request.extra_headers {
         builder = builder.header(name, value);
     }
@@ -2563,9 +2621,13 @@ async fn serve_sim_host(
         .unwrap_or_else(|never| match never {});
     let status = response.status();
     let headers = response.headers().clone();
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .map_err(|error| ClientError::SimNetwork(error.to_string()))?;
+    let body = if request.discard_response_body {
+        Bytes::new()
+    } else {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map_err(|error| ClientError::SimNetwork(error.to_string()))?
+    };
     Ok(Response {
         status,
         headers,

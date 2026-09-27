@@ -1410,11 +1410,12 @@ turned on or has been running alongside billing all along — needs the
 consumer of `Customer.user_id` need no change.
 
 
-### http_client: `ClientError` gains a `SimNetwork` variant (#2967)
+### http_client: `ClientError` is `#[non_exhaustive]` and gains `SimNetwork` (#2967)
 
 **Why:** the simulated network (`sim::SimNet`) fails calls with drops,
-partitions and unknown hosts. A real `reqwest::Error` cannot be built for
-these, so they need their own variant.
+partitions, timeouts and unknown hosts. A real `reqwest::Error` cannot be built
+for these, so they need their own variant. The enum is now
+`#[non_exhaustive]`, so the next new variant is not a breaking change.
 
 You are affected only if you `match` on `ClientError` with no wildcard arm.
 Outside a `Sim` with a `SimNet`, the variant never occurs.
@@ -1435,7 +1436,7 @@ match error {
 match error {
     ClientError::Request(_) | ClientError::SimNetwork(_) => retry(),
     ClientError::Json(_) => bad_payload(),
-    // … every other variant
+    _ => give_up(), // required: the enum is `#[non_exhaustive]`
 }
 ```
 
@@ -1707,6 +1708,20 @@ Other changes that still compile but behave differently at runtime. Examples:
 - Error responses adopted a new JSON shape.
 - A default middleware is now ordered differently.
 - A scheduled task now runs on a different worker.
+
+### Sim: framework code reads the sim clock (#2967)
+
+Inside a `Sim`, framework code with no clock in scope now reads the sim's
+virtual clock (`time::ambient_now` and its siblings), not the OS clock. This
+covers about 55 modules and the `deleted_at` stamp `#[repository]` writes for a
+soft delete. Wall time starts at the sim epoch, `2020-01-01T00:00:00Z`. A sim
+test that compares such a value with `Utc::now()` fails; compare it with the
+sim clock instead. Outside a `Sim`, nothing changes.
+
+Two webhook sites now read the app clock (`state.clock()`) instead of the OS
+clock: the `SignedWebhook` timestamp check and the outbound `t=` timestamp. A
+test that pins the app clock with `TestApp::with_clock` and signs a fixture
+with the real time now gets `401`. Sign the fixture with the pinned time.
 
 ### Sim: `run_to_idle` panics when the drain does not settle (#2967)
 

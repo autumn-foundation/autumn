@@ -50,7 +50,9 @@
 
 use std::future::Future;
 use std::pin::pin;
-use std::task::Poll;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll, Wake, Waker};
 
 use crate::entropy::SeededEntropy;
 
@@ -162,22 +164,80 @@ impl<T> CrashOutcome<T> {
 /// before that point stays done; the work after it never runs. If `op` finishes
 /// first, the result is [`CrashOutcome::Completed`].
 ///
+/// A suspension counts once, however often the caller polls: `op` is polled
+/// again only after it wakes itself. So `crash_at` inside
+/// [`Sim::interleave`](crate::sim::Sim::interleave) or `join!` counts the same
+/// awaits as it does alone.
+///
 /// This drops only `op`. Call [`Sim::kill`](crate::sim::Sim::kill) after a
 /// crash to also stop the app's background work.
 pub async fn crash_at<F: Future>(await_index: u64, op: F) -> CrashOutcome<F::Output> {
     let mut op = pin!(op);
+    let wake = Arc::new(WakeFlag::default());
+    let waker = Waker::from(Arc::clone(&wake));
     let mut suspensions = 0_u64;
-    std::future::poll_fn(move |cx| match op.as_mut().poll(cx) {
-        Poll::Ready(value) => Poll::Ready(CrashOutcome::Completed(value)),
-        Poll::Pending if suspensions == await_index => {
-            Poll::Ready(CrashOutcome::Crashed { await_index })
+    let mut polled = false;
+    std::future::poll_fn(move |cx| {
+        wake.set_parent(cx.waker());
+        // Poll `op` first, and then only after its own waker fired.
+        if polled && !wake.take() {
+            return Poll::Pending;
         }
-        Poll::Pending => {
-            suspensions += 1;
-            Poll::Pending
+        polled = true;
+        match op.as_mut().poll(&mut Context::from_waker(&waker)) {
+            Poll::Ready(value) => Poll::Ready(CrashOutcome::Completed(value)),
+            Poll::Pending if suspensions == await_index => {
+                Poll::Ready(CrashOutcome::Crashed { await_index })
+            }
+            Poll::Pending => {
+                suspensions += 1;
+                Poll::Pending
+            }
         }
     })
     .await
+}
+
+/// The waker [`crash_at`] gives `op`: it records the wake and passes it on.
+#[derive(Default)]
+struct WakeFlag {
+    woken: AtomicBool,
+    parent: Mutex<Option<Waker>>,
+}
+
+impl WakeFlag {
+    fn set_parent(&self, waker: &Waker) {
+        let mut parent = self.parent.lock().unwrap_or_else(PoisonError::into_inner);
+        if !parent
+            .as_ref()
+            .is_some_and(|current| current.will_wake(waker))
+        {
+            *parent = Some(waker.clone());
+        }
+    }
+
+    /// Whether `op` woke since the last call.
+    fn take(&self) -> bool {
+        self.woken.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl Wake for WakeFlag {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.woken.store(true, Ordering::Release);
+        let parent = self
+            .parent
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(parent) = parent {
+            parent.wake();
+        }
+    }
 }
 
 #[cfg(test)]

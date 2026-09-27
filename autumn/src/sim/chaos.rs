@@ -464,13 +464,7 @@ pub(crate) fn install(
     ticking: TickingClock,
     state: Arc<ChaosState>,
 ) -> crate::test::TestApp {
-    let mut app = match chaos.clock_skew {
-        Some(dur) => app.with_clock(SkewClock {
-            inner: ticking,
-            offset: deterministic_skew(seed, dur),
-        }),
-        None => app.with_clock(ticking),
-    };
+    let mut app = app.with_clock(wall_clock(chaos, seed, ticking));
 
     app = app.with_job_interceptor(ChaosJobInterceptor {
         state: Arc::clone(&state),
@@ -492,6 +486,18 @@ pub(crate) fn install(
 
     drop(state);
     app
+}
+
+/// The wall clock the app sees: `ticking`, skewed when `chaos` sets a skew.
+/// The sim also installs it as the ambient wall clock, so both agree.
+pub(crate) fn wall_clock(chaos: &Chaos, seed: u64, ticking: TickingClock) -> Arc<dyn ClockSource> {
+    match chaos.clock_skew {
+        Some(dur) => Arc::new(SkewClock {
+            inner: ticking,
+            offset: deterministic_skew(seed, dur),
+        }),
+        None => Arc::new(ticking),
+    }
 }
 
 /// Fault-injecting [`crate::interceptor::JobInterceptor`] for duplicate

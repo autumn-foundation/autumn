@@ -988,8 +988,8 @@ jobs:
         # `#[sim_test]` fails with its seed instead of hanging the job. It is
         # safe only at `--test-threads=1`, because the paused clock also
         # advances while a test waits on a lock another test thread holds. The
-        # budget is virtual time, so two years costs nothing and stays above
-        # the longest `advance` in the suite (365 days).
+        # budget is virtual time, so two years costs nothing and stays far
+        # above the longest `advance` in the suite (about two months).
         shell: bash
         env:
           AUTUMN_SIM_LIVENESS_BUDGET_SECS: "63072000"
