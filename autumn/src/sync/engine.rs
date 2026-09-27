@@ -1,5 +1,23 @@
 //! Client sync loop: push pending changes, pull newer rows.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -111,6 +129,10 @@ impl SyncEngine {
     /// Panics if the HTTP client's TLS backend cannot be initialized
     /// (`reqwest::Client` construction).
     #[must_use]
+    #[allow(
+        clippy::expect_used,
+        reason = "infallible: reqwest client built from static config; a TLS-backend init failure is an unrecoverable environment fault surfaced as a documented panic"
+    )]
     pub fn new(store: SyncStore, config: SyncConfig) -> Self {
         let client = reqwest::Client::builder()
             .timeout(config.request_timeout)
@@ -256,7 +278,7 @@ impl SyncEngine {
                         // dropped tombstones for rows already buffered.
                         // Restart from scratch (see the doc comment).
                         Some(start) if tombstone_horizon != start => {
-                            restarts += 1;
+                            restarts = restarts.saturating_add(1);
                             if restarts > MAX_SNAPSHOT_RESTARTS {
                                 return Err(SyncError::Server(format!(
                                     "tombstone GC kept moving the horizon mid-snapshot; \
@@ -282,7 +304,9 @@ impl SyncEngine {
                 }
             }
         };
-        report.pulled += self.store.reconcile_snapshot(&snapshot, final_cursor)?;
+        report.pulled = report
+            .pulled
+            .saturating_add(self.store.reconcile_snapshot(&snapshot, final_cursor)?);
         if tombstone_horizon > 0 {
             self.store.prune_acked_tombstones(tombstone_horizon)?;
         }
@@ -326,7 +350,7 @@ impl SyncEngine {
             }
             self.store
                 .confirm_pushed(&request.changes, &push_response.outcomes)?;
-            report.pushed += batch_len;
+            report.pushed = report.pushed.saturating_add(batch_len);
         }
     }
 
@@ -410,7 +434,9 @@ impl SyncEngine {
                     } else {
                         next_cursor
                     };
-                    report.pulled += self.store.apply_remote_page(&rows, new_cursor)?;
+                    report.pulled = report
+                        .pulled
+                        .saturating_add(self.store.apply_remote_page(&rows, new_cursor)?);
                     if caught_up {
                         if tombstone_horizon > 0 {
                             self.store.prune_acked_tombstones(tombstone_horizon)?;

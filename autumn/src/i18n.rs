@@ -49,6 +49,16 @@
 //! }
 //! ```
 
+mod translatable;
+
+pub use translatable::{
+    LocaleScope, TranslatableColumnDescriptor, Translated, ambient_locale, ambient_locale_scope,
+    default_locale_snapshot, fallback_chain_snapshot, install_locale_defaults,
+    publish_ambient_locale, registered_translatable_columns, scoped_or_global_default_locale,
+    translatable_columns_for_table, with_locale, with_locale_chain, with_locale_chain_sync,
+    with_locale_scope, with_locale_scope_sync, with_locale_sync, write_locale,
+};
+
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -92,6 +102,38 @@ pub struct I18nConfig {
     /// Filesystem directory containing `<locale>.ftl` files, relative to
     /// the application's manifest directory. Defaults to `"i18n"`.
     pub dir: String,
+
+    /// Enable locale-prefixed routing (issue #1251). Default `false` — no
+    /// behavior change for existing apps.
+    ///
+    /// When `true`, every route registered via [`AppBuilder::routes`](crate::app::AppBuilder::routes)
+    /// (except those matching [`Self::locale_prefix_exclude`]) is also
+    /// reachable under `/{locale}/...` for each of [`Self::supported_locales`],
+    /// with zero hand-duplicated route definitions. A request to the bare,
+    /// non-prefixed path 308-redirects to the negotiated locale's prefixed
+    /// path, preserving the query string. The locale segment takes
+    /// precedence over cookie/session/`Accept-Language` for the [`Locale`]
+    /// extractor on requests within a prefixed path.
+    pub locale_prefix_enabled: bool,
+
+    /// Route path prefixes exempt from locale-prefixing and from the
+    /// bare-path redirect, even when [`Self::locale_prefix_enabled`] is
+    /// enabled (e.g. `["/api", "/actuator"]` for machine endpoints defined
+    /// as normal routes). A trailing `/*` is accepted and ignored (`"/api"`
+    /// and `"/api/*"` are equivalent). A route matches when its path equals
+    /// the prefix or starts with `{prefix}/`.
+    pub locale_prefix_exclude: Vec<String>,
+
+    /// Exact route paths exempt from locale-prefixing (issue #1251). Unlike
+    /// [`Self::locale_prefix_exclude`], entries here match only the literal
+    /// path itself, never a `{path}/...` child — this is what
+    /// `#[static_get]` routes need, since excluding e.g. `/posts` as a
+    /// *prefix* would also swallow an unrelated dynamic sibling like
+    /// `/posts/{slug}` (Codex review). Not user-configurable — `#[serde(skip)]`
+    /// keeps it out of `autumn.toml`; it's populated internally, from static
+    /// route paths, before router construction.
+    #[serde(skip)]
+    pub locale_prefix_exclude_exact: Vec<String>,
 }
 
 impl Default for I18nConfig {
@@ -101,12 +143,21 @@ impl Default for I18nConfig {
             supported_locales: vec!["en".to_owned()],
             fallback_chain: Vec::new(),
             dir: "i18n".to_owned(),
+            locale_prefix_enabled: false,
+            locale_prefix_exclude: Vec::new(),
+            locale_prefix_exclude_exact: Vec::new(),
         }
     }
 }
 
 impl I18nConfig {
-    /// Resolved fallback chain. Always ends with [`Self::default_locale`].
+    /// Resolved fallback chain.
+    ///
+    /// The configured chain, with [`Self::default_locale`] **appended when it
+    /// is absent** — an explicit chain that already names the default keeps the
+    /// author's order, so the last link is not necessarily the default locale.
+    /// Anything that needs the default locale must read
+    /// [`Self::default_locale`] directly rather than the chain's tail.
     #[must_use]
     pub fn resolved_fallback_chain(&self) -> Vec<String> {
         if self.fallback_chain.is_empty() {
@@ -166,15 +217,17 @@ pub enum LoadError {
 ///
 /// # Resolution order
 ///
-/// 1. `?locale=xx` query parameter (explicit override, useful for testing)
-/// 2. `autumn_locale` cookie (set by application code, e.g. on a switcher
+/// 1. URL locale prefix (issue #1251 — set when [`I18nConfig::locale_prefix_enabled`]
+///    is enabled and the request matched a `/{locale}/...` nest)
+/// 2. `?locale=xx` query parameter (explicit override, useful for testing)
+/// 3. `autumn_locale` cookie (set by application code, e.g. on a switcher
 ///    form submit)
-/// 3. `Accept-Language` header, negotiated against the configured
+/// 4. `Accept-Language` header, negotiated against the configured
 ///    [`I18nConfig::supported_locales`]
-/// 4. [`I18nConfig::default_locale`]
+/// 5. [`I18nConfig::default_locale`]
 ///
 /// This is stable and documented: applications can rely on the order. If
-/// step 1–3 produce a locale that is **not** in the supported list, the
+/// step 1–4 produce a locale that is **not** in the supported list, the
 /// extractor falls through to the next step rather than serving an
 /// unsupported locale.
 #[derive(Debug, Clone)]
@@ -700,17 +753,36 @@ where
         // extension and threaded through via a layer; for tests we build
         // [`Locale`] directly via [`Locale::new`] / [`Locale::with_bundle`].)
         let bundle = parts.extensions.get::<Arc<Bundle>>().cloned();
-        let supported: Vec<String> = bundle
+        // Read the router's `LocaleRoutingConfig` (issue #1251) regardless of
+        // whether a bundle is installed: when locale-prefix routing is on,
+        // the router's nests/redirects are built entirely from `I18nConfig`,
+        // so that config — not an independently-constructed `Bundle` — must
+        // be authoritative for which locales are actually reachable and
+        // what the fallback default is. The bundle stays authoritative only
+        // for `t()`/`t_with()` translation lookups (see `with_bundle` below).
+        let routing_config = parts.extensions.get::<LocaleRoutingConfig>().cloned();
+        let supported: Vec<String> = routing_config
             .as_ref()
-            .map(|b| b.supported_locales.clone())
+            .map(|c| c.supported_locales.clone())
+            .or_else(|| bundle.as_ref().map(|b| b.supported_locales.clone()))
             .unwrap_or_default();
-        let default = bundle
+        let default = routing_config
             .as_ref()
-            .map_or_else(|| "en".to_owned(), |b| b.default_locale.clone());
+            .map(|c| c.default_locale.clone())
+            .or_else(|| bundle.as_ref().map(|b| b.default_locale.clone()))
+            .unwrap_or_else(|| "en".to_owned());
 
-        // Resolution order: query → session (signed cookie) → plain cookie
-        // (legacy / sessions-off) → Accept-Language → default.
-        let mut resolved = resolve_query_override(parts, &supported);
+        // Resolution order: URL locale prefix (issue #1251, when the router's
+        // locale-prefix nesting matched) → query → session (signed cookie) →
+        // plain cookie (legacy / sessions-off) → Accept-Language → default.
+        let mut resolved = parts
+            .extensions
+            .get::<UriPrefixedLocale>()
+            .and_then(|url_locale| negotiate(&url_locale.0, &supported))
+            .map(str::to_owned);
+        if resolved.is_none() {
+            resolved = resolve_query_override(parts, &supported);
+        }
         if resolved.is_none() {
             resolved = resolve_from_session(parts, &supported).await;
         }
@@ -722,12 +794,347 @@ where
         }
         let resolved = resolved.unwrap_or(default);
 
+        // #1384: publish this answer onto the ambient scope, if one is in
+        // effect. `AmbientLocaleLayer` runs the same resolution, but on some
+        // paths it sits outside middleware this extractor reads — most visibly
+        // the session on the SSG/ISG lane, where registered layers are applied
+        // outside the static-first middleware and so outside `SessionLayer`.
+        // Refining here keeps a `#[translatable]` field and a hand-taken
+        // `Locale` parameter from ever disagreeing. A no-op outside a scope.
+        publish_ambient_locale(&resolved);
+
         let mut locale = Self::new(resolved);
         if let Some(bundle) = bundle {
             locale = locale.with_bundle(bundle);
         }
         Ok(locale)
     }
+}
+
+// ── Ambient locale layer (issue #1384) ───────────────────────────────────────
+
+/// Publishes the request's negotiated locale as the **ambient** one.
+///
+/// A tower [`Layer`](tower::Layer) that scopes the whole handler to the
+/// request's locale, so [`Translated`] model fields resolve themselves with no
+/// locale argument anywhere in the signature.
+///
+/// Installed automatically alongside the [`Bundle`] extension when an app
+/// configures i18n, so `#[translatable]` reads "just work". Resolution is the
+/// [`Locale`] extractor's own — the layer runs the extractor — so the ambient
+/// locale and a hand-taken `Locale` parameter can never disagree.
+///
+/// # Cost
+///
+/// Unlike the framework's other hand-rolled request-scope layers (which return
+/// a named `TaskLocalFuture` and never allocate), this
+/// layer boxes its future: resolving the locale means running an `async`
+/// extractor (the session lookup step is async) before the inner service is
+/// called, so there is a genuine `await` to suspend on either way. It is
+/// installed whenever a translation bundle is configured — not only when the
+/// binary declares `#[translatable]` columns — because [`ambient_locale`] and
+/// [`with_locale`] are public API whose scope must exist predictably. So an
+/// i18n app that uses no translatable field still pays one boxed future and
+/// one negotiation per request; the negotiation itself touches no I/O (the
+/// session read is an in-memory lock) and the fallback chain is snapshotted at
+/// construction, so nothing here takes a process-wide lock per request.
+#[derive(Clone, Debug)]
+pub struct AmbientLocaleLayer {
+    /// Fallback chain published into the scope. Snapshotted from the bundle at
+    /// construction so per-request resolution touches no locks.
+    chain: Arc<[String]>,
+    /// The app's default locale, published into the scope so column decoding
+    /// of a legacy plain-text value is request-local rather than reading a
+    /// process-wide global two apps in one process would share.
+    default_locale: Arc<str>,
+}
+
+impl AmbientLocaleLayer {
+    /// Build the layer from the loaded [`Bundle`], reusing its resolved
+    /// fallback chain — i.e. exactly [`I18nConfig::resolved_fallback_chain`],
+    /// the chain UI strings walk.
+    #[must_use]
+    pub fn new(bundle: &Arc<Bundle>) -> Self {
+        Self {
+            chain: bundle.fallback_chain().to_vec().into(),
+            default_locale: Arc::from(bundle.default_locale()),
+        }
+    }
+
+    /// Build the layer from an explicit chain and default locale (tests,
+    /// embedded runtimes).
+    #[must_use]
+    pub fn with_chain(chain: Vec<String>, default_locale: &str) -> Self {
+        Self {
+            chain: chain.into(),
+            default_locale: Arc::from(default_locale),
+        }
+    }
+}
+
+impl<S> tower::Layer<S> for AmbientLocaleLayer {
+    type Service = AmbientLocaleService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        AmbientLocaleService {
+            inner,
+            chain: Arc::clone(&self.chain),
+            default_locale: Arc::clone(&self.default_locale),
+        }
+    }
+}
+
+/// Tower [`Service`](tower::Service) produced by [`AmbientLocaleLayer`].
+#[derive(Clone, Debug)]
+pub struct AmbientLocaleService<S> {
+    inner: S,
+    chain: Arc<[String]>,
+    default_locale: Arc<str>,
+}
+
+impl<S, B> tower::Service<axum::http::Request<B>> for AmbientLocaleService<S>
+where
+    S: tower::Service<axum::http::Request<B>, Response = axum::response::Response>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+    B: Send + 'static,
+{
+    type Response = axum::response::Response;
+    type Error = S::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<B>) -> Self::Future {
+        // `Service::call` may be invoked on a clone that was never `poll_ready`
+        // -ed, so swap in the ready `self.inner` and keep the clone (the
+        // standard tower `Clone` dance).
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        let chain = Arc::clone(&self.chain);
+        let default_locale = Arc::clone(&self.default_locale);
+        Box::pin(async move {
+            let (mut parts, body) = req.into_parts();
+            // Infallible rejection: the extractor always yields a locale.
+            let Ok(locale) = Locale::from_request_parts(&mut parts, &()).await;
+            let scope =
+                LocaleScope::with_default_locale(locale.tag(), chain.to_vec(), &default_locale);
+            let req = axum::http::Request::from_parts(parts, body);
+            // Build the inner future INSIDE the scope as well as polling it
+            // there (the `HttpInterceptorService` pattern), so a nested layer
+            // that refines this scope from its own `call` — see
+            // [`LocalePrefixScopeLayer`] — finds it already established.
+            let inner_future = with_locale_scope_sync(scope.clone(), || inner.call(req));
+            let response = with_locale_scope(scope.clone(), inner_future).await?;
+            // A deferred or streaming body (SSE, `Body::from_stream`, a chunked
+            // download) is polled AFTER the handler future resolves, outside
+            // the task-local scope — so a `Translated` rendered per frame would
+            // fall back to the default locale mid-response. Re-enter the same
+            // scope on every frame poll, exactly as `CurrentActorBody` and
+            // `TenantPropagatingBody` do for their own request-scoped values.
+            Ok(response.map(|body| axum::body::Body::new(AmbientLocaleBody::new(body, scope))))
+        })
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Response body that re-enters its request's [`LocaleScope`] on every
+    /// frame poll, so content rendered lazily still resolves to the visitor's
+    /// locale. The sibling of
+    /// [`CurrentActorBody`](crate::current::CurrentActorBody) and
+    /// [`TenantPropagatingBody`](crate::tenancy::TenantPropagatingBody).
+    pub struct AmbientLocaleBody<B> {
+        #[pin]
+        inner: B,
+        scope: LocaleScope,
+    }
+}
+
+impl<B> AmbientLocaleBody<B> {
+    pub(crate) const fn new(inner: B, scope: LocaleScope) -> Self {
+        Self { inner, scope }
+    }
+}
+
+impl<B> http_body::Body for AmbientLocaleBody<B>
+where
+    B: http_body::Body,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.project();
+        let scope = this.scope.clone();
+        with_locale_scope_sync(scope, || this.inner.poll_frame(cx))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Overrides the ambient locale for one `/{locale}/…` nest (issue #1251 +
+/// #1384).
+///
+/// The URL prefix is the highest-priority locale source — it is step 1 of
+/// [`Locale`]'s documented resolution order — and it is only visible *inside*
+/// the router's per-locale nest, where [`UriPrefixedLocale`] is installed. An
+/// app-wide [`AmbientLocaleLayer`] sits outside that nest and would negotiate
+/// `/es/posts` from `Accept-Language` alone.
+///
+/// It **refines the scope already in effect** rather than establishing a new
+/// one, so the fallback chain stays whatever the app-wide layer published — the
+/// loaded [`Bundle`]'s chain, which an app may have supplied via
+/// `.i18n(bundle)` built from a different [`I18nConfig`] than the router's.
+/// Rebuilding the chain here would shadow it, and `#[translatable]` content
+/// could then resolve down one chain while [`Locale::t`] on the same request
+/// walked another.
+///
+/// The configured chain is used only when there is no scope to refine: the
+/// supported shape where `locale_prefix_enabled` is on but the app never called
+/// `.i18n()`/`.i18n_auto()`, so no bundle — and no app-wide layer — exists.
+#[derive(Clone, Debug)]
+pub struct LocalePrefixScopeLayer {
+    locale: Arc<str>,
+    chain: Arc<[String]>,
+    default_locale: Arc<str>,
+}
+
+impl LocalePrefixScopeLayer {
+    /// Build the layer for one nest's locale segment, with the chain to use
+    /// only when no outer scope exists.
+    #[must_use]
+    pub fn new(locale: impl AsRef<str>, chain: Vec<String>, default_locale: &str) -> Self {
+        Self {
+            locale: Arc::from(locale.as_ref()),
+            chain: chain.into(),
+            default_locale: Arc::from(default_locale),
+        }
+    }
+}
+
+impl<S> tower::Layer<S> for LocalePrefixScopeLayer {
+    type Service = LocalePrefixScopeService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        LocalePrefixScopeService {
+            inner,
+            locale: Arc::clone(&self.locale),
+            chain: Arc::clone(&self.chain),
+            default_locale: Arc::clone(&self.default_locale),
+        }
+    }
+}
+
+/// Tower [`Service`](tower::Service) produced by [`LocalePrefixScopeLayer`].
+#[derive(Clone, Debug)]
+pub struct LocalePrefixScopeService<S> {
+    inner: S,
+    locale: Arc<str>,
+    chain: Arc<[String]>,
+    default_locale: Arc<str>,
+}
+
+impl<S, B> tower::Service<axum::http::Request<B>> for LocalePrefixScopeService<S>
+where
+    S: tower::Service<axum::http::Request<B>, Response = axum::response::Response>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+    B: Send + 'static,
+{
+    type Response = axum::response::Response;
+    type Error = S::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<B>) -> Self::Future {
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        let locale = Arc::clone(&self.locale);
+        let chain = Arc::clone(&self.chain);
+        let default_locale = Arc::clone(&self.default_locale);
+        Box::pin(async move {
+            if let Some(scope) = ambient_locale_scope() {
+                // Refine in place: the app-wide layer's chain is authoritative,
+                // and the prefix outranks whatever it negotiated.
+                scope.set_tag(&*locale);
+                let response = inner.call(req).await?;
+                return Ok(
+                    response.map(|body| axum::body::Body::new(AmbientLocaleBody::new(body, scope)))
+                );
+            }
+            // No app-wide layer: locale-prefix routing without a bundle.
+            let scope = LocaleScope::with_default_locale(&*locale, chain.to_vec(), &default_locale);
+            let inner_future = with_locale_scope_sync(scope.clone(), || inner.call(req));
+            let response = with_locale_scope(scope.clone(), inner_future).await?;
+            Ok(response.map(|body| axum::body::Body::new(AmbientLocaleBody::new(body, scope))))
+        })
+    }
+}
+
+/// Request extension inserted by the router's locale-prefix nesting (issue
+/// #1251) — one instance per `/{locale}` nest, carrying that nest's literal
+/// locale segment.
+///
+/// The [`Locale`] extractor checks this before query/cookie/session/
+/// `Accept-Language`, so a URL like `/es/posts` resolves to `es` regardless
+/// of any cookie or header — with zero changes to handlers, which keep
+/// taking a plain [`Locale`] parameter.
+#[derive(Debug, Clone)]
+pub struct UriPrefixedLocale(pub String);
+
+/// Fallback locale-negotiation data the router installs, as a request
+/// extension, whenever `[i18n] locale_prefix_enabled` is on (issue #1251).
+///
+/// Negotiation ([`negotiate`], `Accept-Language` parsing) needs a supported-
+/// locales list and a default; normally these come from the [`Bundle`]
+/// installed by [`i18n()`](crate::app::AppBuilder::i18n) /
+/// [`i18n_auto()`](crate::app::AppBuilder::i18n_auto). Locale-prefixed
+/// routing is a router-level feature that doesn't require a translation
+/// bundle, though — an app can enable it purely for URL structure — so
+/// without this fallback, [`Locale`] would see an empty supported list and a
+/// hard-coded `"en"` default, causing every bare-path redirect to target
+/// `/en/...` regardless of [`I18nConfig::supported_locales`] /
+/// [`I18nConfig::default_locale`], 404ing whenever `"en"` isn't actually
+/// configured.
+///
+/// The [`Locale`] extractor only consults this when no `Bundle` extension is
+/// present — an app that also calls `.i18n()`/`.i18n_auto()` keeps using its
+/// bundle's data (which itself derives from the same [`I18nConfig`], so the
+/// two never disagree).
+#[derive(Debug, Clone)]
+pub struct LocaleRoutingConfig {
+    /// Mirrors [`I18nConfig::supported_locales`].
+    pub supported_locales: Vec<String>,
+    /// Mirrors [`I18nConfig::default_locale`].
+    pub default_locale: String,
 }
 
 /// Session key used for the persisted locale.
@@ -888,6 +1295,9 @@ mod tests {
             supported_locales: supported.iter().map(|s| (*s).to_owned()).collect(),
             fallback_chain: vec![],
             dir: "i18n".to_owned(),
+            locale_prefix_enabled: false,
+            locale_prefix_exclude: vec![],
+            locale_prefix_exclude_exact: vec![],
         }
     }
 
@@ -1218,6 +1628,141 @@ mod tests {
         parts.extensions.insert(bundle.clone());
         let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
         assert_eq!(locale.tag(), "es");
+    }
+
+    // ── URL locale prefix precedence (issue #1251) ───────────────
+
+    #[tokio::test]
+    async fn url_prefixed_locale_wins_over_query_cookie_and_accept_language() {
+        let cfg = cfg("en", &["en", "es"]);
+        let bundle = Arc::new(bundle_with(&[("en", &[]), ("es", &[])], &cfg));
+        let mut parts = build_parts(
+            "/?locale=en",
+            &[
+                (header::COOKIE.as_str(), "autumn_locale=en"),
+                (header::ACCEPT_LANGUAGE.as_str(), "en"),
+            ],
+        );
+        parts.extensions.insert(bundle.clone());
+        parts.extensions.insert(UriPrefixedLocale("es".to_owned()));
+        let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(
+            locale.tag(),
+            "es",
+            "URL locale prefix must outrank query, cookie, and Accept-Language"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_url_prefixed_locale_falls_through_to_next_step() {
+        let cfg = cfg("en", &["en", "es"]);
+        let bundle = Arc::new(bundle_with(&[("en", &[]), ("es", &[])], &cfg));
+        let mut parts = build_parts("/?locale=es", &[]);
+        parts.extensions.insert(bundle.clone());
+        // Defensive: a bogus/unsupported injected value must not be trusted
+        // blindly — it should fall through to the next resolution step.
+        parts.extensions.insert(UriPrefixedLocale("zz".to_owned()));
+        let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(locale.tag(), "es");
+    }
+
+    // ── LocaleRoutingConfig fallback (issue #1251, Codex review) ──
+
+    #[tokio::test]
+    async fn locale_routing_config_negotiates_without_a_bundle() {
+        // No Bundle installed — only a router-installed LocaleRoutingConfig,
+        // as happens when an app enables `locale_prefix_enabled` without
+        // calling `.i18n()`/`.i18n_auto()`.
+        let mut parts = build_parts("/", &[(header::ACCEPT_LANGUAGE.as_str(), "fr-CA,fr;q=0.9")]);
+        parts.extensions.insert(LocaleRoutingConfig {
+            supported_locales: vec!["fr".to_owned(), "en".to_owned()],
+            default_locale: "fr".to_owned(),
+        });
+        let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(
+            locale.tag(),
+            "fr",
+            "Accept-Language must negotiate against LocaleRoutingConfig's \
+             supported_locales, not an empty list"
+        );
+    }
+
+    #[tokio::test]
+    async fn locale_routing_config_supplies_the_configured_default_without_a_bundle() {
+        let mut parts = build_parts("/", &[]);
+        parts.extensions.insert(LocaleRoutingConfig {
+            supported_locales: vec!["fr".to_owned()],
+            default_locale: "fr".to_owned(),
+        });
+        let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(
+            locale.tag(),
+            "fr",
+            "default must come from LocaleRoutingConfig, not the hard-coded \"en\" fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn url_prefixed_locale_still_wins_without_a_bundle() {
+        let mut parts = build_parts("/", &[(header::ACCEPT_LANGUAGE.as_str(), "en")]);
+        parts.extensions.insert(LocaleRoutingConfig {
+            supported_locales: vec!["fr".to_owned(), "en".to_owned()],
+            default_locale: "fr".to_owned(),
+        });
+        parts.extensions.insert(UriPrefixedLocale("en".to_owned()));
+        let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(locale.tag(), "en");
+    }
+
+    #[tokio::test]
+    async fn locale_routing_config_takes_precedence_over_bundle_for_negotiation() {
+        // Both installed (e.g. app calls .i18n_auto() AND enables
+        // locale_prefix_enabled) — the router's `LocaleRoutingConfig` must
+        // win for NEGOTIATION, since the router's nests/redirects are built
+        // entirely from `I18nConfig`: a locale the bundle "supports" but the
+        // router doesn't route is unreachable anyway, and a locale the
+        // router routes but the bundle doesn't list must still negotiate
+        // successfully (see `bundle_translation_lookup_still_works_when_locale_routing_config_wins`
+        // for confirmation the bundle remains authoritative for `t()`).
+        let cfg = cfg("en", &["en", "es"]);
+        let bundle = Arc::new(bundle_with(&[("en", &[]), ("es", &[])], &cfg));
+        let mut parts = build_parts("/", &[(header::ACCEPT_LANGUAGE.as_str(), "fr-CA,fr;q=0.9")]);
+        parts.extensions.insert(bundle);
+        parts.extensions.insert(LocaleRoutingConfig {
+            supported_locales: vec!["fr".to_owned()],
+            default_locale: "fr".to_owned(),
+        });
+        let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(
+            locale.tag(),
+            "fr",
+            "LocaleRoutingConfig must be authoritative for negotiation, since the \
+             router's reachable locale segments come from I18nConfig, not the bundle"
+        );
+    }
+
+    #[tokio::test]
+    async fn bundle_translation_lookup_still_works_when_locale_routing_config_wins() {
+        // Negotiation lands on "es" via LocaleRoutingConfig even though the
+        // bundle's own supported_locales/default_locale disagree — but the
+        // bundle itself must still be attached, so `t()` keeps working.
+        let cfg = cfg("en", &["en", "es"]);
+        let bundle = Arc::new(bundle_with(
+            &[
+                ("en", &[("greeting", "Hello")]),
+                ("es", &[("greeting", "Hola")]),
+            ],
+            &cfg,
+        ));
+        let mut parts = build_parts("/", &[]);
+        parts.extensions.insert(bundle);
+        parts.extensions.insert(LocaleRoutingConfig {
+            supported_locales: vec!["es".to_owned()],
+            default_locale: "es".to_owned(),
+        });
+        let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(locale.tag(), "es");
+        assert_eq!(locale.t("greeting"), "Hola");
     }
 
     #[test]

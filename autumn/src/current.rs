@@ -110,6 +110,20 @@ impl Current {
         }
     }
 
+    /// The actor published on the **current scope**, with no process-wide
+    /// default fallback.
+    ///
+    /// [`actor`](Self::actor) reads the configured default when no scope is in
+    /// effect, which is right for attributing background writes but wrong for
+    /// authorizing a request: a route that resolves "who is calling" from the
+    /// ambient actor must see `None` for an unauthenticated caller, never a
+    /// job runner's identity. Used by the Web Push subscribe/unsubscribe
+    /// routes for exactly that reason.
+    #[must_use]
+    pub(crate) fn scoped_actor() -> Option<String> {
+        CURRENT_ACTOR.try_with(ActorScope::get).ok().flatten()
+    }
+
     /// Publish the authenticated principal onto the current request scope.
     ///
     /// Called by the auth layer right after it resolves the user id (next to

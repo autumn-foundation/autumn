@@ -1,0 +1,98 @@
+# Migration versions grandfathered by scripts/check-migration-versions.sh
+#
+# Every entry here violates the version rules that gate now enforces: a
+# day-granularity `HHMMSS` of `000000`, an all-zero/pre-epoch version, or a
+# component that is not a real time (`20260530300000` has hour 30).
+#
+# They are listed rather than fixed because THEY CANNOT BE RENAMED. Diesel
+# records applied migrations by version in `__diesel_schema_migrations`, and
+# `autumn_migration_checksums` makes the version a PRIMARY KEY. Renaming a
+# migration that has already run makes the framework consider it unapplied
+# and run it again against production databases.
+#
+# This file is a record of debt, and it should only ever shrink -- an entry
+# comes out when its migration is deleted, never because a new migration was
+# added. A new migration must satisfy the rules:
+#
+#     autumn generate migration <Name> [field:type ...]
+#     autumn schema diff --write-migration --name <name>
+#
+# Both mint a full YYYYMMDDHHMMSS, so two authors collide only if they
+# generate in the same second.
+#
+# Note what is NOT here: `autumn/migrations/20260530200000_create_feature_flags`
+# passes, because `200000` is a real time. The rule is precision, not the
+# presence of zeros.
+
+
+# autumn-cli/src/starters/saas/migrations — Starter template. Copied into a new project verbatim, so its
+# versions become a user app's versions.
+autumn-cli/src/starters/saas/migrations/00000000000000_create_saas
+autumn-cli/src/starters/saas/migrations/00000000000001_create_password_reset_tokens
+
+# autumn-media-plugin/migrations — Plugin migrations. Applied alongside the framework's and the
+# app's own, into one shared version space.
+autumn-media-plugin/migrations/20260720000000_media_rooms
+
+# autumn/migrations — Framework migrations. These ship into every Autumn app, so a
+# collision here lands in every user database.
+autumn/migrations/00000000000000_create_api_tokens
+autumn/migrations/20260512000000_create_api_tokens
+autumn/migrations/20260513000000_create_job_queue
+autumn/migrations/20260515000000_create_repository_commit_hook_queue
+autumn/migrations/20260519000000_add_trace_context_to_jobs
+autumn/migrations/20260526000000_create_version_history
+autumn/migrations/20260530000000_create_runtime_config
+autumn/migrations/20260530300000_create_experiments
+autumn/migrations/20260610000000_add_job_uniqueness_concurrency
+autumn/migrations/20260611000000_add_pending_unique_key_to_jobs
+autumn/migrations/20260612000000_create_shard_directory
+autumn/migrations/20260627000000_create_shard_map
+autumn/migrations/20260628000000_add_queue_to_jobs
+autumn/migrations/20260630000000_add_scoped_token_columns
+autumn/migrations/20260702000000_create_job_tracking
+autumn/migrations/20260709000000_create_migration_checksums
+autumn/migrations/20260826000000_create_ledger_revisions
+
+# benchmarks/runtime/autumn/migrations — Benchmark app.
+benchmarks/runtime/autumn/migrations/00000000000000_create_posts
+benchmarks/runtime/autumn/migrations/00000000000001_create_api_tokens
+
+# examples/blog/migrations — Example app. Also teaches the convention by example.
+examples/blog/migrations/00000000000000_create_posts
+examples/blog/migrations/00000000000001_widen_post_ids_to_bigint
+examples/blog/migrations/00000000000002_create_oauth_identities
+
+# examples/bookmarks-distributed/migrations — Example app. Also teaches the convention by example.
+examples/bookmarks-distributed/migrations/00000000000000_create_bookmarks
+examples/bookmarks-distributed/migrations/00000000000001_widen_bookmark_ids_to_bigint
+
+# examples/bookmarks-sharded/migrations — Example app. Also teaches the convention by example.
+examples/bookmarks-sharded/migrations/00000000000000_create_bookmarks
+
+# examples/bookmarks/migrations — Example app. Also teaches the convention by example.
+examples/bookmarks/migrations/00000000000000_create_bookmarks
+examples/bookmarks/migrations/00000000000001_widen_bookmark_ids_to_bigint
+
+# examples/reddit-clone/migrations — Example app. Also teaches the convention by example.
+examples/reddit-clone/migrations/20260419000000_create_reddit
+examples/reddit-clone/migrations/20260427000000_add_user_avatar
+examples/reddit-clone/migrations/20260820000000_polymorphic_comments
+
+# examples/saas/migrations — Example app. Also teaches the convention by example.
+examples/saas/migrations/00000000000000_create_saas
+examples/saas/migrations/00000000000001_create_password_reset_tokens
+
+# examples/teams/migrations — Example app. Also teaches the convention by example.
+examples/teams/migrations/00000000000000_create_teams
+
+# examples/todo-app/migrations — Example app. Also teaches the convention by example.
+examples/todo-app/migrations/00000000000000_create_todos
+examples/todo-app/migrations/00000000000001_widen_todo_ids_to_bigint
+
+# examples/wiki/migrations — Example app. Also teaches the convention by example.
+examples/wiki/migrations/00000000000000_create_wiki
+examples/wiki/migrations/20260506000000_add_lock_version_to_pages
+examples/wiki/migrations/20260524000000_add_search_to_pages
+examples/wiki/migrations/20260601000000_add_api_credentials
+examples/wiki/migrations/20260721000000_add_collections
