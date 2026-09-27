@@ -24,7 +24,7 @@
 //! use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy};
 //! use std::time::Duration;
 //!
-//! # tokio_test::block_on(async {
+//! # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
 //! // Configure the policy
 //! let policy = CircuitBreakerPolicy {
 //!     failure_ratio_threshold: 0.5,
@@ -379,7 +379,7 @@ impl CircuitBreaker {
     /// ```rust
     /// use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy};
     ///
-    /// # tokio_test::block_on(async {
+    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
     /// let breaker = CircuitBreaker::new("db", CircuitBreakerPolicy::default());
     ///
     /// let result = breaker.run(async {
