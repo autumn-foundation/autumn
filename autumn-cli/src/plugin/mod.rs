@@ -793,6 +793,22 @@ pub fn check_listed_declaration(
         }
         Resolved::FirstParty(_) => {
             check_existing_source(&manifest, crate_name, version)?;
+            // Lockstep: the declared requirement must admit this release, or
+            // Cargo keeps an older crate than the one the review describes.
+            if let Some(declared) = install::declared_dependency_version(&manifest, crate_name)
+                && let (Ok(req), Ok(release)) = (
+                    semver::VersionReq::parse(&declared),
+                    semver::Version::parse(version),
+                )
+                && !req.matches(&release)
+            {
+                return Err(format!(
+                    "Cargo.toml declares `{crate_name} = \"{}\"`, which excludes the verified \
+                     release {version}. Set `{crate_name} = \"{version}\"`, then re-run. No files \
+                     were changed.",
+                    index::sanitize(&declared)
+                ));
+            }
             Ok(patched.map(|patch| {
                 format!(
                     "Note: {patch} redirects `{crate_name}`. The trust review covers the \
@@ -2076,6 +2092,12 @@ mod tests {
         );
         let err = check_listed_declaration(patched.path(), &x, "=0.3.0").unwrap_err();
         assert!(err.contains("[patch.crates-io]"), "{err}");
+        // A renamed patch entry patches its `package`, whatever the key.
+        let renamed = project_with(
+            "[package]\nname = \"a\"\n\n[dependencies]\nautumn-plugin-x = \"=0.3.0\"\n\n\
+             [patch.crates-io]\nlocal-x = { package = \"autumn-plugin-x\", path = \"../x\" }\n",
+        );
+        assert!(check_listed_declaration(renamed.path(), &x, "=0.3.0").is_err());
         let clean = project_with(
             "[package]\nname = \"a\"\n\n[dependencies]\nautumn-plugin-x = \"=0.3.0\"\n",
         );
@@ -2101,6 +2123,17 @@ mod tests {
         );
         let notice = check_listed_declaration(patched.path(), &admin, RELEASE).unwrap();
         assert!(notice.is_some_and(|n| n.contains("[patch.crates-io]")));
+        // A requirement that excludes this release keeps an older crate.
+        let old = project_with(
+            "[package]\nname = \"a\"\n\n[dependencies]\nautumn-admin-plugin = \"=0.0.1\"\n",
+        );
+        let err = check_listed_declaration(old.path(), &admin, RELEASE).unwrap_err();
+        assert!(err.contains("excludes the verified release"), "{err}");
+        let caret = project_with(&format!(
+            "[package]\nname = \"a\"\n\n[dependencies]\nautumn-admin-plugin = \"{}\"\n",
+            series()
+        ));
+        assert!(check_listed_declaration(caret.path(), &admin, RELEASE).is_ok());
     }
 
     /// A `{ workspace = true }` entry is checked against the workspace

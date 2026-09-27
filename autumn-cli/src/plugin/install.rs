@@ -393,9 +393,17 @@ pub fn patched_by(root: &Path, crate_name: &str) -> Option<String> {
         let manifest = dir.join("Cargo.toml");
         if let Some(patch) = table.get("patch").and_then(toml::Value::as_table) {
             for (source, entries) in patch {
-                let hit = entries
-                    .as_table()
-                    .is_some_and(|e| e.keys().any(|k| canonical(k) == want));
+                // Cargo's `package` rename: `local = { package = "x", … }`
+                // patches `x`, whatever the key says.
+                let hit = entries.as_table().is_some_and(|e| {
+                    e.iter().any(|(key, entry)| {
+                        let package = entry
+                            .get("package")
+                            .and_then(toml::Value::as_str)
+                            .unwrap_or(key);
+                        canonical(package) == want
+                    })
+                });
                 if hit {
                     return Some(format!("[patch.{source}] in {}", manifest.display()));
                 }
