@@ -1,0 +1,5 @@
+error: `managed` takes no value; write a bare `#[model(managed)]`
+ --> tests/compile-fail/model_managed_with_args.rs:6:9
+  |
+6 | #[model(managed(foo))]
+  |         ^^^^^^^

@@ -1,0 +1,5 @@
+error: `#[confidential]` requires the field type `autumn_web::confidential::Sealed` (issue #1771). The server never holds the plaintext, so the column is declared as the envelope it actually stores.
+  --> tests/compile-fail/confidential_plain_string.rs:17:15
+   |
+17 |     pub body: String,
+   |               ^^^^^^
