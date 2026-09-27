@@ -546,6 +546,31 @@ async fn store_claims_an_obligation_met_after_the_deadline() {
 }
 
 #[tokio::test]
+async fn store_does_not_roll_back_a_scheduled_record() {
+    let store = MemoryObligationStore::new();
+    let key = "first_response/ticket:1";
+    // Call A creates the record. Call B adopts it and pins it.
+    let (_, created) = store.insert(record(utc(2024, 1, 5, 15, 0))).await.unwrap();
+    assert!(created);
+    assert!(store.mark_scheduled(key).await.unwrap());
+    // Call A fails later: its rollback must not remove B's record.
+    assert!(!store.remove_unscheduled(key).await.unwrap());
+    assert!(store.get(key).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn store_rolls_back_an_unscheduled_record() {
+    let store = MemoryObligationStore::new();
+    let key = "first_response/ticket:1";
+    store.insert(record(utc(2024, 1, 5, 15, 0))).await.unwrap();
+    assert!(store.remove_unscheduled(key).await.unwrap());
+    assert!(
+        !store.mark_scheduled(key).await.unwrap(),
+        "no record to pin"
+    );
+}
+
+#[tokio::test]
 async fn store_clones_share_records() {
     let store = MemoryObligationStore::new();
     let replica = store.clone();

@@ -20,15 +20,19 @@ pub struct ObligationRecord {
     pub obligation: Obligation,
     /// The instant when the escalation was claimed.
     pub escalated_at: Option<DateTime<Utc>>,
+    /// Whether a `track` call finished on this record. A rollback does not
+    /// remove a scheduled record.
+    pub scheduled: bool,
 }
 
 impl ObligationRecord {
-    /// Make a record with no escalation.
+    /// Make a record with no escalation that is not scheduled.
     #[must_use]
     pub const fn new(obligation: Obligation) -> Self {
         Self {
             obligation,
             escalated_at: None,
+            scheduled: false,
         }
     }
 }
@@ -64,6 +68,14 @@ pub trait ObligationStore: Send + Sync + 'static {
 
     /// Clear the escalation instant after a failed enqueue.
     fn release_escalation<'a>(&'a self, key: &'a str) -> StoreFuture<'a, ()>;
+
+    /// Set `scheduled` on the record for `key`. Return `false` if there is
+    /// no record.
+    fn mark_scheduled<'a>(&'a self, key: &'a str) -> StoreFuture<'a, bool>;
+
+    /// Remove the record for `key` only if it is not scheduled. The check and
+    /// the delete must be atomic. Return `true` if it removed the record.
+    fn remove_unscheduled<'a>(&'a self, key: &'a str) -> StoreFuture<'a, bool>;
 
     /// Remove the record for `key`. Return `true` if it existed.
     fn remove<'a>(&'a self, key: &'a str) -> StoreFuture<'a, bool>;
@@ -149,6 +161,22 @@ impl ObligationStore for MemoryObligationStore {
             if let Some(record) = records.get_mut(key) {
                 record.escalated_at = None;
             }
+        })
+    }
+
+    fn mark_scheduled<'a>(&'a self, key: &'a str) -> StoreFuture<'a, bool> {
+        self.with(|records| {
+            records.get_mut(key).is_some_and(|record| {
+                record.scheduled = true;
+                true
+            })
+        })
+    }
+
+    fn remove_unscheduled<'a>(&'a self, key: &'a str) -> StoreFuture<'a, bool> {
+        self.with(|records| {
+            let unscheduled = records.get(key).is_some_and(|record| !record.scheduled);
+            unscheduled && records.remove(key).is_some()
         })
     }
 

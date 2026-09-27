@@ -27,6 +27,9 @@ pub const ESCALATE_JOB: &str = "autumn_sla_escalate";
 /// most.
 const MAX_EARLY_CHECK: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Attempts to pin a tracked record that a failed creator removed.
+const PIN_ATTEMPTS: usize = 3;
+
 /// Attempts for each SLA job before it goes to the dead letters.
 const MAX_ATTEMPTS: u32 = 5;
 
@@ -265,7 +268,7 @@ impl Sla {
     /// # Errors
     ///
     /// If this call made the record and a later step fails, it removes the
-    /// record again.
+    /// record again, unless another `track` call scheduled it.
     ///
     /// # Errors
     ///
@@ -288,13 +291,36 @@ impl Sla {
             .met_at(None);
         let key = resolved.key();
         let store = &self.engine.store;
-        let (record, created) = store.insert(ObligationRecord::new(resolved)).await?;
-        let result = self.mark_and_schedule(&key, record, obligation, now).await;
-        if result.is_err() && created {
-            // Do not keep a record that this call made and could not schedule.
-            store.remove(&key).await?;
+        let (record, created) = store
+            .insert(ObligationRecord::new(resolved.clone()))
+            .await?;
+        let status = match self.mark_and_schedule(&key, record, obligation, now).await {
+            Ok(status) => status,
+            Err(err) => {
+                // Do not keep a record that this call made and could not
+                // schedule, unless another call scheduled it.
+                if created {
+                    store.remove_unscheduled(&key).await?;
+                }
+                return Err(err);
+            }
+        };
+        // Pin the record. If a failed creator removed it after our check job
+        // went on the queue, put it back for that job.
+        for _ in 0..PIN_ATTEMPTS {
+            if store.mark_scheduled(&key).await? {
+                return Ok(status);
+            }
+            store
+                .insert(ObligationRecord::new(resolved.clone()))
+                .await?;
+            if let Some(met) = obligation.met() {
+                store.mark_met(&key, met).await?;
+            }
         }
-        result
+        Err(SlaError::Store(format!(
+            "{key}: the record keeps disappearing"
+        )))
     }
 
     /// Mark a stored record met, if `obligation` is met, then schedule it.

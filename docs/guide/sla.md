@@ -211,8 +211,8 @@ is lost. The record keeps `escalated_at`, so `Sla::statuses` shows it.
 The default `MemoryObligationStore` is local to one process. A check job on
 one replica cannot see an obligation that another replica tracked. For more
 than one replica, put an `ObligationStore` on your database with
-`SlaPlugin::store`, and use it on all replicas. Make `insert` and
-`claim_escalation` atomic, for example:
+`SlaPlugin::store`, and use it on all replicas. Make `insert`,
+`remove_unscheduled` and `claim_escalation` atomic, for example:
 
 ```sql
 UPDATE sla_obligations SET escalated_at = $3

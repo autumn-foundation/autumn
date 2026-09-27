@@ -86,6 +86,14 @@ impl ObligationStore for RacingStore {
         self.inner.release_escalation(key)
     }
 
+    fn mark_scheduled<'a>(&'a self, key: &'a str) -> StoreFuture<'a, bool> {
+        self.inner.mark_scheduled(key)
+    }
+
+    fn remove_unscheduled<'a>(&'a self, key: &'a str) -> StoreFuture<'a, bool> {
+        self.inner.remove_unscheduled(key)
+    }
+
     fn remove<'a>(&'a self, key: &'a str) -> StoreFuture<'a, bool> {
         self.inner.remove(key)
     }
