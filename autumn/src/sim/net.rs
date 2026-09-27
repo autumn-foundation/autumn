@@ -176,7 +176,8 @@ impl SimNet {
         self.lock().partitioned.remove(host);
     }
 
-    /// Every attempt so far, in order.
+    /// Every attempt that finished its latency, in the order they finished. An
+    /// attempt dropped during its latency is not recorded.
     #[must_use]
     pub fn events(&self) -> Vec<NetEvent> {
         self.lock().events.clone()
@@ -201,8 +202,7 @@ impl SimNet {
         timeout: Option<Duration>,
     ) -> Result<(), NetFault> {
         let (latency, fault) = {
-            let mut state = self.lock();
-            let seq = state.events.len() as u64;
+            let state = self.lock();
             // Two draws per attempt, always, so the stream maps one-to-one
             // onto attempts whatever the configuration.
             let latency_draw = state.stream.next_u64();
@@ -223,17 +223,25 @@ impl SimNet {
                 }
                 _ => (latency, fault),
             };
+            drop(state);
+            (latency, fault)
+        };
+        if !latency.is_zero() {
+            tokio::time::sleep(latency).await;
+        }
+        // Record the attempt only once its latency has passed. An attempt
+        // dropped before then (a crash, a cancelled request) never reached the
+        // host, so it leaves no event. Its draws are still spent, so later
+        // attempts replay the same way.
+        {
+            let mut state = self.lock();
+            let seq = state.events.len() as u64;
             state.events.push(NetEvent {
                 seq,
                 host: host.to_owned(),
                 latency,
                 fault,
             });
-            drop(state);
-            (latency, fault)
-        };
-        if !latency.is_zero() {
-            tokio::time::sleep(latency).await;
         }
         match fault {
             NetFault::None => Ok(()),
@@ -319,6 +327,17 @@ mod tests {
         assert_eq!(net.transmit("a", None).await, Ok(()));
         let faults: Vec<_> = net.events().iter().map(|event| event.fault).collect();
         assert_eq!(faults, vec![NetFault::Partitioned, NetFault::None]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_attempt_dropped_during_its_latency_leaves_no_event() {
+        let net = SimNet::new().latency(Duration::from_millis(10), Duration::from_millis(10));
+        let outcome = crate::sim::crash_at(0, net.transmit("h", None)).await;
+        assert!(outcome.is_crashed());
+        assert!(net.events().is_empty(), "the host was never reached");
+        assert_eq!(net.transmit("h", None).await, Ok(()));
+        assert_eq!(net.events().len(), 1);
+        assert_eq!(net.events()[0].seq, 0);
     }
 
     #[tokio::test(start_paused = true)]

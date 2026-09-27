@@ -1391,6 +1391,15 @@ impl AmbientSimClock {
         *own = own.saturating_add(duration);
     }
 
+    /// This sim's tokio origin: the instant that puts all of its own advances
+    /// so far on its timeline. Set on the first elapsed read, which can come
+    /// after `Sim::advance`.
+    fn init_origin(&self, now: tokio::time::Instant) -> tokio::time::Instant {
+        *self
+            .tokio_origin
+            .get_or_init(|| now.checked_sub(self.own_advanced()).unwrap_or(now))
+    }
+
     /// Total time this sim advanced itself.
     fn own_advanced(&self) -> std::time::Duration {
         *self
@@ -1407,7 +1416,12 @@ impl AmbientSimClock {
         end: tokio::time::Instant,
         kept: std::time::Duration,
     ) {
-        // No elapsed read yet: start this sim's timeline after the gap.
+        // No elapsed read yet: fix the origin now. It already leaves out the
+        // gap, and keeps this sim's own advances.
+        if self.tokio_origin.get().is_none() {
+            self.init_origin(end);
+            return;
+        }
         let origin = *self.tokio_origin.get_or_init(|| end);
         let gap = end
             .saturating_duration_since(start.max(origin))
@@ -1488,7 +1502,7 @@ impl crate::time::ClockSource for AmbientSimClock {
             return crate::time::ClockSource::monotonic(&self.ticking);
         }
         let now = tokio::time::Instant::now();
-        let origin = *self.tokio_origin.get_or_init(|| now);
+        let origin = self.init_origin(now);
         let shadowed = *self
             .shadowed
             .lock()

@@ -111,3 +111,13 @@ async fn sim_ambient_clock_outer_advance_during_a_nested_sim_is_kept(sim: Sim) {
         "only the outer sim's own hour is on its timeline"
     );
 }
+
+#[sim_test]
+async fn sim_ambient_clock_advance_before_the_first_elapsed_read_is_kept(sim: Sim) {
+    // The first elapsed read comes after an advance. That hour is still on
+    // the sim's timeline, in lockstep with its wall clock.
+    sim.advance(HOUR).await;
+    assert_eq!(ambient_monotonic().since_origin(), HOUR);
+    sim.advance(HOUR).await;
+    assert_eq!(ambient_monotonic().since_origin(), 2 * HOUR);
+}
