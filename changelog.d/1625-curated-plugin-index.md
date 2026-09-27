@@ -24,8 +24,9 @@
 
 ### Changed
 
-- **`autumn plugin-check` (#1625):** `route-attribution` skips when the
-  contract gives the plugin's registered name and no route carries it (a
-  cache or search plugin). It fails, and names the registered name, when
-  routes carry that name but not `--plugin-name`. The JSON report carries the
-  declared `contract`.
+- **`autumn plugin-check` (#1625):** routes are attributed to
+  `Plugin::name()`, by default the type path. When routes carry only the
+  contract's registered name, the route checks use that name, and the report
+  keeps `--plugin-name`. `route-attribution` skips when no route carries
+  either name (a cache or search plugin). The JSON report carries the declared
+  `contract`.

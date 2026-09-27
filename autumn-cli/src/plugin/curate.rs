@@ -40,6 +40,13 @@ pub fn apply_report(
             listing.name
         ));
     }
+    if listing.trust == index::Trust::Sandboxed {
+        return Err(format!(
+            "`{}` is sandboxed; record its `autumn plugin inspect --format json` report with \
+             `--inspect` instead",
+            listing.name
+        ));
+    }
     check_report_shape(report)?;
     // The contract is the machine-checked source of the range and the tier.
     // Only a pass replaces them: a failed contract may not even parse, and
@@ -754,6 +761,18 @@ mod tests {
         let t = apply_report(&mut l, &r, "0.9.0", "2026-11-02").expect("retry");
         assert_eq!(t, Transition::Delisted);
         assert_eq!(l.status, Status::Delisted);
+    }
+
+    /// A sandboxed listing is verified by `inspect`, never by plugin-check.
+    #[test]
+    fn a_plugin_check_report_for_a_sandboxed_listing_is_refused() {
+        let mut l = sandboxed();
+        let before = l.clone();
+        let contract = Some(lockstep("autumn-plugin-hello", "0.7.0"));
+        let r = report("autumn-plugin-hello", true, contract);
+        let err = apply_report(&mut l, &r, "0.7.0", "2026-10-01").unwrap_err();
+        assert!(err.contains("--inspect"), "{err}");
+        assert_eq!(l, before);
     }
 
     #[test]

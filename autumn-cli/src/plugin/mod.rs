@@ -692,6 +692,15 @@ pub fn check_existing_pin(manifest: &str, crate_name: &str, pinned: &str) -> Res
     if !install::dependency_present(manifest, crate_name) {
         return Ok(());
     }
+    // A version from a path, git or other registry is not the reviewed
+    // crates.io release, whatever it says.
+    if install::dependency_has_alternate_source(manifest, crate_name) {
+        return Err(format!(
+            "Cargo.toml takes `{crate_name}` from a path, git or other registry, but the index \
+             verified the crates.io release `{pinned}`. Set `{crate_name} = \"{pinned}\"` or \
+             remove the entry, then re-run. No files were changed."
+        ));
+    }
     match install::declared_dependency_version(manifest, crate_name) {
         Some(declared) if declared == pinned => Ok(()),
         declared => Err(format!(
@@ -1913,6 +1922,22 @@ mod tests {
         assert!(err.contains("0.4") && err.contains("=0.3.0"), "{err}");
         let path = "[dependencies]\nautumn-plugin-x = { path = \"../x\" }\n";
         assert!(check_existing_pin(path, "autumn-plugin-x", "=0.3.0").is_err());
+        // A matching version from another source is not the reviewed crate.
+        for source in [
+            "path = \"../x\"",
+            "git = \"https://example.com/x\"",
+            "registry = \"other\"",
+        ] {
+            let alt =
+                format!("[dependencies]\nautumn-plugin-x = {{ {source}, version = \"=0.3.0\" }}\n");
+            assert!(
+                check_existing_pin(&alt, "autumn-plugin-x", "=0.3.0").is_err(),
+                "{alt}"
+            );
+        }
+        let table =
+            "[dependencies]\nautumn-plugin-x = { version = \"=0.3.0\", features = [\"a\"] }\n";
+        assert!(check_existing_pin(table, "autumn-plugin-x", "=0.3.0").is_ok());
         let pinned = "[dependencies]\nautumn-plugin-x = \"=0.3.0\"\n";
         assert!(check_existing_pin(pinned, "autumn-plugin-x", "=0.3.0").is_ok());
         assert!(check_existing_pin("[dependencies]\n", "autumn-plugin-x", "=0.3.0").is_ok());

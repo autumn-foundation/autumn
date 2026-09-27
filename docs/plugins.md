@@ -154,8 +154,8 @@ changes a file. Then:
 
 - A listed community crate installs at the version the index verified,
   pinned with `=`. There is no crates.io lookup, so `--offline` works. If
-  `Cargo.toml` already names the crate at another requirement, the command
-  refuses and changes no file.
+  `Cargo.toml` already names the crate at another requirement, or from a
+  path, git or other registry, the command refuses and changes no file.
 - A listing that failed re-verification is refused, with the reason. It is
   also refused when the app's `autumn-web` version is not a plain version.
 - A sandboxed listing is not wired. The command prints the review steps
@@ -744,7 +744,7 @@ This checks:
 | Check | What it verifies |
 |-------|-----------------|
 | `installability` | Binary compiles and route manifest is produced |
-| `route-attribution` | Every plugin route carries `plugin:<your-name>` source. Skips when the contract gives the registered name and no route carries it (a plugin with no routes) |
+| `route-attribution` | Every plugin route carries `plugin:<your-name>` source. When routes carry only the contract's registered name (the default `Plugin::name()`), the route checks use that name. Skips when no route carries either name (a plugin with no routes) |
 | `route-prefix` | Every plugin route lives under the declared prefix |
 | `route-collision` | No two routes share (method, path); names the conflicting handlers and sources |
 | `sensitive-surfaces` | Routes with admin/debug/credential/operator/secret/metrics paths are declared with auth mechanisms |

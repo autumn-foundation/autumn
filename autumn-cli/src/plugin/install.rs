@@ -336,6 +336,26 @@ pub fn declared_dependency_version(manifest: &str, crate_name: &str) -> Option<S
     }
 }
 
+/// Whether `manifest` takes `crate_name` from somewhere other than
+/// crates.io: a `path`, `git` or `registry` key on its `[dependencies]`
+/// entry.
+#[must_use]
+pub fn dependency_has_alternate_source(manifest: &str, crate_name: &str) -> bool {
+    let Ok(table) = toml::from_str::<toml::Table>(manifest) else {
+        return false;
+    };
+    table
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .and_then(|deps| deps.get(crate_name))
+        .and_then(toml::Value::as_table)
+        .is_some_and(|entry| {
+            ["path", "git", "registry", "registry-index"]
+                .iter()
+                .any(|key| entry.contains_key(*key))
+        })
+}
+
 /// Whether the app's `autumn-web` comes from a path or git checkout that no
 /// `[patch.crates-io]` entry redirects.
 ///

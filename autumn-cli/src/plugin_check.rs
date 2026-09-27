@@ -278,23 +278,31 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
         ContractDump::Absent | ContractDump::Malformed(_) => None,
     };
 
+    // Routes are attributed to `Plugin::name()`, by default the type path.
+    // When only the contract's registered name carries routes, the route
+    // checks run under it. The report keeps `--plugin-name`, the crate the
+    // index lists.
+    let registered_as = declared.and_then(|c| c.registered_as.as_deref());
+    let route_key = route_key(opts.plugin_name, registered_as, routes);
+
     checks.push(check_route_attribution(
         opts.plugin_name,
+        route_key,
         routes,
-        declared.and_then(|c| c.registered_as.as_deref()),
+        registered_as,
     ));
 
     if let Some(prefix) = opts.expected_prefix {
-        checks.push(check_route_prefix(opts.plugin_name, prefix, routes));
+        checks.push(check_route_prefix(route_key, prefix, routes));
     }
 
     checks.push(check_collisions(routes));
     checks.push(check_sensitive_surfaces(
-        opts.plugin_name,
+        route_key,
         routes,
         opts.sensitive_routes,
     ));
-    checks.push(check_duplicate_registration(opts.plugin_name, routes));
+    checks.push(check_duplicate_registration(route_key, routes));
     checks.push(check_plugin_contract(
         opts.plugin_name,
         opts.contracts,
@@ -600,44 +608,44 @@ fn check_experimental_surface(
 
 // ── Individual check helpers ───────────────────────────────────────────────
 
-/// `registered_as` is the `Plugin::name()` the contract dump gives for this
-/// plugin. Routes are attributed to that name. When no route carries it, the
-/// plugin mounts none (a cache, a search index): the check skips. When routes
-/// carry it but not `--plugin-name`, the check fails and names it, so the
-/// prefix and sensitive checks are never skipped without a word.
+/// The name the route checks match `plugin:<name>` against: `plugin_name`,
+/// or the contract's `registered_as` when only that name carries routes.
+fn route_key<'a>(
+    plugin_name: &'a str,
+    registered_as: Option<&'a str>,
+    routes: &[RouteInfo],
+) -> &'a str {
+    let carries = |name: &str| {
+        let source = format!("plugin:{name}");
+        routes.iter().any(|r| r.source == source)
+    };
+    match registered_as {
+        Some(registered) if !carries(plugin_name) && carries(registered) => registered,
+        _ => plugin_name,
+    }
+}
+
+/// `route_key` is the name routes are matched under (see [`route_key`]).
+/// `registered_as` is the `Plugin::name()` the contract dump gives. When no
+/// route carries either, a registered plugin mounts none (a cache, a search
+/// index): the check skips.
 fn check_route_attribution(
     plugin_name: &str,
+    route_key: &str,
     routes: &[RouteInfo],
     registered_as: Option<&str>,
 ) -> CheckResult {
-    let expected = format!("plugin:{plugin_name}");
+    let expected = format!("plugin:{route_key}");
     let plugin_routes: Vec<&RouteInfo> = routes.iter().filter(|r| r.source == expected).collect();
 
     if let (true, Some(registered)) = (plugin_routes.is_empty(), registered_as) {
-        let under_registered = routes
-            .iter()
-            .filter(|r| r.source == format!("plugin:{registered}"))
-            .count();
-        return if under_registered == 0 {
-            CheckResult {
-                name: "route-attribution".to_owned(),
-                status: CheckStatus::Skip,
-                message: format!(
-                    "{plugin_name} is registered as `{registered}` and contributes no routes"
-                ),
-                diagnostics: vec![],
-            }
-        } else {
-            CheckResult {
-                name: "route-attribution".to_owned(),
-                status: CheckStatus::Fail,
-                message: format!(
-                    "{under_registered} route(s) are attributed to plugin:{registered}, not \
-                     plugin:{plugin_name} — pass `--plugin-name {registered}`, or override \
-                     `Plugin::name`"
-                ),
-                diagnostics: vec![],
-            }
+        return CheckResult {
+            name: "route-attribution".to_owned(),
+            status: CheckStatus::Skip,
+            message: format!(
+                "{plugin_name} is registered as `{registered}` and contributes no routes"
+            ),
+            diagnostics: vec![],
         };
     }
 
@@ -653,11 +661,16 @@ fn check_route_attribution(
         };
     }
 
+    let via = if route_key == plugin_name {
+        String::new()
+    } else {
+        format!(" (the registered name of {plugin_name})")
+    };
     CheckResult {
         name: "route-attribution".to_owned(),
         status: CheckStatus::Pass,
         message: format!(
-            "{} route(s) correctly attributed to plugin:{plugin_name}",
+            "{} route(s) correctly attributed to plugin:{route_key}{via}",
             plugin_routes.len()
         ),
         diagnostics: vec![],
@@ -918,14 +931,14 @@ mod tests {
             make_route("GET", "/admin", "plugin:admin"),
             make_route("POST", "/admin/items", "plugin:admin"),
         ];
-        let result = check_route_attribution("admin", &routes, None);
+        let result = check_route_attribution("admin", "admin", &routes, None);
         assert_eq!(result.status, CheckStatus::Pass, "{}", result.message);
     }
 
     #[test]
     fn attribution_no_plugin_routes_fails() {
         let routes = vec![make_route("GET", "/posts", "user")];
-        let result = check_route_attribution("admin", &routes, None);
+        let result = check_route_attribution("admin", "admin", &routes, None);
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(
             result.message.contains("plugin:admin"),
@@ -940,7 +953,7 @@ mod tests {
             make_route("GET", "/admin", "plugin:admin"),
             make_route("GET", "/admin/items", "plugin:admin"),
         ];
-        let result = check_route_attribution("admin", &routes, None);
+        let result = check_route_attribution("admin", "admin", &routes, None);
         assert!(result.message.contains('2'), "{}", result.message);
     }
 
@@ -1470,23 +1483,34 @@ mod contract_tests {
     }
 
     /// `--plugin-name` is the crate name, but routes are attributed to
-    /// `Plugin::name()`. When they differ and the plugin HAS routes, a skip
-    /// would leave prefix and sensitive checks unrun.
+    /// `Plugin::name()` (by default the type path). The contract links the
+    /// two, so the route checks run under the registered name, and the report
+    /// keeps the crate name the index lists.
     #[test]
-    fn routes_under_the_registered_name_are_not_skipped() {
+    fn route_checks_follow_the_registered_name() {
         let mut contract = demo_contract();
         contract.registered_as = Some("demo_crate::DemoPlugin".to_owned());
         let dump = present(vec![contract]);
         let mut hidden = route();
         hidden.source = "plugin:demo_crate::DemoPlugin".to_owned();
-        let report = build_report(&opts(&dump), &[hidden]);
-        let check = find(&report, "route-attribution");
-        assert_eq!(check.status, CheckStatus::Fail);
-        assert!(
-            check.message.contains("demo_crate::DemoPlugin"),
+        let mut o = opts(&dump);
+        o.expected_prefix = Some("/elsewhere");
+        let report = build_report(&o, &[hidden]);
+        assert_eq!(report.plugin_name, "autumn-plugin-demo");
+        let attribution = find(&report, "route-attribution");
+        assert_eq!(
+            attribution.status,
+            CheckStatus::Pass,
             "{}",
-            check.message
+            attribution.message
         );
+        assert!(
+            attribution.message.contains("demo_crate::DemoPlugin"),
+            "{}",
+            attribution.message
+        );
+        // The prefix check ran over those routes, and caught the mismatch.
+        assert_eq!(find(&report, "route-prefix").status, CheckStatus::Fail);
     }
 
     /// A contract with no registered name cannot prove the plugin has no
