@@ -7,4 +7,5 @@
   and disabled, the host is degraded and the rollout continues. All other
   results halt the rollout and roll back the hosts on the new release (with
   `--no-rollback`, they stay as they are). Such a run now exits non-zero, where
-  it exited 0 before. The output and the halt alert name the risk.
+  it exited 0 before. The output names the risk, and so does the halt alert
+  while the host stays on the new release.

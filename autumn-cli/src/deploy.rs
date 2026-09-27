@@ -203,10 +203,13 @@ pub struct FleetHalt {
 
 impl FleetHalt {
     /// The risk that the failed step leaves, when the step label alone does not
-    /// name it (issue #2279).
+    /// name it (issue #2279). A `drain-old` halt has a risk only while the host
+    /// is still on the new release. A rollback leaves one slot running.
     #[must_use]
     pub fn risk(&self) -> Option<&'static str> {
-        (self.failed_step == fleet::DRAIN_OLD_LABEL).then_some(fleet::OLD_SLOT_MAY_RUN_NOTE)
+        (self.failed_step == fleet::DRAIN_OLD_LABEL
+            && self.still_on_new.contains(&self.failed_host))
+        .then_some(fleet::OLD_SLOT_MAY_RUN_NOTE)
     }
 }
 
@@ -11397,7 +11400,11 @@ mod tests {
                 "a live old slot is not housekeeping debris: {:?}",
                 halt.degraded
             );
-            assert_eq!(halt.risk(), Some(fleet::OLD_SLOT_MAY_RUN_NOTE));
+            assert_eq!(
+                halt.risk(),
+                None,
+                "compensation left one slot running, so the risk is gone"
+            );
         }
     }
 
@@ -11419,6 +11426,7 @@ mod tests {
             halt.still_on_new,
             vec!["web-a".to_owned(), "web-b".to_owned()]
         );
+        assert_eq!(halt.risk(), Some(fleet::OLD_SLOT_MAY_RUN_NOTE));
         let alert = build_fleet_halted_alert(halt, "myapp", "prod");
         assert_eq!(
             alert.details.get("risk").map(String::as_str),

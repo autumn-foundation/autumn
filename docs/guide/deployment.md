@@ -776,7 +776,8 @@ boot). Then the host is degraded and the rollout continues.
 All other results halt the rollout: the unit can still run, the output is not
 known, or the host does not answer. The rollout then compensates, like any
 other post-go-live failure. With `--no-rollback`, it stops and changes nothing.
-The output and the `risk` field of the halt alert name the risk.
+The output names the risk. While the host stays on the new release, the `risk`
+field of the halt alert names it too.
 
 Every exit path — success, halt, or halt-plus-compensation — ends with the
 per-host `Fleet state:` table, printed **after** any compensation so it describes
