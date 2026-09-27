@@ -1,0 +1,15 @@
+$ cargo test -p autumn-web --test integration_tests --features mcp mcp_step_up_guard
+
+running 3 tests
+test integration::mcp_step_up_guard::step_up_guard_allows_an_mcp_tool_call_with_a_fresh_claim ... ok
+test integration::mcp_step_up_guard::step_up_guard_rejects_an_mcp_tool_call_with_a_session_but_no_fresh_claim ... ok
+test integration::mcp_step_up_guard::step_up_guard_rejects_an_mcp_tool_call_with_no_session ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2261 filtered out; finished in 0.35s
+
+$ cargo clippy -p autumn-web --test integration_tests --features mcp -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12m 24s
+(no warnings attributed to mcp_step_up_guard.rs; exit code 0)
+
+$ cargo fmt --all -- --check
+(clean after `cargo fmt --all` applied once to the new file)
