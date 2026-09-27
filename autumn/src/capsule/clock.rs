@@ -77,20 +77,54 @@ tokio::task_local! {
     static REPLAY_REQUEST: ();
 }
 
-/// Run `future` as *the replayed request*: recorded clock readings are served
-/// (and consumed) only inside this scope.
+/// Run `future` as *the replayed request*: recorded clock readings and entropy
+/// draws are served (and consumed) only inside this scope.
 ///
-/// The replay driver wraps its router call in this. Everything else that
-/// reads the process clock during a replay — app boot, state initializers,
-/// work the handler `tokio::spawn`s — sees a stable non-consuming timestamp
-/// instead, mirroring what the recording did (those reads were never
-/// recorded, because they carried no capture scope).
+/// Established by [`ReportingLayer`](crate::reporting::ReportingLayer) — **not**
+/// by the replay driver — and that placement is the whole point. Capture
+/// records an effect only while a [`CaptureScope`](crate::capsule::CaptureScope)
+/// is live, which is from `CaptureLayer` inwards; `ReportingLayer` sits
+/// immediately inside `CaptureLayer`, so consuming from there makes the two
+/// boundaries the same.
+///
+/// Getting that wrong is not cosmetic. Wrapping the *whole* router instead
+/// would let middleware that runs outside the capture scope — `RequestIdLayer`
+/// minting a request id, the session layer minting a session id — eat tape
+/// entries the recorded handler is still owed, and every identifier the
+/// handler then mints would be one the failing request never used. The
+/// recording never captured those middleware draws (no scope was live yet), so
+/// replay must not serve them either.
+///
+/// Everything else that reads the clock or draws randomness during a replay —
+/// app boot, state initializers, work the handler `tokio::spawn`s — sees a
+/// stable non-consuming value, mirroring what the recording did.
 pub async fn with_replay_request_scope<F: Future>(future: F) -> F::Output {
     REPLAY_REQUEST.scope((), future).await
 }
 
+/// [`with_replay_request_scope`] as a concrete future type.
+///
+/// `ReportingLayer` names its future in its `Service` impl, so it cannot use
+/// the `async fn` above without boxing — and boxing there would add an
+/// allocation to every request of every application, replay or not.
+pub(crate) fn scope_replay_request<F: Future>(
+    future: F,
+) -> tokio::task::futures::TaskLocalFuture<(), F> {
+    REPLAY_REQUEST.scope((), future)
+}
+
+/// [`with_replay_request_scope`] for synchronous work.
+///
+/// `CaptureService::call` runs the inner service's `call` *inside* the capture
+/// scope, deliberately, so a Tower middleware that does its work there is
+/// recorded. Replay has to enter at the same moment or the two boundaries
+/// differ by one `call`, and every reading after it is off by one.
+pub(crate) fn sync_scope_replay_request<R>(f: impl FnOnce() -> R) -> R {
+    REPLAY_REQUEST.sync_scope((), f)
+}
+
 /// Whether the current task is the replay driver's request task.
-fn in_replay_request() -> bool {
+pub(crate) fn in_replay_request() -> bool {
     REPLAY_REQUEST.try_with(|()| ()).is_ok()
 }
 
@@ -105,6 +139,7 @@ fn in_replay_request() -> bool {
 /// any other read (boot-time, or from a task the handler spawned) gets the
 /// last-served reading — or the fallback — without consuming, because the
 /// recording never attributed those reads either.
+#[derive(Debug)]
 pub struct ReplayClock {
     readings: Mutex<VecDeque<DateTime<Utc>>>,
     last: Mutex<Option<DateTime<Utc>>>,

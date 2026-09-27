@@ -236,6 +236,13 @@ async fn ingress_traversals_per_request() -> usize {
     ingress_traversals_with(|app| app).await
 }
 
+/// [`ingress_traversals_per_request`], with a config override — for measuring
+/// how an `[compression]`/similar config-gated layer affects the traversal
+/// count without also touching the route set the probe hooks use.
+async fn ingress_traversals_with_config(config: AutumnConfig) -> usize {
+    ingress_traversals_with(|app| app.config(config)).await
+}
+
 /// [`ingress_traversals_per_request`], with a hook to customize the `TestApp`
 /// (register operator layers / static gates) before it is built.
 async fn ingress_traversals_with(customize: impl FnOnce(TestApp) -> TestApp) -> usize {
@@ -505,5 +512,44 @@ async fn operator_layers_do_not_deepen_the_framework_cascade() {
          {bare} to {with_gate}: the gate group must compose into the same \
          `Router::layer` call as `SecurityHeadersLayer` at its existing \
          position (after the MCP dispatch clone), not add its own nesting level"
+    );
+}
+
+/// Regression gate for issue #2371: enabling `[compression]` must not cost a
+/// `Router::layer` call of its own. `apply_compression_middleware` used to be
+/// the one member of the ingress stack still applied as a standalone
+/// `Router::layer` call (everything else was folded into one tuple by #2198),
+/// documented as unavoidable because `tower::util::option_layer`'s `Either`
+/// requires both branches to share one `Response` type and `CompressionLayer`
+/// changes the response body type. #2371 folds it in anyway by pairing it with
+/// `NormalizeBodyLayer` — the same body-type-adapter trick already used
+/// elsewhere in this tuple — inside the `option_layer` branch itself, so the
+/// `Either`'s two arms agree again.
+///
+/// Compression defaults to OFF, so this is deliberately a *second* probe
+/// (config-gated) rather than a change to [`INGRESS_TRAVERSAL_WINDOW`]: the
+/// default/disabled measurement this file already gates is provably
+/// unaffected (compression contributed zero `Router::layer` calls when
+/// disabled, before and after #2371) — only the enabled case is expected to
+/// change.
+#[tokio::test]
+async fn compression_enabled_does_not_deepen_the_framework_cascade() {
+    let bare = ingress_traversals_per_request().await;
+
+    let mut config = AutumnConfig {
+        profile: Some("test".to_owned()),
+        ..AutumnConfig::default()
+    };
+    config.compression.enabled = true;
+    let with_compression = ingress_traversals_with_config(config).await;
+
+    assert_eq!(
+        with_compression, bare,
+        "enabling [compression] moved the ingress traversal count from {bare} \
+         to {with_compression}: `apply_compression_middleware` (or whatever \
+         replaced it) is applying its own `Router::layer` call instead of \
+         composing into the framework's single merged tuple — each `Router::layer` \
+         call boxes the whole downstream stack in a fresh `BoxCloneSyncService` \
+         that every request above it deep-clones (issues #2193, #2198, #2371)"
     );
 }

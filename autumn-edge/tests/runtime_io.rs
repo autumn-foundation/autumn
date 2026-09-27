@@ -75,15 +75,30 @@ async fn cookie_setter() -> (
     )
 }
 
-/// The `Extension` smuggling shape the `#[edge]` macro cannot see: an alias
-/// hides the extractor's name from the token-level refusal, so the runtime's
-/// missing-extension net has to catch it.
+/// The `Extension` smuggling shape a *hand-built* `EdgeRoute` can still reach.
+///
+/// `edge_get` refuses this at compile time now (the sealed `EdgeExtract`
+/// whitelist does not include `Extension<T>`, alias or not), so this route
+/// below is wired with plain `axum::routing::get` instead of `edge_get` — the
+/// one way left to reach this handler at all. `EdgeRoute` fields are public
+/// and hand-construction is supported (see its own doc comment), so the
+/// runtime's missing-extension net still earns its keep for that path.
 #[derive(Clone)]
 struct Smuggled;
 type Alias = axum::Extension<Smuggled>;
 
 async fn aliased_extension(_ext: Alias) -> &'static str {
     "never reached: the capsule installs no extensions"
+}
+
+/// A handler whose body exceeds the runtime's response-body cap — the shape
+/// a streaming response, or one sized off a path/query parameter, could take.
+/// Collecting it must fail closed into a fallthrough rather than buffer
+/// without bound.
+async fn oversized_body() -> Vec<u8> {
+    // One byte past `runtime::MAX_RESPONSE_BODY_BYTES` (16 MiB); mirrored here
+    // as a literal since the constant is private to the crate.
+    vec![b'x'; 16 * 1024 * 1024 + 1]
 }
 
 /// A handler whose response header value is valid HTTP but not valid UTF-8 —
@@ -116,6 +131,13 @@ fn routes() -> Vec<EdgeRoute> {
         },
         EdgeRoute {
             method: http::Method::GET,
+            path: "/oversized",
+            handler: edge_get(oversized_body),
+            name: "oversized_body",
+            needs: &[],
+        },
+        EdgeRoute {
+            method: http::Method::GET,
             path: "/cookie",
             handler: edge_get(cookie_setter),
             name: "cookie_setter",
@@ -124,7 +146,10 @@ fn routes() -> Vec<EdgeRoute> {
         EdgeRoute {
             method: http::Method::GET,
             path: "/smuggled",
-            handler: edge_get(aliased_extension),
+            // Not `edge_get`: it would refuse `Extension<T>` at compile time.
+            // Hand-wired instead, to prove the runtime net still catches a
+            // hand-built route that skips that guard.
+            handler: axum::routing::get(aliased_extension),
             name: "aliased_extension",
             needs: &[],
         },
@@ -274,10 +299,13 @@ fn head_is_served_by_the_get_router_with_an_empty_body_and_gets_content_length()
 }
 
 #[test]
-fn an_aliased_extension_extractor_falls_through_instead_of_serving_axums_500() {
-    // Also pins axum's rejection wording: if an axum upgrade rephrases
-    // "Missing request extension", this test fails at upgrade time instead of
-    // the net silently going dead.
+fn a_hand_built_route_with_an_extension_extractor_falls_through_instead_of_serving_axums_500() {
+    // `edge_get` cannot even build this route any more — see the `/smuggled`
+    // route above, wired by hand for exactly this reason. This test is the
+    // remaining reason the runtime net still exists: a hand-built `EdgeRoute`
+    // can still reach it. Also pins axum's rejection wording: if an axum
+    // upgrade rephrases "Missing request extension", this test fails at
+    // upgrade time instead of the net silently going dead.
     let frames = drive(&[request_line(EdgeRequest::get("/smuggled"), &[])]);
 
     assert_eq!(frames.len(), 1, "{frames:?}");
@@ -299,6 +327,19 @@ fn a_cookie_setting_handler_is_a_fallthrough_not_a_cacheable_session_leak() {
     assert!(
         detail.contains("cookie") && detail.contains("origin-only"),
         "the decline must name the cookie hazard: {detail}"
+    );
+}
+
+#[test]
+fn an_oversized_response_body_is_a_fallthrough_not_an_unbounded_buffer() {
+    let frames = drive(&[request_line(EdgeRequest::get("/oversized"), &[])]);
+
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    let (reason, detail) = expect_fallthrough(&frames[0]);
+    assert_eq!(reason, FallthroughReason::CapsuleError);
+    assert!(
+        detail.contains("/oversized"),
+        "the decline must name the request: {detail}"
     );
 }
 

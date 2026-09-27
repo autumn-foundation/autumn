@@ -20,8 +20,19 @@ tracing = "0.1"
 validator = { version = "0.20", features = ["derive"] }
 
 [dev-dependencies]
+autumn-web = { path = "../../autumn", features = ["test-support"] }
 example-e2e = { path = "../../example-e2e" }
 tokio = { version = "1", features = ["full"] }
+# A `pg_stat_statements`-instrumented Postgres for the Ledger profiling
+# harness (`tests/collection_links_batch_profile.rs`): `TestDb` starts a plain
+# container with no `shared_preload_libraries`, so it can't host that
+# extension. Same versions, same house pattern already used by `autumn`,
+# `autumn-billing`, `autumn-search`, `autumn-cli` and `examples/cms` for
+# exactly this purpose — workspace-pinned, so this adds no new dependency
+# version to the graph, only wires an already-vetted one into this crate's
+# tests.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
 
 [features]
 # Enable the headless-browser system smoke. Requires Chromium on the host.

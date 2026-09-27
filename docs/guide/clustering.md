@@ -43,8 +43,11 @@ nodes and exactly one shared primitive.
 - **Not a replacement** for the Redis or Postgres backends behind sessions,
   jobs, channels, or the scheduler. It is an additional option that needs no
   datastore, not a substitute for one.
-- **Not tested past two nodes.** The protocol pushes full state to every known
-  peer on every interval; three or more nodes is out of scope for this slice.
+- **Tested at N=5 and N=10, not beyond.** Two throwaway Prospect assays (see
+  [Failure semantics](#failure-semantics)) found no divergence at 5 or 10
+  nodes under ideal single-host conditions. Nothing past N=10 has been
+  measured, every push still carries full state to every known peer, and
+  neither assay is a production guarantee.
 
 ## Enable it
 
@@ -295,6 +298,18 @@ A steady `frames_rejected_total{reason="mac"}` means somebody is talking to
 your port with the wrong secret. Any `pushes_unsendable_total` at all means
 this node has stopped gossiping and its peer is about to evict it — the push is
 also the heartbeat, so that failure is otherwise invisible from the inside.
+
+## A worked example
+
+`examples/bookmarks-distributed` runs this for real: its two web replicas sit
+behind nginx and form a two-node cluster sharing a `bookmarks_created` counter.
+`autumn-docker.toml` holds the `[cluster]` section (the settings both nodes
+share), `docker-compose.yml` holds the per-instance identity — node id,
+advertise address, and the single seed peer — plus the explicitly addressed
+bridge network the advertise addresses need, since this section parses socket
+addresses and does not resolve hostnames. `src/routes/cluster.rs` is the
+application surface: a `/cluster` route reporting the local member view and the
+counter's current lower bound.
 
 ## How it works
 
@@ -768,7 +783,27 @@ member, exactly as with two. It is a `HealthOnly` indicator: it never gates
 node keeps serving its counter and its traffic, and a liveness probe must never
 be able to kill it for being alone.
 
-**Two nodes.** Every push carries the full document to every known peer, there
-are no indirect probes, and there is no quorum anywhere. That is a sound design
-at two nodes and an unproven one beyond that. Treat larger fleets as future
-work, not as a supported configuration.
+**Two nodes, with correctness evidence at five and at ten.** Every push
+carries the full document to every known peer, there are no indirect
+probes, and there is no quorum anywhere. That is a sound design at two
+nodes. Two throwaway assays scaled that up on one host, same protocol
+config each time: `docs/reports/2026-09-04-prospect-cluster-scale-beyond-two-nodes.md`
+(N=5, 4/4 clean runs) and `docs/reports/2026-09-05-prospect-cluster-scale-n10.md`
+(N=10 — double the first assay's N — 5/5 clean runs). Both took cold-start
+convergence, concurrent counter increments from every node, a clean
+departure, and a same-identity rejoin through to correct, identical
+membership views and exact counter sums every time, with no meaningful
+wall-clock growth between the two (every run in both assays lands in a
+~13-15.6s band, dominated by the test harness's own debounce window, not
+by slower convergence). That is evidence the design does not fall over
+outright as N doubles under ideal conditions; it is **not** a production
+guarantee, and it is **not** evidence the trend continues past N=10 — no
+assay has tried. Neither assay ever left one process, one host, or loopback
+networking; both tested only one churn cycle and honest peers — they say
+nothing about real multi-host latency, packet loss or partition, N>10, or
+the all-to-all message volume's O(N²) growth at a scale large enough for it
+to matter (a 10-member document stays several orders of magnitude under the
+64KB wire cap; the untested risk past N=10 is task/connection volume and
+bandwidth, not per-frame size). Treat larger fleets, real multi-host
+deployment, and partition tolerance as still future work, not as a
+supported configuration, until a follow-up assay closes those gaps.

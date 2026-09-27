@@ -100,6 +100,58 @@ async fn post_widgets(axum::Json(_body): axum::Json<Vec<Widget>>) -> http::Statu
     http::StatusCode::OK
 }
 
+// `Option` and `Vec` are matched on the LAST PATH SEGMENT here too, so an
+// application's own generic of that name reaches the `Nullable` / `Array` arms
+// of the route macro's schema-entry builder. Neither is nullable nor an array.
+//
+// Each impostor gets its own module so it shadows exactly one prelude name:
+// declaring both in one module would silently re-point every bare `Option` /
+// `Vec` in it.
+mod impostor_opt {
+    /// Last segment `Option`, but an ordinary struct: an object, never `null`.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    pub struct Option<T> {
+        pub held: T,
+    }
+}
+
+mod impostor_vec {
+    /// Last segment `Vec`, but an ordinary struct: an object, not an array.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    pub struct Vec<T> {
+        pub head: T,
+    }
+}
+
+#[get("/impostor-option")]
+async fn get_impostor_option() -> axum::Json<impostor_opt::Option<Widget>> {
+    axum::Json(impostor_opt::Option {
+        held: Widget { id: 0 },
+    })
+}
+
+#[get("/impostor-vec")]
+async fn get_impostor_vec() -> axum::Json<impostor_vec::Vec<Widget>> {
+    axum::Json(impostor_vec::Vec {
+        head: Widget { id: 0 },
+    })
+}
+
+// A handler that genuinely deals in arbitrary JSON. Nothing registers a schema
+// for `serde_json::Value`, so a named `$ref` to it back-fills into the opaque
+// `{"type":"object"}` placeholder — which misdescribes every array, scalar and
+// null the handler legitimately returns, and fails `--strict` for a handler that
+// is behaving correctly.
+#[get("/arbitrary")]
+async fn get_arbitrary_json() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!([1, 2, 3]))
+}
+
+#[get("/maybe-arbitrary")]
+async fn get_optional_arbitrary_json() -> axum::Json<Option<serde_json::Value>> {
+    axum::Json(None)
+}
+
 // `Valid<Json<T>>` is Autumn's documented validation pattern. The
 // generator must see straight through the wrapper so the resulting
 // spec still reports a request body.
@@ -154,6 +206,33 @@ async fn top_first_protected_handler() -> AutumnResult<&'static str> {
 #[get("/admin-top-first")]
 async fn top_first_admin_handler() -> AutumnResult<&'static str> {
     Ok("admin")
+}
+
+// ── Response schema survives a body guard above the route attribute (#1677) ──
+//
+// `#[secured]`, `#[step_up]`, and `#[throttle]` all rewrite the handler's
+// return type to `Response` when they expand. Written above the route
+// attribute, each expands first — before the route macro ever sees the
+// handler — so the route macro must recover the original `Json<T>` return
+// type from the guard's generated body instead of losing the response
+// schema.
+
+#[secured]
+#[get("/secured-top-first-response")]
+async fn secured_top_first_response() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({}))
+}
+
+#[step_up]
+#[get("/step-up-top-first-response")]
+async fn step_up_top_first_response() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({}))
+}
+
+#[throttle(limit = 5, per = "1m", key = "ip")]
+#[post("/throttle-top-first-response")]
+async fn throttle_top_first_response() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({}))
 }
 
 #[test]
@@ -286,6 +365,121 @@ fn json_vec_response_is_emitted_as_array_schema() {
         media.schema["items"]["$ref"], "#/components/schemas/Widget",
         "array items must still ref the element type"
     );
+}
+
+/// An application `Option<T>` is an ordinary named type. Rendering the route's
+/// response as `oneOf [<inner>, null]` advertised both a null the handler never
+/// emits and the WRONG payload — the inner type, which this wrapper does not
+/// wrap. The wrapper entry carries its own `type_name`, so the generator can
+/// tell it from `std`'s `Option` and emit an honest `$ref` instead.
+#[test]
+fn an_impostor_option_response_is_a_ref_not_a_nullable() {
+    let route = __autumn_route_info_get_impostor_option();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let schema = &spec.paths["/impostor-option"]
+        .get
+        .as_ref()
+        .unwrap()
+        .responses["200"]
+        .content["application/json"]
+        .schema;
+
+    assert!(
+        schema.get("oneOf").is_none(),
+        "an application `Option` must not be advertised as nullable: {schema}"
+    );
+    assert!(
+        schema["$ref"]
+            .as_str()
+            .is_some_and(|r| r.contains("Option")),
+        "it is an ordinary named component: {schema}"
+    );
+}
+
+/// The same collision one level over: an application `Vec<T>` is an object, so
+/// `type: array` + `items` described a shape the handler never serializes.
+#[test]
+fn an_impostor_vec_response_is_a_ref_not_an_array() {
+    let route = __autumn_route_info_get_impostor_vec();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let schema = &spec.paths["/impostor-vec"]
+        .get
+        .as_ref()
+        .unwrap()
+        .responses["200"]
+        .content["application/json"]
+        .schema;
+
+    assert_ne!(
+        schema["type"], "array",
+        "an application `Vec` must not be advertised as an array: {schema}"
+    );
+    assert!(
+        schema.get("items").is_none(),
+        "and it must carry no `items`: {schema}"
+    );
+    assert!(
+        schema["$ref"].as_str().is_some_and(|r| r.contains("Vec")),
+        "it is an ordinary named component: {schema}"
+    );
+}
+
+/// `Json<serde_json::Value>` is unconstrained, not an object, and earns no
+/// component at all — registering one is exactly how it became a placeholder.
+#[test]
+fn route_level_serde_json_value_is_unconstrained() {
+    let route = __autumn_route_info_get_arbitrary_json();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let schema =
+        &spec.paths["/arbitrary"].get.as_ref().unwrap().responses["200"].content["application/json"]
+            .schema;
+
+    assert!(
+        schema.get("$ref").is_none(),
+        "arbitrary JSON must be described inline, not referred to: {schema}"
+    );
+    assert!(
+        schema.get("type").is_none(),
+        "and it must not be constrained to any one type: {schema}"
+    );
+    assert!(
+        spec.components
+            .as_ref()
+            .is_none_or(|c| !c.schemas.contains_key("Value")),
+        "no component may be registered for it, or the back-fill turns it into \
+         the opaque placeholder that `--strict` reports"
+    );
+    assert!(
+        autumn_web::openapi::opaque_component_schemas(&spec).is_empty(),
+        "so a spec whose only untyped thing is genuine arbitrary JSON is clean"
+    );
+}
+
+/// The optional form must NOT gain a null branch: `oneOf` demands that exactly
+/// one branch match, and the unconstrained schema already admits null — so
+/// `oneOf [{unconstrained}, {"type":"null"}]` would reject the very null it is
+/// meant to permit.
+#[test]
+fn route_level_optional_serde_json_value_is_not_wrapped() {
+    let route = __autumn_route_info_get_optional_arbitrary_json();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let schema = &spec.paths["/maybe-arbitrary"]
+        .get
+        .as_ref()
+        .unwrap()
+        .responses["200"]
+        .content["application/json"]
+        .schema;
+
+    assert!(
+        schema.get("oneOf").is_none(),
+        "wrapping unconstrained JSON in a nullable oneOf rejects its own null: {schema}"
+    );
+    assert!(schema.get("$ref").is_none(), "{schema}");
 }
 
 #[test]
@@ -611,6 +805,36 @@ fn unsecured_spec_has_no_security_schemes() {
             "unsecured routes must not emit any security schemes"
         );
     }
+}
+
+#[test]
+fn secured_above_route_attribute_preserves_response_schema() {
+    let route = __autumn_route_info_secured_top_first_response();
+    let resp = route.api_doc.response.as_ref().expect(
+        "a Json<...> return type must still be inferred when #[secured] expands before \
+         the route macro",
+    );
+    assert_eq!(resp.name, "Value");
+}
+
+#[test]
+fn step_up_above_route_attribute_preserves_response_schema() {
+    let route = __autumn_route_info_step_up_top_first_response();
+    let resp = route.api_doc.response.as_ref().expect(
+        "a Json<...> return type must still be inferred when #[step_up] expands before \
+         the route macro",
+    );
+    assert_eq!(resp.name, "Value");
+}
+
+#[test]
+fn throttle_above_route_attribute_preserves_response_schema() {
+    let route = __autumn_route_info_throttle_top_first_response();
+    let resp = route.api_doc.response.as_ref().expect(
+        "a Json<...> return type must still be inferred when #[throttle] expands before \
+         the route macro",
+    );
+    assert_eq!(resp.name, "Value");
 }
 
 // ── Spec validation (all $ref backed by components) ───────────────
@@ -975,4 +1199,281 @@ fn non_colliding_nested_ref_stays_short_with_no_churn() {
         nested_schema["properties"].get("value").is_some(),
         "nested-only component carries its real fields: {nested_schema}"
     );
+}
+
+// ── Per-field query parameters for a nested `Query<T>` (issue #2251) ──
+//
+// `Query<T>` used to document ONE struct-level parameter with
+// `style: form, explode: true` — exact for a scalar or scalar-array field, but
+// undefined for a nested one (neither RFC 6570 nor OAS 3.x say what `form`
+// means for a composite value). A `Query<T>` whose fields are introspectable
+// (an `OpenApiSchema` back-fill match) now documents one parameter PER FIELD,
+// so each field gets the `style` that actually round-trips it through
+// `crate::query_string`'s bracketed decoder.
+
+mod query_shapes {
+    use autumn_web::openapi::OpenApiSchema;
+
+    #[derive(serde::Deserialize, OpenApiSchema)]
+    #[allow(dead_code)]
+    pub struct Filter {
+        pub status: String,
+    }
+
+    #[derive(serde::Deserialize, OpenApiSchema)]
+    #[allow(dead_code)]
+    pub struct Item {
+        pub sku: String,
+    }
+
+    #[derive(serde::Deserialize, OpenApiSchema)]
+    #[allow(dead_code)]
+    pub struct SearchQuery {
+        pub q: Option<String>,
+        pub tags: Option<Vec<String>>,
+        pub filter: Option<Filter>,
+        pub items: Option<Vec<Item>>,
+    }
+}
+
+#[get("/api/nested-search")]
+async fn nested_search_route(_q: Query<query_shapes::SearchQuery>) -> &'static str {
+    "ok"
+}
+
+mod query_required_shapes {
+    use autumn_web::openapi::OpenApiSchema;
+
+    #[derive(serde::Deserialize, OpenApiSchema)]
+    #[allow(dead_code)]
+    pub struct RequiredFilter {
+        pub status: String,
+    }
+
+    #[derive(serde::Deserialize, OpenApiSchema)]
+    #[allow(dead_code)]
+    pub struct RequiredSearchQuery {
+        pub filter: RequiredFilter,
+    }
+}
+
+#[get("/api/required-search")]
+async fn required_search_route(
+    _q: Query<query_required_shapes::RequiredSearchQuery>,
+) -> &'static str {
+    "ok"
+}
+
+mod unregistered_ref_shapes {
+    use autumn_web::openapi::OpenApiSchema;
+
+    // Deliberately does NOT derive `OpenApiSchema` — a plain enum that
+    // serializes as a string (`?dir=asc`), same as any type a caller never
+    // opted into field-accurate schemas for.
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    pub enum Sort {
+        Asc,
+        Desc,
+    }
+
+    #[derive(serde::Deserialize, OpenApiSchema)]
+    #[allow(dead_code)]
+    pub struct UnregisteredRefQuery {
+        pub dir: Sort,
+    }
+}
+
+#[get("/api/unregistered-ref-search")]
+async fn unregistered_ref_search_route(
+    _q: Query<unregistered_ref_shapes::UnregisteredRefQuery>,
+) -> &'static str {
+    "ok"
+}
+
+fn nested_search_spec() -> autumn_web::openapi::OpenApiSpec {
+    let route = __autumn_route_info_nested_search_route();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    autumn_web::openapi::generate_spec(&config, &[&route.api_doc])
+}
+
+fn nested_search_param<'a>(
+    spec: &'a autumn_web::openapi::OpenApiSpec,
+    name: &str,
+) -> &'a autumn_web::openapi::Parameter {
+    spec.paths["/api/nested-search"]
+        .get
+        .as_ref()
+        .expect("GET /api/nested-search")
+        .parameters
+        .iter()
+        .find(|p| p.location == "query" && p.name == name)
+        .unwrap_or_else(|| panic!("expected a query parameter named {name}"))
+}
+
+/// Unwrap a nullable `{"oneOf": [<real>, {"type": "null"}]}` wrapper.
+fn unwrap_nullable(schema: &serde_json::Value) -> &serde_json::Value {
+    schema.get("oneOf").map_or(schema, |branches| &branches[0])
+}
+
+#[test]
+fn one_query_parameter_per_field() {
+    let spec = nested_search_spec();
+    let params: Vec<&str> = spec.paths["/api/nested-search"]
+        .get
+        .as_ref()
+        .unwrap()
+        .parameters
+        .iter()
+        .filter(|p| p.location == "query")
+        .map(|p| p.name.as_str())
+        .collect();
+    assert_eq!(
+        params,
+        ["filter", "items", "q", "tags"],
+        "one parameter per struct field, not one for the whole struct"
+    );
+}
+
+#[test]
+fn scalar_query_field_keeps_form_explode() {
+    let spec = nested_search_spec();
+    let q = nested_search_param(&spec, "q");
+    assert_eq!(q.style.as_deref(), Some("form"));
+    assert_eq!(q.explode, Some(true));
+    assert!(!q.required, "an Option<T> field is not required");
+}
+
+#[test]
+fn scalar_array_query_field_keeps_form_explode() {
+    let spec = nested_search_spec();
+    let tags = nested_search_param(&spec, "tags");
+    assert_eq!(
+        tags.style.as_deref(),
+        Some("form"),
+        "a scalar-array field still round-trips via ?tags=a&tags=b"
+    );
+    assert_eq!(tags.explode, Some(true));
+}
+
+#[test]
+fn nested_object_query_field_uses_deep_object() {
+    let spec = nested_search_spec();
+    let filter = nested_search_param(&spec, "filter");
+    assert_eq!(
+        filter.style.as_deref(),
+        Some("deepObject"),
+        "an object field decodes from ?filter[status]=open, which deepObject describes"
+    );
+    assert_eq!(filter.explode, Some(true));
+    let inner = unwrap_nullable(&filter.schema);
+    let reference = inner["$ref"]
+        .as_str()
+        .expect("a nested object field schema is a $ref");
+    assert!(
+        !reference.contains("::"),
+        "the $ref must be the collision-resolved display key, not a raw type_name: {reference}"
+    );
+    let key = reference.trim_start_matches("#/components/schemas/");
+    let components = spec
+        .components
+        .as_ref()
+        .expect("components must be present");
+    let resolved = components
+        .schemas
+        .get(key)
+        .unwrap_or_else(|| panic!("$ref {reference} must resolve to a real component"));
+    assert!(
+        resolved["properties"].get("status").is_some(),
+        "the resolved component must carry Filter's real fields: {resolved}"
+    );
+}
+
+#[test]
+fn required_nested_object_query_field_is_required() {
+    // `filter` on `RequiredSearchQuery` is NOT `Option`-wrapped, so it must be
+    // `required: true` on its own parameter — the old whole-struct fallback
+    // could never say this (issue #2251).
+    let route = __autumn_route_info_required_search_route();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let op = spec.paths["/api/required-search"].get.as_ref().unwrap();
+    let filter = op
+        .parameters
+        .iter()
+        .find(|p| p.location == "query" && p.name == "filter")
+        .expect("a query parameter named filter");
+    assert!(
+        filter.required,
+        "a non-Option nested field must be required: true"
+    );
+    assert_eq!(filter.style.as_deref(), Some("deepObject"));
+}
+
+#[test]
+fn unregistered_ref_field_keeps_form_explode_not_deep_object() {
+    // `Sort` derives no `OpenApiSchema`, so its own shape can't be read. A
+    // plain enum serializes as a string (?dir=asc), so defaulting an
+    // unresolvable $ref to "flat" must win over guessing "object" — the old
+    // whole-struct fallback got this right by luck (everything was form), and
+    // the per-field split must not regress it (issue #2251).
+    let route = __autumn_route_info_unregistered_ref_search_route();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let op = spec.paths["/api/unregistered-ref-search"]
+        .get
+        .as_ref()
+        .unwrap();
+    let dir = op
+        .parameters
+        .iter()
+        .find(|p| p.location == "query" && p.name == "dir")
+        .expect("a query parameter named dir");
+    assert_eq!(
+        dir.style.as_deref(),
+        Some("form"),
+        "an unregistered $ref must default to flat, not deepObject: {dir:?}"
+    );
+    assert_eq!(dir.explode, Some(true));
+}
+
+#[test]
+fn array_of_objects_query_field_documents_the_gap_instead_of_a_style() {
+    let spec = nested_search_spec();
+    let items = nested_search_param(&spec, "items");
+    assert!(
+        items.style.is_none(),
+        "no OpenAPI style expresses an array of objects (issue #2251)"
+    );
+    assert!(items.explode.is_none());
+    let description = items
+        .description
+        .as_deref()
+        .expect("the gap must be documented on the parameter, not left silent");
+    assert!(
+        description.contains("[0]"),
+        "must name the bracketed encoding a client needs: {description}"
+    );
+}
+
+#[test]
+fn undescribable_query_struct_keeps_the_old_single_parameter() {
+    // `SearchParams` (defined above) derives no `OpenApiSchema`, so its fields
+    // cannot be introspected — the old whole-struct fallback must still apply
+    // (no spec churn for the common undecorated case).
+    let route = __autumn_route_info_search();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let op = spec.paths["/search"].get.as_ref().unwrap();
+    let query_params: Vec<_> = op
+        .parameters
+        .iter()
+        .filter(|p| p.location == "query")
+        .collect();
+    assert_eq!(
+        query_params.len(),
+        1,
+        "an undescribable query struct still documents one struct-level parameter"
+    );
+    assert_eq!(query_params[0].name, "SearchParams");
 }
