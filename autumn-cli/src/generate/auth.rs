@@ -189,7 +189,7 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
         .join(", ");
 
     let merge_missing = |line: &str| -> Option<String> {
-        let feat_bracket = find_unquoted_str(line, "features = [")?;
+        let feat_bracket = find_unquoted_str(strip_line_comment(line), "features = [")?;
         let list_start = feat_bracket + "features = [".len();
         let close_off = find_unquoted(&line[list_start..], ']')?;
         let list_end = close_off + list_start;
@@ -234,7 +234,7 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
         if trimmed.starts_with(&table_prefix) {
             if let Some(new_line) = merge_missing(&trimmed) {
                 lines[i] = format!("{indent}{new_line}");
-            } else if find_unquoted_str(&trimmed, "features = [").is_none() {
+            } else if find_unquoted_str(strip_line_comment(&trimmed), "features = [").is_none() {
                 // No `features` key at all — insert one before the closing brace.
                 if let Some(close_brace) = trimmed.rfind('}') {
                     let before = trimmed[..close_brace].trim_end();
@@ -391,7 +391,7 @@ fn ensure_totp_rs_features(toml: &str) -> String {
     // returning the rewritten line, or `None` if nothing changed (already
     // complete) / no list found.
     let merge_into_list = |line: &str, bracket_search: &str| -> Option<Option<String>> {
-        let feat_bracket = find_unquoted_str(line, bracket_search)?;
+        let feat_bracket = find_unquoted_str(strip_line_comment(line), bracket_search)?;
         let list_start = feat_bracket + bracket_search.len();
         let close_off = find_unquoted(&line[list_start..], ']')?;
         let list_end = close_off + list_start;
@@ -1720,7 +1720,9 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
             if strip_line_comment(&trimmed).contains(FEATURE) {
                 break; // already present
             }
-            if let Some(feat_bracket) = find_unquoted_str(&trimmed, "features = [") {
+            if let Some(feat_bracket) =
+                find_unquoted_str(strip_line_comment(&trimmed), "features = [")
+            {
                 let list_start = feat_bracket + "features = [".len();
                 if let Some(close_bracket) = find_unquoted(&trimmed[list_start..], ']') {
                     let list_end = close_bracket + list_start;
@@ -1996,7 +1998,9 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
             if strip_line_comment(&trimmed).contains(FEATURE) {
                 break; // already present
             }
-            if let Some(feat_bracket) = find_unquoted_str(&trimmed, "features = [") {
+            if let Some(feat_bracket) =
+                find_unquoted_str(strip_line_comment(&trimmed), "features = [")
+            {
                 // Add to existing features list.
                 let list_start = feat_bracket + "features = [".len();
                 let list_end = find_unquoted(&trimmed[list_start..], ']').unwrap() + list_start;
@@ -11305,7 +11309,9 @@ fn ensure_autumn_web_webauthn_feature(toml: &str) -> String {
             if strip_line_comment(&trimmed).contains(FEATURE) {
                 break; // already present
             }
-            if let Some(feat_bracket) = find_unquoted_str(&trimmed, "features = [") {
+            if let Some(feat_bracket) =
+                find_unquoted_str(strip_line_comment(&trimmed), "features = [")
+            {
                 let list_start = feat_bracket + "features = [".len();
                 if let Some(close_bracket) = find_unquoted(&trimmed[list_start..], ']') {
                     let list_end = close_bracket + list_start;
@@ -16506,6 +16512,24 @@ mod tests {
         assert!(
             out.contains("\"mail\""),
             "mail feature must be present: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_mail_feature_ignores_commented_out_features_key() {
+        // Codex review on 4f9291f9: the "already present?" guard strips
+        // comments before checking, but the separate "does a real features
+        // key exist here?" lookup this PR just fixed for quoting still
+        // searched the raw line for comment-stripping too, so a
+        // commented-out `features = [...]` (e.g. left behind by a manual
+        // edit) was found and rewritten — inside the comment, never in
+        // real code — instead of a genuine key being inserted.
+        let toml = "autumn-web = { version = \"0.3\" } # features = [\"mail\"]\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        let code = out.split('#').next().unwrap();
+        assert!(
+            code.contains("features = [\"mail\"]"),
+            "a real, uncommented features key must be inserted: {out}"
         );
     }
 
