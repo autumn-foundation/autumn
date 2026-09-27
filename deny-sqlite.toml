@@ -1,0 +1,112 @@
+# Companion cargo-deny config for the SQLite backend graph (issue #2040 / #1600).
+#
+# The main deny.toml scans the default + Postgres + additive-feature graph; the
+# sqlite and postgres backends are mutually exclusive, so this second config
+# scans the `autumn-web/sqlite` graph. CI runs BOTH:
+#   cargo deny check advisories licenses sources
+#   cargo deny --config deny-sqlite.toml check advisories licenses sources
+#
+# KEEP [advisories].ignore, [licenses].allow, and [sources] IN SYNC with
+# deny.toml — only the [graph] features and the unused-ignored-advisory knob
+# below intentionally differ. See CONTRIBUTING.md and deny.toml's header for how
+# to triage a failing check.
+
+[graph]
+# The SQLite backend graph: default features + autumn-web/sqlite. NOT the
+# additive Postgres set (sqlite flips the backend and is mutually exclusive with
+# managed-pg/pq-sys), and NOT --all-features. Purpose: catch any dependency
+# reachable only from the sqlite backend (the `SQLite runtime` CI job builds it).
+all-features = false
+no-default-features = false
+features = ["autumn-web/sqlite"]
+
+[advisories]
+# RustSec advisory database. Cover the ENTIRE resolved dependency graph
+# (transitive included), not just direct/workspace crates: vulnerabilities are
+# always denied, and unmaintained + unsound are set explicitly to "all" rather
+# than relying on cargo-deny's version-dependent default scope, so no advisory
+# anywhere in the tree can slip past this gate. Yanked crates stay at the
+# default `warn` (currently chacha20 0.10.1, transitive) — tracked but
+# non-blocking.
+# The RUSTSEC-2024-0384 (instant) ignore enters only via managed-pg-bundled,
+# which is not in the sqlite graph, so it is legitimately unused here — don't
+# warn on it (the shared ignore list is kept identical to deny.toml on purpose).
+unused-ignored-advisory = "allow"
+unmaintained = "all"
+unsound = "all"
+yanked = "warn"
+ignore = [
+    # RUSTSEC-2023-0071 — rsa 0.9.x "Marvin Attack" timing sidechannel.
+    # No patched rsa release exists (advisory: "no safe upgrade available").
+    # Ingress: rsa 0.9.10 -> jsonwebtoken -> autumn-web, i.e. only the RSA-family
+    # JWT sign/verify path. Autumn exposes no network-reachable attacker-timed
+    # RSA private-key decryption oracle, so real exposure is limited. Tracked by
+    # issue #1600. Review-by: 2026-10-01 (or when a fixed rsa ships).
+    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release; RSA-JWT path only via jsonwebtoken; tracked in #1600; review-by 2026-10-01" },
+    # RUSTSEC-2024-0384 — instant unmaintained. Build-time, transitive, and only
+    # pulled in by the managed-pg-bundled feature scanned above:
+    # instant -> parking_lot -> reqwest-retry -> postgresql_archive ->
+    # (build) postgresql_embedded -> autumn-web. Not a runtime vulnerability and no
+    # safe upgrade (author recommends web-time). Review-by: 2026-10-01.
+    { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive via postgresql_embedded (managed-pg-bundled feature); no safe upgrade; review-by 2026-10-01" },
+    # RUSTSEC-2026-0253 — `lru`'s `LruCache::pop()` is not panic-safe. Kept
+    # identical to deny.toml on purpose (see the note above the ignore list);
+    # the full rationale lives there. Short version: the workspace's own `lru` is
+    # FIXED at 0.18.2, and this covers only lru 0.16.4 reached through
+    # aws-sdk-s3 1.122, which is MSRV-pinned and has no patched 0.16.x to move
+    # to. Its sole `lru` use is the S3 Express identity cache, whose keys are
+    # `CacheKey(String)` (no panicking `Drop`) and which never calls `pop()`, so
+    # neither precondition for the UB holds. Review-by: 2026-10-01.
+    { id = "RUSTSEC-2026-0253", reason = "lru 0.16.4 only, via MSRV-pinned aws-sdk-s3 1.122 (no patched 0.16.x exists; workspace's own lru is fixed at 0.18.2); S3 Express cache keys are String and pop() is never called, so neither UB precondition holds; review-by 2026-10-01" },
+]
+
+[licenses]
+# The initial tree is entirely permissive (plus weak, file-level MPL-2.0). This
+# allow-list is BLOCKING: a dependency introducing an unlisted license fails CI.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "MIT-0",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
+    "PostgreSQL",
+    # MPL-2.0 is weak, file-level copyleft (the cssparser/selectors stack). It
+    # imposes obligations only on modifications to those upstream files, none on
+    # Autumn's own source, so it is deliberately allowed.
+    "MPL-2.0",
+]
+confidence-threshold = 0.8
+# Gate dev- and build-dependency licenses too (both default false for the
+# licenses check; advisories/sources already include dev+build deps). CI's
+# `cargo test --workspace` compiles dev-dependencies, so their licenses are in
+# scope for this gate.
+include-dev = true
+include-build = true
+
+[licenses.private]
+# The workspace's own example/benchmark crates carry no `license` field; do not
+# fail the gate on first-party unpublished crates.
+ignore = true
+
+[bans]
+# NOT run in CI. Duplicate versions are pervasive and cosmetic in this tree
+# (RustCrypto old/new, windows-sys target shims), so keep them at `warn` for
+# local `cargo deny check bans` runs rather than fighting the tree.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+# All dependencies come from crates.io; there are no git sources. BLOCKING.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

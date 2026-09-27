@@ -1713,7 +1713,8 @@ fn build_mail_alert_channel(
         );
         return None;
     }
-    let mail_cfg = state.config().mail;
+    let config = state.config_arc();
+    let mail_cfg = &config.mail;
     if mail_transport_requires_from(mail_cfg.transport)
         && mail_cfg
             .from
@@ -1915,9 +1916,13 @@ pub fn install_from_config(
     // `sensitive` keeps the dead-lettered-job/scheduled-task alerts off the
     // `/jobs` and `/tasks` endpoints, which are mounted only when `sensitive =
     // true`. The full config is installed on `state` before this runs.
-    let actuator_cfg = state.config().actuator;
+    let app_config = state.config_arc();
+    let actuator_cfg = &app_config.actuator;
     let actuator_sensitive = actuator_cfg.sensitive;
-    let actuator_prefix = actuator_cfg.prefix;
+    // Owned: `AlerterSettings` outlives this handle — it is stored on the
+    // `Alerter` installed as a state extension — so the prefix has to be a
+    // `String` it owns. One field, not the whole config.
+    let actuator_prefix = actuator_cfg.prefix.clone();
     let settings = AlerterSettings::from_config(config, actuator_prefix, actuator_sensitive);
     let alerter = Alerter::new(channels, settings);
     state.insert_extension(alerter.clone());
