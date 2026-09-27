@@ -375,6 +375,48 @@ pub fn with_inherited_dependency(root: &Path, manifest: &str, crate_name: &str) 
     member.to_string()
 }
 
+/// How `crate_name` is redirected away from its crates.io release by a
+/// `[patch.<source>]` or `[replace]` table, in the manifest at `root` or at
+/// the workspace root above it. `None` when nothing redirects it.
+///
+/// `.cargo/config.toml` source replacement is not read here.
+#[must_use]
+pub fn patched_by(root: &Path, crate_name: &str) -> Option<String> {
+    let want = canonical(crate_name);
+    for dir in root.ancestors() {
+        let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
+            continue;
+        };
+        let Ok(table) = toml::from_str::<toml::Table>(&text) else {
+            continue;
+        };
+        let manifest = dir.join("Cargo.toml");
+        if let Some(patch) = table.get("patch").and_then(toml::Value::as_table) {
+            for (source, entries) in patch {
+                let hit = entries
+                    .as_table()
+                    .is_some_and(|e| e.keys().any(|k| canonical(k) == want));
+                if hit {
+                    return Some(format!("[patch.{source}] in {}", manifest.display()));
+                }
+            }
+        }
+        if let Some(replace) = table.get("replace").and_then(toml::Value::as_table) {
+            let hit = replace
+                .keys()
+                .any(|k| canonical(k.split(':').next().unwrap_or(k)) == want);
+            if hit {
+                return Some(format!("[replace] in {}", manifest.display()));
+            }
+        }
+        // Cargo reads patches from the workspace root; stop there.
+        if table.contains_key("workspace") {
+            break;
+        }
+    }
+    None
+}
+
 /// The `[dependencies]` key that names `crate_name` as crates.io does:
 /// case and `-`/`_` do not count. `None` when no key does.
 #[must_use]

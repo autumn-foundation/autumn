@@ -693,28 +693,9 @@ pub fn pinned_version(version: &str) -> String {
 ///
 /// A message naming both requirements. No file is changed.
 pub fn check_existing_pin(manifest: &str, crate_name: &str, pinned: &str) -> Result<(), String> {
-    // crates.io treats `-`/`_` and case as one name, so a variant key is the
-    // same crate. A second key would be a duplicate dependency.
-    if let Some(key) = install::declared_dependency_key(manifest, crate_name)
-        && key != crate_name
-    {
-        return Err(format!(
-            "Cargo.toml declares this crate as `{}`. Rename the key to `{crate_name}`, then \
-             re-run. No files were changed.",
-            index::sanitize(&key)
-        ));
-    }
+    check_existing_source(manifest, crate_name, pinned)?;
     if !install::dependency_present(manifest, crate_name) {
         return Ok(());
-    }
-    // A version from a path, git or other registry is not the reviewed
-    // crates.io release, whatever it says.
-    if install::dependency_has_alternate_source(manifest, crate_name) {
-        return Err(format!(
-            "Cargo.toml takes `{crate_name}` from a path, git or other registry, but the index \
-             verified the crates.io release `{pinned}`. Set `{crate_name} = \"{pinned}\"` or \
-             remove the entry, then re-run. No files were changed."
-        ));
     }
     match install::declared_dependency_version(manifest, crate_name) {
         Some(declared) if declared == pinned => Ok(()),
@@ -726,6 +707,99 @@ pub fn check_existing_pin(manifest: &str, crate_name: &str, pinned: &str) -> Res
                 |v| format!(" = \"{v}\"")
             )
         )),
+    }
+}
+
+/// Refuse an existing declaration that is not the crates.io crate the index
+/// reviewed: a variant key, or a `path`, `git`, `registry` or renamed
+/// `package` entry. `release` names the reviewed version in the message.
+///
+/// # Errors
+///
+/// A message ready to print. No file is changed.
+pub fn check_existing_source(
+    manifest: &str,
+    crate_name: &str,
+    release: &str,
+) -> Result<(), String> {
+    // crates.io treats `-`/`_` and case as one name, so a variant key is the
+    // same crate. A second key would be a duplicate dependency.
+    if let Some(key) = install::declared_dependency_key(manifest, crate_name)
+        && key != crate_name
+    {
+        return Err(format!(
+            "Cargo.toml declares this crate as `{}`. Rename the key to `{crate_name}`, then \
+             re-run. No files were changed.",
+            index::sanitize(&key)
+        ));
+    }
+    // A version from a path, git or other registry is not the reviewed
+    // crates.io release, whatever it says.
+    if install::dependency_present(manifest, crate_name)
+        && install::dependency_has_alternate_source(manifest, crate_name)
+    {
+        return Err(format!(
+            "Cargo.toml takes `{crate_name}` from a path, git or other registry, but the index \
+             verified the crates.io release `{release}`. Set `{crate_name} = \"{release}\"` or \
+             remove the entry, then re-run. No files were changed."
+        ));
+    }
+    Ok(())
+}
+
+/// [`check_listed_declaration`] for `plugin add`: prints a notice, returns
+/// a refusal. `version` is the listed pin (first-party: this release).
+fn print_listed_declaration(root: &Path, resolved: &Resolved, version: &str) -> Result<(), String> {
+    let version = match resolved {
+        Resolved::FirstParty(_) => first_party_version(),
+        Resolved::Community(_) => version,
+    };
+    if let Some(notice) = check_listed_declaration(root, resolved, version)? {
+        println!("{notice}");
+    }
+    Ok(())
+}
+
+/// Check an existing declaration of a listed crate before `plugin add` or
+/// `--with` wires it. A community crate must be the verified `=` pin, and no
+/// `[patch]` may redirect it. A first-party crate must come from crates.io;
+/// a `[patch]` to a local checkout is the dev workflow, so it gets a notice.
+///
+/// # Errors
+///
+/// A message ready to print. No file is changed.
+pub fn check_listed_declaration(
+    root: &Path,
+    resolved: &Resolved,
+    version: &str,
+) -> Result<Option<String>, String> {
+    let crate_name = match resolved {
+        Resolved::FirstParty(entry) => entry.crate_name,
+        Resolved::Community(name) => name.as_str(),
+    };
+    let manifest = std::fs::read_to_string(install::manifest_path(root)).unwrap_or_default();
+    let manifest = install::with_inherited_dependency(root, &manifest, crate_name);
+    let patched = install::patched_by(root, crate_name);
+    match resolved {
+        Resolved::Community(_) => {
+            check_existing_pin(&manifest, crate_name, version)?;
+            if let Some(patch) = patched {
+                return Err(format!(
+                    "{patch} redirects `{crate_name}`, but the index verified its crates.io \
+                     release `{version}`. Remove the patch entry, then re-run. No files were changed."
+                ));
+            }
+            Ok(None)
+        }
+        Resolved::FirstParty(_) => {
+            check_existing_source(&manifest, crate_name, version)?;
+            Ok(patched.map(|patch| {
+                format!(
+                    "Note: {patch} redirects `{crate_name}`. The trust review covers the \
+                     crates.io release, not the patched source."
+                )
+            }))
+        }
     }
 }
 
@@ -860,6 +934,13 @@ pub fn run_add(opts: &AddOptions<'_>) -> i32 {
         Standing::Listed(listing) => Some(pinned_version(&listing.version)),
         Standing::Delisted(_) | Standing::Unlisted => None,
     };
+    // A listed crate's existing declaration must be the reviewed one.
+    if let Some(version) = &listed_version
+        && let Err(err) = print_listed_declaration(opts.root, &resolved, version)
+    {
+        eprintln!("autumn plugin add: {err}");
+        return 1;
+    }
     let outcome = match (&resolved, listed_version) {
         (Resolved::FirstParty(entry), _) => {
             install::plan_add(opts.root, entry, first_party_version())
@@ -867,13 +948,6 @@ pub fn run_add(opts: &AddOptions<'_>) -> i32 {
         // A listed crate installs the version the index verified. No
         // crates.io lookup, so this works with `--offline`.
         (Resolved::Community(crate_name), Some(version)) => {
-            let manifest =
-                std::fs::read_to_string(install::manifest_path(opts.root)).unwrap_or_default();
-            let manifest = install::with_inherited_dependency(opts.root, &manifest, crate_name);
-            if let Err(err) = check_existing_pin(&manifest, crate_name, &version) {
-                eprintln!("autumn plugin add: {err}");
-                return 1;
-            }
             install::plan_add_community(opts.root, crate_name, &version)
         }
         (Resolved::Community(crate_name), None) => {
@@ -1518,14 +1592,16 @@ pub fn wire_scaffold_plugins(root: &Path, plugins: &[ScaffoldPlugin]) -> i32 {
     for plugin in plugins {
         // Gate a listing again, now that the manifest exists: a `--starter`
         // pins its own `autumn-web`, and may already declare the crate.
-        if let (Resolved::Community(crate_name), Some(listing)) =
-            (&plugin.resolved, &plugin.listing)
-        {
-            let manifest =
-                std::fs::read_to_string(install::manifest_path(root)).unwrap_or_default();
-            let manifest = install::with_inherited_dependency(root, &manifest, crate_name);
-            let refused = gate_listing(listing, app_version(root).as_deref())
-                .and_then(|()| check_existing_pin(&manifest, crate_name, &plugin.version));
+        if let Some(listing) = &plugin.listing {
+            let refused = if matches!(plugin.resolved, Resolved::Community(_)) {
+                gate_listing(listing, app_version(root).as_deref())
+            } else {
+                Ok(())
+            }
+            .and_then(|()| check_listed_declaration(root, &plugin.resolved, &plugin.version));
+            if let Ok(Some(notice)) = &refused {
+                println!("{notice}");
+            }
             if let Err(err) = refused {
                 eprintln!(
                     "\nautumn new: the app was created, but {} was not wired — {err}",
@@ -1981,6 +2057,50 @@ mod tests {
         let err = gate_listing(&listing, Some(RELEASE)).unwrap_err();
         assert!(err.contains(">=0.8, <0.10"), "{err}");
         assert!(!err.contains("re-verification"), "{err}");
+    }
+
+    fn project_with(cargo: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), cargo).unwrap();
+        tmp
+    }
+
+    /// A `[patch]` that redirects a listed community crate is refused; the
+    /// trust review would describe code Cargo does not build.
+    #[test]
+    fn a_patched_community_crate_is_refused() {
+        let x = Resolved::Community("autumn-plugin-x".to_owned());
+        let patched = project_with(
+            "[package]\nname = \"a\"\n\n[dependencies]\nautumn-plugin-x = \"=0.3.0\"\n\n\
+             [patch.crates-io]\nautumn_plugin_x = { path = \"../x\" }\n",
+        );
+        let err = check_listed_declaration(patched.path(), &x, "=0.3.0").unwrap_err();
+        assert!(err.contains("[patch.crates-io]"), "{err}");
+        let clean = project_with(
+            "[package]\nname = \"a\"\n\n[dependencies]\nautumn-plugin-x = \"=0.3.0\"\n",
+        );
+        assert_eq!(
+            check_listed_declaration(clean.path(), &x, "=0.3.0"),
+            Ok(None)
+        );
+    }
+
+    /// First-party: the entry must come from crates.io, and a `[patch]` to a
+    /// local checkout (the dev workflow) gets a notice, not a refusal.
+    #[test]
+    fn a_first_party_declaration_is_source_checked() {
+        let admin = resolve("autumn-admin-plugin").unwrap();
+        let path = project_with(
+            "[package]\nname = \"a\"\n\n[dependencies]\nautumn-admin-plugin = { path = \"../admin\" }\n",
+        );
+        let err = check_listed_declaration(path.path(), &admin, RELEASE).unwrap_err();
+        assert!(err.contains("path, git or other registry"), "{err}");
+        let patched = project_with(
+            "[package]\nname = \"a\"\n\n[dependencies]\n\n[patch.crates-io]\n\
+             autumn-admin-plugin = { path = \"../admin\" }\n",
+        );
+        let notice = check_listed_declaration(patched.path(), &admin, RELEASE).unwrap();
+        assert!(notice.is_some_and(|n| n.contains("[patch.crates-io]")));
     }
 
     /// A `{ workspace = true }` entry is checked against the workspace

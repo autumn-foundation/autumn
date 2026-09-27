@@ -243,32 +243,9 @@ impl InspectReport {
     }
 }
 
-/// Write an `autumn plugin inspect --format json` result into a sandboxed
-/// listing. The capabilities and digest come from the artifact, not a hand
-/// edit.
-///
-/// # Errors
-///
-/// When the listing is not sandboxed, or the report names another plugin.
-pub fn apply_inspect(
-    listing: &mut Listing,
-    report: &InspectReport,
-    against: &str,
-    date: &str,
-) -> Result<Transition, String> {
-    if listing.trust != index::Trust::Sandboxed {
-        return Err(format!(
-            "`{}` is not sandboxed; record its `autumn plugin-check` report instead",
-            listing.name
-        ));
-    }
-    if index::canonical(&report.name) != index::canonical(&listing.name) {
-        return Err(format!(
-            "the inspect report is for `{}`, not `{}`",
-            index::sanitize(&report.name),
-            listing.name
-        ));
-    }
+/// Refuse an inspect report this CLI's `inspect` did not make: the route
+/// checks, every quota and limit, and a complete upgrade delta.
+fn check_inspect_shape(listing: &Listing, report: &InspectReport) -> Result<(), String> {
     // `inspect` runs the route checks from `plugin-check` over the manifest.
     // A report without them was not made by `inspect`.
     if index::canonical(&report.conformance.plugin_name) != index::canonical(&listing.name) {
@@ -310,6 +287,57 @@ pub fn apply_inspect(
             missing.join(", ")
         ));
     }
+    // A delta must carry every `ConsentDelta` field as a list: `{}` or a
+    // partial one would read as "nothing new".
+    if let Some(upgrade) = &report.upgrade {
+        let expected = serde_json::to_value(autumn_web::plugin_sandbox::ConsentDelta::default())
+            .unwrap_or_default();
+        let missing: Vec<&str> = expected
+            .as_object()
+            .into_iter()
+            .flat_map(|fields| fields.keys())
+            .filter(|key| upgrade.get(key.as_str()).is_none_or(|v| !v.is_array()))
+            .map(String::as_str)
+            .collect();
+        if !upgrade.is_object() || !missing.is_empty() {
+            return Err(format!(
+                "the inspect report's `upgrade` for `{}` is not a complete delta (missing {}); \
+                 use `autumn plugin inspect --against`",
+                listing.name,
+                missing.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Write an `autumn plugin inspect --format json` result into a sandboxed
+/// listing. The capabilities and digest come from the artifact, not a hand
+/// edit.
+///
+/// # Errors
+///
+/// When the listing is not sandboxed, or the report names another plugin.
+pub fn apply_inspect(
+    listing: &mut Listing,
+    report: &InspectReport,
+    against: &str,
+    date: &str,
+) -> Result<Transition, String> {
+    if listing.trust != index::Trust::Sandboxed {
+        return Err(format!(
+            "`{}` is not sandboxed; record its `autumn plugin-check` report instead",
+            listing.name
+        ));
+    }
+    if index::canonical(&report.name) != index::canonical(&listing.name) {
+        return Err(format!(
+            "the inspect report is for `{}`, not `{}`",
+            index::sanitize(&report.name),
+            listing.name
+        ));
+    }
+    check_inspect_shape(listing, report)?;
     // Replacing a recorded artifact needs a consent check against it. Without
     // `--against` the report has no delta, and new authority would pass.
     let replacing = !listing.artifact_sha256.is_empty()
@@ -983,6 +1011,32 @@ mod tests {
         l
     }
 
+    /// A complete `ConsentDelta`, with `added` capabilities.
+    fn delta(added: &[&str]) -> serde_json::Value {
+        let mut value =
+            serde_json::to_value(autumn_web::plugin_sandbox::ConsentDelta::default()).unwrap();
+        value["added_capabilities"] = serde_json::json!(added);
+        value
+    }
+
+    /// An empty or partial delta is not "nothing new": it is not a delta
+    /// `inspect --against` wrote.
+    #[test]
+    fn a_partial_upgrade_delta_is_refused() {
+        for partial in [
+            serde_json::json!({}),
+            serde_json::json!({"added_capabilities": []}),
+        ] {
+            let mut r = inspect(true);
+            r.upgrade = Some(partial);
+            let err = apply_inspect(&mut sandboxed(), &r, "0.7.0", "2026-10-01").unwrap_err();
+            assert!(err.contains("upgrade"), "{err}");
+        }
+        let mut r = inspect(true);
+        r.upgrade = Some(serde_json::json!({"added_hosts": "api.example.com"}));
+        assert!(apply_inspect(&mut sandboxed(), &r, "0.7.0", "2026-10-01").is_err());
+    }
+
     fn inspect(pass: bool) -> InspectReport {
         InspectReport {
             name: "autumn-plugin-hello".to_owned(),
@@ -1000,7 +1054,7 @@ mod tests {
                 contract: None,
             },
             // A baseline with nothing new: the new artifact asks for no more.
-            upgrade: Some(serde_json::json!({"added_capabilities": []})),
+            upgrade: Some(delta(&[])),
             upgrade_against: Some("00".repeat(32)),
             grants: InspectGrants::default(),
             quotas: autumn_web::plugin_sandbox::CapabilityQuotas::default()
@@ -1148,7 +1202,7 @@ mod tests {
         let mut l = sandboxed();
         let before = l.clone();
         let mut r = inspect(true);
-        r.upgrade = Some(serde_json::json!({"added_capabilities": ["kv"]}));
+        r.upgrade = Some(delta(&["kv"]));
         apply_inspect(&mut l, &r, "0.7.0", "2026-10-01").expect("flag");
         assert_eq!(l.status, Status::Incompatible);
         assert_eq!(l.capabilities, before.capabilities);
@@ -1162,13 +1216,13 @@ mod tests {
     fn an_upgrade_that_needs_consent_is_flagged() {
         let mut l = sandboxed();
         let mut r = inspect(true);
-        r.upgrade = Some(serde_json::json!({"added_capabilities": ["kv"], "added_hosts": []}));
+        r.upgrade = Some(delta(&["kv"]));
         let t = apply_inspect(&mut l, &r, "0.7.0", "2026-10-01").expect("apply");
         assert_eq!(t, Transition::Flagged);
         assert!(l.note.contains("upgrade-consent"), "{}", l.note);
 
         let mut r = inspect(true);
-        r.upgrade = Some(serde_json::json!({"added_capabilities": [], "added_hosts": []}));
+        r.upgrade = Some(delta(&[]));
         let t = apply_inspect(&mut sandboxed(), &r, "0.7.0", "2026-10-01").expect("apply");
         assert_eq!(t, Transition::Listed);
     }
