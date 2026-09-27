@@ -27,6 +27,7 @@ use schema::merged_hosts;
     Debug,
     Default,
     PartialEq,
+    Eq,
     serde::Deserialize,
     serde::Serialize,
     autumn_web::reexports::diesel::AsExpression,
