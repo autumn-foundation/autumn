@@ -429,28 +429,28 @@ pub trait AdminModel: Send + Sync + 'static {
     /// List records with pagination, search, sort, and filters.
     fn list(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         params: ListParams,
     ) -> AdminFuture<'_, ListResult>;
 
     /// Get a single record by ID.
     fn get(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         id: i64,
     ) -> AdminFuture<'_, Option<Value>>;
 
     /// Create a new record from form data.
     fn create(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         data: Value,
     ) -> AdminFuture<'_, Value>;
 
     /// Update an existing record.
     fn update(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         id: i64,
         data: Value,
     ) -> AdminFuture<'_, Value>;
@@ -458,7 +458,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// Delete a record by ID.
     fn delete(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         id: i64,
     ) -> AdminFuture<'_, ()>;
 
@@ -475,7 +475,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// `false`, so models that opt in must override this method.
     fn restore<'a>(
         &'a self,
-        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         _id: i64,
     ) -> AdminFuture<'a, ()> {
         Box::pin(async move {
@@ -493,7 +493,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// `false`.
     fn purge<'a>(
         &'a self,
-        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         _id: i64,
     ) -> AdminFuture<'a, ()> {
         Box::pin(async move {
@@ -511,7 +511,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// `false`.
     fn list_deleted<'a>(
         &'a self,
-        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         _params: ListParams,
     ) -> AdminFuture<'a, ListResult> {
         Box::pin(async move {
@@ -526,53 +526,32 @@ pub trait AdminModel: Send + Sync + 'static {
     /// Execute a bulk action on the given IDs.
     fn execute_action(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         action: &str,
         ids: Vec<i64>,
     ) -> AdminFuture<'_, u64> {
-        // Default implementation: dispatch the built-in `"delete"`, `"restore"`,
-        // and `"purge"` actions. Any other action name returns an error so it
-        // doesn't silently no-op — overriders that declare custom actions must
-        // implement them here.
-        //
-        // We clone the pool (deadpool::Pool is Arc-backed, cheap) so the
-        // returned future only borrows from `&self` and avoids the
-        // lifetime mismatch between `&self` and `&pool` that would
-        // otherwise show up in the trait's elided `'_` return signature.
-        let action = action.to_owned();
-        let pool = pool.clone();
-        Box::pin(async move {
-            match action.as_str() {
-                "delete" => {
-                    let mut count: u64 = 0;
-                    for id in ids {
-                        self.delete(&pool, id).await?;
-                        count += 1;
-                    }
-                    Ok(count)
+        // Default implementation: dispatch the built-in `"delete"` action
+        // here; `"restore"`, `"purge"`, and anything else go through
+        // `dispatch_restore_purge_or_unhandled`, shared with models (e.g.
+        // `TokenAdminModel`, `FeatureFlagAdminModel`) that override this
+        // method to batch `"delete"` into one query but still need the same
+        // restore/purge/unhandled-action fallback.
+        if action == "delete" {
+            // Clone the pool (deadpool::Pool is Arc-backed, cheap) so the
+            // returned future only borrows from `&self` and avoids the
+            // lifetime mismatch between `&self` and `&pool` that would
+            // otherwise show up in the trait's elided `'_` return signature.
+            let pool = pool.clone();
+            return Box::pin(async move {
+                let mut count: u64 = 0;
+                for id in ids {
+                    self.delete(&pool, id).await?;
+                    count += 1;
                 }
-                "restore" => {
-                    let mut count: u64 = 0;
-                    for id in ids {
-                        self.restore(&pool, id).await?;
-                        count += 1;
-                    }
-                    Ok(count)
-                }
-                "purge" => {
-                    let mut count: u64 = 0;
-                    for id in ids {
-                        self.purge(&pool, id).await?;
-                        count += 1;
-                    }
-                    Ok(count)
-                }
-                other => Err(AdminError::Other(format!(
-                    "unhandled bulk action '{other}'; \
-                     override AdminModel::execute_action to support it"
-                ))),
-            }
-        })
+                Ok(count)
+            });
+        }
+        dispatch_restore_purge_or_unhandled(self, pool, action, ids)
     }
 
     /// Return a display string for a record (used in breadcrumbs, titles).
@@ -596,7 +575,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// Override if the backend can count without materializing records.
     fn count(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
     ) -> AdminFuture<'_, u64> {
         let params = ListParams {
             page: 1,
@@ -635,7 +614,13 @@ pub trait AdminModel: Send + Sync + 'static {
         self.fields()
             .into_iter()
             .filter(|f| {
-                !matches!(f.kind, AdminFieldKind::Password | AdminFieldKind::Hidden) && !f.encrypted
+                // #1771: a confidential column, and its blind-index companion,
+                // leave the database in a file built for sharing. The envelope
+                // and the token are both per-owner values, so an exported file
+                // is a portable correlation handle.
+                !matches!(f.kind, AdminFieldKind::Password | AdminFieldKind::Hidden)
+                    && !f.encrypted
+                    && !::autumn_web::confidential::is_confidential_column_name(f.name)
             })
             .map(|f| f.name)
             .collect()
@@ -689,7 +674,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// [`supports_csv_import`]: AdminModel::supports_csv_import
     fn import_csv_row<'a>(
         &'a self,
-        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         _line: u64,
         _row: std::collections::HashMap<String, String>,
         _mode: CsvImportMode,
@@ -711,7 +696,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// that do not opt in get a clear error instead of a silent no-op.
     fn get_history<'a>(
         &'a self,
-        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         _record_id: i64,
         _page: u64,
         _per_page: u64,
@@ -724,6 +709,81 @@ pub trait AdminModel: Send + Sync + 'static {
             ))
         })
     }
+}
+
+/// Refuse a call on the `SQLite` backend, for a model that needs Postgres.
+///
+/// The three built-in models (`tokens`, `experiments`, `feature_flags`) read
+/// Postgres-only tables with Postgres-only SQL: `ILIKE`, `::type` casts,
+/// `NOW()` and writable CTEs. Since issue #2108 the crate COMPILES under
+/// `autumn-web/sqlite`, so registering one on `SQLite` is now a run-time
+/// mistake instead of a build error. Without this guard the operator sees a
+/// raw driver message such as `near "ILIKE": syntax error`.
+///
+/// Call it first in every method of a Postgres-only model. On Postgres it is a
+/// compile-time `Ok(())`: `backend_select!` drops the other arm.
+#[allow(
+    clippy::missing_const_for_fn,
+    clippy::unnecessary_wraps,
+    reason = "the Postgres arm is a trivial Ok(()); the SQLite arm formats an error"
+)]
+pub fn require_postgres(model: &str) -> Result<(), AdminError> {
+    ::autumn_web::backend_select! {
+        pg => {{
+            let _ = model;
+            Ok(())
+        }},
+        sqlite => {{
+            Err(AdminError::Other(format!(
+                "{model} needs the Postgres backend: it reads a Postgres-only table \
+                 with Postgres-only SQL. This app runs on SQLite. Register your own \
+                 AdminModel instead — see the autumn-admin-plugin README, \
+                 \"Database Backends\" (issue #2108)."
+            )))
+        }},
+    }
+}
+
+/// Dispatch the built-in `"restore"`/`"purge"` bulk actions and the fallback
+/// error for anything else.
+///
+/// Shared by `AdminModel::execute_action`'s default and by models (or
+/// generated `#[model]` admin adapters) that override it to special-case
+/// `"delete"` with a batched query — see `TokenAdminModel` and
+/// `FeatureFlagAdminModel` — so that fallthrough behaves identically without
+/// copying the loop.
+pub fn dispatch_restore_purge_or_unhandled<'a>(
+    model: &'a (impl AdminModel + ?Sized),
+    pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
+    action: &str,
+    ids: Vec<i64>,
+) -> AdminFuture<'a, u64> {
+    let action = action.to_owned();
+    let pool = pool.clone();
+    Box::pin(async move {
+        match action.as_str() {
+            "restore" => {
+                let mut count: u64 = 0;
+                for id in ids {
+                    model.restore(&pool, id).await?;
+                    count += 1;
+                }
+                Ok(count)
+            }
+            "purge" => {
+                let mut count: u64 = 0;
+                for id in ids {
+                    model.purge(&pool, id).await?;
+                    count += 1;
+                }
+                Ok(count)
+            }
+            other => Err(AdminError::Other(format!(
+                "unhandled bulk action '{other}'; \
+                 override AdminModel::execute_action to support it"
+            ))),
+        }
+    })
 }
 
 // ── VersionPage → AdminHistoryPage conversion ──────────────────────
@@ -752,7 +812,7 @@ impl From<autumn_web::version_history::VersionPage> for AdminHistoryPage {
     ///
     /// ```rust,ignore
     /// fn get_history<'a>(
-    ///     &'a self, pool: &'a Pool<AsyncPgConnection>,
+    ///     &'a self, pool: &'a Pool<RuntimeConnection>,
     ///     record_id: i64, page: u64, per_page: u64,
     /// ) -> AdminFuture<'a, AdminHistoryPage> {
     ///     let pool = pool.clone();
@@ -807,6 +867,24 @@ pub struct ListParams {
     pub sort_dir: SortDirection,
     /// Active filters (`field_name` → value).
     pub filters: Vec<(String, String)>,
+}
+
+impl ListParams {
+    /// SQL `OFFSET`/`LIMIT` for this page, ready to bind directly.
+    ///
+    /// `per_page == 0` means "no limit": offset 0, limit `i64::MAX`. Every
+    /// built-in `AdminModel::list()` shares this convention.
+    #[must_use]
+    pub fn sql_offset_limit(&self) -> (i64, i64) {
+        if self.per_page == 0 {
+            return (0, i64::MAX);
+        }
+        let offset = self.page.saturating_sub(1) * self.per_page;
+        (
+            i64::try_from(offset).unwrap_or(0),
+            i64::try_from(self.per_page).unwrap_or(i64::MAX),
+        )
+    }
 }
 
 /// Sort direction for list queries.
@@ -926,7 +1004,7 @@ mod tests {
         fn list(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             _params: ListParams,
         ) -> AdminFuture<'_, ListResult> {
@@ -942,7 +1020,7 @@ mod tests {
         fn get(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             _id: i64,
         ) -> AdminFuture<'_, Option<Value>> {
@@ -951,7 +1029,7 @@ mod tests {
         fn create(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             data: Value,
         ) -> AdminFuture<'_, Value> {
@@ -960,7 +1038,7 @@ mod tests {
         fn update(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             _id: i64,
             data: Value,
@@ -970,7 +1048,7 @@ mod tests {
         fn delete(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             id: i64,
         ) -> AdminFuture<'_, ()> {
@@ -1011,7 +1089,7 @@ mod tests {
         fn list(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             _params: ListParams,
         ) -> AdminFuture<'_, ListResult> {
@@ -1027,7 +1105,7 @@ mod tests {
         fn get(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             _id: i64,
         ) -> AdminFuture<'_, Option<Value>> {
@@ -1036,7 +1114,7 @@ mod tests {
         fn create(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             data: Value,
         ) -> AdminFuture<'_, Value> {
@@ -1045,7 +1123,7 @@ mod tests {
         fn update(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             _id: i64,
             data: Value,
@@ -1055,7 +1133,7 @@ mod tests {
         fn delete(
             &self,
             _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             _id: i64,
         ) -> AdminFuture<'_, ()> {
@@ -1067,7 +1145,7 @@ mod tests {
         fn restore<'a>(
             &'a self,
             _pool: &'a diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             id: i64,
         ) -> AdminFuture<'a, ()> {
@@ -1079,7 +1157,7 @@ mod tests {
         fn purge<'a>(
             &'a self,
             _pool: &'a diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             id: i64,
         ) -> AdminFuture<'a, ()> {
@@ -1091,7 +1169,7 @@ mod tests {
         fn list_deleted<'a>(
             &'a self,
             _pool: &'a diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             _params: ListParams,
         ) -> AdminFuture<'a, ListResult> {
@@ -1109,10 +1187,10 @@ mod tests {
     /// Build a `Pool` whose manager would fail to connect — the test models
     /// never call `pool.get()`, so the pool itself just sits unused.
     fn dummy_pool()
-    -> diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection> {
+    -> diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection> {
         use diesel_async::pooled_connection::AsyncDieselConnectionManager;
         use diesel_async::pooled_connection::deadpool::Pool;
-        let mgr = AsyncDieselConnectionManager::<diesel_async::AsyncPgConnection>::new(
+        let mgr = AsyncDieselConnectionManager::<::autumn_web::RuntimeConnection>::new(
             "postgresql://test",
         );
         Pool::builder(mgr).build().expect("build pool")
@@ -1699,5 +1777,37 @@ mod tests {
         assert_eq!(row[4], "true");
         assert_eq!(row[5], "", "null becomes empty string");
         assert_eq!(row[6], "", "missing column becomes empty string");
+    }
+
+    fn list_params(page: u64, per_page: u64) -> ListParams {
+        ListParams {
+            page,
+            per_page,
+            search: None,
+            sort_by: None,
+            sort_dir: SortDirection::default(),
+            filters: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sql_offset_limit_treats_per_page_zero_as_unlimited() {
+        assert_eq!(list_params(1, 0).sql_offset_limit(), (0, i64::MAX));
+        // Even on page 3 — "no limit" ignores paging entirely.
+        assert_eq!(list_params(3, 0).sql_offset_limit(), (0, i64::MAX));
+    }
+
+    #[test]
+    fn sql_offset_limit_paginates_from_page_one() {
+        assert_eq!(list_params(1, 25).sql_offset_limit(), (0, 25));
+        assert_eq!(list_params(2, 25).sql_offset_limit(), (25, 25));
+        assert_eq!(list_params(3, 10).sql_offset_limit(), (20, 10));
+    }
+
+    #[test]
+    fn sql_offset_limit_treats_page_zero_like_page_one() {
+        // `page.saturating_sub(1)` — page 0 behaves like page 1 rather than
+        // underflowing.
+        assert_eq!(list_params(0, 25).sql_offset_limit(), (0, 25));
     }
 }
