@@ -1,0 +1,14 @@
+$ cargo check -p autumn-web --test integration_tests   # with with_tenancy_session_key left pub(crate)
+
+error[E0624]: method `with_tenancy_session_key` is private
+   --> autumn/tests/integration/idempotency_tenant_scope.rs:356:18
+    |
+356 |                 .with_tenancy_session_key(Some(Arc::from("tenant_id"))),
+    |                  ^^^^^^^^^^^^^^^^^^^^^^^^ private method
+    |
+   ::: autumn/src/session.rs:808:5
+    |
+808 |     pub(crate) fn with_tenancy_session_key(mut self, key: Option<Arc<str>>) -> Self {
+    |     ------------------------------------------------------------------------------- private method defined here
+
+error: could not compile `autumn-web` (test "integration_tests") due to 1 previous error
