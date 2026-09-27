@@ -10,9 +10,6 @@
 //! - **Filtering**: Configurable verbosity and component-level filters to manage
 //!   log volume.
 
-#[doc(inline)]
 pub mod capture;
-#[doc(inline)]
 pub mod context;
-#[doc(inline)]
 pub mod filter;
