@@ -57,9 +57,8 @@ use autumn_web::sim_test;
 async fn deterministic(mut sim: Sim) {
     // The seed comes from `AUTUMN_SIM_SEED` (hex `0x..` or decimal), default 0.
     // `sim`'s own clock and RNG (`sim.rng()`) are pure functions of this seed.
-    // An app mounted with `sim.build(...)` inherits the seeded clock
-    // automatically, but NOT seeded entropy — see "Deterministic
-    // identifiers" below for what that means and how to opt in.
+    // An app mounted with `sim.build(...)` gets the virtual clock and an
+    // entropy source seeded from it, so its ids replay too.
     assert_eq!(sim.seed, 0);
 }
 ```
@@ -79,7 +78,12 @@ use autumn_web::test::TestApp;
 
 #[sim_test]
 async fn app_boots_under_the_sim(mut sim: Sim) {
-    sim.build(TestApp::new().routes(routes![index]).jobs(jobs![send_receipt]));
+    sim.build(
+        TestApp::new()
+            .routes(routes![index])
+            .jobs(jobs![send_receipt])
+            .tasks(tasks![nightly_digest]),
+    );
 
     let response = sim.client().get("/").send().await;
     response.assert_ok();
@@ -87,10 +91,11 @@ async fn app_boots_under_the_sim(mut sim: Sim) {
 ```
 
 `sim.build` mounts an [`autumn_web::app::AppBuilder`]-configured app on the
-sim's paused runtime, wired to the virtual clock and (if configured) the
-fault-injection hooks below. **Seeded entropy is not automatic** — see
-"Deterministic identifiers" below for how (and why) to wire it in
-explicitly.
+sim's paused runtime. It wires in the virtual clock, an entropy source seeded
+from `sim.seed` (see "Deterministic identifiers" below), and the
+fault-injection hooks below if you configured any. Register `#[job]`s with
+`TestApp::jobs` and `#[scheduled]` tasks with `TestApp::tasks`, or through a
+plugin, exactly as on `AppBuilder`.
 
 ### Virtual time
 
@@ -102,7 +107,9 @@ sim.run_to_idle().await; // drain everything the advance released
 - [`Sim::advance`] steps the injected [`autumn_web::time::Clock`] and tokio's
   paused timer wheel together, so a `#[job]`'s exponential backoff or a
   `#[scheduled]` tick fires the instant virtual time crosses its deadline —
-  with zero real waiting.
+  with zero real waiting. `sim.build` starts the app's scheduled tasks, so an
+  `every = "1m"` task first ticks one virtual minute after `build`, and a
+  `cron` task at its next occurrence after the sim epoch.
 - [`Sim::run_to_idle`] drains everything already-ready — the job worker, due
   scheduler ticks, durable repository commit hooks — until the runtime is
   quiescent. It does **not** fast-forward to a future timer; pair it with
@@ -119,10 +126,11 @@ draw from an injected [`autumn_web::entropy::Entropy`] source. Reach a seeded
 one from a handler via the [`autumn_web::entropy::Rng`] extractor, or from the
 sim directly via `sim.rng()`.
 
-**Unlike the clock, entropy injection is opt-in** — `Sim::build` does not wire
-it into the mounted app automatically. If any code path your test exercises
-(a job's retry jitter, a minted UUID, anything reading `state.entropy()`)
-needs to be reproducible from the seed, mount with it explicitly:
+`Sim::build` seeds the mounted app's entropy from `sim.seed`, so a job's retry
+jitter, a minted UUID and anything else reading `state.entropy()` replay from
+`AUTUMN_SIM_SEED` with no extra call. The default is the same source as
+`with_entropy(SeededEntropy::new(sim.seed))`. To use a different source, pass
+your own; an explicit `with_entropy` always wins:
 
 ```rust
 use autumn_web::entropy::SeededEntropy;
@@ -130,17 +138,22 @@ use autumn_web::entropy::SeededEntropy;
 sim.build(
     TestApp::new()
         .routes(routes![index])
-        .with_entropy(SeededEntropy::new(sim.seed)),
+        .with_entropy(SeededEntropy::new(0xfeed)),
 );
 ```
 
-Skipping this is easy to miss and easy to get wrong silently: the app still
-runs, the handler still reads *some* entropy source, and a test that only
-asserts non-vacuity (e.g. "outcomes vary across N draws") still passes — it
-just isn't actually replaying from `AUTUMN_SIM_SEED` anymore, so a failure
-downstream of that draw won't reproduce from the printed seed (Codex review).
+An app mounted again after [`Sim::kill`] (a restart) gets a new stream derived
+from the seed, so the restarted process does not repeat the crashed one's ids
+and the run still replays.
+
+Before 0.8.0 the default was the OS entropy source, and a test had to pass
+`with_entropy(SeededEntropy::new(sim.seed))` itself. That call still works and
+now changes nothing.
 
 ### Fault injection
+
+`Chaos` injects faults **probabilistically** — you give it a rate and the seed
+decides which operations get hit:
 
 ```rust
 use autumn_web::sim::Chaos;
@@ -155,9 +168,157 @@ sim.chaos(
 
 Every fault decision is drawn from the seed, so enabling chaos never breaks
 reproducibility — the same seed replays the same fault schedule. See
-[`autumn_web::sim::Chaos`] for the full catalog (SMTP transport faults, a
-seeded LLM stub for agent retry paths, and mid-transaction kill/restart for
-durable-recovery proofs).
+[`autumn_web::sim::Chaos`] for the full catalog, including SMTP transport
+faults. Two related tools sit outside `Chaos`: `sim::llm`'s seeded LLM stub
+for agent retry paths, and [`Sim::kill`] / [`Sim::restart`] for
+crash-recovery proofs. A kill drops the app between two drains, after its
+transactions commit, not in the middle of one. When you want to *name* a fault rather than sample
+one — "fail the 3rd database checkout" — reach for `FaultPlan` in the next
+subsection instead.
+
+### Authored fault scenarios (`FaultPlan`)
+
+`Chaos` is a *rate*: "5% of checkouts fail", with the seed choosing which ones.
+That is the right shape for a sweep hunting rare interleavings, and the wrong
+shape for a regression test — because the sentence a post-mortem actually
+produces is "the **third** connection checkout failed while the **second**
+`send_invoice` execution was retrying", and no probability reproduces that on
+purpose. [`autumn_web::sim::FaultPlan`] lets you author that scenario directly,
+by ordinal rather than by rate, and hands back a serializable record of what
+happened that a test can assert on and CI can replay byte-for-byte.
+
+```rust
+use autumn_web::sim::{FaultPlan, Sim};
+use autumn_web::sim_test;
+use autumn_web::test::TestApp;
+
+#[sim_test]
+async fn the_third_checkout_and_the_second_invoice_fail(mut sim: Sim) {
+    let plan = FaultPlan::from_seed(sim.seed)
+        .fail_db_checkout(3)           // 3rd checkout on any pool (ordinals are 1-based)
+        .fail_job("send_invoice", 2);  // 2nd execution of that job by name
+
+    sim.build(
+        TestApp::new()
+            .routes(routes![checkout])
+            .plugin(InvoiceJobPlugin)
+            .with_fault_plan(plan),
+    );
+
+    for _ in 0..5 {
+        sim.client().post("/checkout").send().await;
+    }
+    sim.run_to_idle().await; // drains the job worker through the fault seam
+
+    let outcome = sim.client().fault_outcome().await;
+
+    assert_eq!(outcome.fired.len(), 2);
+    assert_eq!(outcome.fired[0].ordinal, 3);            // the checkout that failed
+    assert_eq!(outcome.server_errors[0].status, 503);   // captured through reporting
+    assert_eq!(outcome.final_state.db_checkouts, 5);    // every checkout, fired or not
+
+    // Canonical, byte-identical on every replay of this seed — commit it as a
+    // fixture and this scenario becomes a CI regression test.
+    assert_eq!(outcome.to_json_string(), include_str!("fixtures/invoice_scenario.json").trim_end());
+}
+```
+
+Ordinals are **1-based**, and `0` matches nothing (the same convention as
+`Chaos::smtp_faults`). `fail_db_checkout(n)` and `fail_job_execution(n)` count
+across every pool and every job name; `fail_db_checkout_on("replica", 2)` and
+`fail_job("send_invoice", 2)` count on that target's own counter. Duplicate
+entries collapse, so a plan is a set — `plan.planned()` returns the whole
+schedule sorted and `plan.describe()` prints it one fault per line, both before
+you run anything. A plan is pure data: clone it onto two apps and you get two
+independent ledgers.
+
+Faults can be confined to a window of virtual time, driven by the injected
+clock rather than wall time:
+
+```rust
+let plan = FaultPlan::from_seed(sim.seed)
+    .fail_job_execution(2)
+    .only_between(Duration::from_secs(5), Duration::from_secs(10));
+```
+
+The window is half-open (`from <= elapsed < to`) and `elapsed` is measured on
+the app's injected monotonic clock since the app started — so `sim.advance`
+moves it and no real time ever does. Outside the window the effect still
+consumes its ordinal, and the near-miss is recorded in `outcome.suppressed`
+rather than vanishing: a scenario that stopped firing because your timings
+shifted is visible in the outcome instead of silently passing.
+
+The seed earns its keep in the `random_*` lane, which spreads faults across a
+range instead of naming each one:
+
+```rust
+let plan = FaultPlan::from_seed(0x5EED).random_db_checkout_faults(2, 1..=8);
+```
+
+That picks 2 distinct checkout ordinals from `1..=8` using the plan's seed, and
+resolves them into explicit entries *at builder-call time* — so `planned()`
+still describes the schedule completely, a different seed picks different
+checkouts, and a plan built only from explicit `fail_*` calls draws no entropy
+at all.
+
+#### What the outcome record holds
+
+| Field | Contents |
+|---|---|
+| `seed` | the plan's seed, echoed so an outcome identifies its own replay |
+| `fired` | `Vec<FiredFault>` in fire order: `effect`, `target` (pool or job name), the global `ordinal`, the `target_ordinal`, `at` (injected wall clock) and `elapsed_ms` (injected monotonic) |
+| `suppressed` | matched an ordinal but fell outside `only_between` |
+| `unfired` | planned faults the run never reached, sorted — an empty list (together with an empty `suppressed`) is the proof your scenario actually exercised what it authored; a near-miss outside the window counts as reached, so check `suppressed` too |
+| `server_errors` | 5xx captured through `reporting.rs`, in report order: `status`, `method`, `route`, `message`, `problem_type`. Deliberately **no** request ID — it is entropy-minted, and the record has to stay comparable |
+| `final_state` | seam totals: `db_checkouts`, `job_executions`, `job_executions_failed`, `job_executions_succeeded` |
+
+`to_json_string()` is canonical (declaration-order fields, no maps, no floats),
+`fingerprint()` is an FNV-1a 64 over that string, and `FaultOutcome::from_json_str`
+round-trips it. `TestClient::fault_outcome()` is `async` because autumn
+dispatches error reports on a detached task: it settles those with bounded
+cooperative yields before snapshotting, and never advances the virtual clock
+while doing so. `TestClient::fault_ledger()` returns the same handle for an
+un-settled `outcome()` snapshot, and `None` when no plan was attached.
+
+#### The determinism contract
+
+The byte-identical-replay guarantee holds inside a specific box, and `build`
+enforces the parts it can:
+
+- **A paused, current-thread runtime** — `#[sim_test]`, or
+  `#[tokio::test(start_paused = true)]`. On a multi-threaded runtime concurrent
+  executions race for their ordinals and the ordering is not reproducible.
+- **The injected clock.** Window checks and every `at` / `elapsed_ms` read the
+  app's `ClockSource`, so no wall-clock read leaks into the record.
+- **Seeded entropy.** Attaching a plan defaults the app's entropy to
+  `SeededEntropy` derived from the plan's seed, so retry jitter and minted IDs
+  replay from it too. Unlike the rest of the sim this one *is* automatic — an
+  explicit `with_entropy` still wins.
+- **One job worker** (`jobs.workers = 1`), **reporting at
+  `sample_rate = 1.0`**, and **failure capture off** (the default). `build`
+  asserts all three when a plan is attached, rather than letting a second
+  worker, a sampled-out 5xx, or a capsule write that reporting awaits before
+  any reporter runs quietly break replay.
+
+#### What it does not cover
+
+- **Only two effect classes**: database connection checkout and job execution.
+  Mail, outbound HTTP and channels have no `FaultPlan` lane — for SMTP use
+  `Chaos::smtp_faults`, which already takes an explicit 1-based schedule.
+- **Test-only.** `FaultPlan` attaches to a `TestApp`; there is no production
+  fault injection, by design.
+- **`perform_enqueued_jobs` bypasses it.** `TestClient::perform_enqueued_jobs`
+  invokes handlers directly and never crosses the `intercept_execute` seam, so
+  job faults never fire under it. Drain with `sim.run_to_idle()` — plus
+  `sim.advance` to cross a retry backoff — instead.
+
+`autumn/tests/integration/sim_fault_plan.rs` carries the worked example, in the
+same before/after shape as the retry-storm bug above: a `charge_card` job and a
+plan that fails its first execution. With `max_attempts = 1` the charge is never
+recorded and the scenario's resilience assertion fails; with `max_attempts = 3`
+the retry lands it exactly once and the same plan passes — flip that one
+attribute back to reproduce the failure. See issue
+[#1680](https://github.com/autumn-foundation/autumn/issues/1680) for the design.
 
 ### `always!` / `sometimes!`
 
@@ -217,6 +378,31 @@ your own scenario and wire it into your own CI.
 AUTUMN_SIM_SEEDS=1000 cargo run -p autumn-web --release --features sim-testing --bin sim-sweep
 ```
 
+`AUTUMN_SIM_SEED_START` sets the first seed (default `0`). On a failure the
+binary prints a replay command that sets both variables to rerun only the
+failing seed, for example
+`AUTUMN_SIM_SEED_START=300 AUTUMN_SIM_SEEDS=1 cargo run …`.
+
+### Catching a deadlock
+
+A deadlock parks every task with no timer that could wake one, so by default
+a deadlocked `#[sim_test]` hangs. Set `AUTUMN_SIM_LIVENESS_BUDGET_SECS` to arm
+a watchdog: a virtual-time timeout around the test body. Because the paused
+runtime advances straight to the next timer when every task is parked, a
+deadlock reaches the watchdog in microseconds of real time, and the test fails
+with a `sim liveness` panic and its replay line.
+
+```bash
+AUTUMN_SIM_LIVENESS_BUDGET_SECS=31536000 cargo test -p my-crate sim_ -- --test-threads=1
+```
+
+The watchdog is off by default because of how the paused clock works: it also
+advances while a task waits on something outside the runtime, such as a lock
+that a test on another thread holds, or real I/O. So arm it only where sim
+tests run one at a time (`--test-threads=1`) and do no real I/O. A busy loop
+that never parks keeps the runtime from advancing, so the watchdog does not
+detect it; an `always!` invariant is the tool for that.
+
 ---
 
 ## Worked example: a real retry-storm bug
@@ -241,15 +427,9 @@ enqueuing them.
 ```rust
 #[sim_test]
 async fn retries_are_not_synchronized_under_load(mut sim: Sim) {
-    // The retry jitter reads `state.entropy()` (see "Deterministic
-    // identifiers" above), so it needs a seeded source explicitly wired in
-    // to actually replay from `AUTUMN_SIM_SEED` — omitting this is a real
-    // gap Codex review caught in this test's first draft.
-    sim.build(
-        TestApp::new()
-            .plugin(StormProbeJobPlugin)
-            .with_entropy(SeededEntropy::new(sim.seed)),
-    );
+    // The retry jitter reads `state.entropy()`, which `sim.build` seeds
+    // from `sim.seed` (see "Deterministic identifiers" above).
+    sim.build(TestApp::new().plugin(StormProbeJobPlugin));
 
     for id in 0..STORM_SIZE {
         StormProbeJob::enqueue(StormArgs { id }).await.unwrap();
@@ -292,16 +472,56 @@ immediate 0ms retry). See
 
 ---
 
+## A worked example in an app
+
+`examples/reddit-clone/tests/sim_hot_rank.rs` is the smallest complete shape of
+an application `#[sim_test]`: it mounts a route on the sim's paused runtime,
+walks 48 virtual hours in checkpoints, and asserts the app's hot-rank decay
+curve through the ordinary [`Clock`] extractor rather than around it. It uses
+`always!` for the hard invariants and `sometimes!` for reachability, and it
+arranges two deliberately-separated input bands so that
+[`assert_all_sometimes_satisfied`](https://docs.rs/autumn-web/latest/autumn_web/sim/assert/fn.assert_all_sometimes_satisfied.html)
+holds at every seed — the pattern to copy when you want a single-run
+non-vacuity check rather than a sweep.
+
 ## What's virtualized (and what isn't)
 
 | Source | Sim treatment |
 |---|---|
 | Wall-clock time (`Utc::now()` via the `Clock` extractor) | Virtual, driven by `Sim::advance` |
 | Async timers (`tokio::time::sleep`, job backoff, scheduler ticks) | Virtual, via a paused current-thread Tokio runtime |
+| Elapsed / monotonic time (`state.monotonic()`, the `Clock` extractor's `.monotonic()`) | Virtual, driven by `Sim::advance` — but a raw `std::time::Instant` is **not** (see below) |
 | Scheduling of autumn's own background work (jobs, scheduler, commit hooks) | Deterministic, drained by `Sim::run_to_idle` |
-| Framework-minted IDs (job IDs, request IDs, idempotency keys, sessions) | Seeded via the `Entropy` seam |
-| Database | **Boundary** — real in-process SQLite, fault-injected at the connection level via `Chaos`, not simulated at the SQL-dialect level |
+| Framework-minted IDs (job IDs, request IDs, idempotency keys, sessions) | Seeded from `sim.seed` via the `Entropy` seam |
+| Database | **Boundary** — real in-process SQLite, fault-injected at the connection level via `Chaos` (by probability) or `FaultPlan` (by checkout ordinal), not simulated at the SQL-dialect level |
 | Third-party network (SMTP, LLM calls, outbound HTTP) | **Boundary** — mocked/fault-injected via `Chaos`/`sim::llm`, not a full network simulator |
+
+### Keeping your own code deterministic
+
+Tokio's paused runtime virtualizes `tokio::time::Instant` — **not**
+`std::time::Instant`. So a handler or job that measures how long something took
+with `std::time::Instant::now()` reads the real machine clock even inside a
+`#[sim_test]`, and two runs of the same seed disagree. Read time through the
+seams instead:
+
+| Instead of | Use |
+|---|---|
+| `chrono::Utc::now()` | `state.clock().now()`, or the `Clock` extractor in a handler |
+| `std::time::Instant::now()` (measuring elapsed) | `clock.monotonic()` for the start (the extractor snapshots at request start) and `state.monotonic()` for the closing read, then `MonotonicInstant::saturating_duration_since` |
+| `std::time::Instant::now()` (a deadline whose counterparty is `tokio::time::sleep`) | `tokio::time::Instant::now()` — already virtual under the paused runtime |
+| `std::time::SystemTime::now()` | `autumn_web::time::clock_unix_secs(clock)` / `clock_unix_duration(clock)` |
+| `uuid::Uuid::new_v4()` | `state.entropy().uuid_v4()`, or the `Rng` extractor in a handler |
+
+If you write a custom `impl ClockSource` whose `now()` is virtual, you **must**
+also override `monotonic()`. The trait ships a default body that reads the real
+process-monotonic clock — that keeps every pre-existing implementation compiling
+and behaving exactly as before, but it means a virtual clock that forgets to
+override it silently reports real elapsed time.
+
+The framework holds itself to the same rule on the modules listed in
+`scripts/check-determinism-gate.sh`, where a clippy deny-lint enforces it; see
+CONTRIBUTING.md's "Determinism seam gate" for the enforced subset and the parts
+of the framework that are not on the seam yet.
 
 A sim-only green run proves your orchestration, timing, ordering, and identity
 logic — it is **not** a substitute for testcontainer integration tests against

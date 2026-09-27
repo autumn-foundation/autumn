@@ -44,6 +44,52 @@ Chromium `system-tests` lanes (those run in dedicated CI jobs); `cargo test -p
 <pkg>` remains fine for iterating on a single crate — just run
 `./scripts/pre-push-check.sh` before you push.
 
+In CI that blocking gate is **sharded across runners**, so a red PR points at
+one of several jobs rather than a single `Test (<os>)`: `test` runs the
+workspace suite, `trybuild` runs `compile_fail::` in four shards,
+`test-features` runs one job per non-default feature set, and `test-docker`
+runs the Linux testcontainer sweep. `Test suite` (`test-gate`) is the
+aggregate check that must be green. Nothing about how you *write* a test
+changes — see CLAUDE.md "CI test sharding" for the two cases that do matter
+(renaming a `compile_fail.rs` test function, and what branch protection should
+require).
+
+## Changelog notes
+
+A release note does **not** go into `CHANGELOG.md`. It goes into its own file:
+
+```
+changelog.d/<slug>.md
+```
+
+Every PR used to write its note to the top of the `## [Unreleased]` section.
+That is the same few lines every other open PR writes to, so every PR
+conflicted with every other PR, and the conflict was never about the code. A
+fragment is a file of its own, which two PRs never both edit.
+
+A fragment holds the markdown the section holds — a `### <Kind>` heading and
+its bullets:
+
+```markdown
+### Added
+
+- **money:** typed `Money<C>` and an enforced double-entry ledger
+  (issue #1837). `Money<Usd>` plus `Money<Eur>` does not compile.
+```
+
+Write one for a change a user of the framework can see. Skip it for an
+internal refactor that changes nothing on the outside.
+
+A breaking entry keeps the `**Breaking:**` marker and links its migration
+guide, `docs/migrations/next.md`. The migration-guide gate reads the fragments
+together with the changelog, so a break without a guide fails the PR that makes
+it, not the release that ships it.
+
+`./scripts/check-changelog-fragments.sh` gates the shape, and fails a PR that
+edits `CHANGELOG.md`. `./scripts/update-changelog.sh` folds the fragments into
+the changelog when a release is cut. See
+[`changelog.d/README.md`](changelog.d/README.md).
+
 ## Generator conformance gate
 
 Autumn's headline DX promise is that `autumn new` and `autumn generate` emit
@@ -54,17 +100,47 @@ code that **compiles, boots, and serves**. The tests that prove this live in
 |------|------|----------------|
 | `generated_project_compiles_runs_and_serves` | `e2e.rs` | `autumn new` → `cargo build` + HTTP responses |
 | `generated_scaffold_cargo_checks` | `generate.rs` | `generate scaffold` → `cargo check --tests` |
+| `generated_sqlite_scaffold_cargo_checks` | `generate.rs` | SQLite-configured scaffold (`Uuid`/`decimal`/`enum`/`DateTime`/`Attachment`/`json`) → `cargo check`. Not `--all-targets`: the scaffold smoke test is Postgres-only until #1905 (#1924) |
 | `generated_scaffold_config_cargo_checks` | `generate.rs` | config-driven scaffold → `cargo check --tests` |
 | `generated_scaffold_serves_posts_index_and_json_api` | `generate.rs` | scaffold + Postgres migrations + live HTTP |
+| `generated_constrained_scaffold_enforces_validation_end_to_end` | `generate.rs` | scaffold DSL `{…}` constraints + Postgres + live HTTP: rendered HTML5 attributes, 422 + inline errors, nothing stored (#1388) |
 | `console_bare_playground_target_compiles_untouched` | `integration/console.rs` | `autumn console` first-run scaffold → `cargo check --bin playground` |
 | `console_playground_target_compiles_with_a_repository_round_trip` | `integration/console.rs` | playground + `repo.find_all()` → `cargo check --bin playground` |
 | `console_run_exits_non_zero_when_the_database_is_unreachable` | `integration/console.rs` | `autumn console` propagates config/connection failures non-zero |
 | `console_run_surfaces_a_compile_error_in_the_playground` | `integration/console.rs` | a broken playground edit surfaces cargo diagnostics, non-zero |
+| `encrypted_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` scaffold → `cargo check --tests` |
+| `encrypted_api_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` + `--api` → `cargo check --tests` |
+| `encrypted_live_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` + `--live` → `cargo check --tests` |
+| `encrypted_nested_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` + `--belongs-to` → `cargo check --tests` |
+| `encrypted_admin_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` + `generate admin` (wired in) → `cargo check --tests` |
+| `constrained_scaffold_cargo_checks` | `integration/scaffold_validation.rs` | `{min,max}`/`{email}`/`{url}`/nullable-bound scaffold → `cargo check --tests` (#1388) |
+| `plugin_add_first_party_scaffolds_cargo_check` | `generate.rs` | `autumn plugin add` for every first-party plugin into its own fresh scaffold → `cargo check --all-targets` (#1606) |
+| `api_scaffold_cargo_checks` | `integration/api_scaffold.rs` | `--api` scaffold → `cargo check --tests` |
+| `scaffolded_app_passes_routes_audit_gate` | `integration/cloud_native_scaffold.rs` | fresh `autumn new` app passes `autumn routes audit` unmodified (#2154) |
+| `scaffolded_api_app_passes_routes_audit_gate` | `integration/cloud_native_scaffold.rs` | fresh `autumn new --api` app passes `autumn routes audit` unmodified (#2154) |
+| `unscoped_position_generated_project_cargo_checks` | `integration/generate_position_scaffold.rs` | `{position}` scaffold → `cargo check --tests` |
+| `scoped_position_generated_project_cargo_checks` | `integration/generate_position_scaffold.rs` | scoped `{position}` scaffold → `cargo check --tests` |
+| `soft_delete_position_generated_project_cargo_checks` | `integration/generate_position_scaffold.rs` | `{position}` + soft-delete scaffold → `cargo check --tests` |
+| `belongs_to_scaffold_cargo_checks` | `integration/scaffold_belongs_to.rs` | `--belongs-to` scaffold → `cargo check --tests` |
+| `bulk_delete_generated_project_cargo_checks` | `integration/scaffold_bulk_delete.rs` | bulk-delete scaffold → `cargo check --tests` |
+| `richtext_scaffold_cargo_checks` | `integration/scaffold_rich_text.rs` | `{rich_text}` scaffold → `cargo check --tests` |
+| `searchable_scaffold_cargo_checks` | `integration/scaffold_search.rs` | `--searchable` scaffold → `cargo check --tests` |
+| `trash_generated_project_cargo_checks` | `integration/scaffold_trash.rs` | soft-delete trash scaffold → `cargo check --tests` |
+| `linked_seed_binary_cargo_checks` | `integration/seed_model_linking.rs` | scaffolded model linked into `src/bin/seed.rs` → `cargo check --tests` (#1718) |
+| `serve_daemon_start_status_stop_over_unix_socket` | `integration/serve.rs` | fresh scaffold's `autumn serve --daemon` lifecycle over a Unix socket |
+| `generated_form_for_scaffold_cargo_checks` | `integration/scaffold_form_for.rs` | `form_for` view scaffold → `cargo check --tests` |
+| `generated_scaffold_with_missing_reference_target_cargo_checks` | `integration/scaffold_form_for.rs` | `{references}` with a missing target falls back to a number input → `cargo check --tests` |
 
-The four `console.rs` entries compile into the consolidated `cli_tests` binary,
-whose only other CI `--ignored` invocation filters on `offsite`. They are
-therefore named **explicitly** in `.github/workflows/generator-conformance.yml`;
-a new `#[ignore]`d console test that is not added there will never run in CI.
+The `console.rs`, `scaffold_encrypted.rs`, `scaffold_validation.rs`, and the 15
+rows above compile into the consolidated `cli_tests` binary. `ci.yml`'s Docker
+sweep explicitly `--skip`s each of their tests **by exact name** — never by
+module prefix, which would also silently swallow any Docker test later added
+to the same file — because they scaffold and cargo-check/build/run a fresh
+project instead of touching Docker. They are therefore named **explicitly**
+in `.github/workflows/generator-conformance.yml`; a new `#[ignore]`d,
+non-Docker test in that binary needs BOTH a `--skip <exact name>` line in
+`ci.yml`'s sweep AND its own step here, or it either runs in the wrong
+(Docker) step or never runs at all (issue #1945).
 
 ### Why `#[ignore]`?
 
@@ -73,15 +149,19 @@ These tests carry `#[ignore]` annotations so that `cargo test --workspace`
 everyday development. **The `#[ignore]` label means "CI-gated, not
 abandoned."**
 
-The `.github/workflows/generator-conformance.yml` workflow runs all four
+The `.github/workflows/generator-conformance.yml` workflow runs each of these
 tests explicitly via `-- --ignored --exact`. It fires on every PR or push
 that touches:
 
 - `autumn-cli/src/generate/**` (generator logic)
+- `autumn-cli/src/plugin/**` (`autumn plugin add` catalog, mounts, install planning)
 - `autumn-cli/src/templates/**` (scaffold/model/auth templates)
 - `autumn-cli/src/new.rs` (project scaffolding)
 - `autumn/src/lib.rs` or `autumn/src/prelude.rs` (public API surface)
 - `autumn-macros/**` (proc-macro API surface)
+- `autumn-admin-plugin/**`, `autumn-cache-redis/**`, `autumn-media-plugin/**`,
+  `autumn-search/**`, `autumn-storage-s3/**` (the crates whose mount snippets
+  the `plugin add` gate compiles)
 
 A weekly scheduled run also catches breakage that arrives through transitive
 dependency updates rather than direct file edits.
@@ -97,10 +177,12 @@ cargo test -p autumn-cli --test e2e    generated_project_compiles_runs_and_serve
 cargo test -p autumn-cli --test generate generated_scaffold_cargo_checks             -- --ignored --exact
 cargo test -p autumn-cli --test generate generated_scaffold_config_cargo_checks      -- --ignored --exact
 cargo test -p autumn-cli --test generate generated_scaffold_serves_posts_index_and_json_api -- --ignored --exact
+cargo test -p autumn-cli --test generate generated_constrained_scaffold_enforces_validation_end_to_end -- --ignored --exact
+cargo test -p autumn-cli --test cli_tests integration::scaffold_validation::constrained_scaffold_cargo_checks -- --ignored --exact
 ```
 
-The last test requires Docker (for the Postgres testcontainer) and the
-`diesel` CLI on `PATH`.
+The two `--test generate` Postgres gates require Docker (for the Postgres
+testcontainer) and the `diesel` CLI on `PATH`.
 
 ### What triggers a failure?
 
@@ -130,14 +212,27 @@ Per AC2, the gate covers modules that run **per request** or in
 `nested_form`), session and idempotency stores, the scheduler and job queues,
 channels, inbound-mail webhook parsing (`inbound_mail`, which turns unauthenticated
 RFC 5322 / MIME bytes into typed values), the shared saturating-arithmetic helpers
-those modules call (`time_math`), and the per-request middleware stack. These are
-the 30 files listed in the `REQUEST_PATH_MODULES` array in
+those modules call (`time_math`), the per-request middleware stack, and the
+failure-capsule capture path (`autumn/src/capsule/capture.rs`, `wire.rs`,
+`record_db.rs`: they tee a live request's body and its database connection, so
+a panic there would take down the very request they exist to record), and the
+sandboxed-plugin runtime (`autumn/src/plugin_sandbox/host.rs`, `wire.rs`,
+`plugin.rs`: they run an artifact the operator explicitly did not audit, and the
+lane's whole promise is that nothing a hostile guest does can abort the host
+process), and the generated-UI pipeline (`autumn/src/constela/*`: it parses,
+validates, evaluates and renders a document a language model wrote, so every
+panic in it is reachable by whoever can shape that model's prompt — an
+out-of-range index there is a 500 on demand, not an injection, but just as much
+a vulnerability). These are the files listed in the `REQUEST_PATH_MODULES` array in
 `scripts/check-panic-gate.sh`, each entry carrying the Cargo feature that gates
 its `mod` declaration.
 
 **Honest scoping — the manifest is the *enforced* subset, not the whole request
-path.** The 30 modules are the files the gate enforces today, not a claim that
-they are the *only* per-request code. Other unambiguously per-request or
+path.** The modules in that array are the files the gate enforces today, not a
+claim that they are the *only* per-request code. (Stated without a count on
+purpose: the manifest grows every time a batch is audited, and a number written
+here goes stale the first time it does — `check-panic-gate.sh` prints the live
+one on every run.) Other unambiguously per-request or
 framework-owned modules are **not yet gated** and still contain production-path
 panics — known examples include `router.rs`, `etag.rs`, `security/rate_limit.rs`,
 `security/headers.rs`, `sse.rs`, and the `csrf` / `negotiate` / `range` /
@@ -372,6 +467,174 @@ the headers to get green. Pin the toolchain action to the previous version
 (`dtolnay/rust-toolchain@<ver>`), land the PR, and file a burn-down issue for the
 new findings. Losing a lint is permanent; a pin is a week.
 
+## Determinism seam gate
+
+Autumn's simulation testing (`#[sim_test]`, [#1797][issue-1797]) rests on one
+promise: **a run is a pure function of its seed**. That holds only while the
+framework reads time and mints identifiers through its *injected* seams. A single
+`Instant::now()` on a code path a simulation touches makes the run depend on the
+machine it ran on, and the failure mode is silent — the test still passes, it
+just stops proving anything.
+
+The gate makes that a compile error instead of a code-review hope.
+
+### The seams, and what to reach for
+
+| Instead of | Use | Reachable from |
+|---|---|---|
+| `chrono::Utc::now()` | `state.clock().now()` | anything holding an `AppState`; the `Clock` extractor in a handler |
+| `std::time::Instant::now()` (measuring elapsed) | `clock.monotonic()` for the start reading and `state.monotonic()` for the closing one, then `MonotonicInstant::saturating_duration_since`. The `Clock` extractor **snapshots** at request start, so calling `Clock::monotonic` twice returns the same value | same |
+| `std::time::Instant::now()` (a deadline whose counterparty is `tokio::time::sleep`) | `tokio::time::Instant::now()` | anywhere — tokio's paused runtime already virtualizes it |
+| `std::time::SystemTime::now()` | `time::clock_unix_secs(clock)` / `time::clock_unix_duration(clock)` | same |
+| `uuid::Uuid::new_v4()` | `state.entropy().uuid_v4()`; the `Rng` extractor in a handler | same |
+
+Two notes on the monotonic seam, because they are the parts that surprise people:
+
+- **`tokio::time::pause()` does not virtualize `std::time::Instant`.** Only
+  `tokio::time::Instant` moves with the paused timer wheel. That is precisely why
+  a raw `Instant::now()` inside a `#[sim_test]` reads the real machine clock, and
+  why `MonotonicInstant` exists.
+- **`SystemClock` still reads a real `std::time::Instant`.** `MonotonicInstant`
+  is an offset from its source's own origin, so a *virtual* clock can produce one
+  at any point — but in production the origin is a process-global `Instant`, so an
+  NTP step can never make an elapsed duration negative. The seam does not trade
+  monotonicity for testability.
+
+When no clock is reachable at all — a constructor that runs before one is
+installed, a free function with no state argument — `time::monotonic_now()` is the
+sanctioned fallback. It is real time and never follows a simulation, so prefer
+threading a real handle whenever that is possible.
+
+### What the gate covers
+
+`clippy.toml`'s `disallowed-methods` array bans the four calls workspace-wide,
+and each gated module re-denies `clippy::disallowed_methods` for its production
+code path:
+
+```rust
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+```
+
+**The polarity is inverted from the panic gate, deliberately.** The panic-class
+lints are `restriction`-group and allow-by-default, so a module opts in simply by
+denying them. `clippy::disallowed_methods` is *warn*-by-default, so populating the
+config would arm it in all 24 workspace members at once — hundreds of
+pre-existing sites in crates that are not part of the determinism story (the
+`examples/*`, `autumn-cli`'s code generators). The workspace therefore
+**grandfathers** the lint — `[workspace.lints.clippy] disallowed_methods =
+"allow"` in the root `Cargo.toml`, plus a package-level `[lints.clippy]` table in
+each crate that does not opt into the workspace table — and a module opts *in* by
+carrying the header above.
+
+**Honest scoping — the manifest is the *enforced* subset.** The modules listed in
+`GATED_MODULES` in `scripts/check-determinism-gate.sh` are the ones enforced
+today, not a claim that the rest of the crate is on-seam. `autumn/src` still
+contains roughly 150 ungated production call sites. The highest-value next batch
+is the code whose elapsed-time reads gate *control flow* or are observable in a
+response: `idempotency.rs` (replay-window TTLs — note its `IdempotencyEntry`
+exposes `expires_at: Instant` as a **public** field, so migrating it is a
+breaking change and needs a migration-guide entry), `circuit_breaker.rs`
+(open/half-open transitions), and the per-request `middleware/access_log.rs`,
+`middleware/metrics.rs`, and `middleware/server_timing.rs` timers. Then
+`webhook_outbound.rs`, `notifications.rs`, `storage/local.rs`, and the rest. The
+manifest grows monotonically and never shrinks (`MODULE_COUNT_FLOOR`); do not
+read a module's absence from it as a promise that it is on-seam.
+
+Known-open gaps, named rather than hidden:
+
+- **`db::run_instrumented`** is a published `pub` function taking no state, so
+  threading a clock in would break the public API. Its `Instant::now()` carries a
+  per-site `#[allow]` with that reason; the instant never escapes (only
+  `elapsed_ms` does) and the framework has no caller of its own.
+- **`#[repository]`-generated writes.** The macro emits
+  `chrono::Utc::now()` for soft-delete and timestamp columns, and the generated
+  repository holds only a pool — no `AppState`, so no clock is reachable. The
+  expansion carries its own `#[allow(clippy::disallowed_methods, reason = "…")]`
+  so it never trips the lint in the *calling* crate, whose author did not write
+  it. That is a suppression, not a fix: a soft-deleted row's `deleted_at` is
+  still non-deterministic under simulation.
+- **`app.rs`'s TLS `now_unix`** reads real wall time on purpose. Certificate
+  validity is a fact about the real world; a simulation clock pinned to the sim
+  epoch must not be able to declare a live certificate expired.
+
+**Grandfathered crates.** "In-scope crates" is `autumn` (published as
+`autumn-web`) and nothing else today. Every other workspace member is
+grandfathered by a package-level `[lints.clippy] disallowed_methods = "allow"`
+(or by the workspace table, for members that opt into it), and several of them do
+carry production off-seam sites: `autumn-media-plugin` (room/session ids and
+timestamps), `autumn-admin-plugin`, `autumn-cache-redis`, and `autumn-cli`. That
+is a scoping decision, not an audit result — the sim drives an `autumn` app, so
+`autumn` is where determinism is load-bearing first. Gating a plugin crate means
+migrating its sites, adding the header, and adding it to `GATED_MODULES`.
+
+Exempt surfaces mirror the panic gate: `#[cfg(test)]` code (the
+`cfg_attr(not(test), …)` scope handles it automatically), benches, examples,
+`autumn-cli`, and application-author code.
+
+### What the script checks
+
+`scripts/check-determinism-gate.sh` is the gate on the gate, and it deliberately
+**never greps for the banned calls** — clippy does the detection, because clippy
+resolves `use chrono::Utc as U; U::now()` and proc-macro expansions that a grep
+cannot, and, decisively, clippy does *not* see string literals. A grep gate would
+flag the ~30 templated `Utc::now()` occurrences inside `autumn-cli`'s code
+generators and the `include_dir!`-embedded starter apps, which are generated-app
+*text*, not compiled code; "fixing" those would corrupt the apps the CLI emits.
+
+The script guards the things clippy cannot report on itself:
+
+- every manifest module exists, carries the `autumn-determinism-gate:` marker,
+  and the marker is **immediately followed** by the header;
+- **structural header shape**: after stripping comments and whitespace it must
+  open exactly `#![cfg_attr(not(test), deny(` and name every required lint, so a
+  widened predicate like `all(not(test), any())` — whose deny never compiles — or
+  a `not(test)` that lives only in a comment is rejected;
+- **anti-spoof, tree-wide**: no inner `#![allow(…)]` / `#![expect(…)]` /
+  `#![cfg_attr(…, allow(…))]` anywhere under `autumn/src` may re-permit the lint
+  or a blanket group containing it, outside a `#[cfg(test)]` scope;
+- **per-site allow hygiene**: an `#[allow(clippy::disallowed_methods)]` in a gated
+  module must carry a non-empty `reason = "…"` (an empty string fails);
+- **reverse manifest**: a marker-carrying file that is not listed is an error;
+- **config completeness**: `clippy.toml` still bans all four paths, each with a
+  non-empty reason, and still pins `msrv`. Emptying the array would otherwise
+  disarm every header at once while the whole tree stayed green;
+- **no crate-local `clippy.toml`**: clippy reads the nearest ancestor config and
+  stops, so a crate-local file *shadows* the root one entirely — silently
+  removing both the ban and the MSRV pin;
+- **workspace grandfather present**: without it the array arms every member, CI
+  fails on hundreds of out-of-scope sites, and the pressure is to "fix" that by
+  emptying the array;
+- **feature reachability**: a gated module behind a non-default feature must have
+  that feature enabled by an enforcing `ci.yml` clippy lane, or its deny block is
+  never compiled.
+
+Run it locally — it needs no toolchain and finishes in about a second:
+
+```bash
+./scripts/check-determinism-gate.sh              # self-test, then the real check
+./scripts/check-determinism-gate.sh --self-test  # synthetic fixtures only
+./scripts/check-determinism-gate.sh --check-only # real tree only
+```
+
+Like the panic gate, it self-tests first, so a refactor that quietly defangs the
+checker fails immediately rather than years later on a real regression.
+
+### Adding a module to the gate
+
+1. Migrate its production call sites onto the seams (table above).
+2. Add the header block verbatim, right after the module's `//!` docs.
+3. Add `<path>:<feature>` to `GATED_MODULES` and bump `MODULE_COUNT_FLOOR`.
+4. Run `./scripts/check-determinism-gate.sh` and
+   `cargo clippy -p autumn-web --all-targets -- -D warnings`.
+
+[issue-1797]: https://github.com/autumn-foundation/autumn/issues/1797
+
 ## Fuzzing
 
 Autumn coverage-guides a set of [cargo-fuzz][cargo-fuzz] (libFuzzer) harnesses
@@ -382,7 +645,7 @@ so the fuzzers exercise the real parsers, not stubs.
 
 ### Targets
 
-There are five targets, one per parsing surface:
+There are six targets, one per parsing surface:
 
 | Target | Surface under test |
 |--------|--------------------|
@@ -391,8 +654,17 @@ There are five targets, one per parsing surface:
 | `headers` | request header parsing |
 | `session` | session cookie decode/verify |
 | `body` | request body decoding **and the inbound-mail parsers** |
+| `dns` | DNS wire-format parsing for the ACME DNS-01 propagation probe |
+| `sandbox` | the `.autumn-plugin` container, the manifest validator, and the NDJSON frames a sandboxed plugin writes |
 
 Each target has a committed seed corpus at `fuzz/corpus/<target>/`.
+
+`sandbox` splits its input on a NUL byte so one entry can carry a binary
+container and a text frame; a single-field entry drives all three decoders. Every
+byte it sees came out of an artifact the operator explicitly did not audit
+(issue #1609), which is why the surface is fuzzed rather than merely
+unit-tested — a length field in that container is chosen by the same person who
+chose the module.
 
 `body` multiplexes on its first input byte, so one target covers several
 parsers: urlencoded form decoding plus `inbound_mail`'s SES/SNS JSON reader, the
@@ -486,25 +758,51 @@ Reviewers should treat a new request-path parser with neither as incomplete.
 
 ## Supply chain (cargo-deny)
 
-The `supply-chain` CI job (`.github/workflows/ci.yml`) runs `cargo deny check
-advisories licenses sources` **twice** against a pinned cargo-deny (0.20.2):
-once on the checked-in `deny.toml` (the default + Postgres + additive CI feature
-graph) and once on `deny-sqlite.toml` (the mutually-exclusive sqlite backend
-graph). The two configs share the same advisories/licenses/sources policy — keep
-them in sync — and differ only in their `[graph]` features. All three checks —
-advisories (RustSec), licenses (allow-list, including dev- and build-dependency
-licenses), and sources (crate registries) — are **blocking** in both passes, so
-a PR that introduces a new advisory, an un-allowed license, or an unknown source
-registry will fail CI. The step-by-step for triaging a failing advisory (prefer
-a minimal fix; document an ignore with a reason and a review-by date only when
-no fix exists) lives in the header comment of `deny.toml`.
+The `supply-chain` CI job (`.github/workflows/ci.yml`) checks the dependency
+tree with a pinned cargo-deny (0.20.2) against two configs: the checked-in
+`deny.toml` (the default + Postgres + additive CI feature graph) and
+`deny-sqlite.toml` (the mutually-exclusive sqlite backend graph). The two
+configs share the same advisories/licenses/sources policy — keep them in sync —
+and differ only in their `[graph]` features. Licenses (allow-list, including
+dev- and build-dependency licenses) and sources (crate registries) run directly;
+all of it is **blocking**, so a PR that introduces a new advisory, an un-allowed
+license, or an unknown source registry fails CI. The step-by-step for triaging a
+failing advisory (prefer a minimal fix; document an ignore with a reason and a
+review-by date only when no fix exists) lives in the header comment of
+`deny.toml`.
+
+Advisories go through `scripts/check-advisories.sh` (issue #1600), which the
+**Publish Gate** runs too, so a release cannot be tagged while an unwaived
+RustSec advisory sits in the tree being published. Run it locally exactly as CI
+does:
+
+```bash
+./scripts/check-advisories.sh              # workspace, sqlite, scaffold, fuzz, island-flock graphs
+./scripts/check-advisories.sh --self-test  # prove the gate still rejects a CVE
+```
+
+It audits a third graph beyond the two above: `autumn-web` under the `deny.toml`
+that `autumn new` writes into a generated app (`autumn-cli/src/templates/deny.toml.tmpl`),
+so an advisory the scaffold's shipped waiver set does not cover fails here
+rather than in a user's first CI run. Its advisory-database fetch retries and
+**fails closed**; the audits then run `--offline`, so a failure always names an
+advisory rather than a network blip. `--self-test` audits a throwaway crate with
+a deliberately injected known-vulnerable dependency and requires the gate to
+reject it, then to accept it once — and only once — that id is waived.
 
 **Scope.** The gate covers the shipped root workspace — the default plus
 additive Postgres feature graph (`deny.toml`) and the mutually-exclusive sqlite
 backend graph (`deny-sqlite.toml`), including dev- and build-dependency
-licenses. The repository's separate *excluded* sub-workspaces — `fuzz/` and
+licenses — plus, for advisories only, autumn-web's tree under the policy
+`autumn new` ships (`autumn-cli/src/templates/deny.toml.tmpl`). It also covers
+the repository's separate *excluded* sub-workspaces — `fuzz/` and
 `examples/island-flock`, which each declare their own `[workspace]` and are
-excluded from the root `Cargo.toml` — are non-shipped harnesses/examples and are
-not gated here. Adding a per-sub-workspace cargo-deny pass (each needs its own
-config, and `fuzz/Cargo.lock` is currently out of sync with its manifest) is a
-possible follow-up.
+excluded from the root `Cargo.toml` for their own build reasons (a
+nightly/ASAN toolchain and a wasm32-only target, respectively), but are still
+real, shipped CI surface: `fuzz` is compiled and run by every `fuzz.yml` job,
+and `island-flock`'s compiled wasm/js bundle is committed and served by the
+`flock` example. Each has its own narrower `deny.toml`
+(`fuzz/deny.toml`, `examples/island-flock/deny.toml` — advisories + sources
+only; licenses aren't gated on either yet, see each file's header) audited by
+`audit_satellite_graphs` in `scripts/check-advisories.sh`. Triage a failing
+satellite check against that satellite's own `deny.toml`, not the root one.
