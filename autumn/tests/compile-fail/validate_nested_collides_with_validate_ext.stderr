@@ -1,0 +1,13 @@
+error[E0034]: multiple applicable items in scope
+  --> tests/compile-fail/validate_nested_collides_with_validate_ext.rs:23:10
+   |
+23 | #[derive(Validate)]
+   |          ^^^^^^^^ multiple `validate` found
+   |
+note: candidate #1 is defined in an impl of the trait `Validate` for the type `Address`
+  --> tests/compile-fail/validate_nested_collides_with_validate_ext.rs:17:10
+   |
+17 | #[derive(Validate)]
+   |          ^^^^^^^^
+   = note: candidate #2 is defined in an impl of the trait `autumn_web::ValidateExt` for the type `T`
+   = note: this error originates in the derive macro `Validate` (in Nightly builds, run with -Z macro-backtrace for more info)

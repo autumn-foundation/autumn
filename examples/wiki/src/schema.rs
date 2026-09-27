@@ -9,6 +9,25 @@ diesel::table! {
 }
 
 diesel::table! {
+    collections (id) {
+        id -> Int8,
+        title -> Text,
+        created_at -> Timestamp,
+    }
+}
+
+diesel::table! {
+    collection_links (id) {
+        id -> Int8,
+        collection_id -> Int8,
+        label -> Text,
+        url -> Text,
+        position -> Int4,
+        created_at -> Timestamp,
+    }
+}
+
+diesel::table! {
     pages (id) {
         id -> Int8,
         title -> Text,

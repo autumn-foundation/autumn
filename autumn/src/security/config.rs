@@ -68,7 +68,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use hmac::{Hmac, Mac};
 use serde::Deserialize;
+use sha2::Sha256;
 
 // ── Signing secret contract ────────────────────────────────────────────────
 
@@ -237,22 +239,36 @@ pub fn validate_signing_secret(
 
 /// HMAC-SHA256 of `message` under `key`, returned as lowercase hex.
 ///
+/// Re-keys a fresh `Hmac<Sha256>` from `key` on every call (via `keyed_mac`),
+/// so it is the right tool for a one-off or rarely-repeated signature — webhook
+/// delivery signing, mail, alerts, `read_your_writes`, cluster wire messages —
+/// but not for a key that signs or verifies many messages in a request's
+/// lifetime. `ResolvedSigningKeys::sign`/`ResolvedSigningKeys::verify` (the
+/// CSRF and session-cookie hot path, driven every request regardless of
+/// method) instead keep a pre-keyed `Hmac<Sha256>` in `current_mac`/
+/// `previous_macs` and clone it per call, skipping the ipad/opad
+/// `sha2::sha256::compress256` calls `Hmac::new_from_slice` would otherwise
+/// redo on every request. See `ResolvedSigningKeys`'s field docs for the
+/// measured before/after.
+///
+/// This used to hex-encode the 32-byte MAC output one byte at a time with
+/// `write!(acc, "{b:02x}")`, routing every byte through `core::fmt::write` ->
+/// `Formatter::pad_integral` -> `LowerHex::fmt` instead of a direct nibble
+/// lookup — the only hand-rolled byte-to-hex encoder in this crate; every
+/// other call site (`ledger.rs`, `migrate.rs`, `sigv4.rs`, ...) already used
+/// `hex::encode` for the identical operation. Diffing `hmac_sha256_hex`'s own
+/// inclusive Ir directly against itself, old fold vs. `hex::encode`, isolates
+/// the fold's cost: 136,026,523 -> 99,533,081 (-36,493,442 Ir, -26.8% of the
+/// function's own cost, measured when this function was still what
+/// `ResolvedSigningKeys::verify` called on every request).
+///
 /// # Panics
 ///
 /// This should not panic because HMAC accepts keys of any length. A panic would
 /// indicate a broken crypto crate invariant.
 #[must_use]
 pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(message);
-    let bytes = mac.finalize().into_bytes();
-    bytes.iter().fold(String::with_capacity(64), |mut acc, b| {
-        use std::fmt::Write as _;
-        let _ = write!(acc, "{b:02x}");
-        acc
-    })
+    mac_hex(&keyed_mac(key), message)
 }
 
 /// Constant-time string comparison for HMAC verification.
@@ -286,30 +302,62 @@ pub struct ResolvedSigningKeys {
     /// use `current`; tokens carrying a `previous` HMAC continue to verify until
     /// removed (see docs/guide/signing-secrets.md).
     pub previous: Vec<Arc<[u8]>>,
+    /// `current` pre-keyed into an `Hmac<Sha256>`, built once here instead of
+    /// inside every [`Self::sign`]/[`Self::verify`] call. `Hmac::new_from_slice`
+    /// XORs the key into the block-sized ipad/opad pads and absorbs each into its
+    /// own `Sha256` state — one `compress256` call per pad. Cloning an
+    /// already-keyed `Hmac` just copies those two small digest states (no
+    /// hashing), so building it once at startup and cloning it per call skips
+    /// those two compressions on every `sign`/`verify` — hot per-request paths
+    /// via `CsrfLayer` and session-cookie signing — while a rarely-called site
+    /// like a webhook signature still goes through the simpler
+    /// [`hmac_sha256_hex`] free function.
+    current_mac: Hmac<Sha256>,
+    /// `previous`, pre-keyed the same way as `current_mac`.
+    previous_macs: Vec<Hmac<Sha256>>,
+}
+
+/// HMAC-SHA256 of `message` under an already-keyed `mac`, hex-encoded.
+/// `mac` is cloned rather than mutated in place: cloning a keyed `Hmac` just
+/// copies its ipad/opad digest states (cheap), whereas mutating the shared
+/// instance directly would need synchronization since `ResolvedSigningKeys` is
+/// shared via `Arc` across concurrent requests.
+fn mac_hex(mac: &Hmac<Sha256>, message: &[u8]) -> String {
+    let mut mac = mac.clone();
+    mac.update(message);
+    hex::encode(mac.finalize().into_bytes())
+}
+
+fn keyed_mac(key: &[u8]) -> Hmac<Sha256> {
+    <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length")
 }
 
 impl ResolvedSigningKeys {
     /// Build from raw byte vectors.
     pub fn new(current: Vec<u8>, previous: Vec<Vec<u8>>) -> Self {
+        let current_mac = keyed_mac(&current);
+        let previous_macs = previous.iter().map(|k| keyed_mac(k)).collect();
         Self {
             current: current.into(),
             previous: previous.into_iter().map(|v: Vec<u8>| v.into()).collect(),
+            current_mac,
+            previous_macs,
         }
     }
 
     /// HMAC-SHA256 of `message` under the current key, hex-encoded.
     pub fn sign(&self, message: &[u8]) -> String {
-        hmac_sha256_hex(&self.current, message)
+        mac_hex(&self.current_mac, message)
     }
 
     /// Returns `true` when `hex_sig` is a valid HMAC-SHA256 of `message` under
     /// any key (current first, then previous). All comparisons are constant-time.
     pub fn verify(&self, message: &[u8], hex_sig: &str) -> bool {
-        if ct_eq_str(&hmac_sha256_hex(&self.current, message), hex_sig) {
+        if ct_eq_str(&mac_hex(&self.current_mac, message), hex_sig) {
             return true;
         }
-        for prev in &self.previous {
-            if ct_eq_str(&hmac_sha256_hex(prev, message), hex_sig) {
+        for prev_mac in &self.previous_macs {
+            if ct_eq_str(&mac_hex(prev_mac, message), hex_sig) {
                 return true;
             }
         }

@@ -16,6 +16,7 @@ use std::path::Path;
 
 use super::dsl::FieldKind;
 use super::emit::Plan;
+use super::model::LOCK_VERSION_COLUMN;
 use super::naming::{pascal, snake};
 use super::schema_edit::{add_mod_declaration, singularize, update_main_rs};
 use super::{GenerateError, ensure_project_root, read_or_empty};
@@ -44,6 +45,22 @@ pub struct Column {
     /// constant default such as `DEFAULT 0`, which would collide on insert since
     /// the macros exclude `#[id]` from `NewX`.
     pub has_sequence_default: bool,
+    /// True when the column default is a plain integer literal (`DEFAULT 0`,
+    /// `DEFAULT 1`, `DEFAULT 0::integer`).
+    ///
+    /// [`has_default`](Self::has_default) only says a default *expression*
+    /// exists, which is not the same as "the database will supply a usable
+    /// value": `DEFAULT nullif(0,0)` reports a default and still violates a
+    /// `NOT NULL` constraint on every insert that omits the column. Anywhere a
+    /// decision depends on the default actually initializing the column — the
+    /// `#[lock_version]` annotation in [`render_model`] — it must read this
+    /// instead. Same reasoning as `has_sequence_default`: when the *content* of
+    /// the default matters, inspect it rather than trusting its presence.
+    ///
+    /// (A literal `DEFAULT NULL` never reaches here: Postgres normalizes a
+    /// constant-NULL default away, reporting no `column_default` at all, so
+    /// `has_default` is already false for it.)
+    pub default_is_integer_literal: bool,
     /// True when the column is a stored generated column
     /// (`GENERATED ALWAYS AS (...) STORED`). Such columns are read-only, so they
     /// are annotated `#[default]` to keep them out of inserts and updates.
@@ -180,6 +197,23 @@ pub fn plan_pull(
             )));
         }
 
+        // Issue #1318: a `lock_version` column normally comes back annotated, but
+        // `render_model` declines when annotating would leave the model with no
+        // insertable columns at all (the attribute drops it from `New{Model}`).
+        // Say so rather than letting the counter come back as a plain integer
+        // with the conflict check quietly missing.
+        if let Some(col) = table.columns.iter().find(|c| is_lock_version_column(c))
+            && !annotate_lock_version(&table.columns, col)
+        {
+            plan.warn(format!(
+                "table '{}' has a `{}` column, but it is the only insertable column — pulling it \
+                 as `#[lock_version]` would leave New{pascal_name} empty and the project would \
+                 not compile, so it came back as an ordinary integer with no conflict checking. \
+                 Add another column, or hand-write the attribute once the table has one.",
+                table.table, LOCK_VERSION_COLUMN,
+            ));
+        }
+
         // (a) src/models/<snake>.rs
         plan.create(
             models_dir.join(format!("{snake_name}.rs")),
@@ -301,6 +335,15 @@ pub fn render_model(pascal_name: &str, table: &str, columns: &[Column]) -> Strin
     for col in columns {
         if col.is_pk {
             out.push_str("    #[id]\n");
+        } else if annotate_lock_version(columns, col) {
+            // Issue #1318: `lock_version` is the framework's optimistic-locking
+            // counter, so pulling a table that has one must reproduce the
+            // attribute `generate model` would have emitted — otherwise a
+            // `db pull` of a greenfield-generated table silently downgrades the
+            // column to a plain editable integer, losing the conflict check and
+            // the derived `etag()`, and breaking the byte-identical round-trip
+            // property this function documents above.
+            out.push_str("    #[lock_version]\n");
         } else if is_write_excluded(col) {
             // Read-only / framework-managed columns are kept out of `NewX` and
             // the update set via `#[default]`: a `created_at` with a DB default,
@@ -328,6 +371,55 @@ fn inferred_table_name(pascal_name: &str) -> String {
 /// separately by `#[id]` (which takes precedence in `render_model`).
 fn is_write_excluded(col: &Column) -> bool {
     col.is_db_generated() || col.is_generated || (col.name == "created_at" && col.has_default)
+}
+
+/// Whether `col` should carry `#[lock_version]` in the pulled model.
+///
+/// [`is_lock_version_column`] answers "is this the counter"; this additionally
+/// asks whether annotating it would leave the model with **nothing** to insert.
+/// The attribute excludes the column from `New{Model}`, so on a degenerate table
+/// whose only non-key column is the counter, annotating produces an empty struct
+/// whose Diesel `Insertable` derive does not compile — turning a pulled project
+/// that used to build into one that doesn't. `db pull` mirrors a database it does
+/// not control, so it declines the annotation there rather than refusing the
+/// table; `plan_pull` records a warning so the downgrade is not silent. A
+/// greenfield-generated table can never hit this: `plan_model_with_options`
+/// refuses to emit a model with no insertable columns in the first place.
+fn annotate_lock_version(columns: &[Column], col: &Column) -> bool {
+    if !is_lock_version_column(col) {
+        return false;
+    }
+    columns
+        .iter()
+        .any(|other| !other.is_pk && !is_write_excluded(other) && !is_lock_version_column(other))
+}
+
+/// Whether an introspected column is the framework's optimistic-locking counter
+/// (issue #1318): the `lock_version` name, non-nullable, and an integer.
+///
+/// Mirrors [`super::model::is_lock_version_column`], which makes the same call
+/// on a DSL `Field`; the two must agree or `generate model` and `db pull` would
+/// disagree about the same table.
+fn is_lock_version_column(col: &Column) -> bool {
+    col.name == super::model::LOCK_VERSION_COLUMN
+        && !col.nullable
+        && matches!(col.kind, FieldKind::I32 | FieldKind::I64)
+        // `has_default` is load-bearing, not incidental. `#[lock_version]`
+        // excludes the column from `New{Model}`, so the INSERT stops naming it
+        // — and `db pull` deliberately emits no migration, so nothing here can
+        // add the default that would fill the gap. On a legacy table whose
+        // application supplied `lock_version` itself, annotating would turn
+        // every insert into a NOT NULL violation. A greenfield-generated table
+        // always carries `DEFAULT 0` (see `parse_model_metadata`), so the
+        // round-trip property still holds; a defaultless legacy column is
+        // pulled as the ordinary integer it has always been.
+        //
+        // It must be a real integer default, not merely *a* default: a
+        // `NOT NULL` column defaulted to a NULL-valued expression
+        // (`DEFAULT nullif(0,0)`) reports `has_default` and still fails every
+        // insert that omits it, so annotating would break a project that
+        // previously worked by always supplying the column.
+        && col.default_is_integer_literal
 }
 
 /// Build a `diesel::table!` block from introspected columns.
@@ -584,6 +676,7 @@ mod tests {
             is_pk,
             has_default: false,
             has_sequence_default: false,
+            default_is_integer_literal: false,
             is_generated: false,
             is_identity: false,
         }
@@ -599,6 +692,7 @@ mod tests {
             is_pk: true,
             has_default: true,
             has_sequence_default: true,
+            default_is_integer_literal: true,
             is_generated: false,
             is_identity: false,
         }
@@ -614,6 +708,7 @@ mod tests {
             is_pk: false,
             has_default: true,
             has_sequence_default: false,
+            default_is_integer_literal: false,
             is_generated: false,
             is_identity: false,
         }
@@ -930,6 +1025,7 @@ mod tests {
                     is_pk: true,
                     has_default: true,
                     has_sequence_default: false,
+                    default_is_integer_literal: false,
                     is_generated: false,
                     is_identity: false,
                 },
@@ -1034,6 +1130,7 @@ mod tests {
                     is_pk: false,
                     has_default: true, // e.g. DEFAULT 'draft'
                     has_sequence_default: false,
+                    default_is_integer_literal: false,
                     is_generated: false,
                     is_identity: false,
                 },
@@ -1045,6 +1142,7 @@ mod tests {
                     is_pk: false,
                     has_default: false,
                     has_sequence_default: false,
+                    default_is_integer_literal: false,
                     is_generated: true,
                     is_identity: false,
                 },
@@ -1166,6 +1264,7 @@ mod tests {
                     is_pk: true,
                     has_default: false,
                     has_sequence_default: false,
+                    default_is_integer_literal: false,
                     is_generated: false,
                     is_identity: false,
                 },
@@ -1201,6 +1300,7 @@ mod tests {
                     is_pk: true,
                     has_default: false,
                     has_sequence_default: false,
+                    default_is_integer_literal: false,
                     is_generated: false,
                     is_identity: true,
                 },
@@ -1212,6 +1312,7 @@ mod tests {
                     is_pk: false,
                     has_default: false,
                     has_sequence_default: false,
+                    default_is_integer_literal: false,
                     is_generated: false,
                     is_identity: true,
                 },
@@ -1244,6 +1345,7 @@ mod tests {
                     is_pk: false,
                     has_default: true,
                     has_sequence_default: true,
+                    default_is_integer_literal: true,
                     is_generated: false,
                     is_identity: false,
                 },
@@ -1494,6 +1596,7 @@ mod tests {
                     is_pk: true,
                     has_default: true,
                     has_sequence_default: false,
+                    default_is_integer_literal: false,
                     is_generated: false,
                     is_identity: false,
                 },
@@ -1576,6 +1679,7 @@ mod tests {
                 // Irrelevant to render_model (byte-identity test); the id's
                 // sequence default only gates plan_pull's PK acceptance.
                 has_sequence_default: *is_pk,
+                default_is_integer_literal: false,
                 is_generated: false,
                 is_identity: false,
             })
@@ -1586,5 +1690,131 @@ mod tests {
             greenfield, re_derived,
             "introspected model must be byte-identical to greenfield"
         );
+    }
+
+    // ── optimistic locking round-trip (issue #1318) ─────────────────────────
+
+    fn lock_version_column(has_default: bool) -> Column {
+        Column {
+            name: "lock_version".into(),
+            kind: FieldKind::I32,
+            nullable: false,
+            is_pk: false,
+            has_default,
+            has_sequence_default: false,
+            default_is_integer_literal: has_default,
+            is_generated: false,
+            is_identity: false,
+        }
+    }
+
+    fn id_column() -> Column {
+        Column {
+            name: "id".into(),
+            kind: FieldKind::I64,
+            nullable: false,
+            is_pk: true,
+            has_default: true,
+            has_sequence_default: true,
+            default_is_integer_literal: true,
+            is_generated: false,
+            is_identity: false,
+        }
+    }
+
+    /// An ordinary, insertable column — a greenfield table always has at least
+    /// one, which is what keeps the lock annotation from emptying `New{Model}`.
+    fn title_column() -> Column {
+        Column {
+            name: "title".into(),
+            kind: FieldKind::String,
+            nullable: false,
+            is_pk: false,
+            has_default: false,
+            has_sequence_default: false,
+            default_is_integer_literal: false,
+            is_generated: false,
+            is_identity: false,
+        }
+    }
+
+    #[test]
+    fn pulling_a_generated_lock_version_column_reproduces_the_attribute() {
+        // A greenfield-generated table carries `lock_version INTEGER NOT NULL
+        // DEFAULT 0` alongside its real columns, so pulling it must give back the
+        // same model — otherwise `db pull` silently downgrades the column to a
+        // plain editable integer and the conflict check disappears.
+        let model = render_model(
+            "Post",
+            "posts",
+            &[id_column(), title_column(), lock_version_column(true)],
+        );
+        assert!(
+            model.contains("#[lock_version]\n    pub lock_version: i32,"),
+            "model:\n{model}"
+        );
+    }
+
+    #[test]
+    fn pulling_a_lock_only_table_declines_the_annotation_rather_than_emitting_an_empty_insert() {
+        // A table whose only non-key column is the counter: annotating would drop
+        // it from `NewPost`, leaving an empty struct whose `Insertable` derive
+        // does not compile — turning a project that used to build into one that
+        // does not. `db pull` mirrors a database it does not own, so it declines
+        // the attribute instead of refusing the table.
+        let model = render_model("Post", "posts", &[id_column(), lock_version_column(true)]);
+        assert!(
+            !model.contains("#[lock_version]"),
+            "annotating would empty NewPost:\n{model}"
+        );
+        assert!(model.contains("pub lock_version: i32,"), "model:\n{model}");
+
+        // One ordinary column alongside and the annotation comes back.
+        let model = render_model(
+            "Post",
+            "posts",
+            &[id_column(), title_column(), lock_version_column(true)],
+        );
+        assert!(model.contains("#[lock_version]"), "model:\n{model}");
+    }
+
+    #[test]
+    fn pulling_a_lock_version_defaulted_to_a_null_valued_expression_leaves_it_ordinary() {
+        // `has_default` says a default EXPRESSION exists, not that the database
+        // will supply a usable value. A `NOT NULL` column defaulted to
+        // `nullif(0,0)` reports `column_default = "NULLIF(0, 0)"` and still
+        // violates the constraint on every insert that omits it — verified
+        // against Postgres 16 — so annotating would break a project that
+        // previously worked by always supplying the column itself.
+        //
+        // (A literal `DEFAULT NULL` cannot reach here at all: Postgres
+        // normalizes a constant-NULL default away and reports no
+        // `column_default`, so `has_default` is already false.)
+        let mut col = lock_version_column(true);
+        col.default_is_integer_literal = false;
+        let model = render_model("Post", "posts", &[id_column(), title_column(), col]);
+        assert!(
+            !model.contains("#[lock_version]"),
+            "a default that does not initialize the column must not be annotated:\n{model}"
+        );
+        assert!(model.contains("pub lock_version: i32,"), "model:\n{model}");
+    }
+
+    #[test]
+    fn pulling_a_defaultless_lock_version_column_leaves_it_an_ordinary_integer() {
+        // A legacy table whose application set `lock_version` itself has no
+        // database default. Annotating would drop the column from `New{Model}`
+        // — and `db pull` emits no migration to add a default — so every insert
+        // would then violate the NOT NULL constraint. Pull it as-is instead.
+        let model = render_model(
+            "Post",
+            "posts",
+            &[id_column(), title_column(), lock_version_column(false)],
+        );
+        assert!(
+            !model.contains("#[lock_version]"),
+            "a defaultless column must not be annotated:\n{model}"
+        );
+        assert!(model.contains("pub lock_version: i32,"), "model:\n{model}");
     }
 }

@@ -87,7 +87,7 @@ fn create_topology_rejects_configured_statement_timeout() {
 }
 
 /// No configured timeout (the default) boots cleanly — the guard must never bite
-/// an ordinary SQLite deployment.
+/// an ordinary `SQLite` deployment.
 #[test]
 fn create_pool_without_statement_timeout_succeeds() {
     let config = DatabaseConfig {
