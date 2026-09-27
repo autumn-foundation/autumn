@@ -109,8 +109,9 @@ artifact. For a sandboxed listing, run
 `autumn plugin index record --inspect hello.json`. This copies the
 capabilities, the scoped grants (hosts, tables, job types, render slots), the
 quotas and the artifact digest from the artifact. For a new version of a listed artifact,
-run `inspect` with `--against <old>.autumn-plugin`. `record` refuses a new
-artifact without that baseline. If the new version asks for more authority,
+run `inspect` with `--against <recorded>.autumn-plugin`, the artifact whose
+`artifact_sha256` the listing records. `record` refuses a new artifact without
+that baseline, or with another one. If the new version asks for more authority,
 `record` flags the listing and keeps the old artifact.
 
 The job uploads the `plugin-index-reports` artifact. It holds one report per

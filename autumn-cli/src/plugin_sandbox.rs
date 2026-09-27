@@ -169,6 +169,11 @@ pub struct Report {
     /// (issue #1632). `None` when no previous artifact was named.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upgrade: Option<ConsentDelta>,
+    /// The artifact digest of the `--against` baseline, so a reader can tell
+    /// which approved artifact `upgrade` was computed from (#1625). `None`
+    /// when no previous artifact was named.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upgrade_against: Option<String>,
 }
 
 /// Authority the sandbox denies unconditionally in this version.
@@ -312,6 +317,7 @@ impl Report {
             conformance: conformance(manifest),
             consent: manifest.consent_summary(),
             upgrade: None,
+            upgrade_against: None,
         }
     }
 
@@ -583,6 +589,7 @@ pub fn run_inspect(path: &Path, format: &ReportFormat, against: Option<&Path>) {
             std::process::exit(1);
         }
         report.upgrade = Some(artifact.manifest().consent_delta_from(previous.manifest()));
+        report.upgrade_against = previous.artifact_digest().ok();
     }
     match format {
         ReportFormat::Text => print!("{}", report.to_text()),

@@ -285,11 +285,13 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
     let registered_as = declared.and_then(|c| c.registered_as.as_deref());
     let route_key = route_key(opts.plugin_name, registered_as, routes);
 
+    // `--prefix` says the plugin mounts routes, so none found is a failure.
+    let registered_routeless = registered_as.filter(|_| opts.expected_prefix.is_none());
     checks.push(check_route_attribution(
         opts.plugin_name,
         route_key,
         routes,
-        registered_as,
+        registered_routeless,
     ));
 
     if let Some(prefix) = opts.expected_prefix {
@@ -626,9 +628,10 @@ fn route_key<'a>(
 }
 
 /// `route_key` is the name routes are matched under (see [`route_key`]).
-/// `registered_as` is the `Plugin::name()` the contract dump gives. When no
-/// route carries either, a registered plugin mounts none (a cache, a search
-/// index): the check skips.
+/// `registered_as` is the `Plugin::name()` the contract dump gives, passed
+/// only when no `--prefix` was given. When no route carries either name, such
+/// a plugin mounts none (a cache, a search index): the check skips. With
+/// `--prefix`, the plugin must mount routes, so none found fails.
 fn check_route_attribution(
     plugin_name: &str,
     route_key: &str,
@@ -1511,6 +1514,18 @@ mod contract_tests {
         );
         // The prefix check ran over those routes, and caught the mismatch.
         assert_eq!(find(&report, "route-prefix").status, CheckStatus::Fail);
+    }
+
+    /// `--prefix` declares a routed plugin: no attributed routes is a
+    /// failure, never a skip, so the report checks at least one endpoint.
+    #[test]
+    fn a_registered_plugin_with_a_prefix_and_no_routes_fails() {
+        let dump = present(vec![demo_contract()]);
+        let mut o = opts(&dump);
+        o.expected_prefix = Some("/demo");
+        let report = build_report(&o, &[]);
+        assert_eq!(find(&report, "route-attribution").status, CheckStatus::Fail);
+        assert!(!report.passed());
     }
 
     /// A contract with no registered name cannot prove the plugin has no

@@ -189,6 +189,9 @@ pub struct InspectReport {
     /// What the artifact asks for beyond the one named by `--against`.
     #[serde(default)]
     pub upgrade: Option<serde_json::Value>,
+    /// The artifact digest of the `--against` baseline.
+    #[serde(default)]
+    pub upgrade_against: Option<String>,
     /// What each granted capability is scoped to.
     #[serde(default)]
     pub grants: index::Grants,
@@ -263,7 +266,12 @@ pub fn apply_inspect(
     // `--against` the report has no delta, and new authority would pass.
     let replacing = !listing.artifact_sha256.is_empty()
         && report.artifact_sha256.as_deref() != Some(listing.artifact_sha256.as_str());
-    if replacing && report.upgrade.is_none() {
+    // The delta must be against the recorded artifact, not any baseline:
+    // `--against new.autumn-plugin` would compare the artifact with itself.
+    if replacing
+        && (report.upgrade.is_none()
+            || report.upgrade_against.as_deref() != Some(listing.artifact_sha256.as_str()))
+    {
         return Err(format!(
             "`{}` records artifact sha256 {}, and this report is for other bytes. Run \
              `autumn plugin inspect <new>.autumn-plugin --against <recorded>.autumn-plugin \
@@ -898,6 +906,7 @@ mod tests {
             },
             // A baseline with nothing new: the new artifact asks for no more.
             upgrade: Some(serde_json::json!({"added_capabilities": []})),
+            upgrade_against: Some("00".repeat(32)),
             grants: index::Grants::default(),
             quotas: std::collections::BTreeMap::new(),
             limits: std::collections::BTreeMap::new(),
@@ -936,6 +945,13 @@ mod tests {
         let err = apply_inspect(&mut l, &no_baseline, "0.7.0", "2026-10-01").unwrap_err();
         assert!(err.contains("--against"), "{err}");
         assert_eq!(l, before, "a refusal changes nothing");
+
+        // A delta against any other artifact (here: itself) is refused too.
+        let mut self_baseline = inspect(true);
+        self_baseline.upgrade_against = self_baseline.artifact_sha256.clone();
+        let err = apply_inspect(&mut l, &self_baseline, "0.7.0", "2026-10-01").unwrap_err();
+        assert!(err.contains("--against"), "{err}");
+        assert_eq!(l, before);
 
         // The same digest needs no baseline: nothing changed.
         let mut same = inspect(true);
