@@ -335,7 +335,9 @@ Everything works in `dev` with no extra config.
 ### S3 backend
 
 The S3 backend issues real AWS SigV4 presigned PUT URLs. Ensure your bucket CORS
-policy allows `PUT` from your app's origin if you call from browser JavaScript:
+policy allows `PUT` from your app's origin if you call from browser JavaScript
+— this is the **bucket's** policy, separate from your app's own
+[`[cors]` configuration](cors.md):
 
 ```json
 [{

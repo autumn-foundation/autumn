@@ -415,6 +415,10 @@ required CORS headers, the browser rejects it).
 Dev profile smart defaults set `allowed_origins = ["*"]` for convenience.
 Prod defaults leave it empty -- you must explicitly configure allowed origins.
 
+[CORS and Cross-Origin Requests](cors.md) is the `[cors]` section itself: every
+key, the preflight rules, and the credentials/wildcard combination Autumn
+rejects at config load.
+
 ---
 
 ## What Happens When Session/Auth Isn't Set Up?

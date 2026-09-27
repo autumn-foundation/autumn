@@ -501,7 +501,8 @@ CORS `allowed_origins`:
   **403 Forbidden** before any parsing or dispatch.
 
 So to allow a browser-based MCP client from `https://app.example.com`, add that
-origin to your CORS config; agent clients need no configuration.
+origin to your CORS config ([CORS and Cross-Origin
+Requests](cors.md)); agent clients need no configuration.
 
 ---
 
