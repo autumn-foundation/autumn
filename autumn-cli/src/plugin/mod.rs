@@ -618,10 +618,16 @@ pub fn gate_listing(listing: &index::Listing, app: Option<&str>) -> Result<(), S
     let flagged = listing.status == index::Status::Incompatible;
     let compat = app.map_or(Compat::Unknown, |app| listing.compat(app));
     // Fail closed: with no concrete app version, a flag cannot be ruled out.
-    if flagged && compat == Compat::Unknown {
+    // A sandboxed artifact is not tied to an `autumn-web` series, so its flag
+    // applies to every app.
+    if flagged && (compat == Compat::Unknown || listing.trust == index::Trust::Sandboxed) {
+        let why = if listing.trust == index::Trust::Sandboxed {
+            "a sandboxed flag applies to every app"
+        } else {
+            "this app's autumn-web version is not a plain version"
+        };
         return Err(format!(
-            "`{}` failed re-verification on autumn-web {} ({}), and this app's autumn-web \
-             version is not a plain version. No files were changed.",
+            "`{}` failed re-verification on autumn-web {} ({}); {why}. No files were changed.",
             listing.name, listing.conformance.autumn_web, listing.note
         ));
     }
@@ -1875,6 +1881,18 @@ mod tests {
         let listing = flagged_on(RELEASE);
         assert!(gate_listing(&listing, None).is_err());
         assert!(gate_listing(&listing, Some(">=0.1, <99")).is_err());
+    }
+
+    /// A sandboxed artifact is not tied to an `autumn-web` series. A flag on
+    /// it (a failed load, or an unconsented upgrade) applies to every app.
+    #[test]
+    fn the_gate_refuses_a_flagged_sandboxed_listing_on_every_app() {
+        let mut listing = flagged_on("99.0.0");
+        listing.trust = index::Trust::Sandboxed;
+        listing.capabilities = vec!["http-request".to_owned()];
+        listing.autumn_web = ">=0.0.1, <100".to_owned();
+        let err = gate_listing(&listing, Some("0.0.1")).unwrap_err();
+        assert!(err.contains("re-verification"), "{err}");
     }
 
     /// On an app older than the failed series, the reason is the range.

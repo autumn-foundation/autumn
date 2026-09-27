@@ -42,7 +42,9 @@ pub fn apply_report(
     }
     check_report_shape(report)?;
     // The contract is the machine-checked source of the range and the tier.
-    if let Some(contract) = &report.contract {
+    // Only a pass replaces them: a failed contract may not even parse, and
+    // the listing keeps what was last verified.
+    if let Some(contract) = report.contract.as_ref().filter(|_| report.passed()) {
         if let Some(range) = &contract.autumn_web {
             listing.autumn_web.clone_from(range);
         }
@@ -222,12 +224,18 @@ pub fn apply_inspect(
             .filter(|c| c.status == CheckStatus::Fail)
             .map(|c| c.name.clone()),
     );
-    match &report.artifact_sha256 {
-        Some(digest) => digest.clone_into(&mut listing.artifact_sha256),
-        None => failed.push("artifact-digest".to_owned()),
+    if report.artifact_sha256.is_none() {
+        failed.push("artifact-digest".to_owned());
     }
-    report.version.clone_into(&mut listing.version);
-    listing.capabilities.clone_from(&report.capabilities);
+    // Only a pass replaces the reviewed artifact. On a fail the listing keeps
+    // the version, capabilities and digest that were consented to.
+    if failed.is_empty()
+        && let Some(digest) = &report.artifact_sha256
+    {
+        digest.clone_into(&mut listing.artifact_sha256);
+        report.version.clone_into(&mut listing.version);
+        listing.capabilities.clone_from(&report.capabilities);
+    }
     let failed = (!failed.is_empty()).then(|| failed.join(", "));
     Ok(transition(listing, failed.as_deref(), against, date))
 }
@@ -755,6 +763,41 @@ mod tests {
             },
             upgrade: None,
         }
+    }
+
+    /// A failed run keeps the last verified range, version and tier: the
+    /// failed contract may not even parse, and the flag must still be written.
+    #[test]
+    fn a_failed_report_keeps_the_last_verified_contract_fields() {
+        let mut l = listing("autumn-admin-plugin");
+        let before = l.clone();
+        let mut contract = lockstep("autumn-admin-plugin", "9.9.9");
+        contract.autumn_web = Some("not a range".to_owned());
+        let r = report("autumn-admin-plugin", false, Some(contract));
+        apply_report(&mut l, &r, "0.7.0", "2026-10-01").expect("flag");
+        assert_eq!(l.status, Status::Incompatible);
+        assert_eq!(l.autumn_web, before.autumn_web);
+        assert_eq!(l.version, before.version);
+        assert_eq!(l.tier, before.tier);
+        let one = index::PluginIndex {
+            schema: index::SCHEMA,
+            plugins: vec![l],
+        };
+        assert!(index::validate(&one).is_empty());
+    }
+
+    /// A failed inspect keeps the artifact that was consented to.
+    #[test]
+    fn a_failed_inspect_keeps_the_consented_artifact() {
+        let mut l = sandboxed();
+        let before = l.clone();
+        let mut r = inspect(true);
+        r.upgrade = Some(serde_json::json!({"added_capabilities": ["kv"]}));
+        apply_inspect(&mut l, &r, "0.7.0", "2026-10-01").expect("flag");
+        assert_eq!(l.status, Status::Incompatible);
+        assert_eq!(l.capabilities, before.capabilities);
+        assert_eq!(l.artifact_sha256, before.artifact_sha256);
+        assert_eq!(l.version, before.version);
     }
 
     /// `inspect --against` refuses an artifact that grows its authority.
