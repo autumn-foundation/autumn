@@ -344,6 +344,10 @@ fn metrics_active_gauge_balance() {
 }
 
 #[test]
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "the model is about whether the state lock is held across the publish"
+)]
 fn presence_event_ordering_race() {
     let show_bug = std::env::var_os("_LOOM_SHOW_BUG").is_some();
 
@@ -388,18 +392,16 @@ fn presence_event_ordering_race() {
             let events = events.clone();
             thread::spawn(move || {
                 // Thread 2: track() a NEW connection
+                let mut st = state.lock().unwrap();
+                *st = 1;
                 if show_bug {
-                    // BUGGY: update state, release lock, then publish
-                    {
-                        let mut st = state.lock().unwrap();
-                        *st = 1;
-                    }
+                    // BUGGY: release the state lock, then publish
+                    drop(st);
                     events.lock().unwrap().push("Join");
                 } else {
-                    // CORRECT: publish while holding the state lock
-                    let mut st = state.lock().unwrap();
-                    *st = 1;
+                    // CORRECT: publish while still holding the state lock
                     events.lock().unwrap().push("Join");
+                    drop(st);
                 }
             })
         };
@@ -416,14 +418,12 @@ fn presence_event_ordering_race() {
             if final_state == 1 {
                 assert_eq!(
                     *last_event, "Join",
-                    "state is 1 (present) but last event is {}",
-                    last_event
+                    "state is 1 (present) but last event is {last_event}"
                 );
             } else {
                 assert_eq!(
                     *last_event, "Leave",
-                    "state is 0 (absent) but last event is {}",
-                    last_event
+                    "state is 0 (absent) but last event is {last_event}"
                 );
             }
         }
