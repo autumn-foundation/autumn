@@ -76,10 +76,10 @@ pub fn encrypt(
     auth_secret: &[u8],
 ) -> Result<Vec<u8>, PushError> {
     let mut salt = [0_u8; 16];
-    // `OsRng` is the operating system CSPRNG — the same source `SigningKey::
+    // `SysRng` is the operating system CSPRNG — the same source `SigningKey::
     // random` draws from. A non-cryptographic RNG here would be a real break,
     // not a style choice.
-    rand::TryRngCore::try_fill_bytes(&mut rand::rngs::OsRng, &mut salt)
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut salt)
         .map_err(|e| PushError::Encryption(format!("could not draw a random salt: {e}")))?;
     let ephemeral = p256::SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
     encrypt_with(plaintext, ua_public, auth_secret, salt, &ephemeral)

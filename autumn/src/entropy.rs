@@ -39,7 +39,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use rand::{RngCore, SeedableRng};
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use uuid::Uuid;
 
@@ -261,7 +261,7 @@ impl SeededEntropy {
 
 impl Entropy for SeededEntropy {
     fn next_u64(&self) -> u64 {
-        self.with_inner(RngCore::next_u64)
+        self.with_inner(Rng::next_u64)
     }
 
     fn fill_bytes(&self, dest: &mut [u8]) {
