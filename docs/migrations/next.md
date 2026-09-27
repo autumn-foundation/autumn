@@ -1410,6 +1410,58 @@ turned on or has been running alongside billing all along — needs the
 consumer of `Customer.user_id` need no change.
 
 
+### http_client: `ClientError` gains a `SimNetwork` variant (#2967)
+
+**Why:** the simulated network (`sim::SimNet`) fails calls with drops,
+partitions and unknown hosts. A real `reqwest::Error` cannot be built for
+these, so they need their own variant.
+
+You are affected only if you `match` on `ClientError` with no wildcard arm.
+Outside a `Sim` with a `SimNet`, the variant never occurs.
+
+**Before (`{X.Y}`):**
+
+```rust
+match error {
+    ClientError::Request(_) => retry(),
+    ClientError::Json(_) => bad_payload(),
+    // … every other variant, no `_` arm
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+match error {
+    ClientError::Request(_) | ClientError::SimNetwork(_) => retry(),
+    ClientError::Json(_) => bad_payload(),
+    // … every other variant
+}
+```
+
+**Automation:** `manual` — the right arm depends on what your code does with a
+network failure.
+
+### Sim: `SimClock` and `SimApp` are no longer public (#2967)
+
+**Why:** no public API returned either type, so no code could hold one.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::sim::{Sim, SimApp, SimClock};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::sim::Sim;
+// Reach the app with `sim.client()` and time with `sim.advance(..)`.
+```
+
+**Automation:** `manual` — delete the import; nothing else can have used the
+types.
+
 ## Plugin authors
 
 This release **adds** plugin-facing surface and removes none, so no plugin that
@@ -1655,6 +1707,14 @@ Other changes that still compile but behave differently at runtime. Examples:
 - Error responses adopted a new JSON shape.
 - A default middleware is now ordered differently.
 - A scheduled task now runs on a different worker.
+
+### Sim: `run_to_idle` panics when the drain does not settle (#2967)
+
+Before, `Sim::run_to_idle` stopped after its step bound and gave no signal.
+Now, when work still runs in the last rounds of the drain (for example, a job
+that enqueues itself again), it panics with a `sim drain stall` message and
+the seed. A test that relied on the silent stop fails with that message. Fix
+the endless work, or call `Sim::try_run_to_idle` and handle the `SimStall`.
 
 ## Deprecations retained from `{X.Y}`
 

@@ -607,7 +607,7 @@ pub(crate) fn emit_retention(
                                 #after,
                                 "\"))]"
                             ));
-                    ::autumn_web::reexports::chrono::Utc::now()
+                    ::autumn_web::time::ambient_now()
                         .naive_utc()
                         .checked_sub_signed(__chrono_duration)
                         .expect(concat!(
@@ -640,7 +640,7 @@ pub(crate) fn emit_retention(
                                     #purge_after,
                                     "\"))]"
                                 ));
-                        ::autumn_web::reexports::chrono::Utc::now()
+                        ::autumn_web::time::ambient_now()
                             .naive_utc()
                             .checked_sub_signed(__chrono_duration)
                             .expect(concat!(

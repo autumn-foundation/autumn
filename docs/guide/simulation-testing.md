@@ -114,6 +114,9 @@ sim.run_to_idle().await; // drain everything the advance released
   scheduler ticks, durable repository commit hooks — until the runtime is
   quiescent. It does **not** fast-forward to a future timer; pair it with
   `advance` for "jump to the next interesting instant, then settle what fired."
+  If work still runs at the end of the drain (for example, a job that enqueues
+  itself again), `run_to_idle` panics with a `sim drain stall` message and the
+  seed. `Sim::try_run_to_idle` returns the `SimStall` instead.
 - [`Sim::advance_to`] / [`Sim::advance_to_local`] jump to a specific
   (optionally timezone-zoned, DST-aware) instant instead of a raw duration —
   useful for business-calendar / SLA tests that must cross a spring-forward or
@@ -401,7 +404,94 @@ advances while a task waits on something outside the runtime, such as a lock
 that a test on another thread holds, or real I/O. So arm it only where sim
 tests run one at a time (`--test-threads=1`) and do no real I/O. A busy loop
 that never parks keeps the runtime from advancing, so the watchdog does not
-detect it; an `always!` invariant is the tool for that.
+detect it; an `always!` invariant is the tool for that. Autumn's own CI arms the watchdog on its single-threaded `sim_` step.
+
+### Crash at any await
+
+`crash_at(index, op)` runs `op` and drops it at its `index`-th suspension
+point (an await that returns `Pending`). The work before that point stays
+done. The work after it never runs. Then call `sim.kill()` and
+`sim.restart(app)` to model the process dying there.
+
+```rust
+use autumn_web::sim::{crash_at, CrashOutcome};
+
+let point = sim.crash_point().unwrap(); // seeded
+let outcome = crash_at(point.await_index, sim.client().post("/transfer").send()).await;
+if outcome.is_crashed() {
+    sim.crash_and_restart(app_on_the_same_db());
+    sim.run_to_idle().await; // recovery runs here
+}
+```
+
+To test every crash point, increase `index` from 0 until the outcome is
+`CrashOutcome::Completed`.
+
+### Interleaving shuffler
+
+Tokio polls ready tasks in a fixed order. The shuffler changes that order from
+the seed, so a sweep explores task interleavings, not only timer and fault
+orders.
+
+```rust
+let client = sim.client();
+let ops = vec![client.post("/reserve").send(), client.post("/reserve").send()];
+let responses = sim.interleave(ops).await; // seeded poll order
+let handle = sim.spawn(async { /* … */ }); // seeded yields
+```
+
+- `Sim::interleave` polls the futures in a seeded order each round, and can
+  hold one back for a round. A request's handler runs inside its future, so
+  handler awaits are reordered too.
+- `Sim::spawn` spawns a task that can yield before a poll, which moves it
+  behind the other ready tasks.
+
+The same seed replays the same interleaving. Tasks that the framework spawns
+itself (job workers, scheduled loops) keep tokio's order.
+
+### Simulated network
+
+`SimNet` replaces the real network for outbound calls through
+`http_client::Client`:
+
+```rust
+use autumn_web::sim::SimNet;
+
+let net = SimNet::new()
+    .host("payments", payments_router()) // an in-process axum::Router
+    .latency(Duration::from_millis(5), Duration::from_millis(80))
+    .drop_rate(0.1);
+sim.net(net.clone());
+sim.build(TestApp::new().routes(routes![checkout]));
+
+net.partition("payments"); // calls to http://payments/… fail at once
+net.heal("payments");
+let log = net.events(); // one NetEvent per attempt
+```
+
+- Latency is seeded, in virtual time. A drop fails the attempt after its
+  latency, like a reset connection. The client's retry policy applies.
+- A host with no router falls back to the app's `http_mock`s. A host with
+  neither is an error. No call reaches the real network.
+- The same seed records the same `events()`.
+
+Only a `Client` built from the app state (the `Client` extractor or
+`Client::from_state`) uses the network. Like http mocks, it does not use the
+process-global circuit breaker.
+
+### Fuzzing the shared scenario
+
+The `sim-sweep` bin and the `sim_ops` cargo-fuzz target drive one `Op`
+vocabulary, in `autumn_web::sim::scenario`. Random seeds and coverage-guided
+search then look for the same bugs, and a failure found by one replays in the
+other: `scenario::ops_to_bytes` encodes a shrunk sweep failure as a fuzz input.
+
+```bash
+cargo +nightly fuzz run sim_ops
+```
+
+Copy this shape for your own scenario: one `Op` type, a proptest strategy for
+the sweep, and a byte decoder for the fuzz target.
 
 ---
 
@@ -494,7 +584,10 @@ non-vacuity check rather than a sweep.
 | Scheduling of autumn's own background work (jobs, scheduler, commit hooks) | Deterministic, drained by `Sim::run_to_idle` |
 | Framework-minted IDs (job IDs, request IDs, idempotency keys, sessions) | Seeded from `sim.seed` via the `Entropy` seam |
 | Database | **Boundary** — real in-process SQLite, fault-injected at the connection level via `Chaos` (by probability) or `FaultPlan` (by checkout ordinal), not simulated at the SQL-dialect level |
-| Third-party network (SMTP, LLM calls, outbound HTTP) | **Boundary** — mocked/fault-injected via `Chaos`/`sim::llm`, not a full network simulator |
+| Framework code with no clock in scope | Virtual, through the ambient clock (`time::ambient_now` and its siblings) |
+| Outbound HTTP through `http_client::Client` | Simulated by `SimNet`: in-process hosts, seeded latency and drops, partitions |
+| Task-poll order | Tokio's order, or seeded with `Sim::interleave` / `Sim::spawn` |
+| Other third-party network (SMTP, LLM calls) | **Boundary** — mocked/fault-injected via `Chaos`/`sim::llm`, not simulated |
 
 ### Keeping your own code deterministic
 
@@ -511,6 +604,7 @@ seams instead:
 | `std::time::Instant::now()` (a deadline whose counterparty is `tokio::time::sleep`) | `tokio::time::Instant::now()` — already virtual under the paused runtime |
 | `std::time::SystemTime::now()` | `autumn_web::time::clock_unix_secs(clock)` / `clock_unix_duration(clock)` |
 | `uuid::Uuid::new_v4()` | `state.entropy().uuid_v4()`, or the `Rng` extractor in a handler |
+| Any of the time reads above, with no clock in scope | `autumn_web::time::ambient_now()`, `ambient_monotonic()`, `ambient_instant()`, `ambient_system_time()` — these read the running `Sim`'s clock on this thread, else the system clock |
 
 If you write a custom `impl ClockSource` whose `now()` is virtual, you **must**
 also override `monotonic()`. The trait ships a default body that reads the real

@@ -1933,14 +1933,9 @@ fn generate_derived_query_for_source(
                     #(#confidential_guards)*
                     #(#encode_lets)*
                     // The derived soft-delete / timestamp write has no `AppState`
-                    // in scope, so it cannot reach the injected clock. The allow is
-                    // emitted into the expansion so a determinism deny-lint never
-                    // fires in the *calling* crate, whose author did not write this
-                    // code. Known-open gap, tracked as an autumn #1797 follow-up.
-                    // Keep the emitted `reason` SHORT: it is repeated in every
-                    // generated method in every downstream crate.
-                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-                    let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                    // in scope. The ambient clock follows a running `Sim` (autumn
+                    // #2967), and is the system clock otherwise.
+                    let __now = ::autumn_web::time::ambient_now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::reexports::diesel::update(
                         #query_source #(#filters)* .filter(#table_ident::deleted_at.is_null())
@@ -7698,8 +7693,7 @@ fn emit_hooked_delete(config: &RepoConfig, inputs: &HookedDeleteInputs<'_>) -> H
     // Both paths still fire before_delete / after_delete_commit hooks.
     let hooked_delete_mutation_stmt = if config.soft_delete {
         quote! {
-            #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-            let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+            let __now = ::autumn_web::time::ambient_now().naive_utc();
             let __autumn_deleted = ::autumn_web::reexports::diesel::update(
                 #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null())
             )
@@ -9855,8 +9849,7 @@ fn emit_hooked_mutate_many(
 
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-                    let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                    let __now = ::autumn_web::time::ambient_now().naive_utc();
 
                     #delete_many_tx_bind ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
@@ -11321,8 +11314,7 @@ fn emit_plain_delete(config: &RepoConfig, inputs: &PlainDeleteInputs<'_>) -> Pla
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                 #tenant_id_setup
-                #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-                let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                let __now = ::autumn_web::time::ambient_now().naive_utc();
                 let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
                     #cc_before_delete
@@ -11365,8 +11357,7 @@ fn emit_plain_delete(config: &RepoConfig, inputs: &PlainDeleteInputs<'_>) -> Pla
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 #tenant_id_setup
-                #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-                let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                let __now = ::autumn_web::time::ambient_now().naive_utc();
                 let mut conn = self.__autumn_acquire_conn().await?;
                 #cc_delete_tenant_soft_wrap
             }
@@ -11448,8 +11439,7 @@ fn emit_plain_delete(config: &RepoConfig, inputs: &PlainDeleteInputs<'_>) -> Pla
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
-                #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-                let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                let __now = ::autumn_web::time::ambient_now().naive_utc();
                 let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
                     #cc_before_delete
@@ -11484,8 +11474,7 @@ fn emit_plain_delete(config: &RepoConfig, inputs: &PlainDeleteInputs<'_>) -> Pla
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-                let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                let __now = ::autumn_web::time::ambient_now().naive_utc();
                 let mut conn = self.__autumn_acquire_conn().await?;
                 #cc_delete_soft_wrap
             }
@@ -12697,8 +12686,7 @@ fn emit_plain_mutate_many(
 
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-                    let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                    let __now = ::autumn_web::time::ambient_now().naive_utc();
 
                     #delete_many_tx_bind ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
@@ -13421,8 +13409,7 @@ fn emit_dependent_cascade(
                             ),
                         );
                     }
-                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-                    let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                    let __now = ::autumn_web::time::ambient_now().naive_utc();
                     ::autumn_web::reexports::diesel::update(
                         #table_ident::table.find(__cid).filter(#table_ident::deleted_at.is_null())
                     )
@@ -13435,8 +13422,7 @@ fn emit_dependent_cascade(
         } else if config.soft_delete {
             quote! {
                 #destroy_count_bind = if __parent_soft {
-                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-                    let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                    let __now = ::autumn_web::time::ambient_now().naive_utc();
                     ::autumn_web::reexports::diesel::update(
                         #table_ident::table.find(__cid).filter(#table_ident::deleted_at.is_null())
                     )
@@ -18817,8 +18803,7 @@ fn emit_write_bodies(
                 }
             };
             quote! {
-                #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-                let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                let __now = ::autumn_web::time::ambient_now().naive_utc();
                 #tenant_scoped_update
                 if __count == 0 {
                     return Err(::autumn_web::AutumnError::not_found_msg(
