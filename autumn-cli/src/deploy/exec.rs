@@ -2935,29 +2935,36 @@ pub fn probe_rollback_target_dir(
     probe_dir_state("probe-rollback-target", release_dir, exec)
 }
 
-/// Sentinel [`retry_drain_old`] prints when the old slot unit is stopped.
+/// Sentinel [`retry_drain_old`] prints when the old slot unit is stopped and
+/// disabled.
 const OLD_SLOT_STOPPED: &str = "stopped";
 
-/// Sentinel [`retry_drain_old`] prints when the old slot unit is not stopped.
-const OLD_SLOT_RUNNING: &str = "running";
+/// Sentinel [`retry_drain_old`] prints for all other unit states.
+const OLD_SLOT_NOT_STOPPED: &str = "not-stopped";
 
 /// The state of the old slot unit after [`retry_drain_old`] (issue #2279).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OldSlotState {
-    /// The unit is `inactive` or `failed`. No old process runs.
+    /// The unit is loaded, `inactive` or `failed`, and `disabled`. No old process
+    /// runs, and none starts at boot.
     Stopped,
-    /// The unit is in a different state (`active`, `deactivating`, …).
-    Running,
+    /// The unit can run now or at boot (`active`, `deactivating`, `enabled`, …).
+    NotStopped,
     /// The output is not a known sentinel. This proves nothing.
     Unreadable,
 }
 
-/// Retry a failed `drain-old` one time, then read the old slot unit state
-/// (issue #2279).
+/// Retry a failed `drain-old` one time, then read the old slot unit (issue
+/// #2279).
 ///
-/// The old slot runs job workers and the scheduler. If it continues to run, work
-/// runs two times. The check reads `ActiveState`, because `systemctl is-active`
-/// is false while a stop is in progress (`deactivating`).
+/// The old slot runs job workers and the scheduler. If it runs, work runs two
+/// times. The check reads each property with its own `systemctl show`, because
+/// one call does not keep the order of the properties:
+///
+/// - `LoadState=loaded`: a unit that is not found also shows `inactive`.
+/// - `ActiveState` is `inactive` or `failed`: `is-active` is false while the
+///   unit is `deactivating`.
+/// - `UnitFileState=disabled`: an enabled unit starts again at boot.
 ///
 /// # Errors
 ///
@@ -2967,17 +2974,26 @@ pub fn retry_drain_old(
     live_slot: &str,
     exec: &impl DeployExecutor,
 ) -> Result<OldSlotState, DeployExecError> {
-    let unit = slot_unit_name(&cfg.service_name, live_slot);
+    let unit = shell_quote(&format!(
+        "{}.service",
+        slot_unit_name(&cfg.service_name, live_slot)
+    ));
     let shell = format!(
-        "systemctl disable --now {unit}.service >/dev/null 2>&1; \
-         case \"$(systemctl show --property=ActiveState {unit}.service 2>/dev/null)\" in \
-         ActiveState=inactive|ActiveState=failed) printf '%s' '{OLD_SLOT_STOPPED}' ;; \
-         *) printf '%s' '{OLD_SLOT_RUNNING}' ;; esac"
+        "unit={unit}; \
+         systemctl disable --now \"$unit\" >/dev/null 2>&1; \
+         state=\"$(systemctl show --property=LoadState \"$unit\" 2>/dev/null) \
+         $(systemctl show --property=ActiveState \"$unit\" 2>/dev/null) \
+         $(systemctl show --property=UnitFileState \"$unit\" 2>/dev/null)\"; \
+         case \"$state\" in \
+         'LoadState=loaded ActiveState=inactive UnitFileState=disabled'|\
+         'LoadState=loaded ActiveState=failed UnitFileState=disabled') \
+         printf '%s' '{OLD_SLOT_STOPPED}' ;; \
+         *) printf '%s' '{OLD_SLOT_NOT_STOPPED}' ;; esac"
     );
     let out = exec.run(&RemoteCommand::new("drain-old-retry", shell))?;
     Ok(match out.stdout.trim() {
         OLD_SLOT_STOPPED => OldSlotState::Stopped,
-        OLD_SLOT_RUNNING => OldSlotState::Running,
+        OLD_SLOT_NOT_STOPPED => OldSlotState::NotStopped,
         _ => OldSlotState::Unreadable,
     })
 }
@@ -3847,8 +3863,11 @@ pub(crate) mod test_support {
     /// rollout — the structure cross-host ordering assertions read.
     pub(crate) type FleetTape = Rc<RefCell<Vec<(String, RecordedCall)>>>;
 
-    /// Command labels whose **stdout is parsed** by the caller, i.e. the read-only
-    /// probes. An unscripted probe is the single most dangerous silent hole in this
+    /// Command labels whose **stdout is parsed** by the caller: the read-only
+    /// probes, and `drain-old-retry`, which also mutates. Do not use this list as
+    /// a read-only allowlist.
+    ///
+    /// An unscripted probe is the single most dangerous silent hole in this
     /// fake: `run` returns `Ok` with EMPTY stdout for anything unscripted, and
     /// [`super::probe_deploy_state`] reads an empty section as
     /// [`super::DeployMode::First`] / `Absent`. A fleet test that forgets to script
@@ -6493,30 +6512,38 @@ mod tests {
     #[test]
     fn retry_drain_old_retries_once_and_reads_the_old_unit_state() {
         // #2279: after a failed `drain-old`, try the stop again one time. Then
-        // read the state of the old unit. Only a known sentinel is proof.
+        // read the old unit. Only a known sentinel shows the state.
         let cfg = resolved();
         let stopped = RecordingExecutor::new().with_stdout("drain-old-retry", "stopped\n");
         assert_eq!(
             retry_drain_old(&cfg, SLOT_BLUE, &stopped).unwrap(),
             OldSlotState::Stopped,
         );
+        let shell = stopped.shell_for("drain-old-retry").expect("retry ran");
         assert_eq!(
-            stopped.shell_for("drain-old-retry").expect("retry ran"),
-            "systemctl disable --now myapp-blue.service >/dev/null 2>&1; \
-             case \"$(systemctl show --property=ActiveState myapp-blue.service 2>/dev/null)\" in \
-             ActiveState=inactive|ActiveState=failed) printf '%s' 'stopped' ;; \
-             *) printf '%s' 'running' ;; esac",
-            "retry the same stop, then read ActiveState: `is-active` is false while \
-             the unit is still `deactivating`",
+            shell,
+            "unit='myapp-blue.service'; \
+             systemctl disable --now \"$unit\" >/dev/null 2>&1; \
+             state=\"$(systemctl show --property=LoadState \"$unit\" 2>/dev/null) \
+             $(systemctl show --property=ActiveState \"$unit\" 2>/dev/null) \
+             $(systemctl show --property=UnitFileState \"$unit\" 2>/dev/null)\"; \
+             case \"$state\" in \
+             'LoadState=loaded ActiveState=inactive UnitFileState=disabled'|\
+             'LoadState=loaded ActiveState=failed UnitFileState=disabled') \
+             printf '%s' 'stopped' ;; \
+             *) printf '%s' 'not-stopped' ;; esac",
+            "retry the same stop, then read each property on its own line. \
+             `is-active` is false while the unit is `deactivating`. An enabled unit \
+             starts again at boot. A unit that is not found proves nothing.",
         );
         assert_eq!(stopped.run_labels(), vec!["drain-old-retry"]);
 
-        let running = RecordingExecutor::new().with_stdout("drain-old-retry", "running");
+        let not_stopped = RecordingExecutor::new().with_stdout("drain-old-retry", "not-stopped");
         assert_eq!(
-            retry_drain_old(&cfg, SLOT_BLUE, &running).unwrap(),
-            OldSlotState::Running,
+            retry_drain_old(&cfg, SLOT_BLUE, &not_stopped).unwrap(),
+            OldSlotState::NotStopped,
         );
-        for garbled in ["", "bash: -c: line 0"] {
+        for garbled in ["", "bash: -c: line 0", "stopped extra"] {
             let exec = RecordingExecutor::new().with_stdout("drain-old-retry", garbled);
             assert_eq!(
                 retry_drain_old(&cfg, SLOT_BLUE, &exec).unwrap(),

@@ -201,6 +201,15 @@ pub struct FleetHalt {
     pub manual: Vec<(String, &'static str)>,
 }
 
+impl FleetHalt {
+    /// The risk that the failed step leaves, when the step label alone does not
+    /// name it (issue #2279).
+    #[must_use]
+    pub fn risk(&self) -> Option<&'static str> {
+        (self.failed_step == fleet::DRAIN_OLD_LABEL).then_some(fleet::OLD_SLOT_MAY_RUN_NOTE)
+    }
+}
+
 /// Which `autumn deploy` subcommand to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeployAction {
@@ -4066,11 +4075,12 @@ where
 ///   binaries only; a migration that already ran is never undone. The one exception
 ///   is a post-boundary HOUSEKEEPING failure (`record-proxy-options`, `drain-old`,
 ///   `prune`): the host is live and healthy on the new release, so the rollout
-///   warns, marks it degraded, and CONTINUES. A failed `drain-old` is retried
-///   once and continues only when the old slot is proven stopped (#2279). A rollout whose only failures are
-///   housekeeping therefore succeeds (`Ok`) with degraded hosts named in the state
-///   table — rolling a whole fleet back because an `rm -rf` of old release dirs
-///   failed would be a self-inflicted outage.
+///   warns, marks it degraded, and CONTINUES. For a failed `drain-old`, the
+///   driver retries one time. It continues only when the old slot stopped
+///   (#2279). A rollout whose only failures are housekeeping therefore succeeds
+///   (`Ok`) with degraded hosts named in the state table — rolling a whole fleet
+///   back because an `rm -rf` of old release dirs failed would be a
+///   self-inflicted outage.
 ///
 /// **N = 1 is exempt from all of it.** A single-host config takes the pre-#1621
 /// path verbatim: the raw executor error, no fleet vocabulary, no state table, no
@@ -4394,22 +4404,34 @@ where
                 let failed_step = fleet::failed_step_label(&err);
                 outcomes[index] = fleet::classify_host_outcome(&err);
                 // #2279: a live old slot runs workers and the scheduler, so work
-                // runs two times. Retry once. Continue only on a proven stop.
+                // runs two times. Retry one time. Continue only on a proven stop.
                 if matches!(
                     outcomes[index],
                     fleet::HostOutcome::Degraded { label } if label == fleet::DRAIN_OLD_LABEL
                 ) {
-                    let old_slot = exec::retry_drain_old(cfg, state.slots.live_slot, executor)
-                        .unwrap_or(exec::OldSlotState::Unreadable);
+                    let prefix = format!("[{}/{total} {}]", index + 1, host_plan.host);
+                    let old_slot = match exec::retry_drain_old(cfg, state.slots.live_slot, executor)
+                    {
+                        Ok(old_slot) => old_slot,
+                        Err(retry_err) => {
+                            eprintln!("\u{26A0}\u{FE0F}  {prefix} the retry failed: {retry_err}");
+                            exec::OldSlotState::Unreadable
+                        }
+                    };
                     outcomes[index] = fleet::drain_old_outcome(old_slot);
-                    if old_slot != exec::OldSlotState::Stopped {
+                    if old_slot == exec::OldSlotState::Stopped {
                         eprintln!(
-                            "\u{274C} [{}/{total} {}] `{}` failed AFTER the cutover and \
-                             the retry did not prove a stop: {}.",
-                            index + 1,
-                            host_plan.host,
+                            "\u{26A0}\u{FE0F}  {prefix} `{}` failed, but the retry stopped and \
+                             disabled the old slot.",
                             fleet::DRAIN_OLD_LABEL,
-                            fleet::OLD_SLOT_RUNNING_NOTE,
+                        );
+                    } else {
+                        eprintln!(
+                            "\u{26A0}\u{FE0F}  {prefix} serving {} \u{2014} but `{}` failed \
+                             AFTER the cutover: {}.",
+                            input.release_id,
+                            fleet::DRAIN_OLD_LABEL,
+                            fleet::OLD_SLOT_MAY_RUN_NOTE,
                         );
                     }
                 }
@@ -4419,11 +4441,18 @@ where
                 // a failed `rm -rf` (#1621, §4.6).
                 if let fleet::HostOutcome::Degraded { label } = outcomes[index] {
                     degraded.push((host_plan.host.clone(), label));
+                    // Only a missing `shared/proxy-options` marker makes the next
+                    // deploy refuse this host.
+                    let refusal = if label == "record-proxy-options" {
+                        ", which will refuse it"
+                    } else {
+                        ""
+                    };
                     eprintln!(
                         "\u{26A0}\u{FE0F}  [{}/{total} {}] serving {} \u{2014} but `{label}` \
                          failed AFTER the cutover. Traffic is healthy, so the rollout \
                          continues; repair this host (a redeploy does) before the next \
-                         deploy, which will refuse it.\n",
+                         deploy{refusal}.\n",
                         index + 1,
                         host_plan.host,
                         input.release_id,
@@ -4958,7 +4987,7 @@ fn join_host_reasons(pairs: &[(String, &'static str)]) -> String {
 /// endpoint with no fleet or rollout data. `autumn deploy status` is the
 /// command that shows the fleet's actual state.
 fn build_fleet_halted_alert(halt: &FleetHalt, app_name: &str, profile: &str) -> Alert {
-    Alert::trigger(
+    let alert = Alert::trigger(
         AlertCondition::ScheduledTaskFailure,
         format!("scheduled_task_failure:deploy-fleet-halted:{app_name}:{profile}"),
     )
@@ -4977,7 +5006,11 @@ fn build_fleet_halted_alert(halt: &FleetHalt, app_name: &str, profile: &str) -> 
         "route_removal_failed",
         join_host_reasons(&halt.route_removal_failed),
     )
-    .detail("manual", join_host_reasons(&halt.manual))
+    .detail("manual", join_host_reasons(&halt.manual));
+    match halt.risk() {
+        Some(risk) => alert.detail("risk", risk),
+        None => alert,
+    }
     .build()
 }
 
@@ -11263,9 +11296,10 @@ mod tests {
     }
 
     /// A three-host rollout where `web-b`'s `drain-old` fails and its retry
-    /// answers `retry`. Every host can be compensated.
+    /// answers `retry`. Every host can be compensated, unless `frozen`.
     fn drain_old_failure_run(
         retry: &DrainRetry,
+        frozen: bool,
     ) -> (fleet::test_support::FleetRecorder, Result<(), DeployError>) {
         let hosts = ["web-a", "web-b", "web-c"];
         let fleet = fleet_of(&hosts);
@@ -11280,36 +11314,68 @@ mod tests {
             DrainRetry::TransportFails => recorder.transport_fail("web-b", "drain-old-retry"),
         };
         let fixture = FleetFixture::new();
-        let result = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)));
+        let input = if frozen {
+            fixture.input_frozen(&fleet)
+        } else {
+            fixture.input(&fleet)
+        };
+        let result = run_up_with(&input, |cfg| Ok(recorder.executor(cfg)));
         (recorder, result)
     }
 
+    /// Check that `web-b` ran exactly one retry, right after the failed
+    /// `drain-old`, against the same unit.
+    fn assert_one_retry_of_the_drained_unit(recorder: &fleet::test_support::FleetRecorder) {
+        let web_b = recorder.run_labels_for("web-b");
+        assert_eq!(
+            web_b.iter().filter(|l| **l == "drain-old-retry").count(),
+            1,
+            "retry one time only: {web_b:?}"
+        );
+        assert!(
+            web_b
+                .windows(2)
+                .any(|w| w == ["drain-old", "drain-old-retry"]),
+            "the retry runs right after the failed drain: {web_b:?}"
+        );
+        let shell_of = |label: &str| {
+            recorder
+                .calls_for("web-b")
+                .into_iter()
+                .find_map(|call| match call {
+                    exec::test_support::RecordedCall::Run { label: l, shell } if l == label => {
+                        Some(shell)
+                    }
+                    _ => None,
+                })
+                .expect("the op ran")
+        };
+        let drained = shell_of("drain-old");
+        let unit = drained.rsplit(' ').next().expect("drain-old names a unit");
+        assert!(
+            shell_of("drain-old-retry").contains(&format!("unit='{unit}'")),
+            "the retry must target the old slot `{unit}`, never the new one"
+        );
+    }
+
     #[test]
-    fn a_drain_old_failure_whose_old_slot_still_runs_halts_the_rollout() {
-        // #2279: the old slot runs job workers and the scheduler. If it does not
-        // stop, scheduled tasks and jobs run twice. The rollout must not end green.
+    fn a_drain_old_failure_whose_old_slot_may_still_run_halts_the_rollout() {
+        // #2279: the old slot runs job workers and the scheduler. If it can run,
+        // scheduled tasks and jobs run two times. The rollout must not report
+        // success.
         for retry in [
-            DrainRetry::Stdout("running"),
+            DrainRetry::Stdout("not-stopped"),
             DrainRetry::Stdout("bash: -c: line 0"),
             DrainRetry::CommandFails,
             DrainRetry::TransportFails,
         ] {
-            let (recorder, result) = drain_old_failure_run(&retry);
+            let (recorder, result) = drain_old_failure_run(&retry, false);
             let err = result.expect_err("an old slot that may still run must halt the rollout");
 
-            let web_b = recorder.run_labels_for("web-b");
-            let retried = web_b
-                .iter()
-                .position(|label| *label == "drain-old-retry")
-                .expect("the failed drain must be retried and checked");
-            assert_eq!(
-                web_b[retried - 1],
-                "drain-old",
-                "the retry runs right after the failed drain: {web_b:?}"
-            );
+            assert_one_retry_of_the_drained_unit(&recorder);
             assert!(
-                !web_b.contains(&"prune"),
-                "nothing more of the deploy runs on the halted host: {web_b:?}"
+                !recorder.run_labels_for("web-b").contains(&"prune"),
+                "nothing more of the deploy runs on the halted host"
             );
             assert_eq!(
                 recorder.run_labels_for("web-c"),
@@ -11331,23 +11397,62 @@ mod tests {
                 "a live old slot is not housekeeping debris: {:?}",
                 halt.degraded
             );
+            assert_eq!(halt.risk(), Some(fleet::OLD_SLOT_MAY_RUN_NOTE));
         }
+    }
+
+    #[test]
+    fn a_frozen_drain_old_halt_leaves_the_hosts_and_names_the_risk() {
+        // #2279 with `--no-rollback`: nothing is compensated, so the old slot may
+        // still run at exit. The halt and its alert must name that risk.
+        let (recorder, result) = drain_old_failure_run(&DrainRetry::Stdout("not-stopped"), true);
+        let err = result.expect_err("a frozen halt is still a failure");
+
+        assert!(
+            recorder.positions_of("resolve-previous").is_empty(),
+            "a frozen halt compensates nothing"
+        );
+        let halt = fleet_halt_of(&err);
+        assert_eq!(halt.failed_step, "drain-old");
+        assert!(halt.rolled_back.is_empty(), "{:?}", halt.rolled_back);
+        assert_eq!(
+            halt.still_on_new,
+            vec!["web-a".to_owned(), "web-b".to_owned()]
+        );
+        let alert = build_fleet_halted_alert(halt, "myapp", "prod");
+        assert_eq!(
+            alert.details.get("risk").map(String::as_str),
+            Some(fleet::OLD_SLOT_MAY_RUN_NOTE),
+            "the alert must name the risk, not only the step"
+        );
     }
 
     #[test]
     fn a_drain_old_failure_whose_old_slot_is_proven_stopped_still_degrades() {
         // #2279: a transient failure that the retry clears is housekeeping. The
         // rollout continues, as it did before.
-        let (recorder, result) = drain_old_failure_run(&DrainRetry::Stdout("stopped"));
+        let (recorder, result) = drain_old_failure_run(&DrainRetry::Stdout("stopped"), false);
         result.expect("a proven-stopped old slot must not fail the rollout");
 
-        let web_b = recorder.run_labels_for("web-b");
+        assert_one_retry_of_the_drained_unit(&recorder);
         assert!(
-            web_b.contains(&"drain-old-retry") && !web_b.contains(&"restart-previous"),
-            "retry and check, then leave the host on the new release: {web_b:?}"
+            !recorder
+                .run_labels_for("web-b")
+                .contains(&"restart-previous"),
+            "the host stays on the new release"
         );
-        assert!(
-            recorder.run_labels_for("web-c").contains(&"prune"),
+        assert_eq!(
+            recorder.run_labels_for("web-c"),
+            READ_ONLY_PROBES
+                .iter()
+                .copied()
+                .chain(
+                    REDEPLOY_RUN_LABELS
+                        .iter()
+                        .copied()
+                        .filter(|label| *label != "migrate")
+                )
+                .collect::<Vec<_>>(),
             "the rollout must continue past the degraded host"
         );
         assert!(
@@ -11368,11 +11473,20 @@ mod tests {
             .expect_err("a single-host drain failure must fail the deploy");
 
         assert!(matches!(err, DeployError::Exec(_)), "{err:?}");
+        assert_eq!(
+            recorder.run_labels_for("203.0.113.10").last(),
+            Some(&"drain-old"),
+            "N = 1 stops at the failed drain and does not retry"
+        );
+    }
+
+    #[test]
+    fn only_a_drain_old_halt_carries_a_risk() {
+        assert_eq!(sample_halt().risk(), None, "a `migrate` halt adds no risk");
+        let alert = build_fleet_halted_alert(&sample_halt(), "myapp", "production");
         assert!(
-            !recorder
-                .run_labels_for("203.0.113.10")
-                .contains(&"drain-old-retry"),
-            "N = 1 output must stay byte-identical"
+            !alert.details.contains_key("risk"),
+            "other halts keep today's alert details"
         );
     }
 

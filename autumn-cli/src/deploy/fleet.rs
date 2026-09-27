@@ -492,8 +492,8 @@ pub(crate) enum PostBoundaryClass {
 ///   (`refuse_unprovable_proxy_options`), which is exactly why it must be surfaced
 ///   rather than swallowed.
 /// - `drain-old` — disables the now-idle old slot unit. The driver retries a
-///   failed drain and continues ONLY when the old slot is proven stopped (see
-///   [`drain_old_outcome`], issue #2279).
+///   failed drain one time. It continues only when it proves that the old slot
+///   stopped (see [`drain_old_outcome`], issue #2279).
 /// - `prune` — removes old release dirs. Disk hygiene.
 pub(crate) const HOUSEKEEPING_LABELS: [&str; 3] =
     ["record-proxy-options", DRAIN_OLD_LABEL, "prune"];
@@ -502,21 +502,21 @@ pub(crate) const HOUSEKEEPING_LABELS: [&str; 3] =
 pub(crate) const DRAIN_OLD_LABEL: &str = "drain-old";
 
 /// Why a failed `drain-old` halts the rollout (issue #2279).
-pub(crate) const OLD_SLOT_RUNNING_NOTE: &str = "the old slot did not stop. It runs job workers and the scheduler next to \
-     the new slot, so scheduled tasks and jobs can run two times";
+pub(crate) const OLD_SLOT_MAY_RUN_NOTE: &str = "the old slot can still run now or at boot. \
+     It runs job workers and the scheduler, so scheduled tasks and jobs can run two times";
 
 /// The outcome of a failed `drain-old` after [`exec::retry_drain_old`] (issue
 /// #2279).
 ///
 /// The old slot runs job workers and the scheduler (`ProcessRole::Combined`). If
-/// it continues to run, work runs two times. Only a proven stop is housekeeping.
-/// `Running` and `Unreadable` halt and compensate.
+/// it runs, work runs two times. Only a proven stop is housekeeping. `NotStopped`
+/// and `Unreadable` halt and compensate. A first deploy has no `drain-old`.
 pub(crate) const fn drain_old_outcome(state: exec::OldSlotState) -> HostOutcome {
     match state {
         exec::OldSlotState::Stopped => HostOutcome::Degraded {
             label: DRAIN_OLD_LABEL,
         },
-        exec::OldSlotState::Running | exec::OldSlotState::Unreadable => HostOutcome::LiveOnNew {
+        exec::OldSlotState::NotStopped | exec::OldSlotState::Unreadable => HostOutcome::LiveOnNew {
             failed_step: DRAIN_OLD_LABEL,
         },
     }
@@ -978,6 +978,11 @@ pub(crate) fn fleet_summary_lines(
             ),
             // Traffic already moved before the failure, so this host IS on the new
             // release — saying only "failed" would be the dangerous half-truth.
+            // #2279: name the risk, not only the step.
+            HostOutcome::LiveOnNew { failed_step } if *failed_step == DRAIN_OLD_LABEL => format!(
+                "serving {release_id} \u{2014} but `{failed_step}` failed AFTER the cutover: \
+                 {OLD_SLOT_MAY_RUN_NOTE}"
+            ),
             HostOutcome::LiveOnNew { failed_step } => {
                 format!(
                     "serving {release_id} \u{2014} but `{failed_step}` failed AFTER the cutover"
@@ -2920,14 +2925,17 @@ mod tests {
     #[test]
     fn a_failed_drain_old_degrades_only_when_the_old_slot_is_proven_stopped() {
         // #2279: a live old slot runs job workers and the scheduler, so work runs
-        // twice. Only a proven stop may continue the rollout.
+        // two times. Only a proven stop may continue the rollout.
         assert_eq!(
             drain_old_outcome(exec::OldSlotState::Stopped),
             HostOutcome::Degraded {
                 label: DRAIN_OLD_LABEL
             },
         );
-        for state in [exec::OldSlotState::Running, exec::OldSlotState::Unreadable] {
+        for state in [
+            exec::OldSlotState::NotStopped,
+            exec::OldSlotState::Unreadable,
+        ] {
             assert_eq!(
                 drain_old_outcome(state),
                 HostOutcome::LiveOnNew {
@@ -2937,6 +2945,45 @@ mod tests {
             );
         }
         assert_eq!(DRAIN_OLD_LABEL, "drain-old");
+    }
+
+    #[test]
+    fn the_summary_names_the_risk_of_an_old_slot_that_may_still_run() {
+        // #2279: with `--no-rollback` the host stays as it is. The last table the
+        // operator reads must say that work can run two times.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let plan = plan_fleet(&fleet, &[HostMode::Redeploy, HostMode::Redeploy])
+            .expect("a well-formed fleet plans");
+        let rendered = fleet_summary_lines(
+            &plan,
+            &[
+                HostOutcome::LiveOnNew {
+                    failed_step: DRAIN_OLD_LABEL,
+                },
+                HostOutcome::LiveOnNew {
+                    failed_step: "proxy-flip",
+                },
+            ],
+            "20260714T120000Z",
+        )
+        .join("\n");
+        let web_a = rendered
+            .lines()
+            .find(|line| line.contains("web-a"))
+            .expect("web-a row");
+        assert!(web_a.contains(OLD_SLOT_MAY_RUN_NOTE), "{web_a}");
+        let web_b = rendered
+            .lines()
+            .find(|line| line.contains("web-b"))
+            .expect("web-b row");
+        assert!(
+            !web_b.contains(OLD_SLOT_MAY_RUN_NOTE),
+            "only a `drain-old` row names this risk: {web_b}"
+        );
+        assert!(
+            OLD_SLOT_MAY_RUN_NOTE.contains("two times"),
+            "the note must name the risk, not only the step"
+        );
     }
 
     #[test]
