@@ -263,6 +263,9 @@ pub struct Sim {
     /// Keeps [`ambient`](Self::ambient) installed while the sim lives.
     _ambient_guard: crate::time::AmbientGuard,
 
+    /// Removes the tokio time this sim spends on the outer sim's timeline.
+    _shadow: ShadowGuard,
+
     /// How many times [`mount`](Sim::mount) has run. The first mount seeds the
     /// app's entropy from [`seed`](Sim::seed); each restart derives a new seed
     /// from it, so a restarted process does not replay the crashed one's ids.
@@ -291,14 +294,17 @@ impl Sim {
             wall: std::sync::RwLock::new(Arc::new(clock.ticking())),
             ticking: clock.ticking(),
             tokio_origin: std::sync::OnceLock::new(),
+            shadowed: std::sync::Mutex::new(std::time::Duration::ZERO),
         });
         let ambient_guard = crate::time::install_ambient(ambient_clock.clone());
+        let shadow = ShadowGuard::enter(Arc::clone(&ambient_clock));
         Self {
             seed,
             rng: SimRng::new(seed),
             clock,
             ambient: ambient_clock,
             _ambient_guard: ambient_guard,
+            _shadow: shadow,
             chaos: Chaos::default(),
             chaos_state: None,
             app: SimApp::default(),
@@ -1364,6 +1370,71 @@ struct AmbientSimClock {
     ticking: TickingClock,
     /// Tokio's instant at the first elapsed-time read inside the runtime.
     tokio_origin: std::sync::OnceLock<tokio::time::Instant>,
+    /// Tokio time that passed while a nested sim shadowed this one. Tokio's
+    /// clock is one per runtime, so an inner sim's `advance` also moves it;
+    /// this keeps that time off this sim's timeline.
+    shadowed: std::sync::Mutex<std::time::Duration>,
+}
+
+impl AmbientSimClock {
+    /// Take `[start, end)` of tokio time off this sim's timeline.
+    fn exclude(&self, start: tokio::time::Instant, end: tokio::time::Instant) {
+        // No elapsed read yet: start this sim's timeline after the gap.
+        let origin = *self.tokio_origin.get_or_init(|| end);
+        let gap = end.saturating_duration_since(start.max(origin));
+        let mut shadowed = self
+            .shadowed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *shadowed = shadowed.saturating_add(gap);
+    }
+}
+
+thread_local! {
+    /// The sims alive on this thread, newest last.
+    static SIM_CLOCKS: std::cell::RefCell<Vec<Arc<AmbientSimClock>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Records a sim's life on its thread. When a sim nests inside another, its
+/// drop takes the tokio time it lived off the outer sim's timeline.
+struct ShadowGuard {
+    own: Arc<AmbientSimClock>,
+    /// The sim this one shadows, and tokio's instant when this one started.
+    outer: Option<(Arc<AmbientSimClock>, tokio::time::Instant)>,
+}
+
+impl ShadowGuard {
+    fn enter(own: Arc<AmbientSimClock>) -> Self {
+        let outer = SIM_CLOCKS.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            let outer = stack.last().cloned();
+            stack.push(Arc::clone(&own));
+            outer
+        });
+        let start = tokio::runtime::Handle::try_current()
+            .ok()
+            .map(|_| tokio::time::Instant::now());
+        Self {
+            own,
+            outer: outer.zip(start),
+        }
+    }
+}
+
+impl Drop for ShadowGuard {
+    fn drop(&mut self) {
+        let _ = SIM_CLOCKS.try_with(|stack| {
+            if let Ok(mut stack) = stack.try_borrow_mut() {
+                stack.retain(|clock| !Arc::ptr_eq(clock, &self.own));
+            }
+        });
+        if let Some((outer, start)) = self.outer.take()
+            && tokio::runtime::Handle::try_current().is_ok()
+        {
+            outer.exclude(start, tokio::time::Instant::now());
+        }
+    }
 }
 
 impl crate::time::ClockSource for AmbientSimClock {
@@ -1381,7 +1452,14 @@ impl crate::time::ClockSource for AmbientSimClock {
         }
         let now = tokio::time::Instant::now();
         let origin = *self.tokio_origin.get_or_init(|| now);
-        crate::time::MonotonicInstant::from_origin_elapsed(now.saturating_duration_since(origin))
+        let shadowed = *self
+            .shadowed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::time::MonotonicInstant::from_origin_elapsed(
+            now.saturating_duration_since(origin)
+                .saturating_sub(shadowed),
+        )
     }
 }
 

@@ -77,3 +77,20 @@ async fn sim_ambient_clock_deadline_follows_tokio_sleeps(_sim: Sim) {
     }
     assert_eq!(rounds, 5);
 }
+
+#[sim_test]
+async fn sim_ambient_clock_nested_sim_time_stays_off_the_outer_timeline(sim: Sim) {
+    // Tokio's clock is one per runtime. An inner sim's advance moves it, but
+    // must not move the outer sim's elapsed time.
+    let start = ambient_instant();
+    let inner = Sim::from_seed(sim.seed.wrapping_add(1));
+    inner.advance(HOUR).await;
+    drop(inner);
+    assert_eq!(
+        ambient_instant().saturating_duration_since(start),
+        Duration::ZERO,
+        "the inner hour is not on the outer timeline"
+    );
+    sim.advance(HOUR).await;
+    assert_eq!(ambient_instant().saturating_duration_since(start), HOUR);
+}
