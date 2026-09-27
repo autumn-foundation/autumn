@@ -220,13 +220,9 @@ header like `X-Request-Id` is not in the default `allowed_headers` and has to be
 added.
 
 `max_age_secs` (default `86400`, 24 hours) is how long the browser may cache a
-successful preflight, so it is not re-sent before every call. That cache is why an
-allowlist fix can appear not to work: the browser is still answering from the
-preflight it cached under the old policy, and **lowering `max_age_secs` does not
-evict an entry it already holds** — the new value applies only to the next
-preflight it actually sends. To retest a change now, clear the browser's CORS
-cache or use a fresh profile or private window. Lowering the value is worth doing
-*before* a debugging session, not during one.
+**successful** preflight, so it is not re-sent before every call. Only successes
+are cached, so a preflight that is currently failing is re-sent each time and
+takes a fix up immediately.
 
 [simple]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS#simple_requests
 

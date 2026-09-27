@@ -15,9 +15,11 @@
   debug binary is permissive and a release binary is closed. It also documents
   the `allow_credentials = true` + `allowed_origins = ["*"]` pair rejected at
   config load, the preflight rules behind an `OPTIONS` failure, two interactions
-  a reader otherwise meets as an unexplained failure — a mutating cross-origin
-  request needs the CSRF token header in `allowed_headers` under `prod`, and a
-  cached `#[static_get]` hit never reaches the CORS layer — and one limit with no
-  configuration behind it: the built-in CSRF cookie is `SameSite=Lax` in code, so
+  a reader otherwise meets as an unexplained failure — under `prod` a mutating
+  cross-origin request that sends its CSRF token in a header needs that header in
+  `allowed_headers` (a form-field or query token, and a CSRF-exempt path, do not),
+  and a cached `#[static_get]` hit never reaches the CORS layer — and one limit
+  with no configuration behind it: the built-in CSRF cookie is `SameSite=Lax` in
+  code, so
   cross-site cookie-authenticated writes are not a shape the built-in stack
   supports.
