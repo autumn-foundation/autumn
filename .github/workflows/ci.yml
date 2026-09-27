@@ -1692,7 +1692,31 @@ jobs:
             --skip serve_daemon_start_status_stop_over_unix_socket \
             --skip scaffolded_json_field_generates_compiles_inserts_and_selects \
             --skip scrubbed_database_migrates_clean_and_boots_the_app \
-            --skip documented_scaffold_example_builds_without_warnings
+            --skip documented_scaffold_example_builds_without_warnings \
+            --skip offsite_backup_upload_then_restore_round_trips \
+            --skip offsite_backup_uploads_large_artifact_via_multipart
+          # `offsite_backup_upload_then_restore_round_trips` and
+          # `offsite_backup_uploads_large_artifact_via_multipart` ARE Docker
+          # tests, quarantined here rather than left to fail in the sweep
+          # (2026-09-25, see docs/ci-health/quarantine-ledger.md's
+          # `quay.io/minio/minio` entry): `quay.io/minio/minio` — the fallback
+          # this repo switched to in #2740 after Docker Hub deleted the
+          # `minio/minio` org — now also rejects anonymous pulls (confirmed
+          # directly: an anonymous `quay.io/v2/auth` token for this repo comes
+          # back with `"actions":[]`, and a manifest GET with that token 401s,
+          # while the identical probe against `quay.io/prometheus/prometheus`
+          # succeeds — this is scoped to `minio/minio`, not a quay.io-wide
+          # outage). Total and deterministic, not a flake: 5/5 sampled
+          # `Test (Docker)` failures across independent PRs in the ~12h before
+          # this quarantine, plus this repo's own trunk-dev push, all hit this
+          # identical signature. No anonymously-pullable MinIO-compatible
+          # mirror was found to swap to (Docker Hub's `bitnami/minio` lists as
+          # active but currently serves zero pullable tags; `ghcr.io/minio/minio`
+          # also 401s) and swapping registries again without a Docker daemon to
+          # verify compatibility risks repeating the multi-PR collision the
+          # first registry swap caused — see the ledger entry for the human
+          # decision this needs (host a mirror, or pay for authenticated
+          # `quay.io` pulls) before restoring these two.
           # Consolidated `integration_tests` binary: discover-and-run ALL the
           # Docker/testcontainer `#[ignore]`d DB tests instead of a hand-curated
           # per-feature allowlist (#1923). Enabling `test-support` (testcontainers)
@@ -1754,7 +1778,13 @@ jobs:
             --ignored \
             --test-threads=1 \
             --skip per_request_overhead_is_under_50_microseconds_p99 \
-            --skip capture_overhead_on_a_successful_query_request
+            --skip capture_overhead_on_a_successful_query_request \
+            --skip replicates_to_and_restores_from_a_real_s3_endpoint
+          # `replicates_to_and_restores_from_a_real_s3_endpoint` IS a Docker
+          # test, quarantined here for the same `quay.io/minio/minio`
+          # anonymous-pull outage as the two `offsite_backup` tests skipped in
+          # the `cli_tests` sweep above — see that skip's comment and
+          # docs/ci-health/quarantine-ledger.md for the full diagnosis.
           # AC-7 deploy end-to-end (#1607, Slice 4): drives the real `autumn
           # deploy up`/`rollback` over ssh/scp against a privileged systemd
           # container (first deploy, zero-downtime redeploy, on-demand rollback,
