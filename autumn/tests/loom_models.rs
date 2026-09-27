@@ -414,9 +414,17 @@ fn presence_event_ordering_race() {
         if !evs.is_empty() {
             let last_event = evs.last().unwrap();
             if final_state == 1 {
-                assert_eq!(*last_event, "Join", "state is 1 (present) but last event is {}", last_event);
+                assert_eq!(
+                    *last_event, "Join",
+                    "state is 1 (present) but last event is {}",
+                    last_event
+                );
             } else {
-                assert_eq!(*last_event, "Leave", "state is 0 (absent) but last event is {}", last_event);
+                assert_eq!(
+                    *last_event, "Leave",
+                    "state is 0 (absent) but last event is {}",
+                    last_event
+                );
             }
         }
     });
