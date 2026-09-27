@@ -29,6 +29,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -43,7 +45,7 @@ use axum::routing::{get, post};
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel::sql_query;
-use diesel::sql_types::{BigInt, Bool, Jsonb, Nullable, Text, Timestamptz};
+use diesel::sql_types::{Array, BigInt, Bool, Jsonb, Nullable, Text, Timestamptz};
 
 use super::SyncError;
 use super::protocol::{
@@ -636,7 +638,7 @@ struct MemoryState {
 
 impl MemoryState {
     const fn allocate_version(&mut self) -> Version {
-        self.next_version += 1;
+        self.next_version = self.next_version.saturating_add(1);
         self.next_version
     }
 }
@@ -788,7 +790,7 @@ impl SyncBackend for MemorySyncBackend {
             if stored.row.deleted && stored.row.version <= up_to {
                 let max = per_scope.entry(row_scope.clone()).or_insert(0);
                 *max = (*max).max(stored.row.version);
-                removed += 1;
+                removed = removed.saturating_add(1);
                 false
             } else {
                 true
@@ -808,7 +810,15 @@ impl SyncBackend for MemorySyncBackend {
         state
             .applied
             .retain(|_, record| record.applied_at >= older_than);
-        let removed = before - state.applied.len();
+        // `retain` only ever removes, so `before >= len()` holds by
+        // construction — but a `usize` underflow here would be a silent
+        // ~1.8e19 "removed" count in release, so saturate and assert the
+        // invariant in debug rather than trusting it silently.
+        debug_assert!(
+            before >= state.applied.len(),
+            "retain must not grow the applied set"
+        );
+        let removed = before.saturating_sub(state.applied.len());
         drop(state);
         Ok(removed as u64)
     }
@@ -946,10 +956,14 @@ struct PgVersionRecord {
     version: i64,
 }
 
-/// Dedup-record row: originally assigned version plus the resolved-row
-/// snapshot for `Resolved` outcomes (see [`AppliedRecord`]).
+/// Dedup-record row: the `change_id` it answers for (batched lookups return
+/// one row per matched `change_id`, so the caller needs it to key the result
+/// back to the change), plus the originally assigned version and the
+/// resolved-row snapshot for `Resolved` outcomes (see [`AppliedRecord`]).
 #[derive(QueryableByName)]
 struct PgAppliedRecord {
+    #[diesel(sql_type = Text)]
+    change_id: String,
     #[diesel(sql_type = BigInt)]
     version: i64,
     #[diesel(sql_type = Nullable<Jsonb>)]
@@ -974,20 +988,44 @@ struct PgSequenceRecord {
     is_called: bool,
 }
 
-fn pg_upsert_row<C>(
+/// Upsert every row in `stored` in ONE round trip via `UNNEST`-driven
+/// multi-row `INSERT … ON CONFLICT`, instead of one `INSERT` per row.
+///
+/// Callers must pass at most one entry per `(collection, pk)` — a single
+/// `INSERT … ON CONFLICT` statement cannot affect the same conflict target
+/// twice (Postgres raises "ON CONFLICT DO UPDATE command cannot affect row a
+/// second time"). [`SyncBackend::apply_push`] satisfies this by keeping only
+/// the LAST decided state per key in its `current` map before calling here.
+fn pg_upsert_rows<'a, C>(
     conn: &mut C,
     scope: &str,
-    stored: &ServerRow,
+    stored: impl Iterator<Item = &'a ServerRow>,
 ) -> Result<(), diesel::result::Error>
 where
     C: diesel::connection::LoadConnection<Backend = diesel::pg::Pg>,
 {
-    let row = &stored.row;
+    let stored: Vec<&ServerRow> = stored.collect();
+    if stored.is_empty() {
+        return Ok(());
+    }
+    let collections: Vec<&str> = stored.iter().map(|s| s.row.collection.as_str()).collect();
+    let pks: Vec<&str> = stored.iter().map(|s| s.row.pk.as_str()).collect();
+    let payloads: Vec<Option<serde_json::Value>> =
+        stored.iter().map(|s| s.row.payload.clone()).collect();
+    let versions: Vec<i64> = stored.iter().map(|s| s.row.version).collect();
+    let deleteds: Vec<bool> = stored.iter().map(|s| s.row.deleted).collect();
+    let updated_ats: Vec<DateTime<Utc>> = stored.iter().map(|s| s.row.updated_at).collect();
+    let device_ids: Vec<&str> = stored.iter().map(|s| s.row.device_id.as_str()).collect();
+    let created_versions: Vec<i64> = stored.iter().map(|s| s.created_version).collect();
+
     sql_query(
         "INSERT INTO autumn_sync_rows \
          (scope, collection, pk, payload, version, deleted, updated_at, device_id, \
           created_version) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+         SELECT $1, t.* FROM UNNEST( \
+           $2::text[], $3::text[], $4::jsonb[], $5::bigint[], $6::bool[], $7::timestamptz[], \
+           $8::text[], $9::bigint[] \
+         ) AS t(collection, pk, payload, version, deleted, updated_at, device_id, created_version) \
          ON CONFLICT (scope, collection, pk) DO UPDATE SET \
          payload = excluded.payload, version = excluded.version, \
          deleted = excluded.deleted, updated_at = excluded.updated_at, \
@@ -995,25 +1033,81 @@ where
          created_version = excluded.created_version",
     )
     .bind::<Text, _>(scope)
-    .bind::<Text, _>(&row.collection)
-    .bind::<Text, _>(&row.pk)
-    .bind::<Nullable<Jsonb>, _>(&row.payload)
-    .bind::<BigInt, _>(row.version)
-    .bind::<Bool, _>(row.deleted)
-    .bind::<Timestamptz, _>(row.updated_at)
-    .bind::<Text, _>(&row.device_id)
-    .bind::<BigInt, _>(stored.created_version)
+    .bind::<Array<Text>, _>(collections)
+    .bind::<Array<Text>, _>(pks)
+    .bind::<Array<Nullable<Jsonb>>, _>(payloads)
+    .bind::<Array<BigInt>, _>(versions)
+    .bind::<Array<Bool>, _>(deleteds)
+    .bind::<Array<Timestamptz>, _>(updated_ats)
+    .bind::<Array<Text>, _>(device_ids)
+    .bind::<Array<BigInt>, _>(created_versions)
     .execute(conn)
     .map(|_| ())
 }
 
-fn pg_next_version<C>(conn: &mut C) -> Result<Version, diesel::result::Error>
+/// Insert every applied-change dedup record in ONE round trip via
+/// `UNNEST`-driven multi-row `INSERT`, instead of one `INSERT` per change.
+/// `change_id` is batch-unique (`validate_push` rejects repeats), so this
+/// insert can never collide with itself.
+fn pg_insert_applied<C>(
+    conn: &mut C,
+    scope: &str,
+    device_id: &str,
+    records: &[(String, Version, Option<serde_json::Value>)],
+) -> Result<(), diesel::result::Error>
 where
     C: diesel::connection::LoadConnection<Backend = diesel::pg::Pg>,
 {
-    sql_query("SELECT nextval('autumn_sync_version_seq') AS version")
-        .get_result::<PgVersionRecord>(conn)
-        .map(|record| record.version)
+    if records.is_empty() {
+        return Ok(());
+    }
+    let change_ids: Vec<&str> = records.iter().map(|(id, _, _)| id.as_str()).collect();
+    let versions: Vec<i64> = records.iter().map(|(_, version, _)| *version).collect();
+    let resolved_rows: Vec<Option<serde_json::Value>> =
+        records.iter().map(|(_, _, row)| row.clone()).collect();
+    sql_query(
+        "INSERT INTO autumn_sync_applied (scope, device_id, change_id, version, resolved_row) \
+         SELECT $1, $2, t.change_id, t.version, t.resolved_row \
+         FROM UNNEST($3::text[], $4::bigint[], $5::jsonb[]) \
+           AS t(change_id, version, resolved_row)",
+    )
+    .bind::<Text, _>(scope)
+    .bind::<Text, _>(device_id)
+    .bind::<Array<Text>, _>(change_ids)
+    .bind::<Array<BigInt>, _>(versions)
+    .bind::<Array<Nullable<Jsonb>>, _>(resolved_rows)
+    .execute(conn)
+    .map(|_| ())
+}
+
+/// Allocate `n` fresh, unique, monotonically increasing versions in ONE
+/// round trip, instead of one `nextval()` call per change. Ordering across
+/// calls to `next()` on the returned iterator matches the order `nextval()`
+/// would have assigned them one at a time (ascending), so a caller that
+/// consumes them in request order reproduces the old per-change assignment.
+///
+/// The `ORDER BY gs.ord` is load-bearing, not cosmetic: a plain `SELECT`
+/// over a `FROM` clause has no guaranteed row order without it, so nothing
+/// would otherwise pin "first row back" to "first `nextval()` call" — and a
+/// caller that assumes that pairing (as this one does) needs it to be exact
+/// (`nextval()` is `PARALLEL UNSAFE`, so this can't actually be parallelized
+/// today, but the explicit ordinal makes that a documented guarantee rather
+/// than an accident of the current planner).
+fn pg_next_versions<C>(conn: &mut C, n: usize) -> Result<Vec<Version>, diesel::result::Error>
+where
+    C: diesel::connection::LoadConnection<Backend = diesel::pg::Pg>,
+{
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    sql_query(
+        "SELECT nextval('autumn_sync_version_seq') AS version \
+         FROM generate_series(1, $1) WITH ORDINALITY AS gs(n, ord) \
+         ORDER BY gs.ord",
+    )
+    .bind::<BigInt, _>(i64::try_from(n).unwrap_or(i64::MAX))
+    .load::<PgVersionRecord>(conn)
+    .map(|records| records.into_iter().map(|record| record.version).collect())
 }
 
 /// The scope's tombstone GC horizon — `0` when no tombstone of that scope
@@ -1081,25 +1175,46 @@ pub struct PgSyncBackend {
 /// statement inside `transaction()` (semantically identical to
 /// `build_transaction()`, which is an inherent `PgConnection` method the
 /// wrapper does not expose).
+///
+/// The connect AND `$body` both run on a freshly spawned
+/// [`std::thread::scope`] thread, never the calling one — load-bearing, not
+/// an optimization: the rustls arm's connection bridges every sync diesel
+/// call through its own internal `block_on`
+/// (see [`crate::db::establish_migration_connection`]'s doc comment), which
+/// panics if run from a thread already inside some ambient runtime's
+/// context — e.g. `PgSyncBackend::ensure_schema` (or any other method here)
+/// called directly from an async body rather than from `spawn_blocking`. A
+/// freshly spawned thread has never entered any runtime, so it is always
+/// safe. `scope` (rather than a plain `'static` `std::thread::spawn`) lets
+/// `$body` borrow from the enclosing method (e.g. `&self`, request data)
+/// without needing to be `'static`.
 macro_rules! with_sync_pg_connection {
     ($url:expr, |$conn:ident| $body:expr) => {
-        match crate::db::establish_migration_connection($url).map_err(backend_err)? {
-            crate::db::MigrationConnection::Native(mut native) => {
-                let $conn = &mut native;
-                $body
-            }
-            crate::db::MigrationConnection::Rustls { mut conn, runtime } => {
-                let result = {
-                    let $conn = &mut conn;
-                    $body
-                };
-                // The runtime (when owned) drives the connection's tokio
-                // driver task: it must outlive every use of `conn`.
-                drop(conn);
-                drop(runtime);
-                result
-            }
-        }
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    match crate::db::establish_migration_connection($url).map_err(backend_err)? {
+                        crate::db::MigrationConnection::Native(mut native) => {
+                            let $conn = &mut native;
+                            $body
+                        }
+                        crate::db::MigrationConnection::Rustls { mut conn, runtime } => {
+                            let result = {
+                                let $conn = &mut conn;
+                                $body
+                            };
+                            // The runtime drives the connection's tokio
+                            // driver task: it must outlive every use of
+                            // `conn`.
+                            drop(conn);
+                            drop(runtime);
+                            result
+                        }
+                    }
+                })
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
     };
 }
 
@@ -1132,6 +1247,25 @@ impl PgSyncBackend {
 }
 
 impl SyncBackend for PgSyncBackend {
+    /// Batches the per-change round trips into a fixed number of statements
+    /// for the whole push, independent of `request.changes.len()`: one dedup
+    /// lookup, one `FOR UPDATE` row fetch, one version-sequence draw, one
+    /// row upsert, one dedup-record insert — instead of five per change (see
+    /// `docs/perf/sync-push-batching/` for the profile). `apply_change_row`
+    /// (the conflict-arm policy) is untouched and still runs once per
+    /// change, in request order, against the SAME inputs it always got —
+    /// only how those inputs are fetched changed.
+    ///
+    /// A pk touched more than once in one batch (two queued local edits, or
+    /// a create immediately followed by an edit, before either was ever
+    /// synced) still needs SEQUENTIAL semantics: the second change must see
+    /// the first's outcome as its `current` row, exactly as the old
+    /// same-transaction re-`SELECT … FOR UPDATE` would (Postgres read-your-
+    /// own-writes). Here that carry-forward is an in-memory map, seeded once
+    /// from a single batched fetch and updated after each change is decided
+    /// — so the loop below still runs sequentially in request order, it just
+    /// never talks to Postgres inside the loop.
+    #[allow(clippy::too_many_lines)] // one linear batching algorithm, clearest unsplit
     fn apply_push(
         &self,
         scope: &str,
@@ -1151,24 +1285,93 @@ impl SyncBackend for PgSyncBackend {
                 // GC serializes on the same advisory lock, so it cannot move
                 // mid-transaction.
                 let horizon = pg_horizon(conn, scope)?;
-                let mut outcomes = Vec::with_capacity(request.changes.len());
-                for change in &request.changes {
-                    let duplicate = sql_query(
-                        "SELECT version, resolved_row FROM autumn_sync_applied \
-                     WHERE scope = $1 AND device_id = $2 AND change_id = $3",
+
+                // 1. Batch dedup check: every change_id in one round trip.
+                // `validate_push` already rejected repeats within the batch,
+                // so this is a plain equality lookup against EARLIER pushes.
+                let change_ids: Vec<&str> = request
+                    .changes
+                    .iter()
+                    .map(|c| c.change_id.as_str())
+                    .collect();
+                let applied: HashMap<String, PgAppliedRecord> = if change_ids.is_empty() {
+                    HashMap::new()
+                } else {
+                    sql_query(
+                        "SELECT change_id, version, resolved_row FROM autumn_sync_applied \
+                         WHERE scope = $1 AND device_id = $2 AND change_id = ANY($3)",
                     )
                     .bind::<Text, _>(scope)
                     .bind::<Text, _>(&request.device_id)
-                    .bind::<Text, _>(&change.change_id)
-                    .get_result::<PgAppliedRecord>(conn)
-                    .optional()?;
-                    if let Some(record) = duplicate {
+                    .bind::<Array<Text>, _>(&change_ids)
+                    .load::<PgAppliedRecord>(conn)?
+                    .into_iter()
+                    .map(|record| (record.change_id.clone(), record))
+                    .collect()
+                };
+
+                // 2. Batch current-row fetch (FOR UPDATE): one round trip
+                // for every DISTINCT (collection, pk) among changes that
+                // will actually apply — a dedup hit never touches
+                // autumn_sync_rows, same as before.
+                let mut to_apply_keys: Vec<(&str, &str)> = Vec::new();
+                let mut seen_keys = std::collections::HashSet::new();
+                for change in &request.changes {
+                    if applied.contains_key(&change.change_id) {
+                        continue;
+                    }
+                    if seen_keys.insert((change.collection.as_str(), change.pk.as_str())) {
+                        to_apply_keys.push((change.collection.as_str(), change.pk.as_str()));
+                    }
+                }
+                let mut current: HashMap<(String, String), ServerRow> = if to_apply_keys.is_empty()
+                {
+                    HashMap::new()
+                } else {
+                    let collections: Vec<&str> = to_apply_keys.iter().map(|(c, _)| *c).collect();
+                    let pks: Vec<&str> = to_apply_keys.iter().map(|(_, p)| *p).collect();
+                    sql_query(
+                        "SELECT collection, pk, payload, version, deleted, updated_at, device_id, \
+                         created_version \
+                         FROM autumn_sync_rows \
+                         WHERE scope = $1 AND (collection, pk) IN ( \
+                           SELECT * FROM UNNEST($2::text[], $3::text[]) \
+                         ) FOR UPDATE",
+                    )
+                    .bind::<Text, _>(scope)
+                    .bind::<Array<Text>, _>(&collections)
+                    .bind::<Array<Text>, _>(&pks)
+                    .load::<PgRowRecord>(conn)?
+                    .into_iter()
+                    .map(|record| {
+                        (
+                            (record.collection.clone(), record.pk.clone()),
+                            record.into_server_row(),
+                        )
+                    })
+                    .collect()
+                };
+
+                // 3. Batch version allocation: exactly one nextval() per
+                // change that will actually apply — a dedup hit burns no
+                // version, same as before (`pg_next_version` was called
+                // AFTER the dedup `continue`).
+                let to_apply_count = request.changes.len().saturating_sub(applied.len());
+                let mut versions = pg_next_versions(conn, to_apply_count)?.into_iter();
+
+                // 4. Decide every change's outcome in memory (pure — see
+                // above), then batch-write.
+                let mut outcomes = Vec::with_capacity(request.changes.len());
+                let mut to_record: Vec<(String, Version, Option<serde_json::Value>)> =
+                    Vec::with_capacity(to_apply_count);
+                for change in &request.changes {
+                    if let Some(record) = applied.get(&change.change_id) {
                         // Replay the ORIGINAL outcome: a Resolved result must
                         // come back as the same Resolved row, not a
                         // clean-looking AlreadyApplied ack (see AppliedRecord).
-                        outcomes.push(match record.resolved_row {
+                        outcomes.push(match &record.resolved_row {
                             Some(value) => ChangeOutcome::Resolved {
-                                row: serde_json::from_value(value).map_err(|e| {
+                                row: serde_json::from_value(value.clone()).map_err(|e| {
                                     diesel::result::Error::DeserializationError(e.into())
                                 })?,
                             },
@@ -1179,37 +1382,36 @@ impl SyncBackend for PgSyncBackend {
                         continue;
                     }
 
-                    let current = sql_query(
-                        "SELECT collection, pk, payload, version, deleted, updated_at, device_id, \
-                     created_version \
-                     FROM autumn_sync_rows \
-                     WHERE scope = $1 AND collection = $2 AND pk = $3 FOR UPDATE",
-                    )
-                    .bind::<Text, _>(scope)
-                    .bind::<Text, _>(&change.collection)
-                    .bind::<Text, _>(&change.pk)
-                    .get_result::<PgRowRecord>(conn)
-                    .optional()?
-                    .map(PgRowRecord::into_server_row);
-
-                    let version = pg_next_version(conn)?;
-                    // The conflict-arm policy is the shared apply_change_row —
-                    // one authoritative copy for both backends.
+                    let Some(version) = versions.next() else {
+                        return Err(diesel::result::Error::QueryBuilderError(Box::new(
+                            std::io::Error::other(
+                                "apply_push: version pool exhausted (internal invariant \
+                                 violated — to_apply_count must equal the number of \
+                                 non-duplicate changes)",
+                            ),
+                        )));
+                    };
+                    let key = (change.collection.clone(), change.pk.clone());
+                    // The conflict-arm policy is the shared apply_change_row
+                    // — one authoritative copy for both backends. `current`
+                    // reflects any EARLIER change in this same batch to the
+                    // same key (inserted below), exactly like the old
+                    // re-SELECT would have.
                     let (stored, clean) = apply_change_row(
                         change,
                         &request.device_id,
-                        current.as_ref(),
+                        current.get(&key),
                         horizon,
                         resolver,
                         version,
                     );
-                    pg_upsert_row(conn, scope, &stored)?;
                     let outcome = if clean {
                         ChangeOutcome::Applied { version }
                     } else {
-                        ChangeOutcome::Resolved { row: stored.row }
+                        ChangeOutcome::Resolved {
+                            row: stored.row.clone(),
+                        }
                     };
-
                     let resolved_row = match &outcome {
                         ChangeOutcome::Resolved { row } => Some(
                             serde_json::to_value(row)
@@ -1217,19 +1419,21 @@ impl SyncBackend for PgSyncBackend {
                         ),
                         _ => None,
                     };
-                    sql_query(
-                        "INSERT INTO autumn_sync_applied \
-                     (scope, device_id, change_id, version, resolved_row) \
-                     VALUES ($1, $2, $3, $4, $5)",
-                    )
-                    .bind::<Text, _>(scope)
-                    .bind::<Text, _>(&request.device_id)
-                    .bind::<Text, _>(&change.change_id)
-                    .bind::<BigInt, _>(version)
-                    .bind::<Nullable<Jsonb>, _>(resolved_row)
-                    .execute(conn)?;
+                    to_record.push((change.change_id.clone(), version, resolved_row));
+                    // A pk written twice in this batch keeps only its LAST
+                    // value here — the same end state the old sequential
+                    // per-change UPSERTs left, just decided once instead of
+                    // written twice.
+                    current.insert(key, stored);
                     outcomes.push(outcome);
                 }
+
+                // 5. Batch-write: one UPSERT for the final state of every
+                // touched row, one INSERT for every applied change's dedup
+                // record.
+                pg_upsert_rows(conn, scope, current.values())?;
+                pg_insert_applied(conn, scope, &request.device_id, &to_record)?;
+
                 Ok(PushResponse { outcomes })
             })
             .map_err(backend_err)
@@ -1337,14 +1541,25 @@ impl SyncBackend for PgSyncBackend {
                     let max = per_scope.entry(record.scope).or_insert(0);
                     *max = (*max).max(record.version);
                 }
-                for (scope, horizon) in per_scope {
+                // One statement for every scope touched by this sweep instead
+                // of one per scope: a sweep across a multi-tenant instance
+                // can touch hundreds/thousands of distinct scopes, and each
+                // was previously a separate round trip inside this same
+                // advisory-locked transaction. `UNNEST` fans the arrays back
+                // out into rows server-side, so the ON CONFLICT/GREATEST
+                // semantics are identical to issuing the loop above — this is
+                // a batching change, not a behavior change.
+                if !per_scope.is_empty() {
+                    let (scopes, horizons): (Vec<String>, Vec<Version>) =
+                        per_scope.into_iter().unzip();
                     sql_query(
-                        "INSERT INTO autumn_sync_horizons (scope, horizon) VALUES ($1, $2) \
+                        "INSERT INTO autumn_sync_horizons (scope, horizon) \
+                     SELECT * FROM UNNEST($1::TEXT[], $2::BIGINT[]) AS t(scope, horizon) \
                      ON CONFLICT (scope) DO UPDATE SET \
                      horizon = GREATEST(autumn_sync_horizons.horizon, excluded.horizon)",
                     )
-                    .bind::<Text, _>(&scope)
-                    .bind::<BigInt, _>(horizon)
+                    .bind::<Array<Text>, _>(scopes)
+                    .bind::<Array<BigInt>, _>(horizons)
                     .execute(conn)?;
                 }
                 Ok(removed as u64)

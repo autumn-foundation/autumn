@@ -20,6 +20,12 @@ on-screen detail page.
 
 ## Quick start
 
+`Pdf` is behind the non-default `pdf` feature, so enable it first:
+
+```toml
+autumn-web = { version = "0.7", features = ["maud", "pdf"] }
+```
+
 ```rust
 use autumn_web::pdf::Pdf;
 use autumn_web::prelude::*;

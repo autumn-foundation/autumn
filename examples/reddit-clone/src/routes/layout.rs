@@ -2,6 +2,8 @@
 
 use autumn_web::reexports::axum::response::{IntoResponse, Response};
 use autumn_web::reexports::http;
+use autumn_web::seo::SeoMeta;
+use autumn_web::widgets::{ReactionControls, reaction_controls};
 use autumn_web::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HTMX_SSE_JS_PATH, Markup, PreEscaped, html};
 
 /// Redirect that works for both regular and htmx requests.
@@ -82,9 +84,43 @@ pub fn nav_auth_markup(username: Option<&str>) -> Markup {
 /// Base HTML layout wrapping page content.
 ///
 /// Accepts an optional `username` to show login/logout state in the nav.
+///
+/// This is the plain-title entry point, and most pages use it. It builds a
+/// [`SeoMeta`] that holds only the title and calls [`layout_with_seo`]. Pages
+/// that want more meta tags — a description, a canonical URL, Open Graph
+/// values, a `robots` directive — call [`layout_with_seo`] directly with the
+/// builder the `SeoMeta` extractor gave them.
 #[allow(clippy::needless_pass_by_value)] // Maud Markup is idiomatically passed by value
 pub fn layout(
     title: &str,
+    username: Option<&str>,
+    csrf_token: Option<&str>,
+    content: Markup,
+) -> Markup {
+    layout_with_seo(
+        SeoMeta::new().title(format!("{title} \u{2014} Autumn Reddit")),
+        username,
+        csrf_token,
+        content,
+    )
+}
+
+/// Base HTML layout that takes an explicit [`SeoMeta`] builder.
+///
+/// [`SeoMeta::render`] writes the `<title>` tag, so `seo` must carry a title.
+/// The route attribute usually supplies it:
+///
+/// ```rust,ignore
+/// #[get("/about", seo(title = "About \u{2022} Autumn Reddit"))]
+/// pub async fn about(seo: SeoMeta) -> Markup {
+///     layout_with_seo(seo, None, None, html! { /* ... */ })
+/// }
+/// ```
+///
+/// See `docs/guide/seo.md`.
+#[allow(clippy::needless_pass_by_value)] // Maud Markup is idiomatically passed by value
+pub fn layout_with_seo(
+    seo: SeoMeta,
     username: Option<&str>,
     csrf_token: Option<&str>,
     content: Markup,
@@ -95,7 +131,10 @@ pub fn layout(
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                title { (title) " — Autumn Reddit" }
+                // One call writes <title>, the description, the canonical
+                // link, the Open Graph tags, and the Twitter card tags — but
+                // only the ones this page actually set (see docs/guide/seo.md).
+                (seo.render())
                 // Embed CSRF token in a meta tag so htmx JS can read it
                 // (the autumn-csrf cookie is HttpOnly and inaccessible to JS)
                 @if let Some(token) = csrf_token {
@@ -160,6 +199,15 @@ pub fn layout(
                         a href="https://github.com/autumn-foundation/autumn"
                           class="text-orange-600 hover:underline" { "Autumn" }
                         " — Rust + Diesel + Maud + htmx + Tailwind"
+                        " \u{00B7} "
+                        // GDPR Art. 7(3): withdrawing consent must be as easy
+                        // as giving it, so the preferences page is reachable
+                        // from every page rather than only from the banner.
+                        // See docs/guide/cookie-consent.md.
+                        a href=(super::consent::__autumn_path_manage())
+                          class="text-gray-500 hover:text-orange-600 hover:underline" {
+                            "Cookie preferences"
+                        }
                     }
                 }
             }
@@ -167,27 +215,91 @@ pub fn layout(
     }
 }
 
-/// Score display with upvote/downvote buttons (htmx-powered).
-pub fn vote_controls(post_id: i64, score: i64) -> Markup {
+/// Score display with upvote/downvote buttons.
+///
+/// A thin delegation to the framework's `reaction_controls` widget (#1362) —
+/// the view half of `Post`'s `#[votable]` association. The widget renders one
+/// no-JS `POST` form per direction (upgraded in place by htmx), ARIA toggle
+/// buttons with real accessible names, and the `#votes-{id}` outerHTML
+/// self-replacement contract this example's routes already rely on.
+///
+/// `current` is the viewer's own vote from `posts.reaction_of(user, post)`:
+/// `Some(1)` / `Some(-1)` press the matching button, `None` presses neither.
+/// Feeds and live fragments pass `None` deliberately — highlighting every row
+/// would cost one query per post (a batch accessor is the tracked follow-up).
+///
+/// `csrf` is the handler's own `CsrfToken` extractor. CSRF protection is
+/// **enabled** in this app (`autumn.toml`), so it is load-bearing for the no-JS
+/// path: the hidden `_csrf` input is what lets a plain form POST through when
+/// JavaScript is off. The htmx path would survive without it — the framework's
+/// `autumn-htmx-csrf.js` shim sends the token as a header — so a missing token
+/// fails only for the visitors least able to work around it. `None` is
+/// therefore correct in exactly one place: fragments broadcast over SSE, which
+/// by construction only reach clients that are running htmx.
+pub fn vote_controls(
+    post_id: i64,
+    score: i64,
+    current: Option<i16>,
+    csrf: Option<&autumn_web::security::CsrfToken>,
+) -> Markup {
+    reaction_controls(
+        &ReactionControls::votes(
+            format!("votes-{post_id}"),
+            super::votes::__autumn_path_upvote(post_id),
+            super::votes::__autumn_path_downvote(post_id),
+        )
+        .aggregate(score)
+        .current(current)
+        // The form-field name stays the default `_csrf`, which is what the
+        // app's CSRF layer expects.
+        .csrf(csrf, None)
+        .label("Post score"),
+    )
+}
+
+/// The vote control as rendered inside a fragment **broadcast to every
+/// subscriber** (the SSE post-card fan-out).
+///
+/// Same shape as [`vote_controls`] with `current = None` / no CSRF (see the
+/// rationale there), plus `preserve_pressed_state`: the broadcast card swap
+/// arrives on viewers who may have a vote pressed — including the voter
+/// themself, racing their own targeted response — and `hx-preserve` on the
+/// buttons keeps each viewer's live pressed state while the swap still
+/// refreshes the aggregate and the rest of the card.
+pub fn broadcast_vote_controls(post_id: i64, score: i64) -> Markup {
+    reaction_controls(
+        &ReactionControls::votes(
+            format!("votes-{post_id}"),
+            super::votes::__autumn_path_upvote(post_id),
+            super::votes::__autumn_path_downvote(post_id),
+        )
+        .aggregate(score)
+        .preserve_pressed_state(true)
+        .label("Post score"),
+    )
+}
+
+/// The app's one non-essential script, behind the cookie-consent gate.
+///
+/// This is the whole point of the consent feature, and the part a banner alone
+/// does not give you: showing a prompt while loading the tracker regardless of
+/// the answer is non-compliant theater. `Consent::allows` returns `false` for
+/// every category except `"necessary"` until the visitor has recorded a
+/// decision **under the current policy version**, so bumping
+/// `CONSENT_POLICY_VERSION` closes this gate again until they re-decide.
+///
+/// The snippet here is deliberately inert — this is a demo app with no real
+/// analytics vendor — but the call site is the real shape: one `if`, at the
+/// only place the non-essential thing is emitted.
+pub fn analytics_snippet(consent: &autumn_web::consent::Consent) -> Markup {
+    if !consent.allows("analytics", super::consent::CONSENT_POLICY_VERSION) {
+        return html! {};
+    }
     html! {
-        div id=(format!("votes-{post_id}"))
-            class="flex flex-col items-center gap-0.5 text-sm select-none" {
-            button
-                hx-post=(super::votes::__autumn_path_upvote(post_id))
-                hx-target=(format!("#votes-{post_id}"))
-                hx-swap="outerHTML"
-                class="text-gray-400 hover:text-orange-500 cursor-pointer text-lg leading-none" {
-                "\u{25B2}"
-            }
-            span class="font-semibold text-gray-700" { (score) }
-            button
-                hx-post=(super::votes::__autumn_path_downvote(post_id))
-                hx-target=(format!("#votes-{post_id}"))
-                hx-swap="outerHTML"
-                class="text-gray-400 hover:text-blue-500 cursor-pointer text-lg leading-none" {
-                "\u{25BC}"
-            }
-        }
+        // A real app would emit its vendor's <script> tag here. Everything
+        // that sets a non-essential cookie or contacts a third party belongs
+        // on this side of the gate.
+        div id="analytics-enabled" hidden data-analytics="on" {}
     }
 }
 
@@ -214,8 +326,146 @@ pub fn time_ago(dt: &chrono::NaiveDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use autumn_web::html;
+    use autumn_web::seo::SeoMeta;
 
-    use super::layout;
+    use super::{layout, layout_with_seo};
+
+    #[test]
+    fn layout_still_renders_the_site_title_suffix() {
+        let rendered = layout("Front Page", None, None, html! {}).into_string();
+
+        assert!(
+            rendered.contains("<title>Front Page \u{2014} Autumn Reddit</title>"),
+            "rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn layout_with_seo_renders_every_declared_tag() {
+        let seo = SeoMeta::new()
+            .title("hello \u{2022} r/rust \u{2022} Autumn Reddit")
+            .description("A post about Rust.")
+            .canonical("https://autumn-reddit.example.com/r/rust/posts/hello")
+            .og_type("article")
+            .twitter_card("summary_large_image");
+
+        let rendered = layout_with_seo(seo, None, None, html! {}).into_string();
+
+        assert!(
+            rendered.contains("<title>hello \u{2022} r/rust \u{2022} Autumn Reddit</title>"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"<meta name="description" content="A post about Rust.">"#),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains(
+                r#"<link rel="canonical" href="https://autumn-reddit.example.com/r/rust/posts/hello">"#
+            ),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"<meta property="og:type" content="article">"#),
+            "rendered: {rendered}"
+        );
+        // og:title and og:description fall back to the page title and
+        // description, so the app sets each value one time.
+        assert!(
+            rendered.contains(r#"<meta property="og:title" content="hello"#),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"<meta name="twitter:card" content="summary_large_image">"#),
+            "rendered: {rendered}"
+        );
+        // og:url falls back to the canonical URL.
+        assert!(
+            rendered.contains(
+                r#"<meta property="og:url" content="https://autumn-reddit.example.com/r/rust/posts/hello">"#
+            ),
+            "rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn layout_with_seo_emits_only_the_tags_a_page_sets() {
+        let rendered =
+            layout_with_seo(SeoMeta::new().title("Plain"), None, None, html! {}).into_string();
+
+        assert!(
+            rendered.contains("<title>Plain</title>"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("og:type"),
+            "an unset value must emit no tag; rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("rel=\"canonical\""),
+            "an unset value must emit no tag; rendered: {rendered}"
+        );
+    }
+
+    /// `noindex, follow` is the directive a thin-but-linking page wants: keep
+    /// this page out of the index, but let crawlers walk through to the pages
+    /// that belong in it. `routes::auth::profile` declares exactly this.
+    #[test]
+    fn layout_with_seo_renders_noindex_follow_for_a_profile_page() {
+        let seo = SeoMeta::new()
+            .title("u/ferris \u{2022} Autumn Reddit")
+            .robots("noindex, follow")
+            .og_type("profile");
+
+        let rendered = layout_with_seo(seo, None, None, html! {}).into_string();
+
+        assert!(
+            rendered.contains(r#"<meta name="robots" content="noindex, follow">"#),
+            "rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("nofollow"),
+            "`follow` must not be rendered as `nofollow`; rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn layout_with_seo_renders_a_noindex_directive() {
+        let seo = SeoMeta::new()
+            .title("Submit a post \u{2022} Autumn Reddit")
+            .robots("noindex, nofollow");
+
+        let rendered = layout_with_seo(seo, Some("ferris"), None, html! {}).into_string();
+
+        assert!(
+            rendered.contains(r#"<meta name="robots" content="noindex, nofollow">"#),
+            "rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_footer_offers_a_withdraw_route_on_every_page() {
+        // GDPR Art. 7(3): withdrawing must be as easy as consenting, which
+        // means reachable from every page rather than only from the banner.
+        let rendered = layout("Test", None, Some("token"), html! {}).into_string();
+
+        assert!(
+            rendered.contains("/consent/manage"),
+            "every page must link to the cookie-preferences page; rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn analytics_stays_off_until_consent_is_recorded() {
+        use autumn_web::consent::Consent;
+
+        let undecided = super::analytics_snippet(&Consent::undecided()).into_string();
+
+        assert!(
+            undecided.is_empty(),
+            "a non-essential script must not render for an undecided visitor: {undecided}"
+        );
+    }
 
     #[test]
     fn layout_loads_framework_csrf_script_from_same_origin() {

@@ -329,7 +329,7 @@ no one-container-per-test overhead.
 ```toml
 # Cargo.toml  — use the same version as your [dependencies] entry
 [dev-dependencies]
-autumn-web = { version = "0.5", features = ["test-support"] }
+autumn-web = { version = "0.7", features = ["test-support"] }
 serde_json = "1"
 ```
 
@@ -732,7 +732,8 @@ shared instant — use whichever is more ergonomic for your test.
 ### Signed-URL and scheduler determinism
 
 The same `clock_unix_secs` helper that handlers use is also available for
-framework internals:
+framework internals. The signing half lives behind the non-default `storage`
+feature (`features = ["storage"]`) — see [File Storage](./storage.md):
 
 ```rust
 use autumn_web::time::{TickingClock, clock_unix_secs};

@@ -11,9 +11,9 @@ db_sku          = "B_Standard_B1ms"
 #   az account show --query id -o tsv
 subscription_id = "00000000-0000-0000-0000-000000000000"
 
-# bootstrap_image = "mcr.microsoft.com/k8se/quickstart:latest"  # rarely needs to change
+# bootstrap_image = "mcr.microsoft.com/k8se/quickstart:latest"  # keep min_replicas = 0 until your real image is deployed
 
-min_replicas        = 1
+min_replicas        = 0
 max_replicas        = 10
 enable_redis_cache  = false
 
