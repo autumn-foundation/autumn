@@ -173,17 +173,23 @@ may not be installed (`allowed_origins` is empty), or it may be installed and
 the request's `Origin` may simply not match any entry — an exact match on
 scheme, host and port, so a differing port or `http` vs `https` misses.
 
-To tell them apart, make the app state its own configuration rather than reading
-the absence of a header: boot with `AUTUMN_SHOW_CONFIG=1` (or
-`autumn dev --show-config`) and the startup report lists the middleware actually
-installed and the resolved `[cors]` values. If `CORS` is absent from that list,
-`allowed_origins` is empty; if it is present but its origins do not include the
-one your browser is sending, the allowlist is the problem.
+To tell them apart, compare the two strings yourself rather than looking for a
+signal from the framework. Devtools shows the exact `Origin` header the browser
+sent on the request; put it next to the `allowed_origins` your app resolved, and
+the answer is whichever of the two you find: an empty list, or a list that does
+not contain that exact string.
 
-There is also a `CORS enabled` line carrying the origin list and the credentials
-flag, logged when the layer is installed — but treat its presence as evidence and
-its **absence as inconclusive**: it is emitted at `INFO`, so a `log.level` above
-`INFO` suppresses it on a perfectly working configuration.
+Two startup signals help, each with a limit worth knowing before you rely on it:
+
+- `AUTUMN_SHOW_CONFIG=1` (or `autumn dev --show-config`) logs a startup report
+  listing the middleware actually installed, so you can see whether `CORS` is in
+  the stack. It does **not** print the `[cors]` values, so it answers "is the
+  layer there" and not "is my origin allowed".
+- A `CORS enabled` line, logged when the layer is installed, **does** carry the
+  origin list and the credentials flag — the most direct answer available. Treat
+  its presence as evidence and its **absence as inconclusive**: it is emitted at
+  `INFO`, as is the report above, so any `log.level` above `INFO` suppresses both
+  on a perfectly working configuration.
 
 A malformed entry is a third way to miss: an origin that will not parse as a
 header value is dropped with a `CORS: ignoring malformed allowed_origin`
