@@ -90,10 +90,17 @@ allow_credentials = true
    same_site = "None"
    ```
 
-   Browsers honor `None` only on a `Secure` cookie. `session.secure` is already
-   `true` by default, so there is nothing to flip — but it does mean both the app
-   and the calling page must be on HTTPS, which rules the combination out over
-   plain `http://localhost` unless you terminate TLS locally.
+   Browsers honor `None` only on a `Secure` cookie, and `session.secure` is
+   already `true` by default, so there is nothing to flip. `Secure` constrains
+   the channel the cookie is **sent over**, not the page that triggers the
+   request: what has to be HTTPS is your app's own origin — the origin the cookie
+   belongs to. A front-end served over plain HTTP can still hold a session on an
+   HTTPS Autumn app.
+
+   Browsers also treat `http://localhost` as a trustworthy origin and accept a
+   `Secure` cookie there, so local development does not need TLS for this. If a
+   cross-site session works locally but stops working on a deployed host served
+   over plain HTTP, that exemption is the difference.
 
    That is a real loosening of CSRF protection — `SameSite` is a defense you are
    giving up — so prefer putting both the app and its front-end on one origin
