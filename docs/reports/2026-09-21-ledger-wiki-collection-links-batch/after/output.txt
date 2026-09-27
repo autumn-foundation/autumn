@@ -1,0 +1,68 @@
+$ cargo test -p wiki --test collection_links_batch_profile -- --ignored --nocapture --test-threads=1
+
+running 1 test
+test collection_links_batch_profile ...
+=== pg_stat_statements: create (200 new links) ===
+calls=1      buffers=2104     INSERT INTO "collection_links" ("collection_id", "label", "url", "position") VALUES ($1, $2, $3, $4), ($5, $6, $7, $8), ... [200 value tuples total, $1..$800]
+-- INSERT INTO collection_links: calls=1 buffers=2104 -- other collection_links statements (DELETE, etc.): calls=0 buffers=0 --
+
+=== pg_stat_statements: update (replace with 200 different links) ===
+calls=1      buffers=206      DELETE FROM "collection_links" WHERE ("collection_links"."collection_id" = $1)
+calls=1      buffers=2005     INSERT INTO "collection_links" ("collection_id", "label", "url", "position") VALUES ($1, $2, $3, $4), ($5, $6, $7, $8), ... [200 value tuples total, $1..$800]
+-- INSERT INTO collection_links: calls=1 buffers=2005 -- other collection_links statements (DELETE, etc.): calls=1 buffers=206 --
+
+=== statement-count summary ===
+scenario        ins calls    ins buffers  other calls  other buffers
+create                  1           2104            0              0
+update                  1           2005            1            206
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): single-row INSERT shape (one per link, unbatched, the pre-fix defect) ===
+INSERT INTO collection_links (collection_id, label, url, position) VALUES (1, 'Explain Demo', 'https://example.org/explain-demo', 999)
+Insert on public.collection_links  (cost=0.00..0.02 rows=0 width=0) (actual time=0.021..0.022 rows=0 loops=1)
+  Buffers: shared hit=6
+  ->  Result  (cost=0.00..0.02 rows=1 width=92) (actual time=0.005..0.005 rows=1 loops=1)
+        Output: nextval('collection_links_id_seq'::regclass), '1'::bigint, 'Explain Demo'::text, 'https://example.org/explain-demo'::text, 999, now()
+        Buffers: shared hit=1
+Query Identifier: 4590812898016441431
+Planning Time: 0.013 ms
+Trigger RI_ConstraintTrigger_c_16494 for constraint collection_links_collection_id_fkey: time=0.048 calls=1
+Execution Time: 0.080 ms
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): batched multi-row INSERT shape (the fix, one call for the whole link set) ===
+INSERT INTO collection_links (collection_id, label, url, position) VALUES (1, 'Explain Batch 0', 'https://example.org/explain-batch-0', 1000), (1, 'Explain Batch 1', 'https://example.org/explain-batch-1', 1001), (1, 'Explain Batch 2', 'https://example.org/explain-batch-2', 1002)
+Insert on public.collection_links  (cost=0.00..0.06 rows=0 width=0) (actual time=0.047..0.048 rows=0 loops=1)
+  Buffers: shared hit=18
+  ->  Values Scan on "*VALUES*"  (cost=0.00..0.06 rows=3 width=92) (actual time=0.016..0.019 rows=3 loops=1)
+        Output: nextval('collection_links_id_seq'::regclass), "*VALUES*".column1, "*VALUES*".column2, "*VALUES*".column3, "*VALUES*".column4, now()
+        Buffers: shared hit=3
+Query Identifier: -2031661649392160844
+Planning Time: 0.021 ms
+Trigger RI_ConstraintTrigger_c_16494 for constraint collection_links_collection_id_fkey: time=0.058 calls=3
+Execution Time: 0.117 ms
+=== pg_stat_statements: create (2,500 links, chunked insert) ===
+calls=2      buffers=20057    INSERT INTO "collection_links" ("collection_id", "label", "url", "position") VALUES ($1, $2, $3, $4), ... [1,000 value tuples, $1..$4000]
+calls=1      buffers=5013     INSERT INTO "collection_links" ("collection_id", "label", "url", "position") VALUES ($1, $2, $3, $4), ... [500 value tuples, $1..$2000]
+-- INSERT INTO collection_links: calls=3 buffers=25070 --
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.56s
+
+Equivalence assertions (all passed in this run, part of the same test):
+  - create: 200 persisted rows == 200 submitted (label, url, position), in order.
+  - update: 200 persisted rows == 200 submitted (label, url, position), in order;
+    none of the pre-update 200 rows survive.
+  - empty submission: 0 persisted rows, parent still created.
+  - duplicate-content submission (two identical label+url rows): both persisted,
+    not deduplicated.
+  - bind-parameter chunking (post-review addition, see PR #2888 review
+    thread): a 2,500-link create succeeds and issues exactly 3 INSERT
+    statements (two 1,000-row chunks + one 500-row chunk, chunk size =
+    (MAX_BIND_PARAMS / 4).clamp(1, 1000) = 1000), not 1 (which would risk a
+    bind-parameter overflow at real scale beyond this fixture) and not 2,500
+    (which would mean the batching fix had regressed). All 2,500 persisted
+    rows match the submitted input in order across the chunk boundary.
+  - independent equivalence: a parallel collection built with a one-by-one
+    reference INSERT loop (the pre-fix shape, reimplemented standalone for this
+    comparison only) produced byte-identical rows to the batched route's output
+    for the same input.

@@ -1,0 +1,5 @@
+error: commentable counter column `comment_count` on model `Post` must be `i64` (BIGINT), found `i32`; the counter is maintained with `SET c = c + 1` and read back as an `i64` — widen the column and the field
+  --> tests/compile-fail/model_commentable_counter_not_i64.rs:19:24
+   |
+19 |     pub comment_count: i32,
+   |                        ^^^

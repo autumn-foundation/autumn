@@ -1,0 +1,5 @@
+error: `#[classified]` is only supported on non-null `String` fields in v1 (issue #1654). Model the column as a `String`, or classify a neighbouring string column that holds the personal data.
+  --> tests/compile-fail/classified_non_string.rs:13:14
+   |
+13 |     pub age: i32,
+   |              ^^^

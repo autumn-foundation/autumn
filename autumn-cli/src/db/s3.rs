@@ -31,18 +31,20 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
-use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
-type HmacSha256 = Hmac<Sha256>;
+use autumn_web::sigv4;
 
-const ALGORITHM: &str = "AWS4-HMAC-SHA256";
+/// `SigV4` signing lives in `autumn_web::sigv4` so this client and the in-process
+/// `SQLite` replicator (#1628) sign identically, from one implementation. The
+/// aliases below keep this module's call sites and its published test names
+/// unchanged while the arithmetic itself has a single home.
+const ALGORITHM: &str = sigv4::ALGORITHM;
 const SERVICE: &str = "s3";
-const AWS4_REQUEST: &str = "aws4_request";
+const AWS4_REQUEST: &str = sigv4::AWS4_REQUEST;
 /// SHA-256 of the empty string; the payload hash for bodyless requests (GET /
 /// HEAD / DELETE).
-const EMPTY_PAYLOAD_SHA256: &str =
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const EMPTY_PAYLOAD_SHA256: &str = sigv4::EMPTY_PAYLOAD_SHA256;
 /// Upper bound on `list_objects_v2` pagination. At 1000 objects/page (the S3
 /// maximum) this covers a million objects — far beyond any backup prefix — while
 /// bounding a broken endpoint that never stops returning a continuation token.
@@ -178,9 +180,7 @@ pub struct RemoteObjectInfo {
 
 /// Hex-encoded SHA-256 of `data`.
 fn sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
+    sigv4::sha256_hex(data)
 }
 
 /// Raw SHA-256 digest of `data`. (Test helper; the streaming upload/verify paths
@@ -192,30 +192,11 @@ fn sha256_raw(data: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// HMAC-SHA256(`key`, `data`).
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    mac.finalize().into_bytes().into()
-}
-
 /// AWS URI-encode `s`. Unreserved characters (`A-Za-z0-9-._~`) pass through;
 /// everything else is percent-encoded uppercase. `/` is passed through when
 /// `encode_slash` is false (used for object-key path components).
 fn aws_uri_encode(s: &str, encode_slash: bool) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(b as char);
-            }
-            b'/' if !encode_slash => out.push('/'),
-            _ => {
-                let _ = write!(out, "%{b:02X}");
-            }
-        }
-    }
-    out
+    sigv4::uri_encode(s, encode_slash)
 }
 
 /// A header name/value pair for signing.
@@ -229,11 +210,7 @@ fn head_extra_headers() -> Vec<Header> {
 
 /// The `SignedHeaders` list: sorted lowercase header names joined by `;`.
 fn signed_headers_list(headers: &[Header]) -> String {
-    headers
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .collect::<Vec<_>>()
-        .join(";")
+    sigv4::signed_headers_list(headers)
 }
 
 /// Build the `SigV4` canonical request string. `headers` MUST be sorted by
@@ -245,29 +222,13 @@ fn canonical_request(
     headers: &[Header],
     payload_hash: &str,
 ) -> String {
-    let canonical_headers: String = headers
-        .iter()
-        .fold(String::new(), |mut acc, (name, value)| {
-            let _ = writeln!(acc, "{name}:{}", value.trim());
-            acc
-        });
-    let signed = signed_headers_list(headers);
-    format!(
-        "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed}\n{payload_hash}"
+    sigv4::canonical_request(
+        method,
+        canonical_uri,
+        canonical_query,
+        headers,
+        payload_hash,
     )
-}
-
-/// Build the `SigV4` string-to-sign from the canonical-request hash.
-fn string_to_sign(amz_date: &str, scope: &str, canonical_request_hash: &str) -> String {
-    format!("{ALGORITHM}\n{amz_date}\n{scope}\n{canonical_request_hash}")
-}
-
-/// Derive the `SigV4` signing key: a 4-stage HMAC chain over the secret.
-fn signing_key(secret: &str, date: &str, region: &str) -> [u8; 32] {
-    let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
-    let k_region = hmac_sha256(&k_date, region.as_bytes());
-    let k_service = hmac_sha256(&k_region, SERVICE.as_bytes());
-    hmac_sha256(&k_service, AWS4_REQUEST.as_bytes())
 }
 
 /// Compute the lowercase hex signature for a fully-assembled canonical request.
@@ -279,9 +240,15 @@ fn compute_signature(
     scope: &str,
     canonical_req: &str,
 ) -> String {
-    let key = signing_key(secret, date, region);
-    let sts = string_to_sign(amz_date, scope, &sha256_hex(canonical_req.as_bytes()));
-    hex::encode(hmac_sha256(&key, sts.as_bytes()))
+    sigv4::signature(
+        secret,
+        date,
+        region,
+        SERVICE,
+        amz_date,
+        scope,
+        canonical_req,
+    )
 }
 
 // ─── Verification comparator (pure, unit-tested without a live endpoint) ──────
@@ -399,16 +366,7 @@ fn parse_error_code(xml: &str) -> Option<String> {
 /// value AWS-URI-encoded (slash encoded), pairs sorted by encoded key. A
 /// value-less flag (e.g. `uploads`) encodes as `key=`.
 fn canonical_query(params: &[(&str, &str)]) -> String {
-    let mut encoded: Vec<(String, String)> = params
-        .iter()
-        .map(|(k, v)| (aws_uri_encode(k, true), aws_uri_encode(v, true)))
-        .collect();
-    encoded.sort_by(|a, b| a.0.cmp(&b.0));
-    encoded
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("&")
+    sigv4::canonical_query(params)
 }
 
 /// Number of parts a `len`-byte object splits into at `part_size` bytes/part.
@@ -916,6 +874,27 @@ impl S3Client {
         })
     }
 
+    /// Verify the just-written object matches, deleting the remote object on a
+    /// verification failure (#1760). `put_file*` WRITES the object BEFORE
+    /// verifying it, so a mismatch (or a transient read failure during verify)
+    /// can leave a corrupt/partial object behind. On any verify error we
+    /// best-effort `DeleteObject` the key so `put_file_and_verify` is
+    /// self-cleaning for every caller and leaves nothing behind even
+    /// transiently. The delete is cleanup only: its own failure must NEVER mask
+    /// the original verify error, which stays loud and non-zero.
+    fn verify_or_delete(&self, key: &str, len: u64, checksum_b64: &str) -> Result<(), S3Error> {
+        if let Err(e) = self.verify_uploaded(key, len, checksum_b64) {
+            if let Err(del_err) = self.delete_object(key) {
+                eprintln!(
+                    "  \u{26A0} failed to delete {key} after post-upload verification \
+                     failed: {del_err}"
+                );
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Stream the file at `path` to `key` and verify the remote object matches
     /// (AC #2): a single streaming hash pre-pass computes the sha256 + length,
     /// the file is streamed as the PUT body with a server-side checksum, then
@@ -940,7 +919,7 @@ impl S3Client {
         let checksum_b64 = base64_standard(&digest);
         let content_hex = hex::encode(digest);
         self.put_file(key, path, &checksum_b64, &content_hex)?;
-        self.verify_uploaded(key, hashed_len, &checksum_b64)
+        self.verify_or_delete(key, hashed_len, &checksum_b64)
     }
 
     /// Upload `path` to `key` as an S3 multipart upload: `CreateMultipartUpload`,
@@ -975,8 +954,10 @@ impl S3Client {
             Ok(whole_b64) => {
                 // Completion succeeded: the object now exists. Do NOT abort.
                 // Verify the assembled object matches the streamed-hash of the
-                // local file (HEAD length + checksum, else GET-and-rehash).
-                self.verify_uploaded(key, len, &whole_b64)
+                // local file (HEAD length + checksum, else GET-and-rehash). On a
+                // verify failure the completed object is deleted (#1760) so a
+                // corrupt object is never left behind.
+                self.verify_or_delete(key, len, &whole_b64)
             }
             Err(err) => {
                 // Best-effort abort; surface the ORIGINAL upload error regardless
@@ -1294,7 +1275,7 @@ mod tests {
 
     #[test]
     fn string_to_sign_shape() {
-        let sts = string_to_sign(
+        let sts = sigv4::string_to_sign(
             "20130524T000000Z",
             "20130524/us-east-1/s3/aws4_request",
             "abc",
@@ -1586,6 +1567,138 @@ mod tests {
             .unwrap();
         server.join().unwrap();
         assert_eq!(sink, body);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn put_file_and_verify_deletes_object_on_verify_failure() {
+        // #1760: `put_file_and_verify` WRITES the object BEFORE verifying it, so a
+        // post-upload verify failure must best-effort DELETE the just-written key
+        // — leaving no corrupt/partial object behind. A one-connection local S3
+        // stub accepts the PUT, then answers the verify HEAD with a WRONG
+        // Content-Length (forcing a length-mismatch `VerifyFailed`), and records
+        // that a DELETE for the same key follows. The multipart path funnels
+        // through the same `verify_or_delete` helper, so proving the single-PUT
+        // path proves the shared cleanup.
+        use std::io::{Read as _, Write as _};
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("artifact.dump");
+        let payload = b"verify-failure-cleanup-body";
+        std::fs::write(&path, payload).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let payload_len = payload.len();
+
+        let server = std::thread::spawn(move || {
+            let mut methods: Vec<String> = Vec::new();
+            // reqwest's blocking client reuses one keep-alive connection for the
+            // PUT/HEAD/DELETE sequence; the outer loop tolerates a fresh
+            // connection per request too. Read timeouts stop a stray idle
+            // connection from hanging the test.
+            'accept: for _conn in 0..8 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    break;
+                };
+                sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                loop {
+                    // Read the request head (up to CRLFCRLF).
+                    let mut acc: Vec<u8> = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    let header_end = loop {
+                        if let Some(p) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break Some(p + 4);
+                        }
+                        match sock.read(&mut buf) {
+                            Ok(0) | Err(_) => break None,
+                            Ok(n) => acc.extend_from_slice(&buf[..n]),
+                        }
+                    };
+                    let Some(header_end) = header_end else {
+                        break; // connection closed / idle — try the next one
+                    };
+                    let head = String::from_utf8_lossy(&acc[..header_end]).into_owned();
+                    let method = head
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().next())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let content_length: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    // Consume any request body (the PUT streams the file).
+                    let mut remaining = content_length.saturating_sub(acc.len() - header_end);
+                    while remaining > 0 {
+                        match sock.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => remaining = remaining.saturating_sub(n),
+                        }
+                    }
+                    methods.push(method.clone());
+                    match method.as_str() {
+                        "HEAD" => {
+                            // A wrong length forces verify_head's length-mismatch
+                            // VerifyFailed BEFORE any checksum/GET fallback.
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                                payload_len + 999
+                            );
+                            sock.write_all(resp.as_bytes()).ok();
+                        }
+                        "DELETE" => {
+                            sock.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").ok();
+                            sock.flush().ok();
+                            break 'accept;
+                        }
+                        _ => {
+                            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                                .ok();
+                        }
+                    }
+                    sock.flush().ok();
+                }
+            }
+            methods
+        });
+
+        let client = S3Client::new(
+            S3Config {
+                bucket: "b".to_owned(),
+                region: "us-east-1".to_owned(),
+                endpoint: Some(format!("http://127.0.0.1:{port}")),
+                force_path_style: true,
+            },
+            S3Credentials {
+                access_key_id: "k".to_owned(),
+                secret_access_key: "s".to_owned(),
+            },
+        )
+        .unwrap();
+
+        let err = client
+            .put_file_and_verify("prefix/artifact.dump", &path)
+            .expect_err("verify must fail on the mismatched HEAD length");
+        assert!(
+            matches!(err, S3Error::VerifyFailed { .. }),
+            "expected VerifyFailed, got {err:?}"
+        );
+
+        let methods = server.join().unwrap();
+        assert_eq!(
+            methods,
+            vec!["PUT".to_owned(), "HEAD".to_owned(), "DELETE".to_owned()],
+            "on a verify failure the object must be PUT, verified via HEAD, then DELETEd",
+        );
     }
 
     #[test]
