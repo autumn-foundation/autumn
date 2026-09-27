@@ -6,6 +6,8 @@
 //! post's terms *and* the affected terms' post counts. Handlers call these; they
 //! never open a transaction themselves.
 
+use std::collections::HashSet;
+
 use autumn_web::AutumnError;
 use autumn_web::AutumnResult;
 use diesel::prelude::*;
@@ -675,21 +677,38 @@ pub async fn set_post_terms(
 /// row is locked — see [`set_post_terms`] for why the order and the timing both
 /// matter. The ids are sorted here rather than trusted from the caller, because
 /// a caller that forgets is exactly the bug this prevents.
+///
+/// One `WHERE id = ANY(...)` query rather than one `.find()` per id — this
+/// used to loop, and looping is exactly what made `set_post_terms` an N+1 on
+/// the statement count (N cheap PK point lookups, invisible in a buffer-cost
+/// ranking but dominant in `pg_stat_statements.calls`). The row-level lock
+/// still has to be acquired in ascending id order (see [`set_post_terms`]),
+/// which is what `.order(terms::id.asc())` is for — checked with `EXPLAIN
+/// (ANALYZE, BUFFERS, VERBOSE, SETTINGS)` against the real `terms_pkey` index,
+/// including with the ids handed to the planner in descending order (the
+/// opposite of what's asked for) at a realistic 65-id width: Postgres
+/// satisfies the `ORDER BY` from the `Index Scan using terms_pkey` itself —
+/// its `= ANY(...)` support against a btree index presorts the array and
+/// walks the index in order — rather than adding a separate `Sort` node, so
+/// there is no unordered scan for `LockRows` to lock. A term deleted
+/// underneath us simply has no row to lock and nothing to recount, same as
+/// the loop's `.optional()`; `recount_term` reaches the same conclusion for
+/// the one lock it still takes per row (see its own doc comment for why that
+/// one stays unbatched).
 async fn lock_terms(conn: &mut AsyncPgConnection, term_ids: &[i64]) -> AutumnResult<()> {
     let mut ordered = term_ids.to_vec();
     ordered.sort_unstable();
     ordered.dedup();
-    for term_id in ordered {
-        // A term deleted underneath us has no row to lock and nothing to
-        // recount; `recount_term` reaches the same conclusion.
-        let _locked: Option<i64> = terms::table
-            .find(term_id)
-            .select(terms::id)
-            .for_update()
-            .first(conn)
-            .await
-            .optional()?;
+    if ordered.is_empty() {
+        return Ok(());
     }
+    let _locked: Vec<i64> = terms::table
+        .filter(terms::id.eq_any(&ordered))
+        .select(terms::id)
+        .order(terms::id.asc())
+        .for_update()
+        .load(conn)
+        .await?;
     Ok(())
 }
 
@@ -1216,18 +1235,59 @@ pub async fn revisions_for(
 
 /// Rebuild the published-post counts of the given terms.
 ///
-/// The single fan-out: every path that recounts more than one term goes through
-/// here, so the `FOR UPDATE` each `recount_term` takes is always acquired in
-/// ascending id order. Four separate loops in id-of-arrival order is four
-/// chances for two transactions with overlapping term sets to hold the halves
-/// of each other's cycle and deadlock.
+/// The single fan-out: every path that recounts more than one term goes
+/// through here. A caller with N affected terms used to pay 3N round trips —
+/// `recount_term` called once per id, each call its own lock, its own count,
+/// its own update — when the actual identity space this call needs to
+/// resolve is bounded by N distinct term rows, not by looping N times. This
+/// locks every row up front in one batched, ascending-id-order `FOR UPDATE`
+/// (`.order(terms::id.asc())` ahead of `.for_update()`, the same guarantee
+/// `lock_terms` uses and for the same reason: every fan-out over terms locks
+/// ascending, so two transactions touching overlapping sets can never hold
+/// the halves of each other's cycle), computes every count in one grouped
+/// query, then writes every count back in one statement.
+///
+/// The lock has to be taken here, not left to a per-id `recount_term`,
+/// because `recount_terms_for_post` reaches this function directly, without
+/// `set_post_terms`'s prior `lock_terms` call.
 pub async fn recount_terms(conn: &mut AsyncPgConnection, term_ids: &[i64]) -> AutumnResult<()> {
     let mut ordered = term_ids.to_vec();
     ordered.sort_unstable();
     ordered.dedup();
-    for term_id in ordered {
-        recount_term(conn, term_id).await?;
+    if ordered.is_empty() {
+        return Ok(());
     }
+
+    // A term deleted underneath us has no row to lock and drops out here —
+    // `recount_term` used to reach the same conclusion per id, via `.optional()`.
+    let locked: Vec<i64> = terms::table
+        .filter(terms::id.eq_any(&ordered))
+        .select(terms::id)
+        .order(terms::id.asc())
+        .for_update()
+        .load(conn)
+        .await?;
+    if locked.is_empty() {
+        return Ok(());
+    }
+
+    let counts = term_post_counts(conn, &locked).await?;
+
+    use diesel::sql_types::{Array, BigInt};
+    let post_counts: Vec<i64> = locked
+        .iter()
+        .map(|id| counts.get(id).copied().unwrap_or(0))
+        .collect();
+    diesel::sql_query(
+        "UPDATE terms SET post_count = data.count \
+         FROM (SELECT * FROM UNNEST($1::bigint[], $2::bigint[]) AS t(id, count)) AS data \
+         WHERE terms.id = data.id",
+    )
+    .bind::<Array<BigInt>, _>(locked.clone())
+    .bind::<Array<BigInt>, _>(post_counts)
+    .execute(conn)
+    .await?;
+
     Ok(())
 }
 
@@ -1655,25 +1715,33 @@ pub async fn update_user(
         bio,
         website,
     } = edit;
-    // The same rule the registration path applies, for the same reason: this is
-    // a direct Diesel update, so the model's `#[validate(email)]` never runs.
-    // Fixing only the create path left an administrator able to store `user@`
-    // on an existing account.
     let email = email.trim().to_lowercase();
-    if !autumn_web::reexports::validator::ValidateEmail::validate_email(&email) {
-        return Err(AutumnError::unprocessable_msg(
-            "That email address is not valid",
-        ));
-    }
-    if email.len() > crate::hooks::MAX_EMAIL_BYTES {
-        return Err(AutumnError::unprocessable_msg(format!(
-            "Email must be at most {} characters",
-            crate::hooks::MAX_EMAIL_BYTES
-        )));
-    }
 
     with_administrator_guard(conn, actor_id, target_id, role, move |conn| {
         async move {
+            // The same rule the registration path applies, for the same
+            // reason: this is a direct Diesel update, so the model's
+            // `#[validate(email)]` never runs. Fixing only the create path
+            // left an administrator able to store `user@` on an existing
+            // account. Checked here, inside the guard's transaction and
+            // after it has re-confirmed the actor's own authorization —
+            // not before the guard runs, as this used to. An actor demoted
+            // or deleted while this request was in flight must be refused
+            // by the guard's own `FORBIDDEN` before an unrelated 422 from
+            // this validation can reach the caller and redisplay the Users
+            // screen using that stale, already-revoked `actor` (Codex
+            // review finding on PR #2906).
+            if !autumn_web::reexports::validator::ValidateEmail::validate_email(&email) {
+                return Err(AutumnError::unprocessable_msg(
+                    "That email address is not valid",
+                ));
+            }
+            if email.len() > crate::hooks::MAX_EMAIL_BYTES {
+                return Err(AutumnError::unprocessable_msg(format!(
+                    "Email must be at most {} characters",
+                    crate::hooks::MAX_EMAIL_BYTES
+                )));
+            }
             diesel::update(users::table.find(target_id))
                 .set((
                     users::role.eq(role.slug()),
@@ -2381,39 +2449,101 @@ pub async fn ensure_unique_slug(
     let shadowed_by_a_route = !nested_page
         && BARE_PATH_TYPES.contains(&post_type)
         && segment_claim(desired, None).is_some();
-    let mut candidate = if shadowed_by_a_route {
+
+    // The first candidate the original suffix-at-a-time loop would have
+    // queried: `desired` itself, or `desired-2` when `shadowed_by_a_route`
+    // (that slug is reserved by a route rather than by another row, so the
+    // search starts one suffix further in).
+    let first_candidate = if shadowed_by_a_route {
         format!("{desired}-2")
     } else {
         desired.to_owned()
     };
-    for suffix in 2..=200u32 {
-        let mut query = posts::table
-            .filter(posts::slug.eq(candidate.clone()))
-            .filter(posts::post_type.eq_any(&competing_types))
-            .into_boxed();
-        // Siblings only, for a nested page — and for a top-level page or a
-        // post, the bare-path namespace, which nested pages are not in.
-        query = match parent_id {
-            Some(parent) if nested_page => query.filter(posts::parent_id.eq(parent)),
-            _ if BARE_PATH_TYPES.contains(&post_type) => {
-                query.filter(posts::post_type.eq("post").or(posts::parent_id.is_null()))
-            }
-            _ => query,
-        };
-        if let Some(id) = exclude_id {
-            query = query.filter(posts::id.ne(id));
-        }
-        let taken: i64 = query.count().get_result(conn).await?;
-        if taken == 0 {
-            return Ok(candidate);
-        }
-        candidate = format!("{desired}-{suffix}");
+
+    // The overwhelming common case is zero collisions: a title nobody has
+    // used before frees on the very first candidate. Probing that one alone
+    // — the same single-value, index-backed shape the original loop's first
+    // iteration used, and the only string this path allocates — keeps that
+    // case exactly as cheap as before: no wider `= ANY(...)` query the
+    // planner might resolve with a sequential scan, and no wasted formatting
+    // of the ~198 suffixes that turn out not to be needed. Only a collision
+    // here falls through to building and batching the rest of the candidate
+    // list, and it is *that* path — not the common one — that this fix is
+    // for.
+    let mut probe = posts::table
+        .filter(posts::slug.eq(&first_candidate))
+        .filter(posts::post_type.eq_any(&competing_types))
+        .into_boxed();
+    probe = apply_slug_scope(probe, post_type, parent_id, nested_page, exclude_id);
+    let first_taken: i64 = probe.count().get_result(conn).await?;
+    if first_taken == 0 {
+        return Ok(first_candidate);
     }
-    // 200 collisions on one slug is not a naming accident. Refuse rather than
-    // loop or silently overwrite.
-    Err(AutumnError::unprocessable_msg(
-        "Too many posts share this slug; choose a different one",
-    ))
+
+    // Reached only on a collision. The rest of the candidates the original
+    // loop would have queried, in the same order and with the same
+    // off-by-one boundary: `desired-200` is never itself reached (the
+    // loop's `2..=200` range, combined with its check-then-advance
+    // structure, means the last candidate it ever queries is
+    // `desired-199`), so 199 taken candidates — not 200 — is what exhausts
+    // the search. The original loop also rechecks `desired-2` a second time
+    // via its carried-over candidate in the `shadowed_by_a_route` case, a
+    // redundant, idempotent recheck (the same string can't become "more
+    // taken" the second time) that is dropped here rather than reproduced.
+    let first_suffix = if shadowed_by_a_route { 3 } else { 2 };
+    let remaining: Vec<String> = (first_suffix..=199u32)
+        .map(|suffix| format!("{desired}-{suffix}"))
+        .collect();
+
+    let mut query = posts::table
+        .filter(posts::slug.eq_any(&remaining))
+        .filter(posts::post_type.eq_any(&competing_types))
+        .into_boxed();
+    query = apply_slug_scope(query, post_type, parent_id, nested_page, exclude_id);
+    // One round trip for the rest of the candidate list, instead of one per
+    // suffix: every existing row that holds ANY remaining candidate, in a
+    // single query, then the first candidate not among them wins in Rust —
+    // the same "first free wins" rule the original loop applied one probe
+    // at a time.
+    let taken: HashSet<String> = query
+        .select(posts::slug)
+        .load(conn)
+        .await?
+        .into_iter()
+        .collect();
+
+    remaining
+        .into_iter()
+        .find(|candidate| !taken.contains(candidate))
+        // 199 collisions on one slug is not a naming accident. Refuse rather
+        // than loop further or silently overwrite.
+        .ok_or_else(|| {
+            AutumnError::unprocessable_msg("Too many posts share this slug; choose a different one")
+        })
+}
+
+/// Siblings only, for a nested page — and for a top-level page or a post,
+/// the bare-path namespace, which nested pages are not in. Shared between
+/// `ensure_unique_slug`'s fast-path single probe and its batched fallback so
+/// the two stay scoped identically.
+fn apply_slug_scope<'a>(
+    mut query: posts::BoxedQuery<'a, diesel::pg::Pg>,
+    post_type: &str,
+    parent_id: Option<i64>,
+    nested_page: bool,
+    exclude_id: Option<i64>,
+) -> posts::BoxedQuery<'a, diesel::pg::Pg> {
+    query = match parent_id {
+        Some(parent) if nested_page => query.filter(posts::parent_id.eq(parent)),
+        _ if BARE_PATH_TYPES.contains(&post_type) => {
+            query.filter(posts::post_type.eq("post").or(posts::parent_id.is_null()))
+        }
+        _ => query,
+    };
+    if let Some(id) = exclude_id {
+        query = query.filter(posts::id.ne(id));
+    }
+    query
 }
 
 /// The deepest page hierarchy the site will address.
@@ -3622,9 +3752,12 @@ pub async fn import_revisions(
         diesel::delete(revisions::table.filter(revisions::post_id.eq(post_id)))
             .execute(conn)
             .await?;
-        for revision in &keep {
-            diesel::insert_into(revisions::table)
-                .values((
+        // One multi-row INSERT for the whole batch (`keep` is bounded by
+        // `REVISION_LIMIT`), not one round trip per kept revision.
+        let rows: Vec<_> = keep
+            .iter()
+            .map(|revision| {
+                (
                     revisions::post_id.eq(post_id),
                     revisions::title.eq(&revision.title),
                     revisions::excerpt.eq(&revision.excerpt),
@@ -3638,10 +3771,13 @@ pub async fn import_revisions(
                     // Explicit, like a comment's: a history whose timestamps all
                     // say "the moment of the restore" is not a history.
                     revisions::created_at.eq(revision.created_at),
-                ))
-                .execute(conn)
-                .await?;
-        }
+                )
+            })
+            .collect();
+        diesel::insert_into(revisions::table)
+            .values(rows)
+            .execute(conn)
+            .await?;
         Ok::<_, AutumnError>(keep.len())
     })
     .await
@@ -3689,13 +3825,24 @@ pub async fn import_post_meta(
         )
         .execute(conn)
         .await?;
-        for (key, value) in &fields {
+        // Multi-row INSERTs, not one round trip per custom field: a file's
+        // per-post field count is unbounded (a plugin-heavy WordPress export
+        // routinely carries dozens), so this is chunked like `import_terms`'s
+        // batched insert rather than assumed to always fit one statement.
+        const CHUNK: usize = 1000;
+        for chunk in fields.chunks(CHUNK) {
+            let rows: Vec<_> = chunk
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        post_meta::post_id.eq(post_id),
+                        post_meta::meta_key.eq(key),
+                        post_meta::meta_value.eq(value),
+                    )
+                })
+                .collect();
             diesel::insert_into(post_meta::table)
-                .values((
-                    post_meta::post_id.eq(post_id),
-                    post_meta::meta_key.eq(key),
-                    post_meta::meta_value.eq(value),
-                ))
+                .values(rows)
                 .execute(conn)
                 .await?;
         }

@@ -803,6 +803,36 @@ async fn an_auth_session_key_that_collides_with_a_reserved_key_is_refused() {
     }
 }
 
+#[tokio::test]
+async fn an_auth_session_key_of_last_strong_auth_at_is_refused() {
+    // The issue's scenario, pinned by name (#2359): with `[auth].session_key =
+    // "last_strong_auth_at"` the swap would stash the operator's live step-up
+    // claim and write the target id into the key `check_step_up` reads as a
+    // Unix timestamp, so a numeric target id near current epoch seconds
+    // satisfies step-up with no reauthentication. The RESERVED_SESSION_KEYS
+    // loop above covers this key too; this test names it explicitly.
+    let mut config = AutumnConfig::default();
+    config.auth.session_key = "last_strong_auth_at".to_owned();
+    let client = TestApp::new()
+        .routes(routes())
+        .config(config)
+        .state_initializer(|state| {
+            state.insert_extension(ImpersonationGate::allow_roles(["admin"]));
+            state.insert_extension(
+                AuditLogger::new().with_sink(Arc::new(autumn_web::audit::TracingAuditSink)),
+            );
+        })
+        .build();
+    client.post("/login-admin").send().await.assert_ok();
+
+    client
+        .post("/impersonate")
+        .form("user_id=user-9")
+        .send()
+        .await
+        .assert_status(500);
+}
+
 // ── Step-up does not carry into the impersonated identity ─────
 
 #[autumn_web::post("/step-up")]

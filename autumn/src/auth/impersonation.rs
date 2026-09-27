@@ -143,19 +143,26 @@ pub const IMPERSONATOR_STEP_UP_SESSION_KEY: &str = "impersonator_last_strong_aut
 /// and the admin plugin's role middleware read.
 const ROLE_SESSION_KEY: &str = "role";
 
-/// Every session key impersonation writes for its own bookkeeping.
+/// Every session key the impersonation swap must not collide with.
 ///
+/// Most are keys impersonation writes for its own bookkeeping; the live
+/// step-up key is read and stashed by the swap rather than written, but it is
+/// reserved all the same — the swap moves the operator's claim aside and then
+/// writes the target id through the configured auth key, so a colliding
+/// configuration would let a numeric target id satisfy step-up with no
+/// reauthentication.
 /// An app must not configure `[auth].session_key` (or write by hand) any key in
 /// this list: the swap would then clobber its own record.
 /// [`begin_impersonation`] refuses rather than corrupting the session, and
 /// `AppBuilder::impersonation_gate` logs the misconfiguration at startup.
-pub const RESERVED_SESSION_KEYS: [&str; 6] = [
+pub const RESERVED_SESSION_KEYS: [&str; 7] = [
     IMPERSONATOR_SESSION_KEY,
     IMPERSONATED_SESSION_KEY,
     IMPERSONATION_SESSION_ID_KEY,
     IMPERSONATOR_ROLE_SESSION_KEY,
     IMPERSONATOR_STEP_UP_SESSION_KEY,
     ROLE_SESSION_KEY,
+    crate::step_up::STEP_UP_SESSION_KEY,
 ];
 
 /// Whether `key` is one of the [`RESERVED_SESSION_KEYS`].
@@ -483,8 +490,17 @@ pub async fn clear(session: &Session) {
 /// Returns the real impersonator while impersonation is active, and
 /// `effective_user_id` otherwise. This is the single rule the framework's
 /// session-based [`Current::set_actor`] seams apply, so
-/// `#[repository(versioned)]` writes and [`AuditEvent`]s stay attributed to the
-/// human responsible.
+/// `#[repository(versioned)]` writes stay attributed to the human responsible,
+/// and so do [`AuditEvent`]s — for the audit call sites the framework owns,
+/// which read the acting user from [`Current`].
+///
+/// Hand-rolled audit events do not get this for free: [`AuditEvent::new`]
+/// takes an explicit `actor_id`, so a handler that builds its event from the
+/// effective session user still records the *customer* while impersonation is
+/// active — the exact misattribution impersonation exists to prevent, in the
+/// one place an integrator is most likely to hand-roll. Pass
+/// `audit_actor_id(session, user).await` (or `Current::actor()`) as `actor_id`
+/// there.
 ///
 /// Validating by construction: the caller supplies the effective user, so a
 /// stale record — one describing a *different* user than the session now
@@ -1007,6 +1023,19 @@ mod tests {
             Some("target".to_owned()),
             "clear() drops the record, not the session"
         );
+    }
+
+    #[tokio::test]
+    async fn the_live_step_up_key_is_reserved() {
+        // The swap stashes the operator's live step-up claim aside and then
+        // writes the target id through the configured auth key. With
+        // `[auth].session_key = "last_strong_auth_at"` those are the same
+        // entry, and a numeric target id in the neighbourhood of current
+        // epoch seconds would satisfy step-up with no reauthentication — so
+        // the reserved-key check refuses the configuration instead.
+        assert!(is_reserved_session_key(crate::step_up::STEP_UP_SESSION_KEY));
+        assert_eq!(crate::step_up::STEP_UP_SESSION_KEY, "last_strong_auth_at");
+        assert_eq!(RESERVED_SESSION_KEYS.len(), 7);
     }
 
     #[test]

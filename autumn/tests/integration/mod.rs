@@ -171,6 +171,7 @@ mod inline_broadcast_prefetch;
 mod inspector_integration;
 mod isr_coordination;
 mod job_recorder_integration;
+mod job_tenant_scope;
 mod job_tracking_route;
 mod job_tracking_stores_integration;
 #[cfg(all(feature = "ws", feature = "maud", feature = "htmx", feature = "db"))]
@@ -267,6 +268,8 @@ mod problem_details;
 mod process_role_worker_gating;
 #[cfg(feature = "maud")]
 mod profile_conditional_surfaces;
+#[cfg(feature = "db")]
+mod repository_column_order;
 // The capability-sandboxed plugin lane (#1609). Gated on `plugin-sandbox` (the
 // runtime) and `test-support` (the shared WAT escape corpus), neither of which
 // the Docker sweep's feature set enables — so the ignored timing benchmark in
@@ -381,17 +384,21 @@ mod sim_chaos_clock_skew_monotonic;
 mod sim_clock_drain;
 #[cfg(feature = "collab")]
 mod sim_collab_convergence;
+mod sim_default_entropy;
 mod sim_delayed_enqueue;
 mod sim_deterministic_ids;
 mod sim_fault_plan;
 mod sim_fault_plan_pg;
 mod sim_job_clock;
+mod sim_liveness_watchdog;
 mod sim_llm_stub;
 mod sim_monotonic_clock;
 mod sim_rate_limit_clock;
 mod sim_retry_storm;
+mod sim_scheduled_ticks;
 mod sim_strict_wall_clock;
 mod sim_test_smoke;
+mod sim_testapp_jobs;
 mod sqlite_ci_coverage;
 #[cfg(feature = "db")]
 mod sqlite_replication;

@@ -128,13 +128,13 @@ const ADMIN_CSS: &str = "
     }
 
     /* Cards */
-    .card {
+    .autumn-card {
         background: var(--surface);
         border-radius: var(--radius);
         box-shadow: var(--shadow);
         margin-bottom: 1.5rem;
     }
-    .card-header {
+    .autumn-card__header {
         display: flex;
         justify-content: space-between;
         align-items: center;
@@ -142,12 +142,12 @@ const ADMIN_CSS: &str = "
         border-bottom: 1px solid var(--border);
     }
     .header-actions form { display: inline; }
-    .card-title {
+    .autumn-card__title {
         font-size: 1.125rem;
         font-weight: 600;
         margin: 0;
     }
-    .card-body {
+    .autumn-card__body {
         padding: 1.5rem;
     }
 
@@ -313,15 +313,15 @@ const ADMIN_CSS: &str = "
         gap: 1rem;
         margin-bottom: 1.5rem;
     }
-    .stat-card {
+    .autumn-stat-card {
         background: var(--surface);
         border-radius: var(--radius);
         box-shadow: var(--shadow);
         padding: 1.25rem;
     }
-    .stat-label { font-size: 0.8125rem; color: var(--text-muted); font-weight: 500; }
-    .stat-value { font-size: 1.75rem; font-weight: 700; margin-top: 0.25rem; }
-    .stat-link { font-size: 0.8125rem; margin-top: 0.375rem; }
+    .autumn-stat-card__label { font-size: 0.8125rem; color: var(--text-muted); font-weight: 500; }
+    .autumn-stat-card__value { font-size: 1.75rem; font-weight: 700; margin-top: 0.25rem; }
+    .autumn-stat-card__link { font-size: 0.8125rem; margin-top: 0.375rem; }
     .jobs-counter-grid {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -790,7 +790,7 @@ pub fn jobs_counters(snapshot: &JobAdminSnapshot, prefix: &str) -> Markup {
 fn job_counter(label: &str, value: u64) -> Markup {
     html! {
         div class="jobs-counter" {
-            span class="stat-label" { (label) }
+            span class="autumn-stat-card__label" { (label) }
             strong { (value) }
         }
     }
@@ -1168,8 +1168,8 @@ pub fn model_list_page(
                         hx-get={ (prefix) "/" (model_slug) }
                         hx-trigger="input changed delay:300ms"
                         hx-include="closest form"
-                        hx-target="closest .card"
-                        hx-select=".card > *"
+                        hx-target="closest .autumn-card"
+                        hx-select=".autumn-card > *"
                         hx-push-url="true" {}
                     @for (k, v) in filters {
                         input type="hidden" name={ "filter." (k) } value=(v);
@@ -5121,7 +5121,7 @@ mod tests {
         let html = render_layout(None);
         assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
         assert!(
-            html.contains(r#"href="/admin" class="active" aria-current="page""#),
+            html.contains(r#"href="/admin" class="autumn-active" aria-current="page""#),
             "{html}"
         );
     }
@@ -5131,7 +5131,7 @@ mod tests {
         let html = render_layout(Some(JOBS_NAV_SLUG));
         assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
         assert!(
-            html.contains(r#"href="/admin/jobs" class="active" aria-current="page""#),
+            html.contains(r#"href="/admin/jobs" class="autumn-active" aria-current="page""#),
             "{html}"
         );
     }
@@ -5141,7 +5141,7 @@ mod tests {
         let html = render_layout(Some(RUNTIME_CONFIG_NAV_SLUG));
         assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
         assert!(
-            html.contains(r#"href="/admin/config" class="active" aria-current="page""#),
+            html.contains(r#"href="/admin/config" class="autumn-active" aria-current="page""#),
             "{html}"
         );
     }
@@ -5153,7 +5153,7 @@ mod tests {
         // registry is empty (no model nav items).
         let html = render_layout(Some(JOBS_NAV_SLUG));
         assert!(
-            !html.contains(r#"href="/admin" class="active""#),
+            !html.contains(r#"href="/admin" class="autumn-active""#),
             "dashboard must not be active: {html}"
         );
     }
