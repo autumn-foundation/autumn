@@ -31,6 +31,14 @@
 //! handler makes outside the cell's API are out of scope by design. This is a
 //! safe-Rust accounting cell, not a bounding allocator.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -533,7 +541,7 @@ impl TenantCellRegistry {
                 global_tracked: Arc::new(AtomicUsize::new(0)),
                 max_cells,
                 idle_ttl,
-                base: Instant::now(),
+                base: crate::time::ambient_instant(),
                 seq: AtomicU64::new(0),
             }),
         }
@@ -541,7 +549,8 @@ impl TenantCellRegistry {
 
     /// Registry-relative "now" in milliseconds since `base`.
     fn now_millis(&self) -> u64 {
-        u64::try_from(self.inner.base.elapsed().as_millis()).unwrap_or(u64::MAX)
+        let elapsed = crate::time::ambient_instant().saturating_duration_since(self.inner.base);
+        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
     }
 
     /// Draw the next globally-monotonic access sequence number. Each call

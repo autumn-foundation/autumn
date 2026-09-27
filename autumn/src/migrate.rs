@@ -25,6 +25,14 @@
 //! }
 //! ```
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use diesel::RunQueryDsl;
 use diesel::migration::{Migration, MigrationSource};
 use diesel::pg::Pg;
@@ -617,6 +625,12 @@ fn acquire_migration_lock_on<C>(
 where
     C: diesel::connection::LoadConnection<Backend = Pg>,
 {
+    // The lock holder is a real process and the loop blocks on a real sleep.
+    // A virtual clock does not advance here, so read the real clock.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "waits on a real Postgres lock holder with std::thread::sleep"
+    )]
     let start = std::time::Instant::now();
     let poll = std::time::Duration::from_millis(500);
 
@@ -2218,10 +2232,10 @@ where
                         ))
                     })?;
 
-                let started = std::time::Instant::now();
+                let started = crate::time::ambient_instant();
                 conn.revert_migration(migration.as_ref())
                     .map_err(|e| MigrationError::Migration(e.to_string()))?;
-                let duration = started.elapsed();
+                let duration = crate::time::ambient_instant().saturating_duration_since(started);
 
                 // This version is no longer applied, so its recorded checksum row
                 // must go: reverting exactly this migration removes it from
@@ -2496,10 +2510,10 @@ where
                     ))
                 })?;
 
-            let started = std::time::Instant::now();
+            let started = crate::time::ambient_instant();
             conn.revert_migration(migration.as_ref())
                 .map_err(|e| MigrationError::Migration(e.to_string()))?;
-            let duration = started.elapsed();
+            let duration = crate::time::ambient_instant().saturating_duration_since(started);
 
             on_reverted(&RevertedMigration {
                 version: version.clone(),
@@ -2695,6 +2709,12 @@ pub fn wait_for_database(
     max_wait: std::time::Duration,
     mut on_retry: impl FnMut(u32, std::time::Duration),
 ) -> Result<(), MigrationError> {
+    // The database is a real server and the loop blocks on a real sleep.
+    // A virtual clock does not advance here, so read the real clock.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "waits on a real database server with std::thread::sleep"
+    )]
     let start = std::time::Instant::now();
     wait_for_database_inner(
         max_wait,
