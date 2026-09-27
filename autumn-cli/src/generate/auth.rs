@@ -52,14 +52,14 @@ const PASSKEY_EXTRA_DEPS: &[(&str, &str)] = &[
     ("base64", "\"0.22\""),
 ];
 
-/// The code portion of a Cargo.toml line, up to (not including) its first
-/// `#` outside any quoted string — the start of a TOML comment. A raw
-/// substring/character search over a whole line risks matching text that
-/// isn't syntax at all: a feature name mentioned in a comment, a stray
-/// `]`/`}` inside one, or (the reverse mistake) a `#` that is itself inside
-/// a quoted value rather than starting a comment — a git-fork path/URL
-/// fragment like `"../autumn#fork"` is valid TOML, not a comment marker.
-fn strip_line_comment(s: &str) -> &str {
+/// The byte index of the first occurrence of `needle` in `s` that falls
+/// outside any quoted string. A `#`, `]`, `,`, or similar character inside a
+/// quoted TOML value is not syntax at all — Cargo allows unusual feature
+/// names (and git-fork path fragments) containing any of these for a
+/// path/git dependency — so a raw, quote-blind search risks mistaking part
+/// of a value for the comment marker, the array's closing bracket, or an
+/// element separator.
+fn find_unquoted(s: &str, needle: char) -> Option<usize> {
     #[derive(PartialEq)]
     enum Quote {
         None,
@@ -76,11 +76,55 @@ fn strip_line_comment(s: &str) -> &str {
             ('\\', Quote::Double) => {
                 chars.next(); // skip the escaped character
             }
-            ('#', Quote::None) => return &s[..i],
+            (c, Quote::None) if c == needle => return Some(i),
             _ => {}
         }
     }
-    s
+    None
+}
+
+/// Splits `s` on `,` characters that fall outside any quoted string, so a
+/// quoted feature name containing a literal comma is kept whole rather than
+/// torn into two garbage entries.
+fn split_unquoted_commas(s: &str) -> Vec<&str> {
+    #[derive(PartialEq)]
+    enum Quote {
+        None,
+        Double,
+        Single,
+    }
+    let mut quote = Quote::None;
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut chars = s.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match (c, &quote) {
+            ('"', Quote::None) => quote = Quote::Double,
+            ('\'', Quote::None) => quote = Quote::Single,
+            ('"', Quote::Double) | ('\'', Quote::Single) => quote = Quote::None,
+            ('\\', Quote::Double) => {
+                chars.next();
+            }
+            (',', Quote::None) => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// The code portion of a Cargo.toml line, up to (not including) its first
+/// `#` outside any quoted string — the start of a TOML comment. A raw
+/// substring/character search over a whole line risks matching text that
+/// isn't syntax at all: a feature name mentioned in a comment, a stray
+/// `]`/`}` inside one, or (the reverse mistake) a `#` that is itself inside
+/// a quoted value rather than starting a comment — a git-fork path/URL
+/// fragment like `"../autumn#fork"` is valid TOML, not a comment marker.
+fn strip_line_comment(s: &str) -> &str {
+    find_unquoted(s, '#').map_or(s, |i| &s[..i])
 }
 
 /// Required features for the `webauthn-rs` dependency.
@@ -114,7 +158,7 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
     let merge_missing = |line: &str| -> Option<String> {
         let feat_bracket = line.find("features = [")?;
         let list_start = feat_bracket + "features = [".len();
-        let close_off = line[list_start..].find(']')?;
+        let close_off = find_unquoted(&line[list_start..], ']')?;
         let list_end = close_off + list_start;
         let existing_list = &line[list_start..list_end];
         let additions: Vec<String> = WEBAUTHN_RS_FEATURES
@@ -177,7 +221,7 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
                         .chars()
                         .take_while(char::is_ascii_whitespace)
                         .collect();
-                    if strip_line_comment(&t).contains(']') {
+                    if find_unquoted(strip_line_comment(&t), ']').is_some() {
                         // Single-line `features = [...]`.
                         if let Some(new_line) = merge_missing(&t) {
                             lines[j] = format!("{ind2}{new_line}");
@@ -189,7 +233,10 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
                         // appended. A `#` comment is not TOML, so a stray `]`
                         // or trailing text inside one is never real syntax —
                         // every raw-text scan and join below works only on
-                        // each line's code portion (before its first `#`).
+                        // each line's code portion (before its first `#`), and
+                        // only outside any quoted value (Cargo allows unusual
+                        // feature names on a path/git dependency, so a quoted
+                        // `]` or `,` is data, not an array boundary).
                         let mut close_line = None;
                         let mut k = j;
                         while k < lines.len() {
@@ -197,7 +244,7 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
                             if k > j && tk.starts_with('[') {
                                 break; // next table header — array never closed
                             }
-                            if strip_line_comment(&lines[k]).contains(']') {
+                            if find_unquoted(strip_line_comment(&lines[k]), ']').is_some() {
                                 close_line = Some(k);
                                 break;
                             }
@@ -211,8 +258,7 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
                                 list_text.push(' ');
                                 list_text.push_str(strip_line_comment(line.trim()));
                             }
-                            let cl_close = strip_line_comment(&lines[cl])
-                                .find(']')
+                            let cl_close = find_unquoted(strip_line_comment(&lines[cl]), ']')
                                 .unwrap_or(lines[cl].len());
                             list_text.push(' ');
                             list_text.push_str(strip_line_comment(&lines[cl][..cl_close]));
@@ -220,8 +266,8 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
                                 [cl_close.saturating_add(1).min(lines[cl].len())..]
                                 .to_owned();
 
-                            let mut entries: Vec<String> = list_text
-                                .split(',')
+                            let mut entries: Vec<String> = split_unquoted_commas(&list_text)
+                                .into_iter()
                                 .map(str::trim)
                                 .filter(|t| !t.is_empty())
                                 .map(str::to_owned)
@@ -314,7 +360,7 @@ fn ensure_totp_rs_features(toml: &str) -> String {
     let merge_into_list = |line: &str, bracket_search: &str| -> Option<Option<String>> {
         let feat_bracket = line.find(bracket_search)?;
         let list_start = feat_bracket + bracket_search.len();
-        let close_off = line[list_start..].find(']')?;
+        let close_off = find_unquoted(&line[list_start..], ']')?;
         let list_end = close_off + list_start;
         let existing_list = &line[list_start..list_end];
         let additions: Vec<String> = TOTP_RS_FEATURES
@@ -405,7 +451,7 @@ fn ensure_totp_rs_features(toml: &str) -> String {
                     .chars()
                     .take_while(char::is_ascii_whitespace)
                     .collect();
-                if strip_line_comment(&tj).contains(']') {
+                if find_unquoted(strip_line_comment(&tj), ']').is_some() {
                     // Single-line `features = [...]`.
                     match merge_into_list(&tj, "[") {
                         Some(Some(new_line)) => lines[fl] = format!("{indent_j}{new_line}"),
@@ -419,7 +465,10 @@ fn ensure_totp_rs_features(toml: &str) -> String {
                     // comment is not TOML, so a stray `]` or trailing text
                     // inside one is never real syntax — every raw-text scan
                     // and join below works only on each line's code portion
-                    // (before its first `#`).
+                    // (before its first `#`), and only outside any quoted value
+                    // (Cargo allows unusual feature names on a path/git
+                    // dependency, so a quoted `]` or `,` is data, not an array
+                    // boundary).
                     let mut close_line = None;
                     let mut k = fl;
                     while k < lines.len() {
@@ -427,7 +476,7 @@ fn ensure_totp_rs_features(toml: &str) -> String {
                         if k > fl && tk.starts_with('[') {
                             break; // next table header — array never closed
                         }
-                        if strip_line_comment(&lines[k]).contains(']') {
+                        if find_unquoted(strip_line_comment(&lines[k]), ']').is_some() {
                             close_line = Some(k);
                             break;
                         }
@@ -441,16 +490,15 @@ fn ensure_totp_rs_features(toml: &str) -> String {
                             list_text.push(' ');
                             list_text.push_str(strip_line_comment(line.trim()));
                         }
-                        let cl_close = strip_line_comment(&lines[cl])
-                            .find(']')
+                        let cl_close = find_unquoted(strip_line_comment(&lines[cl]), ']')
                             .unwrap_or(lines[cl].len());
                         list_text.push(' ');
                         list_text.push_str(strip_line_comment(&lines[cl][..cl_close]));
                         let trailing =
                             lines[cl][cl_close.saturating_add(1).min(lines[cl].len())..].to_owned();
 
-                        let mut entries: Vec<String> = list_text
-                            .split(',')
+                        let mut entries: Vec<String> = split_unquoted_commas(&list_text)
+                            .into_iter()
                             .map(str::trim)
                             .filter(|t| !t.is_empty())
                             .map(str::to_owned)
@@ -1641,7 +1689,7 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
             }
             if let Some(feat_bracket) = trimmed.find("features = [") {
                 let list_start = feat_bracket + "features = [".len();
-                if let Some(close_bracket) = trimmed[list_start..].find(']') {
+                if let Some(close_bracket) = find_unquoted(&trimmed[list_start..], ']') {
                     let list_end = close_bracket + list_start;
                     let existing = trimmed[list_start..list_end].trim();
                     let new_list = if existing.is_empty() {
@@ -1662,7 +1710,7 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
                         if tj.starts_with('[') {
                             break;
                         }
-                        if let Some(close_idx) = tj.find(']') {
+                        if let Some(close_idx) = find_unquoted(strip_line_comment(tj), ']') {
                             let before_close = tj[..close_idx].trim();
                             let sep = if before_close.is_empty() || before_close.ends_with(',') {
                                 ""
@@ -1736,7 +1784,7 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
                         break;
                     }
                     if let Some(open) = t.find('[') {
-                        if let Some(close) = strip_line_comment(&t).rfind(']') {
+                        if let Some(close) = find_unquoted(strip_line_comment(&t), ']') {
                             let inner = t[open + 1..close].trim();
                             let new_inner = if inner.is_empty() {
                                 FEATURE.to_owned()
@@ -1770,7 +1818,7 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
                                 if code.contains(FEATURE) {
                                     already_present = true;
                                 }
-                                if code.contains(']') {
+                                if find_unquoted(code, ']').is_some() {
                                     close_line = Some(k);
                                     break;
                                 }
@@ -1778,7 +1826,7 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
                             }
                             if !already_present && let Some(k) = close_line {
                                 let tk = lines[k].trim().to_owned();
-                                let close_idx = tk.find(']').unwrap_or(tk.len());
+                                let close_idx = find_unquoted(&tk, ']').unwrap_or(tk.len());
                                 let before_close = tk[..close_idx].trim();
                                 // The closing bracket's own line may have no
                                 // entry before it (just `]`, or just a
@@ -1918,7 +1966,7 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
             if let Some(feat_bracket) = trimmed.find("features = [") {
                 // Add to existing features list.
                 let list_start = feat_bracket + "features = [".len();
-                let list_end = trimmed[list_start..].find(']').unwrap() + list_start;
+                let list_end = find_unquoted(&trimmed[list_start..], ']').unwrap() + list_start;
                 let existing = trimmed[list_start..list_end].trim();
                 let new_list = if existing.is_empty() {
                     FEATURE.to_owned()
@@ -1987,7 +2035,7 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
                         break;
                     }
                     if let Some(open) = t.find('[') {
-                        if let Some(close) = strip_line_comment(&t).rfind(']') {
+                        if let Some(close) = find_unquoted(strip_line_comment(&t), ']') {
                             let inner = t[open + 1..close].trim();
                             let new_inner = if inner.is_empty() {
                                 FEATURE.to_owned()
@@ -2021,7 +2069,7 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
                                 if code.contains(FEATURE) {
                                     already_present = true;
                                 }
-                                if code.contains(']') {
+                                if find_unquoted(code, ']').is_some() {
                                     close_line = Some(k);
                                     break;
                                 }
@@ -2029,7 +2077,7 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
                             }
                             if !already_present && let Some(k) = close_line {
                                 let tk = lines[k].trim().to_owned();
-                                let close_idx = tk.find(']').unwrap_or(tk.len());
+                                let close_idx = find_unquoted(&tk, ']').unwrap_or(tk.len());
                                 let before_close = tk[..close_idx].trim();
                                 // The closing bracket's own line may have no
                                 // entry before it (just `]`, or just a
@@ -11226,7 +11274,7 @@ fn ensure_autumn_web_webauthn_feature(toml: &str) -> String {
             }
             if let Some(feat_bracket) = trimmed.find("features = [") {
                 let list_start = feat_bracket + "features = [".len();
-                if let Some(close_bracket) = trimmed[list_start..].find(']') {
+                if let Some(close_bracket) = find_unquoted(&trimmed[list_start..], ']') {
                     let list_end = close_bracket + list_start;
                     let existing = trimmed[list_start..list_end].trim();
                     let new_list = if existing.is_empty() {
@@ -11247,7 +11295,7 @@ fn ensure_autumn_web_webauthn_feature(toml: &str) -> String {
                         if tj.starts_with('[') {
                             break;
                         }
-                        if let Some(close_idx) = tj.find(']') {
+                        if let Some(close_idx) = find_unquoted(strip_line_comment(tj), ']') {
                             let before_close = tj[..close_idx].trim();
                             let sep = if before_close.is_empty() || before_close.ends_with(',') {
                                 ""
@@ -11323,7 +11371,7 @@ fn ensure_autumn_web_webauthn_feature(toml: &str) -> String {
                         break;
                     }
                     if let Some(open) = t.find('[') {
-                        if let Some(close) = strip_line_comment(&t).rfind(']') {
+                        if let Some(close) = find_unquoted(strip_line_comment(&t), ']') {
                             let inner = t[open + 1..close].trim();
                             let new_inner = if inner.is_empty() {
                                 FEATURE.to_owned()
@@ -11357,7 +11405,7 @@ fn ensure_autumn_web_webauthn_feature(toml: &str) -> String {
                                 if code.contains(FEATURE) {
                                     already_present = true;
                                 }
-                                if code.contains(']') {
+                                if find_unquoted(code, ']').is_some() {
                                     close_line = Some(k);
                                     break;
                                 }
@@ -11365,7 +11413,7 @@ fn ensure_autumn_web_webauthn_feature(toml: &str) -> String {
                             }
                             if !already_present && let Some(k) = close_line {
                                 let tk = lines[k].trim().to_owned();
-                                let close_idx = tk.find(']').unwrap_or(tk.len());
+                                let close_idx = find_unquoted(&tk, ']').unwrap_or(tk.len());
                                 let before_close = tk[..close_idx].trim();
                                 // The closing bracket's own line may have no
                                 // entry before it (just `]`, or just a
@@ -16289,6 +16337,134 @@ mod tests {
             1,
             "the already-present feature must not be duplicated: {out}"
         );
+    }
+
+    #[test]
+    fn ensure_autumn_web_mail_feature_ignores_bracket_inside_quoted_feature_name() {
+        // Codex review on e1e5d48: Cargo permits unusual feature names (e.g.
+        // on a path/git fork) containing characters like `]` or `,`. The
+        // multiline "is this the closing bracket?" scan didn't know about
+        // quoting, so a quoted `]` in an existing feature name was mistaken
+        // for the array's real terminator, truncating the rebuild and
+        // leaving the actual tail (further entries, the real `]`) behind.
+        let toml =
+            "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"foo]bar\",\n]\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert!(
+            out.contains("\"foo]bar\""),
+            "the quoted feature name must survive whole: {out}"
+        );
+        assert!(
+            out.contains("\"mail\""),
+            "mail feature must be merged: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_autumn_web_webauthn_feature_ignores_bracket_inside_quoted_feature_name() {
+        let toml =
+            "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"foo]bar\",\n]\n";
+        let out = ensure_autumn_web_webauthn_feature(toml);
+        assert!(
+            out.contains("\"foo]bar\""),
+            "the quoted feature name must survive whole: {out}"
+        );
+        assert!(
+            out.contains("\"webauthn\""),
+            "webauthn feature must be merged: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_autumn_web_oauth2_feature_ignores_bracket_inside_quoted_feature_name() {
+        let toml =
+            "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"foo]bar\",\n]\n";
+        let out = ensure_autumn_web_oauth2_feature(toml);
+        assert!(
+            out.contains("\"foo]bar\""),
+            "the quoted feature name must survive whole: {out}"
+        );
+        assert!(
+            out.contains("\"oauth2\""),
+            "oauth2 feature must be merged: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_webauthn_rs_features_ignores_bracket_inside_quoted_feature_name() {
+        let toml =
+            "[dependencies.webauthn-rs]\nversion = \"0.5\"\nfeatures = [\n    \"foo]bar\",\n]\n";
+        let out = ensure_webauthn_rs_features(toml);
+        assert!(
+            out.contains("\"foo]bar\""),
+            "the quoted feature name must survive whole: {out}"
+        );
+        assert!(
+            out.contains("\"conditional-ui\"")
+                && out.contains("\"danger-allow-state-serialisation\""),
+            "both required features must be present: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_webauthn_rs_features_preserves_comma_inside_quoted_feature_name() {
+        // Codex review on e1e5d48: collapsing a multiline array split on
+        // every raw `,`, so a feature name containing a literal comma (also
+        // valid for a path/git fork) was torn into two garbage entries.
+        let toml =
+            "[dependencies.webauthn-rs]\nversion = \"0.5\"\nfeatures = [\n    \"foo,bar\",\n]\n";
+        let out = ensure_webauthn_rs_features(toml);
+        assert!(
+            out.contains("\"foo,bar\""),
+            "the quoted feature name must survive whole, not split on its comma: {out}"
+        );
+        assert!(
+            out.contains("\"conditional-ui\"")
+                && out.contains("\"danger-allow-state-serialisation\""),
+            "both required features must be present: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_totp_rs_features_ignores_bracket_inside_quoted_feature_name() {
+        let toml = "[dependencies.totp-rs]\nversion = \"5\"\nfeatures = [\n    \"foo]bar\",\n]\n";
+        let out = ensure_totp_rs_features(toml);
+        assert!(
+            out.contains("\"foo]bar\""),
+            "the quoted feature name must survive whole: {out}"
+        );
+        assert!(
+            out.contains("\"qr\"") && out.contains("\"gen_secret\"") && out.contains("\"otpauth\""),
+            "all three required features must be present: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_totp_rs_features_preserves_comma_inside_quoted_feature_name() {
+        let toml = "[dependencies.totp-rs]\nversion = \"5\"\nfeatures = [\n    \"foo,bar\",\n]\n";
+        let out = ensure_totp_rs_features(toml);
+        assert!(
+            out.contains("\"foo,bar\""),
+            "the quoted feature name must survive whole, not split on its comma: {out}"
+        );
+        assert!(
+            out.contains("\"qr\"") && out.contains("\"gen_secret\"") && out.contains("\"otpauth\""),
+            "all three required features must be present: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
     }
 
     #[test]
