@@ -8807,6 +8807,8 @@ async fn execute_task_result(
     name: &str,
     schedule: &'static str,
 ) -> Result<u64, (u64, String)> {
+    // A tick is work a sim drain must see (issue #2967).
+    crate::sim::note_drain_progress();
     // A fresh span per run so OTLP-enabled deployments see each invocation
     // as its own trace rather than inheriting whatever was current on the
     // scheduler thread.

@@ -53,6 +53,16 @@
 //!   whose tasks all park panics with its replay line instead of hanging. See
 //!   [`__with_liveness_budget`] for the limits.
 //!
+//! The clock and app handles inside a `Sim` are crate-private:
+//!
+//! ```compile_fail
+//! use autumn_web::sim::SimClock;
+//! ```
+//!
+//! ```compile_fail
+//! use autumn_web::sim::SimApp;
+//! ```
+//!
 //! Everything here is designed to grow additively (builder-style) without
 //! breaking the frozen surface — hence the `#[non_exhaustive]` markers.
 
@@ -130,7 +140,7 @@ pub use assert::{
     SometimesRegistry, assert_all_sometimes_satisfied, reset_sometimes_registry,
     sometimes_snapshot, sometimes_unsatisfied,
 };
-pub use crash::{CrashPoint, CrashSchedule};
+pub use crash::{CrashOutcome, CrashPoint, CrashSchedule, crash_at};
 
 // The W6 op-driver (PR2, issue #1797): `Sim::gen_ops`/`Sim::gen_ops_with` (deterministic,
 // non-shrinking generation) and `Sim::run_proptest` (the shrink-capable
@@ -160,7 +170,7 @@ pub use sweep::{SweepFailure, SweepOutcome, sweep_proptest};
 ///
 /// Every sim run starts its virtual clock here so wall-clock-derived values are
 /// reproducible across machines and runs. W2 drives this clock forward via
-/// [`SimClock`].
+/// `SimClock`.
 const SIM_EPOCH_UNIX_SECS: i64 = 1_577_836_800; // 2020-01-01T00:00:00Z
 
 /// A deterministic simulation handle, constructed from a single `u64` seed.
@@ -168,7 +178,7 @@ const SIM_EPOCH_UNIX_SECS: i64 = 1_577_836_800; // 2020-01-01T00:00:00Z
 /// `Sim` is the day-one **public, stability-frozen** entry point handed to a
 /// [`#[sim_test]`](crate::sim_test) body. Its [`seed`](Sim::seed) is public so a
 /// test can assert on or thread it; the injection handles it owns
-/// ([`SimRng`] / [`SimClock`] / [`Chaos`] / [`SimApp`]) are private and reached
+/// ([`SimRng`], the clock, [`Chaos`] and the mounted app) are private and reached
 /// through accessors, so their internals can evolve wave-over-wave without a
 /// breaking change.
 ///
@@ -311,7 +321,7 @@ impl Sim {
     /// Mount `app` on the paused runtime with the simulation's virtual clock
     /// installed, and return the resulting [`crate::test::TestClient`].
     ///
-    /// The simulation's [`SimClock`] is threaded in via
+    /// The simulation's virtual clock is threaded in via
     /// [`crate::test::TestApp::with_clock`], so every handler that reads a
     /// [`crate::time::Clock`] extractor sees the virtual instant — starting at
     /// the fixed sim epoch (`2020-01-01T00:00:00Z`) and moving only when
@@ -433,17 +443,15 @@ impl Sim {
     /// The seed-derived [`CrashSchedule`] for this simulation.
     ///
     /// A pure function of the [`seed`](Self::seed): two same-seed sims return an
-    /// equal schedule (the W5.c determinism Definition-of-Done), while different
-    /// seeds overwhelmingly diverge. The representative realized crash point is
-    /// its [`CrashSchedule::first`]; see the [`crash`] module docs for the
-    /// representative-vs-general scope.
+    /// equal schedule. Pass a point's [`CrashPoint::await_index`] to
+    /// [`crash_at`] to crash there.
     #[must_use]
     pub fn crash_schedule(&self) -> CrashSchedule {
         CrashSchedule::derive(self.seed, crash::DEFAULT_CRASH_SCHEDULE_LEN)
     }
 
-    /// The representative, realized crash point for this simulation — the first
-    /// entry of the seed-derived [`crash_schedule`](Self::crash_schedule).
+    /// The first entry of the seed-derived
+    /// [`crash_schedule`](Self::crash_schedule).
     ///
     /// `None` only if the schedule is empty (it never is under the default
     /// length). Deterministic for a given seed.
@@ -595,7 +603,7 @@ impl Sim {
     /// tokio's paused timer wheel **together**.
     ///
     /// The framework [`crate::time::Clock`] extractor (backed by the
-    /// simulation's [`SimClock`]) and tokio's virtual timer (`tokio::time::sleep`,
+    /// simulation's virtual clock) and tokio's virtual timer (`tokio::time::sleep`,
     /// job backoff delays, delayed enqueues) move by exactly the same amount, so
     /// `Utc::now()`-via-extractor and a sleeping task stay in lockstep — a job
     /// whose retry backs off 24 hours fires the instant this advances 24 hours,
@@ -765,9 +773,8 @@ impl Sim {
     /// The sim runtime is a single-threaded, current-thread runtime with the
     /// clock paused, so background tasks (the job worker consuming its queue, a
     /// retry timer that just fired, a delayed enqueue delivering) make progress
-    /// only when the running task yields. This cooperatively yields until no
-    /// further ready progress is observed (bounded by `MAX_DRAIN_STEPS` so a
-    /// pathological busy task can never hang the drain).
+    /// only when the running task yields. This cooperatively yields for
+    /// `MAX_DRAIN_STEPS` rounds.
     ///
     /// It does **not** fast-forward to a *future* timer — advancing the clock to
     /// reach a not-yet-due backoff/sleep is [`advance`](Sim::advance)'s job
@@ -775,7 +782,27 @@ impl Sim {
     /// break the clock lockstep). The idiom is therefore
     /// [`advance`](Sim::advance) to the next interesting instant, then
     /// `run_to_idle` to settle the work it released.
+    ///
+    /// # Panics
+    ///
+    /// Panics with the seed when the drain does not settle: work still ran in
+    /// its last rounds (issue #2967). A job that enqueues itself again is the
+    /// usual cause. Use [`try_run_to_idle`](Sim::try_run_to_idle) to get the
+    /// [`SimStall`] instead.
     pub async fn run_to_idle(&self) {
+        if let Err(stall) = self.try_run_to_idle().await {
+            panic!("{stall}");
+        }
+    }
+
+    /// Like [`run_to_idle`](Sim::run_to_idle), but returns the stall.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SimStall`] when a job ran, a scheduled tick fired, a commit
+    /// hook drained or the task count changed in the last
+    /// `STALL_WINDOW` of the `MAX_DRAIN_STEPS` rounds.
+    pub async fn try_run_to_idle(&self) -> Result<(), SimStall> {
         // Real-time leak guard (no-op unless `strict_wall_clock` is enabled):
         // sample a REAL instant at entry and enforce the budget before
         // returning, catching a real blocking sleep in a drained task.
@@ -791,7 +818,9 @@ impl Sim {
             .try_client()
             .and_then(|client| crate::db::DbState::pool(client.state()).cloned());
 
-        for _ in 0..MAX_DRAIN_STEPS {
+        let mut last_progress = None;
+        for step in 0..MAX_DRAIN_STEPS {
+            let before = drain_fingerprint();
             // One yield lets each currently-ready spawned task take a step; a
             // zero-duration timer advance flushes any timers registered for the
             // current instant and yields again, so a chain of ready timer/task
@@ -807,21 +836,78 @@ impl Sim {
             // the same claim → run → ack wiring the background commit-hook
             // worker uses, but deterministically and worker-free. A hook may
             // itself enqueue a job, so draining inside the settle loop lets a
-            // subsequent iteration pick that job up, and the returned
-            // hooks-drained count folds into the loop's quiescence: a nonzero
-            // drain is progress that keeps this bounded settle running. Under
-            // the paused runtime the job/timer sources expose no idle signal,
-            // so the cooperative spin remains their settle mechanism and the
-            // loop still exits when the step bound is hit.
+            // subsequent iteration pick that job up.
             #[cfg(feature = "db")]
             if let Some(pool) = commit_hook_pool.as_ref() {
-                let _hooks_drained =
+                let hooks_drained =
                     crate::test::drain_ready_repository_commit_hooks(pool, MAX_DRAIN_STEPS).await;
+                if hooks_drained > 0 {
+                    note_drain_progress();
+                }
+            }
+
+            if drain_fingerprint() != before {
+                last_progress = Some(step);
             }
         }
 
         self.enforce_wall_clock_budget(guard_start);
+        match last_progress {
+            Some(step) if step >= MAX_DRAIN_STEPS - STALL_WINDOW => Err(SimStall {
+                seed: self.seed,
+                steps: MAX_DRAIN_STEPS,
+            }),
+            _ => Ok(()),
+        }
     }
+}
+
+/// A [`Sim::run_to_idle`] drain that did not settle (issue #2967).
+///
+/// Work still ran in the last rounds of the drain, so the app was not idle
+/// when the drain gave up.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimStall {
+    /// The seed of the stalled run.
+    pub seed: u64,
+    /// The drain rounds that ran.
+    pub steps: usize,
+}
+
+impl std::fmt::Display for SimStall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sim drain stall: work still ran after {steps} drain rounds (seed=0x{seed:x}). \
+             A job, hook or task keeps making new work, so the app is never idle. \
+             Replay with AUTUMN_SIM_SEED=0x{seed:x}.",
+            steps = self.steps,
+            seed = self.seed,
+        )
+    }
+}
+
+impl std::error::Error for SimStall {}
+
+thread_local! {
+    /// Work the drain can see on this thread: jobs run, ticks fired, hooks
+    /// drained. [`Sim::try_run_to_idle`] compares it across a round.
+    static DRAIN_PROGRESS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Record one unit of drain-visible work on this thread. The job runner, the
+/// task scheduler and the commit-hook drain call it.
+pub(crate) fn note_drain_progress() {
+    DRAIN_PROGRESS.with(|progress| progress.set(progress.get().wrapping_add(1)));
+}
+
+/// This thread's drain progress plus the runtime's live task count. A change
+/// across a drain round means work ran in it.
+fn drain_fingerprint() -> (u64, usize) {
+    let tasks = tokio::runtime::Handle::try_current()
+        .map_or(0, |handle| handle.metrics().num_alive_tasks());
+    (DRAIN_PROGRESS.with(std::cell::Cell::get), tasks)
 }
 
 /// The entropy seed for the `mount`-th app a simulation mounts.
@@ -906,6 +992,11 @@ pub async fn __with_liveness_budget<F: std::future::Future>(
 /// Generous relative to the handful of hops a job takes from the queue through
 /// its handler to completion under the single-threaded paused runtime.
 const MAX_DRAIN_STEPS: usize = 1024;
+
+/// The last rounds of a drain that must see no work. Work in this window means
+/// the drain did not settle, and [`Sim::try_run_to_idle`] reports a
+/// [`SimStall`].
+const STALL_WINDOW: usize = 64;
 
 /// Default real wall-clock budget for the `strict_wall_clock` leak guard
 /// ([`Sim::strict_wall_clock`]).
@@ -1090,13 +1181,14 @@ impl SimRng {
     }
 }
 
-/// A virtual clock handle for the simulation.
+/// A virtual clock handle for the simulation. Crate-private: no public API
+/// returns it (issue #2967).
 ///
 /// Wraps a [`TickingClock`] started at the fixed sim epoch. [`Sim::advance`]
 /// steps this clock (the wall-clock time a [`crate::time::Clock`] extractor
 /// reports) in lockstep with tokio's paused virtual timer, so
 /// `Utc::now()`-via-extractor and `tokio::time::sleep` never drift apart.
-pub struct SimClock {
+pub(crate) struct SimClock {
     inner: TickingClock,
 }
 
@@ -1139,11 +1231,9 @@ impl SimClock {
 /// [`Sim::build`] is called (an empty [`#[sim_test]`](crate::sim_test) that only
 /// drives time / RNG never mounts an app).
 ///
-/// Marked `#[non_exhaustive]` so later waves (e.g. W4's sim-DB substrate) can
-/// hang additional handles here without a breaking change.
-#[non_exhaustive]
+/// Crate-private: no public API returns it (issue #2967).
 #[derive(Default)]
-pub struct SimApp {
+pub(crate) struct SimApp {
     /// The mounted test client, or `None` before [`Sim::build`].
     client: Option<crate::test::TestClient>,
 }
