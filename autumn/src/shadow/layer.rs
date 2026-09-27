@@ -191,6 +191,10 @@ pub struct ShadowMirrorService<S> {
 impl<S, ReqBody> Service<Request<ReqBody>> for ShadowMirrorService<S>
 where
     S: Service<Request<ReqBody>, Response = Response<Body>>,
+    // The body gate in `decide` needs the body's own end-of-stream signal to
+    // catch *undeclared* bodies (issue #2332): the request type must be an
+    // `http_body::Body`, which every real server body is.
+    ReqBody: http_body::Body,
 {
     type Response = Response<Body>;
     type Error = S::Error;
@@ -203,12 +207,17 @@ where
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let target = request_target(&req);
         let ctx = Arc::clone(&self.ctx);
-        let decision = self
-            .ctx
-            .selector
-            .decide(req.method(), &target, req.headers(), || {
-                roll_from(ctx.entropy.as_ref())
-            });
+        let decision = self.ctx.selector.decide(
+            req.method(),
+            &target,
+            req.headers(),
+            // The body's own end-of-stream signal: the undeclared-body half
+            // of the #2332 gate. A body that is already at end-of-stream (a
+            // normal bodiless GET, which the transport knows from framing)
+            // mirrors as before; anything else sits out.
+            http_body::Body::is_end_stream(req.body()),
+            || roll_from(ctx.entropy.as_ref()),
+        );
 
         let pending = match decision {
             MirrorDecision::Mirror => Some(PendingMirror {
@@ -953,6 +962,29 @@ mod tests {
         })
     }
 
+    /// A primary handler that *consumes* the request body and echoes it back —
+    /// the search-API shape issue #2332 is about. A mirror that replayed the
+    /// request without its body would hand the candidate a different request
+    /// than this handler answered, manufacturing a divergence.
+    fn echo_primary()
+    -> impl tower::Service<
+        Request<Body>,
+        Response = Response<Body>,
+        Error = std::convert::Infallible,
+    > + Clone {
+        service_fn(|req: Request<Body>| async move {
+            let bytes = axum::body::to_bytes(req.into_body(), 64 * 1024)
+                .await
+                .expect("request body");
+            Ok::<_, std::convert::Infallible>(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(bytes))
+                    .expect("response"),
+            )
+        })
+    }
+
     async fn read_body(response: Response<Body>) -> String {
         let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
@@ -998,6 +1030,71 @@ mod tests {
 
         assert!(transport.seen().is_empty());
         assert_eq!(registry.stats().mirrored, 0);
+    }
+
+    #[tokio::test]
+    async fn a_get_carrying_a_body_is_never_mirrored() {
+        let transport = FakeTransport::new(Behaviour::Reply {
+            status: 200,
+            body: "{}",
+        });
+        let registry = ShadowRegistry::new(10);
+        let service = layer(transport.clone(), &registry, settings()).layer(echo_primary());
+
+        // A GET carrying a request body is legal (RFC 9110 does not forbid
+        // it) and search APIs do use it. The primary consumes the body and
+        // answers from it, but nothing is mirrored: the mirror replays
+        // method, target, and headers but no body, so mirroring it would ask
+        // the candidate a different request and record the manufactured
+        // difference as a divergence (issue #2332).
+        let body = r#"{"query":"shoes"}"#;
+        let request = Request::builder()
+            .uri("/api/orders")
+            .header("content-length", body.len())
+            .body(Body::from(body))
+            .expect("request");
+        let response = service.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        // The live request passes through untouched: the primary saw the
+        // whole body.
+        assert_eq!(read_body(response).await, body);
+
+        // And the candidate never saw it: zero mirrored, zero compared,
+        // zero divergences.
+        assert!(transport.seen().is_empty());
+        let stats = registry.stats();
+        assert_eq!(stats.mirrored, 0);
+        assert_eq!(stats.compared, 0);
+        assert_eq!(stats.diverged, 0);
+    }
+
+    #[tokio::test]
+    async fn a_get_with_an_undeclared_body_is_never_mirrored() {
+        let transport = FakeTransport::new(Behaviour::Reply {
+            status: 200,
+            body: "{}",
+        });
+        let registry = ShadowRegistry::new(10);
+        let service = layer(transport.clone(), &registry, settings()).layer(echo_primary());
+
+        // No `Content-Length`, no `Transfer-Encoding`: on HTTP/2 a client can
+        // legally send DATA frames on a GET stream without declaring them.
+        // The headers alone would wave this through — the body's own
+        // end-of-stream signal is what sits it out (issue #2332, option 1).
+        let body = r#"{"query":"shoes"}"#;
+        let request = Request::builder()
+            .uri("/api/orders")
+            .body(Body::from(body))
+            .expect("request");
+        let response = service.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(read_body(response).await, body);
+
+        assert!(transport.seen().is_empty());
+        let stats = registry.stats();
+        assert_eq!(stats.mirrored, 0);
+        assert_eq!(stats.compared, 0);
+        assert_eq!(stats.diverged, 0);
     }
 
     #[tokio::test]
