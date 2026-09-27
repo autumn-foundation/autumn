@@ -491,10 +491,36 @@ pub(crate) enum PostBoundaryClass {
 ///   is invisible today and fails the NEXT deploy closed
 ///   (`refuse_unprovable_proxy_options`), which is exactly why it must be surfaced
 ///   rather than swallowed.
-/// - `drain-old` — disables the now-idle old slot unit. Two slots running is
-///   untidy, not an outage.
+/// - `drain-old` — disables the now-idle old slot unit. The driver retries a
+///   failed drain and continues ONLY when the old slot is proven stopped (see
+///   [`drain_old_outcome`], issue #2279).
 /// - `prune` — removes old release dirs. Disk hygiene.
-pub(crate) const HOUSEKEEPING_LABELS: [&str; 3] = ["record-proxy-options", "drain-old", "prune"];
+pub(crate) const HOUSEKEEPING_LABELS: [&str; 3] =
+    ["record-proxy-options", DRAIN_OLD_LABEL, "prune"];
+
+/// The op that stops the old slot after the cutover.
+pub(crate) const DRAIN_OLD_LABEL: &str = "drain-old";
+
+/// Why a failed `drain-old` halts the rollout (issue #2279).
+pub(crate) const OLD_SLOT_RUNNING_NOTE: &str = "the old slot did not stop. It runs job workers and the scheduler next to \
+     the new slot, so scheduled tasks and jobs can run two times";
+
+/// The outcome of a failed `drain-old` after [`exec::retry_drain_old`] (issue
+/// #2279).
+///
+/// The old slot runs job workers and the scheduler (`ProcessRole::Combined`). If
+/// it continues to run, work runs two times. Only a proven stop is housekeeping.
+/// `Running` and `Unreadable` halt and compensate.
+pub(crate) const fn drain_old_outcome(state: exec::OldSlotState) -> HostOutcome {
+    match state {
+        exec::OldSlotState::Stopped => HostOutcome::Degraded {
+            label: DRAIN_OLD_LABEL,
+        },
+        exec::OldSlotState::Running | exec::OldSlotState::Unreadable => HostOutcome::LiveOnNew {
+            failed_step: DRAIN_OLD_LABEL,
+        },
+    }
+}
 
 /// The one post-boundary label whose failure makes a host's rollback target
 /// unprovable: `commit-markers` writes previous-release + `current` + live-slot as
@@ -2889,6 +2915,28 @@ mod tests {
                  Functional, never be waved through as housekeeping"
             );
         }
+    }
+
+    #[test]
+    fn a_failed_drain_old_degrades_only_when_the_old_slot_is_proven_stopped() {
+        // #2279: a live old slot runs job workers and the scheduler, so work runs
+        // twice. Only a proven stop may continue the rollout.
+        assert_eq!(
+            drain_old_outcome(exec::OldSlotState::Stopped),
+            HostOutcome::Degraded {
+                label: DRAIN_OLD_LABEL
+            },
+        );
+        for state in [exec::OldSlotState::Running, exec::OldSlotState::Unreadable] {
+            assert_eq!(
+                drain_old_outcome(state),
+                HostOutcome::LiveOnNew {
+                    failed_step: DRAIN_OLD_LABEL
+                },
+                "{state:?} must halt and compensate, not continue",
+            );
+        }
+        assert_eq!(DRAIN_OLD_LABEL, "drain-old");
     }
 
     #[test]

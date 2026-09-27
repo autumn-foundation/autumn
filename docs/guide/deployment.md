@@ -728,6 +728,7 @@ failure landed relative to the **go-live step** — `proxy-flip` on a redeploy,
 | At or before go-live, on a redeploy | Previous release still serving (the candidate was torn down) | Already clean — nothing to undo |
 | At or before go-live, on a first deploy | Nothing serving (the candidate was torn down) | Already clean — nothing to undo |
 | After go-live, in housekeeping (`record-proxy-options`, `drain-old`, `prune`) | **Live and healthy on the new release** | **Warn and keep rolling** — the host is fine; only bookkeeping failed |
+| After go-live, at `drain-old`, and the old slot does not stop | Live on the new release, old slot still running | Halt and compensate, this host included — see below |
 | After go-live, at `commit-markers` | Live on the new release, markers mid-transaction | Halt, and **never** auto-roll this host back — the rollback target cannot be trusted |
 | After go-live, anything else | Live on the new release | Halt and compensate, this host included |
 
@@ -764,6 +765,14 @@ A **degraded** host — live and healthy on the new release, but whose post-cuto
 housekeeping failed — is worth repairing promptly: a failed `record-proxy-options`
 makes the **next** deploy of that host fail closed. A redeploy of that host
 repairs it, and the run's final line says how many hosts finished degraded.
+
+A failed `drain-old` is different. The old slot runs job workers and the
+scheduler, so if it does not stop, scheduled tasks and jobs run two times. The
+rollout retries `drain-old` one time and then reads the old unit's
+`ActiveState`. Only `inactive` or `failed` counts as stopped: the host is then
+degraded and the rollout continues. Any other result — the unit is still
+running, the output is not known, or the host does not answer — halts the
+rollout and compensates, like any other post-go-live failure.
 
 Every exit path — success, halt, or halt-plus-compensation — ends with the
 per-host `Fleet state:` table, printed **after** any compensation so it describes
@@ -1410,6 +1419,11 @@ online-safe snapshot of the file with no external tools.
   post-cutover bookkeeping failed. Repair it before the next deploy — a redeploy
   of that host does — because a failed `record-proxy-options` makes the next
   deploy of that host fail closed.
+- **The rollout halted at `drain-old`.** The old slot did not stop after one
+  retry, so it can run scheduled tasks and jobs a second time. Compensation
+  rolls the host back to one running slot. With `--no-rollback`, stop it by
+  hand: `systemctl disable --now <service>-<slot>.service`, for the slot that
+  is not in `shared/live-slot`.
 - **`release directory … already exists`** — the one-second release id was reused
   by a fast re-run. Wait a second and re-run `autumn deploy up`, or remove that
   directory if you are certain it is stale.

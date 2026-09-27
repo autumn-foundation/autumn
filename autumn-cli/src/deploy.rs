@@ -4066,7 +4066,8 @@ where
 ///   binaries only; a migration that already ran is never undone. The one exception
 ///   is a post-boundary HOUSEKEEPING failure (`record-proxy-options`, `drain-old`,
 ///   `prune`): the host is live and healthy on the new release, so the rollout
-///   warns, marks it degraded, and CONTINUES. A rollout whose only failures are
+///   warns, marks it degraded, and CONTINUES. A failed `drain-old` is retried
+///   once and continues only when the old slot is proven stopped (#2279). A rollout whose only failures are
 ///   housekeeping therefore succeeds (`Ok`) with degraded hosts named in the state
 ///   table — rolling a whole fleet back because an `rm -rf` of old release dirs
 ///   failed would be a self-inflicted outage.
@@ -4392,6 +4393,26 @@ where
                 }
                 let failed_step = fleet::failed_step_label(&err);
                 outcomes[index] = fleet::classify_host_outcome(&err);
+                // #2279: a live old slot runs workers and the scheduler, so work
+                // runs two times. Retry once. Continue only on a proven stop.
+                if matches!(
+                    outcomes[index],
+                    fleet::HostOutcome::Degraded { label } if label == fleet::DRAIN_OLD_LABEL
+                ) {
+                    let old_slot = exec::retry_drain_old(cfg, state.slots.live_slot, executor)
+                        .unwrap_or(exec::OldSlotState::Unreadable);
+                    outcomes[index] = fleet::drain_old_outcome(old_slot);
+                    if old_slot != exec::OldSlotState::Stopped {
+                        eprintln!(
+                            "\u{274C} [{}/{total} {}] `{}` failed AFTER the cutover and \
+                             the retry did not prove a stop: {}.",
+                            index + 1,
+                            host_plan.host,
+                            fleet::DRAIN_OLD_LABEL,
+                            fleet::OLD_SLOT_RUNNING_NOTE,
+                        );
+                    }
+                }
                 // Post-boundary housekeeping: the proxy is already serving the new
                 // release on this host and only bookkeeping failed. Warn, record the
                 // debris, and keep rolling — the alternative is an outage caused by
@@ -11231,6 +11252,127 @@ mod tests {
         assert!(
             recorder.positions_of("resolve-previous").is_empty(),
             "a rollout that only degraded must compensate NOTHING anywhere"
+        );
+    }
+
+    /// How the `drain-old-retry` probe on `web-b` answers in the #2279 tests.
+    enum DrainRetry {
+        Stdout(&'static str),
+        CommandFails,
+        TransportFails,
+    }
+
+    /// A three-host rollout where `web-b`'s `drain-old` fails and its retry
+    /// answers `retry`. Every host can be compensated.
+    fn drain_old_failure_run(
+        retry: &DrainRetry,
+    ) -> (fleet::test_support::FleetRecorder, Result<(), DeployError>) {
+        let hosts = ["web-a", "web-b", "web-c"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_compensation(script_redeploy(recorder, host), host, "present");
+        }
+        recorder = recorder.fail("web-b", "drain-old");
+        recorder = match retry {
+            DrainRetry::Stdout(stdout) => recorder.script("web-b", "drain-old-retry", *stdout),
+            DrainRetry::CommandFails => recorder.fail("web-b", "drain-old-retry"),
+            DrainRetry::TransportFails => recorder.transport_fail("web-b", "drain-old-retry"),
+        };
+        let fixture = FleetFixture::new();
+        let result = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)));
+        (recorder, result)
+    }
+
+    #[test]
+    fn a_drain_old_failure_whose_old_slot_still_runs_halts_the_rollout() {
+        // #2279: the old slot runs job workers and the scheduler. If it does not
+        // stop, scheduled tasks and jobs run twice. The rollout must not end green.
+        for retry in [
+            DrainRetry::Stdout("running"),
+            DrainRetry::Stdout("bash: -c: line 0"),
+            DrainRetry::CommandFails,
+            DrainRetry::TransportFails,
+        ] {
+            let (recorder, result) = drain_old_failure_run(&retry);
+            let err = result.expect_err("an old slot that may still run must halt the rollout");
+
+            let web_b = recorder.run_labels_for("web-b");
+            let retried = web_b
+                .iter()
+                .position(|label| *label == "drain-old-retry")
+                .expect("the failed drain must be retried and checked");
+            assert_eq!(
+                web_b[retried - 1],
+                "drain-old",
+                "the retry runs right after the failed drain: {web_b:?}"
+            );
+            assert!(
+                !web_b.contains(&"prune"),
+                "nothing more of the deploy runs on the halted host: {web_b:?}"
+            );
+            assert_eq!(
+                recorder.run_labels_for("web-c"),
+                READ_ONLY_PROBES.to_vec(),
+                "the host after the halt must not be touched"
+            );
+
+            let halt = fleet_halt_of(&err);
+            assert_eq!(halt.failed_host, "web-b");
+            assert_eq!(halt.failed_step, "drain-old");
+            assert_eq!(
+                halt.rolled_back,
+                vec!["web-a".to_owned(), "web-b".to_owned()],
+                "both cut-over hosts are compensated, so each runs ONE slot again"
+            );
+            assert!(halt.still_on_new.is_empty(), "{:?}", halt.still_on_new);
+            assert!(
+                halt.degraded.is_empty(),
+                "a live old slot is not housekeeping debris: {:?}",
+                halt.degraded
+            );
+        }
+    }
+
+    #[test]
+    fn a_drain_old_failure_whose_old_slot_is_proven_stopped_still_degrades() {
+        // #2279: a transient failure that the retry clears is housekeeping. The
+        // rollout continues, as it did before.
+        let (recorder, result) = drain_old_failure_run(&DrainRetry::Stdout("stopped"));
+        result.expect("a proven-stopped old slot must not fail the rollout");
+
+        let web_b = recorder.run_labels_for("web-b");
+        assert!(
+            web_b.contains(&"drain-old-retry") && !web_b.contains(&"restart-previous"),
+            "retry and check, then leave the host on the new release: {web_b:?}"
+        );
+        assert!(
+            recorder.run_labels_for("web-c").contains(&"prune"),
+            "the rollout must continue past the degraded host"
+        );
+        assert!(
+            recorder.positions_of("resolve-previous").is_empty(),
+            "nothing is compensated"
+        );
+    }
+
+    #[test]
+    fn a_single_host_drain_old_failure_keeps_todays_error_and_does_not_retry() {
+        // #2279 keeps AC-1: N = 1 already fails the deploy, so it gets no retry.
+        let fleet = fleet_of(&["203.0.113.10"]);
+        let recorder = script_redeploy(fleet::test_support::FleetRecorder::new(), "203.0.113.10")
+            .fail("203.0.113.10", "drain-old");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a single-host drain failure must fail the deploy");
+
+        assert!(matches!(err, DeployError::Exec(_)), "{err:?}");
+        assert!(
+            !recorder
+                .run_labels_for("203.0.113.10")
+                .contains(&"drain-old-retry"),
+            "N = 1 output must stay byte-identical"
         );
     }
 
