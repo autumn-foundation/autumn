@@ -16,6 +16,13 @@
 //! # }
 //! ```
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
 // #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
@@ -293,7 +300,7 @@ fn gc_tombstone_row(change: &Change, version: Version) -> RemoteRow {
         payload: None,
         version,
         deleted: true,
-        updated_at: Utc::now(),
+        updated_at: crate::time::ambient_now(),
         device_id: String::new(),
     }
 }
@@ -729,7 +736,7 @@ impl SyncBackend for MemorySyncBackend {
                 dedup_key,
                 AppliedRecord {
                     version,
-                    applied_at: Utc::now(),
+                    applied_at: crate::time::ambient_now(),
                     resolved_row,
                 },
             );

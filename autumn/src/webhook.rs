@@ -4,6 +4,14 @@
 //! exact HTTP request bytes before handler code runs. Configure endpoints with
 //! [`WebhookEndpointConfig`] under `security.webhooks.endpoints`.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -969,7 +977,7 @@ impl FromRequest<crate::AppState> for SignedWebhook {
                     "webhook body could not be read: {err}"
                 ))
             })?;
-        let received_at = SystemTime::now();
+        let received_at = UNIX_EPOCH + crate::time::clock_unix_duration(state.clock());
         verify_request(&registry, &endpoint, &parts.headers, body, received_at)
             .await
             .map_err(WebhookVerifyError::into_autumn_error)

@@ -49,6 +49,14 @@
 //! }
 //! ```
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 mod translatable;
 
 pub use translatable::{
@@ -588,7 +596,7 @@ impl Bundle {
 
     fn record_miss(&self, locale: &str, key: &str) {
         self.miss_count.fetch_add(1, Ordering::Relaxed);
-        let now = Instant::now();
+        let now = crate::time::ambient_instant();
         let should_warn = {
             // Default a missing entry far enough in the past that the first
             // miss warns immediately; saturating_sub guards against a
