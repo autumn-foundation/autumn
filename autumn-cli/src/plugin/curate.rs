@@ -776,6 +776,16 @@ pub fn run_record(opts: &RecordOptions<'_>) -> i32 {
     }
 }
 
+/// The listing for `name` in the index text as it stands now, so each
+/// result builds on the last.
+fn listing_in(src: &str, name: &str) -> Result<Listing, String> {
+    index::parse(src)
+        .map_err(|e| e.to_string())?
+        .get(name)
+        .cloned()
+        .ok_or_else(|| format!("the index has no listing for `{}`", index::sanitize(name)))
+}
+
 /// Apply every report and exemption, then write the file once. Nothing is
 /// written when any step fails, or when the result breaks an admission rule.
 fn record(opts: &RecordOptions<'_>) -> Result<Vec<String>, String> {
@@ -791,20 +801,28 @@ fn record(opts: &RecordOptions<'_>) -> Result<Vec<String>, String> {
     let mut src = std::fs::read_to_string(opts.index)
         .map_err(|e| format!("{}: {e}", opts.index.display()))?;
     let mut lines = Vec::new();
+    // One result per listing per run: with two, the order of the arguments
+    // would decide the trust state.
+    let mut seen: Vec<String> = Vec::new();
+    let mut claim = |name: &str| {
+        let key = index::canonical(name);
+        if seen.contains(&key) {
+            return Err(format!(
+                "`{name}` has more than one result in this run (--report, --inspect, --exempt \
+                 or --exempt-failed). Record one per listing; nothing was written"
+            ));
+        }
+        seen.push(key);
+        Ok(())
+    };
 
     for path in opts.reports {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let report: ConformanceReport = serde_json::from_str(&text)
             .map_err(|e| format!("{} is not a plugin-check JSON report: {e}", path.display()))?;
         check_tested_release(&report, opts.against)?;
-        // Parse the text as it stands now, so each report builds on the last.
-        let parsed = index::parse(&src).map_err(|e| e.to_string())?;
-        let mut listing = parsed.get(&report.plugin_name).cloned().ok_or_else(|| {
-            format!(
-                "the index has no listing for `{}`",
-                index::sanitize(&report.plugin_name)
-            )
-        })?;
+        let mut listing = listing_in(&src, &report.plugin_name)?;
+        claim(&listing.name)?;
         let transition = apply_report(&mut listing, &report, opts.against, opts.date)?;
         src = write_listing(&src, &listing)?;
         lines.push(format!(
@@ -820,13 +838,8 @@ fn record(opts: &RecordOptions<'_>) -> Result<Vec<String>, String> {
                 path.display()
             )
         })?;
-        let parsed = index::parse(&src).map_err(|e| e.to_string())?;
-        let mut listing = parsed.get(&report.name).cloned().ok_or_else(|| {
-            format!(
-                "the index has no listing for `{}`",
-                index::sanitize(&report.name)
-            )
-        })?;
+        let mut listing = listing_in(&src, &report.name)?;
+        claim(&listing.name)?;
         let transition = apply_inspect(&mut listing, &report, opts.against, opts.date)?;
         src = write_listing(&src, &listing)?;
         lines.push(format!(
@@ -835,11 +848,8 @@ fn record(opts: &RecordOptions<'_>) -> Result<Vec<String>, String> {
         ));
     }
     for name in opts.exempt {
-        let parsed = index::parse(&src).map_err(|e| e.to_string())?;
-        let mut listing = parsed
-            .get(name)
-            .cloned()
-            .ok_or_else(|| format!("the index has no listing for `{}`", index::sanitize(name)))?;
+        let mut listing = listing_in(&src, name)?;
+        claim(&listing.name)?;
         apply_exempt(&mut listing, opts.against, opts.date)?;
         src = write_listing(&src, &listing)?;
         lines.push(format!(
@@ -848,11 +858,8 @@ fn record(opts: &RecordOptions<'_>) -> Result<Vec<String>, String> {
         ));
     }
     for name in opts.exempt_failed {
-        let parsed = index::parse(&src).map_err(|e| e.to_string())?;
-        let mut listing = parsed
-            .get(name)
-            .cloned()
-            .ok_or_else(|| format!("the index has no listing for `{}`", index::sanitize(name)))?;
+        let mut listing = listing_in(&src, name)?;
+        claim(&listing.name)?;
         let transition = apply_exempt_failed(&mut listing, opts.against, opts.date)?;
         src = write_listing(&src, &listing)?;
         lines.push(format!(
@@ -1634,9 +1641,9 @@ mod tests {
         path
     }
 
-    /// Reports apply in order, each to the result of the one before.
+    /// Two results for one listing (here a fail, then a pass) are refused.
     #[test]
-    fn run_record_applies_two_reports_for_one_plugin_in_order() {
+    fn run_record_refuses_two_results_for_one_listing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let index_path = dir.path().join("index.toml");
         std::fs::write(&index_path, index::BUNDLED).expect("write index");
@@ -1662,11 +1669,12 @@ mod tests {
             against: release,
             date: "2026-10-01",
         });
-        assert_eq!(code, 0);
-        let written = index::parse(&std::fs::read_to_string(&index_path).unwrap()).unwrap();
-        let admin = written.get("autumn-admin-plugin").unwrap();
-        assert_eq!(admin.status, Status::Listed);
-        assert!(admin.note.is_empty(), "{}", admin.note);
+        // With two, the argument order would decide the status.
+        assert_eq!(code, 1);
+        assert_eq!(
+            std::fs::read_to_string(&index_path).unwrap(),
+            index::BUNDLED
+        );
     }
 
     /// A report is recorded for the release it tested, and a pass must say

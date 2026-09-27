@@ -292,12 +292,11 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
 
     // `--prefix` says the plugin mounts routes, so none found is a failure.
     let registered_routeless = registered_as.filter(|_| opts.expected_prefix.is_none());
-    checks.push(check_route_attribution(
-        opts.plugin_name,
-        route_key,
-        routes,
-        registered_routeless,
-    ));
+    checks.push(
+        check_split_attribution(declared, opts.plugin_name, routes).unwrap_or_else(|| {
+            check_route_attribution(opts.plugin_name, route_key, routes, registered_routeless)
+        }),
+    );
 
     if let Some(prefix) = opts.expected_prefix {
         checks.push(check_route_prefix(route_key, prefix, routes));
@@ -649,6 +648,42 @@ fn route_key<'a>(
         Some(registered) if !carries(plugin_name) && carries(registered) => registered,
         _ => plugin_name,
     }
+}
+
+/// A failed `route-attribution` when routes carry more than one of the
+/// plugin's linked names (`--plugin-name`, the contract's crate, its
+/// `registered_as`). The other checks read one name's routes, so they would
+/// miss the rest. `None` when at most one name carries routes.
+fn check_split_attribution(
+    declared: Option<&PluginContract>,
+    plugin_name: &str,
+    routes: &[RouteInfo],
+) -> Option<CheckResult> {
+    let declared = declared?;
+    let mut names = vec![plugin_name, declared.plugin.as_str()];
+    names.extend(declared.registered_as.as_deref());
+    names.sort_unstable();
+    names.dedup();
+    let carrying: Vec<&str> = names
+        .into_iter()
+        .filter(|name| {
+            let source = format!("plugin:{name}");
+            routes.iter().any(|r| r.source == source)
+        })
+        .collect();
+    (carrying.len() > 1).then(|| CheckResult {
+        name: "route-attribution".to_owned(),
+        status: CheckStatus::Fail,
+        message: format!(
+            "routes are attributed to more than one of this plugin's names: {}",
+            carrying.join(", ")
+        ),
+        diagnostics: vec![
+            "one plugin registers under one `Plugin::name()`; the checks cannot tell which \
+             routes are its own"
+                .to_owned(),
+        ],
+    })
 }
 
 /// `route_key` is the name routes are matched under (see [`route_key`]).
@@ -1542,6 +1577,27 @@ mod contract_tests {
     /// `Plugin::name()` (by default the type path). The contract links the
     /// two, so the route checks run under the registered name, and the report
     /// keeps the crate name the index lists.
+    /// Routes under both linked names: the checks would read one set and
+    /// miss the other, so attribution fails.
+    #[test]
+    fn routes_split_across_both_names_fail_attribution() {
+        let mut contract = demo_contract();
+        contract.registered_as = Some("demo_crate::DemoPlugin".to_owned());
+        let dump = present(vec![contract]);
+        let mut hidden = route();
+        hidden.source = "plugin:demo_crate::DemoPlugin".to_owned();
+        hidden.path = "/off-prefix".to_owned();
+        let report = build_report(&opts(&dump), &[route(), hidden]);
+        let attribution = find(&report, "route-attribution");
+        assert_eq!(attribution.status, CheckStatus::Fail);
+        assert!(
+            attribution.message.contains("demo_crate::DemoPlugin"),
+            "{}",
+            attribution.message
+        );
+        assert!(!report.passed());
+    }
+
     #[test]
     fn route_checks_follow_the_registered_name() {
         let mut contract = demo_contract();

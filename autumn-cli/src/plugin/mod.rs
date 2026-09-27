@@ -1543,7 +1543,10 @@ pub fn preflight_scaffold_plugins(
         }
         // `--with X --with X` is a typo, not a conflict: the second one names
         // the same install, and `plugin add` is idempotent regardless.
-        if out.iter().any(|already| already.name == name) {
+        if out
+            .iter()
+            .any(|already| index::canonical(&already.name) == index::canonical(name))
+        {
             continue;
         }
         let resolved = resolve(name).map_err(|err| err.to_string())?;
@@ -1829,6 +1832,23 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("route-collision on re-verification"), "{out}");
+    }
+
+    /// `--with x --with x` with crates.io-equivalent spellings is one plugin.
+    #[test]
+    fn scaffold_plugins_dedupe_by_canonical_name() {
+        let names = [
+            "autumn-admin-plugin".to_owned(),
+            "autumn_admin_plugin".to_owned(),
+        ];
+        let plugins = preflight_scaffold_plugins(
+            &names,
+            &index::load(None).unwrap().index,
+            Some(RELEASE),
+            |_| None,
+        )
+        .expect("preflight");
+        assert_eq!(plugins.len(), 1);
     }
 
     /// A crates.io result spelled with `_` where the index has `-` is the

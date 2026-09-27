@@ -144,7 +144,8 @@ ship a stale index.
 
 A `plugin-check --format json` report names the `autumn-web` its app locked.
 `record` refuses a report that tested another release than `--against`, and
-a passing report that names none.
+a passing report that names none. It also refuses two results for one
+listing in one run.
 
 `record` changes the status by these rules:
 
