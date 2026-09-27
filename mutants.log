@@ -1,4 +1,0 @@
-error: no such command: `mutants`
-
-help: view all installed commands with `cargo --list`
-help: find a package to install `mutants` with `cargo search cargo-mutants`
