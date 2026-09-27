@@ -54,12 +54,12 @@ pub struct EdgeIdentity {
 impl EdgeIdentity {
     /// Construct an identity from normalized claims only.
     #[must_use]
-    pub fn new(user_id: EdgeUserId, roles: Vec<EdgeRole>) -> Self {
+    pub const fn new(user_id: EdgeUserId, roles: Vec<EdgeRole>) -> Self {
         Self { user_id, roles }
     }
     /// Authenticated user claim.
     #[must_use]
-    pub fn user_id(&self) -> &EdgeUserId {
+    pub const fn user_id(&self) -> &EdgeUserId {
         &self.user_id
     }
     /// Normalized role claims.
