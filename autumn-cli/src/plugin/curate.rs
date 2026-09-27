@@ -96,6 +96,31 @@ pub fn apply_report(
     Ok(transition(listing, failed.as_deref(), against, date))
 }
 
+/// A report is recorded only for the release it tested: a pass from an older
+/// release proves nothing about this one, even when its range admits both.
+/// A failing report that names no release (an install that failed before
+/// plugin-check ran) is still recorded as a failure.
+///
+/// # Errors
+///
+/// When the report tested another release, or passes without naming one.
+pub fn check_tested_release(report: &ConformanceReport, against: &str) -> Result<(), String> {
+    let name = index::sanitize(&report.plugin_name);
+    match report.autumn_web.as_deref() {
+        Some(tested) if tested == against => Ok(()),
+        Some(tested) => Err(format!(
+            "the report for `{name}` tested autumn-web {}, not {against}. Re-run \
+             `autumn plugin-check` against {against}",
+            index::sanitize(tested)
+        )),
+        None if !report.passed() => Ok(()),
+        None => Err(format!(
+            "the report for `{name}` does not say which autumn-web it tested. Re-run it with \
+             this CLI's `autumn plugin-check --format json`"
+        )),
+    }
+}
+
 /// Record one run: `failed` is `None` for a pass, or the failed checks.
 fn transition(
     listing: &mut Listing,
@@ -690,6 +715,7 @@ fn record(opts: &RecordOptions<'_>) -> Result<Vec<String>, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let report: ConformanceReport = serde_json::from_str(&text)
             .map_err(|e| format!("{} is not a plugin-check JSON report: {e}", path.display()))?;
+        check_tested_release(&report, opts.against)?;
         // Parse the text as it stands now, so each report builds on the last.
         let parsed = index::parse(&src).map_err(|e| e.to_string())?;
         let mut listing = parsed.get(&report.plugin_name).cloned().ok_or_else(|| {
@@ -809,6 +835,7 @@ mod tests {
                 check("experimental-surface", CheckStatus::Pass),
             ],
             contract,
+            autumn_web: None,
         }
     }
 
@@ -1052,6 +1079,7 @@ mod tests {
                     check("route-collision", CheckStatus::Pass),
                 ],
                 contract: None,
+                autumn_web: None,
             },
             // A baseline with nothing new: the new artifact asks for no more.
             upgrade: Some(delta(&[])),
@@ -1474,11 +1502,12 @@ mod tests {
             "fail.json",
             &report("autumn-admin-plugin", false, None),
         );
-        let ok = report(
+        let mut ok = report(
             "autumn-admin-plugin",
             true,
             Some(lockstep("autumn-admin-plugin", release)),
         );
+        ok.autumn_web = Some(release.to_owned());
         let pass = write_report(dir.path(), "pass.json", &ok);
         let code = run_record(&RecordOptions {
             index: &index_path,
@@ -1496,6 +1525,54 @@ mod tests {
         assert!(admin.note.is_empty(), "{}", admin.note);
     }
 
+    /// A report is recorded for the release it tested, and a pass must say
+    /// which that was.
+    #[test]
+    fn a_report_must_name_the_release_it_tested() {
+        let mut pass = report("autumn-admin-plugin", true, None);
+        assert!(
+            check_tested_release(&pass, "0.7.1")
+                .unwrap_err()
+                .contains("does not say")
+        );
+        pass.autumn_web = Some("0.7.0".to_owned());
+        let err = check_tested_release(&pass, "0.7.1").unwrap_err();
+        assert!(err.contains("tested autumn-web 0.7.0, not 0.7.1"), "{err}");
+        assert!(check_tested_release(&pass, "0.7.0").is_ok());
+        // A failed install names no release, and is still a failure.
+        let fail = report("autumn-admin-plugin", false, None);
+        assert!(check_tested_release(&fail, "0.7.1").is_ok());
+    }
+
+    /// `run_record` refuses a stale pass and writes nothing.
+    #[test]
+    fn run_record_refuses_a_report_from_another_release() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let index_path = dir.path().join("index.toml");
+        std::fs::write(&index_path, index::BUNDLED).expect("write index");
+        let mut r = report(
+            "autumn-admin-plugin",
+            true,
+            Some(lockstep("autumn-admin-plugin", "0.7.0")),
+        );
+        r.autumn_web = Some("0.6.9".to_owned());
+        let stale = write_report(dir.path(), "stale.json", &r);
+        let code = run_record(&RecordOptions {
+            index: &index_path,
+            inspects: &[],
+            reports: &[stale],
+            exempt: &[],
+            exempt_failed: &[],
+            against: "0.7.0",
+            date: "2026-10-01",
+        });
+        assert_eq!(code, 1);
+        assert_eq!(
+            std::fs::read_to_string(&index_path).unwrap(),
+            index::BUNDLED
+        );
+    }
+
     /// A result that breaks an admission rule writes nothing.
     #[test]
     fn run_record_refuses_a_result_that_breaks_a_rule() {
@@ -1504,7 +1581,8 @@ mod tests {
         std::fs::write(&index_path, index::BUNDLED).expect("write index");
         let mut contract = lockstep("autumn-admin-plugin", "0.7.0");
         contract.autumn_web = Some(">=0.1".to_owned());
-        let r = report("autumn-admin-plugin", true, Some(contract));
+        let mut r = report("autumn-admin-plugin", true, Some(contract));
+        r.autumn_web = Some("0.7.0".to_owned());
         let open_range = write_report(dir.path(), "open.json", &r);
         let code = run_record(&RecordOptions {
             index: &index_path,

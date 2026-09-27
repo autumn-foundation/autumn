@@ -140,6 +140,10 @@ Until step 2, `autumn plugin index check` fails: each listing was verified on
 an older release. The CLI unit tests run the same gate, so a release cannot
 ship a stale index.
 
+A `plugin-check --format json` report names the `autumn-web` its app locked.
+`record` refuses a report that tested another release than `--against`, and
+a passing report that names none.
+
 `record` changes the status by these rules:
 
 | Result | Status before | Status after |
@@ -149,6 +153,9 @@ ship a stale index.
 | fail | `incompatible`, same release (a retry) | `incompatible` |
 | fail | `incompatible`, a different release | `delisted` |
 | fail | `delisted` | `delisted` |
+
+Only `record` delists. `index check` refuses a `delisted` listing whose last
+result is not `fail`.
 
 `autumn plugin list` marks an `incompatible` listing. `autumn plugin add`
 refuses it on the failed series and later series, and when it cannot read the

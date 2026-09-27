@@ -9530,6 +9530,7 @@ fn failed_install_report(name: &str, message: &str, output: &str) -> serde_json:
             "message": message,
             "diagnostics": tail,
         }],
+        "autumn_web": env!("CARGO_PKG_VERSION"),
     })
 }
 

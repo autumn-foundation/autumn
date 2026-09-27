@@ -70,6 +70,10 @@ pub struct ConformanceReport {
     /// plugin index records its range and tier from this (issue #1625).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract: Option<PluginContract>,
+    /// The `autumn-web` version the checked app built against, read from its
+    /// `Cargo.lock`. The plugin index records a report only for this release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autumn_web: Option<String>,
 }
 
 impl ConformanceReport {
@@ -225,7 +229,7 @@ pub fn run(opts: &PluginCheckOptions<'_>) {
         std::process::exit(1);
     });
 
-    let report = build_report(
+    let mut report = build_report(
         &PluginCheckOptions {
             package: opts.package,
             bin: opts.bin,
@@ -238,6 +242,7 @@ pub fn run(opts: &PluginCheckOptions<'_>) {
         },
         &routes,
     );
+    report.autumn_web = locked_autumn_web(std::path::Path::new("."));
 
     match opts.format {
         ReportFormat::Text => print!("{}", report.to_text_report()),
@@ -320,7 +325,26 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
         plugin_name: opts.plugin_name.to_owned(),
         checks,
         contract: declared.cloned(),
+        autumn_web: None,
     }
+}
+
+/// The `autumn-web` version `Cargo.lock` resolved for the app in `dir`, or
+/// in the workspace root above it. `None` when there is no lockfile, or it
+/// locks more than one `autumn-web`.
+pub fn locked_autumn_web(dir: &std::path::Path) -> Option<String> {
+    let text = dir
+        .ancestors()
+        .find_map(|d| std::fs::read_to_string(d.join("Cargo.lock")).ok())?;
+    let lock = toml::from_str::<toml::Table>(&text).ok()?;
+    let mut versions = lock
+        .get("package")?
+        .as_array()?
+        .iter()
+        .filter(|p| p.get("name").and_then(toml::Value::as_str) == Some("autumn-web"))
+        .filter_map(|p| p.get("version").and_then(toml::Value::as_str));
+    let first = versions.next()?.to_owned();
+    versions.next().is_none().then_some(first)
 }
 
 /// What the child binary's stderr said about its plugin contracts.
@@ -1188,6 +1212,7 @@ mod tests {
                 },
             ],
             contract: None,
+            autumn_web: None,
         };
         assert!(report.passed());
     }
@@ -1203,6 +1228,7 @@ mod tests {
                 diagnostics: vec![],
             }],
             contract: None,
+            autumn_web: None,
         };
         assert!(!report.passed());
     }
@@ -1213,6 +1239,7 @@ mod tests {
             plugin_name: "autumn-admin-plugin".to_owned(),
             checks: vec![],
             contract: None,
+            autumn_web: None,
         };
         assert!(report.to_text_report().contains("autumn-admin-plugin"));
     }
@@ -1223,6 +1250,7 @@ mod tests {
             plugin_name: "test".to_owned(),
             checks: vec![],
             contract: None,
+            autumn_web: None,
         };
         assert!(report.to_text_report().contains("PASS"));
     }
@@ -1238,6 +1266,7 @@ mod tests {
                 diagnostics: vec![],
             }],
             contract: None,
+            autumn_web: None,
         };
         assert!(report.to_text_report().contains("FAIL"));
     }
@@ -1253,6 +1282,7 @@ mod tests {
                 diagnostics: vec![],
             }],
             contract: None,
+            autumn_web: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1426,6 +1456,29 @@ mod contract_tests {
 
     use super::*;
     use autumn_web::plugin_contract::{PLUGIN_CONTRACT_MARKER, PluginContract};
+
+    /// The tested release is read from `Cargo.lock`, up to the workspace
+    /// root; two locked `autumn-web`s are ambiguous.
+    #[test]
+    fn locked_autumn_web_reads_the_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        assert_eq!(locked_autumn_web(&app), None);
+        let pkg = |v: &str| format!("[[package]]\nname = \"autumn-web\"\nversion = \"{v}\"\n\n");
+        let lock = format!(
+            "version = 4\n\n{}[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n",
+            pkg("0.7.1")
+        );
+        std::fs::write(tmp.path().join("Cargo.lock"), &lock).unwrap();
+        assert_eq!(locked_autumn_web(&app).as_deref(), Some("0.7.1"));
+        std::fs::write(
+            tmp.path().join("Cargo.lock"),
+            format!("version = 4\n\n{}{}", pkg("0.7.1"), pkg("0.6.0")),
+        )
+        .unwrap();
+        assert_eq!(locked_autumn_web(&app), None);
+    }
 
     fn opts(contracts: &ContractDump) -> PluginCheckOptions<'_> {
         PluginCheckOptions {

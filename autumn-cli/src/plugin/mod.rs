@@ -172,7 +172,12 @@ pub fn list_rows(
         })
         .collect();
 
-    let listed = |rows: &[ListRow], name: &str| rows.iter().any(|row| row.crate_name == name);
+    // crates.io treats `-`/`_` and case as one name, so the index's spelling
+    // and a search result's are the same crate.
+    let listed = |rows: &[ListRow], name: &str| {
+        rows.iter()
+            .any(|row| index::canonical(&row.crate_name) == index::canonical(name))
+    };
     for entry in catalog::FIRST_PARTY {
         if !listed(&rows, entry.crate_name) {
             rows.push(ListRow {
@@ -1824,6 +1829,29 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("route-collision on re-verification"), "{out}");
+    }
+
+    /// A crates.io result spelled with `_` where the index has `-` is the
+    /// same crate: one listed row, no unlisted duplicate.
+    #[test]
+    fn a_separator_variant_search_result_merges_with_its_listing() {
+        let found = registry::CommunityPlugin {
+            crate_name: "autumn_plugin_live_feed".to_owned(),
+            version: "0.3.0".to_owned(),
+            summary: "Live feed".to_owned(),
+        };
+        let rows = list_rows(Some(RELEASE), &index_with(listed_community()), &[found]);
+        let feed: Vec<&ListRow> = rows
+            .iter()
+            .filter(|r| index::canonical(&r.crate_name) == "autumn-plugin-live-feed")
+            .collect();
+        assert_eq!(
+            feed.len(),
+            1,
+            "{:?}",
+            rows.iter().map(|r| &r.crate_name).collect::<Vec<_>>()
+        );
+        assert!(feed[0].listing.is_some());
     }
 
     /// AC 4: a delisted plugin is not shown as listed. If crates.io still

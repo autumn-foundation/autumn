@@ -631,6 +631,11 @@ fn check_conformance(listing: &Listing, out: &mut Vec<String>) {
                 "status is incompatible, but the last conformance run did not fail".to_owned(),
             );
         }
+        // Only `record` delists, after a second failure. A delisted entry is
+        // hidden and never re-verified, so a passing one would vanish unseen.
+        (Status::Delisted, CheckOutcome::Pass | CheckOutcome::Exempt) => {
+            out.push("status is delisted, but the last conformance run did not fail".to_owned());
+        }
         _ => {}
     }
     if listing.status != Status::Listed && listing.note.trim().is_empty() {
@@ -1510,6 +1515,20 @@ mod tests {
     fn a_flag_from_an_older_release_must_be_resolved() {
         let text = messages(&staleness(&index_of(vec![flagged()]), "0.8.0"));
         assert!(text.contains("delist"), "{text}");
+    }
+
+    #[test]
+    fn a_delisted_listing_must_have_failed() {
+        let mut gone = community();
+        gone.status = Status::Delisted;
+        gone.note = "removed".to_owned();
+        let text = messages(&validate(&index_of(vec![gone.clone()])));
+        assert!(
+            text.contains("delisted, but the last conformance run did not fail"),
+            "{text}"
+        );
+        gone.conformance.result = CheckOutcome::Fail;
+        assert!(validate(&index_of(vec![gone])).is_empty());
     }
 
     #[test]
