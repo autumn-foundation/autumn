@@ -517,9 +517,17 @@ pub async fn create_menu(
     // — a duplicate slug is the easy way to get one — would leave the previous
     // menu detached and the site's navigation simply gone, from a request that
     // reported an error.
-    let mut conn = repos.conn().await?;
-    if let Err(error) = crate::content::replace_menu_at_location(&mut conn, &name, &location).await
-    {
+    // `with_conn` scopes the checkout to this call, so the connection is
+    // returned to the pool before `redisplay_new_menu` below checks any more
+    // out — a `let conn = repos.conn().await?` held open across that awaited
+    // call would otherwise sit on a pool slot through the whole redisplay,
+    // and a small pool serializes every rejected submission behind it.
+    let result = repos
+        .with_conn(async |conn| {
+            crate::content::replace_menu_at_location(conn, &name, &location).await
+        })
+        .await;
+    if let Err(error) = result {
         // A location race (`idx_menus_location`) or the slug allocator's own
         // "too many menus share that name" both land here as a message the
         // administrator can act on by resubmitting — same distinction the
