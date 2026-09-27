@@ -83,6 +83,39 @@ fn find_unquoted(s: &str, needle: char) -> Option<usize> {
     None
 }
 
+/// The byte index of the first occurrence of the literal substring `needle`
+/// in `s` that starts outside any quoted string — the same guard
+/// `find_unquoted` gives a single character, extended to a key name like
+/// `"features = ["` that could coincidentally appear inside an unrelated
+/// quoted path or URL fragment (`path = "../features = [fork"` is valid
+/// TOML), which would otherwise anchor every later bracket search to the
+/// wrong position inside that quoted value.
+fn find_unquoted_str(s: &str, needle: &str) -> Option<usize> {
+    #[derive(PartialEq)]
+    enum Quote {
+        None,
+        Double,
+        Single,
+    }
+    let mut quote = Quote::None;
+    let mut chars = s.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if quote == Quote::None && s[i..].starts_with(needle) {
+            return Some(i);
+        }
+        match (c, &quote) {
+            ('"', Quote::None) => quote = Quote::Double,
+            ('\'', Quote::None) => quote = Quote::Single,
+            ('"', Quote::Double) | ('\'', Quote::Single) => quote = Quote::None,
+            ('\\', Quote::Double) => {
+                chars.next();
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Splits `s` on `,` characters that fall outside any quoted string, so a
 /// quoted feature name containing a literal comma is kept whole rather than
 /// torn into two garbage entries.
@@ -156,7 +189,7 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
         .join(", ");
 
     let merge_missing = |line: &str| -> Option<String> {
-        let feat_bracket = line.find("features = [")?;
+        let feat_bracket = find_unquoted_str(line, "features = [")?;
         let list_start = feat_bracket + "features = [".len();
         let close_off = find_unquoted(&line[list_start..], ']')?;
         let list_end = close_off + list_start;
@@ -201,7 +234,7 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
         if trimmed.starts_with(&table_prefix) {
             if let Some(new_line) = merge_missing(&trimmed) {
                 lines[i] = format!("{indent}{new_line}");
-            } else if !trimmed.contains("features = [") {
+            } else if find_unquoted_str(&trimmed, "features = [").is_none() {
                 // No `features` key at all — insert one before the closing brace.
                 if let Some(close_brace) = trimmed.rfind('}') {
                     let before = trimmed[..close_brace].trim_end();
@@ -358,7 +391,7 @@ fn ensure_totp_rs_features(toml: &str) -> String {
     // returning the rewritten line, or `None` if nothing changed (already
     // complete) / no list found.
     let merge_into_list = |line: &str, bracket_search: &str| -> Option<Option<String>> {
-        let feat_bracket = line.find(bracket_search)?;
+        let feat_bracket = find_unquoted_str(line, bracket_search)?;
         let list_start = feat_bracket + bracket_search.len();
         let close_off = find_unquoted(&line[list_start..], ']')?;
         let list_end = close_off + list_start;
@@ -1687,7 +1720,7 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
             if strip_line_comment(&trimmed).contains(FEATURE) {
                 break; // already present
             }
-            if let Some(feat_bracket) = trimmed.find("features = [") {
+            if let Some(feat_bracket) = find_unquoted_str(&trimmed, "features = [") {
                 let list_start = feat_bracket + "features = [".len();
                 if let Some(close_bracket) = find_unquoted(&trimmed[list_start..], ']') {
                     let list_end = close_bracket + list_start;
@@ -1963,7 +1996,7 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
             if strip_line_comment(&trimmed).contains(FEATURE) {
                 break; // already present
             }
-            if let Some(feat_bracket) = trimmed.find("features = [") {
+            if let Some(feat_bracket) = find_unquoted_str(&trimmed, "features = [") {
                 // Add to existing features list.
                 let list_start = feat_bracket + "features = [".len();
                 let list_end = find_unquoted(&trimmed[list_start..], ']').unwrap() + list_start;
@@ -11272,7 +11305,7 @@ fn ensure_autumn_web_webauthn_feature(toml: &str) -> String {
             if strip_line_comment(&trimmed).contains(FEATURE) {
                 break; // already present
             }
-            if let Some(feat_bracket) = trimmed.find("features = [") {
+            if let Some(feat_bracket) = find_unquoted_str(&trimmed, "features = [") {
                 let list_start = feat_bracket + "features = [".len();
                 if let Some(close_bracket) = find_unquoted(&trimmed[list_start..], ']') {
                     let list_end = close_bracket + list_start;
@@ -16433,6 +16466,47 @@ mod tests {
         );
         toml::from_str::<toml::Value>(&out)
             .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_webauthn_rs_features_finds_key_past_quoted_lookalike_text() {
+        // Codex review on 445675f2: a quoted path containing the literal
+        // text "features = [" (valid, if contrived, TOML) fooled the
+        // quote-blind `line.find("features = [")` into anchoring the
+        // bracket scan inside that quoted value instead of at the real
+        // features key, so `find_unquoted` (which only starts tracking
+        // quotes from that wrong position onward) got confused and missed
+        // the real array entirely.
+        let toml =
+            "webauthn-rs = { path = \"../features = [fork\", features = [\"conditional-ui\"] }\n";
+        let out = ensure_webauthn_rs_features(toml);
+        assert!(
+            out.contains("\"../features = [fork\""),
+            "the quoted path must survive untouched: {out}"
+        );
+        assert!(
+            out.contains("\"conditional-ui\"")
+                && out.contains("\"danger-allow-state-serialisation\""),
+            "both required features must be present: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_mail_feature_finds_key_past_quoted_lookalike_text_without_panicking() {
+        // Same gap as the webauthn-rs case, but mail's inline-table branch
+        // has no multiline fallback and unwraps the bracket search directly
+        // — an unfixed quote-blind key lookup here would panic, not just
+        // produce a wrong result.
+        let toml = "autumn-web = { path = \"../features = [fork\", features = [\"mail\"] }\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert!(
+            out.contains("\"../features = [fork\""),
+            "the quoted path must survive untouched: {out}"
+        );
+        assert!(
+            out.contains("\"mail\""),
+            "mail feature must be present: {out}"
+        );
     }
 
     #[test]
