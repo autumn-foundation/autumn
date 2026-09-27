@@ -2609,6 +2609,13 @@ async fn serve_sim_host(
             .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"));
         builder = builder.header(reqwest::header::HOST, authority);
     }
+    // Trace context first, as on the real send path. A caller header of the
+    // same name wins.
+    for (name, value) in trace_context_headers() {
+        if !request.extra_headers.contains_key(name.as_str()) {
+            builder = builder.header(name, value);
+        }
+    }
     for (name, value) in &request.extra_headers {
         builder = builder.header(name, value);
     }
@@ -3113,9 +3120,20 @@ fn log_request(
 /// when there is no active span with a valid context.
 #[allow(clippy::missing_const_for_fn)]
 fn inject_trace_context(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    let mut builder = builder;
+    for (name, value) in trace_context_headers() {
+        builder = builder.header(name, value);
+    }
+    builder
+}
+
+/// The W3C trace-context headers for the active span. Empty when the
+/// `telemetry-otlp` feature is disabled or no span has a valid context.
+#[allow(clippy::missing_const_for_fn)]
+fn trace_context_headers() -> Vec<(String, HeaderValue)> {
     #[cfg(not(feature = "telemetry-otlp"))]
     {
-        builder
+        Vec::new()
     }
     #[cfg(feature = "telemetry-otlp")]
     {
@@ -3126,13 +3144,9 @@ fn inject_trace_context(builder: reqwest::RequestBuilder) -> reqwest::RequestBui
         opentelemetry::global::get_text_map_propagator(|propagator| {
             propagator.inject_context(&cx, &mut TraceHeaderInjector(&mut map));
         });
-        let mut builder = builder;
-        for (k, v) in map {
-            if let Ok(value) = HeaderValue::from_str(&v) {
-                builder = builder.header(k, value);
-            }
-        }
-        builder
+        map.into_iter()
+            .filter_map(|(name, value)| Some((name, HeaderValue::from_str(&value).ok()?)))
+            .collect()
     }
 }
 
@@ -3864,6 +3878,58 @@ mod tests {
         );
         // Should complete without panicking; authorization is redacted from span.
         log_request("POST", &url, 201, Duration::from_millis(12), &headers);
+    }
+
+    /// A sim host sees the active span's `traceparent`, as a real upstream
+    /// does, and a caller header of the same name wins (issue #2967).
+    #[cfg(feature = "telemetry-otlp")]
+    #[test]
+    fn sim_host_receives_trace_context() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+        use tracing_subscriber::prelude::*;
+
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+        let provider = SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let echo = || {
+            axum::Router::new().route(
+                "/echo",
+                axum::routing::get(|headers: HeaderMap| async move {
+                    headers
+                        .get("traceparent")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned()
+                }),
+            )
+        };
+        let url = reqwest::Url::parse("http://payments/echo").unwrap();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("sim_trace_test");
+            let _guard = span.enter();
+            runtime.block_on(async {
+                let request = Client::new().get("http://payments/echo");
+                let traceparent = serve_sim_host(echo(), &request, url.clone())
+                    .await
+                    .unwrap()
+                    .text();
+                assert!(traceparent.starts_with("00-"), "{traceparent}");
+
+                let request = Client::new()
+                    .get("http://payments/echo")
+                    .header("traceparent", "caller-value");
+                let response = serve_sim_host(echo(), &request, url.clone()).await.unwrap();
+                assert_eq!(response.text(), "caller-value");
+            });
+        });
     }
 
     // TEST 34: inject_trace_context passthrough (without telemetry-otlp feature).
