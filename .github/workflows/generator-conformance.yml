@@ -87,10 +87,11 @@ on:
       - "autumn-search/**"
       - "autumn-storage-s3/**"
       # The plugin index re-verification (#1625) runs `plugin-check` against
-      # every listing, so the index, the checker and every listed crate
-      # trigger it.
+      # every listing, so the index, the checker (and the route collection
+      # it reads) and every listed crate trigger it.
       - "autumn-cli/plugin-index/**"
       - "autumn-cli/src/plugin_check.rs"
+      - "autumn-cli/src/routes.rs"
       - "autumn-billing/**"
       - "Cargo.toml"
   pull_request:
@@ -167,10 +168,11 @@ on:
       - "autumn-search/**"
       - "autumn-storage-s3/**"
       # The plugin index re-verification (#1625) runs `plugin-check` against
-      # every listing, so the index, the checker and every listed crate
-      # trigger it.
+      # every listing, so the index, the checker (and the route collection
+      # it reads) and every listed crate trigger it.
       - "autumn-cli/plugin-index/**"
       - "autumn-cli/src/plugin_check.rs"
+      - "autumn-cli/src/routes.rs"
       - "autumn-billing/**"
       - "Cargo.toml"
   schedule:

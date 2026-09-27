@@ -378,8 +378,8 @@ pub fn with_inherited_dependency(root: &Path, manifest: &str, crate_name: &str) 
 /// How `crate_name` is redirected away from its crates.io release by a
 /// `[patch]` or `[replace]` table. `None` when nothing redirects it.
 ///
-/// Cargo reads these from the manifest at `root` and each one above it up to
-/// the workspace root, and `[patch]` also from every `.cargo/config.toml`
+/// Cargo reads these from the workspace root manifest only (a member's own
+/// table is ignored), and `[patch]` also from every `.cargo/config.toml`
 /// from `root` up, and from `$CARGO_HOME`. Only a patch for the crates.io
 /// source counts: `[patch."<git url>"]` overrides that source alone.
 /// `[source]` replacement (vendoring) is not read.
@@ -399,11 +399,14 @@ fn patched_by_in(root: &Path, crate_name: &str, cargo_home: Option<&Path>) -> Op
             .ok()
             .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
     };
-    for dir in root.ancestors() {
-        let manifest = dir.join("Cargo.toml");
-        let Some(table) = read(&manifest) else {
-            continue;
-        };
+    // The workspace root: the first manifest from `root` up with a
+    // `[workspace]` table, or `root`'s own when there is none.
+    let manifest = root
+        .ancestors()
+        .map(|dir| dir.join("Cargo.toml"))
+        .find(|path| read(path).is_some_and(|table| table.contains_key("workspace")))
+        .unwrap_or_else(|| root.join("Cargo.toml"));
+    if let Some(table) = read(&manifest) {
         if let Some(source) = crates_io_patch(&table, &want) {
             return Some(format!("[patch.{source}] in {}", manifest.display()));
         }
@@ -414,10 +417,6 @@ fn patched_by_in(root: &Path, crate_name: &str, cargo_home: Option<&Path>) -> Op
             if hit {
                 return Some(format!("[replace] in {}", manifest.display()));
             }
-        }
-        // Cargo reads manifest patches from the workspace root; stop there.
-        if table.contains_key("workspace") {
-            break;
         }
     }
     let configs = root
@@ -1015,6 +1014,32 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    /// Cargo reads manifest patches from the workspace root only: a
+    /// member's own `[patch]` is ignored, the root's counts.
+    #[test]
+    fn only_the_workspace_root_manifest_patches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app");
+        let patch = "[patch.crates-io]\nautumn-plugin-x = { path = \"../x\" }\n";
+        write(
+            &app.join("Cargo.toml"),
+            &format!("[package]\nname = \"app\"\n\n{patch}"),
+        );
+        // Standalone: the package is its own root.
+        assert!(patched_by_in(&app, "autumn-plugin-x", None).is_some());
+        // A member: its own table is ignored.
+        write(
+            &tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n",
+        );
+        assert_eq!(patched_by_in(&app, "autumn-plugin-x", None), None);
+        write(
+            &tmp.path().join("Cargo.toml"),
+            &format!("[workspace]\nmembers = [\"app\"]\n\n{patch}"),
+        );
+        assert!(patched_by_in(&app, "autumn-plugin-x", None).is_some());
     }
 
     /// Cargo also reads `[patch]` from `.cargo/config.toml` above the app,
