@@ -2,22 +2,95 @@
 //!
 //! Two app instances share one clock and one obligation store, as two
 //! replicas share one database. Each tracks the same obligation, so each has a
-//! check job at the deadline. Only one escalation may fire.
+//! check job at the deadline. A barrier holds both checks after they read the
+//! store, so both try to claim. Only one escalation may fire.
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_web::job;
 use autumn_web::prelude::*;
 use autumn_web::sla::{
-    BusinessCalendar, BusinessDuration, MemoryObligationStore, Obligation, Sla, SlaBreach,
-    SlaPlugin,
+    BusinessCalendar, BusinessDuration, MemoryObligationStore, Obligation, ObligationRecord,
+    ObligationStore, Sla, SlaBreach, SlaPlugin, StoreFuture,
 };
 use autumn_web::test::{TestApp, TestClient};
 use autumn_web::time::TickingClock;
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
+use tokio::sync::Barrier;
 
-fn replica(clock: &TickingClock, store: &MemoryObligationStore, fired: &Arc<Mutex<Vec<String>>>) -> TestClient {
+/// A shared store. While armed, the first two `get` calls read, then wait for
+/// each other. Thus two checks read "not escalated" before either one claims.
+#[derive(Clone)]
+struct RacingStore {
+    inner: MemoryObligationStore,
+    armed: Arc<AtomicBool>,
+    barrier: Arc<Barrier>,
+    gets: Arc<AtomicUsize>,
+    claims: Arc<AtomicUsize>,
+}
+
+impl RacingStore {
+    fn new() -> Self {
+        Self {
+            inner: MemoryObligationStore::new(),
+            armed: Arc::default(),
+            barrier: Arc::new(Barrier::new(2)),
+            gets: Arc::default(),
+            claims: Arc::default(),
+        }
+    }
+}
+
+impl ObligationStore for RacingStore {
+    fn insert(&self, record: ObligationRecord) -> StoreFuture<'_, ObligationRecord> {
+        self.inner.insert(record)
+    }
+
+    fn get<'a>(&'a self, key: &'a str) -> StoreFuture<'a, Option<ObligationRecord>> {
+        Box::pin(async move {
+            // Read first, then wait: both checks see "not escalated".
+            let record = self.inner.get(key).await;
+            if self.armed.load(Ordering::SeqCst) && self.gets.fetch_add(1, Ordering::SeqCst) < 2 {
+                self.barrier.wait().await;
+            }
+            record
+        })
+    }
+
+    fn list(&self) -> StoreFuture<'_, Vec<ObligationRecord>> {
+        self.inner.list()
+    }
+
+    fn mark_met<'a>(&'a self, key: &'a str, at: DateTime<Utc>) -> StoreFuture<'a, bool> {
+        self.inner.mark_met(key, at)
+    }
+
+    fn claim_escalation<'a>(
+        &'a self,
+        key: &'a str,
+        due_at: DateTime<Utc>,
+        at: DateTime<Utc>,
+    ) -> StoreFuture<'a, bool> {
+        self.claims.fetch_add(1, Ordering::SeqCst);
+        self.inner.claim_escalation(key, due_at, at)
+    }
+
+    fn release_escalation<'a>(&'a self, key: &'a str) -> StoreFuture<'a, ()> {
+        self.inner.release_escalation(key)
+    }
+
+    fn remove<'a>(&'a self, key: &'a str) -> StoreFuture<'a, bool> {
+        self.inner.remove(key)
+    }
+}
+
+fn replica(
+    clock: &TickingClock,
+    store: &RacingStore,
+    fired: &Arc<Mutex<Vec<String>>>,
+) -> TestClient {
     let sink = Arc::clone(fired);
     let plugin = SlaPlugin::new()
         .calendar(
@@ -25,13 +98,16 @@ fn replica(clock: &TickingClock, store: &MemoryObligationStore, fired: &Arc<Mute
             BusinessCalendar::weekdays("09:00-17:00".parse().unwrap()),
         )
         .store(store.clone())
-        .on_breach("first_response", move |_state: AppState, breach: SlaBreach| {
-            let sink = Arc::clone(&sink);
-            async move {
-                sink.lock().unwrap().push(breach.key);
-                Ok(())
-            }
-        });
+        .on_breach(
+            "first_response",
+            move |_state: AppState, breach: SlaBreach| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.lock().unwrap().push(breach.key);
+                    Ok(())
+                }
+            },
+        );
     TestApp::new()
         .with_clock(clock.clone())
         .plugin(plugin)
@@ -40,7 +116,7 @@ fn replica(clock: &TickingClock, store: &MemoryObligationStore, fired: &Arc<Mute
 
 /// Let spawned job workers run.
 async fn settle() {
-    for _ in 0..64 {
+    for _ in 0..256 {
         tokio::task::yield_now().await;
     }
 }
@@ -52,7 +128,7 @@ async fn sim_sla_two_replicas_escalate_once() {
 
     // Wednesday 2020-01-01 09:00 UTC.
     let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap());
-    let store = MemoryObligationStore::new();
+    let store = RacingStore::new();
     let fired = Arc::new(Mutex::new(Vec::new()));
     let a = replica(&clock, &store, &fired);
     let b = replica(&clock, &store, &fired);
@@ -65,17 +141,28 @@ async fn sim_sla_two_replicas_escalate_once() {
     let due_a = sla_a.track(&obligation).await.unwrap().due_at;
     let due_b = sla_b.track(&obligation).await.unwrap().due_at;
     assert_eq!(due_a, due_b);
-    assert_eq!(due_a, Some(Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap()));
+    assert_eq!(
+        due_a,
+        Some(Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap())
+    );
     settle().await;
 
-    // Go three hours past the start: both check jobs come due.
+    // Go three hours past the start: both check jobs come due and race.
+    store.armed.store(true, Ordering::SeqCst);
     let step = Duration::from_secs(3 * 3600);
     clock.advance(step);
     tokio::time::advance(step).await;
     settle().await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     settle().await;
+    store.armed.store(false, Ordering::SeqCst);
 
+    assert_eq!(store.gets.load(Ordering::SeqCst), 2, "both checks ran");
+    assert_eq!(
+        store.claims.load(Ordering::SeqCst),
+        2,
+        "both checks tried to claim"
+    );
     assert_eq!(*fired.lock().unwrap(), ["first_response/ticket:1"]);
     let status = sla_b.get(&obligation.key()).await.unwrap().unwrap();
     assert!(status.escalated_at.is_some());

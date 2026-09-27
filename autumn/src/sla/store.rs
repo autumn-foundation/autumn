@@ -37,8 +37,8 @@ impl ObligationRecord {
 ///
 /// For more than one replica, all replicas must use the same store, and
 /// [`claim_escalation`](Self::claim_escalation) must be atomic, for example
-/// `UPDATE … SET escalated_at = $2 WHERE key = $1 AND escalated_at IS NULL
-/// AND met_at IS NULL`.
+/// `UPDATE … SET escalated_at = $3 WHERE key = $1 AND escalated_at IS NULL
+/// AND (met_at IS NULL OR met_at > $2)`.
 pub trait ObligationStore: Send + Sync + 'static {
     /// Add `record` if its key is new. Return the stored record.
     fn insert(&self, record: ObligationRecord) -> StoreFuture<'_, ObligationRecord>;
@@ -52,9 +52,14 @@ pub trait ObligationStore: Send + Sync + 'static {
     /// Set the met instant if it is not set. Return `true` if it changed.
     fn mark_met<'a>(&'a self, key: &'a str, at: DateTime<Utc>) -> StoreFuture<'a, bool>;
 
-    /// Set the escalation instant if it and the met instant are not set.
-    /// Return `true` if this call set it.
-    fn claim_escalation<'a>(&'a self, key: &'a str, at: DateTime<Utc>) -> StoreFuture<'a, bool>;
+    /// Set the escalation instant to `at` if it is not set and the
+    /// obligation was not met by `due_at`. Return `true` if this call set it.
+    fn claim_escalation<'a>(
+        &'a self,
+        key: &'a str,
+        due_at: DateTime<Utc>,
+        at: DateTime<Utc>,
+    ) -> StoreFuture<'a, bool>;
 
     /// Clear the escalation instant after a failed enqueue.
     fn release_escalation<'a>(&'a self, key: &'a str) -> StoreFuture<'a, ()>;
@@ -78,19 +83,16 @@ impl MemoryObligationStore {
     pub fn new() -> Self {
         Self::default()
     }
-}
 
-impl MemoryObligationStore {
     /// Run `f` on the records and return its result as a ready future.
     fn with<T: Send + 'static>(
         &self,
         f: impl FnOnce(&mut BTreeMap<String, ObligationRecord>) -> T,
     ) -> StoreFuture<'_, T> {
-        let mut records = self
+        let value = f(&mut self
             .records
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let value = f(&mut records);
+            .unwrap_or_else(std::sync::PoisonError::into_inner));
         Box::pin(std::future::ready(Ok(value)))
     }
 }
@@ -123,9 +125,17 @@ impl ObligationStore for MemoryObligationStore {
         })
     }
 
-    fn claim_escalation<'a>(&'a self, key: &'a str, at: DateTime<Utc>) -> StoreFuture<'a, bool> {
+    fn claim_escalation<'a>(
+        &'a self,
+        key: &'a str,
+        due_at: DateTime<Utc>,
+        at: DateTime<Utc>,
+    ) -> StoreFuture<'a, bool> {
         self.with(|records| match records.get_mut(key) {
-            Some(record) if record.escalated_at.is_none() && record.obligation.met().is_none() => {
+            Some(record)
+                if record.escalated_at.is_none()
+                    && record.obligation.met().is_none_or(|met| met > due_at) =>
+            {
                 record.escalated_at = Some(at);
                 true
             }

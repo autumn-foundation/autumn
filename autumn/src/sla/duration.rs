@@ -9,6 +9,8 @@ use super::{BusinessCalendar, SlaError};
 ///
 /// Days use the business-day length of the calendar. Hours and minutes are
 /// working time.
+///
+/// It serializes as its text, such as `"2 business days"`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct BusinessDuration {
     days: u32,
@@ -80,6 +82,19 @@ impl FromStr for BusinessDuration {
     }
 }
 
+impl serde::Serialize for BusinessDuration {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for BusinessDuration {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 impl std::fmt::Display for BusinessDuration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let parts = [
@@ -107,18 +122,21 @@ impl std::fmt::Display for BusinessDuration {
     }
 }
 
-/// Parse a list of `<count> [business] <unit>` parts. Commas and `and` join
-/// the parts.
+/// Parse a list of `<count> [business] <unit>` parts. A comma, `and`, or
+/// both join two parts.
+///
+/// Keep in step with `parse_duration` in `autumn-macros/src/obligation.rs`.
 fn parse(text: &str) -> Option<BusinessDuration> {
-    let lower = text.to_ascii_lowercase().replace(',', " ");
-    let mut words = lower.split_whitespace().filter(|w| *w != "and").peekable();
+    let lower = text.to_ascii_lowercase().replace(',', " , ");
+    let mut words = lower.split_whitespace().peekable();
     let mut total = BusinessDuration::ZERO;
-    let mut parts = 0_u32;
-    while let Some(word) = words.next() {
-        let count: u64 = word.parse().ok()?;
-        if words.peek() == Some(&"business") {
-            words.next();
+    loop {
+        let count = words.next()?;
+        if !count.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
         }
+        let count: u64 = count.parse().ok()?;
+        words.next_if_eq(&"business");
         match words.next()? {
             "day" | "days" => {
                 total.days = total.days.checked_add(u32::try_from(count).ok()?)?;
@@ -133,7 +151,13 @@ fn parse(text: &str) -> Option<BusinessDuration> {
                 total.secs = total.secs.checked_add(count.checked_mul(scale)?)?;
             }
         }
-        parts = parts.saturating_add(1);
+        if words.peek().is_none() {
+            return Some(total);
+        }
+        let comma = words.next_if_eq(&",").is_some();
+        let and = words.next_if_eq(&"and").is_some();
+        if !comma && !and {
+            return None;
+        }
     }
-    (parts > 0).then_some(total)
 }

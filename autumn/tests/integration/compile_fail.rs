@@ -542,6 +542,15 @@ fn cache_coherence_compile_fail_tests() {
     t.compile_fail("tests/compile-fail/repository_acknowledge_stale_blank_reason.rs");
 }
 
+/// SLA obligations (#1826): `#[obligation]` checks its arguments at compile
+/// time.
+#[test]
+fn obligation_compile_fail_tests() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/compile-fail/obligation_bad_within.rs");
+    t.compile_fail("tests/compile-fail/obligation_missing_starts.rs");
+}
+
 /// Wire contracts (#1755), in their own `#[test]` so the shard that owns them
 /// is the `rest` filter in ci.yml's `trybuild` job rather than the big
 /// `compile_fail_tests` one.

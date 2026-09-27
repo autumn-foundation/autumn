@@ -37,7 +37,17 @@ fn working_hours_parse_accepts_end_of_day() {
 
 #[test]
 fn working_hours_parse_rejects_bad_text() {
-    for text in ["17:00-09:00", "09:00-09:00", "9-5", "", "09:00", "25:00-26:00", "09:60-10:00"] {
+    for text in [
+        "17:00-09:00",
+        "09:00-09:00",
+        "9-5",
+        "",
+        "09:00",
+        "25:00-26:00",
+        "09:60-10:00",
+        "09:+5-17:00",
+        "+9:00-17:00",
+    ] {
         assert!(
             matches!(text.parse::<WorkingHours>(), Err(SlaError::InvalidHours(_))),
             "{text:?} must be rejected"
@@ -111,8 +121,14 @@ fn working_time_counts_real_hours_on_a_dst_day() {
     let ny: Tz = "America/New_York".parse().unwrap();
     let cal = BusinessCalendar::new().hours(Weekday::Sun, WorkingHours::ALL_DAY);
     // 2024-03-10 is a Sunday; clocks go forward at 02:00, so the day has 23h.
-    let start = ny.with_ymd_and_hms(2024, 3, 10, 0, 0, 0).unwrap().with_timezone(&Utc);
-    let end = ny.with_ymd_and_hms(2024, 3, 11, 0, 0, 0).unwrap().with_timezone(&Utc);
+    let start = ny
+        .with_ymd_and_hms(2024, 3, 10, 0, 0, 0)
+        .unwrap()
+        .with_timezone(&Utc);
+    let end = ny
+        .with_ymd_and_hms(2024, 3, 11, 0, 0, 0)
+        .unwrap()
+        .with_timezone(&Utc);
     assert_eq!(cal.working_time(start, end, ny), 23 * HOUR);
 }
 
@@ -171,7 +187,10 @@ fn deadline_that_uses_a_full_window_is_the_close() {
 fn deadline_is_none_without_working_time() {
     let cal = BusinessCalendar::new();
     assert_eq!(cal.deadline(utc(2024, 1, 8, 9, 0), HOUR, Tz::UTC), None);
-    assert_eq!(cal.next_working_instant(utc(2024, 1, 8, 9, 0), Tz::UTC), None);
+    assert_eq!(
+        cal.next_working_instant(utc(2024, 1, 8, 9, 0), Tz::UTC),
+        None
+    );
 }
 
 #[test]
@@ -213,6 +232,66 @@ fn calendar_keeps_a_home_zone() {
     assert_eq!(office().zone(ny).home_zone(), Some(ny));
 }
 
+#[test]
+fn zero_budget_outside_hours_is_due_at_the_next_opening() {
+    let due = office().deadline(utc(2024, 1, 6, 12, 0), Duration::ZERO, Tz::UTC);
+    assert_eq!(due, Some(utc(2024, 1, 8, 9, 0)));
+}
+
+#[test]
+fn a_long_budget_inside_the_horizon_has_a_deadline() {
+    // 3000 business days is about 11.5 years.
+    let budget = BusinessDuration::days(3000).resolve(&office());
+    let due = office().deadline(utc(2024, 1, 8, 9, 0), budget, Tz::UTC);
+    assert!(due.is_some_and(|d| d > utc(2035, 1, 1, 0, 0)));
+}
+
+#[test]
+fn far_future_instants_do_not_panic() {
+    let kiritimati: Tz = "Pacific/Kiritimati".parse().unwrap();
+    let far = DateTime::<Utc>::MAX_UTC;
+    assert!(!office().is_working(far, kiritimati));
+    let _ = office().working_time(utc(2024, 1, 8, 9, 0), far, Tz::UTC);
+}
+
+#[test]
+fn a_skipped_local_day_keeps_the_day_before() {
+    // Samoa skipped 2011-12-30. The window of Thursday 2011-12-29 stays whole.
+    let apia: Tz = "Pacific/Apia".parse().unwrap();
+    let cal = BusinessCalendar::weekdays(WorkingHours::ALL_DAY);
+    let start = apia
+        .with_ymd_and_hms(2011, 12, 29, 0, 0, 0)
+        .unwrap()
+        .with_timezone(&Utc);
+    let end = apia
+        .with_ymd_and_hms(2011, 12, 31, 0, 0, 0)
+        .unwrap()
+        .with_timezone(&Utc);
+    assert_eq!(cal.working_time(start, end, apia), 24 * HOUR);
+    let noon = apia
+        .with_ymd_and_hms(2011, 12, 29, 12, 0, 0)
+        .unwrap()
+        .with_timezone(&Utc);
+    assert!(cal.is_working(noon, apia));
+}
+
+#[test]
+fn a_window_that_opens_in_a_dst_gap_moves_forward() {
+    let ny: Tz = "America/New_York".parse().unwrap();
+    // 2024-03-10 is a Sunday; 02:00-03:00 does not exist.
+    let cal = BusinessCalendar::new().hours(Weekday::Sun, "02:30-04:00".parse().unwrap());
+    let start = ny
+        .with_ymd_and_hms(2024, 3, 10, 0, 0, 0)
+        .unwrap()
+        .with_timezone(&Utc);
+    let end = ny
+        .with_ymd_and_hms(2024, 3, 11, 0, 0, 0)
+        .unwrap()
+        .with_timezone(&Utc);
+    // 02:30 moves to 03:30, so the window is 03:30-04:00.
+    assert_eq!(cal.working_time(start, end, ny), Duration::from_secs(1800));
+}
+
 // ── BusinessDuration ─────────────────────────────────────────────────────────
 
 #[test]
@@ -240,7 +319,19 @@ fn duration_parses_units() {
 
 #[test]
 fn duration_rejects_bad_text() {
-    for text in ["", "two days", "2 fortnights", "2", "business days", "2 business", "-1 days"] {
+    for text in [
+        "",
+        "two days",
+        "2 fortnights",
+        "2",
+        "business days",
+        "2 business",
+        "-1 days",
+        "+2 days",
+        "and 2 and days",
+        "1 day 2 hours",
+        "1 day,",
+    ] {
         assert!(
             matches!(
                 text.parse::<BusinessDuration>(),
@@ -288,12 +379,16 @@ fn ticket(start: DateTime<Utc>) -> Obligation {
 
 #[test]
 fn obligation_key_joins_name_and_subject() {
-    assert_eq!(ticket(utc(2024, 1, 5, 15, 0)).key(), "first_response/ticket:1");
+    assert_eq!(
+        ticket(utc(2024, 1, 5, 15, 0)).key(),
+        "first_response/ticket:1"
+    );
 }
 
 #[test]
 fn status_runs_in_working_time() {
-    let status = ticket(utc(2024, 1, 8, 9, 0)).status_with(&office(), Tz::UTC, utc(2024, 1, 8, 12, 0));
+    let status =
+        ticket(utc(2024, 1, 8, 9, 0)).status_with(&office(), Tz::UTC, utc(2024, 1, 8, 12, 0));
     assert_eq!(status.state, ObligationState::Running);
     assert_eq!(status.elapsed, 3 * HOUR);
     assert_eq!(status.remaining, 13 * HOUR);
@@ -369,7 +464,9 @@ fn zone_from_reads_names_and_options() {
     let ny: Tz = "America/New_York".parse().unwrap();
     let ob = Obligation::new("x", "y").zone_from("America/New_York");
     assert_eq!(ob.time_zone(), Some(ny));
-    let ob = Obligation::new("x", "y").zone(ny).zone_from(&None::<String>);
+    let ob = Obligation::new("x", "y")
+        .zone(ny)
+        .zone_from(&None::<String>);
     assert_eq!(ob.time_zone(), Some(ny), "no value keeps the zone");
     let ob = Obligation::new("x", "y").zone_from(&"Not/AZone".to_owned());
     assert_eq!(ob.time_zone(), None);
@@ -395,11 +492,11 @@ async fn store_claims_an_escalation_once() {
     let store = MemoryObligationStore::new();
     store.insert(record(utc(2024, 1, 5, 15, 0))).await.unwrap();
     let key = "first_response/ticket:1";
-    let at = utc(2024, 1, 9, 15, 0);
-    assert!(store.claim_escalation(key, at).await.unwrap());
-    assert!(!store.claim_escalation(key, at).await.unwrap());
+    let due = utc(2024, 1, 9, 15, 0);
+    assert!(store.claim_escalation(key, due, due).await.unwrap());
+    assert!(!store.claim_escalation(key, due, due).await.unwrap());
     store.release_escalation(key).await.unwrap();
-    assert!(store.claim_escalation(key, at).await.unwrap());
+    assert!(store.claim_escalation(key, due, due).await.unwrap());
 }
 
 #[tokio::test]
@@ -407,12 +504,28 @@ async fn store_does_not_claim_a_met_or_missing_obligation() {
     let store = MemoryObligationStore::new();
     store.insert(record(utc(2024, 1, 5, 15, 0))).await.unwrap();
     let key = "first_response/ticket:1";
+    let due = utc(2024, 1, 9, 15, 0);
     assert!(store.mark_met(key, utc(2024, 1, 8, 10, 0)).await.unwrap());
     assert!(!store.mark_met(key, utc(2024, 1, 8, 11, 0)).await.unwrap());
-    assert!(!store.claim_escalation(key, utc(2024, 1, 9, 15, 0)).await.unwrap());
-    assert!(!store.claim_escalation("nope", utc(2024, 1, 9, 15, 0)).await.unwrap());
+    assert!(!store.claim_escalation(key, due, due).await.unwrap());
+    assert!(!store.claim_escalation("nope", due, due).await.unwrap());
     let stored = store.get(key).await.unwrap().unwrap();
     assert_eq!(stored.obligation.met(), Some(utc(2024, 1, 8, 10, 0)));
+}
+
+#[tokio::test]
+async fn store_claims_an_obligation_met_after_the_deadline() {
+    let store = MemoryObligationStore::new();
+    store.insert(record(utc(2024, 1, 5, 15, 0))).await.unwrap();
+    let key = "first_response/ticket:1";
+    let due = utc(2024, 1, 9, 15, 0);
+    store.mark_met(key, utc(2024, 1, 9, 16, 0)).await.unwrap();
+    assert!(
+        store
+            .claim_escalation(key, due, utc(2024, 1, 9, 17, 0))
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -420,7 +533,44 @@ async fn store_clones_share_records() {
     let store = MemoryObligationStore::new();
     let replica = store.clone();
     store.insert(record(utc(2024, 1, 5, 15, 0))).await.unwrap();
-    assert!(replica.get("first_response/ticket:1").await.unwrap().is_some());
+    assert!(
+        replica
+            .get("first_response/ticket:1")
+            .await
+            .unwrap()
+            .is_some()
+    );
     assert!(replica.remove("first_response/ticket:1").await.unwrap());
-    assert!(store.get("first_response/ticket:1").await.unwrap().is_none());
+    assert!(
+        store
+            .get("first_response/ticket:1")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+// ── Serialization ────────────────────────────────────────────────────────────
+
+#[test]
+fn status_serializes_to_json() {
+    let status =
+        ticket(utc(2024, 1, 8, 9, 0)).status_with(&office(), Tz::UTC, utc(2024, 1, 8, 12, 0));
+    let json = serde_json::to_value(&status).unwrap();
+    assert_eq!(json["state"], "running");
+    assert_eq!(json["zone"], "UTC");
+    assert_eq!(json["remaining"], 13 * 3600);
+    assert_eq!(json["due_at"], "2024-01-09T17:00:00Z");
+}
+
+#[test]
+fn duration_serializes_as_text() {
+    let budget = BusinessDuration::from_parts(1, 4 * 3600);
+    let json = serde_json::to_string(&budget).unwrap();
+    assert_eq!(json, "\"1 business day, 4 business hours\"");
+    assert_eq!(
+        serde_json::from_str::<BusinessDuration>(&json).unwrap(),
+        budget
+    );
+    assert!(serde_json::from_str::<BusinessDuration>("\"soon\"").is_err());
 }

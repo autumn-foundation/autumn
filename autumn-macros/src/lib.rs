@@ -1745,24 +1745,24 @@ pub fn lifecycle(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// # Arguments
 ///
-/// - `name` (first, required): the obligation name.
+/// - `name = ident` (required): the obligation name.
 /// - `within = "..."` (required): the budget, such as `"2 business days"`.
 ///   A bad budget is a compile error.
 /// - `starts = field` (required): a `DateTime<Utc>` field. The clock starts
 ///   there.
 /// - `calendar = "..."`: the calendar name. The default is `"default"`.
-/// - `met = field`: an `Option<DateTime<Utc>>` field. It is set when the
-///   subject met the obligation.
+/// - `met = field`: an `Option<DateTime<Utc>>` field. Your code sets it when
+///   the subject meets the obligation.
 /// - `zone = field`: a time zone field (`Tz`, an IANA name, or an `Option`).
 /// - `subject = field`: the identity field. The default is `id`. The subject
-///   is `"<snake_case type>:<field>"`.
+///   is the `snake_case` type name, a colon, and the field value.
 ///
 /// # Example
 ///
 /// ```ignore
 /// use autumn_web::obligation;
 ///
-/// #[obligation(first_response, within = "2 business days", calendar = "support",
+/// #[obligation(name = first_response, within = "2 business days", calendar = "support",
 ///              starts = opened_at, met = responded_at)]
 /// pub struct Ticket {
 ///     pub id: i64,

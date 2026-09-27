@@ -688,6 +688,43 @@ Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
   (`_autumn_money_*`), append-only by trigger on both backends, shipped in the
   framework migration set.
 
+## SLA obligations (`autumn_web::sla`, unreleased, #1826)
+
+Deadlines in business time. The clock runs only in working hours and reads
+only the injected `Clock`.
+
+- `BusinessCalendar::new()` / `::weekdays(hours)` + `.hours(Weekday, hours)` /
+  `.holiday(NaiveDate)` / `.annual_holiday(month, day)` / `.zone(Tz)` /
+  `.business_day(Duration)`; reads: `working_time(from, to, tz)`,
+  `deadline(from, budget, tz)`, `is_working`, `next_working_instant`,
+  `day_length`, `is_holiday`, `home_zone`.
+- `WorkingHours` — `"09:00-17:00".parse()`, `::new(open, close)`, `ALL_DAY`.
+- `BusinessDuration` — `"2 business days".parse()`, `::days` / `::hours` /
+  `::minutes` / `::from_parts(days, secs)`, `resolve(&calendar)`.
+- `Obligation::new(name, subject)` + `.within(d)` / `.calendar(name)` /
+  `.zone(tz)` / `.zone_from(&value)` / `.starting_at(t)` / `.met_at(t)`;
+  `key()` is `"<name>/<subject>"`; `status_with(&cal, tz, now)` is pure.
+- `#[obligation(name = ident, within = "...", starts = field, calendar = "...",
+  met = field, zone = field, subject = field)]` on a struct adds
+  `<name>_obligation(&self)`. A bad `within` is a compile error.
+- `SlaPlugin::new().calendar(name, cal).store(s).on_breach(name, |state,
+  breach| async { .. }).on_any_breach(..)`; registers jobs `CHECK_JOB`
+  (`autumn_sla_check`) and `ESCALATE_JOB` (`autumn_sla_escalate`).
+- `Sla` extractor (or `Sla::from_state`): `status(&ob)`, `track(&ob)`,
+  `meet(key)`, `get(key)`, `statuses()`, `forget(key)`, `calendar(name)`,
+  `now()`.
+- `ObligationStatus` {`key`, `state`, `zone`, `started_at`, `due_at`,
+  `met_at`, `escalated_at`, `resumes_at`, `budget`, `elapsed`, `remaining`};
+  `ObligationState` {`Running`, `Paused`, `Met`, `Breached`}.
+- `SlaBreach` (serde) {`key`, `obligation`, `subject`, `calendar`, `zone`,
+  `started_at`, `due_at`, `escalated_at`} — the typed escalation.
+- `ObligationStore` trait (`insert`, `get`, `list`, `mark_met`,
+  `claim_escalation`, `release_escalation`, `remove`);
+  `MemoryObligationStore` is the per-process default; replicas need one
+  shared store. A breach met late still escalates.
+- `SlaError` {`InvalidHours`, `InvalidDuration`, `UnknownCalendar`,
+  `NotInstalled`, `NoJobRuntime`, `Job`, `Store`} → 500 through `?`.
+
 ## Form helpers (`autumn_web::form`)
 
 Free functions rendering changeset-aware, accessible inputs:

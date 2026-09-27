@@ -5,8 +5,8 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use chrono::{
-    DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, TimeZone, Timelike, Utc,
-    Weekday,
+    DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeDelta, TimeZone, Timelike,
+    Utc, Weekday,
 };
 use chrono_tz::Tz;
 
@@ -15,11 +15,11 @@ use super::SlaError;
 /// Seconds in one day.
 const DAY_SECS: u32 = 86_400;
 
-/// The scan horizon: ten years of days.
-const SCAN_DAYS: u32 = 3_660;
+/// The scan horizon: one hundred years of days.
+const SCAN_DAYS: usize = 36_525;
 
-/// The longest daylight-saving gap to step over, in minutes.
-const MAX_GAP_MINUTES: i64 = 180;
+/// Stop a scan after this many days in a row with no working time.
+const MAX_IDLE_DAYS: usize = 400;
 
 /// Monday to Friday.
 const WEEKDAYS: [Weekday; 5] = [
@@ -89,7 +89,13 @@ impl FromStr for WorkingHours {
 /// Parse `"HH:MM"` (up to `"24:00"`) to seconds after midnight.
 fn parse_clock(text: &str) -> Option<u32> {
     let (hours, minutes) = text.trim().split_once(':')?;
-    if hours.is_empty() || hours.len() > 2 || minutes.len() != 2 {
+    let digits = |text: &str| text.bytes().all(|b| b.is_ascii_digit());
+    if hours.is_empty()
+        || hours.len() > 2
+        || minutes.len() != 2
+        || !digits(hours)
+        || !digits(minutes)
+    {
         return None;
     }
     let hours: u32 = hours.parse().ok()?;
@@ -97,7 +103,9 @@ fn parse_clock(text: &str) -> Option<u32> {
     if minutes >= 60 || hours > 24 || (hours == 24 && minutes > 0) {
         return None;
     }
-    hours.checked_mul(3_600)?.checked_add(minutes.checked_mul(60)?)
+    hours
+        .checked_mul(3_600)?
+        .checked_add(minutes.checked_mul(60)?)
 }
 
 /// A business calendar.
@@ -204,10 +212,7 @@ impl BusinessCalendar {
     /// Whether `date` is a holiday.
     #[must_use]
     pub fn is_holiday(&self, date: NaiveDate) -> bool {
-        self.holidays.contains(&date)
-            || self
-                .annual_holidays
-                .contains(&(date.month(), date.day()))
+        self.holidays.contains(&date) || self.annual_holidays.contains(&(date.month(), date.day()))
     }
 
     /// Whether `at` is in working time in `zone`.
@@ -229,6 +234,8 @@ impl BusinessCalendar {
     }
 
     /// The working time between `from` and `to` in `zone`.
+    ///
+    /// It counts at most the scan horizon (one hundred years) after `from`.
     #[must_use]
     pub fn working_time(&self, from: DateTime<Utc>, to: DateTime<Utc>, zone: Tz) -> Duration {
         if to <= from || !self.has_working_time() {
@@ -236,7 +243,11 @@ impl BusinessCalendar {
         }
         let last = local_date(to, zone);
         let mut total = TimeDelta::zero();
-        for date in local_date(from, zone).iter_days().take_while(|d| *d <= last) {
+        for date in local_date(from, zone)
+            .iter_days()
+            .take(SCAN_DAYS)
+            .take_while(|d| *d <= last)
+        {
             for (start, end) in self.intervals(date, zone) {
                 let (start, end) = (start.max(from), end.min(to));
                 if end > start {
@@ -251,13 +262,19 @@ impl BusinessCalendar {
 
     /// The instant when `budget` of working time after `from` is used.
     ///
-    /// Returns `None` when the calendar has no working time in the scan
-    /// horizon (ten years).
+    /// A zero budget is due at the next working instant. Returns `None` when
+    /// the calendar has no working time in the scan horizon (one hundred
+    /// years).
     #[must_use]
-    pub fn deadline(&self, from: DateTime<Utc>, budget: Duration, zone: Tz) -> Option<DateTime<Utc>> {
+    pub fn deadline(
+        &self,
+        from: DateTime<Utc>,
+        budget: Duration,
+        zone: Tz,
+    ) -> Option<DateTime<Utc>> {
         let mut left = TimeDelta::from_std(budget).ok()?;
         if left.is_zero() {
-            return self.has_working_time().then_some(from);
+            return self.next_working_instant(from, zone);
         }
         for (start, end) in self.scan(from, zone) {
             let start = start.max(from);
@@ -277,18 +294,33 @@ impl BusinessCalendar {
         self.windows.iter().any(|day| !day.is_empty())
     }
 
-    /// The working intervals from the local date of `from`, day by day, up
-    /// to the scan horizon.
+    /// The working intervals from the local date of `from`, day by day. It
+    /// stops at the scan horizon, or after a long run of days with no
+    /// working time.
     fn scan(
         &self,
         from: DateTime<Utc>,
         zone: Tz,
     ) -> impl Iterator<Item = (DateTime<Utc>, DateTime<Utc>)> + '_ {
-        let days = if self.has_working_time() { SCAN_DAYS } else { 0 };
+        let days = if self.has_working_time() {
+            SCAN_DAYS
+        } else {
+            0
+        };
+        let mut idle = 0_usize;
         local_date(from, zone)
             .iter_days()
-            .take(usize::try_from(days).unwrap_or(usize::MAX))
-            .flat_map(move |date| self.intervals(date, zone))
+            .take(days)
+            .map(move |date| self.intervals(date, zone))
+            .take_while(move |intervals| {
+                idle = if intervals.is_empty() {
+                    idle.saturating_add(1)
+                } else {
+                    0
+                };
+                idle <= MAX_IDLE_DAYS
+            })
+            .flatten()
     }
 
     /// The working intervals of one local date, as UTC instants.
@@ -312,7 +344,7 @@ impl BusinessCalendar {
     }
 }
 
-fn day_index(day: Weekday) -> usize {
+const fn day_index(day: Weekday) -> usize {
     day.num_days_from_monday() as usize
 }
 
@@ -329,22 +361,28 @@ fn merge(mut windows: Vec<WorkingHours>) -> Vec<WorkingHours> {
     merged
 }
 
+/// The local date of `at` in `zone`. At the far ends of the time range it
+/// falls back to the UTC date and does not panic.
 fn local_date(at: DateTime<Utc>, zone: Tz) -> NaiveDate {
-    at.with_timezone(&zone).date_naive()
+    let offset = zone.offset_from_utc_datetime(&at.naive_utc()).fix();
+    at.naive_utc()
+        .checked_add_offset(offset)
+        .map_or_else(|| at.date_naive(), |local| local.date())
 }
 
 /// The UTC instant of `secs` after local midnight on `date`.
 ///
-/// A time in a daylight-saving gap moves forward past the gap. A time that
-/// occurs two times takes the first one.
+/// A time that occurs two times takes the first one. A time in a gap (a
+/// daylight-saving change or a skipped day) uses the offset before the gap,
+/// so it moves forward by the length of the gap.
 fn local_instant(date: NaiveDate, secs: u32, zone: Tz) -> Option<DateTime<Utc>> {
     let naive: NaiveDateTime = date
         .and_time(NaiveTime::MIN)
         .checked_add_signed(TimeDelta::try_seconds(i64::from(secs))?)?;
-    (0..=MAX_GAP_MINUTES).find_map(|minutes| {
-        let shifted = naive.checked_add_signed(TimeDelta::try_minutes(minutes)?)?;
-        zone.from_local_datetime(&shifted)
-            .earliest()
-            .map(|local| local.with_timezone(&Utc))
-    })
+    if let Some(local) = zone.from_local_datetime(&naive).earliest() {
+        return Some(local.with_timezone(&Utc));
+    }
+    let before = naive.checked_sub_signed(TimeDelta::try_days(2)?)?;
+    let offset = zone.from_local_datetime(&before).earliest()?.offset().fix();
+    Some(naive.checked_sub_offset(offset)?.and_utc())
 }

@@ -27,8 +27,9 @@ impl Obligation {
 
     /// Make an obligation called `name` on `subject`.
     ///
-    /// The budget is zero and the calendar is [`Self::DEFAULT_CALENDAR`]. The
-    /// start is the time of [`Sla::track`](super::Sla::track).
+    /// Set the budget with [`within`](Self::within): [`Sla::track`](super::Sla::track)
+    /// refuses a zero budget. The calendar is [`Self::DEFAULT_CALENDAR`]. The
+    /// start is the time of `track`.
     #[must_use]
     pub fn new(name: impl Into<String>, subject: impl Into<String>) -> Self {
         Self {
@@ -44,7 +45,7 @@ impl Obligation {
 
     /// Set the budget.
     #[must_use]
-    pub fn within(mut self, budget: BusinessDuration) -> Self {
+    pub const fn within(mut self, budget: BusinessDuration) -> Self {
         self.within = budget;
         self
     }
@@ -58,14 +59,14 @@ impl Obligation {
 
     /// Set the time zone.
     #[must_use]
-    pub fn zone(mut self, zone: Tz) -> Self {
+    pub const fn zone(mut self, zone: Tz) -> Self {
         self.zone = Some(zone);
         self
     }
 
     /// Set the time zone from a value, such as an IANA name.
     ///
-    /// A value that is not a time zone keeps the fallback zone.
+    /// If the value is not a valid time zone, the zone does not change.
     #[must_use]
     pub fn zone_from<Z: ObligationZone + ?Sized>(mut self, zone: &Z) -> Self {
         self.zone = zone.obligation_zone().or(self.zone);
@@ -74,7 +75,7 @@ impl Obligation {
 
     /// Set the start instant.
     #[must_use]
-    pub fn starting_at(mut self, at: DateTime<Utc>) -> Self {
+    pub const fn starting_at(mut self, at: DateTime<Utc>) -> Self {
         self.started_at = Some(at);
         self
     }
@@ -192,8 +193,10 @@ impl Obligation {
     }
 }
 
-/// The state of an obligation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// The state of an obligation. It serializes in `snake_case`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ObligationState {
     /// Open, and the clock runs now.
     Running,
@@ -220,7 +223,10 @@ impl ObligationState {
 }
 
 /// The status of an obligation at one instant.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// It serializes to JSON for an API. The zone is its IANA name. Durations
+/// are whole seconds.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[non_exhaustive]
 pub struct ObligationStatus {
     /// The unique key, `"<name>/<subject>"`.
@@ -228,10 +234,11 @@ pub struct ObligationStatus {
     /// The state.
     pub state: ObligationState,
     /// The time zone that the calendar hours use.
+    #[serde(serialize_with = "zone_name")]
     pub zone: Tz,
     /// The start instant.
     pub started_at: DateTime<Utc>,
-    /// The deadline. `None` when the calendar has no working time.
+    /// The deadline. `None` when there is no deadline in one hundred years.
     pub due_at: Option<DateTime<Utc>>,
     /// The met instant.
     pub met_at: Option<DateTime<Utc>>,
@@ -240,11 +247,29 @@ pub struct ObligationStatus {
     /// The next working instant while [`ObligationState::Paused`].
     pub resumes_at: Option<DateTime<Utc>>,
     /// The budget as working time.
+    #[serde(serialize_with = "whole_seconds")]
     pub budget: Duration,
     /// The working time used.
+    #[serde(serialize_with = "whole_seconds")]
     pub elapsed: Duration,
     /// The working time that is left. Zero when breached.
+    #[serde(serialize_with = "whole_seconds")]
     pub remaining: Duration,
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde `serialize_with` passes a reference"
+)]
+fn zone_name<S: serde::Serializer>(zone: &Tz, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(zone.name())
+}
+
+fn whole_seconds<S: serde::Serializer>(
+    duration: &Duration,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_u64(duration.as_secs())
 }
 
 /// A value that can give the time zone of an obligation.

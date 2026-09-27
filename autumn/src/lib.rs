@@ -646,11 +646,11 @@ pub mod shadow;
 /// `slugify` cannot answer because it never returns an empty string.
 pub mod slug;
 pub use slug::{contains_letter_or_number, slugify};
+#[cfg(feature = "redis")]
+pub(crate) mod session_redis;
 // Calendar-aware SLA obligations (issue #1826). A plain comment, not `///`:
 // the module header has intra-doc links that must resolve in the module.
 pub mod sla;
-#[cfg(feature = "redis")]
-pub(crate) mod session_redis;
 pub mod sse;
 /// Static site generation support.
 pub mod static_gen;
@@ -1798,7 +1798,7 @@ pub use autumn_macros::lifecycle;
 /// use autumn_web::obligation;
 ///
 /// #[obligation(
-///     first_response,
+///     name = first_response,
 ///     within = "2 business days",
 ///     calendar = "support",
 ///     starts = opened_at,

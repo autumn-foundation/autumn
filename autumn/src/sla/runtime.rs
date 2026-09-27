@@ -23,8 +23,9 @@ pub const CHECK_JOB: &str = "autumn_sla_check";
 /// The job that runs the breach handler of an obligation.
 pub const ESCALATE_JOB: &str = "autumn_sla_escalate";
 
-/// How long the job backend keeps the unique key of an escalation: ten years.
-const ESCALATION_KEY_TTL_MS: u64 = 315_360_000_000;
+/// If a check job runs before its deadline, it waits. It waits 5 minutes at
+/// most.
+const MAX_EARLY_CHECK: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Attempts for each SLA job before it goes to the dead letters.
 const MAX_ATTEMPTS: u32 = 5;
@@ -81,6 +82,16 @@ pub struct SlaPlugin {
     store: Arc<dyn ObligationStore>,
     handlers: BTreeMap<String, BreachHandler>,
     fallback: Option<BreachHandler>,
+}
+
+impl std::fmt::Debug for SlaPlugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlaPlugin")
+            .field("calendars", &self.calendars.keys().collect::<Vec<_>>())
+            .field("handlers", &self.handlers.keys().collect::<Vec<_>>())
+            .field("fallback", &self.fallback.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for SlaPlugin {
@@ -156,12 +167,17 @@ impl crate::plugin::Plugin for SlaPlugin {
         };
         app.state_initializer(move |state| state.insert_extension(engine))
             .jobs(vec![
-                sla_job(CHECK_JOB, check_job, &["key", "due_at"], JobUniquenessWindow::Running),
+                sla_job(
+                    CHECK_JOB,
+                    check_job,
+                    &["key", "due_at"],
+                    JobUniquenessWindow::Running,
+                ),
                 sla_job(
                     ESCALATE_JOB,
                     escalate_job,
-                    &["key"],
-                    JobUniquenessWindow::TtlMs(ESCALATION_KEY_TTL_MS),
+                    &["key", "started_at"],
+                    JobUniquenessWindow::Running,
                 ),
             ])
     }
@@ -194,7 +210,10 @@ pub struct Sla {
 impl std::fmt::Debug for Sla {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Sla")
-            .field("calendars", &self.engine.calendars.keys().collect::<Vec<_>>())
+            .field(
+                "calendars",
+                &self.engine.calendars.keys().collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -206,7 +225,9 @@ impl Sla {
     ///
     /// Returns [`SlaError::NotInstalled`] when the app has no [`SlaPlugin`].
     pub fn from_state(state: &AppState) -> Result<Self, SlaError> {
-        let engine = state.extension::<SlaEngine>().ok_or(SlaError::NotInstalled)?;
+        let engine = state
+            .extension::<SlaEngine>()
+            .ok_or(SlaError::NotInstalled)?;
         Ok(Self {
             state: state.clone(),
             engine,
@@ -243,9 +264,16 @@ impl Sla {
     ///
     /// # Errors
     ///
-    /// Returns an error for an unknown calendar, a store failure, or no job
-    /// runtime.
+    /// Returns an error for a zero budget, an unknown calendar, an
+    /// obligation with no deadline ([`SlaError::NoDeadline`]), a store
+    /// failure, or no job runtime.
     pub async fn track(&self, obligation: &Obligation) -> Result<ObligationStatus, SlaError> {
+        if obligation.budget() == super::BusinessDuration::ZERO {
+            return Err(SlaError::InvalidDuration(format!(
+                "{}: the budget is zero; set it with Obligation::within",
+                obligation.key()
+            )));
+        }
         let now = self.now();
         let calendar = self.calendar_of(obligation)?;
         let resolved = obligation
@@ -262,10 +290,11 @@ impl Sla {
             record = store.get(&key).await?.unwrap_or(record);
         }
         let status = self.status_of(&record, now)?;
-        if status.escalated_at.is_none()
-            && status.met_at.is_none()
-            && let Some(due) = status.due_at
-        {
+        let Some(due) = status.due_at else {
+            store.remove(&key).await?;
+            return Err(SlaError::NoDeadline(key));
+        };
+        if status.escalated_at.is_none() && status.state != ObligationState::Met {
             self.schedule_check(&key, due).await?;
         }
         Ok(status)
@@ -357,7 +386,7 @@ impl Sla {
         self.enqueue(CHECK_JOB, &args, Some(due_at)).await
     }
 
-    async fn enqueue<T: Serialize>(
+    async fn enqueue<T: Serialize + Sync>(
         &self,
         name: &str,
         args: &T,
@@ -367,8 +396,7 @@ impl Sla {
             .state
             .extension::<crate::job::JobClient>()
             .ok_or(SlaError::NoJobRuntime)?;
-        let payload =
-            serde_json::to_value(args).map_err(|err| SlaError::Job(err.to_string()))?;
+        let payload = serde_json::to_value(args).map_err(|err| SlaError::Job(err.to_string()))?;
         client
             .enqueue_due(name, payload, due_at)
             .await
@@ -376,20 +404,33 @@ impl Sla {
     }
 
     /// Run the breach check of `key`. `due_hint` is the deadline in the job.
-    ///
-    /// The job runs at the deadline, so the check reads the status at the
-    /// later of now and `due_hint`. A small clock skew thus cannot hide a
-    /// breach.
     async fn check(&self, key: &str, due_hint: DateTime<Utc>) -> Result<(), SlaError> {
         let store = &self.engine.store;
         let Some(record) = store.get(key).await? else {
+            tracing::warn!(
+                %key,
+                "SLA check found no tracked obligation; replicas need a shared ObligationStore"
+            );
             return Ok(());
         };
         if record.escalated_at.is_some() {
             return Ok(());
         }
-        let now = self.now();
-        let status = self.status_of(&record, now.max(due_hint))?;
+        let mut now = self.now();
+        if let Some(early) = due_hint.signed_duration_since(now).to_std().ok()
+            && !early.is_zero()
+        {
+            // The job ran before the deadline on this clock (clock skew).
+            // Wait for the deadline. Do not guess the status at a later time.
+            if early > MAX_EARLY_CHECK {
+                return Err(SlaError::Job(format!(
+                    "SLA check for {key} ran {early:?} before its deadline"
+                )));
+            }
+            tokio::time::sleep(early).await;
+            now = self.now().max(due_hint);
+        }
+        let status = self.status_of(&record, now)?;
         let due_at = match (status.state, status.due_at) {
             (ObligationState::Breached, Some(due_at)) => due_at,
             (ObligationState::Running | ObligationState::Paused, Some(due_at))
@@ -400,7 +441,7 @@ impl Sla {
             }
             _ => return Ok(()),
         };
-        if !store.claim_escalation(key, now).await? {
+        if !store.claim_escalation(key, due_at, now).await? {
             return Ok(());
         }
         let obligation = &record.obligation;
@@ -415,7 +456,15 @@ impl Sla {
             escalated_at: now,
         };
         if let Err(err) = self.enqueue(ESCALATE_JOB, &breach, None).await {
-            store.release_escalation(key).await?;
+            // Release the claim, so that the retry of this check can claim again.
+            if let Err(release) = store.release_escalation(key).await {
+                tracing::error!(
+                    %key,
+                    enqueue = %err,
+                    release = %release,
+                    "SLA escalation is claimed but not enqueued"
+                );
+            }
             return Err(err);
         }
         Ok(())
@@ -433,7 +482,9 @@ impl Sla {
 fn check_job(state: AppState, payload: Value) -> BreachFuture {
     Box::pin(async move {
         let args: CheckArgs = serde_json::from_value(payload)?;
-        Sla::from_state(&state)?.check(&args.key, args.due_at).await?;
+        Sla::from_state(&state)?
+            .check(&args.key, args.due_at)
+            .await?;
         Ok(())
     })
 }
@@ -441,13 +492,11 @@ fn check_job(state: AppState, payload: Value) -> BreachFuture {
 fn escalate_job(state: AppState, payload: Value) -> BreachFuture {
     Box::pin(async move {
         let breach: SlaBreach = serde_json::from_value(payload)?;
-        match Sla::from_state(&state)?.handler_for(&breach.obligation) {
-            Some(handler) => handler(state, breach).await,
-            None => {
-                tracing::warn!(key = %breach.key, "SLA breach has no handler");
-                Ok(())
-            }
-        }
+        let Some(handler) = Sla::from_state(&state)?.handler_for(&breach.obligation) else {
+            tracing::warn!(key = %breach.key, "SLA breach has no handler");
+            return Ok(());
+        };
+        handler(state, breach).await
     })
 }
 

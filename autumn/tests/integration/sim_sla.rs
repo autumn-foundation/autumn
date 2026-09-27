@@ -13,8 +13,8 @@ use autumn_web::prelude::*;
 use autumn_web::sim::Sim;
 use autumn_web::sim_test;
 use autumn_web::sla::{
-    BusinessCalendar, CHECK_JOB, ESCALATE_JOB, Obligation, ObligationState, Sla, SlaBreach,
-    SlaPlugin,
+    BusinessCalendar, BusinessDuration, CHECK_JOB, ESCALATE_JOB, Obligation, ObligationState, Sla,
+    SlaBreach, SlaPlugin,
 };
 use autumn_web::test::TestApp;
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Timelike, Utc, Weekday};
@@ -26,7 +26,7 @@ fn utc(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(y, m, d, h, min, 0).unwrap()
 }
 
-fn date(y: i32, m: u32, d: u32) -> NaiveDate {
+const fn date(y: i32, m: u32, d: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, d).unwrap()
 }
 
@@ -35,21 +35,27 @@ fn date(y: i32, m: u32, d: u32) -> NaiveDate {
 fn support_plugin(calendar: BusinessCalendar) -> (SlaPlugin, Fired) {
     let fired: Fired = Arc::default();
     let sink = Arc::clone(&fired);
-    let plugin = SlaPlugin::new()
-        .calendar("support", calendar)
-        .on_breach("first_response", move |state: AppState, breach: SlaBreach| {
+    let plugin = SlaPlugin::new().calendar("support", calendar).on_breach(
+        "first_response",
+        move |state: AppState, breach: SlaBreach| {
             let sink = Arc::clone(&sink);
             async move {
                 let now = state.clock().now();
                 sink.lock().unwrap().push((breach, now));
                 Ok(())
             }
-        });
+        },
+    );
     (plugin, fired)
 }
 
 fn fired_keys(fired: &Fired) -> Vec<String> {
-    fired.lock().unwrap().iter().map(|(b, _)| b.key.clone()).collect()
+    fired
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(b, _)| b.key.clone())
+        .collect()
 }
 
 // ── Handlers: declare, read and meet an obligation ───────────────────────────
@@ -66,14 +72,20 @@ async fn open_ticket(sla: Sla, Path(id): Path<u32>) -> AutumnResult<String> {
 #[get("/tickets/{id}/sla")]
 async fn ticket_sla(sla: Sla, Path(id): Path<u32>) -> AutumnResult<String> {
     let key = format!("first_response/ticket:{id}");
-    let status = sla.get(&key).await?.ok_or_else(|| AutumnError::not_found_msg("no sla"))?;
+    let status = sla
+        .get(&key)
+        .await?
+        .ok_or_else(|| AutumnError::not_found_msg("no sla"))?;
     Ok(format!("{:?} {}", status.state, status.remaining.as_secs()))
 }
 
 #[post("/tickets/{id}/respond")]
 async fn respond(sla: Sla, Path(id): Path<u32>) -> AutumnResult<String> {
     let key = format!("first_response/ticket:{id}");
-    let status = sla.meet(&key).await?.ok_or_else(|| AutumnError::not_found_msg("no sla"))?;
+    let status = sla
+        .meet(&key)
+        .await?
+        .ok_or_else(|| AutumnError::not_found_msg("no sla"))?;
     Ok(format!("{:?}", status.state))
 }
 
@@ -210,7 +222,50 @@ async fn sim_sla_status_is_readable_without_tracking(mut sim: Sim) {
 
     let unknown = ob.clone().calendar("nope");
     assert!(sla.status(&unknown).is_err());
-    assert!(sla.get(&ob.key()).await.unwrap().is_none(), "status does not track");
+    let no_budget = Obligation::new("first_response", "ticket:10").calendar("support");
+    assert!(
+        sla.track(&no_budget).await.is_err(),
+        "a zero budget is refused"
+    );
+    assert!(
+        sla.get(&ob.key()).await.unwrap().is_none(),
+        "status does not track"
+    );
+
+    job::clear_global_job_client();
+}
+
+#[sim_test]
+async fn sim_sla_zone_resolves_from_obligation_then_calendar_then_app(mut sim: Sim) {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let ny: Tz = "America/New_York".parse().unwrap();
+    let tokyo: Tz = "Asia/Tokyo".parse().unwrap();
+    let hours = "09:00-17:00".parse().unwrap();
+    let plugin = SlaPlugin::new()
+        .calendar("home", BusinessCalendar::weekdays(hours).zone(ny))
+        .calendar("plain", BusinessCalendar::weekdays(hours));
+    sim.build(TestApp::new().plugin(plugin));
+
+    let sla = Sla::from_state(sim.client().state()).unwrap();
+    let ob = |calendar: &str| {
+        Obligation::new("first_response", "ticket:1")
+            .within(BusinessDuration::hours(1))
+            .calendar(calendar)
+    };
+    // 1. The zone of the obligation wins.
+    assert_eq!(sla.status(&ob("home").zone(tokyo)).unwrap().zone, tokyo);
+    // 2. Then the home zone of the calendar.
+    assert_eq!(sla.status(&ob("home")).unwrap().zone, ny);
+    // 3. Then the app default (`[time_zone]`, UTC here).
+    assert_eq!(sla.status(&ob("plain")).unwrap().zone, Tz::UTC);
+
+    // `track` keeps the zone it found.
+    let tracked = sla.track(&ob("home")).await.unwrap();
+    assert_eq!(tracked.zone, ny);
+    let stored = sla.get(&ob("home").key()).await.unwrap().unwrap();
+    assert_eq!(stored.zone, ny);
 
     job::clear_global_job_client();
 }
@@ -219,7 +274,7 @@ async fn sim_sla_status_is_readable_without_tracking(mut sim: Sim) {
 
 /// A support ticket. The obligation is declared on the model.
 #[obligation(
-    first_response,
+    name = first_response,
     within = "1 business day",
     calendar = "support",
     starts = opened_at,
@@ -307,13 +362,11 @@ async fn sim_sla_support_desk_quarter(mut sim: Sim) {
 
     // The oracle decides which tickets must breach.
     let mut expected = BTreeMap::new();
-    let mut due_by_id = BTreeMap::new();
     let mut holiday_matters = false;
     for (ticket, reply) in tickets.values() {
         let zone: Tz = ticket.customer_zone.parse().unwrap();
         let due = oracle_due(ticket.opened_at, zone, &Q1_HOLIDAYS);
         holiday_matters |= due != oracle_due(ticket.opened_at, zone, &[]);
-        due_by_id.insert(ticket.id, due);
         if reply.is_none_or(|r| r > due) {
             expected.insert(format!("first_response/ticket:{}", ticket.id), due);
         }
@@ -327,13 +380,13 @@ async fn sim_sla_support_desk_quarter(mut sim: Sim) {
         sim.advance_to(&at).await;
         let (ticket, _) = tickets.get_mut(&id).unwrap();
         if ticket.opened_at < at {
-            // A late reply: let the check job that came due finish first.
-            if due_by_id[&id] <= at {
-                sim.run_to_idle().await;
-            }
+            // No drain first: a late reply is still a breach, even when
+            // the check job has not run yet.
             ticket.responded_at = Some(at);
         }
-        sla.track(&ticket.first_response_obligation()).await.unwrap();
+        sla.track(&ticket.first_response_obligation())
+            .await
+            .unwrap();
     }
     sim.advance_to(&utc(2020, 4, 30, 0, 0)).await;
     sim.run_to_idle().await;
@@ -352,9 +405,19 @@ async fn sim_sla_support_desk_quarter(mut sim: Sim) {
     for (breach, ran_at) in &fired {
         assert_eq!(breach.due_at, expected[&breach.key], "{}", breach.key);
         assert!(*ran_at >= breach.due_at, "{} fired early", breach.key);
+        // The sim steps from event to event (at most one day apart), so the
+        // claim happens at the first step after the deadline.
+        assert!(
+            breach.escalated_at <= breach.due_at + chrono::Duration::days(1),
+            "{} escalated late, at {}",
+            breach.key,
+            breach.escalated_at
+        );
     }
+    // About 0.25 s on a Linux debug build. The limit is loose for slow
+    // runners; it catches a real sleep, not jitter.
     assert!(
-        wall < Duration::from_secs(1),
+        wall < Duration::from_secs(5),
         "a quarter of business time took {wall:?} of wall time"
     );
 
