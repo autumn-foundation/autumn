@@ -376,6 +376,11 @@ cfg_test_mod_line_set() {
     pending && /^[[:space:]]*$/ { next }
     pending {
       if ($0 ~ /(^|[[:space:]])mod[[:space:]]+[A-Za-z_]/) {
+        # `mod name;` declares a module held in another file. There is no block
+        # here, so latching would never unlatch: at EOF the file reads as
+        # unbalanced, and anywhere else a later stray `}` silently ends the
+        # exemption somewhere arbitrary. The declaration itself exempts nothing.
+        if (index($0, "{") == 0 && $0 ~ /;/) { pending = 0; next }
         intest = 1
         for (k = pending; k < NR; k++) print k
         print NR
@@ -854,6 +859,24 @@ if [[ "$mode" != "--check-only" ]]; then
       printf '#[cfg(test)]\nmod tests {\n    #![allow(clippy::disallowed_methods)]\n    fn t() { let _ = "}}{{"; }\n}\n'; } \
       > "$tmp/realtests/autumn/src/gated.rs"
     expect_pass "$tmp/realtests" "a real cfg(test) mod is still exempt"
+
+    # `#[cfg(test)] mod tests;` declares a module that lives in another file.
+    # There is no block to track, so the scanner must not latch on it — at EOF
+    # that latch has nothing to close it and the whole file reads as unbalanced
+    # (`autumn/src/money/ledger.rs` ends this way).
+    make_fixture "$tmp/moddecl"
+    { printf '%s' "$GOOD_HEADER"
+      printf 'fn f() {}\n\n#[cfg(test)]\nmod tests;\n'; } \
+      > "$tmp/moddecl/autumn/src/gated.rs"
+    expect_pass "$tmp/moddecl" "a cfg(test) mod declaration at EOF is not unbalanced"
+
+    # And it must exempt nothing: the declaration carries no test code, so an
+    # inner suppression after it is still production code.
+    make_fixture "$tmp/moddeclexempt"
+    { printf '%s' "$GOOD_HEADER"
+      printf '#[cfg(test)]\nmod tests;\n\n#![allow(clippy::disallowed_methods)]\n'; } \
+      > "$tmp/moddeclexempt/autumn/src/gated.rs"
+    expect_fail "$tmp/moddeclexempt" "re-permits" "a cfg(test) mod declaration exempts nothing"
 
     self_test_tail "$tmp"
 

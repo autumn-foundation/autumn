@@ -818,7 +818,13 @@ minutes to `DELETE` expired rows, and Redis expires keys natively via `EX`.
 The synchronous `GET /{plural}/export.csv` admin route runs inline on the
 request thread — fine for small tables, but a 50k-row export blocks the
 worker and risks tripping a proxy idle timeout. A tracked job moves that
-work off the request thread:
+work off the request thread.
+
+`autumn_web::data::csv` is behind the non-default `csv` feature:
+
+```toml
+autumn-web = { version = "0.7", features = ["csv"] }
+```
 
 ```rust,ignore
 use autumn_web::data::csv::export_csv;

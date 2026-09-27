@@ -24,6 +24,16 @@ use autumn_web::cache::coherence::{
 
 use crate::routes;
 
+/// The env var selecting the app binary's cache-coherence dump mode.
+///
+/// Named rather than spelled out at each site because it is set in one place
+/// and must be *cleared* in every other place that spawns the app binary:
+/// `AppBuilder::run` dispatches this mode before the jobs, task, retention
+/// and replay one-shots and before the server binds a listener, so an
+/// inherited value silently wins over whatever was actually asked for
+/// (issue #2370).
+pub const DUMP_ENV: &str = "AUTUMN_DUMP_CACHE_COHERENCE";
+
 /// Options controlling `autumn cache audit`.
 pub struct CacheAuditOptions<'a> {
     /// Cargo package to build and run.

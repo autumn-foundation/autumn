@@ -563,12 +563,7 @@ pub async fn rearm_pending_now(state: &AppState, service: &Arc<BillingService>) 
             return 0;
         }
     };
-    let mut armed = 0_usize;
-    for row in rows {
-        if rearm_row(state, &row).await {
-            armed = armed.saturating_add(1);
-        }
-    }
+    let armed = rearm_rows(state, &rows).await;
     if armed > 0 {
         tracing::info!(armed, "🍂 Autumn Billing: dunning retries re-armed");
     }
@@ -576,26 +571,60 @@ pub async fn rearm_pending_now(state: &AppState, service: &Arc<BillingService>) 
     armed
 }
 
-/// Queue one open row. A `Running` row is queued for when it can be
-/// reclaimed, not reset: another instance may still own it.
-async fn rearm_row(state: &AppState, row: &DunningAttempt) -> bool {
-    let mut when = row.next_attempt_at;
-    if row.state == DunningState::Running
-        && let Some(reclaim) = reclaim_at(row)
-    {
-        when = when.max(reclaim);
-    }
-    match schedule(state, &row.invoice_id, when).await {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!(
+/// Queue every open row. Use one batched round trip when the job client's
+/// backend allows it. Otherwise, `JobClient::enqueue_many_due` falls back
+/// to sequential enqueues (see issue #2748). A `Running` row is queued for
+/// when it can be reclaimed, not reset: another instance may still own it.
+/// Returns how many rows were actually re-armed.
+async fn rearm_rows(state: &AppState, rows: &[DunningAttempt]) -> usize {
+    let Ok(client) = job_client(state) else {
+        // `rearm_pending_now` already waited for the job client via
+        // `wait_for_job_client` before calling this, so this branch means
+        // it was lost in a race after that wait. Log once for the whole
+        // batch, not once per row like the old per-row loop did — the
+        // cause is the same for every row.
+        tracing::warn!("🍂 Autumn Billing: job client unavailable; dunning rows not re-armed");
+        return 0;
+    };
+    let mut invoice_ids = Vec::with_capacity(rows.len());
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut when = row.next_attempt_at;
+        if row.state == DunningState::Running
+            && let Some(reclaim) = reclaim_at(row)
+        {
+            when = when.max(reclaim);
+        }
+        match serde_json::to_value(DunningRetryArgs {
+            invoice_id: row.invoice_id.clone(),
+        }) {
+            Ok(payload) => {
+                invoice_ids.push(row.invoice_id.as_str());
+                items.push((payload, Some(when)));
+            }
+            Err(error) => tracing::warn!(
                 invoice_id = %row.invoice_id,
                 error = %error,
                 "🍂 Autumn Billing: could not re-arm a dunning retry"
-            );
-            false
+            ),
         }
     }
+    if items.is_empty() {
+        return 0;
+    }
+    let results = client.enqueue_many_due(RETRY_JOB_NAME, items).await;
+    let mut armed = 0_usize;
+    for (invoice_id, result) in invoice_ids.into_iter().zip(results) {
+        match result {
+            Ok(()) => armed = armed.saturating_add(1),
+            Err(error) => tracing::warn!(
+                invoice_id,
+                error = %error,
+                "🍂 Autumn Billing: could not re-arm a dunning retry"
+            ),
+        }
+    }
+    armed
 }
 
 /// Delete applied ledger rows older than [`EVENT_RETENTION`].

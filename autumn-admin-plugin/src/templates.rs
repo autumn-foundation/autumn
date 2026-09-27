@@ -128,13 +128,13 @@ const ADMIN_CSS: &str = "
     }
 
     /* Cards */
-    .card {
+    .autumn-card {
         background: var(--surface);
         border-radius: var(--radius);
         box-shadow: var(--shadow);
         margin-bottom: 1.5rem;
     }
-    .card-header {
+    .autumn-card__header {
         display: flex;
         justify-content: space-between;
         align-items: center;
@@ -142,12 +142,12 @@ const ADMIN_CSS: &str = "
         border-bottom: 1px solid var(--border);
     }
     .header-actions form { display: inline; }
-    .card-title {
+    .autumn-card__title {
         font-size: 1.125rem;
         font-weight: 600;
         margin: 0;
     }
-    .card-body {
+    .autumn-card__body {
         padding: 1.5rem;
     }
 
@@ -313,15 +313,15 @@ const ADMIN_CSS: &str = "
         gap: 1rem;
         margin-bottom: 1.5rem;
     }
-    .stat-card {
+    .autumn-stat-card {
         background: var(--surface);
         border-radius: var(--radius);
         box-shadow: var(--shadow);
         padding: 1.25rem;
     }
-    .stat-label { font-size: 0.8125rem; color: var(--text-muted); font-weight: 500; }
-    .stat-value { font-size: 1.75rem; font-weight: 700; margin-top: 0.25rem; }
-    .stat-link { font-size: 0.8125rem; margin-top: 0.375rem; }
+    .autumn-stat-card__label { font-size: 0.8125rem; color: var(--text-muted); font-weight: 500; }
+    .autumn-stat-card__value { font-size: 1.75rem; font-weight: 700; margin-top: 0.25rem; }
+    .autumn-stat-card__link { font-size: 0.8125rem; margin-top: 0.375rem; }
     .jobs-counter-grid {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -790,7 +790,7 @@ pub fn jobs_counters(snapshot: &JobAdminSnapshot, prefix: &str) -> Markup {
 fn job_counter(label: &str, value: u64) -> Markup {
     html! {
         div class="jobs-counter" {
-            span class="stat-label" { (label) }
+            span class="autumn-stat-card__label" { (label) }
             strong { (value) }
         }
     }
@@ -1168,8 +1168,8 @@ pub fn model_list_page(
                         hx-get={ (prefix) "/" (model_slug) }
                         hx-trigger="input changed delay:300ms"
                         hx-include="closest form"
-                        hx-target="closest .card"
-                        hx-select=".card > *"
+                        hx-target="closest .autumn-card"
+                        hx-select=".autumn-card > *"
                         hx-push-url="true" {}
                     @for (k, v) in filters {
                         input type="hidden" name={ "filter." (k) } value=(v);
@@ -1993,6 +1993,13 @@ fn render_cell_value(record: &Value, field: &AdminField) -> Markup {
     if field.encrypted && !field.encrypted_visible {
         return html! { span title="encrypted at rest" { "••••••••" } };
     }
+    // #1771: a `#[confidential]` column holds an envelope the operator cannot
+    // open, so the admin shows a mask rather than base64 nobody can read. The
+    // lookup is by column name, which errs toward privacy: a same-named column
+    // on another table is masked too.
+    if ::autumn_web::confidential::is_confidential_column_name(field.name) {
+        return html! { span title="sealed for its owner" { "••••••••" } };
+    }
     let val = record.get(field.name);
     match val {
         None | Some(Value::Null) => html! {
@@ -2121,6 +2128,13 @@ fn render_detail_value(record: &Value, field: &AdminField) -> Markup {
     if field.encrypted && !field.encrypted_visible {
         return html! { span title="encrypted at rest" { "••••••••" } };
     }
+    // #1771: a `#[confidential]` column holds an envelope the operator cannot
+    // open, so the admin shows a mask rather than base64 nobody can read. The
+    // lookup is by column name, which errs toward privacy: a same-named column
+    // on another table is masked too.
+    if ::autumn_web::confidential::is_confidential_column_name(field.name) {
+        return html! { span title="sealed for its owner" { "••••••••" } };
+    }
     let val = record.get(field.name);
     match val {
         None | Some(Value::Null) => html! {
@@ -2158,6 +2172,19 @@ fn render_detail_value(record: &Value, field: &AdminField) -> Markup {
 /// Shows the current value as static text with no form control so the admin
 /// can see it but cannot alter it (and it is never submitted to the server).
 fn render_readonly_display(field: &AdminField, record: Option<&Value>) -> Markup {
+    // #1771: a `create_only` column reaches this instead of `render_form_widget`
+    // on EDIT, so the mask has to be here too. Redacting in the renderer rather
+    // than at the one call site keeps a future caller from reopening the hole.
+    if ::autumn_web::confidential::is_confidential_column_name(field.name) {
+        return html! {
+            p class="form-static-value" style="margin: 0; padding: 0.375rem 0; color: #555;" {
+                span title="sealed for its owner" { "••••••••" }
+            }
+            small class="form-help" style="color: #888;" {
+                "This field cannot be changed after creation."
+            }
+        };
+    }
     let value = record
         .and_then(|r| r.get(field.name))
         .map(|v| match v {
@@ -2204,6 +2231,14 @@ fn render_form_widget(
     // through to a normal editable input that captures the initial plaintext
     // (the wrapper encrypts it on insert). The flag is per-field, so an
     // unrelated same-named plaintext column stays editable.
+    // #1771: a confidential column is never editable from the admin, on create
+    // or on edit: sealing needs the owner's key, which the server never holds.
+    if ::autumn_web::confidential::is_confidential_column_name(field.name) {
+        return html! {
+            input type="text" class="form-input" value="••••••••" disabled
+                title="Sealed for its owner — the server cannot read or write it";
+        };
+    }
     if field.encrypted && is_edit {
         return html! {
             input type="text" class="form-input" value="••••••••" disabled
@@ -2776,6 +2811,68 @@ mod tests {
         );
         assert!(cell.contains("••••••••"));
         assert!(detail.contains("••••••••"));
+    }
+
+    // #1771: a confidential column is registered process-wide, so the admin can
+    // mask it by name on every surface. Registered here directly rather than
+    // through a `#[model]`, which would need a database schema this crate has no
+    // reason to carry.
+    autumn_web::reexports::inventory::submit! {
+        autumn_web::confidential::ConfidentialColumnDescriptor {
+            model: "AdminSealedNote",
+            table: "admin_sealed_notes",
+            column: "admin_sealed_body",
+            blind_index: ::core::option::Option::Some("admin_sealed_body_bidx"),
+        }
+    }
+
+    /// The envelope and the token are masked in the list, the detail view and
+    /// the editable control.
+    #[test]
+    fn confidential_columns_are_masked_across_admin_views() {
+        let record = serde_json::json!({
+            "id": 1,
+            "admin_sealed_body": "z0BAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "admin_sealed_body_bidx": "0123456789abcdef0123456789abcdef",
+        });
+        for name in ["admin_sealed_body", "admin_sealed_body_bidx"] {
+            let field = AdminField::new(name, AdminFieldKind::Text);
+            let value = record.get(name).and_then(Value::as_str).unwrap();
+            for (what, rendered) in [
+                (
+                    "list cell",
+                    render_cell_value(&record, &field).into_string(),
+                ),
+                ("detail", render_detail_value(&record, &field).into_string()),
+                (
+                    "form widget",
+                    render_form_widget(&field, Some(&record), true, &[]).into_string(),
+                ),
+            ] {
+                assert!(
+                    !rendered.contains(value),
+                    "{what} leaked `{name}`: {rendered}"
+                );
+                assert!(rendered.contains("••••••••"), "{what}: {rendered}");
+            }
+        }
+    }
+
+    /// A `create_only` column reaches `render_readonly_display` on EDIT instead
+    /// of `render_form_widget`, so the mask has to live in the renderer.
+    #[test]
+    fn a_create_only_confidential_column_is_masked_on_the_edit_form() {
+        let record = serde_json::json!({
+            "id": 1,
+            "admin_sealed_body": "z0BAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        });
+        let field = AdminField::new("admin_sealed_body", AdminFieldKind::Text);
+        let rendered = render_readonly_display(&field, Some(&record)).into_string();
+        assert!(
+            !rendered.contains("z0BAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            "the read-only display leaked the envelope: {rendered}"
+        );
+        assert!(rendered.contains("••••••••"), "{rendered}");
     }
 
     #[test]
@@ -5024,7 +5121,7 @@ mod tests {
         let html = render_layout(None);
         assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
         assert!(
-            html.contains(r#"href="/admin" class="active" aria-current="page""#),
+            html.contains(r#"href="/admin" class="autumn-active" aria-current="page""#),
             "{html}"
         );
     }
@@ -5034,7 +5131,7 @@ mod tests {
         let html = render_layout(Some(JOBS_NAV_SLUG));
         assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
         assert!(
-            html.contains(r#"href="/admin/jobs" class="active" aria-current="page""#),
+            html.contains(r#"href="/admin/jobs" class="autumn-active" aria-current="page""#),
             "{html}"
         );
     }
@@ -5044,7 +5141,7 @@ mod tests {
         let html = render_layout(Some(RUNTIME_CONFIG_NAV_SLUG));
         assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
         assert!(
-            html.contains(r#"href="/admin/config" class="active" aria-current="page""#),
+            html.contains(r#"href="/admin/config" class="autumn-active" aria-current="page""#),
             "{html}"
         );
     }
@@ -5056,7 +5153,7 @@ mod tests {
         // registry is empty (no model nav items).
         let html = render_layout(Some(JOBS_NAV_SLUG));
         assert!(
-            !html.contains(r#"href="/admin" class="active""#),
+            !html.contains(r#"href="/admin" class="autumn-active""#),
             "dashboard must not be active: {html}"
         );
     }

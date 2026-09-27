@@ -54,6 +54,42 @@ changes — see CLAUDE.md "CI test sharding" for the two cases that do matter
 (renaming a `compile_fail.rs` test function, and what branch protection should
 require).
 
+## Changelog notes
+
+A release note does **not** go into `CHANGELOG.md`. It goes into its own file:
+
+```
+changelog.d/<slug>.md
+```
+
+Every PR used to write its note to the top of the `## [Unreleased]` section.
+That is the same few lines every other open PR writes to, so every PR
+conflicted with every other PR, and the conflict was never about the code. A
+fragment is a file of its own, which two PRs never both edit.
+
+A fragment holds the markdown the section holds — a `### <Kind>` heading and
+its bullets:
+
+```markdown
+### Added
+
+- **money:** typed `Money<C>` and an enforced double-entry ledger
+  (issue #1837). `Money<Usd>` plus `Money<Eur>` does not compile.
+```
+
+Write one for a change a user of the framework can see. Skip it for an
+internal refactor that changes nothing on the outside.
+
+A breaking entry keeps the `**Breaking:**` marker and links its migration
+guide, `docs/migrations/next.md`. The migration-guide gate reads the fragments
+together with the changelog, so a break without a guide fails the PR that makes
+it, not the release that ships it.
+
+`./scripts/check-changelog-fragments.sh` gates the shape, and fails a PR that
+edits `CHANGELOG.md`. `./scripts/update-changelog.sh` folds the fragments into
+the changelog when a release is cut. See
+[`changelog.d/README.md`](changelog.d/README.md).
+
 ## Generator conformance gate
 
 Autumn's headline DX promise is that `autumn new` and `autumn generate` emit

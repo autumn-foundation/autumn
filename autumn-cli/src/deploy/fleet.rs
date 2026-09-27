@@ -381,6 +381,20 @@ pub(crate) enum HostOutcome {
     /// Fleet compensation removed this host's just-completed FIRST deploy, so it is
     /// back to nothing-installed (see [`RollbackAction::Teardown`]).
     CompensatedTeardown,
+    /// Fleet compensation removed this host's app, but the LAST step — removing the
+    /// proxy route (issue #2270) — failed. Every earlier step ran, so the app is
+    /// gone; only the route is stuck, and the public port may still answer 502.
+    /// This is its OWN outcome, not [`Self::CompensationFailed`]: that variant means
+    /// "still on the new release, roll it back", which is both untrue here (the app
+    /// is gone) and impossible (a first deploy has no previous release).
+    CompensatedTeardownRouteFailed {
+        /// Label of the step that failed — `"proxy-deregister"` for an ordinary
+        /// remote failure, or `"ssh-transport"` when the local `ssh` launch
+        /// itself died. Either way this outcome only happens when the route
+        /// removal (this driver's own, separate call) is the ONE thing that
+        /// failed, so the label always names that attempt, never an earlier one.
+        failed_step: &'static str,
+    },
     /// Fleet compensation was attempted on this host and FAILED — it is still on
     /// the new release. Never swallowed: the failing step is named.
     CompensationFailed {
@@ -405,6 +419,10 @@ impl HostOutcome {
     /// `still_on_new` list and the schema notes must never disagree about it. A
     /// `CompensationFailed` host belongs here precisely BECAUSE the compensation
     /// failed: it is still forward.
+    ///
+    /// [`Self::CompensatedTeardownRouteFailed`] is deliberately ABSENT: its app is
+    /// gone, so it is not forward, even though its own compensation also failed at
+    /// a step.
     pub(crate) const fn on_new_release(&self) -> bool {
         matches!(
             self,
@@ -430,7 +448,8 @@ impl HostOutcome {
             Self::RolledBack { .. }
             | Self::TornDown { .. }
             | Self::CompensatedRollback
-            | Self::CompensatedTeardown => true,
+            | Self::CompensatedTeardown
+            | Self::CompensatedTeardownRouteFailed { .. } => true,
             Self::Untouched
             | Self::Serving
             | Self::Degraded { .. }
@@ -539,15 +558,10 @@ pub(crate) enum RollbackAction {
     /// to roll back TO: the honest compensation is to return the host to
     /// nothing-installed, which is also the state that makes the next `deploy up`
     /// correctly take the First path again. A half-installed host an external load
-    /// balancer may already be probing is worse than a clean absence.
-    ///
-    /// **Known gap (documented, not fixed here):** [`ProxyController`] exposes no
-    /// deregister op, so the host's kamal-proxy still holds a route for the service
-    /// pointing at the (now stopped) slot port — that host's public port answers
-    /// 502 instead of connection-refused until it is deployed again. Removing the
-    /// route needs a new `ProxyController` method and its own exact-vector tests;
-    /// it is tracked as follow-up work, and the state table names the host so the
-    /// operator is never surprised by it.
+    /// balancer may already be probing is worse than a clean absence. This also
+    /// removes the proxy's route to the (now stopped) slot (issue #2270). The
+    /// host's public port then refuses connections instead of answering 502
+    /// until it is deployed again.
     Teardown(usize),
     /// Do NOT touch this host automatically; report it and the reason.
     Manual(usize, &'static str),
@@ -598,6 +612,7 @@ pub(crate) fn fleet_rollback_set(
             | HostOutcome::TornDown { .. }
             | HostOutcome::CompensatedRollback
             | HostOutcome::CompensatedTeardown
+            | HostOutcome::CompensatedTeardownRouteFailed { .. }
             | HostOutcome::CompensationFailed { .. }
             | HostOutcome::Manual { .. } => None,
         })
@@ -960,10 +975,15 @@ pub(crate) fn fleet_summary_lines(
                 "previous release restored (rolled back by the fleet)".to_owned()
             }
             HostOutcome::CompensatedTeardown => {
-                "NOTHING serving (the fleet removed this host's new first deploy; its proxy \
-                 still holds the route until the next deploy)"
+                "NOTHING serving (the fleet removed this host's new first deploy and its proxy \
+                 route)"
                     .to_owned()
             }
+            HostOutcome::CompensatedTeardownRouteFailed { failed_step } => format!(
+                "NOTHING serving (the fleet removed this host's new first deploy, but \
+                 `{failed_step}` failed \u{2014} its public port may still answer 502; \
+                 remove the route by hand or redeploy this host)"
+            ),
             HostOutcome::CompensationFailed { failed_step } => format!(
                 "serving {release_id} \u{2014} the compensating rollback FAILED at \
                  `{failed_step}`"
@@ -972,7 +992,9 @@ pub(crate) fn fleet_summary_lines(
         let marker = match outcome {
             HostOutcome::Serving => "\u{2705}",
             HostOutcome::Untouched => "\u{2013}",
-            HostOutcome::Degraded { .. } => "\u{26A0}\u{FE0F} ",
+            HostOutcome::Degraded { .. } | HostOutcome::CompensatedTeardownRouteFailed { .. } => {
+                "\u{26A0}\u{FE0F} "
+            }
             HostOutcome::CompensatedRollback | HostOutcome::CompensatedTeardown => {
                 "\u{21A9}\u{FE0F} "
             }
@@ -1019,10 +1041,14 @@ pub(crate) fn fleet_summary_lines(
         // Only hosts the fleet actually PUT BACK count as compensated: a
         // `CompensationFailed` host is still on the new release (it is in `on_new`
         // above), so on its own it restored no binaries and the note would be false.
+        // `CompensatedTeardownRouteFailed` DOES count: its app came back too — only
+        // its proxy route stayed stuck.
         let compensated = outcomes.iter().any(|outcome| {
             matches!(
                 outcome,
-                HostOutcome::CompensatedRollback | HostOutcome::CompensatedTeardown
+                HostOutcome::CompensatedRollback
+                    | HostOutcome::CompensatedTeardown
+                    | HostOutcome::CompensatedTeardownRouteFailed { .. }
             )
         });
         if compensated {
@@ -3101,8 +3127,8 @@ mod tests {
             "a degraded host must name the housekeeping step that failed:\n{rendered}"
         );
         assert!(
-            rendered.contains("NOTHING serving") && rendered.contains("still holds the route"),
-            "a torn-down first deploy must state the proxy-route residue:\n{rendered}"
+            rendered.contains("NOTHING serving") && rendered.contains("and its proxy route"),
+            "a torn-down first deploy must state its proxy route was removed too:\n{rendered}"
         );
         assert!(
             rendered.contains("mid-transaction") && rendered.contains("NOT rolled back"),
@@ -3112,6 +3138,53 @@ mod tests {
             rendered.contains(FLEET_SCHEMA_NOT_ROLLED_BACK_NOTE),
             "a compensated fleet whose migration ran must state that the schema did NOT \
              come back with the binaries:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_failed_deregister_reads_as_torn_down_never_as_still_serving() {
+        // Issue #2270: `CompensatedTeardownRouteFailed` means the app is gone and
+        // only the proxy route removal failed. It must NEVER be told to `rollback`
+        // (a first deploy has none to roll back to), and it must still count as a
+        // compensated host for the binaries-vs-schema note (its binaries DID come
+        // back — only the route lagged).
+        let outcome = HostOutcome::CompensatedTeardownRouteFailed {
+            failed_step: "proxy-deregister",
+        };
+        assert!(
+            !outcome.on_new_release(),
+            "the app is gone, so this is not forward"
+        );
+        assert!(outcome.went_back(), "the app came back off the new release");
+
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let plan = plan_fleet(&fleet, &[HostMode::First, HostMode::Redeploy])
+            .expect("a well-formed fleet plans");
+        let rendered = fleet_summary_lines(
+            &plan,
+            &[
+                outcome,
+                HostOutcome::RolledBack {
+                    failed_step: "readiness-gate",
+                },
+            ],
+            "20260714T120000Z",
+        )
+        .join("\n");
+
+        assert!(
+            rendered.contains("NOTHING serving") && rendered.contains("proxy-deregister"),
+            "must name the failed step, not swallow it:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(FLEET_RECOVERY_HINT),
+            "must never suggest `rollback` — a first deploy has no previous \
+             release to roll back to:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(FLEET_SCHEMA_NOT_ROLLED_BACK_NOTE),
+            "the binaries DID come back on this host, so it counts as compensated \
+             for the schema note:\n{rendered}"
         );
     }
 

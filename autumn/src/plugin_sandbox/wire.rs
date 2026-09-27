@@ -62,6 +62,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
 use super::manifest::{SandboxCapability, WIRE_VERSION};
+use crate::security::path::{dot_segment_len, percent_escapes};
 
 /// Request headers that may reach a sandboxed plugin.
 ///
@@ -155,8 +156,8 @@ pub const ALLOWED_RESPONSE_HEADERS: &[&str] = &[
 ///
 /// Two of the refusals below exist because the client normalises the target
 /// before following it, and a check that reads the bytes as sent is answering a
-/// different question than the one that matters: percent-encoded double-dot
-/// segments (`%2e%2e`) and ASCII tabs or newlines, which the client removes
+/// different question than the one that matters: dot segments in any spelling
+/// (`%2e`, `%2e%2e`) and ASCII tabs or newlines, which the client removes
 /// outright.
 fn redirect_target_allowed(
     target: &str,
@@ -205,8 +206,20 @@ fn redirect_target_allowed(
     }
     // No segment may climb out of the prefix. The query and fragment are not
     // path, so stop before them.
+    //
+    // A single-dot segment climbs nothing, but the client removes it:
+    // `/hello/%2e/transfer` arrives as `/hello/transfer`, a route the plugin
+    // does not own (#2463). So every dot segment is refused, in the spellings
+    // `dot_segment_len` knows. An encoded `/` or `\` is refused too: a proxy
+    // that decodes it gives `%2e%2e%2f` a climb.
     let path = rest.split(['?', '#']).next().unwrap_or_default();
-    if path.split('/').any(is_double_dot_segment) {
+    if path
+        .split('/')
+        .any(|segment| dot_segment_len(segment).is_some())
+    {
+        return false;
+    }
+    if percent_escapes(path).any(|(byte, _)| matches!(byte, b'/' | b'\\')) {
         return false;
     }
     // And the target must be a route this plugin actually serves, for every
@@ -312,29 +325,6 @@ fn redirect_lands_on_the_plugin(
         300..=399 => owned.owns(requested, path) && owned.owns("GET", path),
         _ => true,
     }
-}
-
-/// Is this path segment a "double-dot segment" — one that climbs a level?
-///
-/// Comparing against `".."` alone is not enough, and the difference is a real
-/// bypass rather than a nicety: a client normalises the URL *before* it
-/// follows the redirect, and the URL Standard defines a double-dot segment as
-/// `..`, `.%2e`, `%2e.` or `%2e%2e`, ASCII case-insensitively. So
-/// `/hello/%2e%2e/admin` is not literally `..` anywhere, and a browser still
-/// resolves it to `/admin`.
-///
-/// One level of decoding is the right amount: a client decodes percent-escapes
-/// once during normalisation, so `%252e%252e` becomes the literal text
-/// `%2e%2e` and stays a segment name rather than climbing.
-fn is_double_dot_segment(segment: &str) -> bool {
-    // Compared against the borrowed segment. Lower-casing it first copied a
-    // string the guest chose the length of — a `Location` with no `/` after the
-    // prefix is one segment holding the whole value — to answer a question four
-    // fixed spellings can answer in place, while `run` still holds the parsed
-    // response and its clone.
-    ["..", ".%2e", "%2e.", "%2e%2e"]
-        .iter()
-        .any(|spelling| spelling.eq_ignore_ascii_case(segment))
 }
 
 /// Content types a sandboxed plugin's response may declare.
@@ -1314,6 +1304,49 @@ mod tests {
             "/hello",
             &any_route_under_hello(),
             "GET",
+            307,
+        ));
+    }
+
+    #[test]
+    fn a_redirect_may_not_name_a_segment_the_client_removes() {
+        // #2463. The client removes a single-dot segment in all its spellings,
+        // so `/hello/%2e/transfer` arrives as `/hello/transfer`. The plugin
+        // owns the literal here, so only the segment check can refuse it.
+        for (target, arrives_as) in [
+            ("/hello/./transfer", "/hello/transfer"),
+            ("/hello/%2e/transfer", "/hello/transfer"),
+            ("/hello/%2E/transfer", "/hello/transfer"),
+            ("/hello/transfer/.", "/hello/transfer/"),
+            ("/hello/transfer/%2e", "/hello/transfer/"),
+            // A proxy that decodes `%2f` or `%5c` gives each of these a climb.
+            ("/hello/%2e%2e%2ftransfer", "/transfer"),
+            ("/hello/a%2F..%2Ftransfer", "/hello/transfer"),
+            ("/hello/%2e%2e%5ctransfer", "/transfer"),
+        ] {
+            let owned = OwnedRoutes::from_routes([("POST", target)]);
+            assert!(
+                !redirect_target_allowed(target, "/hello", &owned, "POST", 307),
+                "{target} was accepted, and can arrive as {arrives_as}",
+            );
+        }
+
+        // The same route without the segment stays the plugin's to name.
+        let owned = OwnedRoutes::from_routes([("POST", "/hello/transfer")]);
+        assert!(redirect_target_allowed(
+            "/hello/transfer",
+            "/hello",
+            &owned,
+            "POST",
+            307,
+        ));
+        // One level of decoding only: `%252e` arrives as the text `%2e`.
+        let owned = OwnedRoutes::from_routes([("POST", "/hello/%252e")]);
+        assert!(redirect_target_allowed(
+            "/hello/%252e",
+            "/hello",
+            &owned,
+            "POST",
             307,
         ));
     }

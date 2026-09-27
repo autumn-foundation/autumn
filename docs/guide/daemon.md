@@ -185,7 +185,16 @@ doesn't need persistence.
 
 For apps that use `#[model]` / `#[repository]`, `autumn new --bundled-pg`
 scaffolds a daemon that provisions and supervises a **local Postgres** in the
-app's data dir. It wires a `ManagedPostgresPoolProvider` through the existing
+app's data dir. It is behind the non-default `managed-pg` feature; the
+scaffold writes `managed-pg-bundled` (which implies it, plus a vendored
+Postgres) into the generated `Cargo.toml` for you. Wiring the provider into an
+existing app means adding it yourself:
+
+```toml
+autumn-web = { version = "0.7", features = ["managed-pg"] }
+```
+
+It wires a `ManagedPostgresPoolProvider` through the existing
 [pluggable pool provider](./custom-subsystems.md) — there are no changes to the
 query path — and ties the cluster's lifecycle to the daemon via an
 `on_shutdown` hook:

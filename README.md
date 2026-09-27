@@ -235,17 +235,22 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 | [`examples/saas`](examples/saas) | Multi-tenant SaaS starter: session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype (see the [starters guide](docs/guide/starters.md)) |
 | [`examples/teams`](examples/teams) | Organization membership, roles, and email invitations: multi-org `Membership`, a `require_role` guard, `#[mailer]` invite emails, idempotent accept, and role-gated member management |
 | [`examples/media-room`](examples/media-room) | Live-media plugin: installs `autumn-media-plugin` with the rooms primitive and creates/lists mesh-call rooms through the mounted `RoomService` (see the [media guide](docs/guide/media.md)) |
+| [`examples/collab-notes`](examples/collab-notes) | Conflict-free collaborative editing: a `#[collaborative]` text field backed by an in-tree CRDT, live merge and presence over `#[ws]` + channels, and a thin browser replica — no external real-time service (see the [collaboration guide](docs/guide/collaboration.md)) |
 | [`examples/invoice`](examples/invoice) | Renders one Maud view as both an on-screen detail page and a downloadable PDF via `autumn_web::pdf::Pdf` (see the [PDF downloads guide](docs/guide/pdf-downloads.md)) |
 | [`examples/react-graphql`](examples/react-graphql) | TypeScript React SPA on an Autumn backend, talking GraphQL through a generic `GraphqlPlugin`: resolvers built on a `#[model]` + `#[repository]` with `#[normalize]`, `#[validate]` and `MutationHooks`, generated REST CRUD over the same rows, `Plugin` + `nest` + `declare_plugin_routes`, `PluginContract`, and a committed Vite bundle served under the default CSP |
 
 ## Documentation
 
+- [**Guide index — every guide page, grouped by task**](docs/guide/index.md) — the
+  full table of contents for `docs/guide/`; the list below is a selection of
+  highlights, not the whole guide
 - [**What's new in 0.7.0**](docs/releases/0.7.0.md) — a walkthrough of the release: host-preparing deploys and fleets, deterministic simulation testing, the new model attributes, failure-capsule replay, and a request path that allocates ~59% less
 - [Getting Started Guide](docs/guide/getting-started.md)
 - [Authentication](docs/guide/authentication.md) — sessions, password policy, login/logout, `#[secured]`, lockout, and remember-me; the hub that links OAuth, step-up, and MFA
 - [Dev-Loop Latency Budget](docs/guide/dev-loop-latency.md) — p50/p95/max budgets per change class, measurement methodology, and CI gates for `autumn dev`
 - [Cache Coherence](docs/guide/cache-coherence.md) — `autumn cache audit`: the build fails when a `#[repository]` write can leave a `#[cached]` read stale with no invalidation covering it, turning cache invalidation from a runtime footgun into a compile-time obligation
 - [Data Classification](docs/guide/data-classification.md) — `#[classified]`: a personal-data column is carried as a taint on the *type*, so returning it from a JSON response without passing a declared declassification boundary is a compile error, and `autumn data-flow` emits the diffable manifest of which sinks each classified field can reach
+- [Confidential Fields](docs/guide/confidential-fields.md) — `#[confidential]`: a column sealed client side under a key the server never receives, so the database, backups, logs, replay capsules and the admin UI carry only ciphertext; equality still works through a client-computed blind index, and anything that would make the operator read, compare or group the value fails the build
 - [Compile-Time Query Budgets](docs/guide/query-budgets.md) — `#[query_budget(N)]`: the build fails when a handler's reachable paths can exceed its declared query count, catching N+1 regressions on every branch instead of only the ones a test exercises
 - [The Agent Authority Envelope](docs/guide/agent-authority.md) — `#[agent_operable(grant = ...)]`: an agent-callable handler's blast radius becomes a compile-time constant, so a write, outbound host, webhook, job or cross-tenant query the declared grant does not allow fails the build, `autumn agents manifest --check` keeps the diffable record (including MCP tools nothing governs), and every `tools/call` is audited against what the compiler proved
 - [The Architecture Graph](docs/guide/architecture-graph.md) — `autumn graph impact Post`: the framework derives a typed graph of the application from the macros that declare it (routes, models, repositories, jobs, plus each route's auth requirement and the tables it touches) and embeds it in the binary, so impact analysis is a query rather than a full-codebase read, `/actuator/graph` answers from the running process, and `autumn graph show --check` fails the build when a declared element or an edge quietly disappears
@@ -253,6 +258,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Signed Webhook Intake](docs/guide/signed-webhooks.md) — webhooks arriving **in**: verifying a sender's signature, replay protection, and the intake route
 - [Outbound Signed Webhooks](docs/guide/outbound-webhooks.md) — sending outbound webhooks **out** to endpoints your own users/customers register: `WebhookSubscription`, `WebhookOutboundManager::dispatch()`, the retrying `autumn_webhook_delivery` job, and dead-letter inspection and replay under `/actuator/webhooks/*`
 - [Billing](docs/guide/billing.md) — `autumn-billing`: Stripe checkout and portal, a webhook-fed local mirror, the `Entitled<Plan>` gate, and durable dunning retries
+- [Money and the Ledger](docs/guide/money.md) — typed `Money<C>`, currency-safe arithmetic and rounding, and the append-only double-entry ledger with idempotent posting that commits inside your `Db::tx`
 - [Platform Support](docs/guide/platform-support.md) — the Windows tier policy: which commands run natively, which need WSL2, and the `windows-latest` CI job that gates the native journey
 - [Docs Smoke Procedure](docs/guide/docs-smoke.md) - release gate for first-run docs
 - [Release Checklist](docs/release-checklist.md)
@@ -277,7 +283,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Per-User Time Zones](docs/guide/time-zones.md) — rendering timestamps in each user's own time zone: the `TimeZone` extractor resolving their IANA zone, `set_time_zone_in_session`, `local_datetime`, and pairing it with the `Clock` extractor so date/time rendering stays deterministic and test-injectable
 - [Cloud-Native Guide](docs/guide/cloud-native.md)
 - [Capacity Contracts](docs/guide/capacity-contracts.md)
-- [Logging & PII](docs/guide/logging-pii.md)
+- [Logging: levels, format & PII](docs/guide/logging-pii.md)
 - [Failure Capsules](docs/guide/failure-capsules.md) — `[failure_capture]` records a failing request, its database traffic and its clock reads as one replayable file; `autumn replay` re-runs it offline
 - [Edge Capsules](docs/guide/edge.md) — `#[edge]` compiles read-path routes into a portable `wasm32-wasip1` artifact a CDN can run, byte-identical to the origin and falling back to it for anything the edge cannot serve (experimental)
 - [Wire Contracts](docs/guide/wire-contracts.md) — `#[endpoint]` turns a typed handler into a contract, `wire_client!` generates the caller's typed client from it, and `#[contract_checked]` fails the caller's build at the call site when a request or response field the caller actually reads or sets stops matching — including the two breaks the type checker cannot see, a new required field behind `..Default::default()` and a serde-skipped field (experimental)

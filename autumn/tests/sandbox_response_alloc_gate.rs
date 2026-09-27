@@ -65,7 +65,7 @@ const fn response(headers: Vec<(String, String)>) -> SandboxResponse {
 
 #[test]
 fn deciding_a_redirect_stays_in_the_prefix_does_not_copy_the_path() {
-    // One enormous path segment, so `is_double_dot_segment` is asked about the
+    // One enormous path segment, so `dot_segment_len` is asked about the
     // whole thing at once. It is a *permitted* redirect — inside the prefix,
     // no climbing — which is the point: the value survives, so nothing about
     // the outcome reveals that answering cost a copy of it.

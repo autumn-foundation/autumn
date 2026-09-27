@@ -33,7 +33,7 @@ pub fn route_macro(
 ) -> TokenStream {
     let route_args = match parse::parse_route_attr(attr) {
         Ok(a) => a,
-        Err(err) => return err,
+        Err(err) => return emit_with_attr_parse_error(&item, &err),
     };
     let path = route_args.path.clone();
 
@@ -332,6 +332,89 @@ pub fn route_macro(
         #fn_name_alias
 
         #edge_companion
+    }
+}
+
+/// When the `#[get("/path")]`-style attribute itself fails to parse (an empty
+/// literal, a missing leading slash, a dropped string literal entirely —
+/// `#[get()]`), still emit the handler and a stub `__autumn_route_info_*`
+/// companion alongside the `compile_error!`, instead of only the
+/// `compile_error!`.
+///
+/// Without this, the handler silently disappears from the module (the early
+/// `return err` this replaces never re-emits `item`), so `routes![handler]` —
+/// the README's documented way to register every handler — can't find
+/// `handler`, and can't find its `__autumn_route_info_handler` companion
+/// either: two more "cannot find" errors on top of the real one, the second
+/// naming an internal macro symbol no user ever typed (docs/reports/
+/// echo-audit-run.md). Mirrors the same guard already in
+/// `agent_operable_macro` and `query_budget_macro` (see their "Keep the
+/// original tokens so a parse failure still emits the item" comments).
+///
+/// Two things this re-emission must not do (Codex review, PR #2798):
+///
+/// - Assume `item` parses as a bare function. A guard macro stacked *above*
+///   the malformed route attribute (`#[secured]`/`#[step_up]`/`#[throttle]`)
+///   already expanded by the time this runs, so `item` is really its gate
+///   struct/impl followed by the handler — `split_leading_items_and_fn`
+///   (the same helper the successful path uses) is what actually finds the
+///   function in that shape.
+/// - Re-emit `#[intercept(...)]` verbatim. It is a route-macro-only marker
+///   (`parse::extract_interceptors`), never registered as its own attribute
+///   macro, so left on the handler it would fail to resolve and add
+///   "cannot find attribute `intercept`" on top of the real diagnostic.
+/// - Re-emit `#[api_doc(...)]` verbatim either. It *is* a real, independently
+///   registered attribute macro (`#[proc_macro_attribute] pub fn api_doc`),
+///   but only under its full path or when the caller's module has it in
+///   scope; a caller that wrote `use autumn_web::{get, routes};` (not the
+///   prelude) never imported the bare name, so re-emitting it unqualified
+///   fails to resolve too. The successful path always consumes it via
+///   `api_doc::extract` before emitting `input_fn` — this path must match.
+/// - Emit the `__autumn_route_info_*` stub unconditionally on an
+///   `#[edge]`-marked handler. `::autumn_web::Route` (its return type) does
+///   not resolve on `wasm32` builds of the edge lane — e.g.
+///   `examples/edge-greeting`'s capsule target, which depends on
+///   `autumn-edge` but never on `autumn-web` — so the stub itself would fail
+///   to compile there, and `edge_routes![handler]` (the wasm-side sibling of
+///   `routes![handler]`) would still be missing the
+///   `__autumn_edge_route_*` companion it actually collects. Mirrors
+///   `emit_edge_items`: the native stub is gated the same
+///   `#[cfg(not(target_arch = "wasm32"))]` way, and an unconditional
+///   `__autumn_edge_route_*` stub (returning `::autumn_edge::EdgeRoute`,
+///   available on every target `#[edge]` compiles for) stands in for it.
+fn emit_with_attr_parse_error(item: &TokenStream, err: &TokenStream) -> TokenStream {
+    let Ok((leading_items, mut input_fn)) = parse::split_leading_items_and_fn(item) else {
+        return quote! { #item #err };
+    };
+    parse::extract_interceptors(&mut input_fn.attrs);
+    let _ = api_doc::extract(&mut input_fn.attrs);
+    let edge = crate::edge::detect(&input_fn);
+    let vis = &input_fn.vis;
+    let fn_name = &input_fn.sig.ident;
+    let route_info_name = format_ident!("__autumn_route_info_{fn_name}");
+    let native_cfg = edge.map(|_| quote! { #[cfg(not(target_arch = "wasm32"))] });
+    let edge_stub = edge.map(|_| {
+        let edge_route_name = format_ident!("__autumn_edge_route_{fn_name}");
+        quote! {
+            #[doc(hidden)]
+            #vis fn #edge_route_name() -> ::autumn_edge::EdgeRoute {
+                unreachable!()
+            }
+        }
+    });
+    quote! {
+        #leading_items
+        #input_fn
+
+        #native_cfg
+        #[doc(hidden)]
+        #vis fn #route_info_name() -> ::autumn_web::Route {
+            unreachable!()
+        }
+
+        #edge_stub
+
+        #err
     }
 }
 
@@ -929,6 +1012,176 @@ mod tests {
         assert_eq!(
             positional_format_string("/{{literal}}/{id}"),
             "/{{literal}}/{}"
+        );
+    }
+
+    #[test]
+    fn route_macro_attr_parse_error_still_emits_handler_and_companion() {
+        // `#[get()]` -- a dropped path literal. Regression test for the
+        // cascade in `route_attr_error_cascades_through_routes.rs`: without
+        // re-emitting `index` and a stub `__autumn_route_info_index`, this
+        // handler vanishes from the module and `routes![index]` piles on two
+        // more "cannot find" errors, the second naming an internal macro
+        // symbol (docs/reports/echo-audit-run.md).
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! {},
+            quote! {
+                async fn index() -> &'static str { "Hello!" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a bad route attribute must still be a compile error: {generated}"
+        );
+        assert!(
+            generated.contains("fn index"),
+            "the handler must survive the attribute error, or routes![index] \
+             cannot find `index`: {generated}"
+        );
+        assert!(
+            generated.contains("fn __autumn_route_info_index"),
+            "the companion must survive the attribute error, or routes![index] \
+             adds a second, confusing \"cannot find function\" error: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_attr_parse_error_strips_intercept_marker() {
+        // Codex review, PR #2798: `#[intercept(...)]` is a route-macro-only
+        // marker (`parse::extract_interceptors`), never its own registered
+        // attribute macro. Left on the re-emitted handler it fails to
+        // resolve, adding "cannot find attribute `intercept`" on top of the
+        // real diagnostic -- defeating the one-error promise this whole
+        // helper exists for.
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! {},
+            quote! {
+                #[intercept(MyLayer)]
+                async fn index() -> &'static str { "Hello!" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("intercept"),
+            "`#[intercept(...)]` must not survive onto the re-emitted handler: {generated}"
+        );
+        assert!(
+            generated.contains("fn index") && generated.contains("fn __autumn_route_info_index"),
+            "the handler and its companion must still survive: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_attr_parse_error_strips_api_doc_marker() {
+        // Codex review, PR #2798, second round: `#[api_doc(...)]` *is* a real
+        // registered attribute macro, but a caller who wrote
+        // `use autumn_web::{get, routes};` (not the prelude) never imported
+        // the bare `api_doc` name into scope, so re-emitting it unqualified
+        // fails to resolve too -- a different "cannot find attribute" on top
+        // of the real diagnostic. The successful path always consumes it via
+        // `api_doc::extract` before emitting `input_fn`; this path must too.
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! {},
+            quote! {
+                #[api_doc(summary = "Fetch a user by id")]
+                async fn index() -> &'static str { "Hello!" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("api_doc"),
+            "`#[api_doc(...)]` must not survive onto the re-emitted handler: {generated}"
+        );
+        assert!(
+            generated.contains("fn index") && generated.contains("fn __autumn_route_info_index"),
+            "the handler and its companion must still survive: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_attr_parse_error_gates_the_native_stub_on_edge_routes() {
+        // Codex review, PR #2798, third round: `::autumn_web::Route` (the
+        // route-info stub's return type) never resolves on the wasm32
+        // builds `#[edge]` compiles for (examples/edge-greeting's capsule
+        // depends on autumn-edge, never autumn-web) -- the unconditional
+        // stub would itself fail to compile there, and `edge_routes![show]`
+        // would still be missing its own `__autumn_edge_route_show`
+        // companion. Regression test, mirroring
+        // route_macro_edge_cfg_gates_native_companions above: the route-info
+        // stub gets the same wasm32 cfg gate as the successful path's native
+        // companions, and an unconditional edge-route stub stands in for
+        // `edge_routes![]`.
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! {},
+            quote! {
+                #[edge]
+                async fn show() -> &'static str { "post" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a bad route attribute on an edge route must still be a compile error: {generated}"
+        );
+        let gate = "# [cfg (not (target_arch = \"wasm32\"))]";
+        assert!(
+            generated.contains(&format!(
+                "{gate} # [doc (hidden)] fn __autumn_route_info_show"
+            )),
+            "the route-info stub must be gated off wasm32, same as the successful path: \
+             {generated}"
+        );
+        assert!(
+            generated.contains("fn __autumn_edge_route_show () -> :: autumn_edge :: EdgeRoute"),
+            "an unconditional edge-route stub must stand in for edge_routes![show]: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_attr_parse_error_survives_a_guard_expanded_above_it() {
+        // Codex review, PR #2798: `#[secured]` written above a malformed
+        // route attribute has already expanded into its gate struct/impl
+        // followed by the handler by the time route_macro runs -- `item`
+        // is that whole sequence, not a bare function. Regression test that
+        // `emit_with_attr_parse_error` uses `split_leading_items_and_fn`
+        // (the same helper the successful path relies on) rather than
+        // assuming a bare `ItemFn` and silently dropping to the "not a
+        // function" fallback, which would re-emit the gate item but never
+        // build the `__autumn_route_info_*` stub.
+        let secured = crate::secured::secured_macro(
+            quote! { "admin" },
+            quote! {
+                async fn create() -> &'static str { "ok" }
+            },
+        );
+        let generated = route_macro("POST", "post", quote! {}, secured).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a bad route attribute above an expanded guard must still be a compile error: \
+             {generated}"
+        );
+        assert!(
+            generated.contains("fn create"),
+            "the handler must survive alongside the guard's gate item: {generated}"
+        );
+        assert!(
+            generated.contains("fn __autumn_route_info_create"),
+            "the companion must still be built even though `item` carries leading items: \
+             {generated}"
         );
     }
 
