@@ -682,17 +682,27 @@ pub fn with_inherited_dependency(root: &Path, manifest: &str, crate_name: &str) 
 #[must_use]
 pub fn patched_by(root: &Path, crate_name: &str, version: &str) -> Option<String> {
     patched_by_in(root, crate_name, version, cargo_home().as_deref())
-        .or_else(|| env_source_redirect(std::env::vars()))
+        .or_else(|| env_source_redirect(std::env::vars_os()))
 }
 
 /// A `CARGO_SOURCE_CRATES_IO_*` variable: Cargo maps it to the
 /// `[source.crates-io]` config key it names (`replace-with`, `registry`, …),
 /// so it redirects crates.io as a config file would.
-fn env_source_redirect(vars: impl Iterator<Item = (String, String)>) -> Option<String> {
-    vars.filter(|(key, value)| {
-        key.starts_with("CARGO_SOURCE_CRATES_IO_") && !value.trim().is_empty()
+///
+/// It reads the environment as `OsString`s: `std::env::vars` panics on any
+/// variable that is not UTF-8, however unrelated. A value that is not UTF-8
+/// still counts as set.
+fn env_source_redirect(
+    vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Option<String> {
+    vars.filter_map(|(key, value)| {
+        let key = key.to_str()?;
+        let set = value
+            .to_str()
+            .map_or(!value.is_empty(), |value| !value.trim().is_empty());
+        (key.starts_with("CARGO_SOURCE_CRATES_IO_") && set).then(|| key.to_owned())
     })
-    .map(|(key, _)| format!("the {key} environment variable"))
+    .map(|key| format!("the {key} environment variable"))
     .next()
 }
 
@@ -2787,7 +2797,7 @@ maud = { version = "0.27", features = ["axum"] }
         let vars = |pairs: &[(&str, &str)]| {
             pairs
                 .iter()
-                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)))
                 .collect::<Vec<_>>()
                 .into_iter()
         };
@@ -2808,6 +2818,18 @@ maud = { version = "0.27", features = ["axum"] }
             env_source_redirect(vars(&[("CARGO_HOME", "/x"), ("CARGO_TARGET_DIR", "/t")])),
             None
         );
+        // A non-UTF-8 variable, unrelated or not, is read without a panic; a
+        // non-UTF-8 value still counts as set.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let junk = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+            let env = vec![
+                (junk.clone(), junk.clone()),
+                ("CARGO_SOURCE_CRATES_IO_REPLACE_WITH".into(), junk),
+            ];
+            assert!(env_source_redirect(env.into_iter()).is_some());
+        }
     }
 
     /// An alternate registry's framework is another package than crates.io's.
