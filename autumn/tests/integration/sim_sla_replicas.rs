@@ -1121,3 +1121,69 @@ async fn sim_sla_a_stale_escalation_does_not_fire_before_the_new_deadline() {
 
     job::clear_global_job_client();
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sim_sla_a_dispatched_escalation_retries_after_an_on_time_backfill() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
+    let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2020, 1, 1, 12, 0, 0).unwrap());
+    let store = RacingStore::new();
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    let app = replica(&clock, &store, &fired);
+    let ob = Obligation::new("first_response", "ticket:1")
+        .within(BusinessDuration::hours(2))
+        .calendar("support")
+        .starting_at(start)
+        .zone(chrono_tz::Tz::UTC);
+    let key = ob.key();
+    let generation = Uuid::from_u128(19);
+    let token = Uuid::from_u128(51);
+    store
+        .inner
+        .insert(ObligationRecord::new(ob, generation).with_due_at(due))
+        .await
+        .unwrap();
+    // The first attempt began the dispatch, then its handler failed. An
+    // on-time reply is backfilled before the retry.
+    assert!(
+        store
+            .inner
+            .claim_escalation(&key, generation, due, due)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .inner
+            .begin_dispatch(&key, generation, due, token)
+            .await
+            .unwrap()
+    );
+    let met = Utc.with_ymd_and_hms(2020, 1, 1, 10, 30, 0).unwrap();
+    assert!(store.inner.mark_met(&key, generation, met).await.unwrap());
+
+    // The retry has the same token and must still run the handler.
+    let retry = serde_json::json!({
+        "key": key,
+        "obligation": "first_response",
+        "subject": "ticket:1",
+        "calendar": "support",
+        "zone": "UTC",
+        "generation": generation,
+        "started_at": start,
+        "due_at": due,
+        "escalated_at": due,
+        "token": token,
+    });
+    let client = app.state().extension::<job::JobClient>().unwrap();
+    client.enqueue(ESCALATE_JOB, retry).await.unwrap();
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    settle().await;
+    assert_eq!(*fired.lock().unwrap(), ["first_response/ticket:1"]);
+
+    job::clear_global_job_client();
+}

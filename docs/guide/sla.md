@@ -194,7 +194,8 @@ deadline. At the deadline the check job reads the store:
 
 Before the handler runs, the escalate job reads the record again. If a met
 instant on or before the deadline arrived in the meantime (a late `track`), it
-releases the claim and does not run the handler.
+releases the claim and does not run the handler. After a job began the
+dispatch, a late reply does not stop the retries of that job.
 
 An obligation that is met after the deadline is still a breach. It escalates
 even when the check job runs late. Thus the result does not change with the

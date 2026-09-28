@@ -666,7 +666,10 @@ impl Sla {
         let Some(record) = store.get(&breach.key).await? else {
             return Ok(false);
         };
+        // Once an escalate job began the dispatch, a late on-time reply does
+        // not cancel it: the retries of that job must still run.
         let on_time = record.generation == breach.generation
+            && record.dispatch_token.is_none()
             && record
                 .obligation
                 .met()
