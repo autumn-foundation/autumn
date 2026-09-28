@@ -4242,19 +4242,7 @@ fn check_rust_toolchain(msrv: &str) -> CheckResult {
             let ver = String::from_utf8_lossy(&out.stdout).into_owned();
             check_rust_toolchain_impl(ver.trim(), msrv)
         }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let reason = stderr.lines().find(|line| !line.trim().is_empty());
-            CheckResult {
-                name: "rust_toolchain",
-                status: CheckStatus::Fail,
-                detail: Some(reason.map_or_else(
-                    || "`rustc --version` failed".to_owned(),
-                    |reason| format!("`rustc --version` failed: {}", reason.trim()),
-                )),
-                hint: Some("Install Rust via https://rustup.rs/"),
-            }
-        }
+        Ok(out) => rust_toolchain_failure(&String::from_utf8_lossy(&out.stderr)),
         Err(_) => CheckResult {
             name: "rust_toolchain",
             status: CheckStatus::Fail,
@@ -4262,6 +4250,38 @@ fn check_rust_toolchain(msrv: &str) -> CheckResult {
             hint: Some("Install Rust via https://rustup.rs/"),
         },
     }
+}
+
+/// The `rust_toolchain` result when `rustc --version` exits non-zero.
+///
+/// Rust can be installed while the project's pinned toolchain is not: rustup
+/// then says "toolchain '…' is not installed". That needs `rustup toolchain
+/// install`, not a fresh Rust install.
+fn rust_toolchain_failure(stderr: &str) -> CheckResult {
+    let reason = stderr.lines().map(str::trim).find(|line| !line.is_empty());
+    CheckResult {
+        name: "rust_toolchain",
+        status: CheckStatus::Fail,
+        detail: Some(reason.map_or_else(
+            || "`rustc --version` failed".to_owned(),
+            |reason| format!("`rustc --version` failed: {reason}"),
+        )),
+        hint: Some(if stderr.contains("is not installed") {
+            "Run `rustup toolchain install` in this project to install its pinned toolchain"
+        } else {
+            "Install Rust via https://rustup.rs/"
+        }),
+    }
+}
+
+/// Where doctor looks for Tailwind when `cargo metadata` gives no answer, for
+/// example because the pinned toolchain is not installed. `CARGO_TARGET_DIR`
+/// wins, as it does for cargo, so a binary `autumn setup` put there is found.
+fn fallback_target_dir(cargo_target_dir: Option<std::ffi::OsString>) -> std::path::PathBuf {
+    cargo_target_dir.filter(|dir| !dir.is_empty()).map_or_else(
+        || std::path::PathBuf::from("target"),
+        std::path::PathBuf::from,
+    )
 }
 
 fn check_port_bindable(port: u16) -> CheckResult {
@@ -4406,7 +4426,7 @@ fn check_tailwind_binary() -> CheckResult {
     // hard-exit form: one unreadable check must not abort every other check
     // `doctor` still has to report.
     let target_dir = crate::dev::try_resolve_target_directory()
-        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+        .unwrap_or_else(|| fallback_target_dir(std::env::var_os("CARGO_TARGET_DIR")));
     let path = target_dir.join("autumn").join(if cfg!(windows) {
         "tailwindcss.exe"
     } else {
@@ -17912,6 +17932,48 @@ foo = "bar"
             fn_body(dev, "pub fn try_resolve_target_directory(")
                 .contains("no_toolchain_installs(&mut"),
             "doctor's target-dir lookup must forbid a toolchain install"
+        );
+    }
+
+    #[test]
+    fn a_missing_pinned_toolchain_points_at_rustup_toolchain_install() {
+        let r = rust_toolchain_failure(
+            "error: toolchain '1.88.0-x86_64-pc-windows-msvc' is not installed\n\
+             help: run `rustup toolchain install` to install it\n",
+        );
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert_eq!(
+            r.detail.as_deref(),
+            Some(
+                "`rustc --version` failed: error: toolchain \
+                 '1.88.0-x86_64-pc-windows-msvc' is not installed"
+            )
+        );
+        assert!(r.hint.expect("a hint").contains("rustup toolchain install"));
+    }
+
+    #[test]
+    fn any_other_rustc_failure_still_points_at_installing_rust() {
+        let r = rust_toolchain_failure("");
+        assert_eq!(r.detail.as_deref(), Some("`rustc --version` failed"));
+        assert_eq!(r.hint, Some("Install Rust via https://rustup.rs/"));
+    }
+
+    #[test]
+    fn the_tailwind_fallback_honours_cargo_target_dir() {
+        // `cargo metadata` gives no answer when the pinned toolchain is missing.
+        // `autumn setup` put Tailwind under `CARGO_TARGET_DIR`, so look there.
+        assert_eq!(
+            fallback_target_dir(Some("/shared/target".into())),
+            std::path::PathBuf::from("/shared/target")
+        );
+        assert_eq!(
+            fallback_target_dir(None),
+            std::path::PathBuf::from("target")
+        );
+        assert_eq!(
+            fallback_target_dir(Some("".into())),
+            std::path::PathBuf::from("target")
         );
     }
 

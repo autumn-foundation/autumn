@@ -6,4 +6,6 @@
   toolchain, the concurrent installs could leave it half-installed: the next
   `cargo` command failed with "the 'cargo.exe' binary ... is not applicable to
   the toolchain", or doctor hung. Doctor now reports the missing toolchain in
-  the `rust_toolchain` check instead.
+  the `rust_toolchain` check and suggests `rustup toolchain install`. When it
+  cannot read the target directory, the Tailwind check now looks under
+  `CARGO_TARGET_DIR` before `./target`.
