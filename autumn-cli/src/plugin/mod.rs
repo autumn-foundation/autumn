@@ -778,15 +778,6 @@ pub fn check_existing_source(
             index::sanitize(&key)
         ));
     }
-    // An alias of the crate is the same dependency under another name; a
-    // second entry would make Cargo refuse the manifest.
-    if let Some(alias) = install::aliased_dependency_key(manifest, crate_name) {
-        return Err(format!(
-            "Cargo.toml already declares `{crate_name}` as `{}` (a `package` rename). Rename \
-             the key to `{crate_name}` and drop `package`, then re-run. No files were changed.",
-            index::sanitize(&alias)
-        ));
-    }
     // A version from a path, git or other registry is not the reviewed
     // crates.io release, whatever it says.
     if install::dependency_present(manifest, crate_name)
@@ -833,6 +824,15 @@ pub fn check_listed_declaration(
         Resolved::Community(name) => name.as_str(),
     };
     let manifest = std::fs::read_to_string(install::manifest_path(root)).unwrap_or_default();
+    // An alias of the crate, in any dependency table, is the same dependency
+    // under another name; a second entry would make Cargo refuse the manifest.
+    if let Some(alias) = install::aliased_dependency_key(root, &manifest, crate_name) {
+        return Err(format!(
+            "Cargo.toml already declares `{crate_name}` as `{}` (a `package` rename). Rename \
+             the key to `{crate_name}` and drop `package`, then re-run. No files were changed.",
+            index::sanitize(&alias)
+        ));
+    }
     let manifest = install::with_inherited_dependency(root, &manifest, crate_name);
     let patched = install::patched_by(root, crate_name, version);
     match resolved {
@@ -2416,12 +2416,30 @@ mod tests {
         assert!(check(None).is_err());
     }
 
-    /// An alias of the listed crate is refused, not duplicated.
+    /// An alias of the listed crate, in any dependency table or inherited
+    /// from the workspace, is refused, not duplicated.
     #[test]
     fn an_aliased_declaration_is_refused() {
-        let manifest = "[package]\nname = \"a\"\n\n[dependencies]\n\
-                        x = { package = \"autumn_plugin_x\", version = \"=0.3.0\" }\n";
-        let err = check_existing_pin(manifest, "autumn-plugin-x", "=0.3.0").unwrap_err();
+        let x = Resolved::Community("autumn-plugin-x".to_owned());
+        for table in [
+            "dependencies",
+            "dev-dependencies",
+            "build-dependencies",
+            "target.'cfg(unix)'.dependencies",
+        ] {
+            let tmp = project_with(&format!(
+                "[package]\nname = \"a\"\n\n[{table}]\n\
+                 x = {{ package = \"autumn_plugin_x\", version = \"=0.3.0\" }}\n"
+            ));
+            let err = check_listed_declaration(tmp.path(), &x, "=0.3.0").unwrap_err();
+            assert!(err.contains("as `x`"), "{table}: {err}");
+        }
+        let inherited = project_with(
+            "[package]\nname = \"a\"\n\n[dev-dependencies]\nx = { workspace = true }\n\n\
+             [workspace]\n\n[workspace.dependencies]\n\
+             x = { package = \"autumn-plugin-x\", version = \"=0.3.0\" }\n",
+        );
+        let err = check_listed_declaration(inherited.path(), &x, "=0.3.0").unwrap_err();
         assert!(err.contains("as `x`"), "{err}");
     }
 

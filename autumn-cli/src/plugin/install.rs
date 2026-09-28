@@ -774,21 +774,41 @@ pub fn declared_dependency_key(manifest: &str, crate_name: &str) -> Option<Strin
         .cloned()
 }
 
-/// A `[dependencies]` key other than `crate_name` whose `package` names it:
-/// `alias = { package = "crate_name", … }`. Cargo refuses a second entry for
-/// the same crate under another name.
+/// A dependency key other than `crate_name` whose `package` names it
+/// (`alias = { package = "crate_name", … }`), in any dependency table:
+/// regular, dev, build or target-specific. A `{ workspace = true }` entry
+/// takes its `package` from the workspace root of `root`. Cargo refuses a
+/// second entry for the same crate under another name.
 #[must_use]
-pub fn aliased_dependency_key(manifest: &str, crate_name: &str) -> Option<String> {
+pub fn aliased_dependency_key(root: &Path, manifest: &str, crate_name: &str) -> Option<String> {
+    const KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
     let table = toml::from_str::<toml::Table>(manifest).ok()?;
+    let workspace_deps = std::fs::read_to_string(workspace_root(root).join("Cargo.toml"))
+        .ok()
+        .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+        .and_then(|table| table.get("workspace")?.get("dependencies").cloned());
+    let mut tables: Vec<&toml::Value> = KINDS.iter().filter_map(|kind| table.get(*kind)).collect();
+    if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
+        for target in targets.values() {
+            tables.extend(KINDS.iter().filter_map(|kind| target.get(*kind)));
+        }
+    }
     let want = canonical(crate_name);
-    table
-        .get("dependencies")?
-        .as_table()?
-        .iter()
+    tables
+        .into_iter()
+        .filter_map(toml::Value::as_table)
+        .flat_map(|deps| deps.iter())
         .find(|(key, entry)| {
+            let entry = if entry.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+                workspace_deps
+                    .as_ref()
+                    .and_then(|deps| deps.get(key.as_str()))
+            } else {
+                Some(*entry)
+            };
             canonical(key) != want
                 && entry
-                    .get("package")
+                    .and_then(|entry| entry.get("package"))
                     .and_then(toml::Value::as_str)
                     .is_some_and(|package| canonical(package) == want)
         })
