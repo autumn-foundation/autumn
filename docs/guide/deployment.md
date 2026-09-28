@@ -1029,6 +1029,8 @@ Each row carries: mode (`deployed` / `not deployed` / `unreachable` /
 live slot, the `/ready` status code, the maintenance flag
 (`maintenance ON` / `maintenance off` / `maintenance ?`), the proxy's bound
 port, that host's last deploy result, and any per-host drift reasons.
+A deployed host whose `/ready` is not `2xx`, or gives no answer, shows ⚠️. This
+is not drift, so `--strict` does not fail on it.
 
 > **The maintenance cell reports the flag file that host's *running* slot unit
 > polls.** It is resolved on the host from the live slot unit's
