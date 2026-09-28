@@ -521,9 +521,10 @@ fn patched_by_in(
             .ok()
             .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
     };
-    let manifest = workspace_root(root).join("Cargo.toml");
+    let workspace = workspace_root(root);
+    let manifest = workspace.join("Cargo.toml");
     if let Some(table) = read(&manifest) {
-        if let Some(source) = crates_io_patch(&table, &want, pinned.as_ref()) {
+        if let Some(source) = crates_io_patch(&table, &want, pinned.as_ref(), &workspace) {
             return Some(format!("[patch.{source}] in {}", manifest.display()));
         }
         if let Some(replace) = table.get("replace").and_then(toml::Value::as_table) {
@@ -552,8 +553,11 @@ fn patched_by_in(
         } else {
             dir.join("config.toml")
         };
+        // A config's relative paths resolve from the directory holding
+        // its `.cargo` (for `$CARGO_HOME`, its parent).
+        let base = dir.parent().unwrap_or(&dir);
         if let Some(source) =
-            read(&path).and_then(|table| crates_io_patch(&table, &want, pinned.as_ref()))
+            read(&path).and_then(|table| crates_io_patch(&table, &want, pinned.as_ref(), base))
         {
             return Some(format!("[patch.{source}] in {}", path.display()));
         }
@@ -563,11 +567,13 @@ fn patched_by_in(
 
 /// The `[patch.<source>]` key under which `table` patches the crates.io
 /// crate `want` (canonical). A `package` rename counts: `local = { package
-/// = "x", … }` patches `x`, whatever the key says.
+/// = "x", … }` patches `x`, whatever the key says. `base` is where a relative
+/// `path` resolves from.
 fn crates_io_patch(
     table: &toml::Table,
     want: &str,
     pinned: Option<&semver::Version>,
+    base: &Path,
 ) -> Option<String> {
     let patch = table.get("patch")?.as_table()?;
     patch
@@ -580,18 +586,43 @@ fn crates_io_patch(
                         .get("package")
                         .and_then(toml::Value::as_str)
                         .unwrap_or(key);
-                    // A patch whose `version` excludes the pin cannot supply it.
-                    let usable = entry
-                        .get("version")
+                    // Cargo uses a patch only when the version its source
+                    // supplies meets the pin. A local checkout says which it
+                    // is; otherwise a `version` that excludes the pin rules
+                    // it out, and anything else may supply it.
+                    let supplied = entry
+                        .get("path")
                         .and_then(toml::Value::as_str)
-                        .and_then(|req| semver::VersionReq::parse(req).ok())
-                        .zip(pinned)
-                        .is_none_or(|(req, pinned)| req.matches(pinned));
+                        .and_then(|path| package_version(&base.join(path)));
+                    let usable = match (supplied, pinned) {
+                        (Some(supplied), Some(pinned)) => semver::Comparator {
+                            op: semver::Op::Exact,
+                            major: pinned.major,
+                            minor: Some(pinned.minor),
+                            patch: Some(pinned.patch),
+                            pre: pinned.pre.clone(),
+                        }
+                        .matches(&supplied),
+                        _ => entry
+                            .get("version")
+                            .and_then(toml::Value::as_str)
+                            .and_then(|req| semver::VersionReq::parse(req).ok())
+                            .zip(pinned)
+                            .is_none_or(|(req, pinned)| req.matches(pinned)),
+                    };
                     canonical(package) == want && usable
                 })
             })
         })
         .map(|(source, _)| source.clone())
+}
+
+/// The `[package] version` of the crate at `dir`, when it is written there
+/// (not inherited from a workspace).
+fn package_version(dir: &Path) -> Option<semver::Version> {
+    let text = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+    let table = toml::from_str::<toml::Table>(&text).ok()?;
+    semver::Version::parse(table.get("package")?.get("version")?.as_str()?).ok()
 }
 
 /// Whether a `[patch.<source>]` key names crates.io: its name, its git
@@ -1263,6 +1294,39 @@ mod tests {
         assert_eq!(with(", version = \"0.2.0\""), None);
         assert!(with(", version = \"0.3.0\"").is_some());
         assert!(with("").is_some());
+    }
+
+    /// A local checkout's own version decides, not the entry's `version`
+    /// requirement: `version = "0.2.0"` admits 0.2.5, but a 0.2.0 checkout
+    /// cannot supply the `=0.2.5` pin.
+    #[test]
+    fn a_path_patch_is_judged_by_the_checkout_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app");
+        let checkout = |version: &str| {
+            write(
+                &tmp.path().join("x/Cargo.toml"),
+                &format!("[package]\nname = \"autumn-plugin-x\"\nversion = \"{version}\"\n"),
+            );
+        };
+        write(
+            &app.join("Cargo.toml"),
+            "[package]\nname = \"a\"\n\n[patch.crates-io]\n\
+             autumn-plugin-x = { path = \"../x\", version = \"0.2.0\" }\n",
+        );
+        checkout("0.2.0");
+        assert_eq!(patched_by_in(&app, "autumn-plugin-x", "=0.2.5", None), None);
+        checkout("0.2.5");
+        assert!(patched_by_in(&app, "autumn-plugin-x", "=0.2.5", None).is_some());
+        // A config's path resolves from the directory holding its `.cargo`.
+        write(&app.join("Cargo.toml"), "[package]\nname = \"a\"\n");
+        write(
+            &app.join(".cargo/config.toml"),
+            "[patch.crates-io]\nautumn-plugin-x = { path = \"../x\" }\n",
+        );
+        assert!(patched_by_in(&app, "autumn-plugin-x", "=0.2.5", None).is_some());
+        checkout("0.2.0");
+        assert_eq!(patched_by_in(&app, "autumn-plugin-x", "=0.2.5", None), None);
     }
 
     /// A `[replace]` key names one version: another version's replacement
