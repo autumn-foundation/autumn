@@ -4249,6 +4249,17 @@ mod tests {
                 "`{failed_step}` runs before `migrate`"
             );
         }
+        // The live-slot marker repair runs before `migrate` too.
+        assert_eq!(
+            single_host_schema_note(
+                &redeploy,
+                &[HostOutcome::RolledBack {
+                    failed_step: exec::LIVE_SLOT_REPAIR_LABEL
+                }]
+            ),
+            None,
+            "the marker repair runs before `migrate`"
+        );
         // The new release serves: binaries and schema match.
         for outcome in [
             HostOutcome::LiveOnNew {

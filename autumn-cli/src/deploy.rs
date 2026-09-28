@@ -9647,7 +9647,7 @@ mod tests {
             .expect("a bare host is prepared");
         let repair = labels
             .iter()
-            .position(|l| *l == "record-live-slot")
+            .position(|l| *l == exec::LIVE_SLOT_REPAIR_LABEL)
             .expect("a drifted marker is repaired");
         assert!(
             install < repair,
@@ -11619,6 +11619,40 @@ mod tests {
         assert!(
             labels.contains(&"migrate") && !labels.contains(&"proxy-flip"),
             "the deploy must migrate, then stop at the gate: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_host_marker_repair_failure_keeps_todays_error() {
+        // #2276: the live-slot marker repair runs before `migrate`. If it fails,
+        // the schema did not move, so the error gets no schema note.
+        let host = "203.0.113.10";
+        // The marker says blue (3001), but the proxy serves green (3002).
+        let drifted = "redeploy:blue\t3001\n\
+             ---autumn-kamal-proxy-list---\n\
+             Service   Host          Target            State    TLS\n\
+             myapp     example.com   127.0.0.1:3002   running  no\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 3000\n"
+            .to_owned();
+        let recorder = fleet::test_support::FleetRecorder::new()
+            .script(host, "proxy-compat-probe", compatible_deploy_help())
+            .script(host, "detect-current", drifted)
+            .script(host, "probe-release-dir", "absent")
+            .fail_on_occurrence(host, exec::LIVE_SLOT_REPAIR_LABEL, 1);
+        let fleet = fleet_of(&[host]);
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("the failed repair must fail the deploy");
+
+        let labels = recorder.run_labels_for(host);
+        assert!(
+            !labels.contains(&"migrate"),
+            "the repair runs before `migrate`: {labels:?}"
+        );
+        assert_eq!(
+            single_host_exec_message(&err),
+            pre_cutover_error(fleet::HostMode::Redeploy, exec::LIVE_SLOT_REPAIR_LABEL),
         );
     }
 
