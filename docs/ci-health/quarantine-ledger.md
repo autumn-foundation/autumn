@@ -2679,17 +2679,32 @@ measured fix, and verification; not repeated here.
   **Verification**: `python3 -c "import yaml; yaml.safe_load(...)"`
   confirms the edited `ci.yml` is still valid YAML; `actionlint` was not
   available in this sandbox. No Windows runner available locally to
-  reproduce the original failure or to pre-verify the fix — **CI-native
-  verification is pending this PR's own `Windows Tier 1 journey` run**,
+  reproduce the original failure or to pre-verify the fix, so **CI-native
+  verification was pending this PR's own `Windows Tier 1 journey` run**,
   the same posture already used for the `postgresql_embedded`
   `GITHUB_TOKEN` entry above. Revert check: not applicable in the rerun
   sense (nothing about the scaffolded app's behavior changes on the
   success path), but reverting the toolchain-pin edit would restore the
   exact on-demand-install path all four occurrences hit.
+
+  **CI-native confirmation, same day**: PR #2994's own `Windows Tier 1
+  journey` run (job 108894563658, part of workflow run 36409451738)
+  completed `success` at 2026-09-28T11:05:23Z against head `6f47775` — the
+  first run of this job to install `@1.88.0` up front. No on-demand
+  toolchain install, no `cargo.exe`/toolchain error, journey completed
+  clean end to end. Separately, a Codex review comment on #2994 caught a
+  real gap in this fix's own durability: `scripts/check-msrv.sh` only
+  checked that *some* line in `ci.yml` pinned the canonical MSRV (already
+  satisfied by the `msrv` job alone), so a future MSRV bump could update
+  `Cargo.toml` and the `msrv` job while leaving `windows-tier1` on a stale
+  pin, silently reopening this exact race. Fixed in the same PR
+  (`6f47775`): the script now checks `windows-tier1`'s own job block for
+  the canonical pin specifically, verified to fail when that pin is
+  reverted to `@stable` and to pass on the current file.
   **Status**: n=4 organic, mechanism confirmed by source + stderr, fix
-  applied, CI-native confirmation pending this PR's own Windows run. Not
-  quarantined — the job runs unchanged otherwise. Revisit once this PR's
-  own `Windows Tier 1 journey` run completes (pass confirms the fix;
-  another identical failure on this PR's own head would falsify the
-  diagnosis) or after a further ~1 week with zero repeats.
+  applied and **CI-natively confirmed** on #2994's own head (open, CI-green,
+  awaiting human review/merge as of this update). Drift-guard added to
+  `check-msrv.sh` so a future MSRV bump can't silently reopen the race.
+  Treat as closed once #2994 merges; revisit only if a fifth occurrence
+  lands on `trunk-dev` after that.
 

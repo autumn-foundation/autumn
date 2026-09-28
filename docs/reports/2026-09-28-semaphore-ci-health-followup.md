@@ -124,8 +124,18 @@ would restore the exact on-demand-install path all four occurrences hit.
 Local verification: `python3 -c "import yaml; yaml.safe_load(...)"` confirms
 the edited `ci.yml` parses; `actionlint` was not available in this sandbox.
 No Windows runner available locally to reproduce the original failure or
-pre-verify the fix — CI-native confirmation is pending this PR's own
-`Windows Tier 1 journey` run.
+pre-verify the fix.
+
+**Update, same day**: PR #2994's own `Windows Tier 1 journey` run (job
+108894563658) completed `success` at 2026-09-28T11:05:23Z against head
+`6f47775` — the first run to install `@1.88.0` up front, with no on-demand
+toolchain install and no `cargo.exe`/toolchain error. CI-native confirmation
+obtained. Separately, a Codex review comment on #2994 caught that
+`scripts/check-msrv.sh` didn't actually guard `windows-tier1`'s new pin
+against a future MSRV bump (it only checked that *some* line in `ci.yml`
+carried the canonical pin, already satisfied by the `msrv` job alone) — fixed
+in the same PR, verified to fail when the pin is reverted and pass
+otherwise.
 
 ## 🔬 Reproduce
 
