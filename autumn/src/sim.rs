@@ -297,7 +297,6 @@ impl Sim {
         let clock = SimClock::new(TickingClock::starting_at(epoch));
         let ambient_clock = Arc::new(AmbientSimClock {
             wall: std::sync::RwLock::new(Arc::new(clock.ticking())),
-            ticking: clock.ticking(),
             own_advanced: std::sync::Mutex::new(std::time::Duration::ZERO),
             auto_advanced: std::sync::Mutex::new(std::time::Duration::ZERO),
             alive: std::sync::atomic::AtomicBool::new(true),
@@ -1398,8 +1397,6 @@ impl SimClock {
 struct AmbientSimClock {
     /// The sim clock, or its chaos-skewed view once a skewed app mounts.
     wall: std::sync::RwLock<Arc<dyn crate::time::ClockSource>>,
-    /// The unskewed sim clock, read when no runtime runs.
-    ticking: TickingClock,
     /// Time this sim's own `Sim::advance` calls moved tokio's clock.
     own_advanced: std::sync::Mutex<std::time::Duration>,
     /// Time tokio's clock moved by itself while this sim was ambient.
@@ -1589,11 +1586,12 @@ impl crate::time::ClockSource for AmbientSimClock {
     }
 
     fn monotonic(&self) -> crate::time::MonotonicInstant {
-        if tokio::runtime::Handle::try_current().is_err() {
-            // No runtime, so no paused clock to follow.
-            return crate::time::ClockSource::monotonic(&self.ticking);
+        // With no runtime there is no paused clock to settle from. The total
+        // as last settled still holds the auto-advanced time, so a thread
+        // with no runtime reads the same time as the sim's.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            with_sim_stack(SimStack::settle_lazily);
         }
-        with_sim_stack(SimStack::settle_lazily);
         crate::time::MonotonicInstant::from_origin_elapsed(
             Self::read(&self.own_advanced).saturating_add(Self::read(&self.auto_advanced)),
         )
@@ -1680,6 +1678,42 @@ mod tests {
     };
     use chrono::{NaiveDate, TimeZone, Utc};
     use rand::RngCore;
+
+    #[tokio::test(start_paused = true)]
+    async fn blocking_work_reads_auto_advanced_sim_time() {
+        let sim = Sim::from_seed(11);
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        sim.advance(std::time::Duration::from_secs(2)).await;
+        let here = (
+            crate::time::ambient_monotonic(),
+            crate::time::ambient_instant(),
+            crate::time::ambient_now(),
+        );
+        assert_eq!(here.0.since_origin(), std::time::Duration::from_secs(7));
+        let there = crate::time::spawn_blocking(|| {
+            (
+                crate::time::ambient_monotonic(),
+                crate::time::ambient_instant(),
+                crate::time::ambient_now(),
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(there, here, "a blocking worker reads the caller's sim time");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_thread_with_no_runtime_reads_auto_advanced_sim_time() {
+        let sim = Sim::from_seed(12);
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let here = crate::time::ambient_monotonic();
+        assert_eq!(here.since_origin(), std::time::Duration::from_secs(5));
+        let clock: std::sync::Arc<dyn crate::time::ClockSource> = sim.ambient.clone();
+        let there = std::thread::spawn(move || clock.monotonic())
+            .join()
+            .unwrap();
+        assert_eq!(there, here);
+    }
 
     #[test]
     fn liveness_budget_is_off_unless_armed() {
