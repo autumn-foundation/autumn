@@ -475,13 +475,17 @@ fn patched_by_in(
         .map(|dir| dir.join(".cargo"))
         .chain(cargo_home.map(Path::to_path_buf));
     for dir in configs {
-        for file in ["config.toml", "config"] {
-            let path = dir.join(file);
-            if let Some(source) =
-                read(&path).and_then(|table| crates_io_patch(&table, &want, pinned.as_ref()))
-            {
-                return Some(format!("[patch.{source}] in {}", path.display()));
-            }
+        // Cargo reads the extensionless `config` when both exist.
+        let legacy = dir.join("config");
+        let path = if legacy.is_file() {
+            legacy
+        } else {
+            dir.join("config.toml")
+        };
+        if let Some(source) =
+            read(&path).and_then(|table| crates_io_patch(&table, &want, pinned.as_ref()))
+        {
+            return Some(format!("[patch.{source}] in {}", path.display()));
         }
     }
     None
@@ -1180,6 +1184,23 @@ mod tests {
             &format!("[workspace]\nmembers = [\"app\"]\n\n{patch}"),
         );
         assert!(patched_by_in(&app, "autumn-plugin-x", "0.3.0", None).is_some());
+    }
+
+    /// With both `.cargo/config` and `.cargo/config.toml`, Cargo reads the
+    /// extensionless one only.
+    #[test]
+    fn the_extensionless_cargo_config_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("Cargo.toml"), "[package]\nname = \"a\"\n");
+        let patch = "[patch.crates-io]\nautumn-plugin-x = { path = \"../x\" }\n";
+        write(&tmp.path().join(".cargo/config.toml"), patch);
+        write(&tmp.path().join(".cargo/config"), "[build]\njobs = 1\n");
+        assert_eq!(
+            patched_by_in(tmp.path(), "autumn-plugin-x", "0.3.0", None),
+            None
+        );
+        std::fs::remove_file(tmp.path().join(".cargo/config")).unwrap();
+        assert!(patched_by_in(tmp.path(), "autumn-plugin-x", "0.3.0", None).is_some());
     }
 
     /// Cargo also reads `[patch]` from `.cargo/config.toml` above the app,

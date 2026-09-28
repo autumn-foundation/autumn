@@ -816,8 +816,21 @@ pub fn check_listed_declaration(
                 ));
             }
             // A requirement that admits the release can still lock another
-            // one: Cargo builds what `Cargo.lock` says.
-            if let Some(locked) = install::locked_version(root, crate_name)
+            // one: Cargo builds what `Cargo.lock` says. With no single lock,
+            // the requirement itself must be the exact pin.
+            let locked = install::locked_version(root, crate_name);
+            if locked.is_none()
+                && let Some(declared) = install::declared_dependency_version(&manifest, crate_name)
+                && declared.trim() != install::exact_pin(version)
+            {
+                return Err(format!(
+                    "Cargo.toml declares `{crate_name} = \"{}\"` and no Cargo.lock pins it, so \
+                     Cargo may build a release the index has not reviewed. Set \
+                     `{crate_name} = \"={version}\"`, then re-run. No files were changed.",
+                    index::sanitize(&declared)
+                ));
+            }
+            if let Some(locked) = locked
                 && semver::Version::parse(&locked).ok() != semver::Version::parse(version).ok()
             {
                 return Err(format!(
@@ -879,8 +892,22 @@ fn app_version(root: &Path) -> Option<String> {
     if let Some(locked) = install::locked_version(root, "autumn-web") {
         return Some(locked);
     }
+    // Unlocked: an exact requirement is the version; any other is marked
+    // `^`/`~`, so `Listing::compat` judges the whole series it admits.
     match install::app_autumn_web(root) {
-        Ok(install::AppAutumnWeb::Version(version)) => Some(version),
+        Ok(install::AppAutumnWeb::Version(req)) => {
+            let req = req.trim();
+            Some(req.strip_prefix('=').map_or_else(
+                || {
+                    if req.starts_with(['^', '~']) {
+                        req.to_owned()
+                    } else {
+                        format!("^{req}")
+                    }
+                },
+                |exact| exact.trim().to_owned(),
+            ))
+        }
         Ok(install::AppAutumnWeb::Unversioned) | Err(_) => None,
     }
 }
@@ -2200,7 +2227,13 @@ mod tests {
             "[package]\nname = \"a\"\n\n[dependencies]\nautumn-admin-plugin = \"{}\"\n",
             series()
         ));
-        assert!(check_listed_declaration(caret.path(), &admin, RELEASE).is_ok());
+        // Unlocked, a broad requirement may resolve to an unreviewed patch.
+        let err = check_listed_declaration(caret.path(), &admin, RELEASE).unwrap_err();
+        assert!(err.contains("no Cargo.lock pins it"), "{err}");
+        let exact = project_with(&format!(
+            "[package]\nname = \"a\"\n\n[dependencies]\nautumn-admin-plugin = \"={RELEASE}\"\n"
+        ));
+        assert!(check_listed_declaration(exact.path(), &admin, RELEASE).is_ok());
         // The requirement admits the release, but the lockfile holds another.
         let lock = |v: &str| {
             format!(

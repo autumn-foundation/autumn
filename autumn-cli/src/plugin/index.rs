@@ -451,19 +451,26 @@ impl Listing {
     /// `autumn-web` requirement, e.g. `0.7.0`).
     #[must_use]
     pub fn compat(&self, app: &str) -> Compat {
-        let Some(app) = concrete(app) else {
+        let Some(low) = concrete(app) else {
             return Compat::Unknown;
         };
         // A flag wins over the declared range: the range is a claim, the
         // failed run is evidence.
-        if self.flag_applies(&app.to_string()) {
+        if self.flag_applies(&low.to_string()) {
             return Compat::Incompatible;
         }
-        match semver::VersionReq::parse(&self.autumn_web) {
-            Ok(req) if req.matches(&app) => Compat::Compatible,
-            Ok(_) => Compat::Incompatible,
-            Err(_) => Compat::Unknown,
+        let Ok(req) = semver::VersionReq::parse(&self.autumn_web) else {
+            return Compat::Unknown;
+        };
+        if !req.matches(&low) {
+            return Compat::Incompatible;
         }
+        // An unresolved requirement (`^0.7.0`) may resolve to any release of
+        // its series: compatible only when the range admits all of it.
+        if app.trim_start().starts_with(['^', '~']) && !req.matches(&series_top(&low)) {
+            return Compat::Unknown;
+        }
+        Compat::Compatible
     }
 
     /// Whether a failed re-verification applies to an app on `app`: the
@@ -834,6 +841,15 @@ pub fn staleness(index: &PluginIndex, against: &str) -> Vec<Finding> {
 fn concrete(version: &str) -> Option<semver::Version> {
     super::install::parse_version(version)
         .map(|(major, minor, patch)| semver::Version::new(major, minor, patch))
+}
+
+/// The highest version in `v`'s compatibility series.
+const fn series_top(v: &semver::Version) -> semver::Version {
+    if v.major == 0 {
+        semver::Version::new(0, v.minor, u64::MAX)
+    } else {
+        semver::Version::new(v.major, u64::MAX, u64::MAX)
+    }
 }
 
 /// Whether two versions share a compatibility series: `MAJOR.MINOR` below
@@ -1505,6 +1521,19 @@ mod tests {
         assert!(listing.flag_applies("1.1.0"));
         assert!(listing.flag_applies("2.0.0"));
         assert!(!listing.flag_applies("0.9.0"));
+    }
+
+    /// An unresolved app requirement is compatible only when the range
+    /// admits its whole series; a lower series is still incompatible.
+    #[test]
+    fn an_unresolved_app_requirement_needs_the_whole_series() {
+        let mut exact = community();
+        exact.autumn_web = "=0.7.0".to_owned();
+        assert_eq!(exact.compat("0.7.0"), Compat::Compatible);
+        assert_eq!(exact.compat("^0.7.0"), Compat::Unknown);
+        let caret = community();
+        assert_eq!(caret.compat("^0.7.0"), Compat::Compatible);
+        assert_eq!(caret.compat("^0.6.0"), Compat::Incompatible);
     }
 
     #[test]
