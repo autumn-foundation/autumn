@@ -230,6 +230,12 @@ impl CapabilityRateLimiter {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let full = u64::from(self.per_second).saturating_mul(SCALE);
         let now = crate::time::ambient_instant();
+        // A `last` after `now` is from another timeline: the limiter was
+        // shared across a `Sim` boundary. Restart the refill clock at `now`,
+        // or the bucket never refills on this timeline (issue #2967).
+        if bucket.last > now {
+            bucket.last = now;
+        }
         let micros = u64::try_from(now.saturating_duration_since(bucket.last).as_micros())
             .unwrap_or(u64::MAX);
         // `as_micros` rather than `as_secs_f64`: the refill has to be monotone
@@ -259,5 +265,38 @@ impl CapabilityRateLimiter {
         }
         bucket.tokens = bucket.tokens.saturating_sub(SCALE);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use chrono::{TimeZone, Utc};
+
+    use super::{CapabilityRateLimiter, SandboxCapability};
+    use crate::time::{TickingClock, install_ambient};
+
+    #[test]
+    fn a_bucket_from_a_later_timeline_refills_on_this_one() {
+        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let capability = SandboxCapability::ALL[0];
+
+        // The limiter is built and drained an hour into one timeline.
+        let first = TickingClock::starting_at(epoch);
+        first.advance(Duration::from_secs(3600));
+        let guard = install_ambient(Arc::new(first));
+        let limiter = CapabilityRateLimiter::new(1);
+        assert!(limiter.try_take(capability));
+        assert!(!limiter.try_take(capability), "drained");
+        drop(guard);
+
+        // A new timeline starts at zero. One second there refills a token.
+        let second = TickingClock::starting_at(epoch);
+        let _guard = install_ambient(Arc::new(second.clone()));
+        assert!(!limiter.try_take(capability), "no time has passed yet");
+        second.advance(Duration::from_secs(1));
+        assert!(limiter.try_take(capability), "one second refills one token");
     }
 }
