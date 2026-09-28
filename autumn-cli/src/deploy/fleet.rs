@@ -491,10 +491,36 @@ pub(crate) enum PostBoundaryClass {
 ///   is invisible today and fails the NEXT deploy closed
 ///   (`refuse_unprovable_proxy_options`), which is exactly why it must be surfaced
 ///   rather than swallowed.
-/// - `drain-old` — disables the now-idle old slot unit. Two slots running is
-///   untidy, not an outage.
+/// - `drain-old` — disables the now-idle old slot unit. The driver retries a
+///   failed drain one time. It continues only when it proves that the old slot
+///   stopped (see [`drain_old_outcome`], issue #2279).
 /// - `prune` — removes old release dirs. Disk hygiene.
-pub(crate) const HOUSEKEEPING_LABELS: [&str; 3] = ["record-proxy-options", "drain-old", "prune"];
+pub(crate) const HOUSEKEEPING_LABELS: [&str; 3] =
+    ["record-proxy-options", DRAIN_OLD_LABEL, "prune"];
+
+/// The op that stops the old slot after the cutover.
+pub(crate) const DRAIN_OLD_LABEL: &str = "drain-old";
+
+/// Why a failed `drain-old` halts the rollout (issue #2279).
+pub(crate) const OLD_SLOT_MAY_RUN_NOTE: &str = "the old slot can still run now or at boot. \
+     It runs job workers and the scheduler, so scheduled tasks and jobs can run two times";
+
+/// The outcome of a failed `drain-old` after [`exec::retry_drain_old`] (issue
+/// #2279).
+///
+/// The old slot runs job workers and the scheduler (`ProcessRole::Combined`). If
+/// it runs, work runs two times. Only a proven stop is housekeeping. `NotStopped`
+/// and `Unreadable` halt and compensate. A first deploy has no `drain-old`.
+pub(crate) const fn drain_old_outcome(state: exec::OldSlotState) -> HostOutcome {
+    match state {
+        exec::OldSlotState::Stopped => HostOutcome::Degraded {
+            label: DRAIN_OLD_LABEL,
+        },
+        exec::OldSlotState::NotStopped | exec::OldSlotState::Unreadable => HostOutcome::LiveOnNew {
+            failed_step: DRAIN_OLD_LABEL,
+        },
+    }
+}
 
 /// The one post-boundary label whose failure makes a host's rollback target
 /// unprovable: `commit-markers` writes previous-release + `current` + live-slot as
@@ -926,6 +952,17 @@ fn state_table_lines(title: &str, rows: &[(&'static str, &str, String)]) -> Vec<
     lines
 }
 
+/// The `Fleet state:` row for a [`HostOutcome::LiveOnNew`] host. For
+/// `drain-old` it names the risk, not only the step (issue #2279).
+fn live_on_new_row(release_id: &str, failed_step: &str) -> String {
+    let risk = if failed_step == DRAIN_OLD_LABEL {
+        format!(": {OLD_SLOT_MAY_RUN_NOTE}")
+    } else {
+        String::new()
+    };
+    format!("serving {release_id} \u{2014} but `{failed_step}` failed AFTER the cutover{risk}")
+}
+
 /// The per-host state table printed at the END of every fleet rollout — success or
 /// halt (issue #1621, §8.2).
 ///
@@ -952,11 +989,7 @@ pub(crate) fn fleet_summary_lines(
             ),
             // Traffic already moved before the failure, so this host IS on the new
             // release — saying only "failed" would be the dangerous half-truth.
-            HostOutcome::LiveOnNew { failed_step } => {
-                format!(
-                    "serving {release_id} \u{2014} but `{failed_step}` failed AFTER the cutover"
-                )
-            }
+            HostOutcome::LiveOnNew { failed_step } => live_on_new_row(release_id, failed_step),
             HostOutcome::AmbiguousMarkers => format!(
                 "serving {release_id} \u{2014} `{AMBIGUOUS_MARKERS_LABEL}` failed AFTER the \
                  cutover, so the release markers are mid-transaction and this host was NOT \
@@ -1190,24 +1223,23 @@ pub(crate) const DRIFT_PROXY_OPTIONS_UNREADABLE: &str =
 pub(crate) const DRIFT_PROXY_PORT_MISMATCH: &str =
     "the installed proxy unit binds a different public port than `[server] port` configures";
 
-/// State drift: this host claims a promoted release its `current` symlink could
-/// not be resolved to (issue #1621, review round 2).
+/// State drift: this host has a `current` symlink, but it does not point to a
+/// release (issue #1621, review round 2; #2277).
 ///
-/// The probe shell tests `[ -L current ]`, which succeeds for a symlink whose
-/// target cannot be canonicalized, so such a host reports `HostMode::Redeploy`
-/// while `readlink -f` yields nothing and the release reads back
-/// [`ReleaseId::Unknown`]. That combination is not "we have not looked" — it is a
-/// host that says it is serving a release nobody can name, which is exactly the
-/// unprovable state this feature fails closed on.
+/// The probe shell tests `[ -L current ]`. This test also succeeds for a
+/// dangling symlink, so the host reports `HostMode::Redeploy`. The probe names a
+/// release only if `current` resolves to a directory directly in `releases/`.
+/// Otherwise the release is [`ReleaseId::Unknown`]. That combination is not "we
+/// have not looked" — it is a host that says it is serving a release nobody can
+/// name, which is exactly the unprovable state this feature fails closed on.
 ///
 /// It stays out of VERSION drift (an unknown release still names no version to be
 /// mixed with), and it is the reason the NEXT deploy matters: `commit-markers`
-/// copies `readlink current` verbatim into `previous-release`, so deploying this
-/// host records an unresolvable directory as its rollback target — the rollback
-/// then refuses (`probe_rollback_target_dir` fails closed) instead of working.
-pub(crate) const DRIFT_RELEASE_UNREADABLE: &str = "this host has a `current` symlink but the release it points at could not be read (a broken \
-     symlink or a missing releases dir) — repair it before the next deploy, which would record \
-     that unresolvable target as this host's rollback point";
+/// copies `readlink current` verbatim into `previous-release`. A later rollback
+/// then refuses (a missing target) or starts a directory that is not a release.
+pub(crate) const DRIFT_RELEASE_UNREADABLE: &str = "this host's `current` symlink does not point to a release in `releases/` (the link is \
+     broken, the releases dir is missing, or the target is not a release dir) — repair it \
+     before the next deploy, which would record that target as this host's rollback point";
 
 /// State drift: this host's live slot unit could not be read, so the CLI cannot
 /// prove WHICH maintenance flag file the running app polls (issue #1621, review
@@ -1258,6 +1290,15 @@ pub(crate) const MAINTENANCE_DOES_NOT_DRAIN_NOTE: &str = "maintenance mode does 
      design, so a maintained host keeps taking traffic and answers it with 503. Drain at the \
      load balancer if you need the host out of rotation.";
 
+/// Footer text for deployed hosts whose `/ready` answered with a non-2xx code
+/// (issue #2273).
+pub(crate) const NOT_READY_NOTE: &str = "a load balancer that checks `/ready` stops sending traffic to \
+     them. `--strict` does not count this as drift.";
+
+/// Footer text for deployed hosts whose `/ready` gave no answer (issue #2273).
+pub(crate) const READY_UNKNOWN_NOTE: &str = "the app can be down, or the probe failed (no `curl`, or a \
+     timeout). The CLI cannot tell which. `--strict` does not count this as drift.";
+
 /// One host's observed state, as `deploy status` reports it (issue #1621, AC-6).
 ///
 /// Pure data assembled from a read-only probe. It carries the FACTS, never a
@@ -1306,7 +1347,33 @@ pub(crate) struct HostStatus {
     pub(crate) last_deploy: Option<exec::LastDeploy>,
 }
 
+/// A problem with a deployed host's `/ready` answer (issue #2273). It sets the
+/// row marker and a footer line. It is never drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadyConcern {
+    /// The app answered with this non-2xx code.
+    NotReady(u16),
+    /// Nothing answered.
+    NoAnswer,
+}
+
 impl HostStatus {
+    /// The `/ready` problem on this host, if any. Only a reachable host with a
+    /// deployed release has an app to ask, so all other hosts give `None`.
+    ///
+    /// Only 2xx is ready. Autumn's `/ready` answers 200 or 503, so a 3xx comes
+    /// from something else on the port. The deploy gate (`curl -f`) accepts a 3xx.
+    fn ready_concern(&self) -> Option<ReadyConcern> {
+        if !self.reachable || self.mode != Some(HostMode::Redeploy) {
+            return None;
+        }
+        match self.ready_code {
+            Some(code) if (200..300).contains(&code) => None,
+            Some(code) => Some(ReadyConcern::NotReady(code)),
+            None => Some(ReadyConcern::NoAnswer),
+        }
+    }
+
     /// The status of a host whose read-only probe could not be completed.
     ///
     /// Deliberately not an error: `deploy status` reports the whole fleet or it is
@@ -1565,6 +1632,56 @@ fn status_row_cells(status: &HostStatus, report: &DriftReport) -> [String; 8] {
     ]
 }
 
+/// The marker for one status row. `❌`: the host is unreachable. `⚠️`: the host
+/// has drift, maintenance is on, or `/ready` did not give a 2xx answer (issue
+/// #2273). `✅`: all other hosts.
+fn status_marker(status: &HostStatus, report: &DriftReport) -> &'static str {
+    if !status.reachable {
+        "\u{274C}"
+    } else if report
+        .state_drift
+        .iter()
+        .any(|(host, _)| *host == status.host)
+        || status.maintenance == exec::MaintenanceStatus::On
+        || status.ready_concern().is_some()
+    {
+        "\u{26A0}\u{FE0F} "
+    } else {
+        "\u{2705}"
+    }
+}
+
+/// The footer lines for deployed hosts with a `/ready` problem (issue #2273).
+/// Hosts that answered with a code share one line, and hosts with no answer
+/// share another.
+fn readiness_footer_lines(hosts: &[HostStatus]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut not_ready: Vec<String> = Vec::new();
+    let mut no_answer: Vec<&str> = Vec::new();
+    for status in hosts {
+        match status.ready_concern() {
+            Some(ReadyConcern::NotReady(code)) => {
+                not_ready.push(format!("{} ({code})", status.host));
+            }
+            Some(ReadyConcern::NoAnswer) => no_answer.push(status.host.as_str()),
+            None => {}
+        }
+    }
+    if !not_ready.is_empty() {
+        lines.push(format!(
+            "  \u{26A0}\u{FE0F}  `/ready` is not 2xx on {}: {NOT_READY_NOTE}",
+            not_ready.join(", "),
+        ));
+    }
+    if !no_answer.is_empty() {
+        lines.push(format!(
+            "  \u{26A0}\u{FE0F}  no `/ready` answer from {}: {READY_UNKNOWN_NOTE}",
+            no_answer.join(", "),
+        ));
+    }
+    lines
+}
+
 /// The `deploy status` table: one aligned row per host, then the verdict.
 ///
 /// Rendered through [`state_table_lines`] — the SAME primitive the rollout summary
@@ -1572,7 +1689,8 @@ fn status_row_cells(status: &HostStatus, report: &DriftReport) -> [String; 8] {
 /// about how a host row looks (plan §7.3).
 ///
 /// Readiness and maintenance are deliberately SEPARATE columns; see
-/// [`MAINTENANCE_DOES_NOT_DRAIN_NOTE`].
+/// [`MAINTENANCE_DOES_NOT_DRAIN_NOTE`]. A `/ready` answer that is not 2xx, or no
+/// answer, changes the marker. It is not drift. See [`ReadyConcern`].
 pub(crate) fn fleet_status_lines(hosts: &[HostStatus], report: &DriftReport) -> Vec<String> {
     let cells: Vec<[String; 8]> = hosts
         .iter()
@@ -1592,18 +1710,7 @@ pub(crate) fn fleet_status_lines(hosts: &[HostStatus], report: &DriftReport) -> 
         .iter()
         .zip(&cells)
         .map(|(status, cells)| {
-            let marker = if !status.reachable {
-                "\u{274C}"
-            } else if report
-                .state_drift
-                .iter()
-                .any(|(host, _)| *host == status.host)
-                || status.maintenance == exec::MaintenanceStatus::On
-            {
-                "\u{26A0}\u{FE0F} "
-            } else {
-                "\u{2705}"
-            };
+            let marker = status_marker(status, report);
             let mut state = String::new();
             for (index, cell) in cells.iter().enumerate() {
                 if index > 0 {
@@ -1681,6 +1788,7 @@ pub(crate) fn fleet_status_lines(hosts: &[HostStatus], report: &DriftReport) -> 
     for (host, reason) in &report.state_drift {
         lines.push(format!("  \u{26A0}\u{FE0F}  {host}: {reason}"));
     }
+    lines.extend(readiness_footer_lines(hosts));
     // AC-6's third fact carries its own limits, printed where it is read rather
     // than only in the guide — a column whose scope is misread is worse than no
     // column. Only when there is a reachable host, so an all-unreachable report
@@ -2892,6 +3000,70 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_drain_old_degrades_only_when_the_old_slot_is_proven_stopped() {
+        // #2279: a live old slot runs job workers and the scheduler, so work runs
+        // two times. Only a proven stop may continue the rollout.
+        assert_eq!(
+            drain_old_outcome(exec::OldSlotState::Stopped),
+            HostOutcome::Degraded {
+                label: DRAIN_OLD_LABEL
+            },
+        );
+        for state in [
+            exec::OldSlotState::NotStopped,
+            exec::OldSlotState::Unreadable,
+        ] {
+            assert_eq!(
+                drain_old_outcome(state),
+                HostOutcome::LiveOnNew {
+                    failed_step: DRAIN_OLD_LABEL
+                },
+                "{state:?} must halt and compensate, not continue",
+            );
+        }
+        assert_eq!(DRAIN_OLD_LABEL, "drain-old");
+    }
+
+    #[test]
+    fn the_summary_names_the_risk_of_an_old_slot_that_may_still_run() {
+        // #2279: with `--no-rollback` the host stays as it is. The last table the
+        // operator reads must say that work can run two times.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let plan = plan_fleet(&fleet, &[HostMode::Redeploy, HostMode::Redeploy])
+            .expect("a well-formed fleet plans");
+        let rendered = fleet_summary_lines(
+            &plan,
+            &[
+                HostOutcome::LiveOnNew {
+                    failed_step: DRAIN_OLD_LABEL,
+                },
+                HostOutcome::LiveOnNew {
+                    failed_step: "proxy-flip",
+                },
+            ],
+            "20260714T120000Z",
+        )
+        .join("\n");
+        let web_a = rendered
+            .lines()
+            .find(|line| line.contains("web-a"))
+            .expect("web-a row");
+        assert!(web_a.contains(OLD_SLOT_MAY_RUN_NOTE), "{web_a}");
+        let web_b = rendered
+            .lines()
+            .find(|line| line.contains("web-b"))
+            .expect("web-b row");
+        assert!(
+            !web_b.contains(OLD_SLOT_MAY_RUN_NOTE),
+            "only a `drain-old` row names this risk: {web_b}"
+        );
+        assert!(
+            OLD_SLOT_MAY_RUN_NOTE.contains("two times"),
+            "the note must name the risk, not only the step"
+        );
+    }
+
+    #[test]
     fn a_post_boundary_housekeeping_failure_degrades_instead_of_halting() {
         // #1621 (§4.6): the composition the driver actually calls. A pre-boundary
         // outcome passes through untouched (the executor already tore the candidate
@@ -3844,9 +4016,9 @@ mod tests {
 
     #[test]
     fn a_deployed_host_whose_release_is_unreadable_is_state_drift() {
-        // #1621 review round 2. `[ -L current ]` succeeds for a symlink whose target
-        // cannot be canonicalized, so such a host reports `Redeploy` while `readlink
-        // -f` yields nothing and the release reads back `Unknown`. That combination
+        // #1621 review round 2. `[ -L current ]` succeeds for a dangling symlink, so
+        // such a host reports `Redeploy`, but the probe names no release (#2277).
+        // The release reads back `Unknown`. That combination
         // used to produce ONLY the footer line explicitly labelled "reported, not
         // counted as drift", so `deploy status --strict` exited 0 on a host with
         // actionable marker damage — and the next deploy's `commit-markers` copies
@@ -3998,5 +4170,104 @@ mod tests {
             rendered.contains("r1") && rendered.contains("r2"),
             "version drift must show WHICH releases:\n{rendered}"
         );
+    }
+
+    /// The table row for `host`. Rows come before every footer line.
+    fn status_row<'a>(rendered: &'a str, host: &str) -> &'a str {
+        rendered
+            .lines()
+            .find(|line| line.contains(host))
+            .expect("every host has a row")
+    }
+
+    /// The `⚠️` marker slot at the start of a row, not a `⚠️` in a drift cell.
+    const WARN_ROW: &str = "  \u{26A0}\u{FE0F} ";
+
+    #[test]
+    fn a_host_whose_ready_is_not_2xx_never_renders_a_green_marker() {
+        // #2273: a load balancer that checks `/ready` stops sending traffic to a
+        // host that is not 2xx. A green marker on that row tells the operator the
+        // opposite.
+        let mut unready = status("web-b", Some("r1"));
+        unready.ready_code = Some(503);
+        let rows = [status("web-a", Some("r1")), unready];
+        let report = fleet_drift(&rows);
+        let rendered = fleet_status_lines(&rows, &report).join("\n");
+
+        let web_b = status_row(&rendered, "web-b");
+        assert!(web_b.contains("ready 503"), "{rendered}");
+        assert!(web_b.starts_with(WARN_ROW), "{rendered}");
+        assert!(
+            status_row(&rendered, "web-a").contains('\u{2705}'),
+            "a ready host keeps its green marker:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("web-b (503)") && rendered.contains(NOT_READY_NOTE),
+            "the footer names the host, its code and the effect:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_deployed_host_with_no_ready_answer_never_renders_a_green_marker() {
+        // #2273: no answer can be an app that is down or a probe that failed. The
+        // CLI cannot tell which, so the row is not green and the footer says why.
+        let mut silent = status("web-b", Some("r1"));
+        silent.ready_code = None;
+        let rows = [status("web-a", Some("r1")), silent];
+        let report = fleet_drift(&rows);
+        let rendered = fleet_status_lines(&rows, &report).join("\n");
+
+        let web_b = status_row(&rendered, "web-b");
+        assert!(web_b.contains("ready ?"), "{rendered}");
+        assert!(web_b.starts_with(WARN_ROW), "{rendered}");
+        assert!(
+            rendered.contains(READY_UNKNOWN_NOTE),
+            "the footer says the CLI could not tell:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(NOT_READY_NOTE),
+            "no answer is not a proven non-2xx:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn any_2xx_ready_code_keeps_the_green_marker() {
+        let mut no_content = status("web-a", Some("r1"));
+        no_content.ready_code = Some(204);
+        let rows = [no_content];
+        let report = fleet_drift(&rows);
+        let rendered = fleet_status_lines(&rows, &report).join("\n");
+        assert!(
+            status_row(&rendered, "web-a").contains('\u{2705}'),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(NOT_READY_NOTE), "{rendered}");
+    }
+
+    #[test]
+    fn readiness_is_not_judged_on_an_empty_or_unreachable_host() {
+        // A host with no release has no app to answer `/ready`, and the
+        // "no release deployed" footer covers it. An unreachable host has its own
+        // `❌` row, so the report stays about the outage.
+        let mut empty = status("web-a", None);
+        empty.mode = Some(HostMode::First);
+        empty.ready_code = None;
+        let rows = [empty, HostStatus::unreachable("web-b")];
+        let report = fleet_drift(&rows);
+        let rendered = fleet_status_lines(&rows, &report).join("\n");
+        assert!(!rendered.contains(READY_UNKNOWN_NOTE), "{rendered}");
+        assert!(!rendered.contains(NOT_READY_NOTE), "{rendered}");
+    }
+
+    #[test]
+    fn an_unready_host_is_not_drift() {
+        // #2273: readiness changes during a normal drain or start-up. `--strict`
+        // runs from cron and sends an alert on drift. Readiness must not send one.
+        let mut unready = status("web-b", Some("r1"));
+        unready.ready_code = Some(503);
+        let mut silent = status("web-c", Some("r1"));
+        silent.ready_code = None;
+        let report = fleet_drift(&[status("web-a", Some("r1")), unready, silent]);
+        assert!(!report.drifted(), "{:?}", report.state_drift);
     }
 }

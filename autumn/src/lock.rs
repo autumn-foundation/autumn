@@ -80,6 +80,14 @@
 //!   on one connection; a second [`Lock::try_lock`] on the same name in the
 //!   same process observes `None`.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::time::Duration;
 
 use sha2::{Digest as _, Sha256};
@@ -181,7 +189,7 @@ pub use sqlite_impl::{Lock, LockGuard};
 
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 mod db_impl {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use diesel_async::AsyncPgConnection;
     use diesel_async::RunQueryDsl as _;
@@ -470,7 +478,7 @@ mod db_impl {
         /// Returns [`LockError::Timeout`] if the lock is not acquired within
         /// `timeout`, or another [`LockError`] on connection/query failure.
         pub async fn lock_timeout(&self, timeout: Duration) -> Result<LockGuard, LockError> {
-            let start = Instant::now();
+            let start = crate::time::ambient_instant();
             // Bound the initial pool checkout by the same deadline: under pool
             // pressure deadpool's own wait could otherwise block far past
             // `timeout`, returning `PoolUnavailable` instead of honoring the
@@ -481,7 +489,7 @@ mod db_impl {
                 .await
                 .map_err(|_| LockError::Timeout {
                     name: self.name.clone(),
-                    waited: start.elapsed(),
+                    waited: crate::time::ambient_instant().saturating_duration_since(start),
                 })??;
             // Hold that one connection (via one `AcquireConn`) for every poll
             // iteration — no per-poll churn. The guard also makes the whole wait
@@ -497,7 +505,7 @@ mod db_impl {
                 // deadline and could return `Ok` after `timeout` had already
                 // elapsed. On a normal positive `timeout` the first iteration's
                 // elapsed is ~0, so at least one poll always runs.
-                let elapsed = start.elapsed();
+                let elapsed = crate::time::ambient_instant().saturating_duration_since(start);
                 if elapsed >= timeout {
                     // Timed out: recycle the healthy `Object` back to the pool
                     // (the lock was never acquired on it).
@@ -520,7 +528,9 @@ mod db_impl {
                     let conn = ac.into_pooled();
                     return Ok(LockGuard::new(conn, self.key, self.name.clone()));
                 }
-                let remaining = timeout.saturating_sub(start.elapsed());
+                let remaining = timeout.saturating_sub(
+                    crate::time::ambient_instant().saturating_duration_since(start),
+                );
                 // Clamp the effective poll interval to a small minimum so a
                 // zero (or sub-millisecond) interval cannot busy-spin, but never
                 // sleep past the remaining budget.
