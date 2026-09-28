@@ -830,7 +830,11 @@ pub fn check_listed_declaration(
                     index::sanitize(&declared)
                 ));
             }
-            if let Some(locked) = locked
+            // Only a direct declaration's lock counts: a transitive copy
+            // is not the dependency `plan_add` pins, and Cargo can resolve
+            // the new `=release` pin alongside it.
+            if install::dependency_present(&manifest, crate_name)
+                && let Some(locked) = locked
                 && semver::Version::parse(&locked).ok() != semver::Version::parse(version).ok()
             {
                 return Err(format!(
@@ -2245,6 +2249,10 @@ mod tests {
         assert!(err.contains("Cargo.lock locks"), "{err}");
         std::fs::write(caret.path().join("Cargo.lock"), lock(RELEASE)).unwrap();
         assert!(check_listed_declaration(caret.path(), &admin, RELEASE).is_ok());
+        // A transitive lock with no direct declaration does not block the pin.
+        let fresh = project_with("[package]\nname = \"a\"\n\n[dependencies]\n");
+        std::fs::write(fresh.path().join("Cargo.lock"), lock("0.0.1")).unwrap();
+        assert!(check_listed_declaration(fresh.path(), &admin, RELEASE).is_ok());
     }
 
     /// A `{ workspace = true }` entry is checked against the workspace

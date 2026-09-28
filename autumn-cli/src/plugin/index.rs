@@ -415,6 +415,11 @@ impl Listing {
                     label.push_str("; scoped to ");
                     label.push_str(&scopes.join("; "));
                 }
+                // The routes it serves are authority a reviewer consents to.
+                if !self.routes.is_empty() {
+                    label.push_str("; serves ");
+                    label.push_str(&self.routes.join(", "));
+                }
                 // Defaults go unsaid; a changed ceiling is authority.
                 let defaults = autumn_web::plugin_sandbox::CapabilityQuotas::default();
                 let changed: Vec<String> = defaults
@@ -1546,6 +1551,16 @@ mod tests {
         let caret = community();
         assert_eq!(caret.compat("^0.7.0"), Compat::Compatible);
         assert_eq!(caret.compat("^0.6.0"), Compat::Incompatible);
+    }
+
+    #[test]
+    fn a_sandboxed_label_names_its_routes() {
+        let mut listing = community();
+        listing.trust = Trust::Sandboxed;
+        listing.capabilities = vec!["kv".to_owned()];
+        listing.routes = vec!["GET /hello".to_owned(), "HEAD /hello".to_owned()];
+        let label = listing.trust_label();
+        assert!(label.contains("serves GET /hello, HEAD /hello"), "{label}");
     }
 
     #[test]
