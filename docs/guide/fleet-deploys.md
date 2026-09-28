@@ -436,6 +436,13 @@ failed *before* cutover never
 rewrites it, so it is that host's own last completed action rather than a
 verdict on the last rollout, and it is reported, never counted as drift.
 
+A deployed host can answer `/ready` with a code that is not `2xx`, or give no
+answer. Its row then shows ⚠️, and a line under the table names the host. A load
+balancer that checks `/ready` stops sending traffic to that host. This is **not**
+drift, because readiness changes during a normal drain or start-up. `--strict`
+does not fail on it. To alert on readiness, use `--json`. For each host with
+`"mode": "deployed"`, read `ready`: the HTTP code, or `null` for no answer.
+
 ### Alerting on a halted rollout or drift
 
 Do not wire the cron job above to a paging tool by hand. Two paths already
