@@ -272,16 +272,48 @@ pub fn app_autumn_web(root: &Path) -> Result<AppAutumnWeb, PluginError> {
     }
 }
 
-/// Every distinct `autumn-web` requirement the project at `root` declares:
+/// Every distinct `autumn-web` requirement the package at `root` declares:
 /// its own, dev, build and target-specific tables, with `{ workspace = true }`
-/// entries resolved. Several means Cargo's choice depends on the target.
+/// entries resolved. A `[workspace.dependencies]` default the package does not
+/// inherit is not its declaration. Several means Cargo's choice depends on
+/// the target.
 #[must_use]
 pub fn declared_autumn_web_versions(root: &Path) -> Vec<String> {
+    const KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+    let Some(table) = std::fs::read_to_string(manifest_path(root))
+        .ok()
+        .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+    else {
+        return Vec::new();
+    };
+    let mut tables: Vec<&toml::Value> = KINDS.iter().filter_map(|kind| table.get(*kind)).collect();
+    if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
+        for target in targets.values() {
+            tables.extend(KINDS.iter().filter_map(|kind| target.get(*kind)));
+        }
+    }
     let mut versions: Vec<String> = Vec::new();
-    for declaration in crate::doctor::autumn_web_declarations_at(root) {
-        let version = match declaration {
-            crate::doctor::AutumnWebDependency::Version(version) => Some(version),
-            crate::doctor::AutumnWebDependency::Inherited(key) => workspace_version_for(root, &key),
+    for (key, entry) in tables
+        .into_iter()
+        .filter_map(toml::Value::as_table)
+        .flat_map(|deps| deps.iter())
+    {
+        let is_framework = key == "autumn-web"
+            || entry.get("package").and_then(toml::Value::as_str) == Some("autumn-web");
+        if !is_framework {
+            continue;
+        }
+        let version = match entry {
+            toml::Value::String(version) => Some(version.clone()),
+            toml::Value::Table(fields) => fields
+                .get("version")
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| {
+                    (fields.get("workspace").and_then(toml::Value::as_bool) == Some(true))
+                        .then(|| workspace_version_for(root, key))
+                        .flatten()
+                }),
             _ => None,
         };
         if let Some(version) = version.map(|v| v.trim().to_owned())
@@ -731,6 +763,27 @@ pub fn declared_dependency_key(manifest: &str, crate_name: &str) -> Option<Strin
         .keys()
         .find(|key| canonical(key) == want)
         .cloned()
+}
+
+/// A `[dependencies]` key other than `crate_name` whose `package` names it:
+/// `alias = { package = "crate_name", … }`. Cargo refuses a second entry for
+/// the same crate under another name.
+#[must_use]
+pub fn aliased_dependency_key(manifest: &str, crate_name: &str) -> Option<String> {
+    let table = toml::from_str::<toml::Table>(manifest).ok()?;
+    let want = canonical(crate_name);
+    table
+        .get("dependencies")?
+        .as_table()?
+        .iter()
+        .find(|(key, entry)| {
+            canonical(key) != want
+                && entry
+                    .get("package")
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|package| canonical(package) == want)
+        })
+        .map(|(key, _)| key.clone())
 }
 
 /// Whether `manifest` takes `crate_name` from somewhere other than its
@@ -1447,6 +1500,25 @@ mod tests {
         );
         let found = patched_by_in(&app, "autumn-plugin-x", "=0.2.5", None).unwrap();
         assert!(found.contains("replace-with = \"vendored\""), "{found}");
+    }
+
+    /// A `[workspace.dependencies]` default the package does not inherit is
+    /// not one of its declarations.
+    #[test]
+    fn an_uninherited_workspace_default_is_not_declared() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            &tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"a\"\n\n[dependencies]\nautumn-web = \"0.7\"\n\n\
+             [workspace]\n\n[workspace.dependencies]\nautumn-web = \"0.8\"\n",
+        );
+        assert_eq!(declared_autumn_web_versions(tmp.path()), ["0.7"]);
+        write(
+            &tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"a\"\n\n[dependencies]\nautumn-web = { workspace = true }\n\n\
+             [workspace]\n\n[workspace.dependencies]\nautumn-web = \"0.8\"\n",
+        );
+        assert_eq!(declared_autumn_web_versions(tmp.path()), ["0.8"]);
     }
 
     /// A `[replace]` key names one version: another version's replacement

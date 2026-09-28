@@ -778,6 +778,15 @@ pub fn check_existing_source(
             index::sanitize(&key)
         ));
     }
+    // An alias of the crate is the same dependency under another name; a
+    // second entry would make Cargo refuse the manifest.
+    if let Some(alias) = install::aliased_dependency_key(manifest, crate_name) {
+        return Err(format!(
+            "Cargo.toml already declares `{crate_name}` as `{}` (a `package` rename). Rename \
+             the key to `{crate_name}` and drop `package`, then re-run. No files were changed.",
+            index::sanitize(&alias)
+        ));
+    }
     // A version from a path, git or other registry is not the reviewed
     // crates.io release, whatever it says.
     if install::dependency_present(manifest, crate_name)
@@ -2405,6 +2414,15 @@ mod tests {
         assert!(check(Some("{ path = \"../x\", version = \"=0.3.0\" }")).is_err());
         // Not defined in the workspace: unresolvable, so refused.
         assert!(check(None).is_err());
+    }
+
+    /// An alias of the listed crate is refused, not duplicated.
+    #[test]
+    fn an_aliased_declaration_is_refused() {
+        let manifest = "[package]\nname = \"a\"\n\n[dependencies]\n\
+                        x = { package = \"autumn_plugin_x\", version = \"=0.3.0\" }\n";
+        let err = check_existing_pin(manifest, "autumn-plugin-x", "=0.3.0").unwrap_err();
+        assert!(err.contains("as `x`"), "{err}");
     }
 
     /// An existing requirement other than the verified pin is refused.
