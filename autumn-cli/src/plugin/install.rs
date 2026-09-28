@@ -671,6 +671,15 @@ fn patched_by_in(
                 );
             return Some(format!("[source.crates-io] {how} in {}", path.display()));
         }
+        // `paths` overrides replace any crate whose name and version match a
+        // local one, and which crates they cover cannot be told from here.
+        if table
+            .get("paths")
+            .and_then(toml::Value::as_array)
+            .is_some_and(|paths| !paths.is_empty())
+        {
+            return Some(format!("`paths` overrides in {}", path.display()));
+        }
     }
     None
 }
@@ -859,12 +868,27 @@ fn canonical(name: &str) -> String {
 pub fn unpatched_local_framework(root: &Path) -> bool {
     // Any of the package's entries, a `package` rename or an inherited one
     // included, that takes the framework from a checkout.
-    let local = package_autumn_web_entries(root)
+    let locals: Vec<toml::Value> = package_autumn_web_entries(root)
+        .into_iter()
+        .filter(|entry| entry.get("path").is_some() || entry.get("git").is_some())
+        .collect();
+    if locals.is_empty() {
+        return false;
+    }
+    // A patch collapses the two copies only when it supplies the version the
+    // checkout is: Cargo skips a patch whose version does not match. A path
+    // resolves from the app or, when inherited, the workspace root; a git
+    // checkout's version cannot be read, so any patch is taken for it.
+    let version = locals
         .iter()
-        .any(|entry| entry.get("path").is_some() || entry.get("git").is_some());
-    // No pin to compare: any crates.io patch of `autumn-web` collapses the
-    // two copies.
-    local && patched_by(root, "autumn-web", "").is_none()
+        .find_map(|entry| {
+            let path = entry.get("path")?.as_str()?;
+            package_version(&root.join(path))
+                .or_else(|| package_version(&workspace_root(root).join(path)))
+        })
+        .map(|version| version.to_string())
+        .unwrap_or_default();
+    patched_by(root, "autumn-web", &version).is_none()
 }
 
 /// Whether `main_rs` already mounts `entry` **in code**.
@@ -1949,6 +1973,46 @@ maud = { version = "0.27", features = ["axum"] }
                      [dependencies]\naw = { package = \"autumn-web\", path = \"../autumn\" }\n";
         let tmp = fake_project(SCAFFOLD_MAIN, cargo);
         assert!(unpatched_local_framework(tmp.path()));
+    }
+
+    /// A patch that supplies another version than the local checkout does
+    /// not collapse the two copies: Cargo skips it.
+    #[test]
+    fn a_patch_of_another_framework_version_does_not_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app");
+        let framework = |dir: &str, version: &str| {
+            write(
+                &tmp.path().join(dir).join("Cargo.toml"),
+                &format!("[package]\nname = \"autumn-web\"\nversion = \"{version}\"\n"),
+            );
+        };
+        framework("autumn", "0.7.0");
+        framework("other", "0.8.0");
+        let manifest = |patch: &str| {
+            format!(
+                "[package]\nname = \"demo\"\n\n[dependencies]\nautumn-web = {{ path = \"../autumn\" }}\n\n\
+                 [patch.crates-io]\nautumn-web = {{ path = \"../{patch}\" }}\n"
+            )
+        };
+        write(&app.join("Cargo.toml"), &manifest("other"));
+        assert!(unpatched_local_framework(&app));
+        write(&app.join("Cargo.toml"), &manifest("autumn"));
+        assert!(!unpatched_local_framework(&app));
+    }
+
+    /// `paths` overrides in a config can replace any crate.
+    #[test]
+    fn a_paths_override_is_a_redirect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app");
+        write(&app.join("Cargo.toml"), "[package]\nname = \"a\"\n");
+        write(
+            &app.join(".cargo/config.toml"),
+            "paths = [\"../overrides\"]\n",
+        );
+        let found = patched_by_in(&app, "autumn-plugin-x", "=0.2.5", None).unwrap();
+        assert!(found.contains("`paths` overrides"), "{found}");
     }
 
     /// A virtual workspace's unused default does not make it an app.
