@@ -2013,6 +2013,10 @@ enum Commands {
         /// in a plugin's own CI to forbid it.
         #[arg(long)]
         deny_experimental: bool,
+        /// Assert the plugin mounts no routes (a cache, a search index).
+        /// Without it, finding no routes fails `route-attribution`.
+        #[arg(long, conflicts_with = "prefix")]
+        no_routes: bool,
     },
 
     /// Inspect and mutate live runtime configuration values.
@@ -5618,6 +5622,7 @@ fn run_command(command: Commands) {
             sensitive_route,
             format,
             deny_experimental,
+            no_routes,
         } => {
             run_plugin_check_command(
                 package.as_deref(),
@@ -5626,7 +5631,7 @@ fn run_command(command: Commands) {
                 prefix.as_deref(),
                 &sensitive_route,
                 &format,
-                deny_experimental,
+                (deny_experimental, no_routes),
             );
         }
         Commands::Generate(cmd) => run_generate_command(cmd, ApplyMode::Generate),
@@ -5931,7 +5936,7 @@ fn run_plugin_check_command(
     prefix: Option<&str>,
     sensitive_route_args: &[String],
     format: &str,
-    deny_experimental: bool,
+    (deny_experimental, no_routes): (bool, bool),
 ) {
     let fmt = format.parse().unwrap_or_else(|e| {
         eprintln!("autumn plugin-check: {e}");
@@ -5963,6 +5968,7 @@ fn run_plugin_check_command(
         // Populated by `run` from the built binary's contract dump.
         contracts: &plugin_check::ContractDump::Absent,
         deny_experimental,
+        no_routes,
     });
 }
 
@@ -10170,8 +10176,10 @@ mod tests {
                 sensitive_route,
                 format,
                 deny_experimental,
+                no_routes,
             } => {
                 assert!(!deny_experimental, "the flag defaults off");
+                assert!(!no_routes, "the flag defaults off");
                 assert_eq!(package.as_deref(), Some("my-app"));
                 assert_eq!(bin.as_deref(), Some("server"));
                 assert_eq!(plugin_name, "autumn-admin-plugin");
@@ -10181,6 +10189,38 @@ mod tests {
             }
             _ => panic!("expected PluginCheck"),
         }
+    }
+
+    /// `--no-routes` parses, and contradicts `--prefix`.
+    #[test]
+    fn parse_plugin_check_no_routes() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin-check",
+            "--plugin-name",
+            "x",
+            "--no-routes",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::PluginCheck {
+                no_routes: true,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "autumn",
+                "plugin-check",
+                "--plugin-name",
+                "x",
+                "--no-routes",
+                "--prefix",
+                "/x",
+            ])
+            .is_err()
+        );
     }
 
     // ── autumn generate admin tests ────────────────────────────────────────

@@ -520,6 +520,8 @@ fn conformance(manifest: &SandboxManifest) -> ConformanceReport {
             // fail every sandboxed artifact over a contract that cannot exist
             // for one. `false` leaves the check a `Skip`.
             deny_experimental: false,
+            // A manifest serves its declared routes: never routeless.
+            no_routes: false,
         },
         &routes,
     );

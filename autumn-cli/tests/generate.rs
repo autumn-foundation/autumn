@@ -9587,6 +9587,9 @@ fn remove_app_binaries(target: &Path, app: &str) {
 fn plugin_check_report(project: &Path, listing: &toml::Value, target: &str) -> serde_json::Value {
     let name = listing["name"].as_str().unwrap();
     let mut args = vec!["plugin-check", "--plugin-name", name, "--format", "json"];
+    if listing.get("no_routes").and_then(toml::Value::as_bool) == Some(true) {
+        args.push("--no-routes");
+    }
     if let Some(prefix) = listing.get("prefix").and_then(toml::Value::as_str) {
         args.extend(["--prefix", prefix]);
     }

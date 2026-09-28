@@ -347,17 +347,33 @@ pub fn declared_dependency_version(manifest: &str, crate_name: &str) -> Option<S
 }
 
 /// Cargo's workspace root for the package at `dir`: the first directory from
-/// `dir` up whose `Cargo.toml` has a `[workspace]` table, or `dir` itself.
-/// `dir` is made absolute first: the CLI passes `.`, whose parents are empty.
+/// `dir` up whose `Cargo.toml` has a `[workspace]` table that does not
+/// `exclude` it, or `dir` itself. `dir` is made absolute first: the CLI
+/// passes `.`, whose parents are empty.
 #[must_use]
 pub fn workspace_root(dir: &Path) -> PathBuf {
     let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
     dir.ancestors()
         .find(|d| {
-            std::fs::read_to_string(d.join("Cargo.toml"))
+            let Some(workspace) = std::fs::read_to_string(d.join("Cargo.toml"))
                 .ok()
                 .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
-                .is_some_and(|table| table.contains_key("workspace"))
+                .and_then(|table| table.get("workspace").cloned())
+            else {
+                return false;
+            };
+            // An excluded package is its own workspace; Cargo looks further up.
+            let relative = dir.strip_prefix(d).unwrap_or(&dir);
+            let excluded = workspace
+                .get("exclude")
+                .and_then(toml::Value::as_array)
+                .is_some_and(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(toml::Value::as_str)
+                        .any(|path| relative.starts_with(Path::new(path.trim_start_matches("./"))))
+                });
+            !excluded
         })
         .map_or_else(|| dir.clone(), Path::to_path_buf)
 }
@@ -1054,6 +1070,25 @@ mod tests {
     fn write(path: &Path, text: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
+    }
+
+    /// A package an ancestor workspace excludes is its own root.
+    #[test]
+    fn an_excluded_package_is_its_own_workspace_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("apps").join("demo");
+        write(&app.join("Cargo.toml"), "[package]\nname = \"demo\"\n");
+        write(
+            &tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"lib\"]\nexclude = [\"apps\"]\n",
+        );
+        let root = |p: &Path| std::path::absolute(p).unwrap();
+        assert_eq!(workspace_root(&app), root(&app));
+        write(
+            &tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"apps/demo\"]\n",
+        );
+        assert_eq!(workspace_root(&app), root(tmp.path()));
     }
 
     /// The CLI passes `.`: the walk must still reach the workspace root.

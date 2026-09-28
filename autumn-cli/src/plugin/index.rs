@@ -195,6 +195,10 @@ pub struct Listing {
     /// routes.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prefix: String,
+    /// The plugin mounts no routes: `plugin-check --no-routes`. An empty
+    /// `prefix` alone does not say so.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_routes: bool,
     /// `PATH:DESCRIPTION` pairs for `plugin-check --sensitive-route`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sensitive_routes: Vec<String>,
@@ -539,6 +543,7 @@ fn admission_problems(listing: &Listing) -> Vec<String> {
     check_conformance(listing, &mut out);
     check_tier(listing, &mut out);
     check_trust(listing, &mut out);
+    check_routes(listing, &mut out);
     out
 }
 
@@ -691,6 +696,12 @@ fn check_tier(listing: &Listing, out: &mut Vec<String>) {
             Some(_) => out.push(format!("`{name}` is a stable surface, not experimental")),
             None => out.push(format!("`{name}` is not a known plugin surface")),
         }
+    }
+}
+
+fn check_routes(listing: &Listing, out: &mut Vec<String>) {
+    if listing.no_routes && !listing.prefix.is_empty() {
+        out.push("`no_routes` and a `prefix` contradict each other".to_owned());
     }
 }
 
@@ -896,6 +907,7 @@ mod tests {
             status: Status::Listed,
             note: String::new(),
             prefix: String::new(),
+            no_routes: false,
             sensitive_routes: vec![],
             conformance: Conformance {
                 result: CheckOutcome::Pass,
@@ -1534,6 +1546,15 @@ mod tests {
         let caret = community();
         assert_eq!(caret.compat("^0.7.0"), Compat::Compatible);
         assert_eq!(caret.compat("^0.6.0"), Compat::Incompatible);
+    }
+
+    #[test]
+    fn no_routes_and_a_prefix_contradict() {
+        let mut listing = community();
+        listing.no_routes = true;
+        listing.prefix = "/x".to_owned();
+        let text = messages(&validate(&index_of(vec![listing])));
+        assert!(text.contains("no_routes"), "{text}");
     }
 
     #[test]

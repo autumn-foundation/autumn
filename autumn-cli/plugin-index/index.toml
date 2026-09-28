@@ -53,6 +53,7 @@ autumn_web = "0.7"
 tier = "stable"
 trust = "native"
 status = "listed"
+no_routes = true
 
 [plugin.conformance]
 result = "pass"
@@ -69,6 +70,7 @@ autumn_web = "0.7"
 tier = "stable"
 trust = "native"
 status = "listed"
+no_routes = true
 
 [plugin.conformance]
 result = "pass"
@@ -85,6 +87,7 @@ autumn_web = "0.7"
 tier = "stable"
 trust = "native"
 status = "listed"
+no_routes = true
 
 [plugin.conformance]
 result = "pass"

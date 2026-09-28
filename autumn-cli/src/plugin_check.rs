@@ -183,6 +183,10 @@ pub struct PluginCheckOptions<'a> {
     /// not a defect. A plugin whose own CI wants to forbid it passes
     /// `--deny-experimental`.
     pub deny_experimental: bool,
+    /// `--no-routes`: the plugin asserts it mounts no routes (a cache, a
+    /// search index). Only then may `route-attribution` skip when none are
+    /// found; without it, none found fails, as an unannotated `nest` would.
+    pub no_routes: bool,
 }
 
 /// Run `autumn plugin-check`.
@@ -239,6 +243,7 @@ pub fn run(opts: &PluginCheckOptions<'_>) {
             format: opts.format.clone(),
             contracts: &contracts,
             deny_experimental: opts.deny_experimental,
+            no_routes: opts.no_routes,
         },
         &routes,
     );
@@ -290,8 +295,9 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
     let registered_as = declared.and_then(|c| c.registered_as.as_deref());
     let route_key = route_key(opts.plugin_name, registered_as, routes);
 
-    // `--prefix` says the plugin mounts routes, so none found is a failure.
-    let registered_routeless = registered_as.filter(|_| opts.expected_prefix.is_none());
+    // Only an explicit `--no-routes` lets none found skip; a plugin that
+    // mounted an unannotated router would otherwise skip every route check.
+    let registered_routeless = registered_as.filter(|_| opts.no_routes);
     checks.push(
         check_split_attribution(declared, opts.plugin_name, routes).unwrap_or_else(|| {
             check_route_attribution(opts.plugin_name, route_key, routes, registered_routeless)
@@ -677,9 +683,9 @@ fn check_split_attribution(
 
 /// `route_key` is the name routes are matched under (see [`route_key`]).
 /// `registered_as` is the `Plugin::name()` the contract dump gives, passed
-/// only when no `--prefix` was given. When no route carries either name, such
-/// a plugin mounts none (a cache, a search index): the check skips. With
-/// `--prefix`, the plugin must mount routes, so none found fails.
+/// only with `--no-routes`. Then no routes (a cache, a search index) skips,
+/// and routes found contradict the assertion and fail. Without it, no routes
+/// found fails.
 fn check_route_attribution(
     plugin_name: &str,
     route_key: &str,
@@ -689,14 +695,26 @@ fn check_route_attribution(
     let expected = format!("plugin:{route_key}");
     let plugin_routes: Vec<&RouteInfo> = routes.iter().filter(|r| r.source == expected).collect();
 
-    if let (true, Some(registered)) = (plugin_routes.is_empty(), registered_as) {
-        return CheckResult {
-            name: "route-attribution".to_owned(),
-            status: CheckStatus::Skip,
-            message: format!(
-                "{plugin_name} is registered as `{registered}` and contributes no routes"
-            ),
-            diagnostics: vec![],
+    if let Some(registered) = registered_as {
+        return if plugin_routes.is_empty() {
+            CheckResult {
+                name: "route-attribution".to_owned(),
+                status: CheckStatus::Skip,
+                message: format!(
+                    "{plugin_name} is registered as `{registered}` and contributes no routes"
+                ),
+                diagnostics: vec![],
+            }
+        } else {
+            CheckResult {
+                name: "route-attribution".to_owned(),
+                status: CheckStatus::Fail,
+                message: format!(
+                    "--no-routes was given, but {} route(s) are attributed to plugin:{route_key}",
+                    plugin_routes.len()
+                ),
+                diagnostics: vec![],
+            }
         };
     }
 
@@ -1416,6 +1434,7 @@ mod tests {
             format: ReportFormat::Text,
             contracts: &ContractDump::Absent,
             deny_experimental: false,
+            no_routes: false,
         };
         let routes = vec![make_route("GET", "/posts", "user")];
         let report = build_report(&opts, &routes);
@@ -1433,6 +1452,7 @@ mod tests {
             format: ReportFormat::Text,
             contracts: &ContractDump::Absent,
             deny_experimental: false,
+            no_routes: false,
         };
         let report = build_report(&opts, &[]);
         assert!(!report.checks.iter().any(|c| c.name == "route-prefix"));
@@ -1449,6 +1469,7 @@ mod tests {
             format: ReportFormat::Text,
             contracts: &ContractDump::Absent,
             deny_experimental: false,
+            no_routes: false,
         };
         let routes = vec![make_route("GET", "/admin", "plugin:admin")];
         let report = build_report(&opts, &routes);
@@ -1466,6 +1487,7 @@ mod tests {
             format: ReportFormat::Text,
             contracts: &ContractDump::Absent,
             deny_experimental: false,
+            no_routes: false,
         };
         let report = build_report(&opts, &[]);
         assert_eq!(report.plugin_name, "autumn-admin-plugin");
@@ -1527,6 +1549,7 @@ mod contract_tests {
             format: ReportFormat::Text,
             contracts,
             deny_experimental: false,
+            no_routes: false,
         }
     }
 
@@ -1570,9 +1593,31 @@ mod contract_tests {
     #[test]
     fn a_registered_plugin_with_no_routes_skips_route_attribution() {
         let dump = present(vec![demo_contract()]);
-        let report = build_report(&opts(&dump), &[]);
+        let mut o = opts(&dump);
+        o.no_routes = true;
+        let report = build_report(&o, &[]);
         assert_eq!(find(&report, "route-attribution").status, CheckStatus::Skip);
         assert!(report.passed(), "{}", report.to_text_report());
+    }
+
+    /// No routes skips only on an explicit `--no-routes`: an unannotated
+    /// `nest` also dumps none, and must not pass unchecked.
+    #[test]
+    fn no_routes_without_the_assertion_fails_attribution() {
+        let dump = present(vec![demo_contract()]);
+        let report = build_report(&opts(&dump), &[]);
+        assert_eq!(find(&report, "route-attribution").status, CheckStatus::Fail);
+        // And the assertion is refused when routes are there.
+        let mut o = opts(&dump);
+        o.no_routes = true;
+        let report = build_report(&o, &[route()]);
+        let attribution = find(&report, "route-attribution");
+        assert_eq!(attribution.status, CheckStatus::Fail);
+        assert!(
+            attribution.message.contains("--no-routes"),
+            "{}",
+            attribution.message
+        );
     }
 
     /// `--plugin-name` is the crate name, but routes are attributed to

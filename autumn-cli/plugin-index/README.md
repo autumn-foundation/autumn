@@ -30,6 +30,10 @@ You need a published `autumn-plugin-<name>` crate. Then do these steps.
      --format json > autumn-plugin-<name>.json
    ```
 
+   A plugin that mounts no routes (a cache, a search index) passes
+   `--no-routes` instead of `--prefix`, and its listing sets
+   `no_routes = true`. Without it, a run that finds no routes fails.
+
    All checks must pass or skip. Give one `--sensitive-route` for each
    admin, debug, credential, operator, secret or metrics route. CI uses the
    same values from your listing.
@@ -64,7 +68,7 @@ autumn_web = "0.7"
 tier = "stable"
 trust = "native"
 status = "listed"
-prefix = "/<name>"
+prefix = "/<name>"          # or `no_routes = true` for a plugin with none
 # sensitive_routes = ["/<name>/admin:Role: admin required"]
 
 [plugin.conformance]
