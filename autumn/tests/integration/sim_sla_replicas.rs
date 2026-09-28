@@ -14,10 +14,11 @@ use autumn_web::prelude::*;
 use autumn_web::sla::{
     BusinessCalendar, BusinessDuration, ESCALATE_JOB, MemoryObligationStore, Obligation,
     ObligationRecord, ObligationStore, Sla, SlaBreach, SlaError, SlaPlugin, StoreFuture,
+    WorkingHours,
 };
 use autumn_web::test::{TestApp, TestClient};
 use autumn_web::time::TickingClock;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc, Weekday};
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
@@ -1184,6 +1185,41 @@ async fn sim_sla_a_dispatched_escalation_retries_after_an_on_time_backfill() {
     tokio::time::sleep(Duration::from_secs(1)).await;
     settle().await;
     assert_eq!(*fired.lock().unwrap(), ["first_response/ticket:1"]);
+
+    job::clear_global_job_client();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sim_sla_a_deadline_at_the_no_deadline_marker_is_refused_before_insert() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let start = Utc.with_ymd_and_hms(9999, 12, 31, 23, 59, 58).unwrap();
+    let clock = TickingClock::starting_at(start);
+    let store = RacingStore::new();
+    let mut all_week = BusinessCalendar::weekdays(WorkingHours::ALL_DAY);
+    for day in [Weekday::Sat, Weekday::Sun] {
+        all_week = all_week.hours(day, WorkingHours::ALL_DAY);
+    }
+    let app = TestApp::new()
+        .with_clock(clock.clone())
+        .plugin(
+            SlaPlugin::new()
+                .calendar("all", all_week.zone(chrono_tz::Tz::UTC))
+                .store(store.clone()),
+        )
+        .build();
+    let sla = Sla::from_state(app.state()).unwrap();
+    // The deadline is 9999-12-31T23:59:59Z, the no-deadline marker.
+    let ob = Obligation::new("first_response", "ticket:1")
+        .within(BusinessDuration::from_parts(0, 1))
+        .calendar("all")
+        .starting_at(start);
+    assert!(matches!(sla.track(&ob).await, Err(SlaError::NoDeadline(_))));
+    assert!(
+        store.inner.get(&ob.key()).await.unwrap().is_none(),
+        "a refused obligation leaves no record"
+    );
 
     job::clear_global_job_client();
 }

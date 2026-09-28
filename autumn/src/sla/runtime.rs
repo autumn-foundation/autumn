@@ -315,7 +315,9 @@ impl Sla {
             .starting_at(obligation.started_at().unwrap_or(now));
         let key = resolved.key();
         // Refuse before the insert, so a refused obligation leaves no record.
-        let Some(due_at) = resolved.status_with(calendar, zone, now).due_at else {
+        let Some(due_at) =
+            super::store::real_deadline(resolved.status_with(calendar, zone, now).due_at)
+        else {
             return Err(SlaError::NoDeadline(key));
         };
         let store = &self.engine.store;
@@ -426,7 +428,8 @@ impl Sla {
             }
             // No deadline in the scan horizon: store the marker that no
             // claim matches, so an old check cannot escalate.
-            let stored = status.due_at.unwrap_or_else(super::store::no_deadline);
+            let due = super::store::real_deadline(status.due_at);
+            let stored = due.unwrap_or_else(super::store::no_deadline);
             if record.due_at != Some(stored)
                 && !store
                     .set_due(&status.key, record.generation, stored)
@@ -435,7 +438,7 @@ impl Sla {
                 // The record was escalated or replaced after the read.
                 continue;
             }
-            let Some(due) = status.due_at else { continue };
+            let Some(due) = due else { continue };
             if status.state == ObligationState::Met {
                 // Met on time on this calendar: the stored deadline is
                 // enough, and no check is necessary.
