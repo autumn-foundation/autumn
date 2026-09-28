@@ -437,21 +437,55 @@ pub fn workspace_root(dir: &Path) -> PathBuf {
             };
             // An excluded package is its own workspace; Cargo looks further up.
             // An explicit `members` entry wins over `exclude`, as in Cargo's
-            // `is_excluded`: both are path prefixes, not globs.
+            // `is_excluded`. A `members` entry may be a glob (`crates/*`).
             let relative = dir.strip_prefix(d).unwrap_or(&dir);
             let listed = |key: &str| {
                 workspace
                     .get(key)
                     .and_then(toml::Value::as_array)
                     .is_some_and(|paths| {
-                        paths.iter().filter_map(toml::Value::as_str).any(|path| {
-                            relative.starts_with(Path::new(path.trim_start_matches("./")))
-                        })
+                        paths
+                            .iter()
+                            .filter_map(toml::Value::as_str)
+                            .any(|pattern| under_pattern(relative, pattern))
                     })
             };
             !listed("exclude") || listed("members")
         })
         .map_or_else(|| dir.clone(), Path::to_path_buf)
+}
+
+/// Whether `relative` is at or under the directory `pattern` names: a plain
+/// path, or a Cargo `members` glob with `*`, `?` or `**` segments.
+fn under_pattern(relative: &Path, pattern: &str) -> bool {
+    fn segments(pattern: &[&str], parts: &[String]) -> bool {
+        match pattern.split_first() {
+            None => true,
+            Some((&"**", rest)) => (0..=parts.len()).any(|skip| segments(rest, &parts[skip..])),
+            Some((glob, rest)) => parts.split_first().is_some_and(|(part, tail)| {
+                let glob: Vec<char> = glob.chars().collect();
+                let part: Vec<char> = part.chars().collect();
+                wildcard(&glob, &part) && segments(rest, tail)
+            }),
+        }
+    }
+    fn wildcard(glob: &[char], name: &[char]) -> bool {
+        match glob.split_first() {
+            None => name.is_empty(),
+            Some(('*', rest)) => (0..=name.len()).any(|skip| wildcard(rest, &name[skip..])),
+            Some(('?', rest)) => !name.is_empty() && wildcard(rest, &name[1..]),
+            Some((c, rest)) => name.first() == Some(c) && wildcard(rest, &name[1..]),
+        }
+    }
+    let pattern: Vec<&str> = pattern
+        .split(['/', '\\'])
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect();
+    let parts: Vec<String> = relative
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    segments(&pattern, &parts)
 }
 
 /// The version of `crate_name` the workspace's `Cargo.lock` resolved for the
@@ -1475,6 +1509,18 @@ mod tests {
         );
         write(&app.join("Cargo.toml"), "[package]\nname = \"app\"\n");
         assert_eq!(workspace_root(&app), root);
+        // A member glob is an explicit member too.
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"crates/app\"]\n",
+        );
+        assert_eq!(workspace_root(&app), root);
+        // A glob that does not match leaves the exclusion in force.
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"libs/*\"]\nexclude = [\"crates/app\"]\n",
+        );
+        assert_eq!(workspace_root(&app), std::path::absolute(&app).unwrap());
     }
 
     /// A package an ancestor workspace excludes is its own root.

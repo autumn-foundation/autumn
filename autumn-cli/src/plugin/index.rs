@@ -917,10 +917,19 @@ fn concrete(version: &str) -> Option<semver::Version> {
     // A full version keeps its prerelease: `0.7.0-alpha.1` is outside `0.7`,
     // and reading it as `0.7.0` would admit it.
     let full = version.trim().trim_start_matches(['=', '^', '~', ' ']);
-    semver::Version::parse(full).ok().or_else(|| {
-        super::install::parse_version(version)
-            .map(|(major, minor, patch)| semver::Version::new(major, minor, patch))
-    })
+    semver::Version::parse(full)
+        .ok()
+        .or_else(|| {
+            super::install::parse_version(version)
+                .map(|(major, minor, patch)| semver::Version::new(major, minor, patch))
+        })
+        // A major alone (`^1`, `~1`) starts at `major.0.0`; `requirement_top`
+        // bounds the rest.
+        .or_else(|| {
+            full.parse()
+                .ok()
+                .map(|major| semver::Version::new(major, 0, 0))
+        })
 }
 
 /// The highest version an unresolved `^`/`~` requirement `app` (lowest
@@ -1183,6 +1192,16 @@ mod tests {
         one_two.autumn_web = "~1.2".to_owned();
         assert_eq!(one_two.compat("~1.2"), Compat::Compatible);
         assert_eq!(one_two.compat("^1.2"), Compat::Unknown);
+        // A major alone is a range too, from `major.0.0`.
+        let one = Listing {
+            autumn_web: "1".to_owned(),
+            ..community()
+        };
+        assert_eq!(one.compat("^1"), Compat::Compatible);
+        assert_eq!(one.compat("~1"), Compat::Compatible);
+        // `~1` starts below `~1.2`: refused, like any range whose floor is
+        // outside the listing.
+        assert_eq!(one_two.compat("~1"), Compat::Incompatible);
         // A prerelease is not in the stable range Cargo matches it against.
         assert_eq!(listing.compat("0.7.0-alpha.1"), Compat::Incompatible);
     }
