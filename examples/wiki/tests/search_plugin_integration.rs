@@ -31,6 +31,7 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
 use testcontainers::ContainerAsync;
+use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
@@ -53,8 +54,9 @@ const MIGRATION_FILES: &[&str] = &[
 ];
 
 fn apply_migrations(conn: &mut PgConnection) {
-    for sql in MIGRATION_FILES {
-        conn.batch_execute(sql).expect("apply wiki migration");
+    for (index, sql) in MIGRATION_FILES.iter().enumerate() {
+        conn.batch_execute(sql)
+            .unwrap_or_else(|e| panic!("apply wiki migration #{index}: {e}"));
     }
 }
 
@@ -72,7 +74,14 @@ async fn boot() -> (
     Pool<AsyncPgConnection>,
     ContainerAsync<Postgres>,
 ) {
+    // `Postgres::default()` is 11-alpine (testcontainers-modules' own
+    // default), which predates generated columns (Postgres 12+) — the
+    // `add_search_to_pages` migration's `GENERATED ALWAYS AS (...) STORED`
+    // fails on it. Pinned to 16-alpine for the same reason
+    // `tests/collection_links_batch_profile.rs`, which applies these same
+    // migration files, already does.
     let container = Postgres::default()
+        .with_tag("16-alpine")
         .start()
         .await
         .expect("failed to start postgres container");
