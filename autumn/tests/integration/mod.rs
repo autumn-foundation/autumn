@@ -382,19 +382,26 @@ mod sharding_commit_hooks;
 mod sharding_integration;
 mod signed_webhooks;
 mod sim_advance_to;
+mod sim_ambient_clock;
+mod sim_ambient_modules;
 mod sim_chaos_clock_skew_monotonic;
 mod sim_clock_drain;
 #[cfg(feature = "collab")]
 mod sim_collab_convergence;
+mod sim_crash_at;
 mod sim_default_entropy;
 mod sim_delayed_enqueue;
 mod sim_deterministic_ids;
+mod sim_drain_stall;
 mod sim_fault_plan;
 mod sim_fault_plan_pg;
+mod sim_interleave;
 mod sim_job_clock;
 mod sim_liveness_watchdog;
 mod sim_llm_stub;
 mod sim_monotonic_clock;
+#[cfg(feature = "http-client")]
+mod sim_net;
 mod sim_rate_limit_clock;
 mod sim_retry_storm;
 mod sim_scheduled_ticks;
