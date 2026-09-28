@@ -73,7 +73,7 @@ pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
 # links it fails with an undefined symbol. Remove this pin when a fixed
 # release is out. `pq-sys` (below `autumn-web`'s `db` feature) accepts
 # `>=0.2, <0.4`, so the pin changes no other crate.
-pq-src = { version = ">=0.3, <0.3.12", default-features = false }
+pq-src = { version = ">=0.3, <0.3.14", default-features = false }
 # `async-connection-wrapper` provides the sync diesel API (incl. running
 # diesel_migrations) over an async connection — used to run startup
 # migrations and wait checks through the rustls TLS connector, since the
