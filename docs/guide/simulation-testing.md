@@ -614,10 +614,14 @@ seams instead:
 | Any of the time reads above, with no clock in scope | `autumn_web::time::ambient_now()`, `ambient_monotonic()`, `ambient_instant()`, `ambient_system_time()` — these read the running `Sim`'s clock on this thread, else the system clock |
 
 Each `Sim` has its own elapsed-time timeline, and the system clock is another
-one. An ambient instant is comparable only with instants from the same
-timeline. Keep state that stores ambient instants (a cache, a presence map)
-inside one `Sim`, and do not share it with a nested `Sim` or with code outside
-the sim.
+one. `ambient_monotonic()` readings are comparable only within one timeline.
+`ambient_instant()` joins the timelines one after the other: a `Sim` starts its
+instants at the latest instant already given out in the process. So state that
+outlives one `Sim` sees the next one's instants as later, and its TTLs and idle
+ages run on. The reverse is not covered: an outer `Sim` sees instants that a
+nested `Sim` stored as future ones. Keep state that stores ambient instants (a
+cache, a presence map) inside one `Sim`, and do not share it with a nested
+`Sim` or with code outside the sim.
 
 If you write a custom `impl ClockSource` whose `now()` is virtual, you **must**
 also override `monotonic()`. The trait ships a default body that reads the real

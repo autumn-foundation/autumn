@@ -68,36 +68,81 @@ async fn sim_ambient_modules_global_breakers_stay_on_real_time(sim: Sim) {
     );
 }
 
-#[sim_test]
-async fn sim_ambient_modules_idempotency_entries_stay_on_their_timeline(sim: Sim) {
-    use autumn_web::idempotency::{IdempotencyRecord, IdempotencyStore, MemoryIdempotencyStore};
-
-    let store = MemoryIdempotencyStore::new(Duration::from_secs(60));
-    sim.advance(Duration::from_secs(3600)).await;
-    let record = IdempotencyRecord {
+fn idempotency_record() -> autumn_web::idempotency::IdempotencyRecord {
+    autumn_web::idempotency::IdempotencyRecord {
         status: 200,
         headers: Vec::new(),
         body: b"ok".to_vec(),
         metadata: Vec::new(),
-    };
-    store.set("k", record, b"hash".to_vec(), Duration::from_secs(60));
-    assert!(store.try_lock("lock", Duration::from_secs(60)));
-    assert!(store.get("k").is_some(), "fresh on its own timeline");
-    assert!(
-        !store.try_lock("lock", Duration::from_secs(60)),
-        "still held"
-    );
+    }
+}
 
-    // A new sim starts at zero. The entry and the lock were stored an hour
-    // later on another timeline, so they must not outlive their TTL here.
+#[sim_test]
+async fn sim_ambient_modules_idempotency_ttl_runs_on_into_the_next_sim(sim: Sim) {
+    use autumn_web::idempotency::{IdempotencyStore, MemoryIdempotencyStore};
+
+    let minute = Duration::from_secs(60);
+    let store = MemoryIdempotencyStore::new(minute);
+    let first = Sim::from_seed(sim.seed.wrapping_add(1));
+    first.advance(Duration::from_secs(3600)).await;
+    store.set("k", idempotency_record(), b"hash".to_vec(), minute);
+    assert!(store.try_lock("lock", minute));
+    drop(first);
+
+    // The next sim's instants start after the first sim's. The entry and the
+    // lock live out their minute there, and no longer.
+    let second = Sim::from_seed(sim.seed.wrapping_add(2));
+    assert!(store.get("k").is_some(), "inside its TTL");
+    assert!(!store.try_lock("lock", minute), "still held");
+    second.advance(minute + Duration::from_secs(1)).await;
+    assert!(store.get("k").is_none(), "its TTL ran out");
+    assert!(store.try_lock("lock", minute), "the lock ran out");
+}
+
+#[sim_test]
+async fn sim_ambient_modules_idempotency_entries_from_a_nested_sim_are_stale(sim: Sim) {
+    use autumn_web::idempotency::{IdempotencyStore, MemoryIdempotencyStore};
+
+    let minute = Duration::from_secs(60);
+    let store = MemoryIdempotencyStore::new(minute);
     let inner = Sim::from_seed(sim.seed.wrapping_add(1));
+    inner.advance(Duration::from_secs(3600)).await;
+    store.set("k", idempotency_record(), b"hash".to_vec(), minute);
+    assert!(store.try_lock("lock", minute));
+    assert!(store.get("k").is_some(), "fresh on its own timeline");
+    drop(inner);
+
+    // Back on the outer timeline, the inner sim's hour is in the future. An
+    // entry that expires more than its TTL from now is from another timeline.
     assert!(
         store.get("k").is_none(),
         "the entry is from another timeline"
     );
     assert!(
-        store.try_lock("lock", Duration::from_secs(60)),
+        store.try_lock("lock", minute),
         "the lock is from another timeline"
     );
-    drop(inner);
+}
+
+#[sim_test]
+async fn sim_ambient_modules_tenant_cells_idle_out_in_the_next_sim(sim: Sim) {
+    use autumn_web::TenantCellRegistry;
+
+    let minute = Duration::from_secs(60);
+    let registry = TenantCellRegistry::with_limits(0, Some(minute));
+    let first = Sim::from_seed(sim.seed.wrapping_add(1));
+    first.advance(Duration::from_secs(3600)).await;
+    let _cell = registry.get_or_create("tenant", 1024);
+    drop(first);
+
+    // The next sim's instants start after the first sim's, so the cell's
+    // idle age runs on there.
+    let second = Sim::from_seed(sim.seed.wrapping_add(2));
+    assert_eq!(registry.evict_idle_older_than(minute), 0, "not idle yet");
+    second.advance(minute + Duration::from_secs(1)).await;
+    assert_eq!(
+        registry.evict_idle_older_than(minute),
+        1,
+        "idle past its TTL"
+    );
 }

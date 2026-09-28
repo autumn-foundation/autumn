@@ -481,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn a_log_from_a_later_timeline_is_not_this_ones_last_hour() {
+    fn a_log_from_a_nested_timeline_is_not_the_outer_ones_last_hour() {
         use std::sync::Arc;
 
         use chrono::TimeZone as _;
@@ -491,27 +491,28 @@ mod tests {
         let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
         let hour = Duration::from_secs(3600);
         let log = PluginActivityLog::new();
+        let outer = TickingClock::starting_at(epoch);
+        let _outer = install_ambient(Arc::new(outer.clone()));
 
-        // Two hours into one timeline, the plugin calls and drops calls.
-        let first = TickingClock::starting_at(epoch);
-        first.advance(2 * hour);
-        let guard = install_ambient(Arc::new(first));
+        // Two hours into a nested timeline, the plugin calls and drops calls.
+        let inner = TickingClock::starting_at(epoch);
+        let guard = install_ambient(Arc::new(inner.clone()));
+        inner.advance(2 * hour);
         log.ingest("shop", [event("kv-get", CapabilityOutcome::Allowed)]);
         log.ingest_dropped("shop", 3);
         drop(guard);
 
-        // A new timeline starts at zero. Those calls are not its last hour.
-        let second = TickingClock::starting_at(epoch);
-        let _guard = install_ambient(Arc::new(second.clone()));
+        // Those records are in the outer timeline's future, not its last hour.
         let summary = log.summary("shop", hour);
         assert_eq!(summary.allowed.get("kv-get"), None);
         assert_eq!(summary.dropped, 0);
 
-        // Its first call removes them, so they do not come back later on.
+        // The outer timeline's first call removes them, so they do not come
+        // back once it catches up.
         log.ingest("shop", [event("kv-set", CapabilityOutcome::Allowed)]);
         log.ingest_dropped("shop", 1);
-        second.advance(2 * hour);
-        let summary = log.summary("shop", 3 * hour);
+        outer.advance(3 * hour);
+        let summary = log.summary("shop", 4 * hour);
         assert_eq!(summary.allowed.get("kv-get"), None);
         assert_eq!(summary.allowed.get("kv-set").copied(), Some(1));
         assert_eq!(summary.dropped, 1);

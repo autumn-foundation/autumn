@@ -503,6 +503,28 @@ struct AmbientEntry {
     /// Cleared when the guard drops, on any thread.
     alive: Arc<std::sync::atomic::AtomicBool>,
     clock: Arc<dyn ClockSource>,
+    /// Where this clock's [`ambient_instant`]s start, after
+    /// `MONOTONIC_ORIGIN`.
+    floor: Duration,
+    /// The clock's own monotonic reading when it was installed.
+    start: Duration,
+}
+
+/// The latest [`ambient_instant`] given out in this process, in nanoseconds
+/// after `MONOTONIC_ORIGIN`.
+///
+/// A clock installed later starts its instants here, so a new timeline never
+/// starts before an earlier one's instants. State that outlives one `Sim` then
+/// sees the next `Sim`'s instants as later, as real time would, and its TTLs
+/// and idle ages run on (issue #2967).
+static INSTANT_HIGH_WATER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Where a clock installed now starts its instants: the system clock or the
+/// latest instant given out, whichever is later.
+fn instant_floor() -> Duration {
+    let high_water =
+        Duration::from_nanos(INSTANT_HIGH_WATER.load(std::sync::atomic::Ordering::Relaxed));
+    SystemClock.monotonic().since_origin().max(high_water)
 }
 
 /// Removes its clock from the ambient stack when dropped.
@@ -532,28 +554,41 @@ impl Drop for AmbientGuard {
 /// newest installed clock wins, so a nested `Sim` shadows an outer one.
 pub(crate) fn install_ambient(clock: Arc<dyn ClockSource>) -> AmbientGuard {
     let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    // Read before the stack is borrowed: a sim clock's read touches its own
+    // state, not this stack.
+    let start = clock.monotonic().since_origin();
+    let floor = instant_floor();
     AMBIENT.with(|stack| {
         stack.borrow_mut().push(AmbientEntry {
             alive: Arc::clone(&alive),
             clock,
+            floor,
+            start,
         });
     });
     AmbientGuard { alive }
 }
 
-/// Run `read` on the ambient clock, or on [`SystemClock`] when none is set.
-fn with_ambient<T>(read: impl FnOnce(&dyn ClockSource) -> T) -> T {
-    let clock = AMBIENT
+/// The newest live ambient clock on this thread, with its instant floor and
+/// start reading.
+fn ambient_entry() -> Option<(Arc<dyn ClockSource>, Duration, Duration)> {
+    AMBIENT
         .try_with(|stack| {
             let mut stack = stack.try_borrow_mut().ok()?;
             // Prune entries whose guard dropped on another thread.
             stack.retain(|entry| entry.alive.load(std::sync::atomic::Ordering::Acquire));
-            stack.last().map(|entry| Arc::clone(&entry.clock))
+            stack
+                .last()
+                .map(|entry| (Arc::clone(&entry.clock), entry.floor, entry.start))
         })
         .ok()
-        .flatten();
-    match clock {
-        Some(clock) => read(clock.as_ref()),
+        .flatten()
+}
+
+/// Run `read` on the ambient clock, or on [`SystemClock`] when none is set.
+fn with_ambient<T>(read: impl FnOnce(&dyn ClockSource) -> T) -> T {
+    match ambient_entry() {
+        Some((clock, _, _)) => read(clock.as_ref()),
         None => read(&SystemClock),
     }
 }
@@ -566,11 +601,16 @@ fn with_ambient<T>(read: impl FnOnce(&dyn ClockSource) -> T) -> T {
 /// ([`ambient_monotonic`], [`ambient_instant`]) follows tokio's paused clock.
 /// So an ambient deadline and a `tokio::time::sleep` stay on one timeline.
 ///
-/// Each `Sim` has its own timeline, and the system clock is another one. An
-/// ambient instant is comparable only with instants from the same timeline.
-/// Keep state that stores ambient instants (a cache, a presence map) inside
-/// one `Sim`, and do not share it with a nested `Sim` or with code outside
-/// the sim. Process-global state reads the system clock instead (the global
+/// Each `Sim` has its own timeline, and the system clock is another one.
+/// [`ambient_monotonic`] readings are comparable only within one timeline.
+/// [`ambient_instant`] joins the timelines one after the other: a clock
+/// installed later starts its instants at the latest instant already given
+/// out. So state that outlives one `Sim` sees the next one's instants as
+/// later, and its TTLs and idle ages run on. The reverse is not covered: an
+/// outer `Sim` sees the instants a nested `Sim` stored as future ones. Keep
+/// state that stores ambient instants (a cache, a presence map) inside one
+/// `Sim`, and do not share it with a nested `Sim` or with code outside the
+/// sim. Process-global state reads the system clock instead (the global
 /// circuit-breaker registry does).
 ///
 /// Use it where framework code needs a clock but has none in scope. Prefer
@@ -608,9 +648,24 @@ pub fn ambient_monotonic() -> MonotonicInstant {
 ///
 /// Measure with `ambient_instant().saturating_duration_since(start)`, not
 /// `start.elapsed()`: `elapsed` reads the OS clock.
+///
+/// Under a `Sim`, the instant is the sim's elapsed time after a floor fixed
+/// when the sim started. The floor is never before an instant given out
+/// earlier, so instants from one `Sim` to the next go forward. See
+/// [`AmbientClock`].
 #[must_use]
 pub fn ambient_instant() -> std::time::Instant {
-    *MONOTONIC_ORIGIN + ambient_monotonic().since_origin()
+    let offset = match ambient_entry() {
+        Some((clock, floor, start)) => {
+            floor.saturating_add(clock.monotonic().since_origin().saturating_sub(start))
+        }
+        None => SystemClock.monotonic().since_origin(),
+    };
+    INSTANT_HIGH_WATER.fetch_max(
+        u64::try_from(offset.as_nanos()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    *MONOTONIC_ORIGIN + offset
 }
 
 /// The system monotonic clock as a [`std::time::Instant`], never a `Sim`'s.
@@ -882,6 +937,27 @@ mod tests {
         assert_eq!(ambient_now(), pinned);
         drop(outer);
         assert!(ambient_now() > later, "the system clock again");
+    }
+
+    #[test]
+    fn a_later_timeline_starts_after_earlier_instants() {
+        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let hour = std::time::Duration::from_secs(3600);
+        let first = TickingClock::starting_at(epoch);
+        let guard = install_ambient(Arc::new(first.clone()));
+        let start = ambient_instant();
+        first.advance(hour);
+        let stored = ambient_instant();
+        assert_eq!(stored.saturating_duration_since(start), hour);
+        drop(guard);
+
+        // A second clock at the same reading starts after the first's hour.
+        let second = TickingClock::starting_at(epoch);
+        let _guard = install_ambient(Arc::new(second.clone()));
+        let fresh = ambient_instant();
+        assert!(fresh >= stored, "a new timeline does not go back");
+        second.advance(hour);
+        assert_eq!(ambient_instant().saturating_duration_since(fresh), hour);
     }
 
     #[test]

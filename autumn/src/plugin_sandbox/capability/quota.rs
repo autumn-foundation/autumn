@@ -279,24 +279,25 @@ mod tests {
     use crate::time::{TickingClock, install_ambient};
 
     #[test]
-    fn a_bucket_from_a_later_timeline_refills_on_this_one() {
+    fn a_bucket_from_a_nested_timeline_refills_on_the_outer_one() {
         let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
         let capability = SandboxCapability::ALL[0];
-
-        // The limiter is built and drained an hour into one timeline.
-        let first = TickingClock::starting_at(epoch);
-        first.advance(Duration::from_secs(3600));
-        let guard = install_ambient(Arc::new(first));
+        let outer = TickingClock::starting_at(epoch);
+        let _outer = install_ambient(Arc::new(outer.clone()));
         let limiter = CapabilityRateLimiter::new(1);
+
+        // A nested timeline drains the bucket an hour in.
+        let inner = TickingClock::starting_at(epoch);
+        let guard = install_ambient(Arc::new(inner.clone()));
+        inner.advance(Duration::from_secs(3600));
         assert!(limiter.try_take(capability));
         assert!(!limiter.try_take(capability), "drained");
         drop(guard);
 
-        // A new timeline starts at zero. One second there refills a token.
-        let second = TickingClock::starting_at(epoch);
-        let _guard = install_ambient(Arc::new(second.clone()));
+        // Back on the outer timeline, the last refill is in the future. One
+        // second here still refills one token.
         assert!(!limiter.try_take(capability), "no time has passed yet");
-        second.advance(Duration::from_secs(1));
+        outer.advance(Duration::from_secs(1));
         assert!(limiter.try_take(capability), "one second refills one token");
     }
 }
