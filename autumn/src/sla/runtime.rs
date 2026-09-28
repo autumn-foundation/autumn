@@ -418,16 +418,21 @@ impl Sla {
         for record in store.list().await? {
             // The deadline on this replica's calendars, not the stored one.
             let status = self.calendar_status(&record, now)?;
-            let Some(due) = status.due_at else { continue };
             if status.escalated_at.is_some() {
                 continue;
             }
-            if record.due_at != Some(due)
-                && !store.set_due(&status.key, record.generation, due).await?
+            // No deadline in the scan horizon: store the marker that no
+            // claim matches, so an old check cannot escalate.
+            let stored = status.due_at.unwrap_or_else(super::store::no_deadline);
+            if record.due_at != Some(stored)
+                && !store
+                    .set_due(&status.key, record.generation, stored)
+                    .await?
             {
                 // The record was escalated or replaced after the read.
                 continue;
             }
+            let Some(due) = status.due_at else { continue };
             if status.state == ObligationState::Met {
                 // Met on time on this calendar: the stored deadline is
                 // enough, and no check is necessary.
@@ -493,7 +498,11 @@ impl Sla {
         };
         let calendar = self.calendar_of(&record.obligation)?;
         let zone = self.zone_of(&record.obligation, calendar);
-        let mut status = record.obligation.status_with_due(calendar, zone, now, due);
+        let mut status = if due == super::store::no_deadline() {
+            record.obligation.status_without_due(calendar, zone, now)
+        } else {
+            record.obligation.status_with_due(calendar, zone, now, due)
+        };
         status.escalated_at = record.escalated_at;
         Ok(status)
     }

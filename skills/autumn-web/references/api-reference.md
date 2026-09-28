@@ -703,7 +703,7 @@ only the injected `Clock`.
   `::minutes` / `::from_parts(days, secs)`, `resolve(&calendar)`.
 - `Obligation::new(name, subject)` + `.within(d)` / `.calendar(name)` /
   `.zone(tz)` / `.zone_from(&value)` / `.starting_at(t)` / `.met_at(t)`;
-  `key()` is `"<name>/<subject>"`; `status_with(&cal, tz, now)` is pure.
+  `key()` is `"<name>/<subject>"` (`/` and `%` in the name percent-encoded); `status_with(&cal, tz, now)` is pure.
 - `#[obligation(name = ident, within = "...", starts = field, calendar = "...",
   met = field, zone = field, subject = field)]` on a struct adds
   `<name>_obligation(&self)`. A bad `within` is a compile error.

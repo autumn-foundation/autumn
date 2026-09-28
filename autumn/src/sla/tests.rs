@@ -894,3 +894,15 @@ async fn store_sets_the_deadline_until_the_escalation() {
             .unwrap()
     );
 }
+
+#[test]
+fn obligation_key_is_unambiguous_when_the_name_has_a_slash() {
+    let a = Obligation::new("a", "b/c").key();
+    let b = Obligation::new("a/b", "c").key();
+    assert_ne!(a, b);
+    assert_eq!(
+        Obligation::new("first_response", "ticket:1").key(),
+        "first_response/ticket:1"
+    );
+    assert_ne!(Obligation::new("a%2Fb", "c").key(), b);
+}

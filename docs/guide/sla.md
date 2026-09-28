@@ -107,7 +107,8 @@ sla.track(&ticket.first_response_obligation()).await?;
 | `subject` | no | The identity field. The default is `id`. |
 
 The subject is `"<snake_case type>:<subject field>"`, for example
-`"ticket:42"`. The key of the obligation is `"<name>/<subject>"`. You can put
+`"ticket:42"`. The key of the obligation is `"<name>/<subject>"`. A `/` or `%`
+in the name is percent-encoded, so two obligations never share a key. You can put
 more than one `#[obligation]` on one struct. Two types with the same name make
 the same subject; give them different obligation names.
 
@@ -280,7 +281,8 @@ time.
 - Calendars are set in code. There is no holiday import and no editor.
 - If a deploy changes a calendar, call `Sla::reconcile` once from the new
   version (for example, from an `on_startup` hook). It stores each open
-  record's new deadline and puts a check on the queue there. Without it, a
+  record's new deadline and puts a check on the queue there. If the new
+  calendar gives no deadline, the record never escalates. Without it, a
   record keeps the deadline that `track` stored.
 - The clock stops only outside working time. A manual pause is not available.
 - A window cannot cross midnight. Use two windows, such as `"22:00-24:00"` and

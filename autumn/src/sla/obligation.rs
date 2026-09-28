@@ -99,10 +99,12 @@ impl Obligation {
         &self.subject
     }
 
-    /// The unique key, `"<name>/<subject>"`.
+    /// The unique key, `"<name>/<subject>"`. A `%` or `/` in the name is
+    /// percent-encoded, so the first `/` always ends the name.
     #[must_use]
     pub fn key(&self) -> String {
-        format!("{}/{}", self.name, self.subject)
+        let name = self.name.replace('%', "%25").replace('/', "%2F");
+        format!("{name}/{}", self.subject)
     }
 
     /// The budget.
@@ -169,6 +171,16 @@ impl Obligation {
             status.remaining = calendar.working_time(now.max(status.started_at), due_at, zone);
         }
         status
+    }
+
+    /// Calculate the status at `now` with no deadline.
+    pub(super) fn status_without_due(
+        &self,
+        calendar: &BusinessCalendar,
+        zone: Tz,
+        now: DateTime<Utc>,
+    ) -> ObligationStatus {
+        self.status_at(calendar, zone, now, None)
     }
 
     /// Calculate the status at `now` for the deadline `due_at`.

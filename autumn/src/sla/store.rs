@@ -26,7 +26,14 @@ pub struct ObligationRecord {
     pub escalated_at: Option<DateTime<Utc>>,
     /// The deadline that decides the escalation. `track` sets it, and
     /// `Sla::reconcile` changes it. `None` means the calendar decides.
+    /// `9999-12-31T23:59:59Z` means `reconcile` found no deadline: no claim
+    /// matches it.
     pub due_at: Option<DateTime<Utc>>,
+}
+
+/// The stored deadline for "no deadline". No claim matches it.
+pub(super) fn no_deadline() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(253_402_300_799, 0).unwrap_or(DateTime::<Utc>::MAX_UTC)
 }
 
 impl ObligationRecord {

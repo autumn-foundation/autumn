@@ -928,3 +928,62 @@ async fn sim_sla_reconcile_stores_a_later_deadline_for_a_met_record() {
 
     job::clear_global_job_client();
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sim_sla_reconcile_with_no_deadline_stops_the_old_check() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let old_due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
+    let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2020, 1, 1, 10, 0, 0).unwrap());
+    let store = RacingStore::new();
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    let ob = Obligation::new("first_response", "ticket:1")
+        .within(BusinessDuration::hours(2))
+        .calendar("support")
+        .starting_at(start)
+        .zone(chrono_tz::Tz::UTC);
+    let key = ob.key();
+    let generation = Uuid::from_u128(16);
+    store
+        .inner
+        .insert(ObligationRecord::new(ob, generation).with_due_at(old_due))
+        .await
+        .unwrap();
+
+    // The new calendar has no working time, so there is no deadline.
+    {
+        let new = TestApp::new()
+            .with_clock(clock.clone())
+            .plugin(
+                SlaPlugin::new()
+                    .calendar("support", BusinessCalendar::new())
+                    .store(store.clone()),
+            )
+            .build();
+        let sla = Sla::from_state(new.state()).unwrap();
+        assert_eq!(sla.reconcile().await.unwrap(), 0);
+        let status = sla.get(&key).await.unwrap().unwrap();
+        assert_eq!(status.due_at, None);
+    }
+    job::clear_global_job_client();
+
+    // A replica with the old calendar runs the old 11:00 check.
+    let old = replica(&clock, &store, &fired);
+    let check = serde_json::json!({ "key": key, "generation": generation, "due_at": old_due });
+    let client = old.state().extension::<job::JobClient>().unwrap();
+    clock.advance(Duration::from_secs(2 * 3600));
+    client
+        .enqueue(autumn_web::sla::CHECK_JOB, check)
+        .await
+        .unwrap();
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    settle().await;
+    assert!(fired.lock().unwrap().is_empty(), "no deadline: no breach");
+    let record = store.inner.get(&key).await.unwrap().unwrap();
+    assert!(record.escalated_at.is_none());
+
+    job::clear_global_job_client();
+}
