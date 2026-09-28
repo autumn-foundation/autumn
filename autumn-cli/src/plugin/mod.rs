@@ -670,8 +670,12 @@ pub fn gate_listing(listing: &index::Listing, app: Option<&str>) -> Result<(), S
         ));
     }
     // A first-party listing is lockstep; `install::plan_add` gives the
-    // series diagnostic for it.
-    if listing.origin == index::ListingOrigin::FirstParty {
+    // series diagnostic for it. Not for a prerelease app: `plan_add` reads
+    // versions without their prerelease, and a stable plugin pin next to a
+    // prerelease framework is a second framework copy.
+    let prerelease = semver::Version::parse(app.trim().trim_start_matches(['=', '^', '~', ' ']))
+        .is_ok_and(|version| !version.pre.is_empty());
+    if listing.origin == index::ListingOrigin::FirstParty && !prerelease {
         return Ok(());
     }
     Err(format!(
@@ -1990,6 +1994,15 @@ mod tests {
         assert_eq!(app("=0.7.0", None).as_deref(), Some("0.7.0"));
         assert_eq!(app("=0.7", None).as_deref(), Some("~0.7"));
         assert_eq!(app("0.7", None).as_deref(), Some("^0.7"));
+    }
+
+    /// A first-party listing is lockstep, but not across a prerelease: a
+    /// stable pin next to a prerelease framework is a second copy.
+    #[test]
+    fn a_first_party_listing_refuses_a_prerelease_app() {
+        let admin = bundled().get("autumn-admin-plugin").expect("admin").clone();
+        assert!(gate_listing(&admin, Some(&format!("{RELEASE}-alpha.1"))).is_err());
+        assert!(gate_listing(&admin, Some(RELEASE)).is_ok());
     }
 
     /// A listed community crate needs the app's version: a path checkout with

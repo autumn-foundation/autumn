@@ -286,8 +286,10 @@ fn dependency_tables(table: &toml::Table) -> impl Iterator<Item = &toml::Table> 
 /// `{ workspace = true }` entries resolved from the workspace root. A
 /// `[workspace.dependencies]` default the package does not inherit is not
 /// its entry. An inherited `autumn-web` the workspace does not define comes
-/// back as an empty table: declared, but unresolved.
-fn package_autumn_web_entries(root: &Path) -> Vec<toml::Value> {
+/// back as an empty table: declared, but unresolved. The flag says whether
+/// the entry was inherited: its relative `path` then resolves from the
+/// workspace root, not the package.
+fn package_autumn_web_entries(root: &Path) -> Vec<(toml::Value, bool)> {
     let read = |path: &Path| {
         std::fs::read_to_string(path)
             .ok()
@@ -300,9 +302,10 @@ fn package_autumn_web_entries(root: &Path) -> Vec<toml::Value> {
         .and_then(|table| table.get("workspace")?.get("dependencies").cloned());
     let mut entries = Vec::new();
     for (key, entry) in dependency_tables(&table).flat_map(|deps| deps.iter()) {
-        let entry = if entry.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+        let inherited = entry.get("workspace").and_then(toml::Value::as_bool) == Some(true);
+        let entry = if inherited {
             match workspace_deps.as_ref().and_then(|deps| deps.get(key)) {
-                Some(inherited) => inherited.clone(),
+                Some(from_root) => from_root.clone(),
                 None if key == "autumn-web" => toml::Value::Table(toml::Table::new()),
                 None => continue,
             }
@@ -312,7 +315,7 @@ fn package_autumn_web_entries(root: &Path) -> Vec<toml::Value> {
         if key == "autumn-web"
             || entry.get("package").and_then(toml::Value::as_str) == Some("autumn-web")
         {
-            entries.push(entry);
+            entries.push((entry, inherited));
         }
     }
     entries
@@ -326,7 +329,7 @@ fn package_autumn_web_entries(root: &Path) -> Vec<toml::Value> {
 #[must_use]
 pub fn declared_autumn_web_versions(root: &Path) -> Vec<String> {
     let mut versions: Vec<String> = Vec::new();
-    for entry in package_autumn_web_entries(root) {
+    for (entry, _) in package_autumn_web_entries(root) {
         let version = match entry {
             toml::Value::String(version) => Some(version),
             toml::Value::Table(fields) => fields
@@ -437,55 +440,22 @@ pub fn workspace_root(dir: &Path) -> PathBuf {
             };
             // An excluded package is its own workspace; Cargo looks further up.
             // An explicit `members` entry wins over `exclude`, as in Cargo's
-            // `is_excluded`. A `members` entry may be a glob (`crates/*`).
+            // `is_excluded`: both compare as literal path prefixes, so a
+            // member glob (`crates/*`) does not override an exclusion.
             let relative = dir.strip_prefix(d).unwrap_or(&dir);
             let listed = |key: &str| {
                 workspace
                     .get(key)
                     .and_then(toml::Value::as_array)
                     .is_some_and(|paths| {
-                        paths
-                            .iter()
-                            .filter_map(toml::Value::as_str)
-                            .any(|pattern| under_pattern(relative, pattern))
+                        paths.iter().filter_map(toml::Value::as_str).any(|path| {
+                            relative.starts_with(Path::new(path.trim_start_matches("./")))
+                        })
                     })
             };
             !listed("exclude") || listed("members")
         })
         .map_or_else(|| dir.clone(), Path::to_path_buf)
-}
-
-/// Whether `relative` is at or under the directory `pattern` names: a plain
-/// path, or a Cargo `members` glob with `*`, `?` or `**` segments.
-fn under_pattern(relative: &Path, pattern: &str) -> bool {
-    fn segments(pattern: &[&str], parts: &[String]) -> bool {
-        match pattern.split_first() {
-            None => true,
-            Some((&"**", rest)) => (0..=parts.len()).any(|skip| segments(rest, &parts[skip..])),
-            Some((glob, rest)) => parts.split_first().is_some_and(|(part, tail)| {
-                let glob: Vec<char> = glob.chars().collect();
-                let part: Vec<char> = part.chars().collect();
-                wildcard(&glob, &part) && segments(rest, tail)
-            }),
-        }
-    }
-    fn wildcard(glob: &[char], name: &[char]) -> bool {
-        match glob.split_first() {
-            None => name.is_empty(),
-            Some(('*', rest)) => (0..=name.len()).any(|skip| wildcard(rest, &name[skip..])),
-            Some(('?', rest)) => !name.is_empty() && wildcard(rest, &name[1..]),
-            Some((c, rest)) => name.first() == Some(c) && wildcard(rest, &name[1..]),
-        }
-    }
-    let pattern: Vec<&str> = pattern
-        .split(['/', '\\'])
-        .filter(|segment| !segment.is_empty() && *segment != ".")
-        .collect();
-    let parts: Vec<String> = relative
-        .components()
-        .map(|part| part.as_os_str().to_string_lossy().into_owned())
-        .collect();
-    segments(&pattern, &parts)
 }
 
 /// The version of `crate_name` the workspace's `Cargo.lock` resolved for the
@@ -1000,34 +970,33 @@ fn canonical(name: &str) -> String {
 pub fn unpatched_local_framework(root: &Path) -> bool {
     // Any of the package's entries, a `package` rename or an inherited one
     // included, that takes the framework from a checkout.
-    let locals: Vec<toml::Value> = package_autumn_web_entries(root)
+    let locals: Vec<(toml::Value, bool)> = package_autumn_web_entries(root)
         .into_iter()
-        .filter(|entry| entry.get("path").is_some() || entry.get("git").is_some())
+        .filter(|(entry, _)| entry.get("path").is_some() || entry.get("git").is_some())
         .collect();
     if locals.is_empty() {
         return false;
     }
     // A patch collapses the two copies only when it points at the same
     // source: two paths, or two git repositories or refs, are two packages
-    // to Cargo, whatever their version. A path resolves from the app or,
-    // when inherited, the workspace root.
+    // to Cargo, whatever their version. A path resolves from the package,
+    // or from the workspace root when the entry is inherited, as Cargo does.
     let root_abs = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
     let patches = framework_patch_sources(root);
     let path_unpatched = locals
         .iter()
-        .filter_map(|entry| entry.get("path")?.as_str())
-        .any(|path| {
-            let own = root_abs.join(path);
-            let checkout = if own.join("Cargo.toml").is_file() {
-                own
+        .filter_map(|(entry, inherited)| Some((entry.get("path")?.as_str()?, *inherited)))
+        .any(|(path, inherited)| {
+            let base = if inherited {
+                workspace_root(&root_abs)
             } else {
-                workspace_root(&root_abs).join(path)
+                root_abs.clone()
             };
-            !patches.contains(&FrameworkSource::Path(normalized(&checkout)))
+            !patches.contains(&FrameworkSource::Path(normalized(&base.join(path))))
         });
     let git_unpatched = locals
         .iter()
-        .filter_map(git_source)
+        .filter_map(|(entry, _)| git_source(entry))
         .any(|source| !patches.contains(&source));
     path_unpatched || git_unpatched
 }
@@ -1538,16 +1507,11 @@ mod tests {
         );
         write(&app.join("Cargo.toml"), "[package]\nname = \"app\"\n");
         assert_eq!(workspace_root(&app), root);
-        // A member glob is an explicit member too.
+        // A member glob is not an explicit member: Cargo (1.98) keeps the
+        // exclusion, and the app is its own root.
         write(
             &root.join("Cargo.toml"),
             "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"crates/app\"]\n",
-        );
-        assert_eq!(workspace_root(&app), root);
-        // A glob that does not match leaves the exclusion in force.
-        write(
-            &root.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"libs/*\"]\nexclude = [\"crates/app\"]\n",
         );
         assert_eq!(workspace_root(&app), std::path::absolute(&app).unwrap());
     }
@@ -2204,6 +2168,49 @@ maud = { version = "0.27", features = ["axum"] }
             &manifest("git = \"https://example.com/fork-a.git\", tag = \"v0.7.0\""),
         );
         assert!(!unpatched_local_framework(same.path()));
+    }
+
+    /// An inherited path resolves from the workspace root only, even when
+    /// the same relative path also exists under the member.
+    #[test]
+    fn an_inherited_framework_path_resolves_from_the_workspace_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        let app = root.join("app");
+        for dir in [root.join("autumn"), app.join("autumn")] {
+            write(
+                &dir.join("Cargo.toml"),
+                "[package]\nname = \"autumn-web\"\nversion = \"0.7.0\"\n",
+            );
+        }
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n\n\
+             [workspace.dependencies]\nautumn-web = { path = \"autumn\" }\n",
+        );
+        let manifest = |patch: &str| {
+            format!(
+                "[package]\nname = \"app\"\n\n[dependencies]\nautumn-web = {{ workspace = true }}\n\n\
+                 [patch.crates-io]\nautumn-web = {{ path = \"{patch}\" }}\n"
+            )
+        };
+        // A member's own [patch] is ignored; the root's decides. Point the
+        // root's patch at the member's accidental checkout: not the one used.
+        write(&app.join("Cargo.toml"), &manifest("autumn"));
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n\n\
+             [workspace.dependencies]\nautumn-web = { path = \"autumn\" }\n\n\
+             [patch.crates-io]\nautumn-web = { path = \"app/autumn\" }\n",
+        );
+        assert!(unpatched_local_framework(&app));
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n\n\
+             [workspace.dependencies]\nautumn-web = { path = \"autumn\" }\n\n\
+             [patch.crates-io]\nautumn-web = { path = \"autumn\" }\n",
+        );
+        assert!(!unpatched_local_framework(&app));
     }
 
     /// `paths` overrides in a config can replace any crate.
