@@ -66,9 +66,23 @@ if ! grep -q "Rust ${canonical}" README.md; then
   die "README.md Requirements does not reference Rust ${canonical}"
 fi
 
-# CI workflow pin.
+# CI workflow pins. Each job that must track the canonical MSRV is checked
+# within its OWN job block, not with a file-wide grep — a file-wide grep
+# only proves *some* job pins the canonical version, which one job's own
+# regression can hide behind another job's correct pin the moment there is
+# more than one such job in the file (as `windows-tier1` below now is).
 ci="$root/.github/workflows/ci.yml"
-if ! grep -Eq "rust-toolchain@${canonical}\b" "$ci"; then
+
+job_block() {
+  local job="$1"
+  awk -v job="  ${job}:" '
+    $0 == job { flag = 1; next }
+    flag && /^  [A-Za-z]/ { flag = 0 }
+    flag
+  ' "$ci"
+}
+
+if ! grep -Eq "rust-toolchain@${canonical}\b" <<<"$(job_block msrv)"; then
   die "$ci msrv job does not pin dtolnay/rust-toolchain@${canonical}"
 fi
 if ! grep -Eq "MSRV \(${canonical}\)" "$ci"; then
@@ -84,12 +98,7 @@ fi
 # un-retried rustup toolchain install mid-journey — the exact race that
 # caused the "cargo.exe binary... is not applicable to the toolchain"
 # failures fixed in #2994.
-windows_tier1_block="$(awk '
-  /^  windows-tier1:/ { flag = 1 }
-  flag && /^  [A-Za-z]/ && !/^  windows-tier1:/ { flag = 0 }
-  flag
-' "$ci")"
-if ! grep -Eq "rust-toolchain@${canonical}\b" <<<"$windows_tier1_block"; then
+if ! grep -Eq "rust-toolchain@${canonical}\b" <<<"$(job_block windows-tier1)"; then
   die "$ci windows-tier1 job does not pin dtolnay/rust-toolchain@${canonical} (must match the canonical MSRV, not just the msrv job's own pin)"
 fi
 
