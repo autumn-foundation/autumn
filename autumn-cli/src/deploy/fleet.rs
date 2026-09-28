@@ -1190,24 +1190,23 @@ pub(crate) const DRIFT_PROXY_OPTIONS_UNREADABLE: &str =
 pub(crate) const DRIFT_PROXY_PORT_MISMATCH: &str =
     "the installed proxy unit binds a different public port than `[server] port` configures";
 
-/// State drift: this host claims a promoted release its `current` symlink could
-/// not be resolved to (issue #1621, review round 2).
+/// State drift: this host has a `current` symlink, but it does not point to a
+/// release (issue #1621, review round 2; #2277).
 ///
-/// The probe shell tests `[ -L current ]`, which succeeds for a symlink whose
-/// target cannot be canonicalized, so such a host reports `HostMode::Redeploy`
-/// while `readlink -f` yields nothing and the release reads back
-/// [`ReleaseId::Unknown`]. That combination is not "we have not looked" — it is a
-/// host that says it is serving a release nobody can name, which is exactly the
-/// unprovable state this feature fails closed on.
+/// The probe shell tests `[ -L current ]`. This test also succeeds for a
+/// dangling symlink, so the host reports `HostMode::Redeploy`. The probe names a
+/// release only if `current` resolves to a directory directly in `releases/`.
+/// Otherwise the release is [`ReleaseId::Unknown`]. That combination is not "we
+/// have not looked" — it is a host that says it is serving a release nobody can
+/// name, which is exactly the unprovable state this feature fails closed on.
 ///
 /// It stays out of VERSION drift (an unknown release still names no version to be
 /// mixed with), and it is the reason the NEXT deploy matters: `commit-markers`
-/// copies `readlink current` verbatim into `previous-release`, so deploying this
-/// host records an unresolvable directory as its rollback target — the rollback
-/// then refuses (`probe_rollback_target_dir` fails closed) instead of working.
-pub(crate) const DRIFT_RELEASE_UNREADABLE: &str = "this host has a `current` symlink but the release it points at could not be read (a broken \
-     symlink or a missing releases dir) — repair it before the next deploy, which would record \
-     that unresolvable target as this host's rollback point";
+/// copies `readlink current` verbatim into `previous-release`. A later rollback
+/// then refuses (a missing target) or starts a directory that is not a release.
+pub(crate) const DRIFT_RELEASE_UNREADABLE: &str = "this host's `current` symlink does not point to a release in `releases/` (the link is \
+     broken, the releases dir is missing, or the target is not a release dir) — repair it \
+     before the next deploy, which would record that target as this host's rollback point";
 
 /// State drift: this host's live slot unit could not be read, so the CLI cannot
 /// prove WHICH maintenance flag file the running app polls (issue #1621, review
@@ -3844,9 +3843,9 @@ mod tests {
 
     #[test]
     fn a_deployed_host_whose_release_is_unreadable_is_state_drift() {
-        // #1621 review round 2. `[ -L current ]` succeeds for a symlink whose target
-        // cannot be canonicalized, so such a host reports `Redeploy` while `readlink
-        // -f` yields nothing and the release reads back `Unknown`. That combination
+        // #1621 review round 2. `[ -L current ]` succeeds for a dangling symlink, so
+        // such a host reports `Redeploy`, but the probe names no release (#2277).
+        // The release reads back `Unknown`. That combination
         // used to produce ONLY the footer line explicitly labelled "reported, not
         // counted as drift", so `deploy status --strict` exited 0 on a host with
         // actionable marker damage — and the next deploy's `commit-markers` copies
