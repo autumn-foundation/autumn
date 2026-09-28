@@ -107,11 +107,21 @@ versions` line — never `--workspace`, which always reports 0 in this repo):
 | `examples/island-flock/` (no declared `rust-version`; this sandbox's 1.94.1 toolchain) | 31 packages | 31 packages |
 
 Root fell (partially offset by this window's real merges — #2889, #2891
-`infer` 0.16.0→0.22.0, and the `pq-src` fix); `fuzz/` grew against no merged
-movement (`git log --since=2026-09-21 -- fuzz` is empty); `island-flock/`
-held flat. Ownership unchanged from all three prior passes: root is
-Dependabot's territory (`directory: /`); `fuzz/` and `island-flock/` remain
-uncovered by any process (follow-up 7).
+`infer` 0.16.0→0.22.0, and the `pq-src` fix). `fuzz/` also grew net of real
+merged movement, not against a static baseline as an earlier draft of this
+paragraph claimed: `git show --stat ba32d11 -- fuzz/Cargo.lock` and `git show
+--stat 933097b -- fuzz/Cargo.lock` both touch it directly — #2891's own
+regeneration commit message says so explicitly ("chore(deps): regenerate
+fuzz/Cargo.lock for infer 0.22.0 — the Supply chain (cargo-deny) job runs
+with `--locked` against the fuzz workspace, so the root bump has to carry
+the fuzz lockfile with it"), and #2938 carries a matching "record the pq-src
+edge in fuzz/Cargo.lock" commit. `island-flock/` held flat, and its
+`git log --since=2026-09-21` is genuinely empty (verified the same way).
+Ownership unchanged from all three prior passes: root is Dependabot's
+territory (`directory: /`); `fuzz/` and `island-flock/` remain uncovered by
+any *scheduled-batch* process (follow-up 7) even though `fuzz/Cargo.lock`
+itself does get carried along by root-graph bumps that happen to touch a
+crate it shares.
 
 **Supply-chain facts, re-verified**: zero wildcard version ranges
 (`grep -rn 'version = "\*"'`) and zero unpinned git refs (`git = "`) anywhere
@@ -136,9 +146,12 @@ pain-ledger process the charter asks for is actually happening in practice.
 **Dependabot open-PR queue, re-run with `is:open`** (`search_pull_requests`,
 `author:app/dependabot is:open`): **11** open PRs, down from 13 last pass.
 Three merged since 09-21 (`#2613` `actions/attest-build-provenance`, `#2792`
-`taiki-e/install-action`, `#2179` `django` — all three were flagged stale
-last pass); one new PR opened (`#2890`, `jsonwebtoken` 10.4.0 → 11.1.0,
-opened 2026-09-21, i.e. after last week's pass ran).
+`taiki-e/install-action`, `#2179` `django`) — but only `#2179` was actually
+flagged **stale** last pass (42 days then); last pass's own report described
+`#2613` (14 days then) and `#2792` (7 days then) as new and explicitly "not
+yet stale," so it would misstate that report to call all three stale here.
+One new PR opened (`#2890`, `jsonwebtoken` 10.4.0 → 11.1.0, opened
+2026-09-21, i.e. after last week's pass ran).
 
 | PR | Title | Opened | Age today |
 | --- | --- | --- | --- |
@@ -154,14 +167,18 @@ opened 2026-09-21, i.e. after last week's pass ran).
 | #2615 | `dtolnay/rust-toolchain` 1.88.0→1.120.0 | 2026-09-07 | 21 days |
 | #2890 | `jsonwebtoken` 10.4.0→11.1.0 | 2026-09-21 | 7 days |
 
-The eight-PR core (2 GitHub Actions bumps, 6 Cargo semver-major bumps) is
-unchanged and simply 7–8 days older, for the same structural reason established
+The eight-PR structural core (2 GitHub Actions bumps, 6 Cargo semver-major
+bumps — the ones with no covering group at all) is unchanged and simply
+7–8 days older, for the same structural reason established
 over the last two passes: `dependabot.yml`'s `github-actions` ecosystem
 defines no groups at all, and the `rust-deps` catch-all group only covers
 `minor`/`patch` updates, so a pre-1.0 major bump on a `rust-deps`-scoped
 package (or any `github-actions` bump) is individual by design, not
 orphaned. Not something this pass acts on — a human review/merge decision on
-each, same as every prior pass concluded.
+each, same as every prior pass concluded. Counting every PR in the table
+aged 21 days or older (not just the structural eight) gives **ten**: the
+eight-PR core plus `#2302` (35 days) and `#2615` (21 days) — same total as
+last pass's ten, just a week further along, not a narrower backlog.
 
 **New this pass — rehearsed the newest queue entry rather than only listing
 it, since #2890 is exactly the shape of Upgrade this charter gates: a
@@ -211,27 +228,24 @@ queue** — but now with an actual rehearsal result attached instead of being
 another unexamined row in a table.
 
 **Discrepancy from follow-up 8, re-observed via this pass's own `git push`,
-and it moved.** Last pass's `git push` printed "15 vulnerabilities (2 high,
-9 moderate, 4 low)" from GitHub's native Dependabot alert scan; this pass's
-push of the report commit printed **"9 vulnerabilities (2 high, 7
-moderate)"** — total down 6, moderate down 2, low down to 0, high unchanged
-at 2. That move happened during a week where several Cargo dependencies were
-genuinely bumped on `trunk-dev` (`ammonia` 4.1.4→4.2.0, `infer`
-0.16.0→0.22.0, `clap` 4.6.6→4.6.7, plus the `pq-src` pin), which is at least
-consistent with some of the 15 being real GHSA-tracked Cargo advisories that
-resolved when their vulnerable version left the default branch — the
-"genuine gap in cargo-deny's RustSec coverage" scenario follow-up 8 named as
-the worst case, now with a data point suggesting it's plausible rather than
-merely possible. Still not confirmed: this session has no tool to enumerate
-which specific alerts closed or open `/security/dependabot` directly, so I
-cannot join the 6 that disappeared against those specific merges, and the
-remaining 9 (2 high) could equally be non-Rust-ecosystem or already-waived.
-Flagged, not scored, per the same evidentiary bar as last pass — but the
-movement itself is new information: whatever these alerts are, they respond
-to real dependency changes in this repo, which weakens the "these are just
-GitHub double-counting something cargo-deny already waives" hypothesis and
-strengthens the case for someone with Security-tab access to look this week
-rather than let it ride further.
+and the count changed.** Last pass's `git push` printed "15 vulnerabilities
+(2 high, 9 moderate, 4 low)" from GitHub's native Dependabot alert scan;
+this pass's push of the report commit printed **"9 vulnerabilities (2 high,
+7 moderate)"** — total down 6, moderate down 2, low down to 0, high
+unchanged at 2. That move happened during a week where several Cargo
+dependencies were genuinely bumped on `trunk-dev` (`ammonia` 4.1.4→4.2.0,
+`infer` 0.16.0→0.22.0, `clap` 4.6.6→4.6.7, plus the `pq-src` pin) — but this
+session has no tool to enumerate which of the 15 actually closed, so that
+temporal overlap is exactly that and no more: it does not by itself
+distinguish "some of the 15 were real GHSA-tracked Cargo advisories that
+resolved when their vulnerable version left the branch" from "GitHub's alert
+state or advisory data changed for reasons unrelated to this week's Cargo
+bumps." Both remain open explanations. Not scored, per the same evidentiary
+bar as last pass, and this time not leaned on either — the count change is
+recorded as an unclassified fact, not evidence for either hypothesis, until
+someone with Security-tab access joins the specific alerts against specific
+merges. The two "high" alerts being unchanged across both counts is the one
+piece worth a human's attention regardless of how the moderates moved.
 
 ## 💡 Mechanism / forcing fact
 
@@ -260,7 +274,7 @@ None to the dependency graph. This report is the only artifact.
 | Scheduled batch, root graph | 92 packages | 86 packages |
 | Scheduled batch, `fuzz/` graph | 66 packages, uncovered | 71 packages, still uncovered |
 | Scheduled batch, `island-flock/` graph | 31 packages, uncovered | 31 packages, still uncovered |
-| Open Dependabot PRs | 13, of which 10 are 28–69 days old | 11, of which 8 are 21–77 days old (3 merged: #2613, #2792, #2179; 1 new: #2890, rehearsed this pass) |
+| Open Dependabot PRs | 13, of which 10 are 28–69 days old | 11, of which 10 are 21–77 days old (3 merged: #2613, #2792, #2179; 1 new: #2890, rehearsed this pass) |
 | Wildcard ranges / unpinned git refs | 0 / 0 | 0 / 0 |
 | Existing waivers re-checked (root graph, 3) | 3/3 unchanged | 3/3 unchanged |
 | Existing waivers re-checked (satellite-only, `island-flock/deny.toml`, 2) | 2/2 unchanged | 2/2 unchanged |
@@ -335,8 +349,9 @@ git checkout -- autumn/Cargo.toml Cargo.lock
    every Dependabot PR mechanically, but the reachability/forcing-fact
    judgment this pass just did by hand for one PR isn't run on the other
    ten automatically.
-6. Open Dependabot PR queue: 11 (was 13), 8 of them 21–77 days old — same
-   eight PRs as last pass, aged, plus the new #2890 now rehearsed (see
+6. Open Dependabot PR queue: 11 (was 13), 10 of them 21–77 days old — same
+   ten PRs as last pass (the eight-PR structural core plus `#2302` and
+   `#2615`), all just a week older, plus the new #2890 now rehearsed (see
    evidence). Still a human call whether to merge, close, or act on any of
    them; #2615 remains explicitly an "ask before" toolchain bump.
 7. The `fuzz/` (71 packages) and `island-flock/` (31 packages) scheduled
@@ -347,20 +362,22 @@ git checkout -- autumn/Cargo.toml Cargo.lock
    decision. `examples/island-flock/Cargo.toml` still declares no
    `rust-version` (re-checked: just `edition = "2024"`), so there's still no
    MSRV floor for its scheduled-batch row to be checked against.
-8. **Still highest priority, and now moving.** GitHub's native Dependabot
-   alert count for the default branch went 15 (2 high, 9 moderate, 4 low) →
-   **9 (2 high, 7 moderate, 0 low)** between last pass's push and this one
-   (see evidence section) — a real change during a week with real Cargo
-   bumps merged, not noise. This session's GitHub MCP tools were checked
-   again (`get_me`, `search_pull_requests`, `pull_request_read`, and a fresh
-   `ToolSearch` for anything alert/vulnerability-shaped) and still none
-   expose the Security tab's Dependabot alerts directly, so the 6 that
-   closed and the 9 that remain (2 high) still can't be joined against this
-   repo's waivers or its two non-Rust manifests
-   (`examples/react-graphql/frontend/package-lock.json`,
-   `benchmarks/runtime/django`'s Python deps) from this session. The high
-   pair being unchanged while moderates moved is itself worth a human's
-   first look: whatever they are, they didn't resolve on their own this
+8. **Still highest priority, and the count moved (cause unestablished).**
+   GitHub's native Dependabot alert count for the default branch went 15
+   (2 high, 9 moderate, 4 low) → **9 (2 high, 7 moderate, 0 low)** between
+   last pass's push and this one (see evidence section). This session
+   cannot attribute that move to this week's Cargo bumps or to anything
+   else — no tool here enumerates which of the 15 closed, so the change is
+   recorded as a fact, not linked to a cause. This session's GitHub MCP
+   tools were checked again (`get_me`, `search_pull_requests`,
+   `pull_request_read`, and a fresh `ToolSearch` for anything
+   alert/vulnerability-shaped) and still none expose the Security tab's
+   Dependabot alerts directly, so the 6 that closed and the 9 that remain
+   (2 high) still can't be joined against this repo's waivers or its two
+   non-Rust manifests (`examples/react-graphql/frontend/package-lock.json`,
+   `benchmarks/runtime/django`'s Python deps) from this session. The two
+   high-severity alerts being unchanged across both counts is worth a
+   human's first look regardless of what explains the moderates moving.
    week.
 9. The `cargo deny list` vs `cargo deny check bans` discrepancy flagged last
    pass (the former missed the `bitflags`/`parking_lot_core`/`parking_lot`
