@@ -307,11 +307,15 @@ impl Sla {
             .insert(ObligationRecord::new(resolved, generation))
             .await?;
         // A new record has the met instant already. An older one gets it now.
-        if !created
-            && let Some(met) = obligation.met()
-            && store.mark_met(&key, record.generation, met).await?
-        {
-            record.obligation.set_met(met);
+        if !created && let Some(met) = obligation.met() {
+            if store.mark_met(&key, record.generation, met).await? {
+                record.obligation.set_met(met);
+            } else if let Some(fresh) = store.get(&key).await?
+                && fresh.generation == record.generation
+            {
+                // Another call changed the record. Use the stored state.
+                record = fresh;
+            }
         }
         self.schedule(&key, &record, now).await
     }

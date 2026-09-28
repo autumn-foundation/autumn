@@ -31,6 +31,9 @@ struct RacingStore {
     gets: Arc<AtomicUsize>,
     claims: Arc<AtomicUsize>,
     fail_mark_met: Arc<AtomicBool>,
+    /// A met instant that a rival `track` writes just before the next
+    /// `mark_met`, so that call loses the race.
+    rival_met: Arc<Mutex<Option<DateTime<Utc>>>>,
 }
 
 impl RacingStore {
@@ -42,6 +45,7 @@ impl RacingStore {
             gets: Arc::default(),
             claims: Arc::default(),
             fail_mark_met: Arc::default(),
+            rival_met: Arc::default(),
         }
     }
 }
@@ -75,7 +79,13 @@ impl ObligationStore for RacingStore {
         if self.fail_mark_met.load(Ordering::SeqCst) {
             return Box::pin(std::future::ready(Err(SlaError::Store("down".to_owned()))));
         }
-        self.inner.mark_met(key, generation, at)
+        let rival = self.rival_met.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some(rival) = rival {
+                self.inner.mark_met(key, generation, rival).await?;
+            }
+            self.inner.mark_met(key, generation, at).await
+        })
     }
 
     fn claim_escalation<'a>(
@@ -453,6 +463,38 @@ async fn sim_sla_an_early_check_never_uses_the_deadline_as_now() {
         settle().await;
     }
     assert_eq!(*fired.lock().unwrap(), ["first_response/ticket:1"]);
+
+    job::clear_global_job_client();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sim_sla_a_track_that_loses_the_met_race_reads_the_stored_met() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let clock = TickingClock::starting_at(start);
+    let store = RacingStore::new();
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    let app = replica(&clock, &store, &fired);
+    let sla = Sla::from_state(app.state()).unwrap();
+    let ob = Obligation::new("first_response", "ticket:1")
+        .within(BusinessDuration::hours(2))
+        .calendar("support");
+    sla.track(&ob).await.unwrap();
+
+    // A rival `track` marks the record met between this call's insert and
+    // its `mark_met`. This call must return the stored met, not a stale
+    // running status.
+    clock.advance(Duration::from_secs(3600));
+    let rival = start + chrono::Duration::minutes(20);
+    *store.rival_met.lock().unwrap() = Some(rival);
+    let status = sla
+        .track(&ob.clone().met_at(start + chrono::Duration::minutes(40)))
+        .await
+        .unwrap();
+    assert_eq!(status.state, autumn_web::sla::ObligationState::Met);
+    assert_eq!(status.met_at, Some(rival));
 
     job::clear_global_job_client();
 }
