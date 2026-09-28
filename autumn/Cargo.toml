@@ -1082,6 +1082,15 @@ path = "tests/sqlite_statement_timeout_fail_closed.rs"
 name = "sqlite_dependent_destroy"
 path = "tests/sqlite_dependent_destroy.rs"
 
+# `#[commentable]` hard-delete on SQLite (Snag charter, issue #2275 follow-up).
+# `docs/guide/commentable.md` claims "Both backends are supported", but the
+# feature's only live-DB suite is Postgres-only (testcontainers). Runs
+# explicitly: `cargo test -p autumn-web --features sqlite --test
+# sqlite_commentable`.
+[[test]]
+name = "sqlite_commentable"
+path = "tests/sqlite_commentable.rs"
+
 # SQLite read-only-transaction safety proof (issue #1614, Codex P2). The SQLite
 # arm of `Db::tx_with` cannot enforce `READ ONLY`, so a `TxOptions::read_only()`
 # request is rejected before the closure runs rather than silently running a
