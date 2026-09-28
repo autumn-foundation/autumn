@@ -33,14 +33,19 @@ The scaffold now includes:
 That is container scaffolding, not a full cluster deployment. You still need to
 decide your runtime topology.
 
-## Probes
+## Probes: liveness, readiness, and startup
 
-Autumn mounts:
+Autumn mounts four probe endpoints. The paths below are the defaults; each is
+configurable under `[health]` (`live_path`, `ready_path`, `startup_path`,
+`path`), and `[health] enabled = false` suppresses all four so an app can own
+those paths itself.
 
-- `/live`
-- `/ready`
-- `/startup`
-- `/health`
+| Endpoint | Probe | What it reflects |
+| --- | --- | --- |
+| `/live` | liveness | Only that the process is up. Ignores startup and dependency state, so it answers `200` whenever the process is running. |
+| `/ready` | readiness | Startup completion, shutdown draining, and core dependencies (database, registered readiness indicators). `503` when any is not ready. |
+| `/startup` | startup | Stays unavailable until startup hooks complete. |
+| `/health` | — | Compatibility alias for readiness: same checks and same status as `/ready`. |
 
 Recommended use:
 
@@ -49,6 +54,14 @@ Recommended use:
 - startup probe -> `/startup`
 
 Do not point all three at `/health` just because it was easy in older apps.
+`/health` is a readiness answer, so it turns to `503` when a dependency is
+down — and a *liveness* probe reading that `503` makes the orchestrator kill a
+process that was only waiting for its database. The outage becomes a restart
+loop, which is the one failure mode separate probes exist to prevent. Point
+liveness at `/live`, which reports on the process and nothing else.
+
+For readiness that also reflects your own subsystems, see
+[Health Indicators](health-indicators.md).
 
 ## Telemetry
 
