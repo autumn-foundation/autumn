@@ -9695,6 +9695,19 @@ fn index_drift(committed: &str, proposed: &str) -> Vec<String> {
         .collect()
 }
 
+/// How an exempt listing's install result differs from its recorded result,
+/// if it does. `record --exempt-failed` commits a failing install as `fail`,
+/// so only a change from what is recorded is drift.
+fn exempt_drift(name: &str, recorded: &str, result: &Result<(), String>) -> Option<String> {
+    match result {
+        Ok(()) => (recorded != "exempt").then(|| {
+            format!("{name}: the index records `{recorded}`, but its install now compiles")
+        }),
+        Err(stderr) => (recorded != "fail")
+            .then(|| format!("{name}: exempt, but its install does not compile:\n{stderr}")),
+    }
+}
+
 /// Issue #1625, AC 4: re-verify every live listing in the bundled index.
 ///
 /// For each listing: scaffold an app, `plugin add` it, then run
@@ -9754,7 +9767,10 @@ fn plugin_index_reverify_listings() {
                 fs::write(&path, report.to_string()).unwrap();
                 written_reports.push(path);
             }
-            failures.push(failure);
+            // A failure the index already records is not drift.
+            if recorded != "fail" {
+                failures.push(failure);
+            }
             continue;
         }
         if listing["origin"].as_str() == Some("community") {
@@ -9762,21 +9778,12 @@ fn plugin_index_reverify_listings() {
         }
 
         if is_exempt(listing) {
-            match check_exempt_install(&project, target) {
-                Ok(()) => {
-                    exempt_ok.push(name.to_owned());
-                    if recorded != "exempt" {
-                        failures.push(format!(
-                            "{name}: the index records `{recorded}`, but its install now compiles"
-                        ));
-                    }
-                }
-                Err(stderr) => {
-                    exempt_failed.push(name.to_owned());
-                    failures.push(format!(
-                        "{name}: exempt, but its install does not compile:\n{stderr}"
-                    ));
-                }
+            let result = check_exempt_install(&project, target);
+            failures.extend(exempt_drift(name, recorded, &result));
+            if result.is_ok() {
+                exempt_ok.push(name.to_owned());
+            } else {
+                exempt_failed.push(name.to_owned());
             }
             continue;
         }

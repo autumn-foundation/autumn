@@ -72,6 +72,18 @@ pub enum PluginError {
         crate_name: String,
     },
 
+    /// The app declares `autumn-web` at different versions (target-specific
+    /// tables) and no `Cargo.lock` edge says which one Cargo builds.
+    #[error(
+        "this app declares `autumn-web` at more than one version ({declared}) and no Cargo.lock resolves which one it builds, so `{crate_name}` cannot be checked against it — no files were changed. Declare one version, or run `cargo generate-lockfile`, then re-run."
+    )]
+    AmbiguousAutumnWeb {
+        /// The plugin that could not be installed.
+        crate_name: String,
+        /// The declared requirements, comma-separated.
+        declared: String,
+    },
+
     /// crates.io returned something that is not a usable version string.
     #[error(
         "crates.io reported version `{version}` for `{crate_name}`, which is not a usable version requirement — no files were changed"
@@ -242,34 +254,68 @@ pub fn app_autumn_web(root: &Path) -> Result<AppAutumnWeb, PluginError> {
     if !manifest_path(root).is_file() {
         return Err(PluginError::NotInProject);
     }
-    let declarations = crate::doctor::autumn_web_declarations_at(root);
-    let mut declared = false;
-    for declaration in &declarations {
-        match declaration {
-            crate::doctor::AutumnWebDependency::Version(version) => {
-                return Ok(AppAutumnWeb::Version(version.clone()));
+    let entries = package_autumn_web_entries(root);
+    if entries.is_empty() {
+        return Err(PluginError::NoAutumnWeb);
+    }
+    Ok(declared_autumn_web_versions(root)
+        .into_iter()
+        .next()
+        .map_or(AppAutumnWeb::Unversioned, AppAutumnWeb::Version))
+}
+
+/// Every dependency table Cargo reads for a package manifest: regular, dev
+/// and build, and each of those under every `[target.'cfg(…)']`.
+fn dependency_tables(table: &toml::Table) -> impl Iterator<Item = &toml::Table> {
+    const KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+    let targets = table
+        .get("target")
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(toml::Table::values);
+    KINDS
+        .iter()
+        .filter_map(|kind| table.get(*kind))
+        .chain(targets.flat_map(|target| KINDS.iter().filter_map(|kind| target.get(*kind))))
+        .filter_map(toml::Value::as_table)
+}
+
+/// The package's own `autumn-web` dependency entries: every dependency table
+/// Cargo reads for the package at `root` (regular, dev, build and
+/// target-specific), matched by key or by a `package` rename, with
+/// `{ workspace = true }` entries resolved from the workspace root. A
+/// `[workspace.dependencies]` default the package does not inherit is not
+/// its entry. An inherited `autumn-web` the workspace does not define comes
+/// back as an empty table: declared, but unresolved.
+fn package_autumn_web_entries(root: &Path) -> Vec<toml::Value> {
+    let read = |path: &Path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+    };
+    let Some(table) = read(&manifest_path(root)) else {
+        return Vec::new();
+    };
+    let workspace_deps = read(&workspace_root(root).join("Cargo.toml"))
+        .and_then(|table| table.get("workspace")?.get("dependencies").cloned());
+    let mut entries = Vec::new();
+    for (key, entry) in dependency_tables(&table).flat_map(|deps| deps.iter()) {
+        let entry = if entry.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+            match workspace_deps.as_ref().and_then(|deps| deps.get(key)) {
+                Some(inherited) => inherited.clone(),
+                None if key == "autumn-web" => toml::Value::Table(toml::Table::new()),
+                None => continue,
             }
-            crate::doctor::AutumnWebDependency::WithoutVersion => declared = true,
-            // `Inherited` comes back for ANY `{ workspace = true }` entry, not
-            // just this crate's — the scan cannot tell them apart by itself —
-            // so resolve it against the enclosing workspace, exactly as
-            // `autumn upgrade` does. Without this a member crate's version gate
-            // silently never runs, which is the whole guarantee of AC #3.
-            crate::doctor::AutumnWebDependency::Inherited(key) => {
-                match workspace_version_for(root, key) {
-                    Some(version) => return Ok(AppAutumnWeb::Version(version)),
-                    None => declared |= key == "autumn-web",
-                }
-            }
-            crate::doctor::AutumnWebDependency::Absent
-            | crate::doctor::AutumnWebDependency::Unreadable => {}
+        } else {
+            entry.clone()
+        };
+        if key == "autumn-web"
+            || entry.get("package").and_then(toml::Value::as_str) == Some("autumn-web")
+        {
+            entries.push(entry);
         }
     }
-    if declared {
-        Ok(AppAutumnWeb::Unversioned)
-    } else {
-        Err(PluginError::NoAutumnWeb)
-    }
+    entries
 }
 
 /// Every distinct `autumn-web` requirement the package at `root` declares:
@@ -279,46 +325,10 @@ pub fn app_autumn_web(root: &Path) -> Result<AppAutumnWeb, PluginError> {
 /// the target.
 #[must_use]
 pub fn declared_autumn_web_versions(root: &Path) -> Vec<String> {
-    const KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
-    let Some(table) = std::fs::read_to_string(manifest_path(root))
-        .ok()
-        .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
-    else {
-        return Vec::new();
-    };
-    let mut tables: Vec<&toml::Value> = KINDS.iter().filter_map(|kind| table.get(*kind)).collect();
-    if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
-        for target in targets.values() {
-            tables.extend(KINDS.iter().filter_map(|kind| target.get(*kind)));
-        }
-    }
-    // `{ workspace = true }` takes the whole entry, `package` rename
-    // included, from the workspace root: resolve it before asking what it is.
-    let workspace_deps = std::fs::read_to_string(workspace_root(root).join("Cargo.toml"))
-        .ok()
-        .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
-        .and_then(|table| table.get("workspace")?.get("dependencies").cloned());
     let mut versions: Vec<String> = Vec::new();
-    for (key, entry) in tables
-        .into_iter()
-        .filter_map(toml::Value::as_table)
-        .flat_map(|deps| deps.iter())
-    {
-        let entry = if entry.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
-            match workspace_deps.as_ref().and_then(|deps| deps.get(key)) {
-                Some(inherited) => inherited,
-                None => continue,
-            }
-        } else {
-            entry
-        };
-        let is_framework = key == "autumn-web"
-            || entry.get("package").and_then(toml::Value::as_str) == Some("autumn-web");
-        if !is_framework {
-            continue;
-        }
+    for entry in package_autumn_web_entries(root) {
         let version = match entry {
-            toml::Value::String(version) => Some(version.clone()),
+            toml::Value::String(version) => Some(version),
             toml::Value::Table(fields) => fields
                 .get("version")
                 .and_then(toml::Value::as_str)
@@ -332,16 +342,6 @@ pub fn declared_autumn_web_versions(root: &Path) -> Vec<String> {
         }
     }
     versions
-}
-
-/// The version a `{ workspace = true }` entry named `key` resolves to. Cargo
-/// reads it from the package's workspace root only, not from any nearer
-/// manifest that happens to have a `[workspace.dependencies]` table.
-fn workspace_version_for(root: &Path, key: &str) -> Option<String> {
-    match crate::doctor::workspace_dependency_for(&workspace_root(root), key) {
-        Some(crate::doctor::AutumnWebDependency::Version(version)) => Some(version),
-        _ => None,
-    }
 }
 
 /// `version` as an exact Cargo requirement: `=x.y.z`.
@@ -781,22 +781,13 @@ pub fn declared_dependency_key(manifest: &str, crate_name: &str) -> Option<Strin
 /// second entry for the same crate under another name.
 #[must_use]
 pub fn aliased_dependency_key(root: &Path, manifest: &str, crate_name: &str) -> Option<String> {
-    const KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
     let table = toml::from_str::<toml::Table>(manifest).ok()?;
     let workspace_deps = std::fs::read_to_string(workspace_root(root).join("Cargo.toml"))
         .ok()
         .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
         .and_then(|table| table.get("workspace")?.get("dependencies").cloned());
-    let mut tables: Vec<&toml::Value> = KINDS.iter().filter_map(|kind| table.get(*kind)).collect();
-    if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
-        for target in targets.values() {
-            tables.extend(KINDS.iter().filter_map(|kind| target.get(*kind)));
-        }
-    }
     let want = canonical(crate_name);
-    tables
-        .into_iter()
-        .filter_map(toml::Value::as_table)
+    dependency_tables(&table)
         .flat_map(|deps| deps.iter())
         .find(|(key, entry)| {
             let entry = if entry.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
@@ -861,34 +852,11 @@ fn canonical(name: &str) -> String {
 /// manifest that is not the app's workspace root is ignored, as Cargo does.
 #[must_use]
 pub fn unpatched_local_framework(root: &Path) -> bool {
-    let read = |path: &Path| {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
-    };
-    let is_local = |entry: &toml::Value| entry.get("path").is_some() || entry.get("git").is_some();
-    let Some(entry) = read(&manifest_path(root))
-        .and_then(|table| table.get("dependencies")?.get("autumn-web").cloned())
-    else {
-        return false;
-    };
-    let inherited = entry
-        .get("workspace")
-        .and_then(toml::Value::as_bool)
-        .unwrap_or(false);
-    let local = if inherited {
-        read(&workspace_root(root).join("Cargo.toml"))
-            .and_then(|table| {
-                table
-                    .get("workspace")?
-                    .get("dependencies")?
-                    .get("autumn-web")
-                    .cloned()
-            })
-            .is_some_and(|entry| is_local(&entry))
-    } else {
-        is_local(&entry)
-    };
+    // Any of the package's entries, a `package` rename or an inherited one
+    // included, that takes the framework from a checkout.
+    let local = package_autumn_web_entries(root)
+        .iter()
+        .any(|entry| entry.get("path").is_some() || entry.get("git").is_some());
     // No pin to compare: any crates.io patch of `autumn-web` collapses the
     // two copies.
     local && patched_by(root, "autumn-web", "").is_none()
@@ -1067,7 +1035,21 @@ pub fn plan_add(
     entry: &CatalogEntry,
     version: &str,
 ) -> Result<AddOutcome, PluginError> {
-    if let AppAutumnWeb::Version(app_version) = app_autumn_web(root)?
+    app_autumn_web(root)?;
+    // Target-specific declarations of different versions: the one Cargo
+    // builds depends on the target, so only a single lock edge settles it.
+    let declared = declared_autumn_web_versions(root);
+    let app = match declared.as_slice() {
+        [] => None,
+        [one] => Some(one.clone()),
+        several => Some(locked_version_for(root, None, "autumn-web").ok_or_else(|| {
+            PluginError::AmbiguousAutumnWeb {
+                crate_name: entry.crate_name.to_owned(),
+                declared: several.join(", "),
+            }
+        })?),
+    };
+    if let Some(app_version) = app
         && check_compat(&app_version, version) == Compat::Incompatible
     {
         return Err(PluginError::Incompatible {
@@ -1943,6 +1925,45 @@ maud = { version = "0.27", features = ["axum"] }
         let err = plan_add_community(tmp.path(), "autumn-plugin-x", "=0.3.0").unwrap_err();
         assert!(
             matches!(err, PluginError::UnpatchedLocalFramework { .. }),
+            "{err}"
+        );
+    }
+
+    /// A renamed local framework is still local: `aw = { package =
+    /// "autumn-web", path = … }`.
+    #[test]
+    fn a_renamed_local_framework_is_detected() {
+        let cargo = "[package]\nname = \"demo\"\n\n\
+                     [dependencies]\naw = { package = \"autumn-web\", path = \"../autumn\" }\n";
+        let tmp = fake_project(SCAFFOLD_MAIN, cargo);
+        assert!(unpatched_local_framework(tmp.path()));
+    }
+
+    /// A virtual workspace's unused default does not make it an app.
+    #[test]
+    fn an_unused_workspace_default_is_not_an_app() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            &tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = []\n\n[workspace.dependencies]\nautumn-web = \"0.7\"\n",
+        );
+        assert!(matches!(
+            app_autumn_web(tmp.path()),
+            Err(PluginError::NoAutumnWeb)
+        ));
+    }
+
+    /// Target-specific declarations of different versions, with no lock to
+    /// settle them, refuse a first-party install.
+    #[test]
+    fn a_first_party_install_refuses_split_framework_versions() {
+        let cargo = "[package]\nname = \"demo\"\n\n\
+                     [target.'cfg(windows)'.dependencies]\nautumn-web = \"0.7\"\n\n\
+                     [target.'cfg(unix)'.dependencies]\nautumn-web = \"0.8\"\n";
+        let tmp = fake_project(SCAFFOLD_MAIN, cargo);
+        let err = plan_add(tmp.path(), admin(), "0.7.0").unwrap_err();
+        assert!(
+            matches!(err, PluginError::AmbiguousAutumnWeb { .. }),
             "{err}"
         );
     }
