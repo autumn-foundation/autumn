@@ -280,19 +280,43 @@ pub fn sanitize(text: &str) -> String {
     out
 }
 
-/// Control, bidi, zero-width and line-separator characters. `is_control`
-/// covers C0/C1 only; the bidi and format marks (U+061C, U+200E/F,
-/// U+202A–E, U+2066–9, U+206A–F) are listed.
+/// Control, line-separator, format and default-ignorable characters: any a
+/// terminal may reorder or render as nothing. The same set as the sandbox's
+/// `is_display_reordering` (Unicode Cf, plus the full `Default_Ignorable_Code_Point`
+/// property), which autumn-web keeps private.
 #[must_use]
 pub fn is_unsafe_char(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            '\u{061C}'
+            // Format characters (Cf) that are not also default-ignorable.
+            '\u{0600}'..='\u{0605}'
+                | '\u{06DD}'
+                | '\u{070F}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08E2}'
+                | '\u{110BD}'
+                | '\u{110CD}'
+                | '\u{13430}'..='\u{1343F}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                // `Default_Ignorable_Code_Point`, in full.
+                | '\u{00AD}'
+                | '\u{034F}'
+                | '\u{061C}'
+                | '\u{115F}'..='\u{1160}'
+                | '\u{17B4}'..='\u{17B5}'
+                | '\u{180B}'..='\u{180F}'
                 | '\u{200B}'..='\u{200F}'
                 | '\u{2028}'..='\u{202E}'
                 | '\u{2060}'..='\u{206F}'
+                | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0F}'
                 | '\u{FEFF}'
+                | '\u{FFA0}'
+                | '\u{FFF0}'..='\u{FFF8}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D173}'..='\u{1D17A}'
+                | '\u{E0000}'..='\u{E0FFF}'
         )
 }
 
@@ -578,6 +602,7 @@ fn check_text(listing: &Listing, out: &mut Vec<String>) {
                 .iter()
                 .map(|c| ("capabilities", c.as_str())),
         )
+        .chain(listing.routes.iter().map(|r| ("routes", r.as_str())))
         .chain(
             [
                 &listing.grants.hosts,
@@ -1626,6 +1651,20 @@ mod tests {
         assert!(validate(&index_of(vec![listing])).is_empty());
     }
 
+    /// Recorded routes are printed in the trust label, so they are scanned.
+    #[test]
+    fn a_route_with_a_terminal_control_is_refused() {
+        let mut listing = community();
+        listing.trust = Trust::Sandboxed;
+        listing.capabilities = vec!["kv".to_owned()];
+        listing.routes = vec!["GET /safe\u{1b}[2J".to_owned()];
+        let text = messages(&validate(&index_of(vec![listing])));
+        assert!(
+            text.contains("`routes` holds a control character"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn no_routes_and_a_prefix_contradict() {
         let mut listing = community();
@@ -1691,6 +1730,17 @@ mod tests {
             assert!(!sanitize(&format!("a{c}b")).contains(c));
         }
         assert!(!is_unsafe_char('é'));
+        // Default-ignorable letters and marks that render as nothing.
+        for c in [
+            '\u{00AD}',
+            '\u{034F}',
+            '\u{115F}',
+            '\u{3164}',
+            '\u{FE0F}',
+            '\u{E0041}',
+        ] {
+            assert!(is_unsafe_char(c), "U+{:04X}", u32::from(c));
+        }
     }
 
     #[test]
