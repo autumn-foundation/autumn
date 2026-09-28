@@ -1375,6 +1375,16 @@ fn validate_prefix(prefix: &str) -> Result<(), ManifestError> {
     Ok(())
 }
 
+/// A segment that is a single whole capture (`{name}` / `{*name}`): the router
+/// matches it by position, never by comparing its bytes to the request, so
+/// byte-level rules for literal text do not apply to the name an author chose
+/// for it. Anything else — including a *malformed* capture like `{id` — is
+/// literal text as far as the checks below are concerned, and the `matchit`
+/// probe at the end still refuses it with the capture-specific message.
+fn is_capture_segment(segment: &str) -> bool {
+    segment.len() >= 2 && segment.starts_with('{') && segment.ends_with('}')
+}
+
 /// A declared route path may carry axum captures (`{id}`, `{*rest}`) — they are
 /// matched by the host's router, never by the guest — but must otherwise be a
 /// well-formed absolute path.
@@ -1424,6 +1434,20 @@ fn validate_route_path(path: &str) -> Result<(), ManifestError> {
         }
         if percent_escapes(segment).any(|(_, upper)| !upper) {
             return refuse("a route path must write a percent-escape in upper-case hex");
+        }
+        // The router compares against the raw, percent-encoded path as it
+        // arrived on the wire, while the manifest is written in decoded text.
+        // A literal non-ASCII character can therefore never match: every
+        // ordinary client encodes it before sending, so a manifest declaring
+        // `/hello/café` mounts a route no client can reach while `plugin
+        // inspect` prints it as a route the plugin serves (#2481). Refuse
+        // rather than normalise, like every other rule in this function: the
+        // encoded spelling is already the working one, and the consent screen
+        // must show exactly what the router mounts. Captures (`{name}`,
+        // `{*rest}`) are matched by position at request time, so the rule
+        // applies to literal segments only.
+        if !is_capture_segment(segment) && segment.bytes().any(|b| !b.is_ascii()) {
+            return refuse("a literal route segment must be ASCII; write `café` as `caf%C3%A9`");
         }
         if segment.chars().any(char::is_whitespace) {
             return refuse("a route path must not contain whitespace");
@@ -1806,6 +1830,70 @@ max_concurrency = 8
         assert!(SandboxManifest::parse(&src).is_ok());
         let src = valid_toml().replace(r#"path = "/hello/greet""#, r#"path = "/hello/{*rest}""#);
         assert!(SandboxManifest::parse(&src).is_ok());
+    }
+
+    #[test]
+    fn a_route_path_with_a_literal_non_ascii_segment_is_refused() {
+        // #2481. The router compares against the raw, percent-encoded path as
+        // it arrived on the wire, and every ordinary client encodes a
+        // non-ASCII character before sending — so `/hello/café` mounts a
+        // route no client can reach while `plugin inspect` prints it as a
+        // route the plugin serves. The fix is refusal, not normalisation: the
+        // encoded spelling is already the working one.
+        for bad in ["/hello/café", "/café/x", "/hello/中文", "/😀"] {
+            let src =
+                valid_toml().replace(r#"path = "/hello/greet""#, &format!(r#"path = "{bad}""#));
+            let err = SandboxManifest::parse(&src)
+                .expect_err("a literal non-ASCII segment must be refused");
+            assert!(
+                matches!(err, ManifestError::InvalidRoutePath { .. }),
+                "route path {bad} must be refused as an invalid route path: {err}"
+            );
+        }
+
+        // The refusal names the working spelling, so the author is not left
+        // guessing how to write the route they meant.
+        let src = valid_toml().replace(r#"path = "/hello/greet""#, r#"path = "/hello/café""#);
+        let err = SandboxManifest::parse(&src).expect_err("must be refused");
+        assert!(
+            format!("{err}").contains("caf%C3%A9"),
+            "the refusal should suggest the encoded spelling: {err}"
+        );
+    }
+
+    #[test]
+    fn an_encoded_non_ascii_segment_is_the_one_spelling_the_consent_screen_reports() {
+        // The percent-encoded spelling is what clients send, so it validates —
+        // and the consent screen must show exactly the spelling the router
+        // mounts, or the screen lies about what the plugin serves (#2481).
+        // Mounting takes `route.path` verbatim, so the assertion here is that
+        // the consent text carries the same bytes the router gets.
+        let src = valid_toml().replace(r#"path = "/hello/greet""#, r#"path = "/hello/caf%C3%A9""#);
+        let manifest = SandboxManifest::parse(&src).expect("the encoded spelling is valid");
+        assert!(
+            manifest.consent_summary().contains("GET /hello/caf%C3%A9"),
+            "the consent screen must report the mounted spelling"
+        );
+    }
+
+    #[test]
+    fn plain_ascii_routes_are_unaffected_by_the_non_ascii_rule() {
+        // The new rule fires on non-ASCII bytes only: anything that validated
+        // before still validates, punctuation and captures included.
+        for good in [
+            "/hello/greet",
+            "/hello/a.b-c_d~e!f$g&h'i(j)k*l+m,n;o=p",
+            "/hello/{name}",
+            "/hello/{*rest}",
+            "/hello/{id}/posts/{post_id}",
+        ] {
+            let src =
+                valid_toml().replace(r#"path = "/hello/greet""#, &format!(r#"path = "{good}""#));
+            assert!(
+                SandboxManifest::parse(&src).is_ok(),
+                "route path {good} must still validate"
+            );
+        }
     }
 
     #[test]
