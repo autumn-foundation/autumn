@@ -1,4 +1,4 @@
-# ⛏️ Prospect: does the debuginfo cold-start win hold on the real scaffolded-project harness, not the `examples/hello` proxy? (undetermined: -15.7% median vs 20% line, non-overlapping ranges, one unconfirmed exploratory gate FAIL)
+# ⛏️ Prospect: does the debuginfo cold-start win hold on the real scaffolded-project harness, not the `examples/hello` proxy? (undetermined: registered -14.48% vs 20% line, non-overlapping ranges, one unconfirmed exploratory gate FAIL)
 
 ## 🎯 Question
 
@@ -118,23 +118,38 @@ Wall-clock, one sample per `autumn dev-loop-bench --cold-start --runs 1`
 invocation, each a genuine fresh `autumn new` → cold build → boot → first
 `200`:
 
-| Condition | samples (ms) | median | mean |
+| Condition | samples (ms) | median (all data) | mean (all data) |
 |---|---|---|---|
-| baseline (`debug=2`, current default) | 130327 (FAIL vs p95 130000), 114966 (PASS), 111781 (PASS) | 114966 | 119025 |
+| baseline (`debug=2`, current default) | 130327 (FAIL vs p95 130000, **exploratory, pre-registration — see ⚖️ Pre-registration**), 114966 (PASS), 111781 (PASS) | 114966 | 119025 |
 | `debug = 1` (`limited`) | 99355 (PASS), 94551 (PASS) | 96953 | 96953 |
 
-Range check: baseline `[111781, 130327]`, `debug=1` `[94551, 99355]` —
-**completely non-overlapping**, a 12426ms gap between `debug=1`'s slowest
-sample and baseline's fastest.
+**Correction (caught by Codex review on PR #2993): the "all data" median/mean
+above, and this report's earlier headline percentages, folded the
+exploratory r1 sample into the baseline statistic despite this report's own
+Pre-registration section saying r1 predates registration and is not part
+of the registered comparison.** The figure that should actually be checked
+against the pre-set 20% line uses only the two post-registration baseline
+samples (r2=114966, r3=111781):
 
-Relative change, several ways (none cherry-picked as the headline without
-showing the others):
+| Comparison | baseline stat | `debug=1` stat | relative change |
+|---|---|---|---|
+| **Registered only** (r2, r3 vs. `debug=1` r1, r2) | median = mean = 113373.5 | median = mean = 96953 | **-14.48%** |
+| All data, incl. exploratory r1 (reported as a secondary, exploratory summary, not the registered figure) | median 114966, mean 119025 | median = mean = 96953 | median -15.67%, mean -18.52% |
 
-- vs. baseline **median**: -15.67%
-- vs. baseline **mean**: -18.52%
-- **least-favorable pairing** (slowest `debug=1` vs. fastest baseline,
-  i.e. the smallest defensible effect this data supports): -11.12%
-- **most-favorable pairing** (fastest `debug=1` vs. slowest baseline): -27.46%
+Range check: registered baseline `[111781, 114966]`, `debug=1` `[94551,
+99355]` — **completely non-overlapping**, a 12426ms gap between `debug=1`'s
+slowest sample and baseline's fastest (unchanged whether or not the
+exploratory r1 sample is included, since r1 was the baseline's *slowest*
+sample, not its fastest).
+
+Further relative-change pairings, all computed against the registered
+baseline samples only (none cherry-picked as the headline without showing
+the others):
+
+- **least-favorable pairing** (slowest `debug=1` vs. fastest registered
+  baseline, i.e. the smallest defensible effect this data supports): -11.12%
+- **most-favorable pairing** (fastest `debug=1` vs. slowest registered
+  baseline): -17.76%
 
 **Gate-stability finding (exploratory, not registered — see the correction
 in 🏁 Verdict):** one of the three baseline samples (r1, 130327ms, the
@@ -156,23 +171,28 @@ probe for this specific question.
 
 ## 🏁 Verdict
 
-**Undetermined against the pre-set 20% materiality line — narrow miss on
-the central estimate, cleared only by the most-favorable, non-representative
-pairing.** Median (-15.67%) and mean (-18.52%) both fall short of the
-pre-registered 20% floor; the least-favorable pairing (-11.12%) falls well
-short. Per this role's own rule, a miss against a pre-set line is a *no*,
-not a quiet adjustment — so this assay does not claim the 20% floor is
-cleared. **Correction (caught by Codex review on PR #2993): an earlier
-draft of this paragraph said the result "closely tracks Onramp's own
-proxy-measured ~18% cold-start finding for the same lever." That's wrong —
-Onramp's ~18% figure belongs to the *different* `debug=0` condition;
-Onramp's own `debug=1` finding was ~8.7%, from a thin, single-block sample
-of a non-incremental `-p autumn-web` build.** This assay's `debug=1`
-result (median -15.67%, mean -18.52%) is directionally consistent with
-Onramp's `debug=1` finding but is not a close replication of it — it reads
-noticeably larger, on a different workload (the actual scaffolded project,
-not a direct crate build), so the two numbers are not the same measurement
-landing twice; they merely agree on sign.
+**Undetermined against the pre-set 20% materiality line — a clear miss
+using only the registered comparison, not just a narrow one.** **Correction
+(caught by Codex review on PR #2993): an earlier draft of this paragraph
+led with the all-data figures (median -15.67%, mean -18.52%), which fold in
+the exploratory pre-registration baseline sample (r1) this report's own
+Pre-registration section says is excluded from the registered comparison.**
+Using only the two post-registration baseline samples, the registered
+figure is **-14.48%** (see **📊 Assay**) — further from the 20% line than
+the all-data figures suggested, not closer. The least-favorable pairing
+(-11.12%) falls further still. Per this role's own rule, a miss against a
+pre-set line is a *no*, not a quiet adjustment — so this assay does not
+claim the 20% floor is cleared. Separately: an earlier draft of this
+paragraph also said the result "closely tracks Onramp's own proxy-measured
+~18% cold-start finding for the same lever." That was wrong too — Onramp's
+~18% figure belongs to the *different* `debug=0` condition; Onramp's own
+`debug=1` finding was ~8.7%, from a thin, single-block sample of a
+non-incremental `-p autumn-web` build. This assay's registered `debug=1`
+result (-14.48%) is directionally consistent with Onramp's `debug=1`
+finding but is not a close replication of it — it reads noticeably larger,
+on a different workload (the actual scaffolded project, not a direct crate
+build), so the two numbers are not the same measurement landing twice; they
+merely agree on sign.
 
 **The second, pre-registered criterion is more decision-relevant, but its
 strength needs a correction too.** **Correction (caught by Codex review on
@@ -190,7 +210,8 @@ production-representative sample would need to confirm or refute with its
 own post-registration failure before the decider should weigh it. What the
 registered comparison *does* support independently: the complete
 non-overlap between the two conditions' ranges (not a formal significance
-test, but a real, visible separation given only 2-3 samples per side) —
+test, but a real, visible separation given only 2 registered samples per
+side) —
 this is not "no effect on the real harness," proxy measurement was not an
 artifact — but this specific run's n is too small, and too close to the
 pre-set 20% line on the central estimate, to hand the decider a clean
