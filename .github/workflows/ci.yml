@@ -2445,7 +2445,26 @@ jobs:
       RUSTFLAGS: "-Clink-arg=/DEBUG:LongSymbolTruncate"
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to the exact MSRV, not `@stable` (2026-09-28 finding, 🚦
+      # Semaphore): every scaffolded app's `rust-toolchain.toml` pins
+      # `channel = "1.88.0"` literally (autumn-cli/src/templates/rust-toolchain.toml.tmpl,
+      # rendered from Cargo.toml's `rust-version`), a DIFFERENT rustup toolchain
+      # name than "stable". When this job only installed `@stable`, the first
+      # `cargo`/`autumn` invocation inside the scaffolded `tier1_app` directory
+      # (during `autumn setup`, which shells out to `cargo metadata`) made
+      # rustup auto-install the separate "1.88.0-x86_64-pc-windows-msvc"
+      # toolchain on the fly. That on-demand install intermittently left a
+      # non-functional `cargo` component behind, failing every later `cargo`
+      # invocation in the job with `"the 'cargo.exe' binary, normally provided
+      # by the 'cargo' component, is not applicable to the '1.88.0-x86_64-pc-windows-msvc'
+      # toolchain"` — a rustup error, not an autumn/CLI defect. Confirmed by
+      # log content on 4 organic occurrences (runs 108204416273, 108534929493,
+      # 108821476268, 108842089677), all identical, all resolved once the
+      # `read_cargo_metadata` stderr fix (#2973) made the underlying rustup
+      # error visible. Installing the exact MSRV toolchain up front — the same
+      # thing the `msrv` job below already does — removes the on-demand
+      # install path entirely, so there is nothing left to race.
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
 
