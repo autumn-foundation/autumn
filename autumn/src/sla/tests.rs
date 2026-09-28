@@ -672,6 +672,20 @@ async fn store_rolls_back_an_unscheduled_record() {
 }
 
 #[tokio::test]
+async fn store_does_not_roll_back_a_record_that_another_call_changed() {
+    // Call A creates the record. Call C marks it met. Call A fails later:
+    // its rollback must keep C's change.
+    let store = store_with_one().await;
+    store
+        .mark_met(KEY, GEN, utc(2024, 1, 8, 10, 0))
+        .await
+        .unwrap();
+    assert!(!store.remove_unscheduled(KEY, GEN).await.unwrap());
+    let stored = store.get(KEY).await.unwrap().unwrap();
+    assert_eq!(stored.obligation.met(), Some(utc(2024, 1, 8, 10, 0)));
+}
+
+#[tokio::test]
 async fn store_writes_touch_only_their_own_generation() {
     // A slow call loaded generation GEN. Then `forget` and `track` made a
     // new record with the same start but another generation.

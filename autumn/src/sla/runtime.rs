@@ -318,6 +318,11 @@ impl Sla {
         // record back for that job.
         for _ in 0..PIN_ATTEMPTS {
             if store.mark_scheduled(&key, record.generation).await? {
+                // A concurrent re-insert can hold an older copy. Write the
+                // met instant again; `mark_met` keeps a value that is set.
+                if let Some(met) = obligation.met() {
+                    store.mark_met(&key, record.generation, met).await?;
+                }
                 return Ok(status);
             }
             let (current, _) = store.insert(record.clone()).await?;

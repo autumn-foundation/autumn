@@ -95,8 +95,8 @@ pub trait ObligationStore: Send + Sync + 'static {
     /// Set `scheduled`. Return `false` if there is no such record.
     fn mark_scheduled<'a>(&'a self, key: &'a str, generation: Uuid) -> StoreFuture<'a, bool>;
 
-    /// Remove the record only if it is not scheduled. Return `true` if it
-    /// removed the record.
+    /// Remove the record only if it is untouched: not scheduled, not met and
+    /// not escalated. Return `true` if it removed the record.
     fn remove_unscheduled<'a>(&'a self, key: &'a str, generation: Uuid) -> StoreFuture<'a, bool>;
 
     /// Remove the record for `key`, whatever its generation. Return `true`
@@ -222,9 +222,12 @@ impl ObligationStore for MemoryObligationStore {
 
     fn remove_unscheduled<'a>(&'a self, key: &'a str, generation: Uuid) -> StoreFuture<'a, bool> {
         self.with(|records| {
-            let removable = records
-                .get(key)
-                .is_some_and(|record| record.generation == generation && !record.scheduled);
+            let removable = records.get(key).is_some_and(|record| {
+                record.generation == generation
+                    && !record.scheduled
+                    && record.obligation.met().is_none()
+                    && record.escalated_at.is_none()
+            });
             removable && records.remove(key).is_some()
         })
     }
