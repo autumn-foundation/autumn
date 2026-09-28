@@ -239,14 +239,23 @@ follow-up needs, scoped from this assay's own stubs list:
 # samples in one JSON file, at the cost of not reproducing this report's
 # own block-switching-between-single-run-invocations method exactly).
 
-# Baseline (current default, no override) — repeat with i=1,2,3,...:
+# IMPORTANT (caught by Codex review on PR #2993, second round): this
+# assay's actual sequence was baseline(r1,r2) -> debug=1(r1,r2) ->
+# baseline(r3) — not all 3 baseline samples back to back. Collecting all
+# three baseline samples in one loop, as an earlier draft of this recipe
+# did, omits the reversal check (a third baseline sample collected AFTER
+# the debug=1 block, to separate the condition effect from the ~15%
+# session-wide drift this report's own baseline samples show) and cannot
+# reproduce that part of the design. Split as below.
+
+# Baseline block 1 (r1, r2):
 cargo build -p autumn-cli
-for i in 1 2 3; do
+for i in 1 2; do
   ./target/debug/autumn dev-loop-bench --cold-start --runs 1 \
     --output "/tmp/coldstart-baseline-r${i}.json"
 done
 
-# debug=1 ("limited") condition:
+# debug=1 ("limited") condition (r1, r2):
 printf '\n[profile.dev]\ndebug = 1\n' >> autumn-cli/src/templates/Cargo.toml.tmpl
 cargo build -p autumn-cli
 for i in 1 2; do
@@ -254,9 +263,12 @@ for i in 1 2; do
     --output "/tmp/coldstart-debug1-r${i}.json"
 done
 
-# Revert before doing anything else:
+# Revert, then take the reversal-check baseline sample (r3) AFTER the
+# debug=1 block, not batched with r1/r2:
 git checkout -- autumn-cli/src/templates/Cargo.toml.tmpl
 cargo build -p autumn-cli   # restores the baseline binary
+./target/debug/autumn dev-loop-bench --cold-start --runs 1 \
+  --output "/tmp/coldstart-baseline-r3.json"
 git status --short   # must be clean
 ```
 
