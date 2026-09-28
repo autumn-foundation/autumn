@@ -111,6 +111,10 @@ check).
   verified to match `cold-start-latency.yml`'s runner.
 - Only the no-DB (`Hello`) shape was measured (`--include-db` omitted) —
   matches the gated budget, not the informational DB-backed shape.
+- The scaffolded throwaway project's own dependency graph was never pinned
+  or preserved (see **🔬 Reproduce**): `autumn new` emits no `Cargo.lock`,
+  and each tempdir was discarded after its sample. Only the Autumn-side
+  source is exactly reproducible; the resolved dependency graph is not.
 
 ## 📊 Assay
 
@@ -248,15 +252,21 @@ follow-up needs, scoped from this assay's own stubs list:
   whatever `[profile.dev]` is committed in that ref's own template — it
   takes no input to toggle `debug`, so one dispatch measures only one
   condition, not both, and cannot perform the baseline→`debug=1`→baseline
-  reversal this assay used to separate the effect from drift. A real
-  confirmatory follow-up needs **two separate dispatches** (`runs: 5`
-  each): one against `trunk-dev` as-is (baseline) and one against a branch
-  carrying the `[profile.dev] debug = 1` template change, comparing their
-  JSON reports — accepting that CI runners are ephemeral and shared
-  per-dispatch, not a single reused box, so the within-box reversal check
-  this local assay could do is not directly available; a same-day pair of
-  dispatches is the closest practical substitute for controlling
-  session-wide drift.
+  reversal this assay used to separate the effect from drift. **Further
+  correction (caught by Codex review on PR #2993, second round): "two
+  dispatches, one per condition" is not sufficient either.** Each
+  `workflow_dispatch` provisions its own fresh `ubuntu-latest` runner, so
+  all 5 samples of one dispatch share one machine and all 5 of the other
+  share a different machine — runner-to-runner performance variance would
+  then be perfectly confounded with condition, exactly the position/order
+  confound this assay's own local reversal checks existed to rule out, and
+  two single dispatches cannot rule it out. A real confirmatory follow-up
+  needs **multiple dispatches per condition, interleaved across separate
+  runner allocations** (e.g. baseline → `debug=1` → baseline → `debug=1`,
+  each its own dispatch on its own fresh runner, comparing dispatch-level
+  medians across conditions the way this assay compared same-box blocks) —
+  not one dispatch per condition, and not a claim that same-day timing
+  alone substitutes for that.
 
 ## 🔬 Reproduce
 
@@ -268,6 +278,20 @@ follow-up needs, scoped from this assay's own stubs list:
 # numbers this report reports):
 #   git worktree add --detach /tmp/prospect-coldstart-repro c304e8f89c7a3c7f1fb58c23bf4175904633eb5d
 #   cd /tmp/prospect-coldstart-repro
+# DISCLOSED LIMITATION (caught by Codex review on PR #2993): pinning this
+# commit pins the Autumn source (templates, harness, `autumn-web` itself),
+# but NOT the scaffolded throwaway project's own dependency graph.
+# `autumn new` emits no `Cargo.lock`, and `cold_start_driver` runs an
+# unlocked `cargo build` in a fresh tempdir for every sample — so as
+# `maud`/`diesel_migrations`/`tokio`/their transitive deps publish new
+# compatible releases over time, a later run of this recipe resolves a
+# different dependency graph than this assay measured, even pinned to the
+# same commit. This assay did not preserve the generated `Cargo.lock` from
+# its own runs (each ran in an ephemeral tempdir since discarded), so
+# reproducing the *exact* graph measured here is not currently possible —
+# only the Autumn-side inputs are pinned. A follow-up wanting exact
+# reproduction should capture and commit the scaffolded project's
+# `Cargo.lock` alongside its own report.
 # IMPORTANT (caught by Codex review on PR #2993): each `--runs 1` sample
 # below must write to its OWN output path — repeating the same fixed path,
 # as an earlier draft of this recipe did, silently overwrites the previous
