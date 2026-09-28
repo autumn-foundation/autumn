@@ -2617,10 +2617,9 @@ async fn serve_sim_host(
         .method(request.method.clone())
         .uri(target);
     if !request.extra_headers.contains_key(reqwest::header::HOST) {
-        let host = url.host_str().unwrap_or_default();
-        let authority = url
-            .port()
-            .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"));
+        // Host and port as the URL writes them, so an IPv6 host keeps its
+        // brackets (`[::1]:8080`).
+        let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
         builder = builder.header(reqwest::header::HOST, authority);
     }
     // Trace context first, as on the real send path. A caller header of the
@@ -3892,6 +3891,40 @@ mod tests {
         );
         // Should complete without panicking; authorization is redacted from span.
         log_request("POST", &url, 201, Duration::from_millis(12), &headers);
+    }
+
+    /// The sim `Host` header keeps IPv6 brackets and the port (issue #2967).
+    #[test]
+    fn sim_host_header_keeps_ipv6_brackets() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let echo = axum::Router::new().route(
+            "/status",
+            axum::routing::get(|headers: HeaderMap| async move {
+                headers
+                    .get(reqwest::header::HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned()
+            }),
+        );
+        runtime.block_on(async {
+            for (url, host) in [
+                ("http://[::1]:8080/status", "[::1]:8080"),
+                ("http://[::1]/status", "[::1]"),
+                ("http://payments:8443/status", "payments:8443"),
+            ] {
+                let request = Client::new().get(url);
+                let parsed = reqwest::Url::parse(url).unwrap();
+                let seen = serve_sim_host(echo.clone(), &request, parsed)
+                    .await
+                    .unwrap()
+                    .text();
+                assert_eq!(seen, host, "{url}");
+            }
+        });
     }
 
     /// A sim host sees the active span's `traceparent`, as a real upstream
