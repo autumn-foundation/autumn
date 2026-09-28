@@ -39,9 +39,13 @@ registered comparison.
 - **Second, independent criterion, pre-registered alongside the first:**
   does the condition change whether the existing gate's own budget
   (`p95 <= 130000ms`) passes or fails on this box.
-- **Conditions:** this sandbox, single box, `autumn dev-loop-bench
-  --cold-start --runs 1` per sample (no `--include-db`), warm `CARGO_HOME`
-  registry cache from earlier work this session.
+- **Conditions:** this sandbox, single box, `rustc`/`cargo` 1.94.1
+  (`rustc 1.94.1 (e408947bf 2026-03-25)` — added here per Codex review on
+  PR #2993, which noted an earlier draft never stated the assay's compiler
+  version despite measuring a predominantly-compile-time quantity),
+  `autumn dev-loop-bench --cold-start --runs 1` per sample (no
+  `--include-db`), warm `CARGO_HOME` registry cache from earlier work this
+  session.
 - **Time box:** this session, target ≲30 min of additional building (a
   condition switch costs a `cargo build -p autumn-cli` rebuild since
   templates are embedded via `include_str!` at CLI-compile time, plus
@@ -275,9 +279,22 @@ follow-up needs, scoped from this assay's own stubs list:
 # #2993: an earlier draft of this recipe said "current trunk-dev tip," a
 # floating reference that resolves to different template/harness/
 # dependency code as trunk-dev advances, defeating reproduction of the
-# numbers this report reports):
-#   git worktree add --detach /tmp/prospect-coldstart-repro c304e8f89c7a3c7f1fb58c23bf4175904633eb5d
-#   cd /tmp/prospect-coldstart-repro
+# numbers this report reports). CORRECTION (caught by Codex review on PR
+# #2993, second round): an earlier draft left these two lines as comments,
+# so copying the block skipped them and built against the caller's current
+# checkout instead of the pinned commit. Made executable:
+set -e
+git worktree add --detach /tmp/prospect-coldstart-repro c304e8f89c7a3c7f1fb58c23bf4175904633eb5d
+cd /tmp/prospect-coldstart-repro
+
+# Pin the exact toolchain this assay measured with (caught by Codex review
+# on PR #2993: an earlier draft left the active toolchain unpinned — this
+# repo ships no rust-toolchain.toml, only an MSRV, so a bare `cargo` here
+# resolves whatever "stable" means on the calling machine, not necessarily
+# the toolchain every number in this report was measured on):
+rustup toolchain install 1.94.1
+rustup override set 1.94.1
+[ "$(rustc --version)" = "rustc 1.94.1 (e408947bf 2026-03-25)" ] || { echo "toolchain pin failed: got $(rustc --version)" >&2; exit 1; }
 # DISCLOSED LIMITATION (caught by Codex review on PR #2993): pinning this
 # commit pins the Autumn source (templates, harness, `autumn-web` itself),
 # but NOT the scaffolded throwaway project's own dependency graph.
