@@ -4,6 +4,14 @@
 //! serializable [`RouteInfo`] values that the CLI can consume without booting
 //! the full HTTP server.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use serde::{Deserialize, Serialize};
 
 use crate::capacity::{POOL_DB, ResourceShape};
@@ -600,7 +608,7 @@ pub fn collect_route_infos(
     api_versions: &[crate::app::ApiVersion],
 ) -> Result<Vec<RouteInfo>, crate::router::RouterBuildError> {
     let mut infos = Vec::with_capacity(routes.len());
-    let now = chrono::Utc::now();
+    let now = crate::time::ambient_now();
 
     let resolve_status = |route_name: &str,
                           api_version: Option<&str>,

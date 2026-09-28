@@ -82,6 +82,7 @@ on:
       # first-party plugin into a fresh scaffold, so a change to any of
       # them can break the mount this workflow is the only proof of.
       - "autumn-admin-plugin/**"
+      - "autumn-billing/**"
       - "autumn-cache-redis/**"
       - "autumn-media-plugin/**"
       - "autumn-search/**"
@@ -156,6 +157,7 @@ on:
       # first-party plugin into a fresh scaffold, so a change to any of
       # them can break the mount this workflow is the only proof of.
       - "autumn-admin-plugin/**"
+      - "autumn-billing/**"
       - "autumn-cache-redis/**"
       - "autumn-media-plugin/**"
       - "autumn-search/**"
