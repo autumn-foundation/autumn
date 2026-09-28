@@ -166,6 +166,11 @@ pub struct Listing {
     /// The manifest capabilities of a sandboxed plugin. Empty for native.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    /// The routes a sandboxed plugin serves, as `METHOD /path` (the consent
+    /// screen's form, implied `HEAD` included). A new one is authority, so
+    /// a replacement artifact is compared with this. Sandboxed only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<String>,
     /// The reviewed `.autumn-plugin` artifact digest, as
     /// `autumn plugin inspect` prints it. Sandboxed only.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -474,7 +479,14 @@ impl Listing {
             && concrete(app)
                 .zip(concrete(&self.conformance.autumn_web))
                 .is_some_and(|(app, failed)| {
-                    app >= semver::Version::new(failed.major, failed.minor, 0)
+                    // The start of the failed series: `0.x` is its own series,
+                    // a later major is one series from `x.0.0`.
+                    let series = if failed.major == 0 {
+                        semver::Version::new(0, failed.minor, 0)
+                    } else {
+                        semver::Version::new(failed.major, 0, 0)
+                    };
+                    app >= series
                 })
     }
 
@@ -688,6 +700,13 @@ fn check_trust(listing: &Listing, out: &mut Vec<String>) {
         }
         Trust::Native | Trust::Sandboxed => {}
     }
+    if listing.trust == Trust::Native && !listing.routes.is_empty() {
+        out.push(
+            "`routes` records a sandboxed manifest; a native plugin's routes are checked by \
+             `plugin-check`"
+                .to_owned(),
+        );
+    }
     let digest = &listing.artifact_sha256;
     match listing.trust {
         Trust::Sandboxed
@@ -853,6 +872,7 @@ mod tests {
             experimental_surfaces: vec![],
             trust: Trust::Native,
             capabilities: vec![],
+            routes: vec![],
             artifact_sha256: String::new(),
             grants: Grants::default(),
             quotas: BTreeMap::new(),
@@ -1480,6 +1500,19 @@ mod tests {
         assert!(listing.flag_applies("0.9.0"));
         assert!(!listing.flag_applies("0.7.0"));
         assert!(!community().flag_applies("0.8.0"));
+        // After 1.0 the series is the major: a 1.2 failure covers 1.1.
+        listing.conformance.autumn_web = "1.2.0".to_owned();
+        assert!(listing.flag_applies("1.1.0"));
+        assert!(listing.flag_applies("2.0.0"));
+        assert!(!listing.flag_applies("0.9.0"));
+    }
+
+    #[test]
+    fn a_native_listing_cannot_record_routes() {
+        let mut listing = community();
+        listing.routes = vec!["GET /x".to_owned()];
+        let text = messages(&validate(&index_of(vec![listing])));
+        assert!(text.contains("`routes`"), "{text}");
     }
 
     #[test]

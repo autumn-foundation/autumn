@@ -207,6 +207,8 @@ pub struct InspectReport {
     pub artifact_sha256: Option<String>,
     /// The capabilities the manifest asks for.
     pub capabilities: Vec<String>,
+    /// The routes the artifact serves. Required: a route is authority.
+    pub routes: Vec<InspectRoute>,
     /// Whether the module loads into the sandbox.
     pub loads: bool,
     /// The route-conformance report.
@@ -233,6 +235,25 @@ pub struct InspectReport {
 
 /// The `grants` object `inspect` emits. Every list is required: `inspect`
 /// always prints all four, empty or not.
+/// One route of an inspect report.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct InspectRoute {
+    /// HTTP method.
+    pub method: String,
+    /// Full mounted path.
+    pub path: String,
+}
+
+impl InspectReport {
+    /// The routes as the listing records them: `METHOD /path`.
+    fn route_names(&self) -> Vec<String> {
+        self.routes
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.path))
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct InspectGrants {
     /// Hostnames `http-outbound` may call.
@@ -442,6 +463,7 @@ pub fn apply_inspect(
         digest.clone_into(&mut listing.artifact_sha256);
         report.version.clone_into(&mut listing.version);
         listing.capabilities.clone_from(&report.capabilities);
+        listing.routes = report.route_names();
         listing.grants = index::Grants::from(&report.grants);
         listing.quotas.clone_from(&report.quotas);
         listing.limits.clone_from(&report.limits);
@@ -483,6 +505,7 @@ fn widened_authority(listing: &Listing, report: &InspectReport) -> Vec<String> {
         &report.capabilities,
         &mut out,
     );
+    added("route", &listing.routes, &report.route_names(), &mut out);
     added("host", &granted.hosts, &report.grants.hosts, &mut out);
     added("table", &granted.tables, &report.grants.tables, &mut out);
     added(
@@ -492,7 +515,18 @@ fn widened_authority(listing: &Listing, report: &InspectReport) -> Vec<String> {
         &mut out,
     );
     added("slot", &granted.slots, &report.grants.slots, &mut out);
-    raised("quota", &listing.quotas, &report.quotas, &mut out);
+    // A quota for a capability the artifact no longer has governs nothing,
+    // as `ConsentDelta` treats it.
+    let live_quotas: std::collections::BTreeMap<String, u32> = report
+        .quotas
+        .iter()
+        .filter(|(key, _)| {
+            autumn_web::plugin_sandbox::CapabilityQuotas::governed_by(key)
+                .is_none_or(|cap| report.capabilities.iter().any(|c| c == cap.as_str()))
+        })
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    raised("quota", &listing.quotas, &live_quotas, &mut out);
     raised("limit", &listing.limits, &report.limits, &mut out);
     out
 }
@@ -602,6 +636,11 @@ pub fn write_listing(src: &str, listing: &Listing) -> Result<String, String> {
         table.remove("capabilities");
     } else {
         table["capabilities"] = value(listing.capabilities.iter().collect::<Array>());
+    }
+    if listing.routes.is_empty() {
+        table.remove("routes");
+    } else {
+        table["routes"] = value(listing.routes.iter().collect::<Array>());
     }
     set_or_remove(table, "artifact_sha256", &listing.artifact_sha256);
     if listing.grants.is_empty() {
@@ -1124,6 +1163,7 @@ mod tests {
         // The consented authority: what `inspect(true)` reports.
         let r = inspect(true);
         l.capabilities.clone_from(&r.capabilities);
+        l.routes = r.route_names();
         l.grants = index::Grants::from(&r.grants);
         l.quotas.clone_from(&r.quotas);
         l.limits.clone_from(&r.limits);
@@ -1136,8 +1176,14 @@ mod tests {
     /// the listing is flagged and keeps the consented authority.
     #[test]
     fn widened_authority_is_checked_against_the_listing() {
-        let widen: [fn(&mut InspectReport); 4] = [
+        let widen: [fn(&mut InspectReport); 5] = [
             |r| r.capabilities.push("sql".to_owned()),
+            |r| {
+                r.routes.push(InspectRoute {
+                    method: "POST".to_owned(),
+                    path: "/hello/admin".to_owned(),
+                });
+            },
             |r| r.grants.hosts.push("evil.example".to_owned()),
             |r| *r.quotas.values_mut().next().unwrap() += 1,
             |r| *r.limits.get_mut("fuel").unwrap() += 1,
@@ -1161,7 +1207,14 @@ mod tests {
             assert_eq!(l.limits, before.limits);
             assert_eq!(l.grants, before.grants);
             assert_eq!(l.capabilities, before.capabilities);
+            assert_eq!(l.routes, before.routes);
         }
+        // A raised quota for a dropped capability governs nothing.
+        let mut r = inspect(true);
+        r.capabilities.retain(|c| c != "kv");
+        *r.quotas.get_mut("kv_reads").unwrap() += 1;
+        let t = apply_inspect(&mut sandboxed(), &r, "0.7.0", "2026-10-01").expect("apply");
+        assert_eq!(t, Transition::Listed);
         // Lower ceilings are less authority, not more.
         let mut r = inspect(true);
         *r.limits.get_mut("fuel").unwrap() -= 1;
@@ -1214,6 +1267,10 @@ mod tests {
             version: "0.2.0".to_owned(),
             artifact_sha256: Some("ab".repeat(32)),
             capabilities: vec!["http-request".to_owned(), "kv".to_owned()],
+            routes: vec![InspectRoute {
+                method: "GET".to_owned(),
+                path: "/hello".to_owned(),
+            }],
             loads: pass,
             conformance: ConformanceReport {
                 plugin_name: "autumn-plugin-hello".to_owned(),
@@ -1248,7 +1305,7 @@ mod tests {
     fn an_inspect_report_without_grants_does_not_parse() {
         let full = serde_json::json!({
             "name": "autumn-plugin-hello", "version": "0.2.0",
-            "artifact_sha256": "ab".repeat(32), "capabilities": [], "loads": true,
+            "artifact_sha256": "ab".repeat(32), "capabilities": [], "routes": [], "loads": true,
             "conformance": {"plugin_name": "autumn-plugin-hello", "checks": []},
             "quotas": {}, "limits": {},
             "grants": {"hosts": [], "tables": [], "job_types": [], "slots": []},
