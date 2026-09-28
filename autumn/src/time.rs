@@ -677,15 +677,19 @@ pub(crate) fn system_instant() -> std::time::Instant {
 }
 
 /// Whether a TTL cache entry that expires at `expires_at` is still fresh at
-/// `now`. An entry cannot expire more than `ttl` after `now`; one that does
-/// was stored on another timeline (another `Sim`, or the system clock), so
-/// it counts as stale.
+/// `now`.
+///
+/// An entry expires at most `ttl` after the instant it was stored. `now` may
+/// have been read a little before that instant on another thread: callers
+/// read the clock before they take their lock. So an expiry up to `2 * ttl`
+/// after `now` is fresh. One further out was stored on another timeline (a
+/// nested `Sim` that ran ahead), and counts as stale.
 pub(crate) fn ttl_entry_is_fresh(
     expires_at: std::time::Instant,
     now: std::time::Instant,
     ttl: Duration,
 ) -> bool {
-    expires_at > now && expires_at.saturating_duration_since(now) <= ttl
+    expires_at > now && expires_at.saturating_duration_since(now) <= ttl.saturating_mul(2)
 }
 
 /// The ambient wall-clock time as a [`std::time::SystemTime`]. Replaces
@@ -968,8 +972,20 @@ mod tests {
         assert!(!ttl_entry_is_fresh(now, now, ttl), "expired");
         assert!(
             !ttl_entry_is_fresh(now + ttl * 10, now, ttl),
-            "an expiry past now + ttl was stored on a later timeline"
+            "an expiry far past now + ttl was stored on a later timeline"
         );
+    }
+
+    #[test]
+    fn a_ttl_entry_stored_just_after_now_is_fresh() {
+        // Another thread read `now`, then lost the race for the lock to a
+        // thread that stored its entry a moment later. That entry is live.
+        let now = std::time::Instant::now();
+        let ttl = std::time::Duration::from_secs(1);
+        let stored_at = now + std::time::Duration::from_millis(5);
+        assert!(ttl_entry_is_fresh(stored_at + ttl, now, ttl));
+        assert!(ttl_entry_is_fresh(now + ttl * 2, now, ttl));
+        assert!(!ttl_entry_is_fresh(now + ttl * 3, now, ttl));
     }
 
     #[test]

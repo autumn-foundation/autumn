@@ -113,7 +113,8 @@ async fn sim_ambient_modules_idempotency_entries_from_a_nested_sim_are_stale(sim
     drop(inner);
 
     // Back on the outer timeline, the inner sim's hour is in the future. An
-    // entry that expires more than its TTL from now is from another timeline.
+    // entry that expires more than twice its TTL from now is from another
+    // timeline.
     assert!(
         store.get("k").is_none(),
         "the entry is from another timeline"
