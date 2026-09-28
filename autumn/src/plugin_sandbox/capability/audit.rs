@@ -144,6 +144,7 @@ impl PluginActivityLog {
         let mut evicted: Vec<(Instant, String)> = Vec::new();
         {
             let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            forget_a_later_timeline(&mut entries, now);
             for event in events {
                 if entries.len() >= MAX_LOG_EVENTS
                     && let Some((at, who, _)) = entries.pop_front()
@@ -160,6 +161,7 @@ impl PluginActivityLog {
             // Recorded under the *evicted* event's own timestamp, so a drop that
             // has aged out of the window stops being reported with it.
             let mut dropped = self.dropped.lock().unwrap_or_else(PoisonError::into_inner);
+            forget_a_later_timeline(&mut dropped, now);
             for (at, who) in evicted {
                 note_dropped(&mut dropped, at, &who, 1);
             }
@@ -176,8 +178,10 @@ impl PluginActivityLog {
         if dropped == 0 {
             return;
         }
+        let now = crate::time::ambient_instant();
         let mut ring = self.dropped.lock().unwrap_or_else(PoisonError::into_inner);
-        note_dropped(&mut ring, crate::time::ambient_instant(), plugin, dropped);
+        forget_a_later_timeline(&mut ring, now);
+        note_dropped(&mut ring, now, plugin, dropped);
     }
 
     /// What `plugin` did within `window`.
@@ -197,7 +201,7 @@ impl PluginActivityLog {
             // incident.
             let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
             for (at, who, event) in entries.iter() {
-                if who != plugin || cutoff.saturating_duration_since(*at) > window {
+                if who != plugin || !in_window(*at, cutoff, window) {
                     continue;
                 }
                 summary.record(event);
@@ -207,9 +211,7 @@ impl PluginActivityLog {
             let dropped = self.dropped.lock().unwrap_or_else(PoisonError::into_inner);
             dropped
                 .iter()
-                .filter(|(at, who, _)| {
-                    who == plugin && cutoff.saturating_duration_since(*at) <= window
-                })
+                .filter(|(at, who, _)| who == plugin && in_window(*at, cutoff, window))
                 .fold(0_u64, |sum, (_, _, count)| sum.saturating_add(*count))
         };
         summary
@@ -241,6 +243,25 @@ impl PluginActivityLog {
         names.sort();
         names.dedup();
         names
+    }
+}
+
+/// Whether a record at `at` is inside `window` before `cutoff`. A record after
+/// `cutoff` is from another timeline (another `Sim`), so it is not.
+fn in_window(at: Instant, cutoff: Instant, window: Duration) -> bool {
+    cutoff
+        .checked_duration_since(at)
+        .is_some_and(|age| age <= window)
+}
+
+/// Remove records from a later timeline before `now` records on this one.
+///
+/// A log shared across a `Sim` boundary keeps the old timeline's instants.
+/// The ring is in time order within one timeline, so a newest record after
+/// `now` means the timeline changed (issue #2967).
+fn forget_a_later_timeline<T>(ring: &mut VecDeque<(Instant, String, T)>, now: Instant) {
+    if ring.back().is_some_and(|(at, _, _)| *at > now) {
+        ring.retain(|(at, _, _)| *at <= now);
     }
 }
 
@@ -457,6 +478,43 @@ mod tests {
             target: "cart".to_owned(),
             outcome,
         }
+    }
+
+    #[test]
+    fn a_log_from_a_later_timeline_is_not_this_ones_last_hour() {
+        use std::sync::Arc;
+
+        use chrono::TimeZone as _;
+
+        use crate::time::{TickingClock, install_ambient};
+
+        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let hour = Duration::from_secs(3600);
+        let log = PluginActivityLog::new();
+
+        // Two hours into one timeline, the plugin calls and drops calls.
+        let first = TickingClock::starting_at(epoch);
+        first.advance(2 * hour);
+        let guard = install_ambient(Arc::new(first));
+        log.ingest("shop", [event("kv-get", CapabilityOutcome::Allowed)]);
+        log.ingest_dropped("shop", 3);
+        drop(guard);
+
+        // A new timeline starts at zero. Those calls are not its last hour.
+        let second = TickingClock::starting_at(epoch);
+        let _guard = install_ambient(Arc::new(second.clone()));
+        let summary = log.summary("shop", hour);
+        assert_eq!(summary.allowed.get("kv-get"), None);
+        assert_eq!(summary.dropped, 0);
+
+        // Its first call removes them, so they do not come back later on.
+        log.ingest("shop", [event("kv-set", CapabilityOutcome::Allowed)]);
+        log.ingest_dropped("shop", 1);
+        second.advance(2 * hour);
+        let summary = log.summary("shop", 3 * hour);
+        assert_eq!(summary.allowed.get("kv-get"), None);
+        assert_eq!(summary.allowed.get("kv-set").copied(), Some(1));
+        assert_eq!(summary.dropped, 1);
     }
 
     #[test]

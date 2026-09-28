@@ -2629,6 +2629,15 @@ async fn serve_sim_host(
             builder = builder.header(name, value);
         }
     }
+    // The real client sends a `Content-Length` for a known-size body. A
+    // caller header of the same name wins.
+    if let Some(body) = &request.body
+        && !request
+            .extra_headers
+            .contains_key(reqwest::header::CONTENT_LENGTH)
+    {
+        builder = builder.header(reqwest::header::CONTENT_LENGTH, body.len());
+    }
     for (name, value) in &request.extra_headers {
         builder = builder.header(name, value);
     }
@@ -3923,6 +3932,42 @@ mod tests {
                     .unwrap()
                     .text();
                 assert_eq!(seen, host, "{url}");
+            }
+        });
+    }
+
+    /// A sim request with a body carries its `Content-Length`, as the real
+    /// client's does, and a caller value wins (issue #2967).
+    #[test]
+    fn sim_host_receives_content_length() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let echo = axum::Router::new().fallback(|headers: HeaderMap| async move {
+            headers
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("none")
+                .to_owned()
+        });
+        let url = "http://payments/charge";
+        let parsed = reqwest::Url::parse(url).unwrap();
+        runtime.block_on(async {
+            for (request, expected) in [
+                (Client::new().post(url).text_body("hello"), "5"),
+                (
+                    Client::new().post(url).json(&serde_json::json!({"a": 1})),
+                    "7",
+                ),
+                (Client::new().post(url).bytes_body(Bytes::new()), "0"),
+                (Client::new().get(url), "none"),
+            ] {
+                let seen = serve_sim_host(echo.clone(), &request, parsed.clone())
+                    .await
+                    .unwrap()
+                    .text();
+                assert_eq!(seen, expected);
             }
         });
     }
