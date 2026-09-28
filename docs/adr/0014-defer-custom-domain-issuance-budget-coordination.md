@@ -54,14 +54,23 @@ Reproduce with the commands in **Reproduce** below.
    ordinary correctness bugs against the limiter's own documented contract,
    independent of how many replicas exist. Only item 2 ("each replica has
    its own [budget]") is inherently about fleet size.
-3. **The minimal fix already has a ready-built seam.** `CustomDomainStore`
-   (`autumn/src/custom_domain.rs:666`) is already a pluggable trait with
-   `MemoryCustomDomainStore` and `FsCustomDomainStore` implementations,
-   writing one durable record per domain. Option 1 in #2644 — "the
-   `CustomDomainStore` seam already writes per-domain JSON; per-domain
-   attempt timestamps could ride on the record" — requires no new
-   abstraction; it is additive data on a trait that already exists and is
-   already exercised by tests.
+3. **The minimal fix already has a ready-built seam — for the per-domain
+   half.** `CustomDomainStore` (`autumn/src/custom_domain.rs:666`) is
+   already a pluggable trait with `MemoryCustomDomainStore` and
+   `FsCustomDomainStore` implementations, writing one durable record per
+   domain. Durable-state option 1 in #2644 — "the `CustomDomainStore` seam
+   already writes per-domain JSON; per-domain attempt timestamps could ride
+   on the record, **and the global window in one small file**" — requires
+   no new abstraction for the per-domain half; it is additive data on a
+   trait that already exists and is already exercised by tests. The global
+   half needs its own small durable store, not a ride on `CustomDomainStore`:
+   `CustomDomainRegistry::remove_if` (`custom_domain.rs:1606`) deletes a
+   domain's record outright, while `IssuanceLimiter::forget`
+   (`custom_domain.rs:1927`) only clears that domain's *per-domain* history
+   and intentionally leaves its attempts in the global vector — so a global
+   window reconstructed from per-domain records would lose an offboarded
+   domain's still-counting attempts on the next restart, letting the
+   deployment-wide budget run over exactly the case it exists to catch.
 4. **This is not a new architecture question — ADR 0004 already answered
    it in the abstract**, and this repository's evidence bar (Step 7:
    "check for prior decisions") requires citing that rather than re-deciding
@@ -102,12 +111,14 @@ inside Let's Encrypt's 300-new-orders-per-account-per-3-hours limit... a
 permanently broken domain converges to one attempt per `max_backoff_secs`"),
 and that guarantee is what stands between a misconfigured or crash-looping
 deployment and Let's Encrypt rate-limiting the account for every tenant on
-it, not just the broken one. Fixing those three (option 1 in #2644,
-already fully scoped with acceptance criteria) is due regardless of this
-ADR. The question this ADR answers is narrower: whether to *also* build
-fleet-wide coordination (option 3) in the same pass.
+it, not just the broken one. Fixing those three — item 1 via durable-state
+option 1, items 3 and 4 as their own small, independent fixes — is due
+regardless of this ADR; all three already carry acceptance criteria in
+#2644. The question this ADR answers is narrower: whether to *also* build
+fleet-wide coordination (durable-state option 3) in the same pass.
 
-If option 3 is deferred and only options 1/2/4 ship: a deployment running
+If durable-state option 3 is deferred and only items 1, 3, and 4 are
+fixed (via durable-state option 1 for item 1): a deployment running
 multiple replicas that are all actively issuing custom-domain certificates
 gets up to N× the advertised `global_per_hour` budget, same as today,
 where N is replica count. That is a real gap, bounded by Let's Encrypt's
@@ -138,16 +149,21 @@ floor for option 3 — it is not RFC-worthy today.
 
 ## Default path
 
-Ship options 1, 3, and 4 from #2644 as ordinary PR-level bug fixes against
-that issue's existing acceptance criteria: persist the per-domain and
-global attempt windows through the already-pluggable `CustomDomainStore`
-seam, stamp attempts with their own time rather than the tick's start
-time, and route a budget deferral through `retry_after_secs` instead of the
-generic failure/backoff path. None of this needs architecture review — it
-is additive state on an existing trait, exactly the shape ADR 0012 and
-0013 both found to be routine engineering rather than a door worth an ADR.
-Leave the limiter per-process; do not add a Redis or Postgres-backed
-coordination layer for it in this pass.
+Ship durable-state option 1 from #2644 (for failure-mode item 1), together
+with the independent fixes for items 3 and 4, as ordinary PR-level bug
+fixes against that issue's existing acceptance criteria: persist per-domain
+attempt timestamps on the existing `CustomDomainStore` record, persist the
+global attempt window separately in its own small durable store rather than
+deriving it from per-domain records (see Evidence item 3 above for why),
+stamp attempts with their own time rather than the tick's start time, and
+route a budget deferral through `retry_after_secs` instead of the generic
+failure/backoff path. None of this needs architecture review — it is
+additive state on an existing trait plus one small new durable store,
+exactly the shape ADR 0012 and 0013 both found to be routine engineering
+rather than a door worth an ADR. Leave the limiter's *coordination* model
+per-process; do not add a Redis or Postgres-backed cross-replica layer for
+it in this pass — durability and cross-replica coordination are separate
+questions, and only the latter is what this ADR defers.
 
 ## Seam kept open
 
@@ -164,11 +180,20 @@ No new seam is needed to keep option 3 available later. Two already exist:
 
 ## Trigger to revisit
 
-Revisit the option-3 (fleet-wide coordination) decision if either occurs:
+Revisit the durable-state-option-3 (fleet-wide coordination) decision if
+either occurs:
 
 - An operator reports running ≥2 replicas that concurrently issue
-  custom-domain certificates for overlapping domain sets, with the
-  per-process budget gap (#2644 item 2) producing observed over-issuance.
+  custom-domain certificates — for the same hostname or different ones.
+  The fleet lease in `tenant_domains.rs::issue_one` is keyed per-hostname
+  (`format!("custom-domain:{hostname}")`, "one replica per hostname
+  orders"), so it excludes a second replica from racing the *same* domain
+  but does nothing to stop two replicas issuing for *different* domains at
+  the same time, each checked against its own process-local
+  `global_per_hour` allowance. Overlapping domain sets are not required for
+  the per-process budget gap (#2644 item 2) to produce observed
+  over-issuance — disjoint domains issued concurrently across replicas
+  already multiply the advertised budget by replica count.
 - A deployment is documented approaching Let's Encrypt's outer
   300-orders-per-3-hours account limit, making this framework's own budget
   (rather than the vendor's) the thing that needs to hold exactly, not just
@@ -200,6 +225,17 @@ sed -n '1,20p' docs/adr/0010-app-facing-distributed-lock.md
 
 # The one correctly-pluggable precedent for a real fleet-wide need
 grep -n '"memory"\|"redis"\|RedisStore' autumn/src/security/rate_limit.rs
+
+# The fleet lease is keyed per-hostname, not per-tick: it stops two replicas
+# racing the SAME domain, not two replicas issuing for DIFFERENT domains at
+# the same time (why the revisit trigger below needs no overlap requirement)
+grep -n "tick_key\|One replica per hostname" autumn/src/acme/tenant_domains.rs
+
+# forget() clears only per-domain history; remove_if deletes the whole
+# per-domain record outright, so a global window derived from per-domain
+# records would silently drop an offboarded domain's still-counting attempts
+grep -n "fn forget" -A 3 autumn/src/custom_domain.rs
+grep -n "pub async fn remove_if" autumn/src/custom_domain.rs
 
 # Negative search: no other hand-rolled, non-pluggable "shared state" limiter
 # masquerading as cross-replica-safe was found in this pass. Each of these is
