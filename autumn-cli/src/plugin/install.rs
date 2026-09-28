@@ -1578,8 +1578,20 @@ pub fn plan_add(
     let excluded = |app_version: &str| {
         parse_version(app_version).is_none() && !meets_series(app_version, version)
     };
+    // `check_compat` reads versions without their prerelease, but the
+    // plugin's caret `autumn-web = "<release>"` excludes a prerelease of it:
+    // an app on `0.7.0-alpha.1` would build a second, stable framework.
+    let prerelease_excluded = |app_version: &str| {
+        semver::Version::parse(app_version.trim().trim_start_matches(['=', '^', '~', ' ']))
+            .ok()
+            .filter(|app| !app.pre.is_empty())
+            .zip(semver::VersionReq::parse(&format!("^{}", version.trim_start_matches('='))).ok())
+            .is_some_and(|(app, req)| !req.matches(&app))
+    };
     if let Some(app_version) = &app
-        && (check_compat(app_version, version) == Compat::Incompatible || excluded(app_version))
+        && (check_compat(app_version, version) == Compat::Incompatible
+            || excluded(app_version)
+            || prerelease_excluded(app_version))
     {
         return Err(PluginError::Incompatible {
             crate_name: entry.crate_name.to_owned(),
@@ -2910,6 +2922,21 @@ maud = { version = "0.27", features = ["axum"] }
         assert!(spans_series(">=1.2, <3", "1.4.0"));
         assert!(spans_series(">=0.9, <1.5", "1.4.0"));
         assert!(!spans_series("1.2", "1.4.0"));
+    }
+
+    /// A prerelease framework is outside the stable plugin's caret, whether
+    /// or not a listing gate ran first (a delisted or unlisted plugin skips
+    /// it).
+    #[test]
+    fn a_first_party_install_refuses_a_prerelease_framework() {
+        let cargo = "[package]\nname = \"demo\"\n\n\
+                     [dependencies]\nautumn-web = \"=0.7.0-alpha.1\"\n";
+        let tmp = fake_project(SCAFFOLD_MAIN, cargo);
+        let err = plan_add(tmp.path(), admin(), "0.7.0").unwrap_err();
+        assert!(matches!(err, PluginError::Incompatible { .. }), "{err}");
+        // The plugin's own prerelease is its release.
+        let same = fake_project(SCAFFOLD_MAIN, cargo);
+        assert!(plan_add(same.path(), admin(), "0.7.0-alpha.1").is_ok());
     }
 
     /// The locked framework version decides a first-party install when the

@@ -686,6 +686,27 @@ pub fn gate_listing(listing: &index::Listing, app: Option<&str>) -> Result<(), S
     ))
 }
 
+/// A first-party listing must pin this CLI's version: the install is always
+/// this release, so a listing for another one (an `AUTUMN_PLUGIN_INDEX` made
+/// for another CLI) would show trust facts for code it does not install.
+///
+/// # Errors
+///
+/// The refusal, without the trailing "no files" note.
+fn first_party_pin_matches(listing: &index::Listing) -> Result<(), String> {
+    let pinned = listing.version.trim().trim_start_matches('=');
+    if listing.origin != index::ListingOrigin::FirstParty || pinned == first_party_version() {
+        return Ok(());
+    }
+    Err(format!(
+        "the plugin index lists `{}` {pinned}, but this CLI installs first-party plugins at \
+         {}. The index was made for another release: use that release's CLI, or unset \
+         AUTUMN_PLUGIN_INDEX.",
+        listing.name,
+        first_party_version()
+    ))
+}
+
 /// Whether the app's `autumn-web` version is a prerelease (`0.7.0-alpha.1`).
 /// [`install::check_compat`] reads versions without their prerelease, so a
 /// first-party listing is compared with the listing's own range instead.
@@ -1075,6 +1096,14 @@ pub fn run_add(opts: &AddOptions<'_>) -> i32 {
     };
     if let index::Source::Override(path) = &loaded.source {
         println!("Using the plugin index at {}.", path.display());
+    }
+    // Its facts describe the version it pins; a first-party install is this
+    // CLI's version, so an index for another release does not describe it.
+    if let Standing::Listed(listing) = standing
+        && let Err(err) = first_party_pin_matches(listing)
+    {
+        eprintln!("autumn plugin add: {err} No files were changed.");
+        return 1;
     }
 
     // The trust review comes first: before any gate, plan or write (AC 6).
@@ -1670,6 +1699,8 @@ pub fn preflight_scaffold_plugins(
         };
         let name = listed.map_or(name.as_str(), |l| l.name.as_str());
         if let Some(listing) = listed {
+            first_party_pin_matches(listing)
+                .map_err(|err| format!("{err} No files were written."))?;
             if listing.trust == index::Trust::Sandboxed {
                 return Err(format!(
                     "`{name}` is a sandboxed plugin; `--with` cannot wire it. Run \
@@ -2042,6 +2073,27 @@ mod tests {
         assert_eq!(app(">=0.7, <0.8", None).as_deref(), Some(">=0.7, <0.8"));
         assert_eq!(app("0.7.*", None).as_deref(), Some("0.7.*"));
         assert_eq!(app("^0.7", None).as_deref(), Some("^0.7"));
+    }
+
+    /// A first-party listing from another release's index is refused before
+    /// its trust facts are shown: the install would be this CLI's version.
+    #[test]
+    fn a_first_party_listing_from_another_release_is_refused() {
+        let mut admin = bundled().get("autumn-admin-plugin").expect("admin").clone();
+        assert!(first_party_pin_matches(&admin).is_ok());
+        admin.version = "99.0.0".to_owned();
+        let err = first_party_pin_matches(&admin).unwrap_err();
+        assert!(err.contains("99.0.0") && err.contains(RELEASE), "{err}");
+        let mut other_release = bundled();
+        for listing in &mut other_release.plugins {
+            if listing.name == "autumn-admin-plugin" {
+                listing.version = "99.0.0".to_owned();
+            }
+        }
+        let names = vec!["autumn-admin-plugin".to_owned()];
+        let err =
+            preflight_scaffold_plugins(&names, &other_release, None, no_community).unwrap_err();
+        assert!(err.contains("No files were written"), "{err}");
     }
 
     /// A first-party listing is lockstep, but not across a prerelease: a

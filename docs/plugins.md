@@ -200,7 +200,9 @@ release cannot ship a stale index.
 
 To use a different index file (a mirror, or a fork), set
 `AUTUMN_PLUGIN_INDEX=<path>`. The CLI refuses a file that breaks an admission
-rule.
+rule. `plugin add` and `new --with` also refuse a first-party listing that
+pins another release than the CLI's, before showing its trust facts: a
+first-party install is always the CLI's own release.
 
 To list your own plugin, see
 [Submit for listing](#4-submit-for-listing).

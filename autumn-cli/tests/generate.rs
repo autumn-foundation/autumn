@@ -9495,6 +9495,12 @@ fn add_unflagged(tmp: &Path, project: &Path, listing: &toml::Value) -> Result<()
     let table = unflagged.as_table_mut().unwrap();
     table.insert("status".into(), "listed".into());
     table.insert("autumn_web".into(), series.as_str().into());
+    // A first-party install is always this release, and `plugin add` refuses
+    // a first-party listing that pins another one (after a version bump, the
+    // committed listing still names the last).
+    if table.get("origin").and_then(toml::Value::as_str) == Some("first-party") {
+        table.insert("version".into(), release.into());
+    }
     table.remove("note");
     let conformance = table["conformance"].as_table_mut().unwrap();
     conformance.insert("result".into(), "pass".into());
