@@ -740,8 +740,12 @@ enum FrameworkSource {
         url: String,
         reference: Option<(String, String)>,
     },
-    /// An alternate registry, by name (`registry`) or index (`registry-index`).
-    Registry(String),
+    /// An alternate registry, by name (`registry`) or index (`registry-index`),
+    /// and the version requirement the entry names.
+    Registry {
+        registry: String,
+        version: Option<String>,
+    },
 }
 
 /// The alternate-registry source of a dependency entry, if it names one.
@@ -750,7 +754,39 @@ fn registry_source(entry: &toml::Value) -> Option<FrameworkSource> {
         .get("registry")
         .or_else(|| entry.get("registry-index"))
         .and_then(toml::Value::as_str)
-        .map(|registry| FrameworkSource::Registry(registry.trim_end_matches('/').to_owned()))
+        .map(|registry| FrameworkSource::Registry {
+            registry: registry.trim_end_matches('/').to_owned(),
+            version: entry
+                .get("version")
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned),
+        })
+}
+
+/// Whether a registry `patch` unifies the app's registry `local` entry:
+/// the same registry, and a patch version requirement that admits the
+/// lowest version the app's requirement does. Cargo skips a patch whose
+/// version does not fit, so an unreadable version on either side does not
+/// count.
+fn registry_patch_unifies(local: &FrameworkSource, patch: &FrameworkSource) -> bool {
+    let (
+        FrameworkSource::Registry {
+            registry: local_registry,
+            version: Some(local_version),
+        },
+        FrameworkSource::Registry {
+            registry: patch_registry,
+            version: Some(patch_version),
+        },
+    ) = (local, patch)
+    else {
+        return false;
+    };
+    local_registry == patch_registry
+        && parse_version(local_version)
+            .map(|(major, minor, patch)| semver::Version::new(major, minor, patch))
+            .zip(semver::VersionReq::parse(patch_version).ok())
+            .is_some_and(|(floor, req)| req.matches(&floor))
 }
 
 /// The git source of a dependency entry: the URL without a trailing `/` or
@@ -1117,7 +1153,11 @@ pub fn unpatched_local_framework(root: &Path) -> bool {
         .iter()
         .filter(|(entry, _)| entry.get("path").is_none() && entry.get("git").is_none())
         .filter_map(|(entry, _)| registry_source(entry))
-        .any(|source| !patches.contains(&source));
+        .any(|local| {
+            !patches
+                .iter()
+                .any(|patch| registry_patch_unifies(&local, patch))
+        });
     path_unpatched || git_unpatched || registry_unpatched
 }
 
@@ -1339,8 +1379,18 @@ pub fn plan_add(
 ) -> Result<AddOutcome, PluginError> {
     app_autumn_web(root)?;
     let app = resolved_app_version(root, entry.crate_name)?;
+    // A range (`>=0.8, <0.9`) has no single series to compare, but one that
+    // excludes this release cannot build it next to the plugin. A range that
+    // admits it (even across series) stays unresolved and proceeds.
+    let excluded = |app_version: &str| {
+        parse_version(app_version).is_none()
+            && semver::VersionReq::parse(app_version)
+                .ok()
+                .zip(semver::Version::parse(version.trim_start_matches('=')).ok())
+                .is_some_and(|(req, release)| !req.matches(&release))
+    };
     if let Some(app_version) = &app
-        && check_compat(app_version, version) == Compat::Incompatible
+        && (check_compat(app_version, version) == Compat::Incompatible || excluded(app_version))
     {
         return Err(PluginError::Incompatible {
             crate_name: entry.crate_name.to_owned(),
@@ -2464,6 +2514,38 @@ maud = { version = "0.27", features = ["axum"] }
             let tmp = fake_project(SCAFFOLD_MAIN, &cargo);
             assert!(unpatched_local_framework(tmp.path()), "{key}");
         }
+    }
+
+    /// A registry patch counts only when its version admits the app's.
+    #[test]
+    fn a_registry_patch_must_supply_the_apps_version() {
+        let cargo = |patch: &str| {
+            format!(
+                "[package]\nname = \"demo\"\n\n[dependencies]\n\
+                 autumn-web = {{ version = \"0.7\", registry = \"private\" }}\n\n\
+                 [patch.crates-io]\nautumn-web = {{ version = \"{patch}\", registry = \"private\" }}\n"
+            )
+        };
+        let other = fake_project(SCAFFOLD_MAIN, &cargo("0.8"));
+        assert!(unpatched_local_framework(other.path()));
+        let same = fake_project(SCAFFOLD_MAIN, &cargo("0.7"));
+        assert!(!unpatched_local_framework(same.path()));
+    }
+
+    /// An unlocked range that excludes this release refuses the install.
+    #[test]
+    fn a_range_that_excludes_the_release_is_refused() {
+        let cargo = "[package]\nname = \"demo\"\n\n\
+                     [dependencies]\nautumn-web = \">=0.8, <0.9\"\n";
+        let tmp = fake_project(SCAFFOLD_MAIN, cargo);
+        let err = plan_add(tmp.path(), admin(), "0.7.0").unwrap_err();
+        assert!(matches!(err, PluginError::Incompatible { .. }), "{err}");
+        // A range that admits the release (across series) proceeds.
+        let wide = fake_project(
+            SCAFFOLD_MAIN,
+            "[package]\nname = \"demo\"\n\n[dependencies]\nautumn-web = \">=0.6, <0.9\"\n",
+        );
+        assert!(plan_add(wide.path(), admin(), "0.7.0").is_ok());
     }
 
     /// The locked framework version decides a first-party install when the
