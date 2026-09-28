@@ -148,6 +148,39 @@ impl Obligation {
         let started_at = self.started_at.unwrap_or(now);
         let budget = self.within.resolve(calendar);
         let due_at = calendar.deadline(started_at, budget, zone);
+        self.status_at(calendar, zone, now, due_at)
+    }
+
+    /// Calculate the status at `now` with the stored deadline `due_at`, not
+    /// the deadline of `calendar`. The remaining time of an open obligation
+    /// is the working time from `now` to `due_at`.
+    pub(super) fn status_with_due(
+        &self,
+        calendar: &BusinessCalendar,
+        zone: Tz,
+        now: DateTime<Utc>,
+        due_at: DateTime<Utc>,
+    ) -> ObligationStatus {
+        let mut status = self.status_at(calendar, zone, now, Some(due_at));
+        if matches!(
+            status.state,
+            ObligationState::Running | ObligationState::Paused
+        ) {
+            status.remaining = calendar.working_time(now.max(status.started_at), due_at, zone);
+        }
+        status
+    }
+
+    /// Calculate the status at `now` for the deadline `due_at`.
+    fn status_at(
+        &self,
+        calendar: &BusinessCalendar,
+        zone: Tz,
+        now: DateTime<Utc>,
+        due_at: Option<DateTime<Utc>>,
+    ) -> ObligationStatus {
+        let started_at = self.started_at.unwrap_or(now);
+        let budget = self.within.resolve(calendar);
         // A met instant after `now` is not known yet.
         let met_at = self.met_at.filter(|met| *met <= now);
         let elapsed = calendar.working_time(started_at, met_at.unwrap_or(now), zone);

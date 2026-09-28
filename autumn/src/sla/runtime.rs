@@ -23,6 +23,12 @@ pub const CHECK_JOB: &str = "autumn_sla_check";
 /// The job that runs the breach handler of an obligation.
 pub const ESCALATE_JOB: &str = "autumn_sla_escalate";
 
+/// How long the unique key of an escalation stays held after its enqueue,
+/// also after the job is done. An enqueue can fail after the queue stored
+/// the job (for example, a lost connection after the commit). The check
+/// then enqueues the breach again, and this key merges that duplicate.
+const ESCALATE_UNIQUE_MS: u64 = 24 * 60 * 60 * 1_000;
+
 /// Attempts for each SLA job before it goes to the dead letters.
 const MAX_ATTEMPTS: u32 = 5;
 
@@ -191,7 +197,7 @@ impl crate::plugin::Plugin for SlaPlugin {
                     ESCALATE_JOB,
                     escalate_job,
                     &["key", "generation"],
-                    JobUniquenessWindow::Running,
+                    JobUniquenessWindow::TtlMs(ESCALATE_UNIQUE_MS),
                 ),
             ])
     }
@@ -460,29 +466,20 @@ impl Sla {
     }
 
     /// The status of `record`. The stored deadline, if set, decides the
-    /// deadline and the met or breached state. Thus a replica with an old
-    /// calendar agrees with the record.
+    /// deadline and the state. Thus a replica with an old calendar agrees
+    /// with the record.
     fn status_of(
         &self,
         record: &ObligationRecord,
         now: DateTime<Utc>,
     ) -> Result<ObligationStatus, SlaError> {
-        let mut status = self.calendar_status(record, now)?;
-        if let Some(due) = record.due_at
-            && status.due_at != Some(due)
-        {
-            status.due_at = Some(due);
-            status.state = match status.met_at {
-                Some(met) if met <= due => ObligationState::Met,
-                Some(_) => ObligationState::Breached,
-                None if now >= due => ObligationState::Breached,
-                None if status.state == ObligationState::Breached => ObligationState::Running,
-                None => status.state,
-            };
-            if status.state == ObligationState::Breached {
-                status.remaining = std::time::Duration::ZERO;
-            }
-        }
+        let Some(due) = record.due_at else {
+            return self.calendar_status(record, now);
+        };
+        let calendar = self.calendar_of(&record.obligation)?;
+        let zone = self.zone_of(&record.obligation, calendar);
+        let mut status = record.obligation.status_with_due(calendar, zone, now, due);
+        status.escalated_at = record.escalated_at;
         Ok(status)
     }
 

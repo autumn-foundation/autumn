@@ -200,8 +200,10 @@ even when the check job runs late. Thus the result does not change with the
 speed of the workers.
 
 The claim in the `ObligationStore` is the lock. A second check does not claim
-again. The unique key of `autumn_sla_escalate` stops a duplicate job while one
-is on the queue.
+again. The unique key of `autumn_sla_escalate` stays held for one day after
+the enqueue, also after the job ran. Thus if an enqueue reports an error after
+the queue stored the job, the retry of the check does not run the handler
+again.
 
 A failed handler runs again, up to 5 attempts in all, with a first delay of
 1 s. Use

@@ -565,3 +565,97 @@ async fn sim_sla_a_stale_calendar_does_not_claim_before_the_stored_deadline() {
 
     job::clear_global_job_client();
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sim_sla_a_stale_calendar_reads_the_stored_deadline_status() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    // Wednesday 2020-01-01. This replica's calendar puts the deadline at
+    // 11:00. The stored deadline is Thursday 15:00.
+    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let stored = Utc.with_ymd_and_hms(2020, 1, 2, 15, 0, 0).unwrap();
+    let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2020, 1, 1, 18, 0, 0).unwrap());
+    let store = RacingStore::new();
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    let app = replica(&clock, &store, &fired);
+    let ob = Obligation::new("first_response", "ticket:1")
+        .within(BusinessDuration::hours(2))
+        .calendar("support")
+        .starting_at(start)
+        .zone(chrono_tz::Tz::UTC);
+    store
+        .inner
+        .insert(ObligationRecord::new(ob.clone(), Uuid::from_u128(12)).with_due_at(stored))
+        .await
+        .unwrap();
+
+    // 18:00 is outside working time: paused, with the time to the stored
+    // deadline left (Thursday 09:00-15:00).
+    let status = Sla::from_state(app.state())
+        .unwrap()
+        .get(&ob.key())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.state, autumn_web::sla::ObligationState::Paused);
+    assert_eq!(status.due_at, Some(stored));
+    assert_eq!(
+        status.resumes_at,
+        Some(Utc.with_ymd_and_hms(2020, 1, 2, 9, 0, 0).unwrap())
+    );
+    assert_eq!(status.remaining, Duration::from_secs(6 * 3600));
+
+    job::clear_global_job_client();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sim_sla_an_escalation_enqueued_again_after_it_ran_does_not_fire_again() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
+    let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2020, 1, 1, 12, 0, 0).unwrap());
+    let store = RacingStore::new();
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    let app = replica(&clock, &store, &fired);
+    let ob = Obligation::new("first_response", "ticket:1")
+        .within(BusinessDuration::hours(2))
+        .calendar("support")
+        .starting_at(start)
+        .zone(chrono_tz::Tz::UTC);
+    let generation = Uuid::from_u128(13);
+    store
+        .inner
+        .insert(ObligationRecord::new(ob.clone(), generation).with_due_at(due))
+        .await
+        .unwrap();
+    let breach = serde_json::json!({
+        "key": ob.key(),
+        "obligation": "first_response",
+        "subject": "ticket:1",
+        "calendar": "support",
+        "zone": "UTC",
+        "generation": generation,
+        "started_at": start,
+        "due_at": due,
+        "escalated_at": due,
+    });
+    let client = app.state().extension::<job::JobClient>().unwrap();
+
+    // The first enqueue runs. Postgres can commit it and still report an
+    // error, so the check enqueues the same breach again after it ran.
+    client.enqueue(ESCALATE_JOB, breach.clone()).await.unwrap();
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    settle().await;
+    assert_eq!(fired.lock().unwrap().len(), 1);
+    client.enqueue(ESCALATE_JOB, breach).await.unwrap();
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    settle().await;
+    assert_eq!(*fired.lock().unwrap(), ["first_response/ticket:1"]);
+
+    job::clear_global_job_client();
+}
