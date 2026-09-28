@@ -7,6 +7,5 @@
   `cargo` command failed with "the 'cargo.exe' binary ... is not applicable to
   the toolchain", or doctor hung. Doctor now reports the missing toolchain in
   the `rust_toolchain` check and suggests `rustup toolchain install`. When
-  `cargo metadata` cannot name the target directory, the Tailwind check looks
-  under `CARGO_TARGET_DIR` or `./target`. If the binary is not there, the check
-  is not evaluated, so doctor does not report it missing from a guess.
+  `cargo metadata` cannot name the target directory, the Tailwind check is not
+  evaluated, rather than judging the binary at a guessed path.

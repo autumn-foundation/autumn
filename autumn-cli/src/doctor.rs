@@ -4274,16 +4274,6 @@ fn rust_toolchain_failure(stderr: &str) -> CheckResult {
     }
 }
 
-/// Where doctor looks for Tailwind when `cargo metadata` gives no answer, for
-/// example because the pinned toolchain is not installed. `CARGO_TARGET_DIR`
-/// wins, as it does for cargo, so a binary `autumn setup` put there is found.
-fn fallback_target_dir(cargo_target_dir: Option<std::ffi::OsString>) -> std::path::PathBuf {
-    cargo_target_dir.filter(|dir| !dir.is_empty()).map_or_else(
-        || std::path::PathBuf::from("target"),
-        std::path::PathBuf::from,
-    )
-}
-
 fn check_port_bindable(port: u16) -> CheckResult {
     check_port_bindable_impl(port, |p| {
         std::net::TcpListener::bind(("127.0.0.1", p)).is_ok()
@@ -4432,35 +4422,29 @@ fn check_tailwind_binary() -> CheckResult {
             "tailwindcss"
         })
     };
-    crate::dev::try_resolve_target_directory().map_or_else(
-        || {
-            let guess = fallback_target_dir(std::env::var_os("CARGO_TARGET_DIR"));
-            check_tailwind_binary_at_guess(&binary(guess))
-        },
-        |target_dir| check_tailwind_binary_at(&binary(target_dir)),
-    )
+    crate::dev::try_resolve_target_directory().map_or_else(tailwind_not_evaluated, |target_dir| {
+        check_tailwind_binary_at(&binary(target_dir))
+    })
 }
 
 /// The Tailwind check when `cargo metadata` could not name the target
 /// directory, for example because the pinned toolchain is not installed.
 ///
-/// `path` is then only a guess: Cargo also reads `CARGO_BUILD_TARGET_DIR` and
-/// `[build] target-dir` from every `.cargo/config.toml` up the tree. A binary
-/// found there is checked as usual. A binary not found there may still be
-/// where `autumn setup` put it, so the check is not evaluated rather than
-/// failed.
-fn check_tailwind_binary_at_guess(path: &std::path::Path) -> CheckResult {
-    if path.symlink_metadata().is_ok() {
-        return check_tailwind_binary_at(path);
-    }
+/// Any path doctor picked instead would be a guess: Cargo also reads
+/// `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR` and `[build] target-dir` from
+/// every `.cargo/config.toml` up the tree. Whatever is or is not at a guessed
+/// path says nothing about the binary `autumn setup` installed, so the check
+/// is not evaluated.
+fn tailwind_not_evaluated() -> CheckResult {
     CheckResult {
         name: "tailwind_binary",
         status: CheckStatus::Pass,
-        detail: Some(format!(
-            "not evaluated — `cargo metadata` could not name the target directory, and {} is only a guess",
-            path.display()
-        )),
-        hint: Some("Fix the `rust_toolchain` check, then run `autumn doctor` again"),
+        detail: Some(
+            "not evaluated — `cargo metadata` could not name the target directory".to_owned(),
+        ),
+        hint: Some(
+            "Fix what stops `cargo metadata` (see the `rust_toolchain` check), then run `autumn doctor` again",
+        ),
     }
 }
 
@@ -17995,24 +17979,6 @@ foo = "bar"
         assert_eq!(r.hint, Some("Install Rust via https://rustup.rs/"));
     }
 
-    #[test]
-    fn the_tailwind_fallback_honours_cargo_target_dir() {
-        // `cargo metadata` gives no answer when the pinned toolchain is missing.
-        // `autumn setup` put Tailwind under `CARGO_TARGET_DIR`, so look there.
-        assert_eq!(
-            fallback_target_dir(Some("/shared/target".into())),
-            std::path::PathBuf::from("/shared/target")
-        );
-        assert_eq!(
-            fallback_target_dir(None),
-            std::path::PathBuf::from("target")
-        );
-        assert_eq!(
-            fallback_target_dir(Some("".into())),
-            std::path::PathBuf::from("target")
-        );
-    }
-
     // ── check_rust_toolchain_impl ────────────────────────────────────────────
 
     #[test]
@@ -20147,30 +20113,13 @@ foo = "bar"
     }
 
     #[test]
-    fn a_guessed_target_dir_never_reports_tailwind_missing() {
-        // `cargo metadata` gave no answer, so the target dir is a guess: Cargo
-        // may have put the binary under a `[build] target-dir` doctor did not
-        // read. Not found there is "not evaluated", never a false "missing".
-        let temp = tempfile::tempdir().expect("temp dir");
-        let r = check_tailwind_binary_at_guess(&temp_tailwind_path(&temp));
+    fn an_unknown_target_dir_leaves_the_tailwind_check_unevaluated() {
+        // `cargo metadata` gave no answer, so doctor does not know where Cargo
+        // builds. It must not judge the binary at any guessed path.
+        let r = tailwind_not_evaluated();
         assert_eq!(r.status, CheckStatus::Pass);
         let detail = r.detail.expect("a detail");
         assert!(detail.contains("not evaluated"), "{detail}");
-        assert!(!detail.contains("not found"), "{detail}");
-    }
-
-    #[test]
-    fn a_binary_at_the_guessed_target_dir_is_checked_as_usual() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let tailwind_path = temp_tailwind_path(&temp);
-        std::fs::create_dir_all(&tailwind_path).expect("a directory where the binary goes");
-        let r = check_tailwind_binary_at_guess(&tailwind_path);
-        assert_eq!(
-            r.status,
-            CheckStatus::Fail,
-            "a real problem there is still reported"
-        );
-        assert!(r.detail.unwrap_or_default().contains("directory"));
     }
 
     #[test]
