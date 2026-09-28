@@ -84,6 +84,16 @@ pub enum PluginError {
         declared: String,
     },
 
+    /// The app takes `autumn-web` from a local checkout whose version cannot
+    /// be read, and no `Cargo.lock` resolves it.
+    #[error(
+        "this app's `autumn-web` comes from a path or git checkout whose version cannot be read, and no Cargo.lock resolves it, so `{crate_name}` cannot be checked against it — no files were changed. Run `cargo generate-lockfile`, then re-run."
+    )]
+    UnknownAutumnWebVersion {
+        /// The plugin that could not be installed.
+        crate_name: String,
+    },
+
     /// crates.io returned something that is not a usable version string.
     #[error(
         "crates.io reported version `{version}` for `{crate_name}`, which is not a usable version requirement — no files were changed"
@@ -332,6 +342,59 @@ pub fn mixed_autumn_web_declarations(root: &Path) -> bool {
     };
     entries.iter().any(|(entry, _)| versioned(entry))
         && entries.iter().any(|(entry, _)| !versioned(entry))
+}
+
+/// The version of the local `autumn-web` checkout the package depends on by
+/// path: its own manifest's `[package] version`, resolved from the package
+/// or, for an inherited entry, the workspace root. `None` for a git
+/// checkout, or when it cannot be read.
+fn local_framework_version(root: &Path) -> Option<String> {
+    let root_abs = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    package_autumn_web_entries(root)
+        .iter()
+        .find_map(|(entry, inherited)| {
+            let path = entry.get("path")?.as_str()?;
+            let base = if *inherited {
+                workspace_root(&root_abs)
+            } else {
+                root_abs.clone()
+            };
+            package_version(&base.join(path))
+        })
+        .map(|version| version.to_string())
+}
+
+/// Whether any dependency table (regular, dev, build or target-specific)
+/// declares `crate_name` from a `path`, `git` or alternate registry, a
+/// `{ workspace = true }` entry resolved from the workspace root. Cargo
+/// refuses one crate from two sources, so a crates.io entry cannot join it.
+#[must_use]
+pub fn alternate_source_anywhere(root: &Path, manifest: &str, crate_name: &str) -> bool {
+    let Ok(table) = toml::from_str::<toml::Table>(manifest) else {
+        return false;
+    };
+    let workspace_deps = std::fs::read_to_string(workspace_root(root).join("Cargo.toml"))
+        .ok()
+        .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+        .and_then(|table| table.get("workspace")?.get("dependencies").cloned());
+    let want = canonical(crate_name);
+    dependency_tables(&table)
+        .flat_map(|deps| deps.iter())
+        .filter(|(key, _)| canonical(key) == want)
+        .any(|(key, entry)| {
+            let entry = if entry.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+                workspace_deps
+                    .as_ref()
+                    .and_then(|deps| deps.get(key.as_str()))
+            } else {
+                Some(entry)
+            };
+            entry.is_some_and(|entry| {
+                ["path", "git", "registry", "registry-index"]
+                    .iter()
+                    .any(|source| entry.get(*source).is_some())
+            })
+        })
 }
 
 /// Every distinct `autumn-web` requirement the package at `root` declares:
@@ -1212,6 +1275,49 @@ fn indent(text: &str, prefix: &str) -> String {
         .join("\n")
 }
 
+/// The `autumn-web` version the app at `root` builds with, for the
+/// compatibility check of `crate_name`. What Cargo resolved wins when the
+/// declaration still admits it (`">=0.7, <0.9"` locked at 0.8 is 0.8);
+/// target-specific declarations of different versions, or an unversioned
+/// edge beside a versioned one, are settled only by the lock. With no
+/// declared or locked version, the local checkout's own version; `Ok(None)`
+/// when that cannot be read either.
+///
+/// # Errors
+///
+/// [`PluginError::AmbiguousAutumnWeb`] when several declarations and no lock
+/// leave the version open.
+fn resolved_app_version(root: &Path, crate_name: &str) -> Result<Option<String>, PluginError> {
+    let declared = declared_autumn_web_versions(root);
+    let locked = locked_version_for(root, None, "autumn-web");
+    let admits = |req: &str, locked: &str| {
+        semver::VersionReq::parse(req)
+            .ok()
+            .zip(semver::Version::parse(locked).ok())
+            .is_none_or(|(req, version)| req.matches(&version))
+    };
+    let mixed = mixed_autumn_web_declarations(root);
+    let app = match (declared.as_slice(), locked) {
+        ([], locked) => locked,
+        ([one], Some(locked)) if mixed || admits(one, &locked) => Some(locked),
+        ([one], None) if mixed => {
+            return Err(PluginError::AmbiguousAutumnWeb {
+                crate_name: crate_name.to_owned(),
+                declared: format!("{one} and an unversioned path or git entry"),
+            });
+        }
+        ([one], _) => Some(one.clone()),
+        (_, Some(locked)) => Some(locked),
+        (several, None) => {
+            return Err(PluginError::AmbiguousAutumnWeb {
+                crate_name: crate_name.to_owned(),
+                declared: several.join(", "),
+            });
+        }
+    };
+    Ok(app.or_else(|| local_framework_version(root)))
+}
+
 /// Plan the install of `entry` at `version` into the project at `root`.
 ///
 /// Ordering is the contract. The project check and the version gate run before
@@ -1232,52 +1338,27 @@ pub fn plan_add(
     version: &str,
 ) -> Result<AddOutcome, PluginError> {
     app_autumn_web(root)?;
-    // Target-specific declarations of different versions: the one Cargo
-    // builds depends on the target, so only a single lock edge settles it.
-    // What Cargo resolved wins, when the declaration still admits it: `">=0.7,
-    // <0.9"` locked at 0.8 is 0.8.
-    let declared = declared_autumn_web_versions(root);
-    let locked = locked_version_for(root, None, "autumn-web");
-    let admits = |req: &str, locked: &str| {
-        semver::VersionReq::parse(req)
-            .ok()
-            .zip(semver::Version::parse(locked).ok())
-            .is_none_or(|(req, version)| req.matches(&version))
-    };
-    // An unversioned edge next to a versioned one is as ambiguous as two
-    // versions: only the lock says which the build takes.
-    let mixed = mixed_autumn_web_declarations(root);
-    let app = match (declared.as_slice(), locked) {
-        ([], locked) => locked,
-        ([one], Some(locked)) if mixed || admits(one, &locked) => Some(locked),
-        ([one], None) if mixed => {
-            return Err(PluginError::AmbiguousAutumnWeb {
-                crate_name: entry.crate_name.to_owned(),
-                declared: format!("{one} and an unversioned path or git entry"),
-            });
-        }
-        ([one], _) => Some(one.clone()),
-        (_, Some(locked)) => Some(locked),
-        (several, None) => {
-            return Err(PluginError::AmbiguousAutumnWeb {
-                crate_name: entry.crate_name.to_owned(),
-                declared: several.join(", "),
-            });
-        }
-    };
-    if let Some(app_version) = app
-        && check_compat(&app_version, version) == Compat::Incompatible
+    let app = resolved_app_version(root, entry.crate_name)?;
+    if let Some(app_version) = &app
+        && check_compat(app_version, version) == Compat::Incompatible
     {
         return Err(PluginError::Incompatible {
             crate_name: entry.crate_name.to_owned(),
             plugin_version: version.to_owned(),
             supported: supported_range(version),
-            app_version,
+            app_version: app_version.clone(),
         });
     }
 
     if unpatched_local_framework(root) {
         return Err(PluginError::UnpatchedLocalFramework {
+            crate_name: entry.crate_name.to_owned(),
+        });
+    }
+    // A local checkout whose version cannot be read: skipping the check
+    // would pin this series next to a checkout of another.
+    if app.is_none() {
+        return Err(PluginError::UnknownAutumnWebVersion {
             crate_name: entry.crate_name.to_owned(),
         });
     }
@@ -2105,11 +2186,36 @@ maud = { version = "0.27", features = ["axum"] }
     #[test]
     fn a_patched_local_framework_is_allowed() {
         let cargo = "[package]\nname = \"demo\"\n\n\
-                     [dependencies]\nautumn-web = { path = \"../autumn\" }\n\n\
-                     [patch.crates-io]\nautumn-web = { path = \"../autumn\" }\n";
+                     [dependencies]\nautumn-web = { path = \"autumn\" }\n\n\
+                     [patch.crates-io]\nautumn-web = { path = \"autumn\" }\n";
         let tmp = fake_project(SCAFFOLD_MAIN, cargo);
+        write(
+            &tmp.path().join("autumn/Cargo.toml"),
+            "[package]\nname = \"autumn-web\"\nversion = \"0.7.0\"\n",
+        );
         assert!(!unpatched_local_framework(tmp.path()));
         assert!(plan_add(tmp.path(), admin(), "0.7.0").is_ok());
+    }
+
+    /// With no declared or locked version, a first-party install reads the
+    /// local checkout's own version, and fails closed when it cannot.
+    #[test]
+    fn a_first_party_install_reads_the_local_checkout_version() {
+        let cargo = "[package]\nname = \"demo\"\n\n\
+                     [dependencies]\nautumn-web = { path = \"autumn\" }\n\n\
+                     [patch.crates-io]\nautumn-web = { path = \"autumn\" }\n";
+        let tmp = fake_project(SCAFFOLD_MAIN, cargo);
+        let err = plan_add(tmp.path(), admin(), "0.7.0").unwrap_err();
+        assert!(
+            matches!(err, PluginError::UnknownAutumnWebVersion { .. }),
+            "{err}"
+        );
+        write(
+            &tmp.path().join("autumn/Cargo.toml"),
+            "[package]\nname = \"autumn-web\"\nversion = \"0.6.0\"\n",
+        );
+        let err = plan_add(tmp.path(), admin(), "0.7.0").unwrap_err();
+        assert!(matches!(err, PluginError::Incompatible { .. }), "{err}");
     }
 
     /// Only the app's workspace root counts: a nearer manifest that is not

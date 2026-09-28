@@ -837,6 +837,15 @@ pub fn check_listed_declaration(
             index::sanitize(&alias)
         ));
     }
+    // A path, git or registry entry in any table is a second source for the
+    // crate; Cargo refuses the crates.io entry `plugin add` would write.
+    if install::alternate_source_anywhere(root, &manifest, crate_name) {
+        return Err(format!(
+            "Cargo.toml already takes `{crate_name}` from a path, git or other registry (in \
+             a dev, build or target-specific table, or inherited), but the index verified the \
+             crates.io release. Remove that entry, then re-run. No files were changed."
+        ));
+    }
     let manifest = install::with_inherited_dependency(root, &manifest, crate_name);
     let patched = install::patched_by(root, crate_name, version);
     match resolved {
@@ -2435,6 +2444,33 @@ mod tests {
         assert!(check(Some("{ path = \"../x\", version = \"=0.3.0\" }")).is_err());
         // Not defined in the workspace: unresolvable, so refused.
         assert!(check(None).is_err());
+    }
+
+    /// The listed crate from a path, git or registry in any table is a second
+    /// source: refused before `plugin add` writes a crates.io entry.
+    #[test]
+    fn an_alternate_source_in_any_table_is_refused() {
+        let x = Resolved::Community("autumn-plugin-x".to_owned());
+        for table in [
+            "dev-dependencies",
+            "build-dependencies",
+            "target.'cfg(unix)'.dependencies",
+        ] {
+            let tmp = project_with(&format!(
+                "[package]\nname = \"a\"\n\n[{table}]\n\
+                 autumn-plugin-x = {{ path = \"../x\" }}\n"
+            ));
+            let err = check_listed_declaration(tmp.path(), &x, "=0.3.0").unwrap_err();
+            assert!(
+                err.contains("path, git or other registry"),
+                "{table}: {err}"
+            );
+        }
+        // A crates.io dev-dependency is not a second source.
+        let dev = project_with(
+            "[package]\nname = \"a\"\n\n[dev-dependencies]\nautumn-plugin-x = \"=0.3.0\"\n",
+        );
+        assert!(check_listed_declaration(dev.path(), &x, "=0.3.0").is_ok());
     }
 
     /// An alias of the listed crate, in any dependency table or inherited
