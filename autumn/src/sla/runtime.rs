@@ -53,6 +53,9 @@ pub struct SlaBreach {
     pub calendar: String,
     /// The IANA name of the time zone.
     pub zone: String,
+    /// The generation of the tracked record. See
+    /// [`ObligationRecord::generation`].
+    pub generation: uuid::Uuid,
     /// The start instant.
     pub started_at: DateTime<Utc>,
     /// The deadline.
@@ -65,6 +68,10 @@ pub struct SlaBreach {
 #[derive(Debug, Serialize, Deserialize)]
 struct CheckArgs {
     key: String,
+    /// The record that this check is for. A check for a replaced record
+    /// stops. `None` checks any record for the key.
+    #[serde(default)]
+    generation: Option<uuid::Uuid>,
     due_at: DateTime<Utc>,
 }
 
@@ -173,13 +180,13 @@ impl crate::plugin::Plugin for SlaPlugin {
                 sla_job(
                     CHECK_JOB,
                     check_job,
-                    &["key", "due_at"],
+                    &["key", "generation", "due_at"],
                     JobUniquenessWindow::Running,
                 ),
                 sla_job(
                     ESCALATE_JOB,
                     escalate_job,
-                    &["key", "started_at"],
+                    &["key", "generation"],
                     JobUniquenessWindow::Running,
                 ),
             ])
@@ -361,7 +368,7 @@ impl Sla {
             return Err(SlaError::NoDeadline(key.to_owned()));
         };
         if status.escalated_at.is_none() && status.state != ObligationState::Met {
-            self.schedule_check(key, due).await?;
+            self.schedule_check(key, record.generation, due).await?;
         }
         Ok(status)
     }
@@ -447,9 +454,15 @@ impl Sla {
         Ok(status)
     }
 
-    async fn schedule_check(&self, key: &str, due_at: DateTime<Utc>) -> Result<(), SlaError> {
+    async fn schedule_check(
+        &self,
+        key: &str,
+        generation: uuid::Uuid,
+        due_at: DateTime<Utc>,
+    ) -> Result<(), SlaError> {
         let args = CheckArgs {
             key: key.to_owned(),
+            generation: Some(generation),
             due_at,
         };
         self.enqueue(CHECK_JOB, &args, Some(due_at)).await
@@ -473,7 +486,12 @@ impl Sla {
     }
 
     /// Run the breach check of `key`. `due_hint` is the deadline in the job.
-    async fn check(&self, key: &str, due_hint: DateTime<Utc>) -> Result<(), SlaError> {
+    async fn check(
+        &self,
+        key: &str,
+        generation: Option<uuid::Uuid>,
+        due_hint: DateTime<Utc>,
+    ) -> Result<(), SlaError> {
         let store = &self.engine.store;
         let Some(record) = store.get(key).await? else {
             tracing::warn!(
@@ -482,6 +500,11 @@ impl Sla {
             );
             return Ok(());
         };
+        if generation.is_some_and(|generation| generation != record.generation) {
+            // A `forget` and a new `track` replaced this record. The new
+            // record has its own check.
+            return Ok(());
+        }
         if record.escalated_at.is_some() {
             return Ok(());
         }
@@ -506,7 +529,7 @@ impl Sla {
                 if due_at != due_hint =>
             {
                 // The deadline moved. Check again at the new deadline.
-                return self.schedule_check(key, due_at).await;
+                return self.schedule_check(key, record.generation, due_at).await;
             }
             _ => return Ok(()),
         };
@@ -525,6 +548,7 @@ impl Sla {
             subject: obligation.subject().to_owned(),
             calendar: obligation.calendar_name().to_owned(),
             zone: status.zone.name().to_owned(),
+            generation: record.generation,
             started_at: status.started_at,
             due_at,
             escalated_at: now,
@@ -557,7 +581,7 @@ fn check_job(state: AppState, payload: Value) -> BreachFuture {
     Box::pin(async move {
         let args: CheckArgs = serde_json::from_value(payload)?;
         Sla::from_state(&state)?
-            .check(&args.key, args.due_at)
+            .check(&args.key, args.generation, args.due_at)
             .await?;
         Ok(())
     })

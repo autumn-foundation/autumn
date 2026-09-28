@@ -717,7 +717,7 @@ only the injected `Clock`.
   `met_at`, `escalated_at`, `resumes_at`, `budget`, `elapsed`, `remaining`};
   `ObligationState` {`Running`, `Paused`, `Met`, `Breached`}.
 - `SlaBreach` (serde) {`key`, `obligation`, `subject`, `calendar`, `zone`,
-  `started_at`, `due_at`, `escalated_at`} — the typed escalation.
+  `generation`, `started_at`, `due_at`, `escalated_at`} — the typed escalation.
 - `ObligationStore` trait (`insert` → `(record, created)`, `get`, `list`,
   `remove`, and the generation-bound writes `mark_met`, `claim_escalation`,
   `release_escalation`, `mark_scheduled`, `remove_unscheduled`);

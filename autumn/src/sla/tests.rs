@@ -307,6 +307,39 @@ fn a_long_run_of_dated_holidays_does_not_stop_the_scan() {
     );
 }
 
+#[test]
+fn sparse_annual_working_days_are_found_inside_the_horizon() {
+    // Work every day, but every date except February 29 is a holiday.
+    let mut cal = BusinessCalendar::new();
+    for day in [
+        Weekday::Mon,
+        Weekday::Tue,
+        Weekday::Wed,
+        Weekday::Thu,
+        Weekday::Fri,
+        Weekday::Sat,
+        Weekday::Sun,
+    ] {
+        cal = cal.hours(day, WorkingHours::ALL_DAY);
+    }
+    for month in 1..=12 {
+        for day in 1..=31 {
+            if (month, day) != (2, 29) {
+                cal = cal.annual_holiday(month, day);
+            }
+        }
+    }
+    let from = utc(2024, 3, 1, 0, 0);
+    assert_eq!(
+        cal.next_working_instant(from, Tz::UTC),
+        Some(utc(2028, 2, 29, 0, 0))
+    );
+    assert_eq!(
+        cal.deadline(from, HOUR, Tz::UTC),
+        Some(utc(2028, 2, 29, 1, 0))
+    );
+}
+
 // ── BusinessDuration ─────────────────────────────────────────────────────────
 
 #[test]

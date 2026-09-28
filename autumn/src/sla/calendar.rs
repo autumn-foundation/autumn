@@ -18,10 +18,6 @@ const DAY_SECS: u32 = 86_400;
 /// The scan horizon: one hundred years of days.
 const SCAN_DAYS: usize = 36_525;
 
-/// Stop a scan after this many days in a row with no working time, after the
-/// last dated holiday.
-const MAX_IDLE_DAYS: usize = 400;
-
 /// Monday to Friday.
 const WEEKDAYS: [Weekday; 5] = [
     Weekday::Mon,
@@ -295,9 +291,9 @@ impl BusinessCalendar {
         self.windows.iter().any(|day| !day.is_empty())
     }
 
-    /// The working intervals from the local date of `from`, day by day. It
-    /// stops at the scan horizon, or after a long run of days with no
-    /// working time.
+    /// The working intervals from the local date of `from`, day by day, up to
+    /// the scan horizon. Weekdays and annual holidays repeat only every 400
+    /// years, so no shorter cutoff is safe.
     fn scan(
         &self,
         from: DateTime<Utc>,
@@ -308,23 +304,10 @@ impl BusinessCalendar {
         } else {
             0
         };
-        // Dated holidays are finite. Count idle days only after the last
-        // one, so a long holiday run does not stop the scan.
-        let last_holiday = self.holidays.last().copied();
-        let mut idle = 0_usize;
         local_date(from, zone)
             .iter_days()
             .take(days)
-            .map(move |date| (date, self.intervals(date, zone)))
-            .take_while(move |(date, intervals)| {
-                idle = if !intervals.is_empty() || last_holiday.is_some_and(|h| *date <= h) {
-                    0
-                } else {
-                    idle.saturating_add(1)
-                };
-                idle <= MAX_IDLE_DAYS
-            })
-            .flat_map(|(_, intervals)| intervals)
+            .flat_map(move |date| self.intervals(date, zone))
     }
 
     /// The working intervals of one local date, as UTC instants.

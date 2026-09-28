@@ -201,6 +201,37 @@ async fn sim_sla_repeated_track_and_duplicate_checks_escalate_once(mut sim: Sim)
 }
 
 #[sim_test]
+async fn sim_sla_forget_and_track_again_escalates_the_new_record(mut sim: Sim) {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let calendar = BusinessCalendar::weekdays("09:00-17:00".parse().unwrap());
+    let (plugin, fired) = support_plugin(calendar);
+    sim.build(desk_app(plugin));
+    sim.advance_to(&utc(2020, 1, 1, 9, 0)).await;
+
+    let sla = Sla::from_state(sim.client().state()).unwrap();
+    let ob = Obligation::new("first_response", "ticket:8")
+        .within(BusinessDuration::hours(1))
+        .calendar("support")
+        .starting_at(utc(2020, 1, 1, 9, 0));
+    sla.track(&ob).await.unwrap();
+    sim.advance_to(&utc(2020, 1, 1, 11, 0)).await;
+    sim.run_to_idle().await;
+    assert_eq!(fired_keys(&fired).len(), 1);
+
+    // The same key and the same start, tracked again: a new record.
+    assert!(sla.forget(&ob.key()).await.unwrap());
+    sla.track(&ob).await.unwrap();
+    sim.run_to_idle().await;
+    let fired = fired.lock().unwrap().clone();
+    assert_eq!(fired.len(), 2, "the new record escalates too");
+    assert_ne!(fired[0].0.generation, fired[1].0.generation);
+
+    job::clear_global_job_client();
+}
+
+#[sim_test]
 async fn sim_sla_status_is_readable_without_tracking(mut sim: Sim) {
     let _guard = job::global_job_runtime_test_lock().lock().await;
     job::clear_global_job_client();
