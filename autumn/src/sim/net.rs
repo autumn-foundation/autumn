@@ -142,10 +142,13 @@ impl SimNet {
         Self::default()
     }
 
-    /// Serve calls to `host` with `router`.
+    /// Serve calls to `host` with `router`. The name matches as a URL host
+    /// does: `Payments` serves `http://payments/`.
     #[must_use]
     pub fn host(self, host: impl Into<String>, router: axum::Router) -> Self {
-        self.lock().hosts.insert(host.into(), router);
+        self.lock()
+            .hosts
+            .insert(canonical_host(&host.into()), router);
         self
     }
 
@@ -168,12 +171,12 @@ impl SimNet {
     /// Cut `host` off. Each attempt to reach it fails at once until
     /// [`heal`](Self::heal).
     pub fn partition(&self, host: impl Into<String>) {
-        self.lock().partitioned.insert(host.into());
+        self.lock().partitioned.insert(canonical_host(&host.into()));
     }
 
     /// Reconnect a partitioned `host`.
     pub fn heal(&self, host: &str) {
-        self.lock().partitioned.remove(host);
+        self.lock().partitioned.remove(&canonical_host(host));
     }
 
     /// Every attempt that finished its latency, in the order they finished. An
@@ -190,7 +193,7 @@ impl SimNet {
 
     /// The router that serves `host`, if any.
     pub(crate) fn service(&self, host: &str) -> Option<axum::Router> {
-        self.lock().hosts.get(host).cloned()
+        self.lock().hosts.get(&canonical_host(host)).cloned()
     }
 
     /// Send one attempt to `host`: record it, wait its latency, and return the
@@ -207,7 +210,7 @@ impl SimNet {
             // onto attempts whatever the configuration.
             let latency_draw = state.stream.next_u64();
             let drop_draw = state.stream.next_u64();
-            let (latency, fault) = if state.partitioned.contains(host) {
+            let (latency, fault) = if state.partitioned.contains(&canonical_host(host)) {
                 (Duration::ZERO, NetFault::Partitioned)
             } else if super::chaos::unit_from_draw(drop_draw) < state.drop_rate {
                 (
@@ -263,8 +266,29 @@ fn sample_latency((min, max): (Duration, Duration), draw: u64) -> Duration {
     Duration::from_nanos(min_ns.saturating_add(draw % span))
 }
 
+/// `host` as a URL writes it: lower case, with an international name in
+/// punycode and an IPv6 address in brackets. A request's host is always in
+/// this form, so a name registered any other way would never match.
+fn canonical_host(host: &str) -> String {
+    url::Host::parse(host).map_or_else(|_| host.to_ascii_lowercase(), |parsed| parsed.to_string())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_host_name_matches_as_a_url_host_does() {
+        use super::canonical_host;
+        assert_eq!(canonical_host("Payments"), "payments");
+        assert_eq!(
+            canonical_host("PAYMENTS.Example.COM"),
+            "payments.example.com"
+        );
+        assert_eq!(canonical_host("[::1]"), "[::1]");
+        assert_eq!(canonical_host("10.0.0.1"), "10.0.0.1");
+        let url = url::Url::parse("http://Bücher.Example/").unwrap();
+        assert_eq!(canonical_host("Bücher.Example"), url.host_str().unwrap());
+    }
+
     use super::{Duration, NetFault, SimNet, sample_latency};
 
     #[test]

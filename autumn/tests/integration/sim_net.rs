@@ -108,6 +108,21 @@ async fn sim_net_partition_and_heal(mut sim: Sim) {
 }
 
 #[sim_test]
+async fn sim_net_host_names_match_whatever_their_case(mut sim: Sim) {
+    let net = SimNet::new().host("Payments", payments());
+    sim.net(net.clone());
+    sim.build(TestApp::new().routes(routes![pay]));
+    assert_eq!(call(&sim, "/pay").await, "ok: charged");
+
+    net.partition("PAYMENTS");
+    let body = call(&sim, "/pay").await;
+    assert!(body.contains("partition"), "{body}");
+
+    net.heal("Payments");
+    assert_eq!(call(&sim, "/pay").await, "ok: charged");
+}
+
+#[sim_test]
 async fn sim_net_full_drop_rate_exhausts_the_retries(mut sim: Sim) {
     let net = SimNet::new().host("payments", payments()).drop_rate(1.0);
     sim.net(net.clone());
