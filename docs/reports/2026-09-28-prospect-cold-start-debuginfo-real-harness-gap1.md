@@ -1,4 +1,4 @@
-# ⛏️ Prospect: does the debuginfo cold-start win hold on the real scaffolded-project harness, not the `examples/hello` proxy? (undetermined: -15.7% median vs 20% line, but non-overlapping ranges and a live gate failure)
+# ⛏️ Prospect: does the debuginfo cold-start win hold on the real scaffolded-project harness, not the `examples/hello` proxy? (undetermined: -15.7% median vs 20% line, non-overlapping ranges, one unconfirmed exploratory gate FAIL)
 
 ## 🎯 Question
 
@@ -136,15 +136,18 @@ showing the others):
   i.e. the smallest defensible effect this data supports): -11.12%
 - **most-favorable pairing** (fastest `debug=1` vs. slowest baseline): -27.46%
 
-**Gate-stability finding:** one of the three baseline samples (r1,
-130327ms, the exploratory pre-pre-registration run) exceeded the existing
-gate's own p95 130000ms budget — a live, organic FAIL on the *current
-default*, on this box, with no lever applied. Neither `debug=1` sample came
-close to that budget (max 99355ms, 76% of budget). This is new information
-neither prior report had: the gate this decision feeds is not comfortably
-green today: it is close enough to its own budget to fail on ordinary
-run-to-run variance, and this lever moves the measured value well clear of
-that edge in every sample taken.
+**Gate-stability finding (exploratory, not registered — see the correction
+in 🏁 Verdict):** one of the three baseline samples (r1, 130327ms, the
+pre-pre-registration run) exceeded the existing gate's own p95 130000ms
+budget — a live, organic FAIL on the *current default*, on this box, with
+no lever applied. The two baseline samples taken *after* registration (r2,
+r3) both passed, so this FAIL is not independently confirmed by the
+registered comparison alone. Neither `debug=1` sample came close to that
+budget (max 99355ms, 76% of budget). Reported as real data, not hidden,
+but its evidentiary weight is that of a single exploratory observation:
+the gate this decision feeds *may* not be comfortably green today, close
+enough to its own budget to fail on ordinary run-to-run variance — a
+hypothesis this assay raises but does not itself confirm.
 
 **Worst case:** each sample already *is* a worst-case-shaped measurement
 by construction (a genuinely cold, from-scratch build in a fresh tempdir,
@@ -159,19 +162,39 @@ pairing.** Median (-15.67%) and mean (-18.52%) both fall short of the
 pre-registered 20% floor; the least-favorable pairing (-11.12%) falls well
 short. Per this role's own rule, a miss against a pre-set line is a *no*,
 not a quiet adjustment — so this assay does not claim the 20% floor is
-cleared, even though the direction and rough size closely track Onramp's
-own proxy-measured ~18% cold-start finding for the same lever.
+cleared. **Correction (caught by Codex review on PR #2993): an earlier
+draft of this paragraph said the result "closely tracks Onramp's own
+proxy-measured ~18% cold-start finding for the same lever." That's wrong —
+Onramp's ~18% figure belongs to the *different* `debug=0` condition;
+Onramp's own `debug=1` finding was ~8.7%, from a thin, single-block sample
+of a non-incremental `-p autumn-web` build.** This assay's `debug=1`
+result (median -15.67%, mean -18.52%) is directionally consistent with
+Onramp's `debug=1` finding but is not a close replication of it — it reads
+noticeably larger, on a different workload (the actual scaffolded project,
+not a direct crate build), so the two numbers are not the same measurement
+landing twice; they merely agree on sign.
 
-**The second, independently pre-registered criterion is clearly cleared,
-and is arguably the more decision-relevant fact:** the current default
-already produced a live gate failure in this small sample (1 of 3 runs),
-and every `debug=1` sample landed comfortably inside budget with room to
-spare. Combined with the complete non-overlap between the two conditions'
-ranges (not a formal significance test, but a real, visible separation
-given only 2-3 samples per side), this is not "no effect on the real
-harness" — proxy measurement was not an artifact — but this specific run's
-n is too small, and too close to the pre-set line on the central estimate,
-to hand the decider a clean "pursue" against the 20% floor as registered.
+**The second, pre-registered criterion is more decision-relevant, but its
+strength needs a correction too.** **Correction (caught by Codex review on
+PR #2993): an earlier draft called this criterion "clearly cleared" and
+"independently pre-registered."** The only baseline sample that actually
+failed the gate is r1 — the exploratory run that happened *before* the
+pre-registration file was written (see **🧪 Apparatus**). Both baseline
+samples taken *after* registration (r2, r3) passed. So the registered
+comparison alone does not independently demonstrate a gate failure; the
+one FAIL in this report rests on data collected ahead of the criterion it's
+now cited against. The honest framing is: this criterion is **not**
+cleared by the registered dataset on its own — it is an exploratory,
+pre-registration observation, reported as data (not hidden), that a
+production-representative sample would need to confirm or refute with its
+own post-registration failure before the decider should weigh it. What the
+registered comparison *does* support independently: the complete
+non-overlap between the two conditions' ranges (not a formal significance
+test, but a real, visible separation given only 2-3 samples per side) —
+this is not "no effect on the real harness," proxy measurement was not an
+artifact — but this specific run's n is too small, and too close to the
+pre-set 20% line on the central estimate, to hand the decider a clean
+"pursue."
 
 **What gap 1 actually resolves to:** the harness runs live in this sandbox
 without hitting the `crates.io`-403 risk this assay's own riskiest
@@ -207,20 +230,29 @@ follow-up needs, scoped from this assay's own stubs list:
 
 ```bash
 # From a clean checkout on this workspace's current trunk-dev tip.
-cd autumn-cli
+# IMPORTANT (caught by Codex review on PR #2993): each `--runs 1` sample
+# below must write to its OWN output path — repeating the same fixed path,
+# as an earlier draft of this recipe did, silently overwrites the previous
+# sample and leaves no way to recover the multi-sample median/mean this
+# report computes. Use an incrementing index (or run `--runs N` once per
+# condition instead, which reports its own genuine percentiles from N
+# samples in one JSON file, at the cost of not reproducing this report's
+# own block-switching-between-single-run-invocations method exactly).
 
-# Baseline (current default, no override):
+# Baseline (current default, no override) — repeat with i=1,2,3,...:
 cargo build -p autumn-cli
-../target/debug/autumn dev-loop-bench --cold-start --runs 1 \
-  --output /tmp/coldstart-baseline.json
+for i in 1 2 3; do
+  ./target/debug/autumn dev-loop-bench --cold-start --runs 1 \
+    --output "/tmp/coldstart-baseline-r${i}.json"
+done
 
 # debug=1 ("limited") condition:
-cd ..
-# Append to autumn-cli/src/templates/Cargo.toml.tmpl:
 printf '\n[profile.dev]\ndebug = 1\n' >> autumn-cli/src/templates/Cargo.toml.tmpl
 cargo build -p autumn-cli
-./target/debug/autumn dev-loop-bench --cold-start --runs 1 \
-  --output /tmp/coldstart-debug1.json
+for i in 1 2; do
+  ./target/debug/autumn dev-loop-bench --cold-start --runs 1 \
+    --output "/tmp/coldstart-debug1-r${i}.json"
+done
 
 # Revert before doing anything else:
 git checkout -- autumn-cli/src/templates/Cargo.toml.tmpl
