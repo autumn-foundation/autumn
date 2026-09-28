@@ -298,6 +298,11 @@ impl Sim {
             own_advanced: std::sync::Mutex::new(std::time::Duration::ZERO),
         });
         let ambient_guard = crate::time::install_ambient(ambient_clock.clone());
+        // Inside a runtime, fix the elapsed-time origin now, so tokio time
+        // that passes before the first read is on this sim's timeline.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            ambient_clock.init_origin(tokio::time::Instant::now());
+        }
         let shadow = ShadowGuard::enter(Arc::clone(&ambient_clock));
         Self {
             seed,
@@ -1084,6 +1089,9 @@ fn parse_liveness_budget(raw: Option<&str>) -> Option<std::time::Duration> {
 /// [`__with_liveness_budget`] for what the watchdog detects.
 #[doc(hidden)]
 pub async fn __with_liveness_watchdog<F: std::future::Future>(seed: u64, body: F) -> F::Output {
+    // `#[sim_test]` builds the sim before its runtime. Fix the sim's
+    // elapsed-time origin as the runtime starts, before the body runs.
+    anchor_current_sim();
     let raw = std::env::var("AUTUMN_SIM_LIVENESS_BUDGET_SECS").ok();
     __with_liveness_budget(seed, parse_liveness_budget(raw.as_deref()), body).await
 }
@@ -1431,6 +1439,21 @@ impl AmbientSimClock {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *shadowed = shadowed.saturating_add(gap);
+    }
+}
+
+/// Fix the elapsed-time origin of the newest sim on this thread at tokio's
+/// current instant, if it is not fixed yet.
+fn anchor_current_sim() {
+    let Ok(_) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let current = SIM_CLOCKS
+        .try_with(|stack| stack.borrow().last().cloned())
+        .ok()
+        .flatten();
+    if let Some(clock) = current {
+        clock.init_origin(tokio::time::Instant::now());
     }
 }
 

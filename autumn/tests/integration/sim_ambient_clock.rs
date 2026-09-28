@@ -121,3 +121,11 @@ async fn sim_ambient_clock_advance_before_the_first_elapsed_read_is_kept(sim: Si
     sim.advance(HOUR).await;
     assert_eq!(ambient_monotonic().since_origin(), 2 * HOUR);
 }
+
+#[sim_test]
+async fn sim_ambient_clock_tokio_time_before_the_first_elapsed_read_is_kept(_sim: Sim) {
+    // Tokio's clock moves by itself here, before any elapsed read. That hour
+    // is still on the sim's elapsed timeline.
+    tokio::time::sleep(HOUR).await;
+    assert_eq!(ambient_monotonic().since_origin(), HOUR);
+}
