@@ -491,10 +491,36 @@ pub(crate) enum PostBoundaryClass {
 ///   is invisible today and fails the NEXT deploy closed
 ///   (`refuse_unprovable_proxy_options`), which is exactly why it must be surfaced
 ///   rather than swallowed.
-/// - `drain-old` — disables the now-idle old slot unit. Two slots running is
-///   untidy, not an outage.
+/// - `drain-old` — disables the now-idle old slot unit. The driver retries a
+///   failed drain one time. It continues only when it proves that the old slot
+///   stopped (see [`drain_old_outcome`], issue #2279).
 /// - `prune` — removes old release dirs. Disk hygiene.
-pub(crate) const HOUSEKEEPING_LABELS: [&str; 3] = ["record-proxy-options", "drain-old", "prune"];
+pub(crate) const HOUSEKEEPING_LABELS: [&str; 3] =
+    ["record-proxy-options", DRAIN_OLD_LABEL, "prune"];
+
+/// The op that stops the old slot after the cutover.
+pub(crate) const DRAIN_OLD_LABEL: &str = "drain-old";
+
+/// Why a failed `drain-old` halts the rollout (issue #2279).
+pub(crate) const OLD_SLOT_MAY_RUN_NOTE: &str = "the old slot can still run now or at boot. \
+     It runs job workers and the scheduler, so scheduled tasks and jobs can run two times";
+
+/// The outcome of a failed `drain-old` after [`exec::retry_drain_old`] (issue
+/// #2279).
+///
+/// The old slot runs job workers and the scheduler (`ProcessRole::Combined`). If
+/// it runs, work runs two times. Only a proven stop is housekeeping. `NotStopped`
+/// and `Unreadable` halt and compensate. A first deploy has no `drain-old`.
+pub(crate) const fn drain_old_outcome(state: exec::OldSlotState) -> HostOutcome {
+    match state {
+        exec::OldSlotState::Stopped => HostOutcome::Degraded {
+            label: DRAIN_OLD_LABEL,
+        },
+        exec::OldSlotState::NotStopped | exec::OldSlotState::Unreadable => HostOutcome::LiveOnNew {
+            failed_step: DRAIN_OLD_LABEL,
+        },
+    }
+}
 
 /// The one post-boundary label whose failure makes a host's rollback target
 /// unprovable: `commit-markers` writes previous-release + `current` + live-slot as
@@ -953,6 +979,17 @@ fn state_table_lines(title: &str, rows: &[(&'static str, &str, String)]) -> Vec<
     lines
 }
 
+/// The `Fleet state:` row for a [`HostOutcome::LiveOnNew`] host. For
+/// `drain-old` it names the risk, not only the step (issue #2279).
+fn live_on_new_row(release_id: &str, failed_step: &str) -> String {
+    let risk = if failed_step == DRAIN_OLD_LABEL {
+        format!(": {OLD_SLOT_MAY_RUN_NOTE}")
+    } else {
+        String::new()
+    };
+    format!("serving {release_id} \u{2014} but `{failed_step}` failed AFTER the cutover{risk}")
+}
+
 /// The per-host state table printed at the END of every fleet rollout — success or
 /// halt (issue #1621, §8.2).
 ///
@@ -979,11 +1016,7 @@ pub(crate) fn fleet_summary_lines(
             ),
             // Traffic already moved before the failure, so this host IS on the new
             // release — saying only "failed" would be the dangerous half-truth.
-            HostOutcome::LiveOnNew { failed_step } => {
-                format!(
-                    "serving {release_id} \u{2014} but `{failed_step}` failed AFTER the cutover"
-                )
-            }
+            HostOutcome::LiveOnNew { failed_step } => live_on_new_row(release_id, failed_step),
             HostOutcome::AmbiguousMarkers => format!(
                 "serving {release_id} \u{2014} `{AMBIGUOUS_MARKERS_LABEL}` failed AFTER the \
                  cutover, so the release markers are mid-transaction and this host was NOT \
@@ -1217,24 +1250,23 @@ pub(crate) const DRIFT_PROXY_OPTIONS_UNREADABLE: &str =
 pub(crate) const DRIFT_PROXY_PORT_MISMATCH: &str =
     "the installed proxy unit binds a different public port than `[server] port` configures";
 
-/// State drift: this host claims a promoted release its `current` symlink could
-/// not be resolved to (issue #1621, review round 2).
+/// State drift: this host has a `current` symlink, but it does not point to a
+/// release (issue #1621, review round 2; #2277).
 ///
-/// The probe shell tests `[ -L current ]`, which succeeds for a symlink whose
-/// target cannot be canonicalized, so such a host reports `HostMode::Redeploy`
-/// while `readlink -f` yields nothing and the release reads back
-/// [`ReleaseId::Unknown`]. That combination is not "we have not looked" — it is a
-/// host that says it is serving a release nobody can name, which is exactly the
-/// unprovable state this feature fails closed on.
+/// The probe shell tests `[ -L current ]`. This test also succeeds for a
+/// dangling symlink, so the host reports `HostMode::Redeploy`. The probe names a
+/// release only if `current` resolves to a directory directly in `releases/`.
+/// Otherwise the release is [`ReleaseId::Unknown`]. That combination is not "we
+/// have not looked" — it is a host that says it is serving a release nobody can
+/// name, which is exactly the unprovable state this feature fails closed on.
 ///
 /// It stays out of VERSION drift (an unknown release still names no version to be
 /// mixed with), and it is the reason the NEXT deploy matters: `commit-markers`
-/// copies `readlink current` verbatim into `previous-release`, so deploying this
-/// host records an unresolvable directory as its rollback target — the rollback
-/// then refuses (`probe_rollback_target_dir` fails closed) instead of working.
-pub(crate) const DRIFT_RELEASE_UNREADABLE: &str = "this host has a `current` symlink but the release it points at could not be read (a broken \
-     symlink or a missing releases dir) — repair it before the next deploy, which would record \
-     that unresolvable target as this host's rollback point";
+/// copies `readlink current` verbatim into `previous-release`. A later rollback
+/// then refuses (a missing target) or starts a directory that is not a release.
+pub(crate) const DRIFT_RELEASE_UNREADABLE: &str = "this host's `current` symlink does not point to a release in `releases/` (the link is \
+     broken, the releases dir is missing, or the target is not a release dir) — repair it \
+     before the next deploy, which would record that target as this host's rollback point";
 
 /// State drift: this host's live slot unit could not be read, so the CLI cannot
 /// prove WHICH maintenance flag file the running app polls (issue #1621, review
@@ -2919,6 +2951,70 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_drain_old_degrades_only_when_the_old_slot_is_proven_stopped() {
+        // #2279: a live old slot runs job workers and the scheduler, so work runs
+        // two times. Only a proven stop may continue the rollout.
+        assert_eq!(
+            drain_old_outcome(exec::OldSlotState::Stopped),
+            HostOutcome::Degraded {
+                label: DRAIN_OLD_LABEL
+            },
+        );
+        for state in [
+            exec::OldSlotState::NotStopped,
+            exec::OldSlotState::Unreadable,
+        ] {
+            assert_eq!(
+                drain_old_outcome(state),
+                HostOutcome::LiveOnNew {
+                    failed_step: DRAIN_OLD_LABEL
+                },
+                "{state:?} must halt and compensate, not continue",
+            );
+        }
+        assert_eq!(DRAIN_OLD_LABEL, "drain-old");
+    }
+
+    #[test]
+    fn the_summary_names_the_risk_of_an_old_slot_that_may_still_run() {
+        // #2279: with `--no-rollback` the host stays as it is. The last table the
+        // operator reads must say that work can run two times.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let plan = plan_fleet(&fleet, &[HostMode::Redeploy, HostMode::Redeploy])
+            .expect("a well-formed fleet plans");
+        let rendered = fleet_summary_lines(
+            &plan,
+            &[
+                HostOutcome::LiveOnNew {
+                    failed_step: DRAIN_OLD_LABEL,
+                },
+                HostOutcome::LiveOnNew {
+                    failed_step: "proxy-flip",
+                },
+            ],
+            "20260714T120000Z",
+        )
+        .join("\n");
+        let web_a = rendered
+            .lines()
+            .find(|line| line.contains("web-a"))
+            .expect("web-a row");
+        assert!(web_a.contains(OLD_SLOT_MAY_RUN_NOTE), "{web_a}");
+        let web_b = rendered
+            .lines()
+            .find(|line| line.contains("web-b"))
+            .expect("web-b row");
+        assert!(
+            !web_b.contains(OLD_SLOT_MAY_RUN_NOTE),
+            "only a `drain-old` row names this risk: {web_b}"
+        );
+        assert!(
+            OLD_SLOT_MAY_RUN_NOTE.contains("two times"),
+            "the note must name the risk, not only the step"
+        );
+    }
+
+    #[test]
     fn a_post_boundary_housekeeping_failure_degrades_instead_of_halting() {
         // #1621 (§4.6): the composition the driver actually calls. A pre-boundary
         // outcome passes through untouched (the executor already tore the candidate
@@ -3871,9 +3967,9 @@ mod tests {
 
     #[test]
     fn a_deployed_host_whose_release_is_unreadable_is_state_drift() {
-        // #1621 review round 2. `[ -L current ]` succeeds for a symlink whose target
-        // cannot be canonicalized, so such a host reports `Redeploy` while `readlink
-        // -f` yields nothing and the release reads back `Unknown`. That combination
+        // #1621 review round 2. `[ -L current ]` succeeds for a dangling symlink, so
+        // such a host reports `Redeploy`, but the probe names no release (#2277).
+        // The release reads back `Unknown`. That combination
         // used to produce ONLY the footer line explicitly labelled "reported, not
         // counted as drift", so `deploy status --strict` exited 0 on a host with
         // actionable marker damage — and the next deploy's `commit-markers` copies

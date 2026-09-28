@@ -21,6 +21,12 @@
 # by ~17GB and risking ENOSPC. trybuild compiles at run time, not build time, so
 # `--no-run` never triggers it. This gate stays disk-cheap by construction.
 #
+# Why a FEATURE-GATED integration_tests leg (§5b): the `--no-run` above runs
+# with default features, and the gated clippy leg (§4) compiles `--lib` only —
+# so the `#![cfg(feature = "…")]` integration modules (issue #2395) were
+# compiled by neither. §5b compiles the consolidated binary once with the gated
+# feature set, so a break there is caught here instead of in CI's feature lanes.
+#
 # Why a SEPARATE doctest leg: `--no-run` compiles every *binary* test target but
 # does NOT build doctests — doctests are only built during the `--doc` phase. So
 # a doctest that stops compiling (e.g. #2107: an app.rs `no_run` example doctest
@@ -148,15 +154,18 @@ cargo clippy --workspace --all-targets -- -D warnings
 #
 # Feature list kept IDENTICAL to ci.yml's — `check-panic-gate.sh` verifies every
 # gated module's feature is covered by a CI clippy invocation, so the two lists
-# drifting apart is a gate failure, not a silent hole.
+# drifting apart is a gate failure, not a silent hole. It lives in one variable
+# so the feature-gated `integration_tests` compile leg in §5b below reuses the
+# identical set instead of carrying its own copy (issue #2395).
 #
 # `--lib` rather than CI's `--all-targets`: the gate is `cfg_attr(not(test), …)`,
 # so the lib target is where the denials actually apply, and skipping the test /
 # example / bench targets keeps this leg minutes shorter. CI still runs the
 # `--all-targets` form.
-step "cargo clippy -p autumn-web --features \"<gated request-path set>\" --lib -- -D warnings"
+GATED_REQUEST_PATH_FEATURES="ws,mail,offline-sync,collab,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme"
+step "cargo clippy -p autumn-web --features \"$GATED_REQUEST_PATH_FEATURES\" --lib -- -D warnings"
 cargo clippy -p autumn-web \
-  --features "ws,mail,offline-sync,collab,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme" \
+  --features "$GATED_REQUEST_PATH_FEATURES" \
   --lib -- -D warnings
 
 step "cargo clippy -p autumn-web --features \"plugin-sandbox,test-support\" --lib -- -D warnings"
@@ -174,6 +183,31 @@ cargo clippy -p autumn-web --features "plugin-sandbox,test-support" --lib -- -D 
 step "cargo test --workspace --no-run   (compile-only; skips ~17GB trybuild run)"
 cargo test --workspace --no-run
 
+# --- 5b. Compile the feature-gated integration_tests binary (compile-only) ----
+# Issue #2395: the clippy leg above compiles `--lib` only, and step 5 runs with
+# default features — so the `#![cfg(feature = "…")]` integration modules
+# (acme_end_to_end, tls_serving, inbound_mail_integration, translatable, …)
+# were compiled by NEITHER leg. One `--no-run` link of the consolidated binary
+# with the gated set closes the hole for every feature in the list at once,
+# staying disk-cheap by construction (nothing runs; trybuild compiles at run
+# time, so `--no-run` never triggers it).
+#
+# `i18n` joins the set here — it gates integration modules (CI's i18n lane) but
+# no panic-gate lib module, so it is absent from the clippy list — and
+# `test-support` is paired the way CI's feature lanes pair it. `sqlite` stays
+# out: the backend-flip lane is out of scope for this script (see §1d and the
+# header's NOT-run list), and `system-tests` stays out with the browser suite.
+step "cargo test -p autumn-web --features \"<gated set>,i18n,test-support\" --test integration_tests --no-run"
+cargo test -p autumn-web \
+  --features "$GATED_REQUEST_PATH_FEATURES,i18n,test-support" \
+  --test integration_tests --no-run
+
+step "cargo test -p autumn-web --features \"plugin-sandbox,test-support\" --test integration_tests --no-run"
+# plugin-sandbox keeps its own leg here for the same wasmi-link reason the
+# clippy leg above splits it out — and this is the leg that compiles the
+# sandbox's containment corpus (plugin_sandbox.rs, issue #1609).
+cargo test -p autumn-web --features "plugin-sandbox,test-support" --test integration_tests --no-run
+
 # --- 6. Doctests (workspace, doc target only) --------------------------------
 # `--no-run` above skips doctests (they build only in the `--doc` phase), so a
 # doctest compile break — like #2107's app.rs example — would pass locally but
@@ -187,7 +221,7 @@ cargo test --workspace --doc
 
 echo
 echo "pre-push-check: OK — workspace test targets compile clean, doctests pass."
-echo "note: step 1 (panic gate) needs no toolchain; steps 2-5 are COMPILE-ONLY;"
+echo "note: step 1 (panic gate) needs no toolchain; steps 2-5b are COMPILE-ONLY;"
 echo "      step 6 RUNS doctests (cheap: mostly"
 echo "      no_run/ignore, no DB, and --doc never triggers the ~17GB trybuild run)."
 echo "      A bare \`cargo test --workspace\` (without --no-run / --doc) additionally"

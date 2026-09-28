@@ -376,9 +376,10 @@ drift and `--strict` exits non-zero on it (it was previously reported without
 counting). Its row says so:
 
 ```
-⚠️  this host has a `current` symlink but the release it points at could not be
-read (a broken symlink or a missing releases dir) — repair it before the next
-deploy, which would record that unresolvable target as this host's rollback point
+⚠️  this host's `current` symlink does not point to a release in `releases/` (the
+link is broken, the releases dir is missing, or the target is not a release dir)
+— repair it before the next deploy, which would record that target as this
+host's rollback point
 ```
 
 Two more state-drift reasons come from the maintenance probe, and both name the
