@@ -659,3 +659,68 @@ async fn sim_sla_an_escalation_enqueued_again_after_it_ran_does_not_fire_again()
 
     job::clear_global_job_client();
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sim_sla_a_deadline_restored_while_its_check_runs_still_escalates() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    // Wednesday 2020-01-01 09:00. The deadline on this calendar is 11:00.
+    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let clock = TickingClock::starting_at(start);
+    let store = RacingStore::new();
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    let app = replica(&clock, &store, &fired);
+    let sla = Sla::from_state(app.state()).unwrap();
+    let ob = Obligation::new("first_response", "ticket:1")
+        .within(BusinessDuration::hours(2))
+        .calendar("support");
+    sla.track(&ob).await.unwrap();
+    settle().await;
+    let generation = store
+        .inner
+        .get(&ob.key())
+        .await
+        .unwrap()
+        .unwrap()
+        .generation;
+
+    // Another calendar version moved the stored deadline to 15:00.
+    let later = Utc.with_ymd_and_hms(2020, 1, 1, 15, 0, 0).unwrap();
+    assert!(
+        store
+            .inner
+            .set_due(&ob.key(), generation, later)
+            .await
+            .unwrap()
+    );
+
+    // At 11:00 the old check reads the 15:00 record, then waits.
+    store.armed.store(true, Ordering::SeqCst);
+    let step = Duration::from_secs(2 * 3600);
+    clock.advance(step);
+    tokio::time::advance(step).await;
+    for _ in 0..16 {
+        if store.gets.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        settle().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(store.gets.load(Ordering::SeqCst), 1, "the check waits");
+
+    // While it waits, reconcile restores 11:00. Then the check continues.
+    assert_eq!(sla.reconcile().await.unwrap(), 1);
+    let _ = store.get(&ob.key()).await.unwrap();
+    for _ in 0..4 {
+        settle().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert_eq!(
+        *fired.lock().unwrap(),
+        ["first_response/ticket:1"],
+        "the restored 11:00 deadline escalates now, not at 15:00"
+    );
+
+    job::clear_global_job_client();
+}

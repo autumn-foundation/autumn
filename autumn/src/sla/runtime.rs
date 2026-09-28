@@ -83,6 +83,11 @@ struct CheckArgs {
     /// merged into that check.
     #[serde(default)]
     requeue: u32,
+    /// A random value when `reconcile` changed the stored deadline, else 0.
+    /// It is part of the unique key, so a check that runs for the same
+    /// deadline does not absorb the new check.
+    #[serde(default)]
+    revision: u64,
 }
 
 /// The shared state of the SLA engine, kept as an [`AppState`] extension.
@@ -190,7 +195,7 @@ impl crate::plugin::Plugin for SlaPlugin {
                 sla_job(
                     CHECK_JOB,
                     check_job,
-                    &["key", "generation", "due_at", "requeue"],
+                    &["key", "generation", "due_at", "requeue", "revision"],
                     JobUniquenessWindow::Running,
                 ),
                 sla_job(
@@ -341,7 +346,7 @@ impl Sla {
             return Err(SlaError::NoDeadline(key.to_owned()));
         };
         if status.escalated_at.is_none() && status.state != ObligationState::Met {
-            self.schedule_check(key, record.generation, due).await?;
+            self.schedule_check(key, record.generation, due, 0).await?;
         }
         Ok(status)
     }
@@ -399,7 +404,8 @@ impl Sla {
     /// Call it once from the new version after a deploy that changes a
     /// calendar, for example from an `on_startup` hook. Without it, a record
     /// keeps the deadline that `track` stored. It is safe to call at any
-    /// time: a check that is already on the queue is not added again.
+    /// time: for an unchanged deadline, a check that is already on the queue
+    /// is not added again. A changed deadline gets a new check.
     ///
     /// # Errors
     ///
@@ -416,13 +422,18 @@ impl Sla {
             if status.escalated_at.is_some() || status.state == ObligationState::Met {
                 continue;
             }
-            if record.due_at != Some(due)
-                && !store.set_due(&status.key, record.generation, due).await?
-            {
-                // The record was escalated or replaced after the read.
-                continue;
-            }
-            self.schedule_check(&status.key, record.generation, due)
+            let revision = if record.due_at == Some(due) {
+                0
+            } else {
+                if !store.set_due(&status.key, record.generation, due).await? {
+                    // The record was escalated or replaced after the read.
+                    continue;
+                }
+                // A check for `due` can be running with an older read. A
+                // new unique key stops that check from absorbing this one.
+                self.state.entropy().next_u64().max(1)
+            };
+            self.schedule_check(&status.key, record.generation, due, revision)
                 .await?;
             scheduled = scheduled.saturating_add(1);
         }
@@ -488,12 +499,14 @@ impl Sla {
         key: &str,
         generation: uuid::Uuid,
         due_at: DateTime<Utc>,
+        revision: u64,
     ) -> Result<(), SlaError> {
         let args = CheckArgs {
             key: key.to_owned(),
             generation: Some(generation),
             due_at,
             requeue: 0,
+            revision,
         };
         self.enqueue(CHECK_JOB, &args, Some(due_at)).await
     }
@@ -544,6 +557,7 @@ impl Sla {
             generation: args.generation,
             due_at: args.due_at,
             requeue: args.requeue.saturating_add(1),
+            revision: args.revision,
         };
         let client = self
             .state
@@ -588,7 +602,7 @@ impl Sla {
                 if due_at != due_hint =>
             {
                 // The deadline moved. Check again at the new deadline.
-                return self.schedule_check(key, record.generation, due_at).await;
+                return self.schedule_check(key, record.generation, due_at, 0).await;
             }
             _ => return Ok(()),
         };
