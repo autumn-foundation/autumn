@@ -62,12 +62,12 @@ pub fn apply_ops(ops: &[Op]) {
 /// proptest strategy draws from. A trailing partial op is ignored.
 #[must_use]
 pub fn ops_from_bytes(bytes: &[u8]) -> Vec<Op> {
-    bytes
-        .chunks_exact(OP_BYTES)
+    let (ops, _partial) = bytes.as_chunks::<OP_BYTES>();
+    ops.iter()
         .take(MAX_OPS)
-        .map(|chunk| {
-            let amount = 1 + u32::from(u16::from_le_bytes([chunk[1], chunk[2]])) % MAX_AMOUNT;
-            if chunk[0] % 2 == 0 {
+        .map(|&[tag, low, high]| {
+            let amount = 1 + u32::from(u16::from_le_bytes([low, high])) % MAX_AMOUNT;
+            if tag % 2 == 0 {
                 Op::Deposit(amount)
             } else {
                 Op::Withdraw(amount)
