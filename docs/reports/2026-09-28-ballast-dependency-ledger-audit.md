@@ -210,6 +210,29 @@ stays a human review call, same as the other six major-bump PRs in the
 queue** — but now with an actual rehearsal result attached instead of being
 another unexamined row in a table.
 
+**Discrepancy from follow-up 8, re-observed via this pass's own `git push`,
+and it moved.** Last pass's `git push` printed "15 vulnerabilities (2 high,
+9 moderate, 4 low)" from GitHub's native Dependabot alert scan; this pass's
+push of the report commit printed **"9 vulnerabilities (2 high, 7
+moderate)"** — total down 6, moderate down 2, low down to 0, high unchanged
+at 2. That move happened during a week where several Cargo dependencies were
+genuinely bumped on `trunk-dev` (`ammonia` 4.1.4→4.2.0, `infer`
+0.16.0→0.22.0, `clap` 4.6.6→4.6.7, plus the `pq-src` pin), which is at least
+consistent with some of the 15 being real GHSA-tracked Cargo advisories that
+resolved when their vulnerable version left the default branch — the
+"genuine gap in cargo-deny's RustSec coverage" scenario follow-up 8 named as
+the worst case, now with a data point suggesting it's plausible rather than
+merely possible. Still not confirmed: this session has no tool to enumerate
+which specific alerts closed or open `/security/dependabot` directly, so I
+cannot join the 6 that disappeared against those specific merges, and the
+remaining 9 (2 high) could equally be non-Rust-ecosystem or already-waived.
+Flagged, not scored, per the same evidentiary bar as last pass — but the
+movement itself is new information: whatever these alerts are, they respond
+to real dependency changes in this repo, which weakens the "these are just
+GitHub double-counting something cargo-deny already waives" hypothesis and
+strengthens the case for someone with Security-tab access to look this week
+rather than let it ride further.
+
 ## 💡 Mechanism / forcing fact
 
 None, for Ballast to act on directly this pass — the fourth consecutive
@@ -324,17 +347,21 @@ git checkout -- autumn/Cargo.toml Cargo.lock
    decision. `examples/island-flock/Cargo.toml` still declares no
    `rust-version` (re-checked: just `edition = "2024"`), so there's still no
    MSRV floor for its scheduled-batch row to be checked against.
-8. **Still highest priority.** GitHub's native Dependabot alert count for
-   the default branch (15: 2 high, 9 moderate, 4 low, per last pass's `git
-   push` remote message) has not been re-obtained or reconciled this pass —
-   this session's GitHub MCP tools were checked again (`get_me`,
-   `search_pull_requests`, `pull_request_read`, and a fresh `ToolSearch` for
-   anything alert/vulnerability-shaped) and none expose the Security tab's
-   Dependabot alerts. Still needs a human with `/security/dependabot` access,
-   or a future session with that specific tool, to join the 15 against this
-   repo's existing waivers and its two non-Rust manifests
+8. **Still highest priority, and now moving.** GitHub's native Dependabot
+   alert count for the default branch went 15 (2 high, 9 moderate, 4 low) →
+   **9 (2 high, 7 moderate, 0 low)** between last pass's push and this one
+   (see evidence section) — a real change during a week with real Cargo
+   bumps merged, not noise. This session's GitHub MCP tools were checked
+   again (`get_me`, `search_pull_requests`, `pull_request_read`, and a fresh
+   `ToolSearch` for anything alert/vulnerability-shaped) and still none
+   expose the Security tab's Dependabot alerts directly, so the 6 that
+   closed and the 9 that remain (2 high) still can't be joined against this
+   repo's waivers or its two non-Rust manifests
    (`examples/react-graphql/frontend/package-lock.json`,
-   `benchmarks/runtime/django`'s Python deps). Unchanged from last pass.
+   `benchmarks/runtime/django`'s Python deps) from this session. The high
+   pair being unchanged while moderates moved is itself worth a human's
+   first look: whatever they are, they didn't resolve on their own this
+   week.
 9. The `cargo deny list` vs `cargo deny check bans` discrepancy flagged last
    pass (the former missed the `bitflags`/`parking_lot_core`/`parking_lot`
    chain that the latter found): re-tested this pass by re-running the same
