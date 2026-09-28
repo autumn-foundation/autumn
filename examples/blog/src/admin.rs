@@ -419,11 +419,14 @@ impl AdminModel for PostAdmin {
 /// isn't `pub` outside the crate, so an external `tests/*.rs` file can't
 /// reach it. A `--bin` unit test is the same home CLAUDE.md already
 /// validates for a crate-private Docker test (`autumn/src/job.rs`'s Redis
-/// job-admin suite). Not wired into `.github/workflows/ci.yml`'s
-/// Docker-dependent sweep: no line there runs `-p blog` at all today (its
-/// own pre-existing `create_post_round_trip` Docker test in
-/// `tests/integration_test.rs` isn't swept either), so this doesn't
-/// introduce a new CI gap — run manually with:
+/// job-admin suite). No bare `--ignored` sweep runs over `blog` (unlike
+/// `autumn`/`autumn-cli`, see CLAUDE.md), so this specific test target is
+/// named explicitly in `.github/workflows/ci.yml`'s Docker-dependent step,
+/// the same way the `bookmarks-distributed` link-checker profile — the
+/// other `--bin`-only Ledger harness — already is. `blog`'s own
+/// pre-existing `create_post_round_trip` Docker test
+/// (`tests/integration_test.rs`) predates that convention and still isn't
+/// swept; that gap is unrelated to this PR. Run manually with:
 ///
 /// ```text
 /// cargo test -p blog --bin blog -- --ignored ledger_import_csv --nocapture --test-threads=1
