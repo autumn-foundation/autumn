@@ -47,7 +47,7 @@ pub fn apply_report(
             listing.name
         ));
     }
-    check_report_shape(report)?;
+    check_report_shape(report, &listing.prefix)?;
     // The contract is the machine-checked source of the range and the tier.
     // Only a pass replaces them: a failed contract may not even parse, and
     // the listing keeps what was last verified.
@@ -156,24 +156,29 @@ fn transition(
     }
 }
 
-/// The checks every `autumn plugin-check` report carries. A report without
-/// them was not made by `plugin-check`.
-const REQUIRED_CHECKS: [&str; 4] = [
+/// The checks every `autumn plugin-check` report carries. A pass without
+/// one of them was not made by `plugin-check`, or had the failing one cut.
+/// `route-prefix` is added when the listing declares a prefix.
+const REQUIRED_CHECKS: [&str; 7] = [
     "installability",
     "route-attribution",
+    "route-collision",
+    "sensitive-surfaces",
+    "duplicate-registration",
     "plugin-contract",
     "experimental-surface",
 ];
 
 /// Refuse a report that `plugin-check` did not make, or a pass with no
 /// declared range (AC 3: a listing needs the #1601 contract).
-fn check_report_shape(report: &ConformanceReport) -> Result<(), String> {
+fn check_report_shape(report: &ConformanceReport, prefix: &str) -> Result<(), String> {
     let name = index::sanitize(&report.plugin_name);
     // A failing report is always taken: it can only flag, never vouch.
     if !report.passed() {
         return Ok(());
     }
-    for required in REQUIRED_CHECKS {
+    let with_prefix = (!prefix.is_empty()).then_some("route-prefix");
+    for required in REQUIRED_CHECKS.into_iter().chain(with_prefix) {
         if !report.checks.iter().any(|c| c.name == required) {
             return Err(format!(
                 "the report for `{name}` has no `{required}` check; use a report from \
@@ -960,6 +965,9 @@ mod tests {
                 ),
                 check("plugin-contract", CheckStatus::Pass),
                 check("experimental-surface", CheckStatus::Pass),
+                check("route-prefix", CheckStatus::Pass),
+                check("sensitive-surfaces", CheckStatus::Pass),
+                check("duplicate-registration", CheckStatus::Pass),
             ],
             contract,
             autumn_web: None,
@@ -1732,6 +1740,38 @@ mod tests {
             std::fs::read_to_string(&index_path).unwrap(),
             index::BUNDLED
         );
+    }
+
+    /// A pass must carry every check `plugin-check` always emits, and
+    /// `route-prefix` when the listing declares a prefix: a cut report would
+    /// otherwise hide the check that failed.
+    #[test]
+    fn a_pass_missing_an_emitted_check_is_refused() {
+        let contract = || Some(lockstep("autumn-admin-plugin", "0.8.0"));
+        for cut in [
+            "sensitive-surfaces",
+            "duplicate-registration",
+            "route-collision",
+        ] {
+            let mut r = report("autumn-admin-plugin", true, contract());
+            r.checks.retain(|c| c.name != cut);
+            let err = apply_report(
+                &mut listing("autumn-admin-plugin"),
+                &r,
+                "0.8.0",
+                "2026-10-01",
+            )
+            .unwrap_err();
+            assert!(err.contains(cut), "{err}");
+        }
+        let mut r = report("autumn-admin-plugin", true, contract());
+        r.checks.retain(|c| c.name != "route-prefix");
+        let mut prefixed = listing("autumn-admin-plugin");
+        prefixed.prefix = "/admin".to_owned();
+        assert!(apply_report(&mut prefixed, &r, "0.8.0", "2026-10-01").is_err());
+        let mut bare = listing("autumn-admin-plugin");
+        bare.prefix.clear();
+        assert!(apply_report(&mut bare, &r, "0.8.0", "2026-10-01").is_ok());
     }
 
     /// A report is recorded for the release it tested, and a pass must say

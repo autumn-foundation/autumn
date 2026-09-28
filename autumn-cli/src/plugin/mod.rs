@@ -409,6 +409,7 @@ pub fn render_list_json(rows: &[ListRow], app_version: Option<&str>) -> String {
                     "kind": l.trust,
                     "label": l.trust_label(),
                     "capabilities": l.capabilities,
+                    "routes": l.routes,
                     "artifact_sha256": (!l.artifact_sha256.is_empty()).then_some(&l.artifact_sha256),
                     "grants": l.grants,
                     "quotas": l.quotas,
@@ -1955,6 +1956,7 @@ mod tests {
         hello.grants.hosts = vec!["api.example.com".to_owned()];
         hello.quotas.insert("kv_reads".to_owned(), 7);
         hello.limits.insert("fuel".to_owned(), 9);
+        hello.routes = vec!["GET /hello".to_owned()];
         let mut broken = flagged_on(RELEASE);
         broken.name = "autumn-plugin-broken".to_owned();
         let mut plugin_index = bundled();
@@ -1980,6 +1982,7 @@ mod tests {
         assert_eq!(hello["trust"]["limits"]["fuel"], 9);
         assert_eq!(hello["trust"]["kind"], "sandboxed");
         assert_eq!(hello["trust"]["capabilities"][0], "http-request");
+        assert_eq!(hello["trust"]["routes"][0], "GET /hello");
         let broken = find("autumn-plugin-broken");
         assert_eq!(broken["listed"], true);
         assert_eq!(broken["verified"], false);
