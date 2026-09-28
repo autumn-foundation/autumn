@@ -868,8 +868,16 @@ fn package_version(dir: &Path) -> Option<semver::Version> {
 /// Whether a `[patch.<source>]` key names crates.io: its name, its git
 /// index, or its sparse index.
 fn is_crates_io_source(source: &str) -> bool {
+    // Cargo canonicalizes the URL: a trailing `/` or `.git` and the case of
+    // a GitHub path do not make it another source.
+    let source = source.trim().trim_end_matches('/');
+    let source = source
+        .strip_suffix(".git")
+        .unwrap_or(source)
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
     matches!(
-        source.trim_end_matches('/'),
+        source.as_str(),
         "crates-io"
             | "https://github.com/rust-lang/crates.io-index"
             | "sparse+https://index.crates.io"
@@ -2211,6 +2219,31 @@ maud = { version = "0.27", features = ["axum"] }
              [patch.crates-io]\nautumn-web = { path = \"autumn\" }\n",
         );
         assert!(!unpatched_local_framework(&app));
+    }
+
+    /// The crates.io index URL with `.git`, a trailing `/` or other case is
+    /// still crates.io: Cargo 1.98 applies such a patch to crates.io deps.
+    #[test]
+    fn a_crates_io_patch_under_another_spelling_is_a_redirect() {
+        for source in [
+            "\"https://github.com/rust-lang/crates.io-index.git\"",
+            "\"https://github.com/rust-lang/crates.io-index/\"",
+            "\"https://github.com/Rust-Lang/Crates.io-Index\"",
+            "\"sparse+https://index.crates.io/\"",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(
+                &tmp.path().join("Cargo.toml"),
+                &format!(
+                    "[package]\nname = \"a\"\n\n[patch.{source}]\n\
+                     autumn-plugin-x = {{ path = \"../x\" }}\n"
+                ),
+            );
+            assert!(
+                patched_by_in(tmp.path(), "autumn-plugin-x", "=0.3.0", None).is_some(),
+                "{source}"
+            );
+        }
     }
 
     /// `paths` overrides in a config can replace any crate.
