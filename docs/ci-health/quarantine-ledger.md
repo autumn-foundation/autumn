@@ -46,108 +46,7 @@ quarantine, per the rule above.
 
 ## Open entries
 
-### `offsite_backup::offsite_backup_upload_then_restore_round_trips` / `offsite_backup::offsite_backup_uploads_large_artifact_via_multipart` / `sqlite_replication_s3::replicates_to_and_restores_from_a_real_s3_endpoint`
-
-- **Quarantined**: 2026-09-25 in #2953.
-- **Owner**: @madmax983 (repo owner) — the fix needs a business/infra decision
-  (pay for authenticated `quay.io` pulls, or stand up and maintain a
-  self-hosted/mirrored MinIO image) that this role cannot make unilaterally
-  per its own "ask before: new CI spend" rule. Not the person who diagnosed
-  it (this pass); the person on the hook for the remediation decision.
-- **Diagnose-by**: N/A — mechanism is confirmed, not pending (see below).
-  **Revisit-by**: 2026-10-02 — check whether `quay.io/minio/minio` anonymous
-  pulls have been restored, or whether a decision has been made, before this
-  entry goes stale.
-- **Rerun-rate baseline**: not applicable in the stochastic sense — this is a
-  deterministic, 100% external-dependency outage, not a flake. 6/6 `Test
-  (Docker)` failures carry the identical signature in the ~12h window sampled
-  before this quarantine (2026-09-24T20:21:13Z-2026-09-25T09:09Z): 5
-  independent PRs (`claude/tender-galileo-q43orv`, `claude/busy-cerf-0i7k5y`,
-  `claude/friendly-ritchie-nv7uw7`, `claude/wizardly-wright-dyva9u`,
-  `claude/brave-goldberg-h3c4cr`) plus this repo's own `trunk-dev` push of the
-  2026-09-24 Semaphore follow-up (#2942, run 36004498723, a docs-only ledger
-  PR with zero code changes — confirming the failure tracks the external
-  dependency, not any PR's own diff). No PR in the sampled window that
-  reached the `Test (Docker)` job passed it.
-- **Failure signature**: panic `` start MinIO — is Docker running?:
-  Client(PullImage { descriptor: "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z",
-  err: DockerResponseServerError { status_code: 500, message: "unauthorized:
-  access to the requested resource is not authorized" } }) `` at
-  `autumn-cli/tests/integration/offsite_backup.rs:82:10` (and the identical
-  shape at `autumn/tests/integration/sqlite_replication_s3.rs`'s own
-  `MinIO::default()` call site).
-- **Mechanism**: unpinned/vanished external dependency — the same category as
-  the closed MinIO/Docker-Hub entry above, recurring against the fallback
-  that entry's own fix (#2740) switched to. Confirmed directly, not inferred
-  from the CI error text alone: an anonymous `quay.io/v2/auth` token request
-  for `repository:minio/minio:pull` succeeds (200) but the returned JWT's
-  `access` grant carries `"actions":[]` — empty, no `pull` — and a manifest
-  GET against `quay.io/v2/minio/minio/manifests/RELEASE.2025-09-07T16-13-09Z`
-  with that token still 401s (`www-authenticate: Bearer ...`). The identical
-  probe against an unrelated public quay.io repo, `quay.io/prometheus/prometheus`,
-  returns a normal 200 with a real manifest — so this is scoped to
-  `minio/minio` specifically, not a quay.io-wide policy change or outage.
-  MinIO Inc.'s own repository page (`quay.io/repository/minio/minio`, the web
-  UI, not the registry API) still returns 200, so the repository exists and
-  is browsable; only anonymous registry pulls are cut off. This is the same
-  vendor that deleted its Docker Hub org outright in October 2025 (see the
-  closed entry above) now also closing off the last public registry this
-  repo's tests depended on.
-- **Test-vs-product**: neither — pure external CI/test infrastructure
-  dependency (a third-party vendor's container distribution policy), no
-  product code path is implicated, the same classification as every other
-  "unpinned external service" entry in this ledger.
-- **Remediation attempted, not found**: searched for a still-anonymously-pullable
-  MinIO-compatible replacement image before quarantining rather than after.
-  `docker.io/minio/minio` remains gone (the October 2025 org deletion, see
-  above — not re-checked in depth this pass since nothing suggests it
-  returned). `docker.io/bitnami/minio`: Docker Hub's own repository API
-  reports it `"is_private": false` and `"status": "active"` with 58M+
-  historical pulls, but its registry tags list (`GET
-  /v2/bitnami/minio/tags/list`, both with and without a token, and via
-  `hub.docker.com`'s own tags API) returns zero tags — consistent with
-  Broadcom's 2025 Bitnami Secure Images move, which pulled free-tier tags
-  behind a paid catalog while leaving the repository shell/description in
-  place. `ghcr.io/minio/minio` and `public.ecr.aws/minio/minio` both 401.
-  No further candidates were tried this pass. A working replacement, if one
-  exists, was not found by registry-probing alone — this may need the
-  vendor's own current documentation (unavailable to check further in this
-  pass) or a self-hosted mirror.
-- **Fix, not applied — quarantined instead, per the "ask before: new CI
-  spend" rule and because no Docker daemon is available in this sandbox to
-  verify a replacement image's compatibility with `testcontainers_modules::minio::MinIO`'s
-  wait strategy and env-var expectations before committing to one.** Swapping
-  registries blind, a second time, risks repeating the multi-PR collision
-  the first swap caused (see the escape entry above) — and this time there
-  is no confirmed working target to swap to. Instead: `--skip
-  offsite_backup_upload_then_restore_round_trips --skip
-  offsite_backup_uploads_large_artifact_via_multipart` added to `ci.yml`'s
-  `cli_tests` bare `--ignored` sweep, and `--skip
-  replicates_to_and_restores_from_a_real_s3_endpoint` added to the
-  `integration_tests` sweep — both by exact test name, the same convention
-  this repo already uses for the non-Docker generator-conformance skips in
-  the same block (CLAUDE.md's "Docker / testcontainer DB tests run
-  automatically in CI" section). This is quarantine, not deletion: the tests
-  are untouched, still compile, and still run for anyone with Docker and
-  working `quay.io` credentials locally.
-- **Not covered by this quarantine**: `examples/reddit-clone/tests/avatar_s3_integration.rs`'s
-  `avatar_blob_store_roundtrip` — same `MinIO::default().with_name(MINIO_IMAGE)`
-  call site, same outage, but (per the closed MinIO entry above) this test
-  was never part of either CI Docker sweep to begin with, so no `ci.yml`
-  change is needed to stop it from failing CI; it simply fails identically
-  whenever anyone runs it directly.
-- **Impact while open**: this fails the required `Test (Docker)` job — and
-  therefore the required `Test suite` (`test-gate`) aggregator — on every PR
-  whose run reaches that job, independent of the PR's own diff, until this
-  quarantine merges. Given the ~12h/6-for-6 sampling above, that was
-  effectively every PR reaching the Docker sweep in that window.
-- **Linked issue/PR**: none filed separately — tracked here and in #2953,
-  which is the fix (the quarantine) as well as the diagnosis.
-- **Skip mechanism**: `ci.yml`'s `cli_tests` and `integration_tests` bare
-  `--ignored` sweeps, `--skip <exact test name>`, chosen over `#[ignore]`ing
-  the test bodies themselves so the quarantine is visible and reversible in
-  one place (this ledger entry names both `ci.yml` lines) rather than
-  scattered across test source files.
+None.
 
 ## Closed entries
 
@@ -2515,6 +2414,125 @@ opened here 2026-09-21 (n=1, mechanism unconfirmed) and **closed the same
 week** — see its entry under "Closed entries" above for the full diagnosis,
 measured fix, and verification; not repeated here.
 
+
+### (quay.io, 2026-09-25) `offsite_backup::offsite_backup_upload_then_restore_round_trips` / `offsite_backup::offsite_backup_uploads_large_artifact_via_multipart` / `sqlite_replication_s3::replicates_to_and_restores_from_a_real_s3_endpoint`
+
+- **Quarantined**: 2026-09-25 in #2953.
+- **Owner**: @madmax983 (repo owner) — the fix needs a business/infra decision
+  (pay for authenticated `quay.io` pulls, or stand up and maintain a
+  self-hosted/mirrored MinIO image) that this role cannot make unilaterally
+  per its own "ask before: new CI spend" rule. Not the person who diagnosed
+  it (this pass); the person on the hook for the remediation decision.
+- **Diagnose-by**: N/A — mechanism is confirmed, not pending (see below).
+  **Revisit-by**: 2026-10-02 — check whether `quay.io/minio/minio` anonymous
+  pulls have been restored, or whether a decision has been made, before this
+  entry goes stale.
+- **Rerun-rate baseline**: not applicable in the stochastic sense — this is a
+  deterministic, 100% external-dependency outage, not a flake. 6/6 `Test
+  (Docker)` failures carry the identical signature in the ~12h window sampled
+  before this quarantine (2026-09-24T20:21:13Z-2026-09-25T09:09Z): 5
+  independent PRs (`claude/tender-galileo-q43orv`, `claude/busy-cerf-0i7k5y`,
+  `claude/friendly-ritchie-nv7uw7`, `claude/wizardly-wright-dyva9u`,
+  `claude/brave-goldberg-h3c4cr`) plus this repo's own `trunk-dev` push of the
+  2026-09-24 Semaphore follow-up (#2942, run 36004498723, a docs-only ledger
+  PR with zero code changes — confirming the failure tracks the external
+  dependency, not any PR's own diff). No PR in the sampled window that
+  reached the `Test (Docker)` job passed it.
+- **Failure signature**: panic `` start MinIO — is Docker running?:
+  Client(PullImage { descriptor: "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z",
+  err: DockerResponseServerError { status_code: 500, message: "unauthorized:
+  access to the requested resource is not authorized" } }) `` at
+  `autumn-cli/tests/integration/offsite_backup.rs:82:10` (and the identical
+  shape at `autumn/tests/integration/sqlite_replication_s3.rs`'s own
+  `MinIO::default()` call site).
+- **Mechanism**: unpinned/vanished external dependency — the same category as
+  the closed MinIO/Docker-Hub entry above, recurring against the fallback
+  that entry's own fix (#2740) switched to. Confirmed directly, not inferred
+  from the CI error text alone: an anonymous `quay.io/v2/auth` token request
+  for `repository:minio/minio:pull` succeeds (200) but the returned JWT's
+  `access` grant carries `"actions":[]` — empty, no `pull` — and a manifest
+  GET against `quay.io/v2/minio/minio/manifests/RELEASE.2025-09-07T16-13-09Z`
+  with that token still 401s (`www-authenticate: Bearer ...`). The identical
+  probe against an unrelated public quay.io repo, `quay.io/prometheus/prometheus`,
+  returns a normal 200 with a real manifest — so this is scoped to
+  `minio/minio` specifically, not a quay.io-wide policy change or outage.
+  MinIO Inc.'s own repository page (`quay.io/repository/minio/minio`, the web
+  UI, not the registry API) still returns 200, so the repository exists and
+  is browsable; only anonymous registry pulls are cut off. This is the same
+  vendor that deleted its Docker Hub org outright in October 2025 (see the
+  closed entry above) now also closing off the last public registry this
+  repo's tests depended on.
+- **Test-vs-product**: neither — pure external CI/test infrastructure
+  dependency (a third-party vendor's container distribution policy), no
+  product code path is implicated, the same classification as every other
+  "unpinned external service" entry in this ledger.
+- **Remediation attempted, not found**: searched for a still-anonymously-pullable
+  MinIO-compatible replacement image before quarantining rather than after.
+  `docker.io/minio/minio` remains gone (the October 2025 org deletion, see
+  above — not re-checked in depth this pass since nothing suggests it
+  returned). `docker.io/bitnami/minio`: Docker Hub's own repository API
+  reports it `"is_private": false` and `"status": "active"` with 58M+
+  historical pulls, but its registry tags list (`GET
+  /v2/bitnami/minio/tags/list`, both with and without a token, and via
+  `hub.docker.com`'s own tags API) returns zero tags — consistent with
+  Broadcom's 2025 Bitnami Secure Images move, which pulled free-tier tags
+  behind a paid catalog while leaving the repository shell/description in
+  place. `ghcr.io/minio/minio` and `public.ecr.aws/minio/minio` both 401.
+  No further candidates were tried this pass. A working replacement, if one
+  exists, was not found by registry-probing alone — this may need the
+  vendor's own current documentation (unavailable to check further in this
+  pass) or a self-hosted mirror.
+- **Fix, not applied — quarantined instead, per the "ask before: new CI
+  spend" rule and because no Docker daemon is available in this sandbox to
+  verify a replacement image's compatibility with `testcontainers_modules::minio::MinIO`'s
+  wait strategy and env-var expectations before committing to one.** Swapping
+  registries blind, a second time, risks repeating the multi-PR collision
+  the first swap caused (see the escape entry above) — and this time there
+  is no confirmed working target to swap to. Instead: `--skip
+  offsite_backup_upload_then_restore_round_trips --skip
+  offsite_backup_uploads_large_artifact_via_multipart` added to `ci.yml`'s
+  `cli_tests` bare `--ignored` sweep, and `--skip
+  replicates_to_and_restores_from_a_real_s3_endpoint` added to the
+  `integration_tests` sweep — both by exact test name, the same convention
+  this repo already uses for the non-Docker generator-conformance skips in
+  the same block (CLAUDE.md's "Docker / testcontainer DB tests run
+  automatically in CI" section). This is quarantine, not deletion: the tests
+  are untouched, still compile, and still run for anyone with Docker and
+  working `quay.io` credentials locally.
+- **Not covered by this quarantine**: `examples/reddit-clone/tests/avatar_s3_integration.rs`'s
+  `avatar_blob_store_roundtrip` — same `MinIO::default().with_name(MINIO_IMAGE)`
+  call site, same outage, but (per the closed MinIO entry above) this test
+  was never part of either CI Docker sweep to begin with, so no `ci.yml`
+  change is needed to stop it from failing CI; it simply fails identically
+  whenever anyone runs it directly.
+- **Impact while open**: this fails the required `Test (Docker)` job — and
+  therefore the required `Test suite` (`test-gate`) aggregator — on every PR
+  whose run reaches that job, independent of the PR's own diff, until this
+  quarantine merges. Given the ~12h/6-for-6 sampling above, that was
+  effectively every PR reaching the Docker sweep in that window.
+- **Linked issue/PR**: none filed separately — tracked here and in #2953,
+  which is the fix (the quarantine) as well as the diagnosis.
+- **Skip mechanism**: `ci.yml`'s `cli_tests` and `integration_tests` bare
+  `--ignored` sweeps, `--skip <exact test name>`, chosen over `#[ignore]`ing
+  the test bodies themselves so the quarantine is visible and reversible in
+  one place (this ledger entry names both `ci.yml` lines) rather than
+  scattered across test source files.
+- **Resolution**: switched every `MinIO` call site to Chainguard's free
+  `cgr.dev/chainguard/minio` image, pinned by digest, and removed the three
+  `--skip` lines. It is the upstream `minio` binary with the same entrypoint,
+  so `testcontainers_modules::minio::MinIO`'s command, `minioadmin`
+  credentials and wait strategy work unchanged. The image has no `EXPOSE`, so
+  each call site publishes port 9000 with `.with_mapped_port(0, 9000.tcp())`.
+  Anonymous pulls need no
+  account or secret. Chainguard's free tier serves only the `latest` tag, but
+  it keeps old digests pullable, so the pin holds. Verified by running all
+  three tests plus the reddit-clone avatar test against a local Docker daemon
+  before the push. Candidates that failed an anonymous pull on 2026-09-26:
+  `quay.io/minio/minio` (401), `docker.io/minio/minio` (gone),
+  `ghcr.io/minio/minio` (denied), `mirror.gcr.io/minio/minio` (not found).
+  `docker.io/bitnamilegacy/minio` pulls, but it is frozen and has a different
+  entrypoint.
+- **Closed**: 2026-09-26, in the PR that restores the tests.
 ### `Windows Tier 1 journey`: `autumn setup` fails "✗ Failed to read cargo metadata" against a freshly-scaffolded app
 
 - **New, 2026-09-27. n=2 organic, identical signature, ~32h apart, on two
