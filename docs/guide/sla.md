@@ -206,6 +206,12 @@ the enqueue, also after the job ran. Thus if an enqueue reports an error after
 the queue stored the job, the retry of the check does not run the handler
 again.
 
+Each escalate job also carries a random `token`. Before the handler runs, the
+job stores its token in the record (`begin_dispatch`). The first token wins. A
+job with another token, for example one enqueued after the unique key expired,
+does not run the handler. A retry of the winning job has the same token, so it
+runs.
+
 A failed handler runs again, up to 5 attempts in all, with a first delay of
 1 s. Use
 `on_any_breach` for obligations that have no named handler.
@@ -228,7 +234,7 @@ than one replica, put an `ObligationStore` on your database with
 `SlaPlugin::store`, and use it on all replicas.
 
 Each record has a `generation`, a unique id that `track` makes. The writes
-after the insert (`mark_met`, `set_due`, `claim_escalation`,
+after the insert (`mark_met`, `set_due`, `begin_dispatch`, `claim_escalation`,
 `release_escalation`) must change the record only when the key and the
 generation both match, in one atomic step. Thus a slow call never changes a
 record that `forget` and a new `track` replaced.

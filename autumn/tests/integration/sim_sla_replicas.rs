@@ -105,6 +105,15 @@ impl ObligationStore for RacingStore {
         self.inner.set_due(key, generation, due_at)
     }
 
+    fn begin_dispatch<'a>(
+        &'a self,
+        key: &'a str,
+        generation: Uuid,
+        token: Uuid,
+    ) -> StoreFuture<'a, bool> {
+        self.inner.begin_dispatch(key, generation, token)
+    }
+
     fn claim_escalation<'a>(
         &'a self,
         key: &'a str,
@@ -984,6 +993,64 @@ async fn sim_sla_reconcile_with_no_deadline_stops_the_old_check() {
     assert!(fired.lock().unwrap().is_empty(), "no deadline: no breach");
     let record = store.inner.get(&key).await.unwrap().unwrap();
     assert!(record.escalated_at.is_none());
+
+    job::clear_global_job_client();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sim_sla_a_second_escalation_after_the_unique_window_does_not_fire() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
+    let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2020, 1, 1, 12, 0, 0).unwrap());
+    let store = RacingStore::new();
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    let app = replica(&clock, &store, &fired);
+    let ob = Obligation::new("first_response", "ticket:1")
+        .within(BusinessDuration::hours(2))
+        .calendar("support")
+        .starting_at(start)
+        .zone(chrono_tz::Tz::UTC);
+    let generation = Uuid::from_u128(17);
+    store
+        .inner
+        .insert(ObligationRecord::new(ob.clone(), generation).with_due_at(due))
+        .await
+        .unwrap();
+    let breach = |token: u128| {
+        serde_json::json!({
+            "key": ob.key(),
+            "obligation": "first_response",
+            "subject": "ticket:1",
+            "calendar": "support",
+            "zone": "UTC",
+            "generation": generation,
+            "started_at": start,
+            "due_at": due,
+            "escalated_at": due,
+            "token": Uuid::from_u128(token),
+        })
+    };
+    let client = app.state().extension::<job::JobClient>().unwrap();
+
+    client.enqueue(ESCALATE_JOB, breach(1)).await.unwrap();
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    settle().await;
+    assert_eq!(fired.lock().unwrap().len(), 1);
+
+    // More than a day later the unique key has expired. A second
+    // escalation for the same record must not run the handler again.
+    let step = Duration::from_secs(25 * 3600);
+    clock.advance(step);
+    tokio::time::advance(step).await;
+    client.enqueue(ESCALATE_JOB, breach(2)).await.unwrap();
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    settle().await;
+    assert_eq!(*fired.lock().unwrap(), ["first_response/ticket:1"]);
 
     job::clear_global_job_client();
 }

@@ -718,12 +718,15 @@ only the injected `Clock`.
   `met_at`, `escalated_at`, `resumes_at`, `budget`, `elapsed`, `remaining`};
   `ObligationState` {`Running`, `Paused`, `Met`, `Breached`}.
 - `SlaBreach` (serde) {`key`, `obligation`, `subject`, `calendar`, `zone`,
-  `generation`, `started_at`, `due_at`, `escalated_at`} — the typed escalation.
+  `generation`, `started_at`, `due_at`, `escalated_at`, `token`} — the typed
+  escalation.
 - `ObligationStore` trait (`insert` → `(record, created)`, `get`, `list`,
   `remove`, and the generation-bound writes `mark_met`, `set_due`,
-  `claim_escalation`, `release_escalation`); `ObligationRecord { obligation,
-  generation, escalated_at, due_at }` (the stored deadline decides the
-  claim; `reconcile` rewrites it after a calendar change); `track` is idempotent and safe to retry;
+  `begin_dispatch`, `claim_escalation`, `release_escalation`);
+  `ObligationRecord { obligation, generation, escalated_at, due_at,
+  dispatch_token }` (the stored deadline decides the claim; `reconcile`
+  rewrites it after a calendar change; the first escalate job's token wins
+  the dispatch, so the handler runs once); `track` is idempotent and safe to retry;
   `MemoryObligationStore` is the per-process default; replicas need one
   shared store. A breach met late still escalates.
 - `SlaError` {`InvalidHours`, `InvalidDuration`, `UnknownCalendar`,

@@ -790,6 +790,15 @@ impl ObligationStore for FlakyRelease {
         self.inner.set_due(key, generation, due_at)
     }
 
+    fn begin_dispatch<'a>(
+        &'a self,
+        key: &'a str,
+        generation: uuid::Uuid,
+        token: uuid::Uuid,
+    ) -> StoreFuture<'a, bool> {
+        self.inner.begin_dispatch(key, generation, token)
+    }
+
     fn claim_escalation<'a>(
         &'a self,
         key: &'a str,
@@ -905,4 +914,21 @@ fn obligation_key_is_unambiguous_when_the_name_has_a_slash() {
         "first_response/ticket:1"
     );
     assert_ne!(Obligation::new("a%2Fb", "c").key(), b);
+}
+
+#[tokio::test]
+async fn store_begins_one_dispatch_for_each_record() {
+    let store = store_with_one().await;
+    let first = uuid::Uuid::from_u128(21);
+    let second = uuid::Uuid::from_u128(22);
+    assert!(store.begin_dispatch(KEY, GEN, first).await.unwrap());
+    // A retry of the same job passes; another job does not.
+    assert!(store.begin_dispatch(KEY, GEN, first).await.unwrap());
+    assert!(!store.begin_dispatch(KEY, GEN, second).await.unwrap());
+    assert!(
+        !store
+            .begin_dispatch(KEY, uuid::Uuid::from_u128(9), first)
+            .await
+            .unwrap()
+    );
 }

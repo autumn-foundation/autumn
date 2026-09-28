@@ -29,6 +29,9 @@ pub struct ObligationRecord {
     /// `9999-12-31T23:59:59Z` means `reconcile` found no deadline: no claim
     /// matches it.
     pub due_at: Option<DateTime<Utc>>,
+    /// The token of the escalate job that runs the handler. The first job
+    /// that sets it runs; a job with another token does not.
+    pub dispatch_token: Option<Uuid>,
 }
 
 /// The stored deadline for "no deadline". No claim matches it.
@@ -45,6 +48,7 @@ impl ObligationRecord {
             generation,
             escalated_at: None,
             due_at: None,
+            dispatch_token: None,
         }
     }
 
@@ -94,6 +98,16 @@ pub trait ObligationStore: Send + Sync + 'static {
         key: &'a str,
         generation: Uuid,
         due_at: DateTime<Utc>,
+    ) -> StoreFuture<'a, bool>;
+
+    /// Set the dispatch token to `token` if it is not set. Return `true` if
+    /// the stored token is `token` after the call. Thus only one escalate
+    /// job for the record runs the handler, and its own retries still run.
+    fn begin_dispatch<'a>(
+        &'a self,
+        key: &'a str,
+        generation: Uuid,
+        token: Uuid,
     ) -> StoreFuture<'a, bool>;
 
     /// Set the escalation instant to `at` if the escalation is not set, the
@@ -218,6 +232,18 @@ impl ObligationStore for MemoryObligationStore {
             open
         });
         Box::pin(async move { Ok(changed.await?.unwrap_or(false)) })
+    }
+
+    fn begin_dispatch<'a>(
+        &'a self,
+        key: &'a str,
+        generation: Uuid,
+        token: Uuid,
+    ) -> StoreFuture<'a, bool> {
+        let owned = self.with_instance(key, generation, |record| {
+            *record.dispatch_token.get_or_insert(token) == token
+        });
+        Box::pin(async move { Ok(owned.await?.unwrap_or(false)) })
     }
 
     fn claim_escalation<'a>(

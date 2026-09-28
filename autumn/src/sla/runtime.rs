@@ -67,6 +67,10 @@ pub struct SlaBreach {
     pub due_at: DateTime<Utc>,
     /// The instant when the escalation was claimed.
     pub escalated_at: DateTime<Utc>,
+    /// A random token for this escalation. See
+    /// [`ObligationStore::begin_dispatch`].
+    #[serde(default)]
+    pub token: uuid::Uuid,
 }
 
 /// The payload of [`CHECK_JOB`].
@@ -638,6 +642,7 @@ impl Sla {
             started_at: status.started_at,
             due_at,
             escalated_at: now,
+            token: self.state.entropy().uuid_v4(),
         };
         if let Err(err) = self.enqueue(ESCALATE_JOB, &breach, None).await {
             // Release the claim, so that the retry of this check can claim again.
@@ -703,6 +708,18 @@ fn escalate_job(state: AppState, payload: Value) -> BreachFuture {
         let breach: SlaBreach = serde_json::from_value(payload)?;
         let sla = Sla::from_state(&state)?;
         if sla.met_on_time(&breach).await? {
+            return Ok(());
+        }
+        // One escalate job for each record runs the handler. Another job
+        // for the same record (for example after the unique key expired)
+        // stops here.
+        if !sla
+            .engine
+            .store
+            .begin_dispatch(&breach.key, breach.generation, breach.token)
+            .await?
+        {
+            tracing::info!(key = %breach.key, "SLA escalation already dispatched");
             return Ok(());
         }
         let Some(handler) = sla.handler_for(&breach.obligation) else {
