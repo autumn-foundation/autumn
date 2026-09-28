@@ -275,6 +275,32 @@ pub enum TlsError {
         /// Human-readable parse detail.
         detail: String,
     },
+    /// The mTLS revocation list does not cover every CA in the client-CA
+    /// bundle: no CRL in the file is issued by one or more of the bundle's
+    /// CAs (issue #2706).
+    ///
+    /// Once any CRL is configured, rustls denies handshakes whose revocation
+    /// status is *unknown*, so clients presenting certificates issued by an
+    /// uncovered CA are refused even though their CA is trusted — the
+    /// availability trap in the CA rotation `docs/guide/tls.md` documents
+    /// (old + new CA in one bundle, CRL published for the old one first).
+    /// Publish a CRL for each CA in the bundle (or remove the uncovered CA)
+    /// before starting with a CRL configured.
+    #[error(
+        "the mTLS revocation list `{crl_path}` has no CRL issued by {uncovered:?} \
+         from the client CA bundle `{ca_bundle_path}`; once any CRL is configured, \
+         rustls refuses handshakes whose revocation status is unknown, so these \
+         CAs' clients would be rejected — publish a CRL for each CA in the \
+         bundle or remove the uncovered CA"
+    )]
+    CrlCoverageGap {
+        /// CA bundle path.
+        ca_bundle_path: PathBuf,
+        /// CRL path.
+        crl_path: PathBuf,
+        /// Subject DNs of the CAs no CRL in the file is issued by.
+        uncovered: Vec<String>,
+    },
     /// Building the rustls client-certificate verifier failed.
     #[error("failed to build the mTLS client certificate verifier: {source}")]
     BuildClientVerifier {

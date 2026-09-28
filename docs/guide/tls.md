@@ -1115,6 +1115,19 @@ Two deliberate choices:
   honoring the list rather than failing every handshake — the revocations it
   names stay enforced. `autumn doctor` warns so the staleness is not silent.
 
+And one hard rule:
+
+- **Every CA in the bundle needs a CRL.** Once `crl_path` is set, rustls
+  denies handshakes whose revocation status is *unknown*, so a CRL that names
+  only some of the bundle's CAs would silently refuse the clients of the rest
+  — exactly the availability trap the rotation above walks into if the new
+  CA's CRL is published late. The server **fails fast at startup**, naming the
+  uncovered CAs, rather than serving half the clients. During a rotation,
+  publish the new CA's CRL (an empty one counts — a CRL with zero revoked
+  certificates) before, or together with, the bundle edit that adds the new
+  CA. A CRL-file change that breaks coverage hot-reloads the same way any bad
+  bundle does: it logs an error and keeps the previous trust store.
+
 **OCSP and OCSP stapling are not supported.** CRL plus short-lived certificates
 first.
 
@@ -1170,7 +1183,8 @@ Both surface through the usual metrics/actuator endpoints.
 
 Startup **fails fast** with the offending path in the message on a missing,
 unparseable, or empty CA bundle or CRL — the listener never binds trusting
-nobody.
+nobody. It also fails fast when the CRL does not cover every CA in the bundle
+(see above), naming the uncovered CAs.
 
 ### `autumn doctor`
 
@@ -1178,9 +1192,11 @@ nobody.
 
 - **Fail** — the bundle or CRL is missing, unparseable, or empty (the same
   conditions the runtime refuses to boot on), or a CA in the bundle has expired.
-- **Warn** — a CA expires within 30 days, the CRL's `nextUpdate` has passed, or
-  `mode = "optional"` with no route requiring a certificate (client auth
-  configured and enforcing nothing).
+- **Warn** — the CRL has no entry for every CA in the bundle (the runtime
+  refuses to boot on this too, so `--strict` fails the run), a CA expires
+  within 30 days, the CRL's `nextUpdate` has passed, or `mode = "optional"`
+  with no route requiring a certificate (client auth configured and enforcing
+  nothing).
 - **Pass** — otherwise, reporting the mode, the CA count, and how many route
   prefixes demand a certificate.
 

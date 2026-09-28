@@ -13,7 +13,11 @@
 //! 1. **Fail-fast loading** —
 //!    [`load_client_roots`](crate::tls::client_auth::load_client_roots) and
 //!    [`load_crls`](crate::tls::client_auth::load_crls) reject a missing,
-//!    unparseable, or empty bundle, naming the path.
+//!    unparseable, or empty bundle, naming the path; when a CRL is configured,
+//!    [`ensure_crl_coverage`](crate::tls::client_auth::ensure_crl_coverage)
+//!    additionally requires a CRL for *every* CA in the bundle, because rustls
+//!    denies handshakes with unknown revocation status once any CRL exists
+//!    (issue #2706).
 //! 2. **A swappable verifier** —
 //!    [`ReloadableClientVerifier`](crate::tls::client_auth::ReloadableClientVerifier)
 //!    holds the current `rustls` verifier behind an `RwLock`, so a CA rotation
@@ -303,22 +307,14 @@ fn sha256_fingerprint(der: &[u8]) -> String {
 /// Returns a [`TlsError`] describing the first problem encountered.
 pub fn load_client_roots(path: &Path) -> Result<RootCertStore, TlsError> {
     let mut roots = RootCertStore::empty();
-    let mut count = 0usize;
-    for cert in CertificateDer::pem_file_iter(path).map_err(|source| map_pem_err(path, source))? {
-        let cert = cert.map_err(|source| map_pem_err(path, source))?;
-        count += 1;
+    for (idx, cert) in read_ca_cert_ders(path)?.into_iter().enumerate() {
         roots
             .add(cert)
             .map_err(|source| TlsError::InvalidClientCa {
                 path: path.to_path_buf(),
-                position: count,
+                position: idx + 1,
                 source: Box::new(source),
             })?;
-    }
-    if count == 0 {
-        return Err(TlsError::NoClientCas {
-            path: path.to_path_buf(),
-        });
     }
     Ok(roots)
 }
@@ -344,6 +340,26 @@ pub fn load_crls(path: &Path) -> Result<Vec<CertificateRevocationListDer<'static
         });
     }
     Ok(crls)
+}
+
+/// Read the CA bundle's certificate DERs, failing fast — naming the path — on
+/// a missing/unreadable file, unparseable PEM, or a bundle with no CERTIFICATE
+/// block. The [`load_client_roots`] trust-anchor validation happens when the
+/// DERs are added to the store, so this is the shared read for both that path
+/// and the coverage check.
+fn read_ca_cert_ders(ca_bundle_path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError> {
+    let mut certs = Vec::new();
+    for cert in CertificateDer::pem_file_iter(ca_bundle_path)
+        .map_err(|source| map_pem_err(ca_bundle_path, source))?
+    {
+        certs.push(cert.map_err(|source| map_pem_err(ca_bundle_path, source))?);
+    }
+    if certs.is_empty() {
+        return Err(TlsError::NoClientCas {
+            path: ca_bundle_path.to_path_buf(),
+        });
+    }
+    Ok(certs)
 }
 
 /// Map a PEM error over the CA bundle, distinguishing "file missing" from
@@ -375,6 +391,110 @@ fn map_crl_pem_err(path: &Path, source: rustls_pki_types::pem::Error) -> TlsErro
     }
 }
 
+/// Subject DNs of the CAs in the bundle at `ca_bundle_path` that no CRL in the
+/// file at `crl_path` is issued by — the coverage gaps behind issue #2706.
+///
+/// Both files load through the runtime paths first, so a gap report never
+/// grades a bundle or CRL the server would refuse to boot on. Names are
+/// compared by exact DER encoding of the X.509 Name, not by their string
+/// rendering — the comparison is deliberately strict (a reordered RDN
+/// sequence is a different DER and does not match), which is the safe choice
+/// here: a CRL's issuer field is copied byte-for-byte from its CA's subject
+/// when the CRL is minted, so an honest CRL always matches exactly.
+///
+/// Returns the empty vector when every CA in the bundle has at least one CRL.
+/// When the CRL file holds several CRLs, one per issuing CA, each CA needs
+/// only one of them.
+///
+/// # Errors
+///
+/// Returns a [`TlsError`] for a missing/unreadable file, unparseable PEM, an
+/// empty bundle or CRL, or a block that is not parseable DER.
+pub fn crl_coverage_gaps(ca_bundle_path: &Path, crl_path: &Path) -> Result<Vec<String>, TlsError> {
+    // Load through the runtime paths first, so the coverage check never
+    // grades a bundle or CRL the server would refuse to boot on.
+    load_client_roots(ca_bundle_path)?;
+    let crls = load_crls(crl_path)?;
+    let ca_certs = read_ca_cert_ders(ca_bundle_path)?;
+    crl_coverage_gaps_in(&ca_certs, &crls, ca_bundle_path, crl_path)
+}
+
+/// [`crl_coverage_gaps`] over already-loaded DERs: the single snapshot
+/// [`build_from_paths`] validates before constructing the verifier, so the
+/// coverage decision and the trust store can never disagree about which bytes
+/// they graded — a rotation landing between two reads cannot leave one
+/// seeing the old files and the other the new ones. Paths are only used for
+/// error reporting.
+fn crl_coverage_gaps_in(
+    ca_certs: &[CertificateDer<'static>],
+    crls: &[CertificateRevocationListDer<'static>],
+    ca_bundle_path: &Path,
+    crl_path: &Path,
+) -> Result<Vec<String>, TlsError> {
+    use x509_parser::prelude::FromDer as _;
+
+    let mut ca_subjects: Vec<(Vec<u8>, String)> = Vec::new();
+    for (idx, cert) in ca_certs.iter().enumerate() {
+        let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(cert.as_ref())
+            .map_err(|e| TlsError::ParseChainCert {
+                path: ca_bundle_path.to_path_buf(),
+                position: idx + 1,
+                detail: e.to_string(),
+            })?;
+        let subject = parsed.subject();
+        ca_subjects.push((subject.as_raw().to_vec(), subject.to_string()));
+    }
+
+    let mut crl_issuers: Vec<Vec<u8>> = Vec::new();
+    for (idx, crl) in crls.iter().enumerate() {
+        let (_, parsed) =
+            x509_parser::revocation_list::CertificateRevocationList::from_der(crl.as_ref())
+                .map_err(|e| TlsError::ParseCrlDer {
+                    path: crl_path.to_path_buf(),
+                    position: idx + 1,
+                    detail: e.to_string(),
+                })?;
+        crl_issuers.push(parsed.issuer().as_raw().to_vec());
+    }
+
+    Ok(ca_subjects
+        .into_iter()
+        .filter(|(der, _)| !crl_issuers.iter().any(|issuer| issuer == der))
+        .map(|(_, name)| name)
+        .collect())
+}
+
+/// Fail fast when the CRL set does not cover every CA in the bundle (issue
+/// #2706).
+///
+/// The file-loading path ([`build_from_paths`]) enforces this against the same
+/// snapshot it builds the verifier from, via the shared core; this public
+/// wrapper is for callers assembling a verifier from already-loaded files:
+/// once any CRL is present, rustls denies handshakes whose revocation status
+/// is *unknown*, so a CRL published for only some of the bundle's CAs silently
+/// refuses the clients of the rest — the availability trap in the CA rotation
+/// `docs/guide/tls.md` documents (old + new CA in one bundle, CRL published
+/// for the old one first). Naming the uncovered issuers at startup makes the
+/// trap visible before traffic; the trust-store reload path keeps the previous
+/// verifier on this error, so a bad rotation never takes the listener down.
+///
+/// # Errors
+///
+/// Returns [`TlsError::CrlCoverageGap`] naming every uncovered CA, or a parse
+/// error for either file.
+pub fn ensure_crl_coverage(ca_bundle_path: &Path, crl_path: &Path) -> Result<(), TlsError> {
+    let gaps = crl_coverage_gaps(ca_bundle_path, crl_path)?;
+    if gaps.is_empty() {
+        Ok(())
+    } else {
+        Err(TlsError::CrlCoverageGap {
+            ca_bundle_path: ca_bundle_path.to_path_buf(),
+            crl_path: crl_path.to_path_buf(),
+            uncovered: gaps,
+        })
+    }
+}
+
 /// Build the rustls client-certificate verifier for `mode` over `roots`.
 ///
 /// Revocation is checked for the presented client certificate only
@@ -384,6 +504,14 @@ fn map_crl_pem_err(path: &Path, source: rustls_pki_types::pem::Error) -> TlsErro
 /// deliberately NOT enforced — a stale CRL keeps revoking the certificates it
 /// lists (fail-closed) instead of failing every handshake; `autumn doctor`
 /// grades the staleness instead.
+///
+/// This function does NOT check that the CRL set covers every trust anchor —
+/// once any CRL is configured, rustls denies handshakes with unknown
+/// revocation status, so a partial CRL set refuses the clients of the uncovered
+/// CAs. The file-loading path enforces that invariant first, against the same
+/// snapshot the verifier is built from (issue #2706); call
+/// [`ensure_crl_coverage`] yourself when assembling a
+/// verifier from already-loaded files.
 ///
 /// # Errors
 ///
@@ -669,17 +797,49 @@ impl ClientTrustReloader {
 }
 
 /// Load both files and build a verifier from them.
+///
+/// Used at startup and on trust-store reload; both callers fail closed — the
+/// startup path exits, the reload path keeps the previous verifier.
 fn build_from_paths(
     ca_bundle_path: &Path,
     crl_path: Option<&Path>,
     mode: ClientAuthMode,
     provider: &Arc<CryptoProvider>,
 ) -> Result<Arc<dyn ClientCertVerifier>, TlsError> {
-    let roots = load_client_roots(ca_bundle_path)?;
+    // Single snapshot: both files are read once into these DERs, and the
+    // coverage check below plus the verifier construction both operate on
+    // them — a rotation landing mid-load can never leave the coverage
+    // decision and the trust store disagreeing about which bytes they saw.
+    let ca_certs = read_ca_cert_ders(ca_bundle_path)?;
     let crls = match crl_path {
         Some(path) => load_crls(path)?,
         None => Vec::new(),
     };
+    let mut roots = RootCertStore::empty();
+    for (idx, cert) in ca_certs.iter().enumerate() {
+        roots
+            .add(cert.clone())
+            .map_err(|source| TlsError::InvalidClientCa {
+                path: ca_bundle_path.to_path_buf(),
+                position: idx + 1,
+                source: Box::new(source),
+            })?;
+    }
+    if let Some(path) = crl_path {
+        // Fail fast on the #2706 availability trap: a CRL set that covers
+        // only some of the bundle's CAs makes rustls refuse the clients of
+        // the rest (unknown revocation status is denied once any CRL is
+        // configured). Checked against the same snapshot the verifier is
+        // built from, above.
+        let gaps = crl_coverage_gaps_in(&ca_certs, &crls, ca_bundle_path, path)?;
+        if !gaps.is_empty() {
+            return Err(TlsError::CrlCoverageGap {
+                ca_bundle_path: ca_bundle_path.to_path_buf(),
+                crl_path: path.to_path_buf(),
+                uncovered: gaps,
+            });
+        }
+    }
     build_client_verifier(roots, crls, mode, Arc::clone(provider))
 }
 
@@ -1507,6 +1667,74 @@ mod tests {
     fn loads_a_crl() {
         let (_dir, path) = write_temp("crl.pem", CRL_PEM);
         assert_eq!(load_crls(&path).expect("CRL loads").len(), 1);
+    }
+
+    // ── CRL coverage (issue #2706) ──────────────────────────────────────────
+
+    #[test]
+    fn crl_coverage_is_full_when_every_ca_has_a_crl() {
+        let (_bundle_dir, bundle) = write_temp("ca.pem", CA_PEM);
+        let (_crl_dir, crl) = write_temp("crl.pem", CRL_PEM);
+        assert_eq!(
+            crl_coverage_gaps(&bundle, &crl).expect("coverage check runs"),
+            Vec::<String>::new(),
+            "the fixture CRL is issued by the fixture CA"
+        );
+    }
+
+    #[test]
+    fn crl_coverage_names_the_ca_with_no_crl() {
+        // The rotation shape from #2706: old + new CA in one bundle, but the
+        // CRL file names only the old CA.
+        let (_bundle_dir, bundle) = write_temp("ca.pem", &format!("{CA_PEM}{OTHER_CA_PEM}"));
+        let (_crl_dir, crl) = write_temp("crl.pem", CRL_PEM);
+        let gaps = crl_coverage_gaps(&bundle, &crl).expect("coverage check runs");
+        assert_eq!(gaps.len(), 1, "exactly the uncovered CA is named: {gaps:?}");
+        assert!(
+            gaps[0].contains("Autumn Untrusted CA"),
+            "the gap names the CA with no CRL: {}",
+            gaps[0]
+        );
+    }
+
+    #[test]
+    fn ensure_crl_coverage_fails_fast_naming_the_uncovered_ca() {
+        let (_bundle_dir, bundle) = write_temp("ca.pem", &format!("{CA_PEM}{OTHER_CA_PEM}"));
+        let (_crl_dir, crl) = write_temp("crl.pem", CRL_PEM);
+        let err = ensure_crl_coverage(&bundle, &crl).expect_err("a partial CRL set must fail fast");
+        assert!(matches!(err, TlsError::CrlCoverageGap { .. }), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("Autumn Untrusted CA"), "{message}");
+        assert!(message.contains("refuses"), "{message}");
+    }
+
+    #[test]
+    fn the_startup_path_refuses_a_crl_set_that_covers_only_some_cas() {
+        // `build_from_paths` is the boot path (and the trust-store reload
+        // path): it must fail closed on the #2706 availability trap.
+        let (_bundle_dir, bundle) = write_temp("ca.pem", &format!("{CA_PEM}{OTHER_CA_PEM}"));
+        let (_crl_dir, crl) = write_temp("crl.pem", CRL_PEM);
+        let err = build_from_paths(
+            &bundle,
+            Some(&crl),
+            ClientAuthMode::Required,
+            &super::super::crypto_provider(),
+        )
+        .expect_err("boot must refuse a partial CRL set");
+        assert!(matches!(err, TlsError::CrlCoverageGap { .. }), "{err}");
+    }
+
+    #[test]
+    fn the_startup_path_builds_when_every_ca_has_a_crl() {
+        let (_bundle_dir, bundle) = write_temp("ca.pem", CA_PEM);
+        let (_crl_dir, crl) = write_temp("crl.pem", CRL_PEM);
+        build_from_paths(
+            &bundle,
+            Some(&crl),
+            ClientAuthMode::Required,
+            &super::super::crypto_provider(),
+        )
+        .expect("a fully-covered CRL set builds");
     }
 
     // ── verifier construction ───────────────────────────────────────────────
