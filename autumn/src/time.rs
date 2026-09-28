@@ -566,6 +566,13 @@ fn with_ambient<T>(read: impl FnOnce(&dyn ClockSource) -> T) -> T {
 /// ([`ambient_monotonic`], [`ambient_instant`]) follows tokio's paused clock.
 /// So an ambient deadline and a `tokio::time::sleep` stay on one timeline.
 ///
+/// Each `Sim` has its own timeline, and the system clock is another one. An
+/// ambient instant is comparable only with instants from the same timeline.
+/// Keep state that stores ambient instants (a cache, a presence map) inside
+/// one `Sim`, and do not share it with a nested `Sim` or with code outside
+/// the sim. Process-global state reads the system clock instead (the global
+/// circuit-breaker registry does).
+///
 /// Use it where framework code needs a clock but has none in scope. Prefer
 /// the app's injected clock ([`AppState::clock`](crate::state::AppState::clock),
 /// the [`Clock`] extractor) wherever one is reachable.

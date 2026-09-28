@@ -613,6 +613,12 @@ seams instead:
 | `uuid::Uuid::new_v4()` | `state.entropy().uuid_v4()`, or the `Rng` extractor in a handler |
 | Any of the time reads above, with no clock in scope | `autumn_web::time::ambient_now()`, `ambient_monotonic()`, `ambient_instant()`, `ambient_system_time()` — these read the running `Sim`'s clock on this thread, else the system clock |
 
+Each `Sim` has its own elapsed-time timeline, and the system clock is another
+one. An ambient instant is comparable only with instants from the same
+timeline. Keep state that stores ambient instants (a cache, a presence map)
+inside one `Sim`, and do not share it with a nested `Sim` or with code outside
+the sim.
+
 If you write a custom `impl ClockSource` whose `now()` is virtual, you **must**
 also override `monotonic()`. The trait ships a default body that reads the real
 process-monotonic clock — that keeps every pre-existing implementation compiling
