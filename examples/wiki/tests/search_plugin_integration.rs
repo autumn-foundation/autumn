@@ -133,7 +133,19 @@ async fn run_commit_hooks(pool: &Pool<AsyncPgConnection>) {
     drain_ready_repository_commit_hooks(pool, 16).await;
 }
 
-#[tokio::test]
+// `flavor = "multi_thread"`, not the default current-thread runtime:
+// `TestApp::build()` runs a plugin's startup hook (here, `SearchPlugin`'s
+// `ensure_indexes()`, real Postgres I/O via `.with_db(pool)`) by spawning an
+// OS thread and synchronously `.join()`-ing it while that thread calls
+// `Handle::block_on(hook)`. Under a current-thread runtime that join starves
+// the runtime's own reactor — the one thread able to drive the pool's I/O is
+// blocked waiting on the spawned thread, which is waiting on I/O nobody is
+// polling — a permanent deadlock `tokio::time::timeout` cannot preempt,
+// because it never gets a chance to run either. Two prior runs of this test
+// hung for the full 75-minute CI job timeout with no output past "running 1
+// test" before this was found. A multi-thread runtime keeps a worker free to
+// drive the reactor while another thread blocks, which resolves it.
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Docker (testcontainers)"]
 async fn creating_a_page_makes_it_searchable_through_the_plugin() {
     let (client, pool, _container) = with_timeout(
