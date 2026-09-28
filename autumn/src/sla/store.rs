@@ -129,7 +129,7 @@ pub trait ObligationStore: Send + Sync + 'static {
     ) -> StoreFuture<'a, bool>;
 
     /// Clear the escalation instant after a failed enqueue, only if it is
-    /// still `claimed_at`.
+    /// still `claimed_at` and no escalate job began the dispatch.
     fn release_escalation<'a>(
         &'a self,
         key: &'a str,
@@ -284,7 +284,7 @@ impl ObligationStore for MemoryObligationStore {
         claimed_at: DateTime<Utc>,
     ) -> StoreFuture<'a, ()> {
         let released = self.with_instance(key, generation, |record| {
-            if record.escalated_at == Some(claimed_at) {
+            if record.escalated_at == Some(claimed_at) && record.dispatch_token.is_none() {
                 record.escalated_at = None;
             }
         });

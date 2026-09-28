@@ -221,8 +221,8 @@ A failed handler runs again, up to 5 attempts in all, with a first delay of
 example, the job queue refused the check), the record stays and the next call
 schedules the check.
 
-If the enqueue fails, the check releases the claim, and the queue runs the
-check again. A failed release is tried again, up to 5 attempts. If the process
+If the enqueue fails, the check releases the claim (unless an escalate job
+already began the dispatch), and the queue runs the check again. A failed release is tried again, up to 5 attempts. If the process
 stops after the claim and before the enqueue, or all release attempts fail,
 that escalation is lost. The record keeps `escalated_at`, so `Sla::statuses`
 shows it.

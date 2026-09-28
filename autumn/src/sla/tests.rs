@@ -964,3 +964,23 @@ async fn store_dispatches_only_at_the_stored_deadline_and_when_not_met() {
             .unwrap()
     );
 }
+
+#[tokio::test]
+async fn store_keeps_the_claim_once_dispatch_began() {
+    let store = store_with_one().await;
+    let due = utc(2024, 1, 9, 15, 0);
+    assert!(store.claim_escalation(KEY, GEN, due, due).await.unwrap());
+    assert!(
+        store
+            .begin_dispatch(KEY, GEN, due, uuid::Uuid::from_u128(24))
+            .await
+            .unwrap()
+    );
+    // A check whose enqueue reported an error releases its claim, but the
+    // queued job already began: the claim stays.
+    store.release_escalation(KEY, GEN, due).await.unwrap();
+    assert_eq!(
+        store.get(KEY).await.unwrap().unwrap().escalated_at,
+        Some(due)
+    );
+}
