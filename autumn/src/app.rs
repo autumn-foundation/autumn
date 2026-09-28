@@ -420,7 +420,7 @@ pub struct AppBuilder {
     /// Non-None while a plugin's `build()` is executing; routes and scoped
     /// groups added during that window are attributed to this plugin.
     current_plugin: Option<String>,
-    tasks: Vec<crate::task::TaskInfo>,
+    pub(crate) tasks: Vec<crate::task::TaskInfo>,
     one_off_tasks: Vec<crate::task::OneOffTaskInfo>,
     pub(crate) jobs: Vec<crate::job::JobInfo>,
     /// Registered event listeners; durable ones are synthesized into jobs at
@@ -8679,7 +8679,7 @@ fn start_task_scheduler(
 
 #[allow(clippy::cast_possible_truncation)]
 #[allow(clippy::cognitive_complexity)]
-fn start_task_scheduler_with_config(
+pub(crate) fn start_task_scheduler_with_config(
     tasks: Vec<crate::task::TaskInfo>,
     state: &AppState,
     shutdown: &tokio_util::sync::CancellationToken,

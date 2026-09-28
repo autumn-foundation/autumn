@@ -496,7 +496,9 @@ enforces `max_depth` (default 5) and same-record `reply_to`, and moves
 `comment_count` with the #1325 counter-cache primitive in the same transaction.
 `comment_thread` is one query at any depth; `delete_comment` cascades to the
 descendant subtree and is idempotent, and takes `parent_id` so a comment id
-alone is never authority over a comment on another record.
+alone is never authority over a comment on another record. With
+`soft_delete = false` it refuses (`422`) a subtree that has a reply on another
+record, because the `parent_id` cascade would delete that reply too.
 `recompute_comment_count` is the drift repair (`counter_cache_recompute` would
 be WRONG here — it keys on the fk column alone, which is shared across models).
 Like `react()`, all four take their own pooled connection — never hold a `Db`

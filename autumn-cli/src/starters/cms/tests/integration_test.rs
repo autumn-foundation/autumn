@@ -14735,6 +14735,50 @@ async fn a_menu_assigned_to_the_footer_is_rendered() {
     );
 }
 
+/// `Menu::name` declares `#[validate(length(min = 1, max = 200))]`, but
+/// `replace_menu_at_location` writes the row through a raw
+/// `diesel::insert_into` that never runs the model's generated
+/// `validator::Validate` — so `create_menu` was the only place left to
+/// enforce it, and it did not. A blank (including whitespace-only, which the
+/// browser's `required` attribute does not reject) or overlong name is now
+/// refused at 422, with the "New menu" card's location choice preserved,
+/// instead of being silently persisted — an empty name previously fell back
+/// to a hashed slug and inserted a menu with a blank display name.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_invalid_menu_name_is_refused_and_redisplayed() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    for name in ["   ", &"x".repeat(201)] {
+        let resp = client
+            .post("/admin/appearance/menus")
+            .header("cookie", &cookie)
+            .form(&form(&[("name", name), ("location", "primary")]))
+            .send()
+            .await;
+        resp.assert_status(422);
+        assert!(
+            resp.header("location").is_none(),
+            "a rejected submission must not redirect"
+        );
+        resp.assert_body_contains("must be between 1 and 200 characters")
+            .assert_body_contains(r#"value="primary" selected"#);
+    }
+
+    let count: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::menus::table
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("the count")
+    };
+    assert_eq!(count, 0, "neither invalid name may be persisted");
+}
+
 /// Only one menu can hold a theme location, under concurrency.
 ///
 /// The replacement cleared the incumbent and inserted, with nothing
