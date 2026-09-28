@@ -56,6 +56,7 @@ mod mailer;
 mod mailer_preview;
 mod main_macro;
 mod oauth2_callback;
+mod obligation;
 mod one_off_task;
 mod one_off_tasks_macro;
 mod openapi_schema;
@@ -1735,6 +1736,49 @@ pub fn lifecycle(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
     let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
     autumn_macros_support::crate_path::finalize(lifecycle::lifecycle_macro(attr, item.into()))
+        .into()
+}
+
+/// Declare a business-time obligation on a struct (issue #1826).
+///
+/// It adds `<name>_obligation(&self) -> autumn_web::sla::Obligation`.
+///
+/// # Arguments
+///
+/// - `name = ident` (required): the obligation name.
+/// - `within = "..."` (required): the budget, such as `"2 business days"`.
+///   A bad budget is a compile error.
+/// - `starts = field` (required): a `DateTime<Utc>` field. The clock starts
+///   there.
+/// - `calendar = "..."`: the calendar name. The default is `"default"`.
+/// - `met = field`: an `Option<DateTime<Utc>>` field. Your code sets it when
+///   the subject meets the obligation.
+/// - `zone = field`: a time zone field (`Tz`, an IANA name, or an `Option`).
+/// - `subject = field`: the identity field. The default is `id`. The subject
+///   is the `snake_case` type name, a colon, and the field value.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_web::obligation;
+///
+/// #[obligation(name = first_response, within = "2 business days", calendar = "support",
+///              starts = opened_at, met = responded_at)]
+/// pub struct Ticket {
+///     pub id: i64,
+///     pub opened_at: chrono::DateTime<chrono::Utc>,
+///     pub responded_at: Option<chrono::DateTime<chrono::Utc>>,
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn obligation(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(obligation::obligation_macro(attr, item.into()))
         .into()
 }
 

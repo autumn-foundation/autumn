@@ -648,6 +648,9 @@ pub mod slug;
 pub use slug::{contains_letter_or_number, slugify};
 #[cfg(feature = "redis")]
 pub(crate) mod session_redis;
+// Calendar-aware SLA obligations (issue #1826). A plain comment, not `///`:
+// the module header has intra-doc links that must resolve in the module.
+pub mod sla;
 pub mod sse;
 /// Static site generation support.
 pub mod static_gen;
@@ -1785,6 +1788,33 @@ pub use autumn_macros::edge_routes;
 /// pub enum ArticleState { Draft, Published, Archived }
 /// ```
 pub use autumn_macros::lifecycle;
+
+/// Declare a business-time obligation on a struct (issue #1826).
+///
+/// It adds a `<name>_obligation(&self)` method that returns an
+/// [`sla::Obligation`]. See the [`sla`] module.
+///
+/// ```rust,ignore
+/// use autumn_web::obligation;
+///
+/// #[obligation(
+///     name = first_response,
+///     within = "2 business days",
+///     calendar = "support",
+///     starts = opened_at,
+///     met = responded_at,
+///     zone = customer_zone,
+/// )]
+/// pub struct Ticket {
+///     pub id: i64,
+///     pub opened_at: chrono::DateTime<chrono::Utc>,
+///     pub responded_at: Option<chrono::DateTime<chrono::Utc>>,
+///     pub customer_zone: String,
+/// }
+///
+/// let obligation = ticket.first_response_obligation();
+/// ```
+pub use autumn_macros::obligation;
 
 /// Marker trait implemented by every `#[lifecycle]` enum, exposing that
 /// lifecycle's transition edges as a string-keyed table.

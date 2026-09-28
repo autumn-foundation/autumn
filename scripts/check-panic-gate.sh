@@ -133,6 +133,9 @@ REQUEST_PATH_MODULES=(
   # handler, and a panic there is a half-written charge.
   autumn/src/money/mod.rs:default
   autumn/src/money/ledger.rs:db
+  # Calendar-aware SLA obligations (#1826). The Sla extractor calculates
+  # deadlines on the request path.
+  autumn/src/sla/mod.rs:default
   autumn/src/cluster/mod.rs:default
   autumn/src/cluster/counter.rs:default
   autumn/src/cluster/membership.rs:default
@@ -180,7 +183,7 @@ REQUEST_PATH_MODULES=(
 # cannot quietly shrink the gate's surface. It tracks the manifest's length, so
 # it moves with every addition too — otherwise a one-entry revert would shrink
 # the manifest back under the floor while the gate still passed.
-MODULE_COUNT_FLOOR=80
+MODULE_COUNT_FLOOR=84
 
 # Gated modules whose feature is KNOWINGLY not enabled by any enforcing CI clippy
 # lane, as `<path>:<feature>`. Their headers are real but unenforced: the deny
