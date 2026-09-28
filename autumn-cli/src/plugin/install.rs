@@ -664,6 +664,17 @@ enum FrameworkSource {
         url: String,
         reference: Option<(String, String)>,
     },
+    /// An alternate registry, by name (`registry`) or index (`registry-index`).
+    Registry(String),
+}
+
+/// The alternate-registry source of a dependency entry, if it names one.
+fn registry_source(entry: &toml::Value) -> Option<FrameworkSource> {
+    entry
+        .get("registry")
+        .or_else(|| entry.get("registry-index"))
+        .and_then(toml::Value::as_str)
+        .map(|registry| FrameworkSource::Registry(registry.trim_end_matches('/').to_owned()))
 }
 
 /// The git source of a dependency entry: the URL without a trailing `/` or
@@ -716,6 +727,8 @@ fn framework_patch_sources(root: &Path) -> Vec<FrameworkSource> {
                     dirs.push(FrameworkSource::Path(normalized(&base.join(path))));
                 } else if let Some(git) = git_source(entry) {
                     dirs.push(git);
+                } else if let Some(registry) = registry_source(entry) {
+                    dirs.push(registry);
                 }
             }
         }
@@ -992,7 +1005,11 @@ pub fn unpatched_local_framework(root: &Path) -> bool {
     // included, that takes the framework from a checkout.
     let locals: Vec<(toml::Value, bool)> = package_autumn_web_entries(root)
         .into_iter()
-        .filter(|(entry, _)| entry.get("path").is_some() || entry.get("git").is_some())
+        .filter(|(entry, _)| {
+            ["path", "git", "registry", "registry-index"]
+                .iter()
+                .any(|key| entry.get(*key).is_some())
+        })
         .collect();
     if locals.is_empty() {
         return false;
@@ -1018,7 +1035,14 @@ pub fn unpatched_local_framework(root: &Path) -> bool {
         .iter()
         .filter_map(|(entry, _)| git_source(entry))
         .any(|source| !patches.contains(&source));
-    path_unpatched || git_unpatched
+    // An alternate registry's `autumn-web` is another package than
+    // crates.io's, at any version.
+    let registry_unpatched = locals
+        .iter()
+        .filter(|(entry, _)| entry.get("path").is_none() && entry.get("git").is_none())
+        .filter_map(|(entry, _)| registry_source(entry))
+        .any(|source| !patches.contains(&source));
+    path_unpatched || git_unpatched || registry_unpatched
 }
 
 /// Whether `main_rs` already mounts `entry` **in code**.
@@ -1197,16 +1221,27 @@ pub fn plan_add(
     app_autumn_web(root)?;
     // Target-specific declarations of different versions: the one Cargo
     // builds depends on the target, so only a single lock edge settles it.
+    // What Cargo resolved wins, when the declaration still admits it: `">=0.7,
+    // <0.9"` locked at 0.8 is 0.8.
     let declared = declared_autumn_web_versions(root);
-    let app = match declared.as_slice() {
-        [] => None,
-        [one] => Some(one.clone()),
-        several => Some(locked_version_for(root, None, "autumn-web").ok_or_else(|| {
-            PluginError::AmbiguousAutumnWeb {
+    let locked = locked_version_for(root, None, "autumn-web");
+    let admits = |req: &str, locked: &str| {
+        semver::VersionReq::parse(req)
+            .ok()
+            .zip(semver::Version::parse(locked).ok())
+            .is_none_or(|(req, version)| req.matches(&version))
+    };
+    let app = match (declared.as_slice(), locked) {
+        ([], locked) => locked,
+        ([one], Some(locked)) if admits(one, &locked) => Some(locked),
+        ([one], _) => Some(one.clone()),
+        (_, Some(locked)) => Some(locked),
+        (several, None) => {
+            return Err(PluginError::AmbiguousAutumnWeb {
                 crate_name: entry.crate_name.to_owned(),
                 declared: several.join(", "),
-            }
-        })?),
+            });
+        }
     };
     if let Some(app_version) = app
         && check_compat(&app_version, version) == Compat::Incompatible
@@ -2285,6 +2320,40 @@ maud = { version = "0.27", features = ["axum"] }
             env_source_redirect(vars(&[("CARGO_HOME", "/x"), ("CARGO_TARGET_DIR", "/t")])),
             None
         );
+    }
+
+    /// An alternate registry's framework is another package than crates.io's.
+    #[test]
+    fn an_alternate_registry_framework_is_not_crates_io() {
+        for key in [
+            "registry = \"private\"",
+            "registry-index = \"sparse+https://r.example/\"",
+        ] {
+            let cargo = format!(
+                "[package]\nname = \"demo\"\n\n[dependencies]\n\
+                 autumn-web = {{ version = \"0.7\", {key} }}\n"
+            );
+            let tmp = fake_project(SCAFFOLD_MAIN, &cargo);
+            assert!(unpatched_local_framework(tmp.path()), "{key}");
+        }
+    }
+
+    /// The locked framework version decides a first-party install when the
+    /// declaration still admits it: a broad range locked at 0.8 is 0.8.
+    #[test]
+    fn a_first_party_install_reads_the_locked_framework() {
+        let cargo = "[package]\nname = \"demo\"\n\n\
+                     [dependencies]\nautumn-web = \">=0.7, <0.9\"\n";
+        let tmp = fake_project(SCAFFOLD_MAIN, cargo);
+        std::fs::write(
+            tmp.path().join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"demo\"\nversion = \"0.1.0\"\n\
+             dependencies = [\"autumn-web\"]\n\n\
+             [[package]]\nname = \"autumn-web\"\nversion = \"0.8.0\"\n",
+        )
+        .unwrap();
+        let err = plan_add(tmp.path(), admin(), "0.7.0").unwrap_err();
+        assert!(matches!(err, PluginError::Incompatible { .. }), "{err}");
     }
 
     /// `paths` overrides in a config can replace any crate.
