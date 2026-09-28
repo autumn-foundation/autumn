@@ -14,8 +14,13 @@
   (`live_path`, `ready_path`, `startup_path`, `path`) and that
   `[health] enabled = false` suppresses all four. The standing warning not to
   point all three at `/health` now gives its reason: `/health` is a readiness
-  answer, so it returns `503` when a dependency is down, and a *liveness*
-  probe reading that `503` has the orchestrator kill a process that was only
-  waiting for its database — turning a recoverable outage into a restart loop.
+  answer, so it returns `503` for conditions a restart does not fix — a
+  saturated connection pool, a replica that cannot safely serve reads, a
+  readiness indicator reporting down, a drain in progress — and a *liveness*
+  probe reading one of those has the orchestrator kill a process that was
+  working. The section also records what readiness does **not** check: the
+  built-in `db` indicator reports pool availability, not primary connectivity,
+  so an unreachable primary can leave `/ready` at `200` while idle connections
+  remain.
   Six reader spellings that returned nothing now land on the section, gated by
   `scripts/check-docs-retrieval.sh` and `scripts/check-docs-aliases.sh`.
