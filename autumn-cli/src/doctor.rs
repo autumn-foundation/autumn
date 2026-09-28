@@ -4425,15 +4425,43 @@ fn check_tailwind_binary() -> CheckResult {
     // where `dev` expects it. Tolerant, not `resolve_target_directory`'s
     // hard-exit form: one unreadable check must not abort every other check
     // `doctor` still has to report.
-    let target_dir = crate::dev::try_resolve_target_directory()
-        .unwrap_or_else(|| fallback_target_dir(std::env::var_os("CARGO_TARGET_DIR")));
-    let path = target_dir.join("autumn").join(if cfg!(windows) {
-        "tailwindcss.exe"
-    } else {
-        "tailwindcss"
-    });
+    let binary = |target_dir: std::path::PathBuf| {
+        target_dir.join("autumn").join(if cfg!(windows) {
+            "tailwindcss.exe"
+        } else {
+            "tailwindcss"
+        })
+    };
+    crate::dev::try_resolve_target_directory().map_or_else(
+        || {
+            let guess = fallback_target_dir(std::env::var_os("CARGO_TARGET_DIR"));
+            check_tailwind_binary_at_guess(&binary(guess))
+        },
+        |target_dir| check_tailwind_binary_at(&binary(target_dir)),
+    )
+}
 
-    check_tailwind_binary_at(&path)
+/// The Tailwind check when `cargo metadata` could not name the target
+/// directory, for example because the pinned toolchain is not installed.
+///
+/// `path` is then only a guess: Cargo also reads `CARGO_BUILD_TARGET_DIR` and
+/// `[build] target-dir` from every `.cargo/config.toml` up the tree. A binary
+/// found there is checked as usual. A binary not found there may still be
+/// where `autumn setup` put it, so the check is not evaluated rather than
+/// failed.
+fn check_tailwind_binary_at_guess(path: &std::path::Path) -> CheckResult {
+    if path.symlink_metadata().is_ok() {
+        return check_tailwind_binary_at(path);
+    }
+    CheckResult {
+        name: "tailwind_binary",
+        status: CheckStatus::Pass,
+        detail: Some(format!(
+            "not evaluated — `cargo metadata` could not name the target directory, and {} is only a guess",
+            path.display()
+        )),
+        hint: Some("Fix the `rust_toolchain` check, then run `autumn doctor` again"),
+    }
 }
 
 fn check_stale_artifacts() -> CheckResult {
@@ -20108,6 +20136,33 @@ foo = "bar"
             r.detail.as_deref().unwrap_or("").contains("directory"),
             "detail should identify directory path, got {r:?}"
         );
+    }
+
+    #[test]
+    fn a_guessed_target_dir_never_reports_tailwind_missing() {
+        // `cargo metadata` gave no answer, so the target dir is a guess: Cargo
+        // may have put the binary under a `[build] target-dir` doctor did not
+        // read. Not found there is "not evaluated", never a false "missing".
+        let temp = tempfile::tempdir().expect("temp dir");
+        let r = check_tailwind_binary_at_guess(&temp_tailwind_path(&temp));
+        assert_eq!(r.status, CheckStatus::Pass);
+        let detail = r.detail.expect("a detail");
+        assert!(detail.contains("not evaluated"), "{detail}");
+        assert!(!detail.contains("not found"), "{detail}");
+    }
+
+    #[test]
+    fn a_binary_at_the_guessed_target_dir_is_checked_as_usual() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let tailwind_path = temp_tailwind_path(&temp);
+        std::fs::create_dir_all(&tailwind_path).expect("a directory where the binary goes");
+        let r = check_tailwind_binary_at_guess(&tailwind_path);
+        assert_eq!(
+            r.status,
+            CheckStatus::Fail,
+            "a real problem there is still reported"
+        );
+        assert!(r.detail.unwrap_or_default().contains("directory"));
     }
 
     #[test]
