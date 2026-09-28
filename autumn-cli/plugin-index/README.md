@@ -18,7 +18,9 @@ A listing tells a user four things before they install a plugin:
 You need a published `autumn-plugin-<name>` crate. Then do these steps.
 
 1. Declare the supported range. Implement `Plugin::contract` and return
-   `PluginContract::new(env!("CARGO_PKG_NAME")).autumn_web("<range>")`.
+   `PluginContract::new(env!("CARGO_PKG_NAME")).plugin_version(env!("CARGO_PKG_VERSION")).autumn_web("<range>")`.
+   `record` refuses a passing report whose contract names no
+   `plugin_version`, since then it cannot show which release was built.
    Declare each experimental surface with `uses_experimental`. See
    [The plugin API contract](../../docs/plugins.md#the-plugin-api-contract).
 2. Make a small host app that mounts the plugin.

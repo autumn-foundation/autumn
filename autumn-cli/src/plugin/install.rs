@@ -763,12 +763,23 @@ fn registry_source(entry: &toml::Value) -> Option<FrameworkSource> {
         })
 }
 
-/// Whether a registry `patch` unifies the app's registry `local` entry:
-/// the same registry, and a patch version requirement that admits the
-/// lowest version the app's requirement does. Cargo skips a patch whose
-/// version does not fit, so an unreadable version on either side does not
-/// count.
-fn registry_patch_unifies(local: &FrameworkSource, patch: &FrameworkSource) -> bool {
+/// Whether a registry `patch` unifies the app's registry `local` entry: the
+/// same registry, and a patch that supplies the version the app resolves.
+/// Cargo skips a patch whose version does not fit, and takes the newest
+/// version a requirement admits, so:
+///
+/// - with a locked version (`locked`) the app's requirement admits, the patch
+///   must admit that version;
+/// - without one, the patch must admit exactly the versions the app's
+///   requirement does, so both resolve to the same release. A requirement
+///   [`requirement_bounds`] cannot bound (a range, a wildcard) does not count.
+///
+/// An unreadable version on either side does not count.
+fn registry_patch_unifies(
+    local: &FrameworkSource,
+    patch: &FrameworkSource,
+    locked: Option<&str>,
+) -> bool {
     let (
         FrameworkSource::Registry {
             registry: local_registry,
@@ -782,11 +793,62 @@ fn registry_patch_unifies(local: &FrameworkSource, patch: &FrameworkSource) -> b
     else {
         return false;
     };
-    local_registry == patch_registry
-        && parse_version(local_version)
-            .map(|(major, minor, patch)| semver::Version::new(major, minor, patch))
-            .zip(semver::VersionReq::parse(patch_version).ok())
-            .is_some_and(|(floor, req)| req.matches(&floor))
+    if local_registry != patch_registry {
+        return false;
+    }
+    let Ok(patch_req) = semver::VersionReq::parse(patch_version) else {
+        return false;
+    };
+    let resolved = locked
+        .and_then(|locked| semver::Version::parse(locked).ok())
+        .filter(|locked| {
+            semver::VersionReq::parse(local_version).is_ok_and(|req| req.matches(locked))
+        });
+    resolved.map_or_else(
+        || {
+            requirement_bounds(local_version)
+                .is_some_and(|bounds| requirement_bounds(patch_version) == Some(bounds))
+        },
+        |resolved| patch_req.matches(&resolved),
+    )
+}
+
+/// The lowest and highest version a `^`, `~`, `=` or bare requirement admits;
+/// `None` for anything else (a range, a wildcard, a pre-release).
+fn requirement_bounds(req: &str) -> Option<(semver::Version, semver::Version)> {
+    let req = req.trim();
+    let (op, rest) = match req.chars().next()? {
+        op @ ('^' | '~' | '=') => (op, req[1..].trim()),
+        c if c.is_ascii_digit() => ('^', req),
+        _ => return None,
+    };
+    let parts = rest
+        .split('.')
+        .map(|part| part.parse::<u64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    let (major, minor, patch) = match parts.as_slice() {
+        [major] => (*major, None, None),
+        [major, minor] => (*major, Some(*minor), None),
+        [major, minor, patch] => (*major, Some(*minor), Some(*patch)),
+        _ => return None,
+    };
+    let low = semver::Version::new(major, minor.unwrap_or(0), patch.unwrap_or(0));
+    let top = |minor: Option<u64>, patch: Option<u64>| {
+        semver::Version::new(major, minor.unwrap_or(u64::MAX), patch.unwrap_or(u64::MAX))
+    };
+    let high = match op {
+        // `=`: the named version; a partial one spans what it leaves out.
+        '=' => top(minor, patch),
+        // `~`: its minor, or its major when it names only one.
+        '~' => top(minor, None),
+        // `^`: the compatibility series of the leftmost non-zero part.
+        _ => match minor {
+            Some(minor) if major == 0 && minor > 0 => top(Some(minor), None),
+            Some(0) if major == 0 => top(Some(0), patch),
+            _ => top(None, None),
+        },
+    };
+    Some((low, high))
 }
 
 /// The git source of a dependency entry: the URL without a trailing `/` or
@@ -1148,7 +1210,9 @@ pub fn unpatched_local_framework(root: &Path) -> bool {
         .filter_map(|(entry, _)| git_source(entry))
         .any(|source| !patches.contains(&source));
     // An alternate registry's `autumn-web` is another package than
-    // crates.io's, at any version.
+    // crates.io's, at any version, unless a patch supplies the one the app
+    // resolves.
+    let locked = locked_version_for(root, None, "autumn-web");
     let registry_unpatched = locals
         .iter()
         .filter(|(entry, _)| entry.get("path").is_none() && entry.get("git").is_none())
@@ -1156,7 +1220,7 @@ pub fn unpatched_local_framework(root: &Path) -> bool {
         .any(|local| {
             !patches
                 .iter()
-                .any(|patch| registry_patch_unifies(&local, patch))
+                .any(|patch| registry_patch_unifies(&local, patch, locked.as_deref()))
         });
     path_unpatched || git_unpatched || registry_unpatched
 }
@@ -2530,6 +2594,64 @@ maud = { version = "0.27", features = ["axum"] }
         assert!(unpatched_local_framework(other.path()));
         let same = fake_project(SCAFFOLD_MAIN, &cargo("0.7"));
         assert!(!unpatched_local_framework(same.path()));
+        // Unlocked, the patch must admit exactly what the app's requirement
+        // does: a wider patch may resolve to a newer release.
+        let wider = fake_project(SCAFFOLD_MAIN, &cargo(">=0.7"));
+        assert!(unpatched_local_framework(wider.path()));
+    }
+
+    /// A locked app is checked at the version it resolved, not its floor: a
+    /// range locked at 0.8 is not unified by a patch that supplies 0.7.
+    #[test]
+    fn a_registry_patch_must_supply_the_locked_version() {
+        let cargo = |patch: &str| {
+            format!(
+                "[package]\nname = \"demo\"\n\n[dependencies]\n\
+                 autumn-web = {{ version = \">=0.7, <0.9\", registry = \"private\" }}\n\n\
+                 [patch.crates-io]\nautumn-web = {{ version = \"{patch}\", registry = \"private\" }}\n"
+            )
+        };
+        let locked = |tmp: &tempfile::TempDir| {
+            std::fs::write(
+                tmp.path().join("Cargo.lock"),
+                "version = 4\n\n[[package]]\nname = \"demo\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\"autumn-web\"]\n\n\
+                 [[package]]\nname = \"autumn-web\"\nversion = \"0.8.2\"\n",
+            )
+            .unwrap();
+        };
+        let floor = fake_project(SCAFFOLD_MAIN, &cargo("0.7"));
+        locked(&floor);
+        assert!(unpatched_local_framework(floor.path()));
+        let resolved = fake_project(SCAFFOLD_MAIN, &cargo("0.8"));
+        locked(&resolved);
+        assert!(!unpatched_local_framework(resolved.path()));
+        // Unlocked, a range cannot be matched to one patch.
+        let unlocked = fake_project(SCAFFOLD_MAIN, &cargo("0.8"));
+        assert!(unpatched_local_framework(unlocked.path()));
+    }
+
+    #[test]
+    fn requirement_bounds_follow_cargo() {
+        let v = |major, minor, patch| semver::Version::new(major, minor, patch);
+        let max = u64::MAX;
+        for (req, low, high) in [
+            ("0.7", v(0, 7, 0), v(0, 7, max)),
+            ("^0.7.3", v(0, 7, 3), v(0, 7, max)),
+            ("~0.7", v(0, 7, 0), v(0, 7, max)),
+            ("=0.7.3", v(0, 7, 3), v(0, 7, 3)),
+            ("=0.7", v(0, 7, 0), v(0, 7, max)),
+            ("1.2", v(1, 2, 0), v(1, max, max)),
+            ("~1", v(1, 0, 0), v(1, max, max)),
+            ("0", v(0, 0, 0), v(0, max, max)),
+            ("0.0", v(0, 0, 0), v(0, 0, max)),
+            ("0.0.3", v(0, 0, 3), v(0, 0, 3)),
+        ] {
+            assert_eq!(requirement_bounds(req), Some((low, high)), "{req}");
+        }
+        for req in [">=0.7", ">=0.7, <0.9", "*", "0.7.*", "1.0.0-rc.1"] {
+            assert_eq!(requirement_bounds(req), None, "{req}");
+        }
     }
 
     /// An unlocked range that excludes this release refuses the install.

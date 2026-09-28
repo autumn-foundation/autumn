@@ -53,18 +53,30 @@ pub fn apply_report(
     // the listing keeps what was last verified.
     if let Some(contract) = report.contract.as_ref().filter(|_| report.passed()) {
         // The pin is the version that was built and checked. A contract that
-        // reports another one is refused, never used to move the pin.
-        if let Some(version) = &contract.plugin_version
-            && listing.origin == ListingOrigin::Community
-            && version != &listing.version
-        {
-            return Err(format!(
-                "the report for `{}` says version {}, but the index verified {}. Change \
-                 `version` in the listing and re-run the check",
-                listing.name,
-                index::sanitize(version),
-                listing.version
-            ));
+        // reports another one is refused, never used to move the pin, and
+        // one that reports none cannot show which release was built.
+        if listing.origin == ListingOrigin::Community {
+            match &contract.plugin_version {
+                None => {
+                    return Err(format!(
+                        "the report for `{}` passes, but its contract names no \
+                         `plugin_version`, so it cannot show that {} was built. Declare \
+                         `.plugin_version(env!(\"CARGO_PKG_VERSION\"))` in `Plugin::contract` \
+                         and re-run the check",
+                        listing.name, listing.version
+                    ));
+                }
+                Some(version) if version != &listing.version => {
+                    return Err(format!(
+                        "the report for `{}` says version {}, but the index verified {}. \
+                         Change `version` in the listing and re-run the check",
+                        listing.name,
+                        index::sanitize(version),
+                        listing.version
+                    ));
+                }
+                Some(_) => {}
+            }
         }
         if let Some(range) = &contract.autumn_web {
             listing.autumn_web.clone_from(range);
@@ -1192,6 +1204,27 @@ mod tests {
         let err = apply_report(&mut l, &r, "0.7.0", "2026-10-01").unwrap_err();
         assert!(err.contains("0.4.0") && err.contains("0.3.0"), "{err}");
         assert_eq!(l, before);
+    }
+
+    /// A passing community report must name the version it built: without
+    /// one, a check of 0.2 could verify a listing pinned at 0.3.
+    #[test]
+    fn a_community_contract_must_name_its_version() {
+        let mut l = listing("autumn-admin-plugin");
+        l.origin = ListingOrigin::Community;
+        l.name = "autumn-plugin-x".to_owned();
+        l.version = "0.3.0".to_owned();
+        let before = l.clone();
+        let mut contract = lockstep("autumn-plugin-x", "0.7.0");
+        contract.plugin_version = None;
+        let r = report("autumn-plugin-x", true, Some(contract.clone()));
+        let err = apply_report(&mut l, &r, "0.7.0", "2026-10-01").unwrap_err();
+        assert!(err.contains("plugin_version"), "{err}");
+        assert_eq!(l, before);
+        // The pinned version passes.
+        contract.plugin_version = Some("0.3.0".to_owned());
+        let r = report("autumn-plugin-x", true, Some(contract));
+        apply_report(&mut l, &r, "0.7.0", "2026-10-01").expect("the pin was built");
     }
 
     /// A sandboxed listing is verified by `inspect`, never by plugin-check.
