@@ -27,8 +27,8 @@ pub const ESCALATE_JOB: &str = "autumn_sla_escalate";
 /// clock), it waits in steps of this length.
 const EARLY_CHECK_STEP: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// The longest total wait of an early check. After it, the check trusts the
-/// queue and reads the status at the deadline.
+/// The longest wait of an early check in one attempt. After it, the attempt
+/// fails and the job queue runs the check again.
 const MAX_EARLY_WAIT: std::time::Duration = std::time::Duration::from_secs(3_600);
 
 /// Attempts for each SLA job before it goes to the dead letters.
@@ -476,12 +476,16 @@ impl Sla {
     }
 
     /// Wait until the injected clock reaches `due_hint`, and return the
-    /// instant to read the status at.
+    /// injected time.
     ///
     /// A check job can run early when the queue clock leads the app clock.
-    /// It waits in steps and does not fail, so the retry budget stays. After
-    /// [`MAX_EARLY_WAIT`] it trusts the queue and uses `due_hint`.
-    async fn wait_for(&self, key: &str, due_hint: DateTime<Utc>) -> DateTime<Utc> {
+    /// It waits in steps. After [`MAX_EARLY_WAIT`] it fails, and the job
+    /// queue runs it again. It never uses `due_hint` as the time.
+    async fn wait_for(
+        &self,
+        key: &str,
+        due_hint: DateTime<Utc>,
+    ) -> Result<DateTime<Utc>, SlaError> {
         let mut waited = std::time::Duration::ZERO;
         loop {
             let now = self.now();
@@ -491,7 +495,7 @@ impl Sla {
                 .ok()
                 .filter(|early| !early.is_zero())
             else {
-                return now;
+                return Ok(now);
             };
             if waited >= MAX_EARLY_WAIT {
                 tracing::warn!(
@@ -499,7 +503,9 @@ impl Sla {
                     ?early,
                     "SLA check ran far before its deadline; the job queue clock leads the app clock"
                 );
-                return due_hint;
+                return Err(SlaError::Job(format!(
+                    "SLA check of {key} ran {early:?} before its deadline"
+                )));
             }
             let step = early.min(EARLY_CHECK_STEP);
             tokio::time::sleep(step).await;
@@ -515,7 +521,7 @@ impl Sla {
         due_hint: DateTime<Utc>,
     ) -> Result<(), SlaError> {
         // Wait first, then read the record, so the read is fresh.
-        let now = self.wait_for(key, due_hint).await;
+        let now = self.wait_for(key, due_hint).await?;
         let store = &self.engine.store;
         let Some(record) = store.get(key).await? else {
             tracing::warn!(

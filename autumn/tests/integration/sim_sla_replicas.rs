@@ -394,3 +394,65 @@ async fn sim_sla_a_check_that_runs_hours_early_waits_and_escalates() {
 
     job::clear_global_job_client();
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sim_sla_an_early_check_never_uses_the_deadline_as_now() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
+    let clock = TickingClock::starting_at(start);
+    let store = RacingStore::new();
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    let app = replica(&clock, &store, &fired);
+
+    let ob = Obligation::new("first_response", "ticket:1")
+        .within(BusinessDuration::hours(2))
+        .calendar("support")
+        .starting_at(start)
+        .zone(chrono_tz::Tz::UTC);
+    let generation = Uuid::from_u128(8);
+    store
+        .inner
+        .insert(ObligationRecord::new(ob.clone(), generation))
+        .await
+        .unwrap();
+    let check = serde_json::json!({ "key": ob.key(), "generation": generation, "due_at": due });
+    let client = app.state().extension::<job::JobClient>().unwrap();
+    client
+        .enqueue(autumn_web::sla::CHECK_JOB, check)
+        .await
+        .unwrap();
+
+    // The queue waits more than the early-wait limit; the app clock stays
+    // before the deadline. The check must not escalate.
+    for _ in 0..16 {
+        tokio::time::advance(Duration::from_secs(600)).await;
+        settle().await;
+    }
+    assert!(
+        fired.lock().unwrap().is_empty(),
+        "not before the app deadline"
+    );
+    assert!(
+        store
+            .inner
+            .get(&ob.key())
+            .await
+            .unwrap()
+            .unwrap()
+            .escalated_at
+            .is_none()
+    );
+
+    // The app clock reaches the deadline; the check escalates.
+    clock.advance(Duration::from_secs(3 * 3600));
+    for _ in 0..8 {
+        tokio::time::advance(Duration::from_secs(600)).await;
+        settle().await;
+    }
+    assert_eq!(*fired.lock().unwrap(), ["first_response/ticket:1"]);
+
+    job::clear_global_job_client();
+}
