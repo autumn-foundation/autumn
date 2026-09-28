@@ -39,13 +39,26 @@ registered comparison.
 - **Second, independent criterion, pre-registered alongside the first:**
   does the condition change whether the existing gate's own budget
   (`p95 <= 130000ms`) passes or fails on this box.
-- **Conditions:** this sandbox, single box, `rustc`/`cargo` 1.94.1
-  (`rustc 1.94.1 (e408947bf 2026-03-25)` — added here per Codex review on
-  PR #2993, which noted an earlier draft never stated the assay's compiler
-  version despite measuring a predominantly-compile-time quantity),
-  `autumn dev-loop-bench --cold-start --runs 1` per sample (no
-  `--include-db`), warm `CARGO_HOME` registry cache from earlier work this
-  session.
+- **Conditions:** this sandbox, single box. **Correction (caught by Codex
+  review on PR #2993, second round on this same point): the compiler that
+  actually built and timed every scaffolded-project sample was NOT the
+  1.94.1 an earlier draft claimed.** `autumn new` writes its own
+  `rust-toolchain.toml` into the scaffolded project (channel pinned to the
+  workspace's `rust-version`, `1.88.0`, via `CARGO_PKG_RUST_VERSION` —
+  `autumn-cli/src/new.rs:227`), and `cold_start_driver` builds that project
+  from its own directory. Per rustup's override precedence, a directory
+  override set on an *ancestor* directory (what this report's Reproduce
+  section's `rustup override set` does) does not reach a sibling tempdir
+  outside that ancestry, so it never applied to the scaffolded project at
+  all — the nearer `rust-toolchain.toml` rustup finds walking up from the
+  scaffold's own directory wins, and this sandbox happens to have `1.88.0`
+  already installed (`rustup toolchain list`). So **every timing in this
+  report was actually measured under `rustc 1.88.0`**, not 1.94.1 — 1.94.1
+  only ever applied to building the `autumn` CLI binary itself (a one-time,
+  excluded-from-timing cost per condition-block), never to the timed
+  `cargo build` inside the scaffold. `autumn dev-loop-bench --cold-start
+  --runs 1` per sample (no `--include-db`), warm `CARGO_HOME` registry
+  cache from earlier work this session.
 - **Time box:** this session, target ≲30 min of additional building (a
   condition switch costs a `cargo build -p autumn-cli` rebuild since
   templates are embedded via `include_str!` at CLI-compile time, plus
@@ -287,14 +300,25 @@ set -e
 git worktree add --detach /tmp/prospect-coldstart-repro c304e8f89c7a3c7f1fb58c23bf4175904633eb5d
 cd /tmp/prospect-coldstart-repro
 
-# Pin the exact toolchain this assay measured with (caught by Codex review
-# on PR #2993: an earlier draft left the active toolchain unpinned — this
-# repo ships no rust-toolchain.toml, only an MSRV, so a bare `cargo` here
-# resolves whatever "stable" means on the calling machine, not necessarily
-# the toolchain every number in this report was measured on):
-rustup toolchain install 1.94.1
-rustup override set 1.94.1
-[ "$(rustc --version)" = "rustc 1.94.1 (e408947bf 2026-03-25)" ] || { echo "toolchain pin failed: got $(rustc --version)" >&2; exit 1; }
+# CORRECTION (caught by Codex review on PR #2993, third round on toolchain
+# pinning): an earlier draft pinned 1.94.1 here via `rustup override set`,
+# but that override applies only to this worktree directory and its
+# descendants — the scaffolded project cold_start_driver builds lives in
+# an UNRELATED tempdir outside this worktree, so the override never
+# reached it. What actually selects the compiler for the timed build is
+# the `rust-toolchain.toml` `autumn new` writes INTO the scaffold itself
+# (channel pinned to the workspace's rust-version, 1.88.0). rustup resolves
+# that automatically by walking up from the scaffold's own directory — no
+# manual override is needed or effective here. All this recipe needs to do
+# is ensure 1.88.0 is installed so that resolution succeeds instead of
+# triggering rustup's (possibly network-blocked) auto-install:
+rustup toolchain install 1.88.0
+rustup toolchain list | grep -q '^1\.88\.0' || { echo "1.88.0 toolchain not installed" >&2; exit 1; }
+# (Building the `autumn` CLI binary itself, below, uses whatever toolchain
+# is otherwise active/default in this shell — that only affects the
+# excluded-from-timing CLI-rebuild cost per condition-block, never the
+# timed scaffold build, so it does not need pinning for this reproduction
+# to match the reported numbers.)
 # DISCLOSED LIMITATION (caught by Codex review on PR #2993): pinning this
 # commit pins the Autumn source (templates, harness, `autumn-web` itself),
 # but NOT the scaffolded throwaway project's own dependency graph.
