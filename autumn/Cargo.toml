@@ -23,6 +23,9 @@ presence = ["ws"]
 # The hub half additionally needs `presence`; the CRDT, the marker and the
 # offline-sync resolver compile without it.
 collab = []
+# Calendar-aware SLA obligations (issue #1826). Adds `autumn_web::sla` and
+# `#[obligation]`. Zero new dependencies.
+sla = []
 flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]

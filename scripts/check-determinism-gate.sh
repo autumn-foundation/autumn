@@ -136,7 +136,7 @@ GATED_MODULES=(
   # Calendar-aware SLA obligations (#1826). Every deadline, status and
   # escalation reads the injected clock, so a sim replays a quarter of
   # business time the same way each run.
-  autumn/src/sla/mod.rs:default
+  autumn/src/sla/mod.rs:sla
   # Direct HTTPS termination (#1603). `tls.rs::now_unix` is the module's one
   # deliberate real-wall-time read — certificate validity is a fact about the
   # real world, not about the injected clock — and the gate is what keeps a
