@@ -170,6 +170,11 @@ changes a file. Then:
 - A community listing is refused when the app's `autumn-web` requirement may
   resolve outside the listing's range: `"=0.7"` with no `Cargo.lock` may be
   0.7.1, which a `=0.7.0` listing was never checked on.
+- A first-party plugin is refused when, with no `Cargo.lock`, the app's
+  `autumn-web` requirement admits another release series too:
+  `">=0.6, <0.9"` may build the app on 0.8 next to a 0.7 plugin. With
+  `autumn new --starter`, the listing is also checked against the starter's
+  own `autumn-web` pin, a prerelease pin included.
 - A sandboxed listing is not wired. The command prints the review steps
   (`autumn plugin inspect`, `SandboxedPlugin::from_file`), changes no file,
   and exits 2.

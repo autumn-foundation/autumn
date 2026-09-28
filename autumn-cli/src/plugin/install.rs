@@ -84,6 +84,18 @@ pub enum PluginError {
         declared: String,
     },
 
+    /// The app's `autumn-web` requirement admits more than one release
+    /// series and no `Cargo.lock` resolves which one it builds.
+    #[error(
+        "this app's `autumn-web` requirement `{declared}` spans more than one release series and no Cargo.lock resolves which one it builds, so Cargo could build `{crate_name}` against another framework copy — no files were changed. Narrow the requirement to one series, or run `cargo generate-lockfile`, then re-run."
+    )]
+    UnresolvedAutumnWebRange {
+        /// The plugin that could not be installed.
+        crate_name: String,
+        /// The app's requirement.
+        declared: String,
+    },
+
     /// The app takes `autumn-web` from a local checkout whose version cannot
     /// be read, and no `Cargo.lock` resolves it.
     #[error(
@@ -1422,6 +1434,35 @@ fn resolved_app_version(root: &Path, crate_name: &str) -> Result<Option<String>,
     Ok(app.or_else(|| local_framework_version(root)))
 }
 
+/// Whether the requirement `app` admits a release outside `release`'s
+/// compatibility series. A requirement is one interval, so it spans series
+/// exactly when it admits the first version of the next series or the last
+/// of the previous one. A concrete (locked) version, read as `^x.y.z`, never
+/// does.
+fn spans_series(app: &str, release: &str) -> bool {
+    let Ok(req) = semver::VersionReq::parse(app) else {
+        return false;
+    };
+    let Ok(release) = semver::Version::parse(release.trim_start_matches('=')) else {
+        return false;
+    };
+    let (next, previous) = if release.major == 0 {
+        (
+            semver::Version::new(0, release.minor + 1, 0),
+            release
+                .minor
+                .checked_sub(1)
+                .map(|minor| semver::Version::new(0, minor, u64::MAX)),
+        )
+    } else {
+        (
+            semver::Version::new(release.major + 1, 0, 0),
+            Some(semver::Version::new(release.major - 1, u64::MAX, u64::MAX)),
+        )
+    };
+    req.matches(&next) || previous.is_some_and(|previous| req.matches(&previous))
+}
+
 /// Plan the install of `entry` at `version` into the project at `root`.
 ///
 /// Ordering is the contract. The project check and the version gate run before
@@ -1461,6 +1502,17 @@ pub fn plan_add(
             plugin_version: version.to_owned(),
             supported: supported_range(version),
             app_version: app_version.clone(),
+        });
+    }
+
+    // An unresolved requirement that admits this release and another series
+    // lets Cargo pick that series for the app and this one for the plugin.
+    if let Some(app_version) = &app
+        && spans_series(app_version, version)
+    {
+        return Err(PluginError::UnresolvedAutumnWebRange {
+            crate_name: entry.crate_name.to_owned(),
+            declared: app_version.clone(),
         });
     }
 
@@ -2662,12 +2714,50 @@ maud = { version = "0.27", features = ["axum"] }
         let tmp = fake_project(SCAFFOLD_MAIN, cargo);
         let err = plan_add(tmp.path(), admin(), "0.7.0").unwrap_err();
         assert!(matches!(err, PluginError::Incompatible { .. }), "{err}");
-        // A range that admits the release (across series) proceeds.
+        // Unlocked, a range that admits the release and another series is
+        // refused: Cargo may build the app on 0.8 and the plugin on 0.7.
         let wide = fake_project(
             SCAFFOLD_MAIN,
             "[package]\nname = \"demo\"\n\n[dependencies]\nautumn-web = \">=0.6, <0.9\"\n",
         );
-        assert!(plan_add(wide.path(), admin(), "0.7.0").is_ok());
+        let err = plan_add(wide.path(), admin(), "0.7.0").unwrap_err();
+        assert!(
+            matches!(err, PluginError::UnresolvedAutumnWebRange { .. }),
+            "{err}"
+        );
+        // A range inside the release's series proceeds.
+        let narrow = fake_project(
+            SCAFFOLD_MAIN,
+            "[package]\nname = \"demo\"\n\n[dependencies]\nautumn-web = \">=0.7.0, <0.8\"\n",
+        );
+        assert!(plan_add(narrow.path(), admin(), "0.7.0").is_ok());
+    }
+
+    #[test]
+    fn spans_series_reads_the_neighbouring_series() {
+        for app in [
+            ">=0.6, <0.9",
+            ">=0.7, <0.9",
+            ">=0.6.5, <0.8",
+            "0",
+            "*",
+            ">=0.7",
+        ] {
+            assert!(spans_series(app, "0.7.0"), "{app}");
+        }
+        for app in [
+            "0.7",
+            "~0.7",
+            "=0.7.0",
+            "0.7.3",
+            ">=0.7.0, <0.8",
+            "0.7.0-alpha.1",
+        ] {
+            assert!(!spans_series(app, "0.7.0"), "{app}");
+        }
+        assert!(spans_series(">=1.2, <3", "1.4.0"));
+        assert!(spans_series(">=0.9, <1.5", "1.4.0"));
+        assert!(!spans_series("1.2", "1.4.0"));
     }
 
     /// The locked framework version decides a first-party install when the

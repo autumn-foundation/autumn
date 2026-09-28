@@ -1733,14 +1733,12 @@ pub fn wire_scaffold_plugins(root: &Path, plugins: &[ScaffoldPlugin]) -> i32 {
     let mut worst = 0;
     for plugin in plugins {
         // Gate a listing again, now that the manifest exists: a `--starter`
-        // pins its own `autumn-web`, and may already declare the crate.
+        // pins its own `autumn-web`, and may already declare the crate. A
+        // first-party listing too: a prerelease pin next to this release's
+        // stable plugin would be a second framework copy.
         if let Some(listing) = &plugin.listing {
-            let refused = if matches!(plugin.resolved, Resolved::Community(_)) {
-                gate_listing_in(listing, root)
-            } else {
-                Ok(())
-            }
-            .and_then(|()| check_listed_declaration(root, &plugin.resolved, &plugin.version));
+            let refused = gate_listing_in(listing, root)
+                .and_then(|()| check_listed_declaration(root, &plugin.resolved, &plugin.version));
             if let Ok(Some(notice)) = &refused {
                 println!("{notice}");
             }
@@ -3183,6 +3181,23 @@ mod tests {
         assert_ne!(code, 0);
         let after = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
         assert_eq!(after, cargo);
+    }
+
+    /// A first-party listing is gated against the starter as well: a
+    /// prerelease pin is refused before anything is written.
+    #[test]
+    fn wiring_regates_a_first_party_listing_against_a_prerelease_starter() {
+        let cargo = format!(
+            "[package]\nname = \"s\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+             [dependencies]\nautumn-web = \"={RELEASE}-alpha.1\"\n"
+        );
+        let tmp = starter_project(&cargo);
+        let names = vec!["autumn-admin-plugin".to_owned()];
+        let plugins = preflight_scaffold_plugins(&names, &bundled(), None, no_community).unwrap();
+        let code = wire_scaffold_plugins(tmp.path(), &plugins);
+        assert_ne!(code, 0);
+        let after = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert_eq!(after, cargo, "a refused listing writes nothing");
     }
 
     #[test]
