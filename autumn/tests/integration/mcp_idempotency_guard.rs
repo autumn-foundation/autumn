@@ -19,14 +19,10 @@
 //! or double-send instead of replaying the cached response, even though the
 //! app author wrote the exact guard the docs show.
 //!
-//! Both assertions below would fail loudly on that regression:
-//! `idempotency_replay_prevents_double_execution_over_mcp_dispatch` if the
-//! layer stopped engaging at all (the handler would run twice, producing two
-//! different `charge_id`s), and
-//! `idempotency_replay_rejects_reused_key_with_different_payload_over_mcp_dispatch`
-//! if the layer's payload-fingerprint check were bypassed (a reused key with
-//! a different body would silently replay the *first* payload's response
-//! instead of surfacing `422`).
+//! Each scenario gets its own handler and its own call counter — sharing one
+//! `static` across two `#[tokio::test]`s that run concurrently in this binary
+//! would race the two tests against each other instead of isolating each
+//! handler's own execution count.
 
 #![cfg(feature = "mcp")]
 
@@ -41,23 +37,9 @@ struct ChargeRequest {
     amount: i64,
 }
 
-static CHARGE_CALLS: AtomicU32 = AtomicU32::new(0);
-
-/// Each execution returns a fresh `charge_id`, so two responses being
-/// byte-identical proves the second call was replayed from the idempotency
-/// cache rather than re-executed.
-#[post("/charge-mcp-tool")]
-#[api_doc(mcp, summary = "Charges a card; must not double-charge on retry")]
-async fn charge_mcp_tool(Json(body): Json<ChargeRequest>) -> AutumnResult<Json<serde_json::Value>> {
-    let charge_id = CHARGE_CALLS.fetch_add(1, Ordering::SeqCst);
-    Ok(Json(serde_json::json!({
-        "charge_id": charge_id,
-        "amount": body.amount,
-    })))
-}
-
 async fn call_charge_tool(
     client: &TestClient,
+    tool: &str,
     idempotency_key: &str,
     amount: i64,
 ) -> serde_json::Value {
@@ -68,7 +50,7 @@ async fn call_charge_tool(
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": {"name": "charge_mcp_tool", "arguments": {"body": {"amount": amount}}}
+            "params": {"name": tool, "arguments": {"body": {"amount": amount}}}
         }))
         .send()
         .await;
@@ -76,26 +58,41 @@ async fn call_charge_tool(
     resp.json::<serde_json::Value>()
 }
 
+static DOUBLE_EXECUTION_CHARGE_CALLS: AtomicU32 = AtomicU32::new(0);
+
+/// Each execution returns a fresh `charge_id`, so two responses being
+/// byte-identical proves the second call was replayed from the idempotency
+/// cache rather than re-executed.
+#[post("/charge-mcp-tool-a")]
+#[api_doc(mcp, summary = "Charges a card; must not double-charge on retry")]
+async fn charge_mcp_tool_a(
+    Json(body): Json<ChargeRequest>,
+) -> AutumnResult<Json<serde_json::Value>> {
+    let charge_id = DOUBLE_EXECUTION_CHARGE_CALLS.fetch_add(1, Ordering::SeqCst);
+    Ok(Json(serde_json::json!({
+        "charge_id": charge_id,
+        "amount": body.amount,
+    })))
+}
+
 /// A retried MCP `tools/call` carrying the same `Idempotency-Key` and the
 /// same payload must be served from the cache, not re-executed — proving
 /// `IdempotencyLayer` is actually consulted on the MCP dispatch path.
 #[tokio::test]
 async fn idempotency_replay_prevents_double_execution_over_mcp_dispatch() {
-    CHARGE_CALLS.store(0, Ordering::SeqCst);
-
     let client = TestApp::new()
         .idempotent()
-        .routes(routes![charge_mcp_tool])
+        .routes(routes![charge_mcp_tool_a])
         .mount_mcp("/mcp")
         .build();
 
-    let first = call_charge_tool(&client, "retry-key-1", 500).await;
+    let first = call_charge_tool(&client, "charge_mcp_tool_a", "retry-key-1", 500).await;
     assert_ne!(
         first["result"]["isError"], true,
         "first call must succeed: {first}"
     );
 
-    let second = call_charge_tool(&client, "retry-key-1", 500).await;
+    let second = call_charge_tool(&client, "charge_mcp_tool_a", "retry-key-1", 500).await;
     assert_ne!(
         second["result"]["isError"], true,
         "replayed call must still report success: {second}"
@@ -107,11 +104,28 @@ async fn idempotency_replay_prevents_double_execution_over_mcp_dispatch() {
          cached response, not execute the handler again"
     );
     assert_eq!(
-        CHARGE_CALLS.load(Ordering::SeqCst),
+        DOUBLE_EXECUTION_CHARGE_CALLS.load(Ordering::SeqCst),
         1,
         "the handler must run exactly once; the retry must be served from the idempotency \
          cache instead of double-charging"
     );
+}
+
+static MISMATCHED_PAYLOAD_CHARGE_CALLS: AtomicU32 = AtomicU32::new(0);
+
+#[post("/charge-mcp-tool-b")]
+#[api_doc(
+    mcp,
+    summary = "Charges a card; must reject a reused key with a different payload"
+)]
+async fn charge_mcp_tool_b(
+    Json(body): Json<ChargeRequest>,
+) -> AutumnResult<Json<serde_json::Value>> {
+    let charge_id = MISMATCHED_PAYLOAD_CHARGE_CALLS.fetch_add(1, Ordering::SeqCst);
+    Ok(Json(serde_json::json!({
+        "charge_id": charge_id,
+        "amount": body.amount,
+    })))
 }
 
 /// Reusing an `Idempotency-Key` with a *different* payload over MCP dispatch
@@ -119,21 +133,19 @@ async fn idempotency_replay_prevents_double_execution_over_mcp_dispatch() {
 /// stored response for a different amount.
 #[tokio::test]
 async fn idempotency_replay_rejects_reused_key_with_different_payload_over_mcp_dispatch() {
-    CHARGE_CALLS.store(0, Ordering::SeqCst);
-
     let client = TestApp::new()
         .idempotent()
-        .routes(routes![charge_mcp_tool])
+        .routes(routes![charge_mcp_tool_b])
         .mount_mcp("/mcp")
         .build();
 
-    let first = call_charge_tool(&client, "retry-key-2", 500).await;
+    let first = call_charge_tool(&client, "charge_mcp_tool_b", "retry-key-2", 500).await;
     assert_ne!(
         first["result"]["isError"], true,
         "first call must succeed: {first}"
     );
 
-    let second = call_charge_tool(&client, "retry-key-2", 999).await;
+    let second = call_charge_tool(&client, "charge_mcp_tool_b", "retry-key-2", 999).await;
     assert_eq!(
         second["result"]["isError"], true,
         "a reused Idempotency-Key with a different payload must surface as a tool error \
@@ -146,5 +158,11 @@ async fn idempotency_replay_rejects_reused_key_with_different_payload_over_mcp_d
         text.contains("different payload"),
         "the tool error must surface the handler's 422 payload-mismatch body, not swallow it: \
          {text}"
+    );
+    assert_eq!(
+        MISMATCHED_PAYLOAD_CHARGE_CALLS.load(Ordering::SeqCst),
+        1,
+        "the handler must run exactly once; a payload mismatch must be rejected by the \
+         idempotency layer, never re-executed"
     );
 }

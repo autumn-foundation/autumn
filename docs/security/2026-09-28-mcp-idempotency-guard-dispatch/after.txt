@@ -1,0 +1,11 @@
+$ cargo test -p autumn-web --test integration_tests --features mcp mcp_idempotency_guard -- --nocapture
+
+   Compiling autumn-web v0.7.0 (/home/user/autumn/autumn)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11m 46s
+     Running tests/integration_tests.rs (target/debug/deps/integration_tests-d71e09116d676f83)
+
+running 2 tests
+test integration::mcp_idempotency_guard::idempotency_replay_rejects_reused_key_with_different_payload_over_mcp_dispatch ... ok
+test integration::mcp_idempotency_guard::idempotency_replay_prevents_double_execution_over_mcp_dispatch ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2276 filtered out; finished in 0.01s
