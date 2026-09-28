@@ -160,7 +160,9 @@ changes a file. Then:
   and changes no file. It also refuses when a crates.io `[patch]` (in a manifest or
   a `.cargo/config.toml`) or a `[replace]` table redirects the crate. For a first-party plugin, a `[patch]` to a local
   checkout only prints a notice: the trust review covers the crates.io
-  release.
+  release. A first-party plugin `Cargo.toml` already declares must also be the
+  `=` pin of the reviewed release: `"0.7"` would take a later patch on the
+  next `cargo update`.
 - A listing that failed re-verification is refused, with the reason. It is
   also refused when the app's `autumn-web` version is not a plain version.
 - A sandboxed listing is not wired. The command prints the review steps

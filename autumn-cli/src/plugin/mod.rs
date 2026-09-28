@@ -768,7 +768,8 @@ fn print_listed_declaration(root: &Path, resolved: &Resolved, version: &str) -> 
 
 /// Check an existing declaration of a listed crate before `plugin add` or
 /// `--with` wires it. A community crate must be the verified `=` pin, and no
-/// `[patch]` may redirect it. A first-party crate must come from crates.io;
+/// `[patch]` may redirect it. A first-party crate must come from crates.io
+/// and, when already declared, be the `=` pin of the reviewed release;
 /// a `[patch]` to a local checkout is the dev workflow, so it gets a notice.
 ///
 /// # Errors
@@ -815,21 +816,21 @@ pub fn check_listed_declaration(
                     index::sanitize(&declared)
                 ));
             }
-            // A requirement that admits the release can still lock another
-            // one: Cargo builds what `Cargo.lock` says. With no single lock,
-            // the requirement itself must be the exact pin.
-            let locked = install::locked_version(root, crate_name);
-            if locked.is_none()
-                && let Some(declared) = install::declared_dependency_version(&manifest, crate_name)
-                && declared.trim() != install::exact_pin(version)
+            // A requirement that admits the release admits its later patches
+            // too: a lock at the release today is one `cargo update` from an
+            // unreviewed one. `plan_add` keeps an existing entry, so the entry
+            // itself must be the exact pin.
+            if let Some(declared) = install::declared_dependency_version(&manifest, crate_name)
+                && declared.split_whitespace().collect::<String>() != install::exact_pin(version)
             {
                 return Err(format!(
-                    "Cargo.toml declares `{crate_name} = \"{}\"` and no Cargo.lock pins it, so \
-                     Cargo may build a release the index has not reviewed. Set \
-                     `{crate_name} = \"={version}\"`, then re-run. No files were changed.",
+                    "Cargo.toml declares `{crate_name} = \"{}\"`, so Cargo may build a release \
+                     the index has not reviewed. Set `{crate_name} = \"={version}\"`, then \
+                     re-run. No files were changed.",
                     index::sanitize(&declared)
                 ));
             }
+            let locked = install::locked_version(root, crate_name);
             // Only a direct declaration's lock counts: a transitive copy
             // is not the dependency `plan_add` pins, and Cargo can resolve
             // the new `=release` pin alongside it.
@@ -2262,24 +2263,30 @@ mod tests {
             "[package]\nname = \"a\"\n\n[dependencies]\nautumn-admin-plugin = \"{}\"\n",
             series()
         ));
-        // Unlocked, a broad requirement may resolve to an unreviewed patch.
-        let err = check_listed_declaration(caret.path(), &admin, RELEASE).unwrap_err();
-        assert!(err.contains("no Cargo.lock pins it"), "{err}");
-        let exact = project_with(&format!(
-            "[package]\nname = \"a\"\n\n[dependencies]\nautumn-admin-plugin = \"={RELEASE}\"\n"
-        ));
-        assert!(check_listed_declaration(exact.path(), &admin, RELEASE).is_ok());
-        // The requirement admits the release, but the lockfile holds another.
+        // A broad requirement may resolve to an unreviewed patch, locked or
+        // not: a lock at the release today moves on the next `cargo update`.
         let lock = |v: &str| {
             format!(
                 "version = 4\n\n[[package]]\nname = \"autumn-admin-plugin\"\nversion = \"{v}\"\n"
             )
         };
-        std::fs::write(caret.path().join("Cargo.lock"), lock("0.0.1")).unwrap();
-        let err = check_listed_declaration(caret.path(), &admin, RELEASE).unwrap_err();
+        for locked in [None, Some(RELEASE)] {
+            if let Some(v) = locked {
+                std::fs::write(caret.path().join("Cargo.lock"), lock(v)).unwrap();
+            }
+            let err = check_listed_declaration(caret.path(), &admin, RELEASE).unwrap_err();
+            assert!(err.contains("not reviewed"), "{locked:?}: {err}");
+        }
+        let exact = project_with(&format!(
+            "[package]\nname = \"a\"\n\n[dependencies]\nautumn-admin-plugin = \"={RELEASE}\"\n"
+        ));
+        assert!(check_listed_declaration(exact.path(), &admin, RELEASE).is_ok());
+        // The exact pin, but the lockfile still holds another release.
+        std::fs::write(exact.path().join("Cargo.lock"), lock("0.0.1")).unwrap();
+        let err = check_listed_declaration(exact.path(), &admin, RELEASE).unwrap_err();
         assert!(err.contains("Cargo.lock locks"), "{err}");
-        std::fs::write(caret.path().join("Cargo.lock"), lock(RELEASE)).unwrap();
-        assert!(check_listed_declaration(caret.path(), &admin, RELEASE).is_ok());
+        std::fs::write(exact.path().join("Cargo.lock"), lock(RELEASE)).unwrap();
+        assert!(check_listed_declaration(exact.path(), &admin, RELEASE).is_ok());
         // A transitive lock with no direct declaration does not block the pin.
         let fresh = project_with("[package]\nname = \"a\"\n\n[dependencies]\n");
         std::fs::write(fresh.path().join("Cargo.lock"), lock("0.0.1")).unwrap();
