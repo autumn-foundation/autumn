@@ -928,6 +928,40 @@ fn framework_patch_sources(root: &Path) -> Vec<FrameworkSource> {
     dirs
 }
 
+/// The package name and version a Cargo package ID spec names:
+/// `name`, `name:1.2.3`, `name@1.2.3`, or any of these after a source URL
+/// and `#` (`https://github.com/rust-lang/crates.io-index#name@1.2.3`). A
+/// URL whose fragment is only a version, or that has none, names the last
+/// segment of its path.
+fn package_id_spec(spec: &str) -> Option<(String, Option<String>)> {
+    let split = |pkg: &str| {
+        let (name, version) = pkg
+            .split_once(['@', ':'])
+            .map_or((pkg, None), |(name, version)| {
+                (name, Some(version.to_owned()))
+            });
+        (!name.is_empty()).then(|| (name.to_owned(), version))
+    };
+    let (url, fragment) = spec
+        .split_once('#')
+        .map_or((spec, None), |(url, fragment)| (url, Some(fragment)));
+    if !url.contains("://") {
+        return split(fragment.unwrap_or(url));
+    }
+    let last_segment = || {
+        let path = url.split(['?']).next().unwrap_or(url).trim_end_matches('/');
+        let last = path.rsplit('/').next().unwrap_or(path);
+        last.strip_suffix(".git").unwrap_or(last).to_owned()
+    };
+    match fragment {
+        Some(version) if version.starts_with(|c: char| c.is_ascii_digit()) => {
+            Some((last_segment(), Some(version.to_owned())))
+        }
+        Some(pkg) => split(pkg),
+        None => Some((last_segment(), None)),
+    }
+}
+
 /// [`patched_by`] with `$CARGO_HOME` given, so a test need not set it.
 fn patched_by_in(
     root: &Path,
@@ -951,13 +985,17 @@ fn patched_by_in(
             return Some(format!("[patch.{source}] in {}", manifest.display()));
         }
         if let Some(replace) = table.get("replace").and_then(toml::Value::as_table) {
-            // A `[replace]` key is a package ID, `name:version`: it replaces
-            // that version only. A bare name matches any.
+            // A `[replace]` key is a package ID spec: `name`, `name:version`
+            // or `name@version`, optionally after a source URL and `#`. It
+            // replaces that version only; a bare name matches any, and a
+            // partial version its whole series.
             let version = version.trim_start_matches('=');
             let hit = replace.keys().any(|key| {
-                let mut id = key.splitn(2, ':');
-                let name = id.next().unwrap_or(key);
-                canonical(name) == want && id.next().is_none_or(|v| v == version)
+                package_id_spec(key).is_some_and(|(name, spec_version)| {
+                    canonical(&name) == want
+                        && spec_version
+                            .is_none_or(|v| v == version || version.starts_with(&format!("{v}.")))
+                })
             });
             if hit {
                 return Some(format!("[replace] in {}", manifest.display()));
@@ -2088,6 +2126,25 @@ mod tests {
         assert_eq!(with("autumn-plugin-x:0.2.0"), None);
         assert!(with("autumn-plugin-x:0.3.0").is_some());
         assert!(with("autumn_plugin_x").is_some());
+        // Every package ID spec form Cargo accepts (verified with cargo
+        // 1.98 metadata): `@`, and a source URL before `#`.
+        for key in [
+            "autumn-plugin-x@0.3.0",
+            "autumn-plugin-x@0.3",
+            "https://github.com/rust-lang/crates.io-index#autumn-plugin-x:0.3.0",
+            "https://github.com/rust-lang/crates.io-index#autumn-plugin-x@0.3.0",
+            "https://github.com/rust-lang/crates.io-index#autumn-plugin-x",
+            "registry+https://github.com/rust-lang/crates.io-index#autumn-plugin-x@0.3.0",
+            "https://github.com/acme/autumn-plugin-x.git#0.3.0",
+        ] {
+            assert!(with(key).is_some(), "{key}");
+        }
+        for key in [
+            "https://github.com/rust-lang/crates.io-index#autumn-plugin-x@0.2.0",
+            "https://github.com/rust-lang/crates.io-index#other@0.3.0",
+        ] {
+            assert_eq!(with(key), None, "{key}");
+        }
     }
 
     /// The locked version comes from the workspace lockfile, by canonical

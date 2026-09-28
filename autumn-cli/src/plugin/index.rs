@@ -949,6 +949,11 @@ fn req_interval(req: &str) -> Option<(semver::Version, Option<semver::Version>)>
     let mut low = Version::new(0, 0, 0);
     let mut high: Option<Version> = None;
     for c in &req.comparators {
+        // A prerelease bound admits prereleases this model does not order
+        // against a stable range: fail closed.
+        if !c.pre.is_empty() {
+            return None;
+        }
         let (major, minor, patch) = (c.major, c.minor, c.patch);
         let base = Version::new(major, minor.unwrap_or(0), patch.unwrap_or(0));
         // The first version after everything the named parts cover.
@@ -1273,6 +1278,11 @@ mod tests {
         let mut flagged = community();
         flagged.status = Status::Incompatible;
         assert_eq!(flagged.compat(">=0.7, <0.8"), Compat::Unknown);
+        // A prerelease-only range is not inside a stable one.
+        assert_eq!(
+            listing.compat(">=0.7.0-alpha.1, <=0.7.0-alpha.5"),
+            Compat::Unknown
+        );
     }
 
     #[test]
