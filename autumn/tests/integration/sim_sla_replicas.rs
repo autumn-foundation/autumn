@@ -282,3 +282,69 @@ async fn sim_sla_on_time_met_after_the_claim_cancels_the_breach() {
 
     job::clear_global_job_client();
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sim_sla_reconcile_moves_a_check_to_an_earlier_deadline() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    // Wednesday 2020-01-01 09:00 UTC.
+    let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap());
+    let store = RacingStore::new();
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    let ob = Obligation::new("first_response", "ticket:1")
+        .within(BusinessDuration::hours(2))
+        .calendar("support");
+
+    // Old deploy: work 09:00-10:00, so the deadline is Thursday 10:00.
+    {
+        let sink = Arc::clone(&fired);
+        let old = TestApp::new()
+            .with_clock(clock.clone())
+            .plugin(
+                SlaPlugin::new()
+                    .calendar(
+                        "support",
+                        BusinessCalendar::weekdays("09:00-10:00".parse().unwrap()),
+                    )
+                    .store(store.clone())
+                    .on_breach(
+                        "first_response",
+                        move |_state: AppState, breach: SlaBreach| {
+                            let sink = Arc::clone(&sink);
+                            async move {
+                                sink.lock().unwrap().push(breach.key);
+                                Ok(())
+                            }
+                        },
+                    ),
+            )
+            .build();
+        let status = Sla::from_state(old.state())
+            .unwrap()
+            .track(&ob)
+            .await
+            .unwrap();
+        assert_eq!(
+            status.due_at,
+            Some(Utc.with_ymd_and_hms(2020, 1, 2, 10, 0, 0).unwrap())
+        );
+    }
+    job::clear_global_job_client();
+
+    // New deploy: work 09:00-17:00, so the deadline moves to Wednesday 11:00.
+    let new = replica(&clock, &store, &fired);
+    let sla = Sla::from_state(new.state()).unwrap();
+    assert_eq!(sla.reconcile().await.unwrap(), 1);
+    settle().await;
+
+    let step = Duration::from_secs(3 * 3600);
+    clock.advance(step);
+    tokio::time::advance(step).await;
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    settle().await;
+    assert_eq!(*fired.lock().unwrap(), ["first_response/ticket:1"]);
+
+    job::clear_global_job_client();
+}

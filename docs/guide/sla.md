@@ -267,6 +267,10 @@ time.
 ## Limits
 
 - Calendars are set in code. There is no holiday import and no editor.
+- If a deploy changes a calendar, call `Sla::reconcile` once (for example,
+  from an `on_startup` hook). It puts a check on the queue at each open
+  record's new deadline. Without it, a deadline that moved earlier escalates
+  only at the old deadline.
 - The clock stops only outside working time. A manual pause is not available.
 - A window cannot cross midnight. Use two windows, such as `"22:00-24:00"` and
   `"00:00-06:00"`.

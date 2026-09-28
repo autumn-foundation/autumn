@@ -711,7 +711,8 @@ only the injected `Clock`.
   breach| async { .. }).on_any_breach(..)`; registers jobs `CHECK_JOB`
   (`autumn_sla_check`) and `ESCALATE_JOB` (`autumn_sla_escalate`).
 - `Sla` extractor (or `Sla::from_state`): `status(&ob)`, `track(&ob)`,
-  `meet(key)`, `get(key)`, `statuses()`, `forget(key)`, `calendar(name)`,
+  `meet(key)`, `get(key)`, `statuses()`, `forget(key)`, `reconcile()` (after a
+  calendar change), `calendar(name)`,
   `now()`.
 - `ObligationStatus` {`key`, `state`, `zone`, `started_at`, `due_at`,
   `met_at`, `escalated_at`, `resumes_at`, `budget`, `elapsed`, `remaining`};

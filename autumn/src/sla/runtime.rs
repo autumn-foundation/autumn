@@ -375,6 +375,36 @@ impl Sla {
             .collect()
     }
 
+    /// Put a check job on the queue for each open record, at its deadline
+    /// on the current calendars. Returns the number of records it checked.
+    ///
+    /// Call it once after a deploy that changes a calendar, for example from
+    /// an `on_startup` hook. A deadline that moved later is found by the old
+    /// check. A deadline that moved earlier needs this call. It is safe to
+    /// call at any time: a check that is already on the queue is not added
+    /// again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a store failure, an unknown calendar, or no job
+    /// runtime.
+    pub async fn reconcile(&self) -> Result<usize, SlaError> {
+        let now = self.now();
+        let mut scheduled = 0_usize;
+        for record in self.engine.store.list().await? {
+            let status = self.status_of(&record, now)?;
+            if let Some(due) = status.due_at
+                && status.escalated_at.is_none()
+                && status.state != ObligationState::Met
+            {
+                self.schedule_check(&status.key, record.generation, due)
+                    .await?;
+                scheduled = scheduled.saturating_add(1);
+            }
+        }
+        Ok(scheduled)
+    }
+
     /// Stop tracking `key`. Returns `true` if it was tracked.
     ///
     /// # Errors
