@@ -504,16 +504,30 @@ pub trait IdempotencyStore: Send + Sync + 'static {
 /// Suitable for single-process deployments and integration tests. For
 /// multi-replica deployments configure `backend = "redis"` in `autumn.toml`.
 pub struct MemoryIdempotencyStore {
-    entries: RwLock<HashMap<String, IdempotencyEntry>>,
+    entries: RwLock<HashMap<String, MemoryEntry>>,
     in_flight: RwLock<HashMap<String, MemoryInFlightLock>>,
     /// Counts `set` calls to trigger periodic expired-entry eviction.
     write_count: AtomicU64,
     default_ttl: Duration,
 }
 
+/// A stored entry and the TTL it was stored with. The TTL lets a read tell
+/// an entry from another timeline (another `Sim`) from a fresh one.
+struct MemoryEntry {
+    entry: IdempotencyEntry,
+    ttl: Duration,
+}
+
+impl MemoryEntry {
+    fn is_fresh(&self, now: Instant) -> bool {
+        crate::time::ttl_entry_is_fresh(self.entry.expires_at, now, self.ttl)
+    }
+}
+
 struct MemoryInFlightLock {
     owner: String,
     expires_at: Instant,
+    ttl: Duration,
 }
 
 /// Compute an expiry `Instant` for `ttl`, saturating instead of panicking on
@@ -544,14 +558,14 @@ impl MemoryIdempotencyStore {
 
 impl IdempotencyStore for MemoryIdempotencyStore {
     fn get(&self, key: &str) -> Option<IdempotencyEntry> {
+        let now = crate::time::ambient_instant();
         // Release the read lock immediately after cloning.
-        let entry = self
-            .entries
+        self.entries
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .get(key)
-            .cloned();
-        entry.filter(|e| e.expires_at > crate::time::ambient_instant())
+            .filter(|stored| stored.is_fresh(now))
+            .map(|stored| stored.entry.clone())
     }
 
     fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {
@@ -561,13 +575,13 @@ impl IdempotencyStore for MemoryIdempotencyStore {
             expires_at: saturating_deadline(ttl),
         };
         let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
-        entries.insert(key.to_owned(), entry);
+        entries.insert(key.to_owned(), MemoryEntry { entry, ttl });
         // Periodically evict expired entries to bound memory growth for
         // long-running processes. O(N) scan is amortised over every 128 writes.
         let n = self.write_count.fetch_add(1, Ordering::Relaxed);
         if n.is_multiple_of(128) {
             let now = crate::time::ambient_instant();
-            entries.retain(|_, v| v.expires_at > now);
+            entries.retain(|_, stored| stored.is_fresh(now));
         }
     }
 
@@ -583,7 +597,7 @@ impl IdempotencyStore for MemoryIdempotencyStore {
             .unwrap_or_else(PoisonError::into_inner);
         // Check only the requested key's active in-flight marker.
         if let Some(lock) = in_flight.get(key)
-            && lock.expires_at > now
+            && crate::time::ttl_entry_is_fresh(lock.expires_at, now, lock.ttl)
         {
             return false; // still in flight
         }
@@ -599,6 +613,7 @@ impl IdempotencyStore for MemoryIdempotencyStore {
             MemoryInFlightLock {
                 owner: owner.to_owned(),
                 expires_at: saturating_deadline(ttl),
+                ttl,
             },
         );
         true
