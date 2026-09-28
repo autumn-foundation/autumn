@@ -272,19 +272,14 @@ pub fn app_autumn_web(root: &Path) -> Result<AppAutumnWeb, PluginError> {
     }
 }
 
-/// The version a `{ workspace = true }` entry named `key` resolves to, found
-/// by walking up from `root` the way Cargo does.
+/// The version a `{ workspace = true }` entry named `key` resolves to. Cargo
+/// reads it from the package's workspace root only, not from any nearer
+/// manifest that happens to have a `[workspace.dependencies]` table.
 fn workspace_version_for(root: &Path, key: &str) -> Option<String> {
-    let mut dir = Some(root);
-    while let Some(current) = dir {
-        if let Some(crate::doctor::AutumnWebDependency::Version(version)) =
-            crate::doctor::workspace_dependency_for(current, key)
-        {
-            return Some(version);
-        }
-        dir = current.parent();
+    match crate::doctor::workspace_dependency_for(&workspace_root(root), key) {
+        Some(crate::doctor::AutumnWebDependency::Version(version)) => Some(version),
+        _ => None,
     }
-    None
 }
 
 /// `version` as an exact Cargo requirement: `=x.y.z`.
@@ -1107,6 +1102,31 @@ mod tests {
             "[package]\nname = \"app\"\nworkspace = \"../..\"\n",
         );
         assert_eq!(workspace_root(&app), outer.canonicalize().unwrap());
+    }
+
+    /// `{ workspace = true }` resolves against the package's workspace root,
+    /// not a nearer manifest with its own `[workspace.dependencies]`.
+    #[test]
+    fn an_inherited_version_comes_from_the_named_workspace_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().join("outer");
+        let app = outer.join("inner").join("app");
+        write(
+            &outer.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"inner/app\"]\n\n[workspace.dependencies]\nautumn-web = \"0.7\"\n",
+        );
+        write(
+            &outer.join("inner/Cargo.toml"),
+            "[workspace]\nmembers = []\n\n[workspace.dependencies]\nautumn-web = \"0.6\"\n",
+        );
+        write(
+            &app.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nworkspace = \"../..\"\n\n[dependencies]\nautumn-web = { workspace = true }\n",
+        );
+        assert!(matches!(
+            app_autumn_web(&app),
+            Ok(AppAutumnWeb::Version(v)) if v == "0.7"
+        ));
     }
 
     /// A package an ancestor workspace excludes is its own root.

@@ -123,7 +123,9 @@ that baseline, or with another one. If the new version asks for more authority,
 `record` flags the listing and keeps the old artifact. `record` also compares
 the report's capabilities, routes, grants, quotas and limits with the recorded
 ones (a quota for a dropped capability does not count),
-and refuses a report whose delta hides an increase.
+and refuses a report whose delta hides an increase. A report with the recorded
+`artifact_sha256` must also repeat the recorded version, capabilities, routes,
+grants, quotas and limits, because one artifact has one manifest.
 
 The job uploads the `plugin-index-reports` artifact. It holds one report per
 listing and `index.toml`: the index with the reports already recorded.

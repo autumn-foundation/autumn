@@ -429,6 +429,22 @@ pub fn apply_inspect(
             listing.name, listing.artifact_sha256
         ));
     }
+    // The same bytes carry the same manifest. A report that repeats the
+    // recorded digest with other metadata is edited, and would rewrite what
+    // the listing says the artifact can do.
+    if !replacing && !listing.artifact_sha256.is_empty() {
+        let changed = changed_metadata(listing, report);
+        if !changed.is_empty() {
+            return Err(format!(
+                "the inspect report for `{}` names the recorded artifact sha256 {}, but its {} \
+                 differ from the listing's. One artifact has one manifest: re-run \
+                 `autumn plugin inspect --format json` on the recorded artifact",
+                listing.name,
+                listing.artifact_sha256,
+                changed.join(", ")
+            ));
+        }
+    }
     // The delta is the report's own claim. Compare the authority it reports
     // with what the listing recorded, and refuse a delta that hides growth.
     let widened = widened_authority(listing, report);
@@ -475,6 +491,30 @@ pub fn apply_inspect(
     }
     let failed = (!failed.is_empty()).then(|| failed.join(", "));
     Ok(transition(listing, failed.as_deref(), against, date))
+}
+
+/// The artifact-derived fields where `report` differs from `listing`.
+fn changed_metadata(listing: &Listing, report: &InspectReport) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    if report.version != listing.version {
+        changed.push("version");
+    }
+    if report.capabilities != listing.capabilities {
+        changed.push("capabilities");
+    }
+    if report.route_names() != listing.routes {
+        changed.push("routes");
+    }
+    if index::Grants::from(&report.grants) != listing.grants {
+        changed.push("grants");
+    }
+    if report.quotas != listing.quotas {
+        changed.push("quotas");
+    }
+    if report.limits != listing.limits {
+        changed.push("limits");
+    }
+    changed
 }
 
 /// Authority `report` has beyond what `listing` recorded: a capability, a
@@ -1170,6 +1210,7 @@ mod tests {
         l.trust = index::Trust::Sandboxed;
         // The consented authority: what `inspect(true)` reports.
         let r = inspect(true);
+        l.version.clone_from(&r.version);
         l.capabilities.clone_from(&r.capabilities);
         l.routes = r.route_names();
         l.grants = index::Grants::from(&r.grants);
@@ -1479,6 +1520,28 @@ mod tests {
         assert_eq!(l.artifact_sha256, "ab".repeat(32));
         assert_eq!(l.version, "0.2.0");
         assert_eq!(l.conformance.result, CheckOutcome::Pass);
+    }
+
+    /// One digest, one manifest: a report repeating the recorded digest must
+    /// repeat its metadata, or it would rewrite what the listing vouches for.
+    #[test]
+    fn an_unchanged_digest_with_changed_metadata_is_refused() {
+        let mut l = sandboxed();
+        apply_inspect(&mut l, &inspect(true), "0.7.0", "2026-10-01").expect("apply");
+        // A retry with the same bytes and the same manifest records again.
+        let mut again = l.clone();
+        apply_inspect(&mut again, &inspect(true), "0.7.0", "2026-10-02").expect("retry");
+
+        let mut fewer = inspect(true);
+        fewer.capabilities.pop();
+        fewer.routes.clear();
+        let err = apply_inspect(&mut l.clone(), &fewer, "0.7.0", "2026-10-02").unwrap_err();
+        assert!(err.contains("capabilities, routes"), "{err}");
+
+        let mut bumped = inspect(true);
+        bumped.version = "0.2.1".to_owned();
+        let err = apply_inspect(&mut l, &bumped, "0.7.0", "2026-10-02").unwrap_err();
+        assert!(err.contains("version"), "{err}");
     }
 
     #[test]
