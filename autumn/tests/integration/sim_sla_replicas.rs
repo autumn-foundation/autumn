@@ -75,11 +75,12 @@ impl ObligationStore for RacingStore {
     fn claim_escalation<'a>(
         &'a self,
         key: &'a str,
+        started_at: DateTime<Utc>,
         due_at: DateTime<Utc>,
         at: DateTime<Utc>,
     ) -> StoreFuture<'a, bool> {
         self.claims.fetch_add(1, Ordering::SeqCst);
-        self.inner.claim_escalation(key, due_at, at)
+        self.inner.claim_escalation(key, started_at, due_at, at)
     }
 
     fn release_escalation<'a>(&'a self, key: &'a str) -> StoreFuture<'a, ()> {

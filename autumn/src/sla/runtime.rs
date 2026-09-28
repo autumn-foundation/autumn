@@ -498,7 +498,12 @@ impl Sla {
             }
             _ => return Ok(()),
         };
-        if !store.claim_escalation(key, due_at, now).await? {
+        // Claim this instance only: a `forget` and `track` since the read
+        // makes a new record with another start.
+        if !store
+            .claim_escalation(key, status.started_at, due_at, now)
+            .await?
+        {
             return Ok(());
         }
         let obligation = &record.obligation;

@@ -489,6 +489,9 @@ fn zone_from_reads_names_and_options() {
 
 // ── MemoryObligationStore ────────────────────────────────────────────────────
 
+/// The start of the obligation that `record(START)` makes.
+const START: DateTime<Utc> = DateTime::from_timestamp(1_704_466_800, 0).unwrap();
+
 fn record(start: DateTime<Utc>) -> ObligationRecord {
     ObligationRecord::new(ticket(start).zone(Tz::UTC))
 }
@@ -510,10 +513,10 @@ async fn store_claims_an_escalation_once() {
     store.insert(record(utc(2024, 1, 5, 15, 0))).await.unwrap();
     let key = "first_response/ticket:1";
     let due = utc(2024, 1, 9, 15, 0);
-    assert!(store.claim_escalation(key, due, due).await.unwrap());
-    assert!(!store.claim_escalation(key, due, due).await.unwrap());
+    assert!(store.claim_escalation(key, START, due, due).await.unwrap());
+    assert!(!store.claim_escalation(key, START, due, due).await.unwrap());
     store.release_escalation(key).await.unwrap();
-    assert!(store.claim_escalation(key, due, due).await.unwrap());
+    assert!(store.claim_escalation(key, START, due, due).await.unwrap());
 }
 
 #[tokio::test]
@@ -524,8 +527,13 @@ async fn store_does_not_claim_a_met_or_missing_obligation() {
     let due = utc(2024, 1, 9, 15, 0);
     assert!(store.mark_met(key, utc(2024, 1, 8, 10, 0)).await.unwrap());
     assert!(!store.mark_met(key, utc(2024, 1, 8, 11, 0)).await.unwrap());
-    assert!(!store.claim_escalation(key, due, due).await.unwrap());
-    assert!(!store.claim_escalation("nope", due, due).await.unwrap());
+    assert!(!store.claim_escalation(key, START, due, due).await.unwrap());
+    assert!(
+        !store
+            .claim_escalation("nope", START, due, due)
+            .await
+            .unwrap()
+    );
     let stored = store.get(key).await.unwrap().unwrap();
     assert_eq!(stored.obligation.met(), Some(utc(2024, 1, 8, 10, 0)));
 }
@@ -539,7 +547,7 @@ async fn store_claims_an_obligation_met_after_the_deadline() {
     store.mark_met(key, utc(2024, 1, 9, 16, 0)).await.unwrap();
     assert!(
         store
-            .claim_escalation(key, due, utc(2024, 1, 9, 17, 0))
+            .claim_escalation(key, START, due, utc(2024, 1, 9, 17, 0))
             .await
             .unwrap()
     );
@@ -568,6 +576,21 @@ async fn store_rolls_back_an_unscheduled_record() {
         !store.mark_scheduled(key).await.unwrap(),
         "no record to pin"
     );
+}
+
+#[tokio::test]
+async fn store_does_not_claim_a_replaced_instance() {
+    let store = MemoryObligationStore::new();
+    let key = "first_response/ticket:1";
+    let due = utc(2024, 1, 9, 15, 0);
+    // A check read the instance that started at START. Then `forget` and
+    // `track` made a new instance.
+    store.insert(record(START)).await.unwrap();
+    store.remove(key).await.unwrap();
+    store.insert(record(utc(2024, 1, 8, 9, 0))).await.unwrap();
+    assert!(!store.claim_escalation(key, START, due, due).await.unwrap());
+    let stored = store.get(key).await.unwrap().unwrap();
+    assert_eq!(stored.escalated_at, None, "the new instance is not claimed");
 }
 
 #[tokio::test]

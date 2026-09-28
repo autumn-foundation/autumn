@@ -41,8 +41,8 @@ impl ObligationRecord {
 ///
 /// For more than one replica, all replicas must use the same store, and
 /// [`claim_escalation`](Self::claim_escalation) must be atomic, for example
-/// `UPDATE … SET escalated_at = $3 WHERE key = $1 AND escalated_at IS NULL
-/// AND (met_at IS NULL OR met_at > $2)`.
+/// `UPDATE … SET escalated_at = $4 WHERE key = $1 AND started_at = $2 AND
+/// escalated_at IS NULL AND (met_at IS NULL OR met_at > $3)`.
 pub trait ObligationStore: Send + Sync + 'static {
     /// Add `record` if its key is new. Return the stored record, and `true`
     /// if this call created it. The check and the write must be atomic.
@@ -57,11 +57,13 @@ pub trait ObligationStore: Send + Sync + 'static {
     /// Set the met instant if it is not set. Return `true` if it changed.
     fn mark_met<'a>(&'a self, key: &'a str, at: DateTime<Utc>) -> StoreFuture<'a, bool>;
 
-    /// Set the escalation instant to `at` if it is not set and the
+    /// Set the escalation instant to `at` if the record for `key` started at
+    /// `started_at` (the same instance), the escalation is not set, and the
     /// obligation was not met by `due_at`. Return `true` if this call set it.
     fn claim_escalation<'a>(
         &'a self,
         key: &'a str,
+        started_at: DateTime<Utc>,
         due_at: DateTime<Utc>,
         at: DateTime<Utc>,
     ) -> StoreFuture<'a, bool>;
@@ -141,12 +143,14 @@ impl ObligationStore for MemoryObligationStore {
     fn claim_escalation<'a>(
         &'a self,
         key: &'a str,
+        started_at: DateTime<Utc>,
         due_at: DateTime<Utc>,
         at: DateTime<Utc>,
     ) -> StoreFuture<'a, bool> {
         self.with(|records| match records.get_mut(key) {
             Some(record)
-                if record.escalated_at.is_none()
+                if record.obligation.started_at() == Some(started_at)
+                    && record.escalated_at.is_none()
                     && record.obligation.met().is_none_or(|met| met > due_at) =>
             {
                 record.escalated_at = Some(at);

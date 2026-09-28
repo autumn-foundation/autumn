@@ -215,8 +215,9 @@ than one replica, put an `ObligationStore` on your database with
 `remove_unscheduled` and `claim_escalation` atomic, for example:
 
 ```sql
-UPDATE sla_obligations SET escalated_at = $3
-WHERE key = $1 AND escalated_at IS NULL AND (met_at IS NULL OR met_at > $2)
+UPDATE sla_obligations SET escalated_at = $4
+WHERE key = $1 AND started_at = $2
+  AND escalated_at IS NULL AND (met_at IS NULL OR met_at > $3)
 ```
 
 ---
