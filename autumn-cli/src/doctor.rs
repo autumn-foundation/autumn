@@ -4231,15 +4231,31 @@ pub fn check_rust_toolchain_impl(current_output: &str, required: &str) -> CheckR
 // ─── IO-dependent checks ──────────────────────────────────────────────────────
 
 fn check_rust_toolchain(msrv: &str) -> CheckResult {
-    match std::process::Command::new("rustc")
-        .arg("--version")
-        .output()
-    {
+    // `rustc` is rustup's shim, and doctor runs its checks at the same time. If
+    // the project pins a toolchain this machine lacks, rustup errors instead of
+    // installing it: concurrent installs leave a toolchain half-installed.
+    let mut rustc = std::process::Command::new("rustc");
+    rustc.arg("--version");
+    crate::deps::no_toolchain_installs(&mut rustc);
+    match rustc.output() {
         Ok(out) if out.status.success() => {
             let ver = String::from_utf8_lossy(&out.stdout).into_owned();
             check_rust_toolchain_impl(ver.trim(), msrv)
         }
-        _ => CheckResult {
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let reason = stderr.lines().find(|line| !line.trim().is_empty());
+            CheckResult {
+                name: "rust_toolchain",
+                status: CheckStatus::Fail,
+                detail: Some(reason.map_or_else(
+                    || "`rustc --version` failed".to_owned(),
+                    |reason| format!("`rustc --version` failed: {}", reason.trim()),
+                )),
+                hint: Some("Install Rust via https://rustup.rs/"),
+            }
+        }
+        Err(_) => CheckResult {
             name: "rust_toolchain",
             status: CheckStatus::Fail,
             detail: Some("`rustc --version` failed".into()),
@@ -17867,6 +17883,36 @@ foo = "bar"
     fn check_port_bindable_impl_reports_correct_port() {
         let r = check_port_bindable_impl(8080, |_| true);
         assert!(r.detail.as_deref().unwrap_or("").contains("8080"));
+    }
+
+    // ── no toolchain installs ────────────────────────────────────────────────
+
+    /// The body of the first `fn` whose signature starts with `signature`.
+    fn fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source.find(signature).expect("function present");
+        let end = source[start..].find("\n}\n").expect("function end");
+        &source[start..start + end]
+    }
+
+    #[test]
+    fn doctor_checks_never_make_rustup_install_a_toolchain() {
+        // Regression, caught by the Windows Tier 1 journey: doctor runs its
+        // checks at the same time, and `rustc`/`cargo` there are rustup's shims,
+        // which install the project's pinned toolchain on first use. Several
+        // checks installing it at once left it half-installed, and the next
+        // `cargo` failed with "the 'cargo.exe' binary ... is not applicable to
+        // the '1.88.0' toolchain". A check must not install anything.
+        let doctor = include_str!("doctor.rs");
+        assert!(
+            fn_body(doctor, "fn check_rust_toolchain(msrv").contains("no_toolchain_installs(&mut"),
+            "the rust_toolchain check must forbid a toolchain install"
+        );
+        let dev = include_str!("dev.rs");
+        assert!(
+            fn_body(dev, "pub fn try_resolve_target_directory(")
+                .contains("no_toolchain_installs(&mut"),
+            "doctor's target-dir lookup must forbid a toolchain install"
+        );
     }
 
     // ── check_rust_toolchain_impl ────────────────────────────────────────────
