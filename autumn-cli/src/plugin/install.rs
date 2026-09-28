@@ -594,6 +594,18 @@ pub fn with_inherited_dependency(root: &Path, manifest: &str, crate_name: &str) 
 #[must_use]
 pub fn patched_by(root: &Path, crate_name: &str, version: &str) -> Option<String> {
     patched_by_in(root, crate_name, version, cargo_home().as_deref())
+        .or_else(|| env_source_redirect(std::env::vars()))
+}
+
+/// A `CARGO_SOURCE_CRATES_IO_*` variable: Cargo maps it to the
+/// `[source.crates-io]` config key it names (`replace-with`, `registry`, …),
+/// so it redirects crates.io as a config file would.
+fn env_source_redirect(vars: impl Iterator<Item = (String, String)>) -> Option<String> {
+    vars.filter(|(key, value)| {
+        key.starts_with("CARGO_SOURCE_CRATES_IO_") && !value.trim().is_empty()
+    })
+    .map(|(key, _)| format!("the {key} environment variable"))
+    .next()
 }
 
 /// `$CARGO_HOME`, or `~/.cargo`.
@@ -2244,6 +2256,35 @@ maud = { version = "0.27", features = ["axum"] }
                 "{source}"
             );
         }
+    }
+
+    /// Cargo reads `source.crates-io.*` from the environment too.
+    #[test]
+    fn an_environment_crates_io_replacement_is_a_redirect() {
+        let vars = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect::<Vec<_>>()
+                .into_iter()
+        };
+        let found = env_source_redirect(vars(&[
+            ("PATH", "/usr/bin"),
+            ("CARGO_SOURCE_CRATES_IO_REPLACE_WITH", "vendor"),
+        ]))
+        .unwrap();
+        assert!(
+            found.contains("CARGO_SOURCE_CRATES_IO_REPLACE_WITH"),
+            "{found}"
+        );
+        assert_eq!(
+            env_source_redirect(vars(&[("CARGO_SOURCE_CRATES_IO_REPLACE_WITH", "")])),
+            None
+        );
+        assert_eq!(
+            env_source_redirect(vars(&[("CARGO_HOME", "/x"), ("CARGO_TARGET_DIR", "/t")])),
+            None
+        );
     }
 
     /// `paths` overrides in a config can replace any crate.

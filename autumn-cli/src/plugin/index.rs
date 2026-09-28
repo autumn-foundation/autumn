@@ -945,7 +945,13 @@ fn requirement_top(app: &str, low: &semver::Version) -> Option<semver::Version> 
             semver::Version::new(low.major, low.minor, u64::MAX)
         });
     }
-    app.starts_with('^').then(|| series_top(low))
+    // `^0` (a major alone) admits every 0.x, not just 0.0.x.
+    let rest = app.strip_prefix('^')?;
+    Some(if rest.trim().split('.').count() == 1 {
+        semver::Version::new(low.major, u64::MAX, u64::MAX)
+    } else {
+        series_top(low)
+    })
 }
 
 /// The highest version in `v`'s compatibility series.
@@ -1199,6 +1205,12 @@ mod tests {
         };
         assert_eq!(one.compat("^1"), Compat::Compatible);
         assert_eq!(one.compat("~1"), Compat::Compatible);
+        // `^0` admits every 0.x: a listing below 0.8 does not cover it.
+        let below = Listing {
+            autumn_web: ">=0, <0.8".to_owned(),
+            ..community()
+        };
+        assert_eq!(below.compat("^0"), Compat::Unknown);
         // `~1` starts below `~1.2`: refused, like any range whose floor is
         // outside the listing.
         assert_eq!(one_two.compat("~1"), Compat::Incompatible);

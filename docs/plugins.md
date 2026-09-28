@@ -159,8 +159,8 @@ changes a file. Then:
   git or other registry, or renamed to another package, the command refuses
   and changes no file. It also refuses when a crates.io `[patch]` (in a manifest or
   a `.cargo/config.toml`), a `[replace]` table, a `[source.crates-io]`
-  table (a `replace-with` or a redefinition), or a `paths` override
-  redirects the crate. For a first-party plugin, a `[patch]` to a local
+  table (a `replace-with` or a redefinition), a `CARGO_SOURCE_CRATES_IO_*`
+  environment variable, or a `paths` override redirects the crate. For a first-party plugin, a `[patch]` to a local
   checkout only prints a notice: the trust review covers the crates.io
   release. A first-party plugin `Cargo.toml` already declares must also be the
   `=` pin of the reviewed release: `"0.7"` would take a later patch on the
