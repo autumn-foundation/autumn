@@ -785,7 +785,7 @@ pub fn check_listed_declaration(
     };
     let manifest = std::fs::read_to_string(install::manifest_path(root)).unwrap_or_default();
     let manifest = install::with_inherited_dependency(root, &manifest, crate_name);
-    let patched = install::patched_by(root, crate_name);
+    let patched = install::patched_by(root, crate_name, version);
     match resolved {
         Resolved::Community(_) => {
             check_existing_pin(&manifest, crate_name, version)?;
@@ -813,6 +813,18 @@ pub fn check_listed_declaration(
                      release {version}. Set `{crate_name} = \"{version}\"`, then re-run. No files \
                      were changed.",
                     index::sanitize(&declared)
+                ));
+            }
+            // A requirement that admits the release can still lock another
+            // one: Cargo builds what `Cargo.lock` says.
+            if let Some(locked) = install::locked_version(root, crate_name)
+                && semver::Version::parse(&locked).ok() != semver::Version::parse(version).ok()
+            {
+                return Err(format!(
+                    "Cargo.lock locks `{crate_name}` at {}, but the index verified {version}. Run \
+                     `cargo update -p {crate_name} --precise {version}`, then re-run. No files \
+                     were changed.",
+                    index::sanitize(&locked)
                 ));
             }
             Ok(patched.map(|patch| {
@@ -2184,6 +2196,17 @@ mod tests {
             "[package]\nname = \"a\"\n\n[dependencies]\nautumn-admin-plugin = \"{}\"\n",
             series()
         ));
+        assert!(check_listed_declaration(caret.path(), &admin, RELEASE).is_ok());
+        // The requirement admits the release, but the lockfile holds another.
+        let lock = |v: &str| {
+            format!(
+                "version = 4\n\n[[package]]\nname = \"autumn-admin-plugin\"\nversion = \"{v}\"\n"
+            )
+        };
+        std::fs::write(caret.path().join("Cargo.lock"), lock("0.0.1")).unwrap();
+        let err = check_listed_declaration(caret.path(), &admin, RELEASE).unwrap_err();
+        assert!(err.contains("Cargo.lock locks"), "{err}");
+        std::fs::write(caret.path().join("Cargo.lock"), lock(RELEASE)).unwrap();
         assert!(check_listed_declaration(caret.path(), &admin, RELEASE).is_ok());
     }
 

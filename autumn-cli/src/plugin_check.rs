@@ -332,17 +332,7 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
 /// in `dir`. Cargo uses the workspace root's lockfile, not a member's. `None`
 /// when there is no lockfile, or it locks more than one `autumn-web`.
 pub fn locked_autumn_web(dir: &std::path::Path) -> Option<String> {
-    let root = crate::plugin::install::workspace_root(dir);
-    let text = std::fs::read_to_string(root.join("Cargo.lock")).ok()?;
-    let lock = toml::from_str::<toml::Table>(&text).ok()?;
-    let mut versions = lock
-        .get("package")?
-        .as_array()?
-        .iter()
-        .filter(|p| p.get("name").and_then(toml::Value::as_str) == Some("autumn-web"))
-        .filter_map(|p| p.get("version").and_then(toml::Value::as_str));
-    let first = versions.next()?.to_owned();
-    versions.next().is_none().then_some(first)
+    crate::plugin::install::locked_version(dir, "autumn-web")
 }
 
 /// What the child binary's stderr said about its plugin contracts.

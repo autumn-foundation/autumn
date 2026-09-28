@@ -352,6 +352,29 @@ pub fn workspace_root(dir: &Path) -> PathBuf {
         .map_or_else(|| dir.clone(), Path::to_path_buf)
 }
 
+/// The version of `crate_name` the workspace's `Cargo.lock` resolved for the
+/// package at `dir` (Cargo reads the workspace root's lockfile only). `None`
+/// when there is no lockfile, the crate is not locked, or it is locked at
+/// more than one version.
+#[must_use]
+pub fn locked_version(dir: &Path, crate_name: &str) -> Option<String> {
+    let text = std::fs::read_to_string(workspace_root(dir).join("Cargo.lock")).ok()?;
+    let lock = toml::from_str::<toml::Table>(&text).ok()?;
+    let want = canonical(crate_name);
+    let mut versions = lock
+        .get("package")?
+        .as_array()?
+        .iter()
+        .filter(|p| {
+            p.get("name")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|name| canonical(name) == want)
+        })
+        .filter_map(|p| p.get("version").and_then(toml::Value::as_str));
+    let first = versions.next()?.to_owned();
+    versions.next().is_none().then_some(first)
+}
+
 /// `manifest` with a `crate_name = { workspace = true }` entry replaced by the
 /// workspace root's `[workspace.dependencies]` entry, as Cargo resolves it.
 /// The root is the first ancestor of `root` (itself included) whose
@@ -395,15 +418,20 @@ pub fn with_inherited_dependency(root: &Path, manifest: &str, crate_name: &str) 
 /// source counts: `[patch."<git url>"]` overrides that source alone.
 /// `[source]` replacement (vendoring) is not read.
 #[must_use]
-pub fn patched_by(root: &Path, crate_name: &str) -> Option<String> {
+pub fn patched_by(root: &Path, crate_name: &str, version: &str) -> Option<String> {
     let cargo_home = std::env::var_os("CARGO_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".cargo")));
-    patched_by_in(root, crate_name, cargo_home.as_deref())
+    patched_by_in(root, crate_name, version, cargo_home.as_deref())
 }
 
 /// [`patched_by`] with `$CARGO_HOME` given, so a test need not set it.
-fn patched_by_in(root: &Path, crate_name: &str, cargo_home: Option<&Path>) -> Option<String> {
+fn patched_by_in(
+    root: &Path,
+    crate_name: &str,
+    version: &str,
+    cargo_home: Option<&Path>,
+) -> Option<String> {
     let want = canonical(crate_name);
     // Absolute, or the parents of `.` (what the CLI passes) are empty.
     let root = &std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
@@ -418,9 +446,14 @@ fn patched_by_in(root: &Path, crate_name: &str, cargo_home: Option<&Path>) -> Op
             return Some(format!("[patch.{source}] in {}", manifest.display()));
         }
         if let Some(replace) = table.get("replace").and_then(toml::Value::as_table) {
-            let hit = replace
-                .keys()
-                .any(|k| canonical(k.split(':').next().unwrap_or(k)) == want);
+            // A `[replace]` key is a package ID, `name:version`: it replaces
+            // that version only. A bare name matches any.
+            let version = version.trim_start_matches('=');
+            let hit = replace.keys().any(|key| {
+                let mut id = key.splitn(2, ':');
+                let name = id.next().unwrap_or(key);
+                canonical(name) == want && id.next().is_none_or(|v| v == version)
+            });
             if hit {
                 return Some(format!("[replace] in {}", manifest.display()));
             }
@@ -1011,7 +1044,10 @@ mod tests {
             "[package]\nname = \"a\"\n\n[patch.\"https://github.com/acme/repo\"]\n\
              autumn-plugin-x = { path = \"../x\" }\n",
         );
-        assert_eq!(patched_by_in(tmp.path(), "autumn-plugin-x", None), None);
+        assert_eq!(
+            patched_by_in(tmp.path(), "autumn-plugin-x", "0.3.0", None),
+            None
+        );
         for source in [
             "crates-io",
             "\"https://github.com/rust-lang/crates.io-index\"",
@@ -1025,10 +1061,54 @@ mod tests {
                 ),
             );
             assert!(
-                patched_by_in(tmp.path(), "autumn-plugin-x", None).is_some(),
+                patched_by_in(tmp.path(), "autumn-plugin-x", "0.3.0", None).is_some(),
                 "{source}"
             );
         }
+    }
+
+    /// A `[replace]` key names one version: another version's replacement
+    /// does not redirect the pin.
+    #[test]
+    fn a_replace_for_another_version_is_not_a_redirect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("Cargo.toml");
+        let with = |key: &str| {
+            write(
+                &manifest,
+                &format!(
+                    "[package]\nname = \"a\"\n\n[replace]\n\"{key}\" = {{ path = \"../x\" }}\n"
+                ),
+            );
+            patched_by_in(tmp.path(), "autumn-plugin-x", "=0.3.0", None)
+        };
+        assert_eq!(with("autumn-plugin-x:0.2.0"), None);
+        assert!(with("autumn-plugin-x:0.3.0").is_some());
+        assert!(with("autumn_plugin_x").is_some());
+    }
+
+    /// The locked version comes from the workspace lockfile, by canonical
+    /// name; two locked versions are ambiguous.
+    #[test]
+    fn locked_version_reads_the_workspace_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("Cargo.toml"), "[package]\nname = \"a\"\n");
+        assert_eq!(locked_version(tmp.path(), "autumn-admin-plugin"), None);
+        let pkg =
+            |v: &str| format!("[[package]]\nname = \"autumn-admin-plugin\"\nversion = \"{v}\"\n\n");
+        write(
+            &tmp.path().join("Cargo.lock"),
+            &format!("version = 4\n\n{}", pkg("0.7.1")),
+        );
+        assert_eq!(
+            locked_version(tmp.path(), "autumn_admin_plugin").as_deref(),
+            Some("0.7.1")
+        );
+        write(
+            &tmp.path().join("Cargo.lock"),
+            &format!("version = 4\n\n{}{}", pkg("0.7.1"), pkg("0.6.0")),
+        );
+        assert_eq!(locked_version(tmp.path(), "autumn-admin-plugin"), None);
     }
 
     /// Cargo reads manifest patches from the workspace root only: a
@@ -1043,18 +1123,18 @@ mod tests {
             &format!("[package]\nname = \"app\"\n\n{patch}"),
         );
         // Standalone: the package is its own root.
-        assert!(patched_by_in(&app, "autumn-plugin-x", None).is_some());
+        assert!(patched_by_in(&app, "autumn-plugin-x", "0.3.0", None).is_some());
         // A member: its own table is ignored.
         write(
             &tmp.path().join("Cargo.toml"),
             "[workspace]\nmembers = [\"app\"]\n",
         );
-        assert_eq!(patched_by_in(&app, "autumn-plugin-x", None), None);
+        assert_eq!(patched_by_in(&app, "autumn-plugin-x", "0.3.0", None), None);
         write(
             &tmp.path().join("Cargo.toml"),
             &format!("[workspace]\nmembers = [\"app\"]\n\n{patch}"),
         );
-        assert!(patched_by_in(&app, "autumn-plugin-x", None).is_some());
+        assert!(patched_by_in(&app, "autumn-plugin-x", "0.3.0", None).is_some());
     }
 
     /// Cargo also reads `[patch]` from `.cargo/config.toml` above the app,
@@ -1065,17 +1145,20 @@ mod tests {
         let app = tmp.path().join("work").join("app");
         write(&app.join("Cargo.toml"), "[package]\nname = \"a\"\n");
         let patch = "[patch.crates-io]\nautumn_plugin_x = { path = \"../x\" }\n";
-        assert_eq!(patched_by_in(&app, "autumn-plugin-x", None), None);
+        assert_eq!(patched_by_in(&app, "autumn-plugin-x", "0.3.0", None), None);
 
         write(&tmp.path().join("work/.cargo/config.toml"), patch);
-        let found = patched_by_in(&app, "autumn-plugin-x", None).unwrap();
+        let found = patched_by_in(&app, "autumn-plugin-x", "0.3.0", None).unwrap();
         assert!(found.contains("config.toml"), "{found}");
         std::fs::remove_dir_all(tmp.path().join("work/.cargo")).unwrap();
 
         let home = tmp.path().join("cargo-home");
         write(&home.join("config.toml"), patch);
-        assert!(patched_by_in(&app, "autumn-plugin-x", Some(&home)).is_some());
-        assert_eq!(patched_by_in(&app, "autumn-plugin-y", Some(&home)), None);
+        assert!(patched_by_in(&app, "autumn-plugin-x", "0.3.0", Some(&home)).is_some());
+        assert_eq!(
+            patched_by_in(&app, "autumn-plugin-y", "0.3.0", Some(&home)),
+            None
+        );
     }
     use crate::plugin::catalog;
 
