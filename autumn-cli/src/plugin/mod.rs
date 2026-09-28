@@ -892,28 +892,32 @@ fn source_label(source: &index::Source) -> String {
 
 /// The app's `autumn-web` version, or `None` when it cannot be determined.
 fn app_version(root: &Path) -> Option<String> {
-    // What Cargo resolved, when it has: a `"0.7"` requirement may be 0.7.1.
-    if let Some(locked) = install::locked_version(root, "autumn-web") {
-        return Some(locked);
-    }
-    // Unlocked: an exact requirement is the version; any other is marked
-    // `^`/`~`, so `Listing::compat` judges the whole series it admits.
-    match install::app_autumn_web(root) {
-        Ok(install::AppAutumnWeb::Version(req)) => {
-            let req = req.trim();
-            Some(req.strip_prefix('=').map_or_else(
-                || {
-                    if req.starts_with(['^', '~']) {
-                        req.to_owned()
-                    } else {
-                        format!("^{req}")
-                    }
-                },
-                |exact| exact.trim().to_owned(),
-            ))
-        }
+    let declared = match install::app_autumn_web(root) {
+        Ok(install::AppAutumnWeb::Version(req)) => Some(req.trim().to_owned()),
         Ok(install::AppAutumnWeb::Unversioned) | Err(_) => None,
+    };
+    // What Cargo resolved, when it has: a `"0.7"` requirement may be 0.7.1.
+    // A lock the manifest no longer admits is stale; the next build moves it.
+    if let Some(locked) = install::locked_version(root, "autumn-web") {
+        let current = declared
+            .as_deref()
+            .and_then(|req| semver::VersionReq::parse(req).ok())
+            .zip(semver::Version::parse(&locked).ok())
+            .is_none_or(|(req, version)| req.matches(&version));
+        if current {
+            return Some(locked);
+        }
     }
+    // Unlocked: only a full `=x.y.z` is a version. Any other requirement is
+    // marked `^`/`~`, so `Listing::compat` judges the whole series it admits;
+    // `=0.7` matches every 0.7.x, so it becomes `~0.7`.
+    let req = declared?;
+    Some(match req.strip_prefix('=').map(str::trim) {
+        Some(exact) if exact.split('.').count() == 3 => exact.to_owned(),
+        Some(partial) => format!("~{partial}"),
+        None if req.starts_with(['^', '~']) => req,
+        None => format!("^{req}"),
+    })
 }
 
 /// Run `autumn plugin list`. Returns the process exit code.
@@ -1897,6 +1901,33 @@ mod tests {
         )
         .expect("preflight");
         assert_eq!(plugins.len(), 1);
+    }
+
+    /// The app's version: a lock the manifest still admits, else the
+    /// requirement, concrete only for a full `=x.y.z`.
+    #[test]
+    fn app_version_reads_a_current_lock_or_the_requirement() {
+        let app = |req: &str, lock: Option<&str>| {
+            let tmp = project_with(&format!(
+                "[package]\nname = \"a\"\n\n[dependencies]\nautumn-web = \"{req}\"\n"
+            ));
+            if let Some(v) = lock {
+                std::fs::write(
+                    tmp.path().join("Cargo.lock"),
+                    format!(
+                        "version = 4\n\n[[package]]\nname = \"autumn-web\"\nversion = \"{v}\"\n"
+                    ),
+                )
+                .unwrap();
+            }
+            app_version(tmp.path())
+        };
+        assert_eq!(app("0.7", Some("0.7.3")).as_deref(), Some("0.7.3"));
+        // A stale lock the manifest no longer admits is not the version.
+        assert_eq!(app("0.8", Some("0.7.3")).as_deref(), Some("^0.8"));
+        assert_eq!(app("=0.7.0", None).as_deref(), Some("0.7.0"));
+        assert_eq!(app("=0.7", None).as_deref(), Some("~0.7"));
+        assert_eq!(app("0.7", None).as_deref(), Some("^0.7"));
     }
 
     /// A crates.io result spelled with `_` where the index has `-` is the

@@ -353,6 +353,22 @@ pub fn declared_dependency_version(manifest: &str, crate_name: &str) -> Option<S
 #[must_use]
 pub fn workspace_root(dir: &Path) -> PathBuf {
     let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    // `[package] workspace = "../.."` names the root outright, and Cargo
+    // takes it over any nearer `[workspace]`.
+    let explicit = std::fs::read_to_string(dir.join("Cargo.toml"))
+        .ok()
+        .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+        .and_then(|table| {
+            table
+                .get("package")?
+                .get("workspace")?
+                .as_str()
+                .map(str::to_owned)
+        });
+    if let Some(explicit) = explicit {
+        let root = dir.join(explicit);
+        return root.canonicalize().unwrap_or(root);
+    }
     dir.ancestors()
         .find(|d| {
             let Some(workspace) = std::fs::read_to_string(d.join("Cargo.toml"))
@@ -1070,6 +1086,27 @@ mod tests {
     fn write(path: &Path, text: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
+    }
+
+    /// `[package] workspace` names the root, over a nearer `[workspace]`.
+    #[test]
+    fn an_explicit_package_workspace_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().join("outer");
+        let app = outer.join("inner").join("app");
+        write(
+            &outer.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"inner/app\"]\n",
+        );
+        write(
+            &outer.join("inner/Cargo.toml"),
+            "[workspace]\nmembers = []\n",
+        );
+        write(
+            &app.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nworkspace = \"../..\"\n",
+        );
+        assert_eq!(workspace_root(&app), outer.canonicalize().unwrap());
     }
 
     /// A package an ancestor workspace excludes is its own root.
