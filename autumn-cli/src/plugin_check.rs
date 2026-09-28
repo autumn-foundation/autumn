@@ -247,7 +247,7 @@ pub fn run(opts: &PluginCheckOptions<'_>) {
         },
         &routes,
     );
-    report.autumn_web = locked_autumn_web(std::path::Path::new("."));
+    report.autumn_web = locked_autumn_web(std::path::Path::new("."), opts.package);
 
     match opts.format {
         ReportFormat::Text => print!("{}", report.to_text_report()),
@@ -335,10 +335,27 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
 }
 
 /// The `autumn-web` version the workspace's `Cargo.lock` resolved for the app
-/// in `dir`. Cargo uses the workspace root's lockfile, not a member's. `None`
-/// when there is no lockfile, or it locks more than one `autumn-web`.
-pub fn locked_autumn_web(dir: &std::path::Path) -> Option<String> {
-    crate::plugin::install::locked_version(dir, "autumn-web")
+/// in `dir`. Cargo uses the workspace root's lockfile, not a member's. With
+/// `package` (`-p`, else the manifest's own package) it follows that
+/// package's dependency edge, so another member on another `autumn-web` does
+/// not make it ambiguous. `None` when there is no lockfile, or the version
+/// cannot be told apart.
+pub fn locked_autumn_web(dir: &std::path::Path, package: Option<&str>) -> Option<String> {
+    use crate::plugin::install;
+    let own = || {
+        let text = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+        let table = toml::from_str::<toml::Table>(&text).ok()?;
+        table
+            .get("package")?
+            .get("name")?
+            .as_str()
+            .map(str::to_owned)
+    };
+    package
+        .map(str::to_owned)
+        .or_else(own)
+        .and_then(|package| install::locked_dependency_of(dir, &package, "autumn-web"))
+        .or_else(|| install::locked_version(dir, "autumn-web"))
 }
 
 /// What the child binary's stderr said about its plugin contracts.
@@ -1516,27 +1533,57 @@ mod contract_tests {
             "[workspace]\nmembers = [\"app\"]\n",
         )
         .unwrap();
-        assert_eq!(locked_autumn_web(&app), None);
+        assert_eq!(locked_autumn_web(&app, None), None);
         let pkg = |v: &str| format!("[[package]]\nname = \"autumn-web\"\nversion = \"{v}\"\n\n");
         let lock = format!(
             "version = 4\n\n{}[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n",
             pkg("0.7.1")
         );
         std::fs::write(tmp.path().join("Cargo.lock"), &lock).unwrap();
-        assert_eq!(locked_autumn_web(&app).as_deref(), Some("0.7.1"));
+        assert_eq!(locked_autumn_web(&app, None).as_deref(), Some("0.7.1"));
         // A stale member lockfile is not the one Cargo builds with.
         std::fs::write(
             app.join("Cargo.lock"),
             format!("version = 4\n\n{}", pkg("0.1.0")),
         )
         .unwrap();
-        assert_eq!(locked_autumn_web(&app).as_deref(), Some("0.7.1"));
+        assert_eq!(locked_autumn_web(&app, None).as_deref(), Some("0.7.1"));
         std::fs::write(
             tmp.path().join("Cargo.lock"),
             format!("version = 4\n\n{}{}", pkg("0.7.1"), pkg("0.6.0")),
         )
         .unwrap();
-        assert_eq!(locked_autumn_web(&app), None);
+        assert_eq!(locked_autumn_web(&app, None), None);
+        // The selected package's own edge tells two locked versions apart.
+        let host = "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\
+                    dependencies = [\"autumn-web 0.7.1\", \"serde\"]\n\n";
+        let other = "[[package]]\nname = \"other\"\nversion = \"0.1.0\"\n\
+                     dependencies = [\"autumn-web 0.6.0\"]\n\n";
+        std::fs::write(
+            tmp.path().join("Cargo.lock"),
+            format!(
+                "version = 4\n\n{host}{other}{}{}",
+                pkg("0.7.1"),
+                pkg("0.6.0")
+            ),
+        )
+        .unwrap();
+        assert_eq!(locked_autumn_web(&app, None).as_deref(), Some("0.7.1"));
+        assert_eq!(
+            locked_autumn_web(tmp.path(), Some("other")).as_deref(),
+            Some("0.6.0")
+        );
+        // A bare edge names the one locked version.
+        std::fs::write(
+            tmp.path().join("Cargo.lock"),
+            format!(
+                "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\"autumn-web\"]\n\n{}",
+                pkg("0.7.1")
+            ),
+        )
+        .unwrap();
+        assert_eq!(locked_autumn_web(&app, None).as_deref(), Some("0.7.1"));
     }
 
     fn opts(contracts: &ContractDump) -> PluginCheckOptions<'_> {

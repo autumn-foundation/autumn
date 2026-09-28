@@ -644,6 +644,21 @@ pub fn gate_listing(listing: &index::Listing, app: Option<&str>) -> Result<(), S
     let Some(app) = app else {
         return Ok(());
     };
+    // Fail closed: a requirement the range does not contain may resolve to a
+    // release the listing was never checked on. A first-party listing is
+    // lockstep, and `install::plan_add` checks its series.
+    if compat == Compat::Unknown && listing.origin != index::ListingOrigin::FirstParty {
+        return Err(format!(
+            "`{}` {} supports autumn-web {}, but this app's autumn-web requirement `{}` may \
+             resolve outside it. Pin autumn-web inside that range, or run `cargo \
+             generate-lockfile` so Cargo.lock names the version, then re-run. No files were \
+             changed.",
+            listing.name,
+            listing.version,
+            listing.autumn_web,
+            index::sanitize(app)
+        ));
+    }
     if compat != Compat::Incompatible {
         return Ok(());
     }
@@ -2368,6 +2383,12 @@ mod tests {
     #[test]
     fn the_gate_passes_a_compatible_or_unknown_app() {
         assert!(gate_listing(&listed_community(), Some(RELEASE)).is_ok());
+        // A requirement the range does not contain is refused, not waved on.
+        let mut narrow = listed_community();
+        narrow.autumn_web = format!("={RELEASE}");
+        let err = gate_listing(&narrow, Some(&format!("~{}", series()))).unwrap_err();
+        assert!(err.contains("may resolve outside it"), "{err}");
+        assert!(gate_listing(&narrow, Some(RELEASE)).is_ok());
         assert!(gate_listing(&listed_community(), None).is_ok());
     }
 

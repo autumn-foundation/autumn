@@ -165,6 +165,9 @@ changes a file. Then:
   next `cargo update`.
 - A listing that failed re-verification is refused, with the reason. It is
   also refused when the app's `autumn-web` version is not a plain version.
+- A community listing is refused when the app's `autumn-web` requirement may
+  resolve outside the listing's range: `"=0.7"` with no `Cargo.lock` may be
+  0.7.1, which a `=0.7.0` listing was never checked on.
 - A sandboxed listing is not wired. The command prints the review steps
   (`autumn plugin inspect`, `SandboxedPlugin::from_file`), changes no file,
   and exits 2.

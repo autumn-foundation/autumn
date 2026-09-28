@@ -415,6 +415,46 @@ pub fn locked_version(dir: &Path, crate_name: &str) -> Option<String> {
     versions.next().is_none().then_some(first)
 }
 
+/// The version of `crate_name` that `package`'s own dependency edge in the
+/// workspace `Cargo.lock` resolves to. Unlike [`locked_version`] this is
+/// exact when other members lock other versions. `None` when the lock has no
+/// single `package` entry, or it does not depend on `crate_name`.
+#[must_use]
+pub fn locked_dependency_of(dir: &Path, package: &str, crate_name: &str) -> Option<String> {
+    let text = std::fs::read_to_string(workspace_root(dir).join("Cargo.lock")).ok()?;
+    let lock = toml::from_str::<toml::Table>(&text).ok()?;
+    let packages = lock.get("package")?.as_array()?;
+    let named = |want: &str| {
+        let want = canonical(want);
+        packages.iter().filter(move |p| {
+            p.get("name")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|name| canonical(name) == want)
+        })
+    };
+    let mut owners = named(package);
+    let owner = owners.next()?;
+    if owners.next().is_some() {
+        return None;
+    }
+    // An edge is `name`, or `name version` when the lock holds several.
+    let edge = owner
+        .get("dependencies")?
+        .as_array()?
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .map(str::split_whitespace)
+        .find_map(|mut parts| {
+            (canonical(parts.next()?) == canonical(crate_name)).then(|| parts.next())
+        })?;
+    if let Some(version) = edge {
+        return Some(version.to_owned());
+    }
+    let mut versions = named(crate_name).filter_map(|p| p.get("version")?.as_str());
+    let first = versions.next()?.to_owned();
+    versions.next().is_none().then_some(first)
+}
+
 /// `manifest` with a `crate_name = { workspace = true }` entry replaced by the
 /// workspace root's `[workspace.dependencies]` entry, as Cargo resolves it.
 /// The root is the first ancestor of `root` (itself included) whose
