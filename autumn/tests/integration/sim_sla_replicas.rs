@@ -98,14 +98,6 @@ impl ObligationStore for RacingStore {
         self.inner.release_escalation(key, generation, claimed_at)
     }
 
-    fn mark_scheduled<'a>(&'a self, key: &'a str, generation: Uuid) -> StoreFuture<'a, bool> {
-        self.inner.mark_scheduled(key, generation)
-    }
-
-    fn remove_unscheduled<'a>(&'a self, key: &'a str, generation: Uuid) -> StoreFuture<'a, bool> {
-        self.inner.remove_unscheduled(key, generation)
-    }
-
     fn remove<'a>(&'a self, key: &'a str) -> StoreFuture<'a, bool> {
         self.inner.remove(key)
     }
@@ -197,7 +189,7 @@ async fn sim_sla_two_replicas_escalate_once() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn sim_sla_track_rolls_back_only_the_record_it_made() {
+async fn sim_sla_a_failed_track_can_be_retried() {
     let _guard = job::global_job_runtime_test_lock().lock().await;
     job::clear_global_job_client();
 
@@ -207,23 +199,24 @@ async fn sim_sla_track_rolls_back_only_the_record_it_made() {
     let fired = Arc::new(Mutex::new(Vec::new()));
     let app = replica(&clock, &store, &fired);
     let sla = Sla::from_state(app.state()).unwrap();
-    store.fail_mark_met.store(true, Ordering::SeqCst);
-
-    // A new record, then `mark_met` fails: the record goes away.
-    let fresh = Obligation::new("first_response", "ticket:1")
-        .within(BusinessDuration::hours(2))
-        .calendar("support")
-        .met_at(start);
-    assert!(sla.track(&fresh).await.is_err());
-    assert!(sla.get(&fresh.key()).await.unwrap().is_none());
-
-    // A record that another call made stays.
-    let shared = Obligation::new("first_response", "ticket:2")
+    let ob = Obligation::new("first_response", "ticket:1")
         .within(BusinessDuration::hours(2))
         .calendar("support");
-    sla.track(&shared).await.unwrap();
-    assert!(sla.track(&shared.clone().met_at(start)).await.is_err());
-    assert!(sla.get(&shared.key()).await.unwrap().is_some());
+    sla.track(&ob).await.unwrap();
+
+    // The store fails while a later `track` reports the reply.
+    let met = start + chrono::Duration::minutes(30);
+    store.fail_mark_met.store(true, Ordering::SeqCst);
+    assert!(sla.track(&ob.clone().met_at(met)).await.is_err());
+    let status = sla.get(&ob.key()).await.unwrap().unwrap();
+    assert_eq!(status.met_at, None, "the record stays, not met yet");
+
+    // The same call again succeeds.
+    store.fail_mark_met.store(false, Ordering::SeqCst);
+    clock.advance(Duration::from_secs(3600));
+    let status = sla.track(&ob.clone().met_at(met)).await.unwrap();
+    assert_eq!(status.met_at, Some(met));
+    assert_eq!(status.state, autumn_web::sla::ObligationState::Met);
 
     job::clear_global_job_client();
 }

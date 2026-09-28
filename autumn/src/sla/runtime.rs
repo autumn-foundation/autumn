@@ -27,9 +27,6 @@ pub const ESCALATE_JOB: &str = "autumn_sla_escalate";
 /// most.
 const MAX_EARLY_CHECK: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Attempts to pin a tracked record that a failed creator removed.
-const PIN_ATTEMPTS: usize = 3;
-
 /// Attempts for each SLA job before it goes to the dead letters.
 const MAX_ATTEMPTS: u32 = 5;
 
@@ -272,10 +269,9 @@ impl Sla {
     /// A second call with the same key keeps the first record. A met instant
     /// on `obligation` marks the record met.
     ///
-    /// # Errors
-    ///
-    /// If this call made the record and a later step fails, it removes the
-    /// record again, unless another `track` call scheduled it.
+    /// It is safe to call again. If it fails after it stored the record (for
+    /// example, the job queue refused the check), the record stays and the
+    /// next call schedules the check.
     ///
     /// # Errors
     ///
@@ -291,74 +287,29 @@ impl Sla {
                 obligation.key()
             )));
         }
+        let zone = self.zone_of(obligation, calendar);
         let resolved = obligation
             .clone()
-            .zone(self.zone_of(obligation, calendar))
-            .starting_at(obligation.started_at().unwrap_or(now))
-            .met_at(None);
+            .zone(zone)
+            .starting_at(obligation.started_at().unwrap_or(now));
         let key = resolved.key();
+        // Refuse before the insert, so a refused obligation leaves no record.
+        if resolved.status_with(calendar, zone, now).due_at.is_none() {
+            return Err(SlaError::NoDeadline(key));
+        }
         let store = &self.engine.store;
         let generation = self.state.entropy().uuid_v4();
-        let (record, created) = store
+        let (mut record, created) = store
             .insert(ObligationRecord::new(resolved, generation))
             .await?;
-        let status = match self.mark_and_schedule(&key, &record, obligation, now).await {
-            Ok(status) => status,
-            Err(err) => {
-                // Do not keep a record that this call made and could not
-                // schedule, unless another call scheduled it.
-                if created {
-                    store.remove_unscheduled(&key, record.generation).await?;
-                }
-                return Err(err);
-            }
-        };
-        // Pin the instance that this call scheduled. If a failed creator
-        // removed it after our check job went on the queue, put the stored
-        // record back for that job.
-        for _ in 0..PIN_ATTEMPTS {
-            if store.mark_scheduled(&key, record.generation).await? {
-                // A concurrent re-insert can hold an older copy. Write the
-                // met instant again; `mark_met` keeps a value that is set.
-                if let Some(met) = obligation.met() {
-                    store.mark_met(&key, record.generation, met).await?;
-                }
-                return Ok(status);
-            }
-            let (current, _) = store.insert(record.clone()).await?;
-            if current.generation != record.generation {
-                // A `forget` and a new `track` replaced this instance. The
-                // new call owns the new record.
-                return Ok(status);
-            }
-            if let Some(met) = obligation.met() {
-                store.mark_met(&key, record.generation, met).await?;
-            }
-        }
-        Err(SlaError::Store(format!(
-            "{key}: the record keeps disappearing"
-        )))
-    }
-
-    /// Mark a stored record met, if `obligation` is met, then schedule it.
-    async fn mark_and_schedule(
-        &self,
-        key: &str,
-        record: &ObligationRecord,
-        obligation: &Obligation,
-        now: DateTime<Utc>,
-    ) -> Result<ObligationStatus, SlaError> {
-        let mut record = record.clone();
-        if let Some(met) = obligation.met()
-            && self
-                .engine
-                .store
-                .mark_met(key, record.generation, met)
-                .await?
+        // A new record has the met instant already. An older one gets it now.
+        if !created
+            && let Some(met) = obligation.met()
+            && store.mark_met(&key, record.generation, met).await?
         {
             record.obligation.set_met(met);
         }
-        self.schedule(key, &record, now).await
+        self.schedule(&key, &record, now).await
     }
 
     /// Put the check job of `record` on the queue, if it is still open.

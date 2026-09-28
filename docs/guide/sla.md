@@ -207,6 +207,10 @@ A failed handler runs again, up to 5 attempts in all, with a first delay of
 1 s. Use
 `on_any_breach` for obligations that have no named handler.
 
+`track` is safe to call again. If it fails after it stored the record (for
+example, the job queue refused the check), the record stays and the next call
+schedules the check.
+
 If the process stops after the claim and before the enqueue, that escalation
 is lost. The record keeps `escalated_at`, so `Sla::statuses` shows it.
 
@@ -218,9 +222,9 @@ than one replica, put an `ObligationStore` on your database with
 `SlaPlugin::store`, and use it on all replicas.
 
 Each record has a `generation`, a unique id that `track` makes. The writes
-after the insert (`mark_met`, `claim_escalation`, `release_escalation`,
-`mark_scheduled`, `remove_unscheduled`) must change the record only when the
-key and the generation both match, in one atomic step. Thus a slow call never
+after the insert (`mark_met`, `claim_escalation`, `release_escalation`) must
+change the record only when the key and the generation both match, in one
+atomic step. Thus a slow call never
 changes a record that `forget` and a new `track` replaced. For example:
 
 ```sql

@@ -24,20 +24,16 @@ pub struct ObligationRecord {
     pub generation: Uuid,
     /// The instant when the escalation was claimed.
     pub escalated_at: Option<DateTime<Utc>>,
-    /// Whether a `track` call finished on this record. A rollback does not
-    /// remove a scheduled record.
-    pub scheduled: bool,
 }
 
 impl ObligationRecord {
-    /// Make a new record with no escalation that is not scheduled.
+    /// Make a new record with no escalation.
     #[must_use]
     pub const fn new(obligation: Obligation, generation: Uuid) -> Self {
         Self {
             obligation,
             generation,
             escalated_at: None,
-            scheduled: false,
         }
     }
 }
@@ -91,13 +87,6 @@ pub trait ObligationStore: Send + Sync + 'static {
         generation: Uuid,
         claimed_at: DateTime<Utc>,
     ) -> StoreFuture<'a, ()>;
-
-    /// Set `scheduled`. Return `false` if there is no such record.
-    fn mark_scheduled<'a>(&'a self, key: &'a str, generation: Uuid) -> StoreFuture<'a, bool>;
-
-    /// Remove the record only if it is untouched: not scheduled, not met and
-    /// not escalated. Return `true` if it removed the record.
-    fn remove_unscheduled<'a>(&'a self, key: &'a str, generation: Uuid) -> StoreFuture<'a, bool>;
 
     /// Remove the record for `key`, whatever its generation. Return `true`
     /// if it existed.
@@ -213,23 +202,6 @@ impl ObligationStore for MemoryObligationStore {
             }
         });
         Box::pin(async move { released.await.map(|_| ()) })
-    }
-
-    fn mark_scheduled<'a>(&'a self, key: &'a str, generation: Uuid) -> StoreFuture<'a, bool> {
-        let marked = self.with_instance(key, generation, |record| record.scheduled = true);
-        Box::pin(async move { Ok(marked.await?.is_some()) })
-    }
-
-    fn remove_unscheduled<'a>(&'a self, key: &'a str, generation: Uuid) -> StoreFuture<'a, bool> {
-        self.with(|records| {
-            let removable = records.get(key).is_some_and(|record| {
-                record.generation == generation
-                    && !record.scheduled
-                    && record.obligation.met().is_none()
-                    && record.escalated_at.is_none()
-            });
-            removable && records.remove(key).is_some()
-        })
     }
 
     fn remove<'a>(&'a self, key: &'a str) -> StoreFuture<'a, bool> {

@@ -652,40 +652,6 @@ async fn store_claims_an_obligation_met_after_the_deadline() {
 }
 
 #[tokio::test]
-async fn store_does_not_roll_back_a_scheduled_record() {
-    // Call A creates the record. Call B adopts it and pins it.
-    let store = store_with_one().await;
-    assert!(store.mark_scheduled(KEY, GEN).await.unwrap());
-    // Call A fails later: its rollback must not remove B's record.
-    assert!(!store.remove_unscheduled(KEY, GEN).await.unwrap());
-    assert!(store.get(KEY).await.unwrap().is_some());
-}
-
-#[tokio::test]
-async fn store_rolls_back_an_unscheduled_record() {
-    let store = store_with_one().await;
-    assert!(store.remove_unscheduled(KEY, GEN).await.unwrap());
-    assert!(
-        !store.mark_scheduled(KEY, GEN).await.unwrap(),
-        "no record to pin"
-    );
-}
-
-#[tokio::test]
-async fn store_does_not_roll_back_a_record_that_another_call_changed() {
-    // Call A creates the record. Call C marks it met. Call A fails later:
-    // its rollback must keep C's change.
-    let store = store_with_one().await;
-    store
-        .mark_met(KEY, GEN, utc(2024, 1, 8, 10, 0))
-        .await
-        .unwrap();
-    assert!(!store.remove_unscheduled(KEY, GEN).await.unwrap());
-    let stored = store.get(KEY).await.unwrap().unwrap();
-    assert_eq!(stored.obligation.met(), Some(utc(2024, 1, 8, 10, 0)));
-}
-
-#[tokio::test]
 async fn store_writes_touch_only_their_own_generation() {
     // A slow call loaded generation GEN. Then `forget` and `track` made a
     // new record with the same start but another generation.
@@ -700,13 +666,10 @@ async fn store_writes_touch_only_their_own_generation() {
 
     assert!(!store.claim_escalation(KEY, GEN, due, due).await.unwrap());
     assert!(!store.mark_met(KEY, GEN, due).await.unwrap());
-    assert!(!store.mark_scheduled(KEY, GEN).await.unwrap());
-    assert!(!store.remove_unscheduled(KEY, GEN).await.unwrap());
     let stored = store.get(KEY).await.unwrap().unwrap();
     assert_eq!(stored.generation, new);
     assert_eq!(stored.escalated_at, None);
     assert_eq!(stored.obligation.met(), None);
-    assert!(!stored.scheduled);
 
     // The new claim is not released by the old instance.
     assert!(store.claim_escalation(KEY, new, due, due).await.unwrap());
