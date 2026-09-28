@@ -752,3 +752,91 @@ fn duration_serializes_as_text() {
     );
     assert!(serde_json::from_str::<BusinessDuration>("\"soon\"").is_err());
 }
+
+/// A store whose `release_escalation` fails a set number of times.
+struct FlakyRelease {
+    inner: MemoryObligationStore,
+    failures: std::sync::atomic::AtomicUsize,
+}
+
+impl ObligationStore for FlakyRelease {
+    fn insert(&self, record: ObligationRecord) -> StoreFuture<'_, (ObligationRecord, bool)> {
+        self.inner.insert(record)
+    }
+
+    fn get<'a>(&'a self, key: &'a str) -> StoreFuture<'a, Option<ObligationRecord>> {
+        self.inner.get(key)
+    }
+
+    fn list(&self) -> StoreFuture<'_, Vec<ObligationRecord>> {
+        self.inner.list()
+    }
+
+    fn mark_met<'a>(
+        &'a self,
+        key: &'a str,
+        generation: uuid::Uuid,
+        at: DateTime<Utc>,
+    ) -> StoreFuture<'a, bool> {
+        self.inner.mark_met(key, generation, at)
+    }
+
+    fn claim_escalation<'a>(
+        &'a self,
+        key: &'a str,
+        generation: uuid::Uuid,
+        due_at: DateTime<Utc>,
+        at: DateTime<Utc>,
+    ) -> StoreFuture<'a, bool> {
+        self.inner.claim_escalation(key, generation, due_at, at)
+    }
+
+    fn release_escalation<'a>(
+        &'a self,
+        key: &'a str,
+        generation: uuid::Uuid,
+        claimed_at: DateTime<Utc>,
+    ) -> StoreFuture<'a, ()> {
+        use std::sync::atomic::Ordering;
+        let fail = self
+            .failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        if fail {
+            return Box::pin(std::future::ready(Err(SlaError::Store("down".to_owned()))));
+        }
+        self.inner.release_escalation(key, generation, claimed_at)
+    }
+
+    fn remove<'a>(&'a self, key: &'a str) -> StoreFuture<'a, bool> {
+        self.inner.remove(key)
+    }
+}
+
+async fn flaky_release(failures: usize) -> FlakyRelease {
+    let store = FlakyRelease {
+        inner: store_with_one().await,
+        failures: failures.into(),
+    };
+    let due = utc(2024, 1, 9, 15, 0);
+    assert!(store.claim_escalation(KEY, GEN, due, due).await.unwrap());
+    store
+}
+
+#[tokio::test(start_paused = true)]
+async fn release_claim_retries_a_failed_release() {
+    let store = flaky_release(2).await;
+    let due = utc(2024, 1, 9, 15, 0);
+    runtime::release_claim(&store, KEY, GEN, due).await.unwrap();
+    assert!(
+        store.claim_escalation(KEY, GEN, due, due).await.unwrap(),
+        "the claim is free again, so a retried check can escalate"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn release_claim_gives_up_after_its_attempts() {
+    let store = flaky_release(usize::MAX).await;
+    let due = utc(2024, 1, 9, 15, 0);
+    assert!(runtime::release_claim(&store, KEY, GEN, due).await.is_err());
+}

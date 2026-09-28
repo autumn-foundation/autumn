@@ -37,6 +37,12 @@ const MAX_ATTEMPTS: u32 = 5;
 /// The first retry delay of an SLA job.
 const BACKOFF_MS: u64 = 1_000;
 
+/// Attempts to release a claim after a failed enqueue.
+const RELEASE_ATTEMPTS: u32 = 5;
+
+/// The first delay between two release attempts. It doubles each time.
+const RELEASE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
 type BreachFuture = Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>>;
 type BreachHandler = Arc<dyn Fn(AppState, SlaBreach) -> BreachFuture + Send + Sync>;
 
@@ -575,12 +581,12 @@ impl Sla {
         };
         if let Err(err) = self.enqueue(ESCALATE_JOB, &breach, None).await {
             // Release the claim, so that the retry of this check can claim again.
-            if let Err(release) = store.release_escalation(key, record.generation, now).await {
+            if let Err(release) = release_claim(store.as_ref(), key, record.generation, now).await {
                 tracing::error!(
                     %key,
                     enqueue = %err,
                     release = %release,
-                    "SLA escalation is claimed but not enqueued"
+                    "SLA escalation is claimed but not enqueued; this escalation is lost"
                 );
             }
             return Err(err);
@@ -651,4 +657,27 @@ impl axum::extract::FromRequestParts<AppState> for Sla {
     ) -> Result<Self, Self::Rejection> {
         Ok(Self::from_state(state)?)
     }
+}
+
+/// Release the claim of `key` after a failed enqueue. Try again after a store
+/// error, up to [`RELEASE_ATTEMPTS`] times. A claim that stays set stops each
+/// retry of the check, so the escalation is lost.
+pub(super) async fn release_claim(
+    store: &dyn ObligationStore,
+    key: &str,
+    generation: uuid::Uuid,
+    claimed_at: DateTime<Utc>,
+) -> Result<(), SlaError> {
+    let mut delay = RELEASE_BACKOFF;
+    for attempt in 1..RELEASE_ATTEMPTS {
+        match store.release_escalation(key, generation, claimed_at).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                tracing::warn!(%key, attempt, error = %err, "SLA claim release failed; trying again");
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2);
+            }
+        }
+    }
+    store.release_escalation(key, generation, claimed_at).await
 }
