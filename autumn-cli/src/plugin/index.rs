@@ -500,7 +500,9 @@ impl Listing {
         }
         // An unresolved requirement (`^0.7.0`) may resolve to any release of
         // its series: compatible only when the range admits all of it.
-        if app.trim_start().starts_with(['^', '~']) && !req.matches(&series_top(&low)) {
+        if let Some(top) = requirement_top(app, &low)
+            && !req.matches(&top)
+        {
             return Compat::Unknown;
         }
         Compat::Compatible
@@ -921,6 +923,22 @@ fn concrete(version: &str) -> Option<semver::Version> {
     })
 }
 
+/// The highest version an unresolved `^`/`~` requirement `app` (lowest
+/// version `low`) admits; `None` for a concrete version. A caret spans the
+/// compatibility series; a tilde stays within its minor (`~1.2`, `~0.7.3`),
+/// or its major when it names only one (`~1`).
+fn requirement_top(app: &str, low: &semver::Version) -> Option<semver::Version> {
+    let app = app.trim_start();
+    if let Some(rest) = app.strip_prefix('~') {
+        return Some(if rest.trim().split('.').count() == 1 {
+            semver::Version::new(low.major, u64::MAX, u64::MAX)
+        } else {
+            semver::Version::new(low.major, low.minor, u64::MAX)
+        });
+    }
+    app.starts_with('^').then(|| series_top(low))
+}
+
 /// The highest version in `v`'s compatibility series.
 const fn series_top(v: &semver::Version) -> semver::Version {
     if v.major == 0 {
@@ -1160,6 +1178,11 @@ mod tests {
         assert_eq!(listing.compat("0.6.0"), Compat::Incompatible);
         assert_eq!(listing.compat("0.8.0"), Compat::Incompatible);
         assert_eq!(listing.compat(">=0.6"), Compat::Unknown);
+        // A tilde stays within its minor: `~1.2` fits a `~1.2` listing.
+        let mut one_two = community();
+        one_two.autumn_web = "~1.2".to_owned();
+        assert_eq!(one_two.compat("~1.2"), Compat::Compatible);
+        assert_eq!(one_two.compat("^1.2"), Compat::Unknown);
         // A prerelease is not in the stable range Cargo matches it against.
         assert_eq!(listing.compat("0.7.0-alpha.1"), Compat::Incompatible);
     }

@@ -589,10 +589,94 @@ pub fn with_inherited_dependency(root: &Path, manifest: &str, crate_name: &str) 
 /// takes every crates.io crate from the named source.
 #[must_use]
 pub fn patched_by(root: &Path, crate_name: &str, version: &str) -> Option<String> {
-    let cargo_home = std::env::var_os("CARGO_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".cargo")));
-    patched_by_in(root, crate_name, version, cargo_home.as_deref())
+    patched_by_in(root, crate_name, version, cargo_home().as_deref())
+}
+
+/// `$CARGO_HOME`, or `~/.cargo`.
+fn cargo_home() -> Option<PathBuf> {
+    std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".cargo")))
+}
+
+/// The Cargo config files that apply at `root`, each with the directory its
+/// relative paths resolve from: `.cargo/config` (Cargo reads it over
+/// `config.toml` when both exist) in `root` and every ancestor, then
+/// `$CARGO_HOME`'s. A path resolves from the directory holding `.cargo`.
+fn config_files(root: &Path, cargo_home: Option<&Path>) -> Vec<(PathBuf, PathBuf)> {
+    root.ancestors()
+        .map(|dir| dir.join(".cargo"))
+        .chain(cargo_home.map(Path::to_path_buf))
+        .map(|dir| {
+            let legacy = dir.join("config");
+            let path = if legacy.is_file() {
+                legacy
+            } else {
+                dir.join("config.toml")
+            };
+            let base = dir.parent().map_or_else(|| dir.clone(), Path::to_path_buf);
+            (path, base)
+        })
+        .collect()
+}
+
+/// `path` without `.` and `..` segments: the real path when it exists, else
+/// a lexical normalization, so two spellings of one checkout compare equal.
+fn normalized(path: &Path) -> PathBuf {
+    if let Ok(real) = path.canonicalize() {
+        return real;
+    }
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The checkouts crates.io patches of `autumn-web` point at, from the
+/// workspace root manifest and every applicable config, normalized.
+fn framework_patch_dirs(root: &Path) -> Vec<PathBuf> {
+    let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    let workspace = workspace_root(&root);
+    let mut files = vec![(workspace.join("Cargo.toml"), workspace)];
+    files.extend(config_files(&root, cargo_home().as_deref()));
+    let want = canonical("autumn-web");
+    let mut dirs = Vec::new();
+    for (file, base) in files {
+        let Some(table) = std::fs::read_to_string(&file)
+            .ok()
+            .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+        else {
+            continue;
+        };
+        let Some(patch) = table.get("patch").and_then(toml::Value::as_table) else {
+            continue;
+        };
+        for (_, entries) in patch
+            .iter()
+            .filter(|(source, _)| is_crates_io_source(source))
+        {
+            for (key, entry) in entries.as_table().into_iter().flat_map(|e| e.iter()) {
+                let package = entry
+                    .get("package")
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or(key);
+                if canonical(package) != want {
+                    continue;
+                }
+                if let Some(path) = entry.get("path").and_then(toml::Value::as_str) {
+                    dirs.push(normalized(&base.join(path)));
+                }
+            }
+        }
+    }
+    dirs
 }
 
 /// [`patched_by`] with `$CARGO_HOME` given, so a test need not set it.
@@ -631,25 +715,11 @@ fn patched_by_in(
             }
         }
     }
-    let configs = root
-        .ancestors()
-        .map(|dir| dir.join(".cargo"))
-        .chain(cargo_home.map(Path::to_path_buf));
-    for dir in configs {
-        // Cargo reads the extensionless `config` when both exist.
-        let legacy = dir.join("config");
-        let path = if legacy.is_file() {
-            legacy
-        } else {
-            dir.join("config.toml")
-        };
-        // A config's relative paths resolve from the directory holding
-        // its `.cargo` (for `$CARGO_HOME`, its parent).
-        let base = dir.parent().unwrap_or(&dir);
+    for (path, base) in config_files(root, cargo_home) {
         let Some(table) = read(&path) else {
             continue;
         };
-        if let Some(source) = crates_io_patch(&table, &want, pinned.as_ref(), base) {
+        if let Some(source) = crates_io_patch(&table, &want, pinned.as_ref(), &base) {
             return Some(format!("[patch.{source}] in {}", path.display()));
         }
         // Source replacement swaps crates.io itself: every crate, this one
@@ -875,20 +945,28 @@ pub fn unpatched_local_framework(root: &Path) -> bool {
     if locals.is_empty() {
         return false;
     }
-    // A patch collapses the two copies only when it supplies the version the
-    // checkout is: Cargo skips a patch whose version does not match. A path
-    // resolves from the app or, when inherited, the workspace root; a git
-    // checkout's version cannot be read, so any patch is taken for it.
-    let version = locals
+    // A patch collapses the two copies only when it points at the same
+    // checkout: two paths are two packages to Cargo, whatever their version.
+    // A path resolves from the app or, when inherited, the workspace root.
+    let root_abs = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    let patches = framework_patch_dirs(root);
+    let path_unpatched = locals
         .iter()
-        .find_map(|entry| {
-            let path = entry.get("path")?.as_str()?;
-            package_version(&root.join(path))
-                .or_else(|| package_version(&workspace_root(root).join(path)))
-        })
-        .map(|version| version.to_string())
-        .unwrap_or_default();
-    patched_by(root, "autumn-web", &version).is_none()
+        .filter_map(|entry| entry.get("path")?.as_str())
+        .any(|path| {
+            let own = root_abs.join(path);
+            let checkout = if own.join("Cargo.toml").is_file() {
+                own
+            } else {
+                workspace_root(&root_abs).join(path)
+            };
+            !patches.contains(&normalized(&checkout))
+        });
+    // A git checkout cannot be compared by path: any crates.io patch of the
+    // framework is taken for it.
+    let git_unpatched = locals.iter().any(|entry| entry.get("git").is_some())
+        && patched_by(root, "autumn-web", "").is_none();
+    path_unpatched || git_unpatched
 }
 
 /// Whether `main_rs` already mounts `entry` **in code**.
@@ -1998,6 +2076,31 @@ maud = { version = "0.27", features = ["axum"] }
         write(&app.join("Cargo.toml"), &manifest("other"));
         assert!(unpatched_local_framework(&app));
         write(&app.join("Cargo.toml"), &manifest("autumn"));
+        assert!(!unpatched_local_framework(&app));
+    }
+
+    /// A patch to another checkout of the same version is another package
+    /// to Cargo: it does not collapse the app's own copy.
+    #[test]
+    fn a_patch_to_another_checkout_does_not_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app");
+        for fork in ["fork-a", "fork-b"] {
+            write(
+                &tmp.path().join(fork).join("Cargo.toml"),
+                "[package]\nname = \"autumn-web\"\nversion = \"0.7.0\"\n",
+            );
+        }
+        let manifest = |patch: &str| {
+            format!(
+                "[package]\nname = \"demo\"\n\n[dependencies]\nautumn-web = {{ path = \"../fork-a\" }}\n\n\
+                 [patch.crates-io]\nautumn-web = {{ path = \"{patch}\" }}\n"
+            )
+        };
+        write(&app.join("Cargo.toml"), &manifest("../fork-b"));
+        assert!(unpatched_local_framework(&app));
+        // Another spelling of the same checkout is the same package.
+        write(&app.join("Cargo.toml"), &manifest("../app/../fork-a"));
         assert!(!unpatched_local_framework(&app));
     }
 
