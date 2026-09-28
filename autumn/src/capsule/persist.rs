@@ -987,7 +987,7 @@ mod tests {
         // `reporting::dispatch` hands persistence to `spawn_blocking`, so the
         // whole scope has to survive the trip to another thread and the write
         // has to land there — not just when it runs inline on the worker.
-        let written = tokio::task::spawn_blocking(move || {
+        let written = crate::time::spawn_blocking(move || {
             persist(
                 &scope,
                 CapsuleOutcome::Status {

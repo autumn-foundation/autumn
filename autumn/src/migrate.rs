@@ -582,7 +582,7 @@ pub(crate) async fn check_replica_migration_readiness_blocking(
     primary_url: String,
     replica_url: String,
 ) -> ReplicaMigrationReadiness {
-    tokio::task::spawn_blocking(move || {
+    crate::time::spawn_blocking(move || {
         check_replica_migration_readiness(&primary_url, &replica_url)
     })
     .await
@@ -4884,7 +4884,7 @@ mod tests {
         let handles: Vec<_> = (0..4)
             .map(|_| {
                 let url = url.clone();
-                tokio::task::spawn_blocking(move || run_pending_locked(&url, TEST_MIGRATIONS, None))
+                crate::time::spawn_blocking(move || run_pending_locked(&url, TEST_MIGRATIONS, None))
             })
             .collect();
 
@@ -4949,7 +4949,7 @@ mod tests {
 
         // Diesel's sync API is blocking; run it off the runtime thread. The
         // container handle stays owned here so it outlives the blocking work.
-        tokio::task::spawn_blocking(move || checksum_loop_body(&url))
+        crate::time::spawn_blocking(move || checksum_loop_body(&url))
             .await
             .expect("checksum loop task panicked");
     }

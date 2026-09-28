@@ -27,4 +27,5 @@ disallowed-methods = [
   { path = "chrono::Utc::now", reason = "read the injected wall clock: state.clock().now(), or the Clock extractor in a handler. With no clock in scope, use autumn_web::time::ambient_now() (#2967). (#1797)" },
   { path = "std::time::SystemTime::now", reason = "use autumn_web::time::clock_unix_secs(clock) / clock_unix_duration(clock), which read the injected clock. With no clock in scope, use autumn_web::time::ambient_system_time() (#2967). (#1797)" },
   { path = "uuid::Uuid::new_v4", reason = "mint ids through the injected entropy source: state.entropy().uuid_v4(), or the Rng extractor in a handler. (#1797)" },
+  { path = "tokio::task::spawn_blocking", reason = "use crate::time::spawn_blocking, which carries the running Sim's ambient clock into the blocking thread. Under a plain spawn_blocking, time read in the closure is the system clock, even inside a #[sim_test] (#2967)." },
 ]

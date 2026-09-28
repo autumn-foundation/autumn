@@ -4028,7 +4028,7 @@ impl AppBuilder {
             let interval = std::time::Duration::from_millis(500);
             loop {
                 let poll_path = path.clone();
-                let load_res = tokio::task::spawn_blocking(move || {
+                let load_res = crate::time::spawn_blocking(move || {
                     crate::maintenance::MaintenanceState::load_from_file(&poll_path)
                 })
                 .await;
@@ -4181,7 +4181,7 @@ impl AppBuilder {
             // read from it, so a test that freezes time moves them all (#1797).
             let clock = state.clock_arc();
 
-            let built = tokio::task::spawn_blocking(move || {
+            let built = crate::time::spawn_blocking(move || {
                 crate::replication::build(
                     &replication_config,
                     &database_url,
@@ -6992,7 +6992,7 @@ impl AppBuilder {
 
         // The diesel harness and the advisory-lock poll block, so apply off the
         // Tokio worker threads. Each target's failure exits non-zero from inside.
-        let applied_total = tokio::task::spawn_blocking(move || {
+        let applied_total = crate::time::spawn_blocking(move || {
             let mut total = 0_usize;
             if let Some(url) = &control_url {
                 // SQLite single-writer control target (issue #1614, PR3): apply with
@@ -11974,7 +11974,7 @@ async fn run_startup_migrations(
     let disambiguated = crate::migrate::compute_migration_disambiguation(&disambiguation_sets);
     #[cfg(feature = "sqlite")]
     let sqlite_history_sets = crate::migrate::sqlite_collision_pairs(&disambiguation_sets);
-    let migration_result = tokio::task::spawn_blocking(move || {
+    let migration_result = crate::time::spawn_blocking(move || {
         // SQLite single-writer startup-migration path (#1614, PR3): apply the
         // registered migrations to a `sqlite://` control target with no advisory
         // lock. Sharding — directory, shard-map, per-shard fan-out — is

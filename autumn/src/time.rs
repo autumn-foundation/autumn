@@ -553,11 +553,20 @@ impl Drop for AmbientGuard {
 /// Make `clock` the ambient clock of this thread until the guard drops. The
 /// newest installed clock wins, so a nested `Sim` shadows an outer one.
 pub(crate) fn install_ambient(clock: Arc<dyn ClockSource>) -> AmbientGuard {
-    let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
     // Read before the stack is borrowed: a sim clock's read touches its own
     // state, not this stack.
     let start = clock.monotonic().since_origin();
-    let floor = instant_floor();
+    install_ambient_at(clock, instant_floor(), start)
+}
+
+/// Install `clock` with a given instant floor and start reading, so its
+/// instants on this thread match those it gives on another.
+fn install_ambient_at(
+    clock: Arc<dyn ClockSource>,
+    floor: Duration,
+    start: Duration,
+) -> AmbientGuard {
+    let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
     AMBIENT.with(|stack| {
         stack.borrow_mut().push(AmbientEntry {
             alive: Arc::clone(&alive),
@@ -583,6 +592,29 @@ fn ambient_entry() -> Option<(Arc<dyn ClockSource>, Duration, Duration)> {
         })
         .ok()
         .flatten()
+}
+
+/// Run `f` on tokio's blocking pool with this thread's ambient clock.
+///
+/// The ambient clock belongs to one thread. Under a plain
+/// `tokio::task::spawn_blocking`, time read in `f` is the system clock, even
+/// inside a `Sim`. This carries the running sim's clock into the blocking
+/// thread, with the same instants, so `f` reads the sim's time. With no
+/// ambient clock it is a plain `spawn_blocking` (issue #2967).
+pub(crate) fn spawn_blocking<F, R>(f: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let carried = ambient_entry();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the sanctioned spawn_blocking: it carries the ambient clock"
+    )]
+    tokio::task::spawn_blocking(move || {
+        let _guard = carried.map(|(clock, floor, start)| install_ambient_at(clock, floor, start));
+        f()
+    })
 }
 
 thread_local! {
@@ -984,6 +1016,55 @@ mod tests {
         assert!(fresh >= stored, "a new timeline does not go back");
         second.advance(hour);
         assert_eq!(ambient_instant().saturating_duration_since(fresh), hour);
+    }
+
+    #[test]
+    fn framework_code_spawns_blocking_work_through_the_ambient_helper() {
+        // A plain `tokio::task::spawn_blocking` reads the system clock inside
+        // a `Sim`. Clippy bans it only in the modules the determinism gate
+        // covers, so this checks the rest of the crate (issue #2967).
+        fn visit(dir: &std::path::Path, offenders: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(&path, offenders);
+                } else if path.extension().is_some_and(|ext| ext == "rs")
+                    && !path.ends_with("src/time.rs")
+                    && std::fs::read_to_string(&path)
+                        .unwrap()
+                        .contains("task::spawn_blocking")
+                {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+        let mut offenders = Vec::new();
+        visit(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut offenders,
+        );
+        assert!(
+            offenders.is_empty(),
+            "use crate::time::spawn_blocking instead of tokio::task::spawn_blocking in {offenders:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_blocking_reads_the_callers_ambient_clock() {
+        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let clock = TickingClock::starting_at(epoch);
+        let guard = install_ambient(Arc::new(clock.clone()));
+        clock.advance(std::time::Duration::from_secs(3600));
+        let here = (ambient_now(), ambient_instant());
+        let there = spawn_blocking(|| (ambient_now(), ambient_instant()))
+            .await
+            .unwrap();
+        assert_eq!(there, here, "the blocking thread reads the same clock");
+        drop(guard);
+
+        // With no ambient clock, the blocking thread reads the system clock.
+        let there = spawn_blocking(ambient_now).await.unwrap();
+        assert!((Utc::now() - there).num_seconds().abs() < 5);
     }
 
     #[test]

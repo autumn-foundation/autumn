@@ -487,6 +487,7 @@ The gate makes that a compile error instead of a code-review hope.
 | `std::time::Instant::now()` (a deadline whose counterparty is `tokio::time::sleep`) | `tokio::time::Instant::now()` | anywhere — tokio's paused runtime already virtualizes it |
 | `std::time::SystemTime::now()` | `time::clock_unix_secs(clock)` / `time::clock_unix_duration(clock)` | same |
 | `uuid::Uuid::new_v4()` | `state.entropy().uuid_v4()`; the `Rng` extractor in a handler | same |
+| `tokio::task::spawn_blocking` | `crate::time::spawn_blocking`, which carries the running `Sim`'s ambient clock into the blocking thread | framework code |
 
 Two notes on the monotonic seam, because they are the parts that surprise people:
 

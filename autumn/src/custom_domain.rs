@@ -2014,7 +2014,7 @@ impl DomainVerifier for SystemDomainVerifier {
         Box::pin(async move {
             let host = hostname.to_owned();
             // `getaddrinfo` blocks; keep it off the async worker.
-            let resolved = tokio::task::spawn_blocking(move || {
+            let resolved = crate::time::spawn_blocking(move || {
                 use std::net::ToSocketAddrs as _;
                 (host.as_str(), 0_u16)
                     .to_socket_addrs()

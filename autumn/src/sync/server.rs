@@ -1730,7 +1730,7 @@ where
                             )
                                 .into_response();
                         }
-                        let result = tokio::task::spawn_blocking(move || {
+                        let result = crate::time::spawn_blocking(move || {
                             backend.apply_push(scope.as_str(), &request, resolver.as_ref())
                         })
                         .await;
@@ -1750,7 +1750,7 @@ where
                         };
                         let limit = query.limit.clamp(1, MAX_PULL_LIMIT);
                         let session_start = query.session_start();
-                        let result = tokio::task::spawn_blocking(move || {
+                        let result = crate::time::spawn_blocking(move || {
                             backend.pull_since(scope.as_str(), query.cursor, limit, session_start)
                         })
                         .await;
