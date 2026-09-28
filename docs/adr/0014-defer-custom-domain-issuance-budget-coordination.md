@@ -23,18 +23,30 @@ built now, alongside the fix, or deferred.
 
 ## Door class and reversal cost
 
-**Two-way door.** `IssuanceLimiter::check`/`record_attempt` are called from
-exactly one place (`tenant_domains.rs`'s renewal tick) through a small,
-already-narrow interface. Swapping its internal `RwLock<Attempts>` for a
-durable or distributed store changes nothing at the call site — reversal in
-either direction (add coordination, or strip it back out) is a same-crate,
-single-module change. Per this framework's own rule, a door this cheap is
-normally a PR-level call, not an ADR; it is recorded here only because
-#2644 already staged the fleet-wide option as one of three named choices,
-and taking it without evidence would be exactly the "deciding a two-way
-door by RFC" mistake this framework warns against in the other direction —
-so this ADR's job is to say *no*, in writing, rather than let the biggest
-option win by being listed last.
+**Two-way door**, but reversal is not the bare storage swap this ADR
+originally described. `check` (`tenant_domains.rs:483`) runs before the
+per-hostname fleet lease is even acquired, and `record_attempt`
+(`tenant_domains.rs:561`) runs after two subsequent awaited calls
+(`try_acquire`, `record_issuing_for`) — a real gap, not a formality. The
+per-hostname lease excludes a second replica from racing the *same*
+hostname through that gap, but does nothing for two replicas each ordering
+a *different* hostname: both can call `check` and see capacity before
+either calls `record_attempt`, a classic check-then-act race. Swapping
+`RwLock<Attempts>` for a durable or distributed store behind the same two
+separate calls would not close that race; a correct option 3 needs an
+atomic check-and-reserve operation (or a global guard spanning both calls),
+which is a real interface change at the one call site, not only an
+internal one. That is more work than a pure storage swap, but it is still
+contained to `tenant_domains.rs`'s `issue_one` and `IssuanceLimiter`'s
+public methods — reversal in either direction (add atomic fleet-wide
+reservation, or strip it back to today's two-call shape) stays a
+same-crate, few-function change, not a rearchitecture. Per this framework's
+own rule, a door this cheap is normally a PR-level call, not an ADR; it is
+recorded here only because #2644 already staged the fleet-wide option as
+one of three named choices, and taking it without evidence would be
+exactly the "deciding a two-way door by RFC" mistake this framework warns
+against in the other direction — so this ADR's job is to say *no*, in
+writing, rather than let the biggest option win by being listed last.
 
 ## Evidence (Tier 2 — repository and issue record)
 
@@ -176,7 +188,11 @@ No new seam is needed to keep option 3 available later. Two already exist:
 - ADR 0010's app-facing distributed lock already provides the "exactly once
   across the cluster" primitive a fleet-wide `global_per_hour` enforcement
   would coordinate through, so building option 3 later starts from an
-  existing, tested primitive rather than a new one.
+  existing, tested primitive rather than a new one. Building it correctly
+  means using that lock to make `check` and `record_attempt` an atomic
+  check-and-reserve (or wrapping both calls in one held lock) — see Door
+  class above — not merely pointing the existing two-call interface at a
+  shared store.
 
 ## Trigger to revisit
 
@@ -236,6 +252,13 @@ grep -n "tick_key\|One replica per hostname" autumn/src/acme/tenant_domains.rs
 # records would silently drop an offboarded domain's still-counting attempts
 grep -n "fn forget" -A 3 autumn/src/custom_domain.rs
 grep -n "pub async fn remove_if" autumn/src/custom_domain.rs
+
+# check() and record_attempt() are two separate calls with a real awaited
+# gap between them (try_acquire, record_issuing_for) that the per-hostname
+# lease does not close for two DIFFERENT hostnames — the check-then-act race
+# a correct option 3 must close with an atomic reservation, not just storage
+grep -n "self.limiter.check\|self.limiter.record_attempt\|record_issuing_for" \
+  autumn/src/acme/tenant_domains.rs
 
 # Negative search: no other hand-rolled, non-pluggable "shared state" limiter
 # masquerading as cross-replica-safe was found in this pass. Each of these is
