@@ -73,5 +73,8 @@ fn main() {
     assert_eq!(doc.len(), chars);
     black_box(doc.text());
 
-    println!("typed {chars} characters, document holds {}", doc.element_count());
+    println!(
+        "typed {chars} characters, document holds {}",
+        doc.element_count()
+    );
 }
