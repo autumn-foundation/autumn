@@ -109,9 +109,10 @@ impl ObligationStore for RacingStore {
         &'a self,
         key: &'a str,
         generation: Uuid,
+        due_at: DateTime<Utc>,
         token: Uuid,
     ) -> StoreFuture<'a, bool> {
-        self.inner.begin_dispatch(key, generation, token)
+        self.inner.begin_dispatch(key, generation, due_at, token)
     }
 
     fn claim_escalation<'a>(
@@ -302,6 +303,7 @@ async fn sim_sla_on_time_met_after_the_claim_cancels_the_breach() {
         "started_at": start,
         "due_at": due,
         "escalated_at": claimed,
+        "token": Uuid::from_u128(41),
     });
     clock.advance(Duration::from_secs(3 * 3600));
     let client = app.state().extension::<job::JobClient>().unwrap();
@@ -658,6 +660,7 @@ async fn sim_sla_an_escalation_enqueued_again_after_it_ran_does_not_fire_again()
         "started_at": start,
         "due_at": due,
         "escalated_at": due,
+        "token": Uuid::from_u128(42),
     });
     let client = app.state().extension::<job::JobClient>().unwrap();
 
@@ -840,6 +843,7 @@ async fn sim_sla_an_on_time_met_clears_a_newer_claim_than_the_job_payload() {
         "started_at": start,
         "due_at": due,
         "escalated_at": first_claim,
+        "token": Uuid::from_u128(43),
     });
     let client = app.state().extension::<job::JobClient>().unwrap();
     client.enqueue(ESCALATE_JOB, breach).await.unwrap();
@@ -1050,6 +1054,69 @@ async fn sim_sla_a_second_escalation_after_the_unique_window_does_not_fire() {
     settle().await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     settle().await;
+    assert_eq!(*fired.lock().unwrap(), ["first_response/ticket:1"]);
+
+    job::clear_global_job_client();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sim_sla_a_stale_escalation_does_not_fire_before_the_new_deadline() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    // The escalate job for 11:00 is still queued, its claim was released,
+    // and reconcile then stored 15:00.
+    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let old_due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
+    let new_due = Utc.with_ymd_and_hms(2020, 1, 1, 15, 0, 0).unwrap();
+    let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2020, 1, 1, 12, 0, 0).unwrap());
+    let store = RacingStore::new();
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    let app = replica(&clock, &store, &fired);
+    let ob = Obligation::new("first_response", "ticket:1")
+        .within(BusinessDuration::hours(2))
+        .calendar("support")
+        .starting_at(start)
+        .zone(chrono_tz::Tz::UTC);
+    let key = ob.key();
+    let generation = Uuid::from_u128(18);
+    store
+        .inner
+        .insert(ObligationRecord::new(ob, generation).with_due_at(new_due))
+        .await
+        .unwrap();
+    let stale = serde_json::json!({
+        "key": key,
+        "obligation": "first_response",
+        "subject": "ticket:1",
+        "calendar": "support",
+        "zone": "UTC",
+        "generation": generation,
+        "started_at": start,
+        "due_at": old_due,
+        "escalated_at": old_due,
+        "token": Uuid::from_u128(31),
+    });
+    let client = app.state().extension::<job::JobClient>().unwrap();
+    client.enqueue(ESCALATE_JOB, stale).await.unwrap();
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    settle().await;
+    assert!(fired.lock().unwrap().is_empty(), "open until 15:00");
+
+    // At 15:00 the check for the stored deadline escalates one time.
+    let check = serde_json::json!({ "key": key, "generation": generation, "due_at": new_due });
+    let step = Duration::from_secs(4 * 3600);
+    clock.advance(step);
+    tokio::time::advance(step).await;
+    client
+        .enqueue(autumn_web::sla::CHECK_JOB, check)
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        settle().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
     assert_eq!(*fired.lock().unwrap(), ["first_response/ticket:1"]);
 
     job::clear_global_job_client();

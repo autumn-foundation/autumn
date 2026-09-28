@@ -201,16 +201,17 @@ even when the check job runs late. Thus the result does not change with the
 speed of the workers.
 
 The claim in the `ObligationStore` is the lock. A second check does not claim
-again. The unique key of `autumn_sla_escalate` stays held for one day after
-the enqueue, also after the job ran. Thus if an enqueue reports an error after
+again. The unique key of `autumn_sla_escalate` (key, generation and deadline)
+stays held for one day after the enqueue, also after the job ran. Thus if an enqueue reports an error after
 the queue stored the job, the retry of the check does not run the handler
 again.
 
 Each escalate job also carries a random `token`. Before the handler runs, the
-job stores its token in the record (`begin_dispatch`). The first token wins. A
-job with another token, for example one enqueued after the unique key expired,
-does not run the handler. A retry of the winning job has the same token, so it
-runs.
+job stores its token in the record (`begin_dispatch`). The first token wins,
+and only when the stored deadline is still the job's deadline. A job with
+another token, for example one enqueued after the unique key expired, or a job
+for a deadline that `reconcile` moved, does not run the handler. A retry of
+the winning job has the same token, so it runs.
 
 A failed handler runs again, up to 5 attempts in all, with a first delay of
 1 s. Use

@@ -69,7 +69,6 @@ pub struct SlaBreach {
     pub escalated_at: DateTime<Utc>,
     /// A random token for this escalation. See
     /// [`ObligationStore::begin_dispatch`].
-    #[serde(default)]
     pub token: uuid::Uuid,
 }
 
@@ -205,7 +204,7 @@ impl crate::plugin::Plugin for SlaPlugin {
                 sla_job(
                     ESCALATE_JOB,
                     escalate_job,
-                    &["key", "generation"],
+                    &["key", "generation", "due_at"],
                     JobUniquenessWindow::TtlMs(ESCALATE_UNIQUE_MS),
                 ),
             ])
@@ -711,12 +710,12 @@ fn escalate_job(state: AppState, payload: Value) -> BreachFuture {
             return Ok(());
         }
         // One escalate job for each record runs the handler. Another job
-        // for the same record (for example after the unique key expired)
-        // stops here.
+        // for the same record (for example after the unique key expired),
+        // or a job for a deadline that `reconcile` moved, stops here.
         if !sla
             .engine
             .store
-            .begin_dispatch(&breach.key, breach.generation, breach.token)
+            .begin_dispatch(&breach.key, breach.generation, breach.due_at, breach.token)
             .await?
         {
             tracing::info!(key = %breach.key, "SLA escalation already dispatched");

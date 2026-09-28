@@ -100,13 +100,16 @@ pub trait ObligationStore: Send + Sync + 'static {
         due_at: DateTime<Utc>,
     ) -> StoreFuture<'a, bool>;
 
-    /// Set the dispatch token to `token` if it is not set. Return `true` if
-    /// the stored token is `token` after the call. Thus only one escalate
-    /// job for the record runs the handler, and its own retries still run.
+    /// Set the dispatch token to `token` if it is not set, the stored
+    /// deadline is `due_at` (or not set), and the obligation was not met by
+    /// `due_at`. Return `true` if the stored token is `token` after the
+    /// call. Thus only one escalate job for the record runs the handler, a
+    /// job for an old deadline does not, and the winner's retries still run.
     fn begin_dispatch<'a>(
         &'a self,
         key: &'a str,
         generation: Uuid,
+        due_at: DateTime<Utc>,
         token: Uuid,
     ) -> StoreFuture<'a, bool>;
 
@@ -238,10 +241,19 @@ impl ObligationStore for MemoryObligationStore {
         &'a self,
         key: &'a str,
         generation: Uuid,
+        due_at: DateTime<Utc>,
         token: Uuid,
     ) -> StoreFuture<'a, bool> {
         let owned = self.with_instance(key, generation, |record| {
-            *record.dispatch_token.get_or_insert(token) == token
+            if let Some(stored) = record.dispatch_token {
+                return stored == token;
+            }
+            let current = record.due_at.is_none_or(|due| due == due_at)
+                && record.obligation.met().is_none_or(|met| met > due_at);
+            if current {
+                record.dispatch_token = Some(token);
+            }
+            current
         });
         Box::pin(async move { Ok(owned.await?.unwrap_or(false)) })
     }

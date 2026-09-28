@@ -794,9 +794,10 @@ impl ObligationStore for FlakyRelease {
         &'a self,
         key: &'a str,
         generation: uuid::Uuid,
+        due_at: DateTime<Utc>,
         token: uuid::Uuid,
     ) -> StoreFuture<'a, bool> {
-        self.inner.begin_dispatch(key, generation, token)
+        self.inner.begin_dispatch(key, generation, due_at, token)
     }
 
     fn claim_escalation<'a>(
@@ -921,13 +922,44 @@ async fn store_begins_one_dispatch_for_each_record() {
     let store = store_with_one().await;
     let first = uuid::Uuid::from_u128(21);
     let second = uuid::Uuid::from_u128(22);
-    assert!(store.begin_dispatch(KEY, GEN, first).await.unwrap());
+    let due = utc(2024, 1, 9, 15, 0);
+    assert!(store.begin_dispatch(KEY, GEN, due, first).await.unwrap());
     // A retry of the same job passes; another job does not.
-    assert!(store.begin_dispatch(KEY, GEN, first).await.unwrap());
-    assert!(!store.begin_dispatch(KEY, GEN, second).await.unwrap());
+    assert!(store.begin_dispatch(KEY, GEN, due, first).await.unwrap());
+    assert!(!store.begin_dispatch(KEY, GEN, due, second).await.unwrap());
     assert!(
         !store
-            .begin_dispatch(KEY, uuid::Uuid::from_u128(9), first)
+            .begin_dispatch(KEY, uuid::Uuid::from_u128(9), due, first)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn store_dispatches_only_at_the_stored_deadline_and_when_not_met() {
+    let store = MemoryObligationStore::new();
+    let old_due = utc(2024, 1, 9, 15, 0);
+    let new_due = utc(2024, 1, 10, 15, 0);
+    let token = uuid::Uuid::from_u128(23);
+    store
+        .insert(record(utc(2024, 1, 5, 15, 0), GEN).with_due_at(new_due))
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .begin_dispatch(KEY, GEN, old_due, token)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .mark_met(KEY, GEN, utc(2024, 1, 10, 9, 0))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .begin_dispatch(KEY, GEN, new_due, token)
             .await
             .unwrap()
     );
