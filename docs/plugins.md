@@ -759,7 +759,7 @@ This checks:
 | Check | What it verifies |
 |-------|-----------------|
 | `installability` | Binary compiles and route manifest is produced |
-| `route-attribution` | Every plugin route carries `plugin:<your-name>` source. When routes carry only the contract's registered name (the default `Plugin::name()`), the route checks use that name. With `--no-routes` (a plugin that mounts none, such as a cache), skips when no route carries either name, and fails if one does. Without it, no routes found fails |
+| `route-attribution` | Every plugin route carries `plugin:<your-name>` source. When routes carry only the contract's registered name (the default `Plugin::name()`), the route checks use that name. With `--no-routes` (a plugin that mounts none, such as a cache), skips when no route carries either name, and fails if one does. Without it, no routes found fails. It also fails when the app mounts a raw `.merge()` or an undeclared `.nest()` router: its routes were never listed, so no check saw them |
 | `route-prefix` | Every plugin route lives under the declared prefix |
 | `route-collision` | No two routes share (method, path); names the conflicting handlers and sources |
 | `sensitive-surfaces` | Routes with admin/debug/credential/operator/secret/metrics paths are declared with auth mechanisms |

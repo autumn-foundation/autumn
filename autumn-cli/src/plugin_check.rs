@@ -247,11 +247,25 @@ pub fn run(opts: &PluginCheckOptions<'_>) {
         },
         &routes,
     );
-    // `--bin` alone still names one package: the member that owns it.
-    let package = opts
-        .package
-        .map(str::to_owned)
-        .or_else(|| opts.bin.and_then(package_owning_bin));
+    // Routes behind a raw `.merge()`/`.nest()` were never listed, so no
+    // check above saw them.
+    fail_on_omitted_routers(
+        &mut report,
+        crate::routes_audit::parse_omitted_count(&stderr),
+    );
+    // Without `-p`, the package is the member owning the binary that ran,
+    // named by `--bin` or picked implicitly by `find_binary`.
+    let package = opts.package.map(str::to_owned).or_else(|| {
+        opts.bin
+            .map(str::to_owned)
+            .or_else(|| {
+                binary
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(str::to_owned)
+            })
+            .and_then(|bin| package_owning_bin(&bin))
+    });
     report.autumn_web = locked_autumn_web(std::path::Path::new("."), package.as_deref());
 
     match opts.format {
@@ -347,6 +361,25 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
 /// cannot be told apart.
 pub fn locked_autumn_web(dir: &std::path::Path, package: Option<&str>) -> Option<String> {
     crate::plugin::install::locked_version_for(dir, package, "autumn-web")
+}
+
+/// Fail `route-attribution` when the dump omitted raw routers: their routes
+/// were never attributed, prefix-checked or reviewed for sensitive paths.
+fn fail_on_omitted_routers(report: &mut ConformanceReport, omitted: usize) {
+    if omitted == 0 {
+        return;
+    }
+    if let Some(check) = report
+        .checks
+        .iter_mut()
+        .find(|check| check.name == "route-attribution")
+    {
+        check.status = CheckStatus::Fail;
+        check.message = format!(
+            "{omitted} raw router(s) added via .merge()/.nest() are not enumerable, so their \
+             routes were not checked. Declare them with AppBuilder::declare_plugin_routes"
+        );
+    }
 }
 
 /// The workspace package with a `bin` target named `bin`, from `cargo
@@ -1605,6 +1638,28 @@ mod contract_tests {
         )
         .unwrap();
         assert_eq!(locked_autumn_web(&app, None).as_deref(), Some("0.7.1"));
+    }
+
+    /// An omitted raw router fails the report, even when the listed routes
+    /// pass: its routes were never checked.
+    #[test]
+    fn omitted_routers_fail_route_attribution() {
+        let mut report = ConformanceReport {
+            plugin_name: "autumn-plugin-x".to_owned(),
+            checks: vec![CheckResult {
+                name: "route-attribution".to_owned(),
+                status: CheckStatus::Pass,
+                message: String::new(),
+                diagnostics: vec![],
+            }],
+            contract: None,
+            autumn_web: None,
+        };
+        fail_on_omitted_routers(&mut report, 0);
+        assert!(report.passed());
+        fail_on_omitted_routers(&mut report, 2);
+        assert!(!report.passed());
+        assert!(report.checks[0].message.contains("2 raw router(s)"));
     }
 
     /// `--bin` without `-p` names the member that owns that binary.

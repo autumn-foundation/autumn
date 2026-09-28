@@ -680,6 +680,31 @@ pub fn gate_listing(listing: &index::Listing, app: Option<&str>) -> Result<(), S
     ))
 }
 
+/// [`gate_listing`] against the app at `root`. A native community listing
+/// also needs the app's `autumn-web` version to check its range, so a path or
+/// git dependency no `Cargo.lock` resolves is refused. Outside a project the
+/// install fails later, with its own message.
+fn gate_listing_in(listing: &index::Listing, root: &Path) -> Result<(), String> {
+    let app = app_version(root);
+    gate_listing(listing, app.as_deref())?;
+    if app.is_none()
+        && listing.origin != index::ListingOrigin::FirstParty
+        && listing.trust == index::Trust::Native
+        && matches!(
+            install::app_autumn_web(root),
+            Ok(install::AppAutumnWeb::Unversioned)
+        )
+    {
+        return Err(format!(
+            "`{}` {} supports autumn-web {}, but this app's autumn-web is a path or git \
+             dependency and no Cargo.lock names its version. Run `cargo generate-lockfile`, \
+             then re-run. No files were changed.",
+            listing.name, listing.version, listing.autumn_web
+        ));
+    }
+    Ok(())
+}
+
 /// The manual steps for a sandboxed listing. `plugin add` writes no file for
 /// one: its artifact is not a crate dependency.
 #[must_use]
@@ -1009,7 +1034,7 @@ pub fn run_add(opts: &AddOptions<'_>) -> i32 {
     // The trust review comes first: before any gate, plan or write (AC 6).
     println!("{}", render_trust(name, &standing));
     if let Standing::Listed(listing) = standing {
-        if let Err(err) = gate_listing(listing, app_version(opts.root).as_deref()) {
+        if let Err(err) = gate_listing_in(listing, opts.root) {
             eprintln!("autumn plugin add: {err}");
             return 1;
         }
@@ -1686,7 +1711,7 @@ pub fn wire_scaffold_plugins(root: &Path, plugins: &[ScaffoldPlugin]) -> i32 {
         // pins its own `autumn-web`, and may already declare the crate.
         if let Some(listing) = &plugin.listing {
             let refused = if matches!(plugin.resolved, Resolved::Community(_)) {
-                gate_listing(listing, app_version(root).as_deref())
+                gate_listing_in(listing, root)
             } else {
                 Ok(())
             }
@@ -1955,6 +1980,33 @@ mod tests {
         assert_eq!(app("=0.7.0", None).as_deref(), Some("0.7.0"));
         assert_eq!(app("=0.7", None).as_deref(), Some("~0.7"));
         assert_eq!(app("0.7", None).as_deref(), Some("^0.7"));
+    }
+
+    /// A listed community crate needs the app's version: a path checkout with
+    /// no lockfile is refused until Cargo.lock names it.
+    #[test]
+    fn a_community_listing_needs_the_app_version() {
+        let tmp = project_with(
+            "[package]\nname = \"a\"\n\n[dependencies]\nautumn-web = { path = \"../autumn\" }\n",
+        );
+        let listing = listed_community();
+        let err = gate_listing_in(&listing, tmp.path()).unwrap_err();
+        assert!(err.contains("path or git"), "{err}");
+        std::fs::write(
+            tmp.path().join("Cargo.lock"),
+            format!(
+                "version = 4\n\n[[package]]\nname = \"a\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\"autumn-web\"]\n\n\
+                 [[package]]\nname = \"autumn-web\"\nversion = \"{RELEASE}\"\n"
+            ),
+        )
+        .unwrap();
+        assert!(gate_listing_in(&listing, tmp.path()).is_ok());
+        // A sandboxed listing is not tied to a framework version.
+        std::fs::remove_file(tmp.path().join("Cargo.lock")).unwrap();
+        let mut sandboxed = listing;
+        sandboxed.trust = index::Trust::Sandboxed;
+        assert!(gate_listing_in(&sandboxed, tmp.path()).is_ok());
     }
 
     /// A crates.io result spelled with `_` where the index has `-` is the
