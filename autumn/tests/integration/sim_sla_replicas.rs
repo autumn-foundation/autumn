@@ -348,3 +348,49 @@ async fn sim_sla_reconcile_moves_a_check_to_an_earlier_deadline() {
 
     job::clear_global_job_client();
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sim_sla_a_check_that_runs_hours_early_waits_and_escalates() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
+    let clock = TickingClock::starting_at(start);
+    let store = RacingStore::new();
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    let app = replica(&clock, &store, &fired);
+
+    // A record with no check of its own, then one check that the queue runs
+    // two hours early (its clock leads the app clock).
+    let ob = Obligation::new("first_response", "ticket:1")
+        .within(BusinessDuration::hours(2))
+        .calendar("support")
+        .starting_at(start)
+        .zone(chrono_tz::Tz::UTC);
+    let generation = Uuid::from_u128(7);
+    store
+        .inner
+        .insert(ObligationRecord::new(ob.clone(), generation))
+        .await
+        .unwrap();
+    let check = serde_json::json!({ "key": ob.key(), "generation": generation, "due_at": due });
+    let client = app.state().extension::<job::JobClient>().unwrap();
+    client
+        .enqueue(autumn_web::sla::CHECK_JOB, check)
+        .await
+        .unwrap();
+    settle().await;
+    assert!(fired.lock().unwrap().is_empty(), "not before the deadline");
+
+    // The app clock reaches the deadline; the waiting check escalates.
+    let step = Duration::from_secs(3 * 3600);
+    clock.advance(step);
+    tokio::time::advance(step).await;
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    settle().await;
+    assert_eq!(*fired.lock().unwrap(), ["first_response/ticket:1"]);
+
+    job::clear_global_job_client();
+}

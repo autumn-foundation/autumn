@@ -23,9 +23,13 @@ pub const CHECK_JOB: &str = "autumn_sla_check";
 /// The job that runs the breach handler of an obligation.
 pub const ESCALATE_JOB: &str = "autumn_sla_escalate";
 
-/// If a check job runs before its deadline, it waits. It waits 5 minutes at
-/// most.
-const MAX_EARLY_CHECK: std::time::Duration = std::time::Duration::from_secs(300);
+/// If a check job runs before its deadline (the queue clock leads the app
+/// clock), it waits in steps of this length.
+const EARLY_CHECK_STEP: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The longest total wait of an early check. After it, the check trusts the
+/// queue and reads the status at the deadline.
+const MAX_EARLY_WAIT: std::time::Duration = std::time::Duration::from_secs(3_600);
 
 /// Attempts for each SLA job before it goes to the dead letters.
 const MAX_ATTEMPTS: u32 = 5;
@@ -471,6 +475,38 @@ impl Sla {
             .map_err(|err| SlaError::Job(err.to_string()))
     }
 
+    /// Wait until the injected clock reaches `due_hint`, and return the
+    /// instant to read the status at.
+    ///
+    /// A check job can run early when the queue clock leads the app clock.
+    /// It waits in steps and does not fail, so the retry budget stays. After
+    /// [`MAX_EARLY_WAIT`] it trusts the queue and uses `due_hint`.
+    async fn wait_for(&self, key: &str, due_hint: DateTime<Utc>) -> DateTime<Utc> {
+        let mut waited = std::time::Duration::ZERO;
+        loop {
+            let now = self.now();
+            let Some(early) = due_hint
+                .signed_duration_since(now)
+                .to_std()
+                .ok()
+                .filter(|early| !early.is_zero())
+            else {
+                return now;
+            };
+            if waited >= MAX_EARLY_WAIT {
+                tracing::warn!(
+                    %key,
+                    ?early,
+                    "SLA check ran far before its deadline; the job queue clock leads the app clock"
+                );
+                return due_hint;
+            }
+            let step = early.min(EARLY_CHECK_STEP);
+            tokio::time::sleep(step).await;
+            waited = waited.saturating_add(step);
+        }
+    }
+
     /// Run the breach check of `key`. `due_hint` is the deadline in the job.
     async fn check(
         &self,
@@ -478,6 +514,8 @@ impl Sla {
         generation: Option<uuid::Uuid>,
         due_hint: DateTime<Utc>,
     ) -> Result<(), SlaError> {
+        // Wait first, then read the record, so the read is fresh.
+        let now = self.wait_for(key, due_hint).await;
         let store = &self.engine.store;
         let Some(record) = store.get(key).await? else {
             tracing::warn!(
@@ -493,20 +531,6 @@ impl Sla {
         }
         if record.escalated_at.is_some() {
             return Ok(());
-        }
-        let mut now = self.now();
-        if let Some(early) = due_hint.signed_duration_since(now).to_std().ok()
-            && !early.is_zero()
-        {
-            // The job ran before the deadline on this clock (clock skew).
-            // Wait for the deadline. Do not guess the status at a later time.
-            if early > MAX_EARLY_CHECK {
-                return Err(SlaError::Job(format!(
-                    "SLA check for {key} ran {early:?} before its deadline"
-                )));
-            }
-            tokio::time::sleep(early).await;
-            now = self.now().max(due_hint);
         }
         let status = self.status_of(&record, now)?;
         let due_at = match (status.state, status.due_at) {
