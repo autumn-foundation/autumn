@@ -883,10 +883,14 @@ fn git_source(entry: &toml::Value) -> Option<FrameworkSource> {
 /// ancestor's and `$CARGO_HOME`'s, and any config overrides the workspace
 /// manifest. So only the first file, in that order, that patches it counts;
 /// a patch it overrides unifies nothing.
-fn framework_patch_sources(root: &Path) -> Vec<FrameworkSource> {
+///
+/// `from` is the directory Cargo is invoked in: it reads the configs there
+/// and above, so a workspace member's own `.cargo/config.toml` applies only
+/// when Cargo runs inside the member, not from the workspace root.
+fn framework_patch_sources(root: &Path, from: &Path) -> Vec<FrameworkSource> {
     let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
     let workspace = workspace_root(&root);
-    let mut files = config_files(&root, cargo_home().as_deref());
+    let mut files = config_files(from, cargo_home().as_deref());
     files.push((workspace.join("Cargo.toml"), workspace));
     let want = canonical("autumn-web");
     let mut dirs = Vec::new();
@@ -1249,15 +1253,37 @@ pub fn unpatched_local_framework(root: &Path) -> bool {
     // to Cargo, whatever their version. A path resolves from the package,
     // or from the workspace root when the entry is inherited, as Cargo does.
     let root_abs = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
-    let patches = framework_patch_sources(root);
+    // Cargo may run in the member or at the workspace root, and a member's
+    // own config applies only in the first: the patch has to unify in both
+    // (verified with cargo 1.98 metadata).
+    let workspace = workspace_root(&root_abs);
+    let mut contexts = vec![root_abs.clone()];
+    if workspace != root_abs {
+        contexts.push(workspace);
+    }
+    let locked = locked_version_for(root, None, "autumn-web");
+    contexts
+        .iter()
+        .any(|from| unpatched_from(root, &root_abs, &locals, from, locked.as_deref()))
+}
+
+/// [`unpatched_local_framework`] for Cargo invoked in `from`.
+fn unpatched_from(
+    root: &Path,
+    root_abs: &Path,
+    locals: &[(toml::Value, bool)],
+    from: &Path,
+    locked: Option<&str>,
+) -> bool {
+    let patches = framework_patch_sources(root, from);
     let path_unpatched = locals
         .iter()
         .filter_map(|(entry, inherited)| Some((entry.get("path")?.as_str()?, *inherited)))
         .any(|(path, inherited)| {
             let base = if inherited {
-                workspace_root(&root_abs)
+                workspace_root(root_abs)
             } else {
-                root_abs.clone()
+                root_abs.to_path_buf()
             };
             !patches.contains(&FrameworkSource::Path(normalized(&base.join(path))))
         });
@@ -1268,7 +1294,6 @@ pub fn unpatched_local_framework(root: &Path) -> bool {
     // An alternate registry's `autumn-web` is another package than
     // crates.io's, at any version, unless a patch supplies the one the app
     // resolves.
-    let locked = locked_version_for(root, None, "autumn-web");
     let registry_unpatched = locals
         .iter()
         .filter(|(entry, _)| entry.get("path").is_none() && entry.get("git").is_none())
@@ -1276,7 +1301,7 @@ pub fn unpatched_local_framework(root: &Path) -> bool {
         .any(|local| {
             !patches
                 .iter()
-                .any(|patch| registry_patch_unifies(&local, patch, locked.as_deref()))
+                .any(|patch| registry_patch_unifies(&local, patch, locked))
         });
     path_unpatched || git_unpatched || registry_unpatched
 }
@@ -2504,6 +2529,32 @@ maud = { version = "0.27", features = ["axum"] }
         let effective = fake_project(SCAFFOLD_MAIN, &cargo("other"));
         config(&effective, "autumn");
         assert!(!unpatched_local_framework(effective.path()));
+    }
+
+    /// Cargo ignores a member's own `.cargo/config.toml` when it runs from
+    /// the workspace root, so a patch found only there does not unify the
+    /// framework; the same patch at the root does.
+    #[test]
+    fn a_member_only_config_patch_does_not_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            &tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n",
+        );
+        let app = tmp.path().join("app");
+        write(
+            &app.join("Cargo.toml"),
+            "[package]\nname = \"app\"\n\n\
+             [dependencies]\nautumn-web = { path = \"../autumn\" }\n",
+        );
+        let patch = "[patch.crates-io]\nautumn-web = { path = \"autumn\" }\n";
+        write(
+            &app.join(".cargo/config.toml"),
+            &patch.replace("autumn\"", "../autumn\""),
+        );
+        assert!(unpatched_local_framework(&app));
+        write(&tmp.path().join(".cargo/config.toml"), patch);
+        assert!(!unpatched_local_framework(&app));
     }
 
     /// With no declared or locked version, a first-party install reads the
