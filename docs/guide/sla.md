@@ -278,7 +278,8 @@ time.
 - A window cannot cross midnight. Use two windows, such as `"22:00-24:00"` and
   `"00:00-06:00"`.
 - `track` refuses a zero budget. Set it with `Obligation::within`.
-- A check job waits when the job queue clock leads the app clock. After one
-  hour of waiting it fails, and the queue runs it again (5 attempts in all).
+- If a check job runs before its deadline on the app clock (the job queue
+  clock leads the app clock), it puts itself on the queue again after the
+  difference. This uses no retry attempt.
 - The scan horizon is one hundred years. `track` refuses an obligation with no
   deadline in that time (`SlaError::NoDeadline`).

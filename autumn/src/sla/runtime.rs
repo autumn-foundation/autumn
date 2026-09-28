@@ -23,14 +23,6 @@ pub const CHECK_JOB: &str = "autumn_sla_check";
 /// The job that runs the breach handler of an obligation.
 pub const ESCALATE_JOB: &str = "autumn_sla_escalate";
 
-/// If a check job runs before its deadline (the queue clock leads the app
-/// clock), it waits in steps of this length.
-const EARLY_CHECK_STEP: std::time::Duration = std::time::Duration::from_secs(300);
-
-/// The longest wait of an early check in one attempt. After it, the attempt
-/// fails and the job queue runs the check again.
-const MAX_EARLY_WAIT: std::time::Duration = std::time::Duration::from_secs(3_600);
-
 /// Attempts for each SLA job before it goes to the dead letters.
 const MAX_ATTEMPTS: u32 = 5;
 
@@ -80,6 +72,11 @@ struct CheckArgs {
     #[serde(default)]
     generation: Option<uuid::Uuid>,
     due_at: DateTime<Utc>,
+    /// How many times an early check put itself on the queue again. It is
+    /// part of the unique key, so a requeue from a running check is not
+    /// merged into that check.
+    #[serde(default)]
+    requeue: u32,
 }
 
 /// The shared state of the SLA engine, kept as an [`AppState`] extension.
@@ -187,7 +184,7 @@ impl crate::plugin::Plugin for SlaPlugin {
                 sla_job(
                     CHECK_JOB,
                     check_job,
-                    &["key", "generation", "due_at"],
+                    &["key", "generation", "due_at", "requeue"],
                     JobUniquenessWindow::Running,
                 ),
                 sla_job(
@@ -464,6 +461,7 @@ impl Sla {
             key: key.to_owned(),
             generation: Some(generation),
             due_at,
+            requeue: 0,
         };
         self.enqueue(CHECK_JOB, &args, Some(due_at)).await
     }
@@ -485,42 +483,46 @@ impl Sla {
             .map_err(|err| SlaError::Job(err.to_string()))
     }
 
-    /// Wait until the injected clock reaches `due_hint`, and return the
-    /// injected time.
+    /// If the injected clock is before the deadline in `args`, put the check
+    /// on the queue again after the difference, and return `true`.
     ///
-    /// A check job can run early when the queue clock leads the app clock.
-    /// It waits in steps. After [`MAX_EARLY_WAIT`] it fails, and the job
-    /// queue runs it again. It never uses `due_hint` as the time.
-    async fn wait_for(
-        &self,
-        key: &str,
-        due_hint: DateTime<Utc>,
-    ) -> Result<DateTime<Utc>, SlaError> {
-        let mut waited = std::time::Duration::ZERO;
-        loop {
-            let now = self.now();
-            let Some(early) = due_hint
-                .signed_duration_since(now)
-                .to_std()
-                .ok()
-                .filter(|early| !early.is_zero())
-            else {
-                return Ok(now);
-            };
-            if waited >= MAX_EARLY_WAIT {
-                tracing::warn!(
-                    %key,
-                    ?early,
-                    "SLA check ran far before its deadline; the job queue clock leads the app clock"
-                );
-                return Err(SlaError::Job(format!(
-                    "SLA check of {key} ran {early:?} before its deadline"
-                )));
-            }
-            let step = early.min(EARLY_CHECK_STEP);
-            tokio::time::sleep(step).await;
-            waited = waited.saturating_add(step);
+    /// A check job runs early when the queue clock leads the app clock. The
+    /// requeue uses no retry attempt, so a large clock difference does not
+    /// send the check to the dead letters.
+    async fn requeue_if_early(&self, args: &CheckArgs) -> Result<bool, SlaError> {
+        let Some(early) = args
+            .due_at
+            .signed_duration_since(self.now())
+            .to_std()
+            .ok()
+            .filter(|early| !early.is_zero())
+        else {
+            return Ok(false);
+        };
+        if args.requeue > 0 {
+            tracing::warn!(
+                key = %args.key,
+                ?early,
+                requeue = args.requeue,
+                "SLA check ran before its deadline again; the job queue clock leads the app clock"
+            );
         }
+        let again = CheckArgs {
+            key: args.key.clone(),
+            generation: args.generation,
+            due_at: args.due_at,
+            requeue: args.requeue.saturating_add(1),
+        };
+        let client = self
+            .state
+            .extension::<crate::job::JobClient>()
+            .ok_or(SlaError::NoJobRuntime)?;
+        let payload = serde_json::to_value(&again).map_err(|err| SlaError::Job(err.to_string()))?;
+        client
+            .enqueue_relative(CHECK_JOB, payload, early)
+            .await
+            .map_err(|err| SlaError::Job(err.to_string()))?;
+        Ok(true)
     }
 
     /// Run the breach check of `key`. `due_hint` is the deadline in the job.
@@ -530,8 +532,7 @@ impl Sla {
         generation: Option<uuid::Uuid>,
         due_hint: DateTime<Utc>,
     ) -> Result<(), SlaError> {
-        // Wait first, then read the record, so the read is fresh.
-        let now = self.wait_for(key, due_hint).await?;
+        let now = self.now();
         let store = &self.engine.store;
         let Some(record) = store.get(key).await? else {
             tracing::warn!(
@@ -626,9 +627,10 @@ impl Sla {
 fn check_job(state: AppState, payload: Value) -> BreachFuture {
     Box::pin(async move {
         let args: CheckArgs = serde_json::from_value(payload)?;
-        Sla::from_state(&state)?
-            .check(&args.key, args.generation, args.due_at)
-            .await?;
+        let sla = Sla::from_state(&state)?;
+        if !sla.requeue_if_early(&args).await? {
+            sla.check(&args.key, args.generation, args.due_at).await?;
+        }
         Ok(())
     })
 }

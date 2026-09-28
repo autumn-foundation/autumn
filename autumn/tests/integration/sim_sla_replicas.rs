@@ -435,9 +435,9 @@ async fn sim_sla_an_early_check_never_uses_the_deadline_as_now() {
         .await
         .unwrap();
 
-    // The queue waits more than the early-wait limit; the app clock stays
-    // before the deadline. The check must not escalate.
-    for _ in 0..16 {
+    // The queue clock stays ahead for 12 hours, more than the retry budget
+    // of the check. The check must not escalate, and must not give up.
+    for _ in 0..72 {
         tokio::time::advance(Duration::from_secs(600)).await;
         settle().await;
     }
@@ -458,7 +458,7 @@ async fn sim_sla_an_early_check_never_uses_the_deadline_as_now() {
 
     // The app clock reaches the deadline; the check escalates.
     clock.advance(Duration::from_secs(3 * 3600));
-    for _ in 0..8 {
+    for _ in 0..18 {
         tokio::time::advance(Duration::from_secs(600)).await;
         settle().await;
     }
