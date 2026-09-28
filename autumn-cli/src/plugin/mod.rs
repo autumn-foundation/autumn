@@ -144,11 +144,15 @@ pub fn list_rows(
             let (origin, version, compat) = match listing.origin {
                 // Lockstep: the CLI version is the one to install. A failed
                 // re-verification still wins over the series match.
+                // A prerelease app is compared with the listing's range, as
+                // `plugin add` does: a stable pin excludes the prerelease.
                 index::ListingOrigin::FirstParty => {
+                    let excluded = |app: &str| listing.compat(app) == Compat::Incompatible;
                     let flagged = listing.status == index::Status::Incompatible
-                        && app_version
-                            .is_some_and(|app| listing.compat(app) == Compat::Incompatible);
-                    let compat = if flagged {
+                        && app_version.is_some_and(excluded);
+                    let prerelease =
+                        app_version.is_some_and(|app| is_prerelease(app) && excluded(app));
+                    let compat = if flagged || prerelease {
                         Compat::Incompatible
                     } else {
                         lockstep
@@ -673,15 +677,21 @@ pub fn gate_listing(listing: &index::Listing, app: Option<&str>) -> Result<(), S
     // series diagnostic for it. Not for a prerelease app: `plan_add` reads
     // versions without their prerelease, and a stable plugin pin next to a
     // prerelease framework is a second framework copy.
-    let prerelease = semver::Version::parse(app.trim().trim_start_matches(['=', '^', '~', ' ']))
-        .is_ok_and(|version| !version.pre.is_empty());
-    if listing.origin == index::ListingOrigin::FirstParty && !prerelease {
+    if listing.origin == index::ListingOrigin::FirstParty && !is_prerelease(app) {
         return Ok(());
     }
     Err(format!(
         "`{}` {} supports autumn-web {}, but this app uses autumn-web {app}. No files were changed.",
         listing.name, listing.version, listing.autumn_web
     ))
+}
+
+/// Whether the app's `autumn-web` version is a prerelease (`0.7.0-alpha.1`).
+/// [`install::check_compat`] reads versions without their prerelease, so a
+/// first-party listing is compared with the listing's own range instead.
+fn is_prerelease(app: &str) -> bool {
+    semver::Version::parse(app.trim().trim_start_matches(['=', '^', '~', ' ']))
+        .is_ok_and(|version| !version.pre.is_empty())
 }
 
 /// [`gate_listing`] against the app at `root`. A native community listing
@@ -1844,6 +1854,19 @@ mod tests {
                 .unwrap_or_else(|| panic!("{} has no listing", entry.crate_name));
             assert_eq!(listing.trust_label(), index::FULL_TRUST_LABEL);
         }
+    }
+
+    /// Discovery agrees with installation: a prerelease app is not shown the
+    /// stable first-party plugins as compatible, since `plugin add` refuses
+    /// them.
+    #[test]
+    fn first_party_rows_are_incompatible_with_a_prerelease_app() {
+        let prerelease = format!("{RELEASE}-alpha.1");
+        let rows = list_rows(Some(&prerelease), &bundled(), &[]);
+        let admin = row(&rows, "autumn-admin-plugin");
+        assert_eq!(admin.compat, Compat::Incompatible);
+        let rows = list_rows(Some(RELEASE), &bundled(), &[]);
+        assert_eq!(row(&rows, "autumn-admin-plugin").compat, Compat::Compatible);
     }
 
     /// AC 2: a listed community crate resolves from the index: its version

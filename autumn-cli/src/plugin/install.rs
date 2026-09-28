@@ -1434,6 +1434,62 @@ fn resolved_app_version(root: &Path, crate_name: &str) -> Result<Option<String>,
     Ok(app.or_else(|| local_framework_version(root)))
 }
 
+/// `release`'s compatibility series as `(first, last, next_first,
+/// previous_last)`: its own first and last version, the first version of the
+/// next series, and the last of the previous one (none below `0.0`).
+fn series_bounds(
+    release: &semver::Version,
+) -> (
+    semver::Version,
+    semver::Version,
+    semver::Version,
+    Option<semver::Version>,
+) {
+    if release.major == 0 {
+        (
+            semver::Version::new(0, release.minor, 0),
+            semver::Version::new(0, release.minor, u64::MAX),
+            semver::Version::new(0, release.minor + 1, 0),
+            release
+                .minor
+                .checked_sub(1)
+                .map(|minor| semver::Version::new(0, minor, u64::MAX)),
+        )
+    } else {
+        (
+            semver::Version::new(release.major, 0, 0),
+            semver::Version::new(release.major, u64::MAX, u64::MAX),
+            semver::Version::new(release.major + 1, 0, 0),
+            Some(semver::Version::new(release.major - 1, u64::MAX, u64::MAX)),
+        )
+    }
+}
+
+/// Whether the requirement `app` admits some version in `release`'s
+/// compatibility series. A requirement is one interval, so it meets the
+/// series exactly when it admits one of the series' ends or its own lower
+/// bound lies inside the series; that bound is a comparator's version, or
+/// the one after it for `>`. An unreadable side counts as meeting it.
+fn meets_series(app: &str, release: &str) -> bool {
+    let (Ok(req), Ok(release)) = (
+        semver::VersionReq::parse(app),
+        semver::Version::parse(release.trim_start_matches('=')),
+    ) else {
+        return true;
+    };
+    let (first, last, _, _) = series_bounds(&release);
+    let in_series = |v: &semver::Version| *v >= first && *v <= last;
+    let lower_bounds = req.comparators.iter().flat_map(|c| {
+        let base = semver::Version::new(c.major, c.minor.unwrap_or(0), c.patch.unwrap_or(0));
+        let after = semver::Version::new(base.major, base.minor, base.patch.saturating_add(1));
+        [base, after]
+    });
+    [first.clone(), last.clone()]
+        .into_iter()
+        .chain(lower_bounds)
+        .any(|v| in_series(&v) && req.matches(&v))
+}
+
 /// Whether the requirement `app` admits a release outside `release`'s
 /// compatibility series. A requirement is one interval, so it spans series
 /// exactly when it admits the first version of the next series or the last
@@ -1446,20 +1502,7 @@ fn spans_series(app: &str, release: &str) -> bool {
     let Ok(release) = semver::Version::parse(release.trim_start_matches('=')) else {
         return false;
     };
-    let (next, previous) = if release.major == 0 {
-        (
-            semver::Version::new(0, release.minor + 1, 0),
-            release
-                .minor
-                .checked_sub(1)
-                .map(|minor| semver::Version::new(0, minor, u64::MAX)),
-        )
-    } else {
-        (
-            semver::Version::new(release.major + 1, 0, 0),
-            Some(semver::Version::new(release.major - 1, u64::MAX, u64::MAX)),
-        )
-    };
+    let (_, _, next, previous) = series_bounds(&release);
     req.matches(&next) || previous.is_some_and(|previous| req.matches(&previous))
 }
 
@@ -1485,14 +1528,11 @@ pub fn plan_add(
     app_autumn_web(root)?;
     let app = resolved_app_version(root, entry.crate_name)?;
     // A range (`>=0.8, <0.9`) has no single series to compare, but one that
-    // excludes this release cannot build it next to the plugin. A range that
-    // admits it (even across series) stays unresolved and proceeds.
+    // admits nothing in this release's series cannot build next to the
+    // plugin, whose own `autumn-web` requirement is a caret on the release.
+    // A range inside the series (`>=0.7.1, <0.8`) proceeds.
     let excluded = |app_version: &str| {
-        parse_version(app_version).is_none()
-            && semver::VersionReq::parse(app_version)
-                .ok()
-                .zip(semver::Version::parse(version.trim_start_matches('=')).ok())
-                .is_some_and(|(req, release)| !req.matches(&release))
+        parse_version(app_version).is_none() && !meets_series(app_version, version)
     };
     if let Some(app_version) = &app
         && (check_compat(app_version, version) == Compat::Incompatible || excluded(app_version))
@@ -2725,12 +2765,33 @@ maud = { version = "0.27", features = ["axum"] }
             matches!(err, PluginError::UnresolvedAutumnWebRange { .. }),
             "{err}"
         );
-        // A range inside the release's series proceeds.
-        let narrow = fake_project(
-            SCAFFOLD_MAIN,
-            "[package]\nname = \"demo\"\n\n[dependencies]\nautumn-web = \">=0.7.0, <0.8\"\n",
-        );
-        assert!(plan_add(narrow.path(), admin(), "0.7.0").is_ok());
+        // A range inside the release's series proceeds, even one above the
+        // release: the plugin's caret `autumn-web` requirement admits it.
+        for range in [">=0.7.0, <0.8", ">=0.7.1, <0.8"] {
+            let narrow = fake_project(
+                SCAFFOLD_MAIN,
+                &format!(
+                    "[package]\nname = \"demo\"\n\n[dependencies]\nautumn-web = \"{range}\"\n"
+                ),
+            );
+            assert!(plan_add(narrow.path(), admin(), "0.7.0").is_ok(), "{range}");
+        }
+    }
+
+    #[test]
+    fn meets_series_reads_the_release_series() {
+        for app in [
+            ">=0.7.1, <0.8",
+            ">=0.7.0, <0.8",
+            ">=0.6, <0.9",
+            ">0.7.2, <0.7.9",
+            "<0.7.3",
+        ] {
+            assert!(meets_series(app, "0.7.0"), "{app}");
+        }
+        for app in [">=0.8, <0.9", "<0.7.0", ">=0.6, <0.7", ">0.7"] {
+            assert!(!meets_series(app, "0.7.0"), "{app}");
+        }
     }
 
     #[test]
