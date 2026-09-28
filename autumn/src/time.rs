@@ -621,6 +621,18 @@ pub(crate) fn system_instant() -> std::time::Instant {
     *MONOTONIC_ORIGIN + SystemClock.monotonic().since_origin()
 }
 
+/// Whether a TTL cache entry that expires at `expires_at` is still fresh at
+/// `now`. An entry cannot expire more than `ttl` after `now`; one that does
+/// was stored on another timeline (another `Sim`, or the system clock), so
+/// it counts as stale.
+pub(crate) fn ttl_entry_is_fresh(
+    expires_at: std::time::Instant,
+    now: std::time::Instant,
+    ttl: Duration,
+) -> bool {
+    expires_at > now && expires_at.saturating_duration_since(now) <= ttl
+}
+
 /// The ambient wall-clock time as a [`std::time::SystemTime`]. Replaces
 /// `SystemTime::now()` where no clock is in scope. See [`AmbientClock`].
 #[must_use]
@@ -870,6 +882,18 @@ mod tests {
         assert_eq!(ambient_now(), pinned);
         drop(outer);
         assert!(ambient_now() > later, "the system clock again");
+    }
+
+    #[test]
+    fn a_ttl_entry_from_another_timeline_is_stale() {
+        let now = std::time::Instant::now();
+        let ttl = std::time::Duration::from_secs(60);
+        assert!(ttl_entry_is_fresh(now + ttl, now, ttl));
+        assert!(!ttl_entry_is_fresh(now, now, ttl), "expired");
+        assert!(
+            !ttl_entry_is_fresh(now + ttl * 10, now, ttl),
+            "an expiry past now + ttl was stored on a later timeline"
+        );
     }
 
     #[test]

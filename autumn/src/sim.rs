@@ -1422,17 +1422,27 @@ struct SimStack {
     /// also counted as auto-advanced time: not when it is cancelled after the
     /// clock moved, and not when advances run at the same time.
     pending_advance: std::time::Duration,
+    /// The runtime these sims run on, so a sim dropped on another thread can
+    /// still read this runtime's clock and settle up to its drop.
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl SimStack {
     /// Give the tokio time since the last settle to the ambient sim, and
     /// drop entries whose sim has dropped (on any thread).
     fn settle(&mut self) {
-        if tokio::runtime::Handle::try_current().is_err() {
+        if let Ok(current) = tokio::runtime::Handle::try_current() {
+            self.runtime = Some(current);
+        }
+        let Some(runtime) = self.runtime.clone() else {
             self.clocks.retain(|clock| clock.is_alive());
             return;
-        }
-        let now = tokio::time::Instant::now();
+        };
+        // Read this stack's runtime clock, also from another thread.
+        let now = {
+            let _enter = runtime.enter();
+            tokio::time::Instant::now()
+        };
         if let Some(checkpoint) = self.checkpoint {
             let moved = now.saturating_duration_since(checkpoint);
             let explicit = moved.min(self.pending_advance);
@@ -1447,23 +1457,31 @@ impl SimStack {
         if self.clocks.is_empty() {
             self.checkpoint = None;
             self.pending_advance = std::time::Duration::ZERO;
+            self.runtime = None;
         } else {
             self.checkpoint = Some(now);
         }
     }
 }
 
+/// A thread's sim stack. Shared, so a sim dropped on another thread can
+/// settle the stack of the thread it was built on.
+type SharedSimStack = Arc<std::sync::Mutex<SimStack>>;
+
 thread_local! {
-    static SIM_STACK: std::cell::RefCell<SimStack> = std::cell::RefCell::new(SimStack::default());
+    static SIM_STACK: SharedSimStack = SharedSimStack::default();
 }
 
-/// Run `f` on this thread's sim stack. `None` during thread teardown or a
-/// re-entrant call.
+/// Run `f` on `stack`.
+fn lock_sim_stack<T>(stack: &SharedSimStack, f: impl FnOnce(&mut SimStack) -> T) -> T {
+    f(&mut stack
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner))
+}
+
+/// Run `f` on this thread's sim stack. `None` during thread teardown.
 fn with_sim_stack<T>(f: impl FnOnce(&mut SimStack) -> T) -> Option<T> {
-    SIM_STACK
-        .try_with(|stack| stack.try_borrow_mut().ok().map(|mut stack| f(&mut stack)))
-        .ok()
-        .flatten()
+    SIM_STACK.try_with(|stack| lock_sim_stack(stack, f)).ok()
 }
 
 /// Start attributing tokio time on this thread from now. `#[sim_test]` builds
@@ -1483,11 +1501,14 @@ fn anchor_current_sim() {
 /// Keeps a sim on its thread's sim stack while the sim lives.
 struct SimStackGuard {
     own: Arc<AmbientSimClock>,
+    /// The stack of the thread the sim was built on.
+    home: SharedSimStack,
 }
 
 impl SimStackGuard {
     fn enter(own: Arc<AmbientSimClock>) -> Self {
-        with_sim_stack(|stack| {
+        let home = SIM_STACK.with(Arc::clone);
+        lock_sim_stack(&home, |stack| {
             // Time so far belongs to the sim that was ambient until now.
             stack.settle();
             stack.clocks.push(Arc::clone(&own));
@@ -1495,22 +1516,22 @@ impl SimStackGuard {
                 stack.checkpoint = Some(tokio::time::Instant::now());
             }
         });
-        Self { own }
+        Self { own, home }
     }
 }
 
 impl Drop for SimStackGuard {
     fn drop(&mut self) {
-        // Settle first, so time up to now goes to this sim while it is still
-        // ambient. On another thread, the stack there does not hold this sim:
-        // the cleared flag removes it from its own stack on that stack's next
-        // settle, and tokio time since that stack's last settle goes to the
-        // sim that is ambient there next.
-        with_sim_stack(SimStack::settle);
-        self.own
-            .alive
-            .store(false, std::sync::atomic::Ordering::Release);
-        with_sim_stack(SimStack::settle);
+        // On the home stack, from any thread: settle, so time up to the drop
+        // goes to this sim while it is still ambient; then mark it dead and
+        // settle again, which removes it. Later time goes to the next sim.
+        lock_sim_stack(&self.home, |stack| {
+            stack.settle();
+            self.own
+                .alive
+                .store(false, std::sync::atomic::Ordering::Release);
+            stack.settle();
+        });
     }
 }
 

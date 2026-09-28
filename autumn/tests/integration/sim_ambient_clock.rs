@@ -207,3 +207,13 @@ async fn sim_ambient_clock_inner_sleep_before_a_cross_thread_drop_stays_inner(si
         "the inner sim's hour is not on the outer timeline"
     );
 }
+
+#[sim_test]
+async fn sim_ambient_clock_time_after_a_cross_thread_drop_goes_to_the_outer_sim(sim: Sim) {
+    let start = ambient_instant();
+    let inner = Sim::from_seed(sim.seed.wrapping_add(1));
+    std::thread::spawn(move || drop(inner)).join().unwrap();
+    // The outer sim is ambient again, and its own sleep is on its timeline.
+    tokio::time::sleep(HOUR).await;
+    assert_eq!(ambient_instant().saturating_duration_since(start), HOUR);
+}

@@ -525,7 +525,9 @@ pub mod pg {
                 return CacheLookup::Miss;
             };
             match cache.get(key) {
-                Some(c) if c.expires_at > now => CacheLookup::Hit(c.value.clone()),
+                Some(c) if crate::time::ttl_entry_is_fresh(c.expires_at, now, self.cache_ttl) => {
+                    CacheLookup::Hit(c.value.clone())
+                }
                 _ => CacheLookup::Miss,
             }
         }
