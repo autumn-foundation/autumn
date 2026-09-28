@@ -1636,6 +1636,8 @@ dependencies = [
  "pq-sys",
  "serde",
  "serde_json",
+ "testcontainers",
+ "testcontainers-modules",
  "tokio",
 ]
 
