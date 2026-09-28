@@ -162,7 +162,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 # so the lib target is where the denials actually apply, and skipping the test /
 # example / bench targets keeps this leg minutes shorter. CI still runs the
 # `--all-targets` form.
-GATED_REQUEST_PATH_FEATURES="ws,mail,offline-sync,collab,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme"
+GATED_REQUEST_PATH_FEATURES="ws,mail,offline-sync,collab,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme,i18n,presence"
 step "cargo clippy -p autumn-web --features \"$GATED_REQUEST_PATH_FEATURES\" --lib -- -D warnings"
 cargo clippy -p autumn-web \
   --features "$GATED_REQUEST_PATH_FEATURES" \
@@ -192,14 +192,13 @@ cargo test --workspace --no-run
 # staying disk-cheap by construction (nothing runs; trybuild compiles at run
 # time, so `--no-run` never triggers it).
 #
-# `i18n` joins the set here — it gates integration modules (CI's i18n lane) but
-# no panic-gate lib module, so it is absent from the clippy list — and
-# `test-support` is paired the way CI's feature lanes pair it. `sqlite` stays
+# The set already holds `i18n`, which also gates integration modules (CI's i18n
+# lane), and `test-support` is paired the way CI's feature lanes pair it. `sqlite` stays
 # out: the backend-flip lane is out of scope for this script (see §1d and the
 # header's NOT-run list), and `system-tests` stays out with the browser suite.
-step "cargo test -p autumn-web --features \"<gated set>,i18n,test-support\" --test integration_tests --no-run"
+step "cargo test -p autumn-web --features \"<gated set>,test-support\" --test integration_tests --no-run"
 cargo test -p autumn-web \
-  --features "$GATED_REQUEST_PATH_FEATURES,i18n,test-support" \
+  --features "$GATED_REQUEST_PATH_FEATURES,test-support" \
   --test integration_tests --no-run
 
 step "cargo test -p autumn-web --features \"plugin-sandbox,test-support\" --test integration_tests --no-run"

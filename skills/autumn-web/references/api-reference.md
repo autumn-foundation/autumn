@@ -1254,6 +1254,7 @@ to a wall-clock jump in production.
 | `MonotonicInstant::saturating_duration_since(earlier)` | Elapsed duration; never negative, never panics (**0.7.0**) |
 | `MonotonicInstant::saturating_add(dur)` | Deadline arithmetic without `Instant + Duration`'s panic (**0.7.0**) |
 | `time::monotonic_now()` | Real monotonic clock, for code with no `ClockSource` in scope (**0.7.0**) |
+| `time::ambient_now()` / `ambient_monotonic()` / `ambient_instant()` / `ambient_system_time()` / `AmbientClock` | For code with no clock in scope: the running `Sim`'s virtual clock on this thread, else the system clock. Measure with `ambient_instant().saturating_duration_since(start)`, never `start.elapsed()` (#2967) |
 | `time::clock_unix_secs(clock)` / `clock_unix_duration(clock)` | Unix time from the injected clock |
 | `ClockSource::now` / `ClockSource::monotonic` | The trait; `monotonic` is defaulted to real time, so a **virtual** clock must override it (**0.7.0**) |
 | `Rng` extractor -> `.uuid_v4()` / `.uuid_v7(ms)` / `.next_u64()` | Ids and randomness from the injected `Entropy` source |
@@ -1264,6 +1265,16 @@ to a wall-clock jump in production.
 `std::time::Instant` — a raw `std::time::Instant` reads the real machine clock
 even inside a `#[sim_test]`. For a deadline whose counterparty is
 `tokio::time::sleep`, use `tokio::time::Instant`.
+
+## Simulation Phase 2 (`autumn_web::sim`, #2967)
+
+| API | Purpose |
+|---|---|
+| `Sim::net(SimNet)` | Route outbound `http_client::Client` calls through a seeded virtual network. `SimNet::new().host("payments", router).latency(min, max).drop_rate(p)`; `net.partition("payments")` / `net.heal(..)`; `net.events()` logs each attempt (`NetFault::{None, Dropped, Partitioned, TimedOut}`). No call reaches the real network; a host with no router falls back to `http_mock`s (`http-client` feature) |
+| `Sim::interleave(Vec<F>)` / `Sim::spawn(fut)` | Seeded poll order for futures / seeded yields for a spawned task, so a sweep explores task interleavings. The same seed replays the same order |
+| `sim::crash_at(index, op)` → `CrashOutcome` | Drop `op` at its `index`-th suspension. Pair with `CrashPoint::await_index` and `Sim::kill` / `Sim::restart` |
+| `Sim::try_run_to_idle()` → `Result<(), SimStall>` | `run_to_idle` panics with the seed when the drain never settles (a job that re-enqueues itself); this returns the `SimStall` instead |
+| `http_client::ClientError::SimNetwork` | A sim drop, partition, timeout or unknown host. `ClientError` is `#[non_exhaustive]` |
 
 ## Authored fault scenarios (`autumn_web::sim::FaultPlan`, #1680)
 
