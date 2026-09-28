@@ -485,7 +485,14 @@ impl Listing {
     #[must_use]
     pub fn compat(&self, app: &str) -> Compat {
         let Some(low) = concrete(app) else {
-            return Compat::Unknown;
+            // A range (`>=0.7, <0.8`, `0.7.*`) is compatible when every
+            // version it admits is inside the listing's range. A flag cannot
+            // be ruled out for a range, so a flagged listing stays unknown.
+            return if self.status != Status::Incompatible && range_within(app, &self.autumn_web) {
+                Compat::Compatible
+            } else {
+                Compat::Unknown
+            };
         };
         // A flag wins over the declared range: the range is a claim, the
         // failed run is evidence.
@@ -932,6 +939,71 @@ fn concrete(version: &str) -> Option<semver::Version> {
         })
 }
 
+/// The versions a requirement admits, as `[low, high)`; `high` is `None`
+/// when unbounded. Cargo's rules for each operator, intersected across the
+/// comparators. `None` for an unparsable or empty requirement. Prereleases
+/// are not modelled: a requirement without one never resolves to one.
+fn req_interval(req: &str) -> Option<(semver::Version, Option<semver::Version>)> {
+    use semver::{Op, Version};
+    let req = semver::VersionReq::parse(req).ok()?;
+    let mut low = Version::new(0, 0, 0);
+    let mut high: Option<Version> = None;
+    for c in &req.comparators {
+        let (major, minor, patch) = (c.major, c.minor, c.patch);
+        let base = Version::new(major, minor.unwrap_or(0), patch.unwrap_or(0));
+        // The first version after everything the named parts cover.
+        let past = match (minor, patch) {
+            (Some(minor), Some(patch)) => Version::new(major, minor, patch + 1),
+            (Some(minor), None) => Version::new(major, minor + 1, 0),
+            (None, _) => Version::new(major + 1, 0, 0),
+        };
+        let caret_top = match (major, minor, patch) {
+            (0, None, _) => Version::new(1, 0, 0),
+            (0, Some(0), None) => Version::new(0, 1, 0),
+            (0, Some(0), Some(patch)) => Version::new(0, 0, patch + 1),
+            (0, Some(minor), _) => Version::new(0, minor + 1, 0),
+            _ => Version::new(major + 1, 0, 0),
+        };
+        let tilde_top = minor.map_or_else(
+            || Version::new(major + 1, 0, 0),
+            |minor| Version::new(major, minor + 1, 0),
+        );
+        let (lo, hi) = match c.op {
+            Op::Exact | Op::Wildcard => (base, Some(past)),
+            Op::Greater => (past, None),
+            Op::GreaterEq => (base, None),
+            Op::Less => (Version::new(0, 0, 0), Some(base)),
+            Op::LessEq => (Version::new(0, 0, 0), Some(past)),
+            Op::Tilde => (base, Some(tilde_top)),
+            Op::Caret => (base, Some(caret_top)),
+            _ => return None,
+        };
+        low = low.max(lo);
+        high = match (high, hi) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+    }
+    high.as_ref()
+        .is_none_or(|high| low < *high)
+        .then_some((low, high))
+}
+
+/// Whether every version the requirement `app` admits is admitted by
+/// `range`.
+fn range_within(app: &str, range: &str) -> bool {
+    let (Some((app_low, app_high)), Some((low, high))) = (req_interval(app), req_interval(range))
+    else {
+        return false;
+    };
+    let high_ok = match (&app_high, &high) {
+        (_, None) => true,
+        (None, Some(_)) => false,
+        (Some(app_high), Some(high)) => app_high <= high,
+    };
+    app_low >= low && high_ok
+}
+
 /// The highest version an unresolved `^`/`~` requirement `app` (lowest
 /// version `low`) admits; `None` for a concrete version. A caret spans the
 /// compatibility series; a tilde stays within its minor (`~1.2`, `~0.7.3`),
@@ -1184,6 +1256,42 @@ mod tests {
     }
 
     // ── Compat ──────────────────────────────────────────────────────────
+
+    /// A bounded range the listing's range contains is compatible: every
+    /// version the app can resolve was covered. A wider one, or one next to
+    /// a flag, stays unknown.
+    #[test]
+    fn a_range_inside_the_listing_is_compatible() {
+        let listing = community();
+        assert_eq!(listing.autumn_web, "0.7");
+        for app in [">=0.7, <0.8", "0.7.*", ">=0.7.2, <0.7.9", ">0.7.0, <=0.7.5"] {
+            assert_eq!(listing.compat(app), Compat::Compatible, "{app}");
+        }
+        for app in [">=0.7, <0.9", ">=0.6, <0.8", ">=0.7", "*", "0.*"] {
+            assert_eq!(listing.compat(app), Compat::Unknown, "{app}");
+        }
+        let mut flagged = community();
+        flagged.status = Status::Incompatible;
+        assert_eq!(flagged.compat(">=0.7, <0.8"), Compat::Unknown);
+    }
+
+    #[test]
+    fn req_interval_follows_cargo() {
+        let v = |major, minor, patch| semver::Version::new(major, minor, patch);
+        for (req, low, high) in [
+            ("0.7", v(0, 7, 0), Some(v(0, 8, 0))),
+            ("^0.0.3", v(0, 0, 3), Some(v(0, 0, 4))),
+            ("~1.2", v(1, 2, 0), Some(v(1, 3, 0))),
+            ("=0.7", v(0, 7, 0), Some(v(0, 8, 0))),
+            ("0.7.*", v(0, 7, 0), Some(v(0, 8, 0))),
+            (">0.7", v(0, 8, 0), None),
+            (">0.7.2, <=0.7.5", v(0, 7, 3), Some(v(0, 7, 6))),
+            ("*", v(0, 0, 0), None),
+        ] {
+            assert_eq!(req_interval(req), Some((low, high)), "{req}");
+        }
+        assert_eq!(req_interval(">=0.8, <0.7"), None);
+    }
 
     #[test]
     fn compat_follows_the_declared_range() {

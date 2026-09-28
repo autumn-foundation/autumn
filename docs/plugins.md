@@ -169,7 +169,9 @@ changes a file. Then:
   also refused when the app's `autumn-web` version is not a plain version.
 - A community listing is refused when the app's `autumn-web` requirement may
   resolve outside the listing's range: `"=0.7"` with no `Cargo.lock` may be
-  0.7.1, which a `=0.7.0` listing was never checked on.
+  0.7.1, which a `=0.7.0` listing was never checked on. A bounded range the
+  listing's range contains, such as `">=0.7, <0.8"` against `0.7`, is
+  accepted.
 - A first-party plugin is refused when, with no `Cargo.lock`, the app's
   `autumn-web` requirement admits another release series too:
   `">=0.6, <0.9"` may build the app on 0.8 next to a 0.7 plugin. With

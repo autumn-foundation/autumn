@@ -47,7 +47,7 @@ pub fn apply_report(
             listing.name
         ));
     }
-    check_report_shape(report, &listing.prefix)?;
+    check_report_shape(report, &listing.prefix, listing.no_routes)?;
     // The contract is the machine-checked source of the range and the tier.
     // Only a pass replaces them: a failed contract may not even parse, and
     // the listing keeps what was last verified.
@@ -183,7 +183,11 @@ const REQUIRED_CHECKS: [&str; 7] = [
 
 /// Refuse a report that `plugin-check` did not make, or a pass with no
 /// declared range (AC 3: a listing needs the #1601 contract).
-fn check_report_shape(report: &ConformanceReport, prefix: &str) -> Result<(), String> {
+fn check_report_shape(
+    report: &ConformanceReport,
+    prefix: &str,
+    no_routes: bool,
+) -> Result<(), String> {
     let name = index::sanitize(&report.plugin_name);
     // A failing report is always taken: it can only flag, never vouch.
     if !report.passed() {
@@ -209,6 +213,21 @@ fn check_report_shape(report: &ConformanceReport, prefix: &str) -> Result<(), St
                 || "no prefix".to_owned(),
                 |p| format!("`{}`", index::sanitize(p))
             )
+        ));
+    }
+    // `no_routes` exempts a listing from a prefix, so its report must show
+    // the assertion held: `route-attribution` skips only under `plugin-check
+    // --no-routes` with no routes found. A run without it passes a plugin
+    // that mounts routes, and none of them would have been prefix-checked.
+    if no_routes
+        && !report
+            .checks
+            .iter()
+            .any(|c| c.name == "route-attribution" && c.status == CheckStatus::Skip)
+    {
+        return Err(format!(
+            "the listing for `{name}` says `no_routes`, but the report does not show that \
+             no routes were found; re-run `autumn plugin-check --no-routes`"
         ));
     }
     let contract_passed = report
@@ -1064,6 +1083,32 @@ mod tests {
     }
 
     // ── apply_report ────────────────────────────────────────────────────
+
+    /// A `no_routes` listing needs a report made under `--no-routes` that
+    /// found none: a plain run passes a plugin that mounts routes.
+    #[test]
+    fn a_routeless_listing_needs_a_no_routes_report() {
+        let mut l = listing("autumn-search");
+        assert!(l.no_routes);
+        let before = l.clone();
+        let contract = Some(lockstep("autumn-search", "0.7.0"));
+        let err = apply_report(
+            &mut l,
+            &report("autumn-search", true, contract.clone()),
+            "0.7.0",
+            "2026-10-01",
+        )
+        .unwrap_err();
+        assert!(err.contains("--no-routes"), "{err}");
+        assert_eq!(l, before);
+        let mut r = report("autumn-search", true, contract);
+        for c in &mut r.checks {
+            if c.name == "route-attribution" {
+                c.status = CheckStatus::Skip;
+            }
+        }
+        apply_report(&mut l, &r, "0.7.0", "2026-10-01").expect("no routes were found");
+    }
 
     /// A `route-prefix` pass is evidence only for the prefix it tested:
     /// `--prefix /` admits every route and cannot vouch for `/admin`.
