@@ -64,6 +64,27 @@ fn sim_ambient_clock_outside_a_sim_is_the_system_clock() {
     );
 }
 
+#[test]
+fn sim_ambient_clock_anchored_sim_counts_a_sleep_before_the_first_read() {
+    // A sim built before the caller's own paused runtime.
+    let sim = Sim::from_seed(7);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        sim.anchor();
+        // Tokio auto-advances this sleep before anything reads the clock.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(ambient_monotonic().since_origin(), Duration::from_secs(1));
+        // A second anchor keeps the time already counted.
+        sim.anchor();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(ambient_monotonic().since_origin(), Duration::from_secs(2));
+    });
+}
+
 #[sim_test]
 async fn sim_ambient_clock_deadline_follows_tokio_sleeps(_sim: Sim) {
     // No `Sim::advance`: the paused runtime moves itself to each sleep's end.

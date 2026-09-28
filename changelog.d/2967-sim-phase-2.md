@@ -28,6 +28,9 @@
   `Sim` controls it (issue #2967).
 - **sim-testing:** `Sim::try_run_to_idle` returns a `SimStall` when the drain
   does not settle (issue #2967).
+- **sim-testing:** `Sim::anchor` starts a sim's elapsed time in a runtime
+  built after the sim. `#[sim_test]` and a sim built inside its runtime need
+  no call (issue #2967).
 
 ### Changed
 

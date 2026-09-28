@@ -265,7 +265,7 @@ pub struct Sim {
 
     /// Keeps this sim on its thread's sim stack, which splits tokio time
     /// between the sims that share a runtime.
-    _sim_stack: SimStackGuard,
+    stack_guard: SimStackGuard,
 
     /// How many times [`mount`](Sim::mount) has run. The first mount seeds the
     /// app's entropy from [`seed`](Sim::seed); each restart derives a new seed
@@ -280,6 +280,10 @@ impl Sim {
     /// does **not** boot a database or an app, so an empty
     /// [`#[sim_test]`](crate::sim_test) runs with zero setup. Mount an app with
     /// [`build`](Sim::build).
+    ///
+    /// Built inside its paused runtime, the sim's elapsed time starts here.
+    /// Built before that runtime, call [`anchor`](Sim::anchor) first thing in
+    /// it; `#[sim_test]` does this for you.
     #[must_use]
     pub fn from_seed(seed: u64) -> Self {
         // Each seed run starts with a clean reachability registry, so the sweep
@@ -306,7 +310,7 @@ impl Sim {
             clock,
             ambient: ambient_clock,
             _ambient_guard: ambient_guard,
-            _sim_stack: sim_stack,
+            stack_guard: sim_stack,
             chaos: Chaos::default(),
             chaos_state: None,
             app: SimApp::default(),
@@ -315,6 +319,20 @@ impl Sim {
             net: None,
             shuffle_calls: std::sync::atomic::AtomicU64::new(0),
             mounts: 0,
+        }
+    }
+
+    /// Start this sim's elapsed time at tokio's current instant, if it has not
+    /// started yet. Call it first thing in the runtime that drives a sim built
+    /// before that runtime: tokio time that passes before the sim is anchored
+    /// is not in its elapsed time. Calling it again changes nothing, and
+    /// outside a runtime it does nothing.
+    ///
+    /// A sim built inside its runtime, or run by
+    /// [`#[sim_test]`](crate::sim_test), is anchored already.
+    pub fn anchor(&self) {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            lock_sim_stack(&self.stack_guard.home, SimStack::settle);
         }
     }
 
@@ -1417,6 +1435,8 @@ struct SimStack {
     /// Tokio's instant up to which auto-advanced time is attributed. `None`
     /// until a sim's runtime starts on this thread.
     checkpoint: Option<tokio::time::Instant>,
+    /// Whether this thread already warned about a sim that was not anchored.
+    warned_unanchored: bool,
     /// `Sim::advance` time not yet taken out of a settle. The next settles
     /// take it out of the tokio time they see first, so an advance is never
     /// also counted as auto-advanced time: not when it is cancelled after the
@@ -1428,6 +1448,25 @@ struct SimStack {
 }
 
 impl SimStack {
+    /// [`settle`](Self::settle), from a clock read or an advance. When no
+    /// sim on this thread was anchored, warn once: tokio time that passed
+    /// before this call is not in the sim's elapsed time.
+    fn settle_lazily(&mut self) {
+        if self.checkpoint.is_none()
+            && !self.warned_unanchored
+            && self.clocks.iter().any(|clock| clock.is_alive())
+            && tokio::runtime::Handle::try_current().is_ok()
+        {
+            self.warned_unanchored = true;
+            tracing::warn!(
+                "a Sim built outside its runtime was not anchored; its elapsed \
+                 time starts now. Call `Sim::anchor` first in the runtime, or use \
+                 #[sim_test]"
+            );
+        }
+        self.settle();
+    }
+
     /// Give the tokio time since the last settle to the ambient sim, and
     /// drop entries whose sim has dropped (on any thread).
     fn settle(&mut self) {
@@ -1484,18 +1523,14 @@ fn with_sim_stack<T>(f: impl FnOnce(&mut SimStack) -> T) -> Option<T> {
     SIM_STACK.try_with(|stack| lock_sim_stack(stack, f)).ok()
 }
 
-/// Start attributing tokio time on this thread from now. `#[sim_test]` builds
-/// the sim before its runtime, so it calls this as the runtime starts.
+/// Start attributing tokio time on this thread from now, if nothing has
+/// yet. `#[sim_test]` builds the sim before its runtime, so it calls this as
+/// the runtime starts. Settling first keeps any time already attributed.
 fn anchor_current_sim() {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
     }
-    with_sim_stack(|stack| {
-        stack.clocks.retain(|clock| clock.is_alive());
-        if !stack.clocks.is_empty() {
-            stack.checkpoint = Some(tokio::time::Instant::now());
-        }
-    });
+    with_sim_stack(SimStack::settle);
 }
 
 /// Keeps a sim on its thread's sim stack while the sim lives.
@@ -1539,7 +1574,7 @@ impl Drop for SimStackGuard {
 /// tokio's clock, so a cancel cannot split the two.
 fn note_own_advance(sim: &AmbientSimClock, duration: std::time::Duration) {
     with_sim_stack(|stack| {
-        stack.settle();
+        stack.settle_lazily();
         stack.pending_advance = stack.pending_advance.saturating_add(duration);
     });
     AmbientSimClock::add(&sim.own_advanced, duration);
@@ -1558,7 +1593,7 @@ impl crate::time::ClockSource for AmbientSimClock {
             // No runtime, so no paused clock to follow.
             return crate::time::ClockSource::monotonic(&self.ticking);
         }
-        with_sim_stack(SimStack::settle);
+        with_sim_stack(SimStack::settle_lazily);
         crate::time::MonotonicInstant::from_origin_elapsed(
             Self::read(&self.own_advanced).saturating_add(Self::read(&self.auto_advanced)),
         )
