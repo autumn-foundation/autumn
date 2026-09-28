@@ -658,6 +658,15 @@ name = "ledger_post"
 harness = false
 required-features = ["sqlite"]
 
+# Live-typing workload for the collaborative text CRDT (issue #1806): drives
+# `CollabText::insert_after` one keystroke at a time, the same call
+# `CollabHub`'s message loop makes per op. See the file header for the exact
+# commands.
+[[bench]]
+name = "collab_edit"
+harness = false
+required-features = ["collab"]
+
 # W6 PR3 seed-sweep runner (issue #1797): CI-facing driver for
 # `sim::sweep::sweep_proptest`. `required-features` (not a `#![cfg(...)]` file
 # guard, since a `[[bin]]` target — unlike a `[[test]]` — is simply skipped by
