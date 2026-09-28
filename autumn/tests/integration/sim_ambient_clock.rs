@@ -174,3 +174,21 @@ async fn sim_ambient_clock_inner_sim_dropped_on_another_thread(sim: Sim) {
     sim.advance(HOUR).await;
     assert_eq!(ambient_instant().saturating_duration_since(start), HOUR);
 }
+
+#[sim_test]
+async fn sim_ambient_clock_cancelled_advance_counts_once(sim: Sim) {
+    // `advance` yields once before it moves the clock and once after. A crash
+    // at the second yield keeps the moved hour, and counts it once.
+    let outcome = autumn_web::sim::crash_at(1, sim.advance(HOUR)).await;
+    assert!(outcome.is_crashed());
+    assert_eq!(ambient_monotonic().since_origin(), HOUR);
+    tokio::task::yield_now().await;
+    assert_eq!(ambient_monotonic().since_origin(), HOUR, "still once");
+}
+
+#[sim_test]
+async fn sim_ambient_clock_concurrent_advances_count_once_each(sim: Sim) {
+    tokio::join!(sim.advance(HOUR), sim.advance(HOUR));
+    assert_eq!(ambient_now(), sim_epoch() + chrono::Duration::hours(2));
+    assert_eq!(ambient_monotonic().since_origin(), 2 * HOUR);
+}

@@ -752,9 +752,10 @@ impl Sim {
         self.clock.advance(duration);
         // Advance tokio's paused timer wheel; this fires due timers and yields
         // so their tasks are polled before returning.
-        begin_own_advance(&self.ambient, duration);
+        // `tokio::time::advance` moves the clock in its first poll, the same
+        // poll as this note, and only then yields.
+        note_own_advance(&self.ambient, duration);
         tokio::time::advance(duration).await;
-        end_own_advance(duration);
         self.enforce_wall_clock_budget(guard_start);
     }
 
@@ -1416,6 +1417,11 @@ struct SimStack {
     /// Tokio's instant up to which auto-advanced time is attributed. `None`
     /// until a sim's runtime starts on this thread.
     checkpoint: Option<tokio::time::Instant>,
+    /// `Sim::advance` time not yet taken out of a settle. The next settles
+    /// take it out of the tokio time they see first, so an advance is never
+    /// also counted as auto-advanced time: not when it is cancelled after the
+    /// clock moved, and not when advances run at the same time.
+    pending_advance: std::time::Duration,
 }
 
 impl SimStack {
@@ -1427,17 +1433,20 @@ impl SimStack {
             return;
         }
         let now = tokio::time::Instant::now();
-        if let (Some(checkpoint), Some(top)) = (self.checkpoint, self.clocks.last()) {
-            AmbientSimClock::add(
-                &top.auto_advanced,
-                now.saturating_duration_since(checkpoint),
-            );
+        if let Some(checkpoint) = self.checkpoint {
+            let moved = now.saturating_duration_since(checkpoint);
+            let explicit = moved.min(self.pending_advance);
+            self.pending_advance = self.pending_advance.saturating_sub(explicit);
+            if let Some(top) = self.clocks.last() {
+                AmbientSimClock::add(&top.auto_advanced, moved.saturating_sub(explicit));
+            }
         }
-        self.checkpoint = if self.clocks.is_empty() {
-            None
+        if self.clocks.is_empty() {
+            self.checkpoint = None;
+            self.pending_advance = std::time::Duration::ZERO;
         } else {
-            Some(now)
-        };
+            self.checkpoint = Some(now);
+        }
     }
 }
 
@@ -1502,21 +1511,14 @@ impl Drop for SimStackGuard {
     }
 }
 
-/// Before `sim` advances tokio's clock by `duration`: settle, and record the
-/// advance as `sim`'s own.
-fn begin_own_advance(sim: &AmbientSimClock, duration: std::time::Duration) {
-    with_sim_stack(SimStack::settle);
-    AmbientSimClock::add(&sim.own_advanced, duration);
-}
-
-/// After the advance: move the checkpoint past it, so the ambient sim does not
-/// also count it as auto-advanced time.
-fn end_own_advance(duration: std::time::Duration) {
+/// Record `duration` as `sim`'s own advance. Call in the same poll that moves
+/// tokio's clock, so a cancel cannot split the two.
+fn note_own_advance(sim: &AmbientSimClock, duration: std::time::Duration) {
     with_sim_stack(|stack| {
-        if let Some(checkpoint) = stack.checkpoint {
-            stack.checkpoint = Some(checkpoint + duration);
-        }
+        stack.settle();
+        stack.pending_advance = stack.pending_advance.saturating_add(duration);
     });
+    AmbientSimClock::add(&sim.own_advanced, duration);
 }
 
 impl crate::time::ClockSource for AmbientSimClock {
