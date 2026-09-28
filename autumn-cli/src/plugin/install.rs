@@ -673,9 +673,35 @@ fn normalized(path: &Path) -> PathBuf {
     out
 }
 
-/// The checkouts crates.io patches of `autumn-web` point at, from the
-/// workspace root manifest and every applicable config, normalized.
-fn framework_patch_dirs(root: &Path) -> Vec<PathBuf> {
+/// Where a framework dependency or patch takes `autumn-web` from: a path
+/// checkout (normalized), or a git repository and the one ref it names.
+#[derive(Debug, PartialEq, Eq)]
+enum FrameworkSource {
+    Path(PathBuf),
+    Git {
+        url: String,
+        reference: Option<(String, String)>,
+    },
+}
+
+/// The git source of a dependency entry: the URL without a trailing `/` or
+/// `.git`, and its `rev`, `tag` or `branch`.
+fn git_source(entry: &toml::Value) -> Option<FrameworkSource> {
+    let url = entry.get("git")?.as_str()?;
+    let url = url.trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url).to_owned();
+    let reference = ["rev", "tag", "branch"].iter().find_map(|key| {
+        entry
+            .get(*key)
+            .and_then(toml::Value::as_str)
+            .map(|value| ((*key).to_owned(), value.to_owned()))
+    });
+    Some(FrameworkSource::Git { url, reference })
+}
+
+/// The sources crates.io patches of `autumn-web` point at, from the
+/// workspace root manifest and every applicable config.
+fn framework_patch_sources(root: &Path) -> Vec<FrameworkSource> {
     let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
     let workspace = workspace_root(&root);
     let mut files = vec![(workspace.join("Cargo.toml"), workspace)];
@@ -705,7 +731,9 @@ fn framework_patch_dirs(root: &Path) -> Vec<PathBuf> {
                     continue;
                 }
                 if let Some(path) = entry.get("path").and_then(toml::Value::as_str) {
-                    dirs.push(normalized(&base.join(path)));
+                    dirs.push(FrameworkSource::Path(normalized(&base.join(path))));
+                } else if let Some(git) = git_source(entry) {
+                    dirs.push(git);
                 }
             }
         }
@@ -980,10 +1008,11 @@ pub fn unpatched_local_framework(root: &Path) -> bool {
         return false;
     }
     // A patch collapses the two copies only when it points at the same
-    // checkout: two paths are two packages to Cargo, whatever their version.
-    // A path resolves from the app or, when inherited, the workspace root.
+    // source: two paths, or two git repositories or refs, are two packages
+    // to Cargo, whatever their version. A path resolves from the app or,
+    // when inherited, the workspace root.
     let root_abs = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
-    let patches = framework_patch_dirs(root);
+    let patches = framework_patch_sources(root);
     let path_unpatched = locals
         .iter()
         .filter_map(|entry| entry.get("path")?.as_str())
@@ -994,12 +1023,12 @@ pub fn unpatched_local_framework(root: &Path) -> bool {
             } else {
                 workspace_root(&root_abs).join(path)
             };
-            !patches.contains(&normalized(&checkout))
+            !patches.contains(&FrameworkSource::Path(normalized(&checkout)))
         });
-    // A git checkout cannot be compared by path: any crates.io patch of the
-    // framework is taken for it.
-    let git_unpatched = locals.iter().any(|entry| entry.get("git").is_some())
-        && patched_by(root, "autumn-web", "").is_none();
+    let git_unpatched = locals
+        .iter()
+        .filter_map(git_source)
+        .any(|source| !patches.contains(&source));
     path_unpatched || git_unpatched
 }
 
@@ -2148,6 +2177,33 @@ maud = { version = "0.27", features = ["axum"] }
         // Another spelling of the same checkout is the same package.
         write(&app.join("Cargo.toml"), &manifest("../app/../fork-a"));
         assert!(!unpatched_local_framework(&app));
+    }
+
+    /// A git patch counts only for the same repository and ref.
+    #[test]
+    fn a_git_patch_must_match_the_apps_repository() {
+        let manifest = |patch: &str| {
+            format!(
+                "[package]\nname = \"demo\"\n\n[dependencies]\n\
+                 autumn-web = {{ git = \"https://example.com/fork-a\", tag = \"v0.7.0\" }}\n\n\
+                 [patch.crates-io]\nautumn-web = {{ {patch} }}\n"
+            )
+        };
+        let other = fake_project(
+            SCAFFOLD_MAIN,
+            &manifest("git = \"https://example.com/fork-b\", tag = \"v0.7.0\""),
+        );
+        assert!(unpatched_local_framework(other.path()));
+        let other_ref = fake_project(
+            SCAFFOLD_MAIN,
+            &manifest("git = \"https://example.com/fork-a\", tag = \"v0.6.0\""),
+        );
+        assert!(unpatched_local_framework(other_ref.path()));
+        let same = fake_project(
+            SCAFFOLD_MAIN,
+            &manifest("git = \"https://example.com/fork-a.git\", tag = \"v0.7.0\""),
+        );
+        assert!(!unpatched_local_framework(same.path()));
     }
 
     /// `paths` overrides in a config can replace any crate.
