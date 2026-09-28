@@ -263,8 +263,9 @@ pub struct Sim {
     /// Keeps [`ambient`](Self::ambient) installed while the sim lives.
     _ambient_guard: crate::time::AmbientGuard,
 
-    /// Removes the tokio time this sim spends on the outer sim's timeline.
-    _shadow: ShadowGuard,
+    /// Keeps this sim on its thread's sim stack, which splits tokio time
+    /// between the sims that share a runtime.
+    _sim_stack: SimStackGuard,
 
     /// How many times [`mount`](Sim::mount) has run. The first mount seeds the
     /// app's entropy from [`seed`](Sim::seed); each restart derives a new seed
@@ -293,24 +294,19 @@ impl Sim {
         let ambient_clock = Arc::new(AmbientSimClock {
             wall: std::sync::RwLock::new(Arc::new(clock.ticking())),
             ticking: clock.ticking(),
-            tokio_origin: std::sync::OnceLock::new(),
-            shadowed: std::sync::Mutex::new(std::time::Duration::ZERO),
             own_advanced: std::sync::Mutex::new(std::time::Duration::ZERO),
+            auto_advanced: std::sync::Mutex::new(std::time::Duration::ZERO),
+            alive: std::sync::atomic::AtomicBool::new(true),
         });
         let ambient_guard = crate::time::install_ambient(ambient_clock.clone());
-        // Inside a runtime, fix the elapsed-time origin now, so tokio time
-        // that passes before the first read is on this sim's timeline.
-        if tokio::runtime::Handle::try_current().is_ok() {
-            ambient_clock.init_origin(tokio::time::Instant::now());
-        }
-        let shadow = ShadowGuard::enter(Arc::clone(&ambient_clock));
+        let sim_stack = SimStackGuard::enter(Arc::clone(&ambient_clock));
         Self {
             seed,
             rng: SimRng::new(seed),
             clock,
             ambient: ambient_clock,
             _ambient_guard: ambient_guard,
-            _shadow: shadow,
+            _sim_stack: sim_stack,
             chaos: Chaos::default(),
             chaos_state: None,
             app: SimApp::default(),
@@ -756,8 +752,9 @@ impl Sim {
         self.clock.advance(duration);
         // Advance tokio's paused timer wheel; this fires due timers and yields
         // so their tasks are polled before returning.
-        self.ambient.note_advance(duration);
+        begin_own_advance(&self.ambient, duration);
         tokio::time::advance(duration).await;
+        end_own_advance(duration);
         self.enforce_wall_clock_budget(guard_start);
     }
 
@@ -1089,8 +1086,8 @@ fn parse_liveness_budget(raw: Option<&str>) -> Option<std::time::Duration> {
 /// [`__with_liveness_budget`] for what the watchdog detects.
 #[doc(hidden)]
 pub async fn __with_liveness_watchdog<F: std::future::Future>(seed: u64, body: F) -> F::Output {
-    // `#[sim_test]` builds the sim before its runtime. Fix the sim's
-    // elapsed-time origin as the runtime starts, before the body runs.
+    // `#[sim_test]` builds the sim before its runtime. Start its elapsed
+    // time as the runtime starts, before the body runs.
     anchor_current_sim();
     let raw = std::env::var("AUTUMN_SIM_LIVENESS_BUDGET_SECS").ok();
     __with_liveness_budget(seed, parse_liveness_budget(raw.as_deref()), body).await
@@ -1368,147 +1365,158 @@ impl SimClock {
 
 /// The clock a `Sim` installs as its thread's ambient clock (issue #2967).
 ///
-/// Wall time is the sim clock, so it moves only on [`Sim::advance`]. Elapsed
-/// time follows tokio's paused clock, which [`Sim::advance`] also moves, and
-/// which moves by itself when every task waits on a timer. So a deadline read
-/// from the ambient clock and a `tokio::time::sleep` stay on one timeline, and
-/// a wait loop that sleeps until its deadline ends.
+/// Wall time is the sim clock, so it moves only on [`Sim::advance`].
+///
+/// Elapsed time is kept per sim. Tokio's paused clock is one per runtime, and
+/// several sims can share a runtime, so a sim's elapsed time is:
+///
+/// - the time its own [`Sim::advance`] calls moved tokio's clock, plus
+/// - the time tokio's clock moved by itself (a `sleep` the paused runtime
+///   auto-advanced) while this sim was the ambient clock.
+///
+/// So an ambient deadline and a `tokio::time::sleep` stay on one timeline, and
+/// another sim's `advance` never moves this sim's elapsed time.
 struct AmbientSimClock {
     /// The sim clock, or its chaos-skewed view once a skewed app mounts.
     wall: std::sync::RwLock<Arc<dyn crate::time::ClockSource>>,
     /// The unskewed sim clock, read when no runtime runs.
     ticking: TickingClock,
-    /// Tokio's instant at the first elapsed-time read inside the runtime.
-    tokio_origin: std::sync::OnceLock<tokio::time::Instant>,
-    /// Tokio time that passed while a nested sim shadowed this one. Tokio's
-    /// clock is one per runtime, so an inner sim's `advance` also moves it;
-    /// this keeps that time off this sim's timeline.
-    shadowed: std::sync::Mutex<std::time::Duration>,
-    /// Total time this sim's own `Sim::advance` calls moved tokio's clock.
-    /// Time a sim advances is its own, even while a nested sim shadows it.
+    /// Time this sim's own `Sim::advance` calls moved tokio's clock.
     own_advanced: std::sync::Mutex<std::time::Duration>,
+    /// Time tokio's clock moved by itself while this sim was ambient.
+    auto_advanced: std::sync::Mutex<std::time::Duration>,
+    /// Cleared when the sim drops, on any thread.
+    alive: std::sync::atomic::AtomicBool,
 }
 
 impl AmbientSimClock {
-    /// Record an advance this sim made itself.
-    fn note_advance(&self, duration: std::time::Duration) {
-        let mut own = self
-            .own_advanced
+    fn add(slot: &std::sync::Mutex<std::time::Duration>, duration: std::time::Duration) {
+        let mut total = slot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *own = own.saturating_add(duration);
+        *total = total.saturating_add(duration);
     }
 
-    /// This sim's tokio origin: the instant that puts all of its own advances
-    /// so far on its timeline. Set on the first elapsed read, which can come
-    /// after `Sim::advance`.
-    fn init_origin(&self, now: tokio::time::Instant) -> tokio::time::Instant {
-        *self
-            .tokio_origin
-            .get_or_init(|| now.checked_sub(self.own_advanced()).unwrap_or(now))
-    }
-
-    /// Total time this sim advanced itself.
-    fn own_advanced(&self) -> std::time::Duration {
-        *self
-            .own_advanced
+    fn read(slot: &std::sync::Mutex<std::time::Duration>) -> std::time::Duration {
+        *slot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Take `[start, end)` of tokio time off this sim's timeline, except the
-    /// `kept` part: time this sim advanced itself in that window.
-    fn exclude(
-        &self,
-        start: tokio::time::Instant,
-        end: tokio::time::Instant,
-        kept: std::time::Duration,
-    ) {
-        // No elapsed read yet: fix the origin now. It already leaves out the
-        // gap, and keeps this sim's own advances.
-        if self.tokio_origin.get().is_none() {
-            self.init_origin(end);
-            return;
-        }
-        let origin = *self.tokio_origin.get_or_init(|| end);
-        let gap = end
-            .saturating_duration_since(start.max(origin))
-            .saturating_sub(kept);
-        let mut shadowed = self
-            .shadowed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *shadowed = shadowed.saturating_add(gap);
+    fn is_alive(&self) -> bool {
+        self.alive.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
-/// Fix the elapsed-time origin of the newest sim on this thread at tokio's
-/// current instant, if it is not fixed yet.
-fn anchor_current_sim() {
-    let Ok(_) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    let current = SIM_CLOCKS
-        .try_with(|stack| stack.borrow().last().cloned())
-        .ok()
-        .flatten();
-    if let Some(clock) = current {
-        clock.init_origin(tokio::time::Instant::now());
+/// The sims alive on one thread, and tokio's instant at the last settle.
+#[derive(Default)]
+struct SimStack {
+    /// Newest last. The newest live sim is the ambient one.
+    clocks: Vec<Arc<AmbientSimClock>>,
+    /// Tokio's instant up to which auto-advanced time is attributed. `None`
+    /// until a sim's runtime starts on this thread.
+    checkpoint: Option<tokio::time::Instant>,
+}
+
+impl SimStack {
+    /// Give the tokio time since the last settle to the ambient sim, and
+    /// drop entries whose sim has dropped (on any thread).
+    fn settle(&mut self) {
+        self.clocks.retain(|clock| clock.is_alive());
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        if let (Some(checkpoint), Some(top)) = (self.checkpoint, self.clocks.last()) {
+            AmbientSimClock::add(
+                &top.auto_advanced,
+                now.saturating_duration_since(checkpoint),
+            );
+        }
+        self.checkpoint = if self.clocks.is_empty() {
+            None
+        } else {
+            Some(now)
+        };
     }
 }
 
 thread_local! {
-    /// The sims alive on this thread, newest last.
-    static SIM_CLOCKS: std::cell::RefCell<Vec<Arc<AmbientSimClock>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static SIM_STACK: std::cell::RefCell<SimStack> = std::cell::RefCell::new(SimStack::default());
 }
 
-/// Records a sim's life on its thread. When a sim nests inside another, its
-/// drop takes the tokio time it lived off the outer sim's timeline.
-struct ShadowGuard {
-    own: Arc<AmbientSimClock>,
-    /// The sim this one shadows, tokio's instant when this one started, and
-    /// the outer sim's own advances at that instant.
-    outer: Option<(
-        Arc<AmbientSimClock>,
-        tokio::time::Instant,
-        std::time::Duration,
-    )>,
+/// Run `f` on this thread's sim stack. `None` during thread teardown or a
+/// re-entrant call.
+fn with_sim_stack<T>(f: impl FnOnce(&mut SimStack) -> T) -> Option<T> {
+    SIM_STACK
+        .try_with(|stack| stack.try_borrow_mut().ok().map(|mut stack| f(&mut stack)))
+        .ok()
+        .flatten()
 }
 
-impl ShadowGuard {
-    fn enter(own: Arc<AmbientSimClock>) -> Self {
-        let outer = SIM_CLOCKS.with(|stack| {
-            let mut stack = stack.borrow_mut();
-            let outer = stack.last().cloned();
-            stack.push(Arc::clone(&own));
-            outer
-        });
-        let start = tokio::runtime::Handle::try_current()
-            .ok()
-            .map(|_| tokio::time::Instant::now());
-        let outer = outer.zip(start).map(|(outer, start)| {
-            let advanced = outer.own_advanced();
-            (outer, start, advanced)
-        });
-        Self { own, outer }
+/// Start attributing tokio time on this thread from now. `#[sim_test]` builds
+/// the sim before its runtime, so it calls this as the runtime starts.
+fn anchor_current_sim() {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
     }
+    with_sim_stack(|stack| {
+        stack.clocks.retain(|clock| clock.is_alive());
+        if !stack.clocks.is_empty() {
+            stack.checkpoint = Some(tokio::time::Instant::now());
+        }
+    });
 }
 
-impl Drop for ShadowGuard {
-    fn drop(&mut self) {
-        let _ = SIM_CLOCKS.try_with(|stack| {
-            if let Ok(mut stack) = stack.try_borrow_mut() {
-                stack.retain(|clock| !Arc::ptr_eq(clock, &self.own));
+/// Keeps a sim on its thread's sim stack while the sim lives.
+struct SimStackGuard {
+    own: Arc<AmbientSimClock>,
+}
+
+impl SimStackGuard {
+    fn enter(own: Arc<AmbientSimClock>) -> Self {
+        with_sim_stack(|stack| {
+            // Time so far belongs to the sim that was ambient until now.
+            stack.settle();
+            stack.clocks.push(Arc::clone(&own));
+            if stack.checkpoint.is_none() && tokio::runtime::Handle::try_current().is_ok() {
+                stack.checkpoint = Some(tokio::time::Instant::now());
             }
         });
-        if let Some((outer, start, advanced_at_start)) = self.outer.take()
-            && tokio::runtime::Handle::try_current().is_ok()
-        {
-            let kept = outer.own_advanced().saturating_sub(advanced_at_start);
-            outer.exclude(start, tokio::time::Instant::now(), kept);
-        }
+        Self { own }
     }
+}
+
+impl Drop for SimStackGuard {
+    fn drop(&mut self) {
+        // Settle first, so time up to now goes to this sim while it is still
+        // ambient. On another thread, the stack there does not hold this sim:
+        // the cleared flag removes it from its own stack on that stack's next
+        // settle, and tokio time since that stack's last settle goes to the
+        // sim that is ambient there next.
+        with_sim_stack(SimStack::settle);
+        self.own
+            .alive
+            .store(false, std::sync::atomic::Ordering::Release);
+        with_sim_stack(SimStack::settle);
+    }
+}
+
+/// Before `sim` advances tokio's clock by `duration`: settle, and record the
+/// advance as `sim`'s own.
+fn begin_own_advance(sim: &AmbientSimClock, duration: std::time::Duration) {
+    with_sim_stack(SimStack::settle);
+    AmbientSimClock::add(&sim.own_advanced, duration);
+}
+
+/// After the advance: move the checkpoint past it, so the ambient sim does not
+/// also count it as auto-advanced time.
+fn end_own_advance(duration: std::time::Duration) {
+    with_sim_stack(|stack| {
+        if let Some(checkpoint) = stack.checkpoint {
+            stack.checkpoint = Some(checkpoint + duration);
+        }
+    });
 }
 
 impl crate::time::ClockSource for AmbientSimClock {
@@ -1524,15 +1532,9 @@ impl crate::time::ClockSource for AmbientSimClock {
             // No runtime, so no paused clock to follow.
             return crate::time::ClockSource::monotonic(&self.ticking);
         }
-        let now = tokio::time::Instant::now();
-        let origin = self.init_origin(now);
-        let shadowed = *self
-            .shadowed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        with_sim_stack(SimStack::settle);
         crate::time::MonotonicInstant::from_origin_elapsed(
-            now.saturating_duration_since(origin)
-                .saturating_sub(shadowed),
+            Self::read(&self.own_advanced).saturating_add(Self::read(&self.auto_advanced)),
         )
     }
 }

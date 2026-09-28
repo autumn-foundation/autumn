@@ -129,3 +129,48 @@ async fn sim_ambient_clock_tokio_time_before_the_first_elapsed_read_is_kept(_sim
     tokio::time::sleep(HOUR).await;
     assert_eq!(ambient_monotonic().since_origin(), HOUR);
 }
+
+#[sim_test]
+async fn sim_ambient_clock_outer_advance_leaves_the_inner_timeline_alone(sim: Sim) {
+    // The inner sim is ambient while the outer sim advances. The inner sim's
+    // elapsed time stays in lockstep with its own wall clock.
+    let inner = Sim::from_seed(sim.seed.wrapping_add(1));
+    let start = ambient_instant();
+    sim.advance(HOUR).await;
+    assert_eq!(
+        ambient_now(),
+        sim_epoch(),
+        "the inner wall clock did not move"
+    );
+    assert_eq!(
+        ambient_instant().saturating_duration_since(start),
+        Duration::ZERO,
+        "the outer hour is not on the inner timeline"
+    );
+    drop(inner);
+    assert_eq!(
+        ambient_monotonic().since_origin(),
+        HOUR,
+        "the outer sim kept its hour"
+    );
+}
+
+#[sim_test]
+async fn sim_ambient_clock_inner_sim_dropped_on_another_thread(sim: Sim) {
+    let start = ambient_instant();
+    let inner = Sim::from_seed(sim.seed.wrapping_add(1));
+    inner.advance(HOUR).await;
+    std::thread::spawn(move || drop(inner)).join().unwrap();
+    assert_eq!(ambient_now(), sim_epoch(), "the outer sim is ambient again");
+    assert_eq!(
+        ambient_instant().saturating_duration_since(start),
+        Duration::ZERO,
+        "the inner hour stays off the outer timeline"
+    );
+    // A later nested sim still splits time with the right outer sim.
+    let next = Sim::from_seed(sim.seed.wrapping_add(2));
+    next.advance(HOUR).await;
+    drop(next);
+    sim.advance(HOUR).await;
+    assert_eq!(ambient_instant().saturating_duration_since(start), HOUR);
+}
