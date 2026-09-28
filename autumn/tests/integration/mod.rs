@@ -197,6 +197,8 @@ mod maud_render;
 #[cfg(feature = "mcp")]
 mod mcp_endpoint;
 #[cfg(feature = "mcp")]
+mod mcp_idempotency_guard;
+#[cfg(feature = "mcp")]
 mod mcp_plugin;
 #[cfg(all(feature = "db", feature = "mcp"))]
 mod mcp_repository;
