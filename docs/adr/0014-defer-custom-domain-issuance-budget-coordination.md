@@ -179,12 +179,20 @@ questions, and only the latter is what this ADR defers.
 
 ## Seam kept open
 
-No new seam is needed to keep option 3 available later. Two already exist:
+One seam already exists; one small seam is new but ships as part of the
+default path's ordinary bug fix, not as something option 3 must add later:
 
-- `CustomDomainStore` already abstracts persistence behind a trait with
-  swappable implementations, so a future backend for the attempt log
-  (should one become necessary) is additive, not a rewrite of
-  `IssuanceLimiter`'s call sites.
+- `CustomDomainStore` already abstracts *per-domain* persistence behind a
+  trait with swappable implementations (`load_all`/`save`/`delete` on one
+  `CustomDomain` at a time), so a future backend for the per-domain half of
+  the attempt log is additive, not a rewrite of `IssuanceLimiter`'s call
+  sites. It cannot serve the global window, though: it has no operation for
+  a single deployment-wide value, only per-record ones. The default path's
+  own small durable store for the global window (see Default path above) is
+  therefore a new seam — but it is built now, as part of the ordinary fix
+  for items 1/3/4, not deferred alongside option 3. Once it exists, a later
+  option-3 implementation extends it rather than inventing persistence from
+  scratch.
 - ADR 0010's app-facing distributed lock already provides the "exactly once
   across the cluster" primitive a fleet-wide `global_per_hour` enforcement
   would coordinate through, so building option 3 later starts from an
