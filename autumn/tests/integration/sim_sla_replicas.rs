@@ -34,6 +34,9 @@ struct RacingStore {
     /// A met instant that a rival `track` writes just before the next
     /// `mark_met`, so that call loses the race.
     rival_met: Arc<Mutex<Option<DateTime<Utc>>>>,
+    /// A deadline that a rival `reconcile` stores just before the next
+    /// `mark_met`.
+    rival_due: Arc<Mutex<Option<DateTime<Utc>>>>,
 }
 
 impl RacingStore {
@@ -46,6 +49,7 @@ impl RacingStore {
             claims: Arc::default(),
             fail_mark_met: Arc::default(),
             rival_met: Arc::default(),
+            rival_due: Arc::default(),
         }
     }
 }
@@ -80,7 +84,11 @@ impl ObligationStore for RacingStore {
             return Box::pin(std::future::ready(Err(SlaError::Store("down".to_owned()))));
         }
         let rival = self.rival_met.lock().unwrap().take();
+        let rival_due = self.rival_due.lock().unwrap().take();
         Box::pin(async move {
+            if let Some(due) = rival_due {
+                self.inner.set_due(key, generation, due).await?;
+            }
             if let Some(rival) = rival {
                 self.inner.mark_met(key, generation, rival).await?;
             }
@@ -833,6 +841,90 @@ async fn sim_sla_an_on_time_met_clears_a_newer_claim_than_the_job_payload() {
     assert!(fired.lock().unwrap().is_empty(), "met on time: no breach");
     let record = store.inner.get(&key).await.unwrap().unwrap();
     assert_eq!(record.escalated_at, None, "the stored claim is released");
+
+    job::clear_global_job_client();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sim_sla_a_track_reads_a_deadline_that_changed_before_its_met_write() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    // Wednesday 2020-01-01 09:00. The deadline on this calendar is 11:00.
+    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let clock = TickingClock::starting_at(start);
+    let store = RacingStore::new();
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    let app = replica(&clock, &store, &fired);
+    let sla = Sla::from_state(app.state()).unwrap();
+    let ob = Obligation::new("first_response", "ticket:1")
+        .within(BusinessDuration::hours(2))
+        .calendar("support");
+    sla.track(&ob).await.unwrap();
+
+    // A rival reconcile stores 15:00 just before this call writes a 12:00
+    // reply. The stored record is met on time.
+    clock.advance(Duration::from_secs(4 * 3600));
+    let later = Utc.with_ymd_and_hms(2020, 1, 1, 15, 0, 0).unwrap();
+    *store.rival_due.lock().unwrap() = Some(later);
+    let met = Utc.with_ymd_and_hms(2020, 1, 1, 12, 0, 0).unwrap();
+    let status = sla.track(&ob.clone().met_at(met)).await.unwrap();
+    assert_eq!(status.due_at, Some(later));
+    assert_eq!(status.state, autumn_web::sla::ObligationState::Met);
+
+    job::clear_global_job_client();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sim_sla_reconcile_stores_a_later_deadline_for_a_met_record() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    // Budget 6 h from 09:00: 15:00 on this calendar. The record still has
+    // the old 11:00 deadline and a 12:00 reply, so it reads as breached.
+    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let old_due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
+    let new_due = Utc.with_ymd_and_hms(2020, 1, 1, 15, 0, 0).unwrap();
+    let met = Utc.with_ymd_and_hms(2020, 1, 1, 12, 0, 0).unwrap();
+    let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2020, 1, 1, 13, 0, 0).unwrap());
+    let store = RacingStore::new();
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    let app = replica(&clock, &store, &fired);
+    let sla = Sla::from_state(app.state()).unwrap();
+    let ob = Obligation::new("first_response", "ticket:1")
+        .within(BusinessDuration::hours(6))
+        .calendar("support")
+        .starting_at(start)
+        .zone(chrono_tz::Tz::UTC)
+        .met_at(met);
+    let key = ob.key();
+    let generation = Uuid::from_u128(15);
+    store
+        .inner
+        .insert(ObligationRecord::new(ob, generation).with_due_at(old_due))
+        .await
+        .unwrap();
+
+    // reconcile stores 15:00; no check is needed for a met record.
+    assert_eq!(sla.reconcile().await.unwrap(), 0);
+    let record = store.inner.get(&key).await.unwrap().unwrap();
+    assert_eq!(record.due_at, Some(new_due));
+
+    // The old 11:00 check then finds the reply on time.
+    let check = serde_json::json!({ "key": key, "generation": generation, "due_at": old_due });
+    let client = app.state().extension::<job::JobClient>().unwrap();
+    client
+        .enqueue(autumn_web::sla::CHECK_JOB, check)
+        .await
+        .unwrap();
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    settle().await;
+    assert!(fired.lock().unwrap().is_empty(), "no false breach");
+    assert_eq!(
+        sla.get(&key).await.unwrap().unwrap().state,
+        autumn_web::sla::ObligationState::Met
+    );
 
     job::clear_global_job_client();
 }

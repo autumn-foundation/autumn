@@ -322,12 +322,12 @@ impl Sla {
             .await?;
         // A new record has the met instant already. An older one gets it now.
         if !created && let Some(met) = obligation.met() {
-            if store.mark_met(&key, record.generation, met).await? {
-                record.obligation.set_met(met);
-            } else if let Some(fresh) = store.get(&key).await?
+            store.mark_met(&key, record.generation, met).await?;
+            // Read the record again: another call can have changed its met
+            // instant or its deadline since the insert.
+            if let Some(fresh) = store.get(&key).await?
                 && fresh.generation == record.generation
             {
-                // Another call changed the record. Use the stored state.
                 record = fresh;
             }
         }
@@ -397,9 +397,9 @@ impl Sla {
             .collect()
     }
 
-    /// Store the deadline of each open record on the current calendars, and
-    /// put a check job on the queue there. Returns the number of records it
-    /// checked.
+    /// Store the deadline of each record that is not escalated, on the
+    /// current calendars. Put a check job on the queue there for each record
+    /// that is not met. Returns the number of checks it added.
     ///
     /// Call it once from the new version after a deploy that changes a
     /// calendar, for example from an `on_startup` hook. Without it, a record
@@ -419,13 +419,18 @@ impl Sla {
             // The deadline on this replica's calendars, not the stored one.
             let status = self.calendar_status(&record, now)?;
             let Some(due) = status.due_at else { continue };
-            if status.escalated_at.is_some() || status.state == ObligationState::Met {
+            if status.escalated_at.is_some() {
                 continue;
             }
             if record.due_at != Some(due)
                 && !store.set_due(&status.key, record.generation, due).await?
             {
                 // The record was escalated or replaced after the read.
+                continue;
+            }
+            if status.state == ObligationState::Met {
+                // Met on time on this calendar: the stored deadline is
+                // enough, and no check is necessary.
                 continue;
             }
             // A check for `due` can be running with an older read, also
