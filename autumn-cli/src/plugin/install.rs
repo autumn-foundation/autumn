@@ -653,18 +653,23 @@ fn patched_by_in(
             return Some(format!("[patch.{source}] in {}", path.display()));
         }
         // Source replacement swaps crates.io itself: every crate, this one
-        // included, comes from the named source (a vendor dir, a mirror).
-        if let Some(with) = table
+        // included, comes from the named source (a vendor dir, a mirror). A
+        // `[source.crates-io]` that sets `registry`, `local-registry`,
+        // `directory` or `git` redefines it the same way.
+        if let Some(crates_io) = table
             .get("source")
             .and_then(|source| source.get("crates-io"))
-            .and_then(|source| source.get("replace-with"))
-            .and_then(toml::Value::as_str)
+            .and_then(toml::Value::as_table)
+            .filter(|crates_io| !crates_io.is_empty())
         {
-            return Some(format!(
-                "[source.crates-io] replace-with = \"{}\" in {}",
-                super::index::sanitize(with),
-                path.display()
-            ));
+            let how = crates_io
+                .get("replace-with")
+                .and_then(toml::Value::as_str)
+                .map_or_else(
+                    || "redefines crates.io".to_owned(),
+                    |with| format!("replace-with = \"{}\"", super::index::sanitize(with)),
+                );
+            return Some(format!("[source.crates-io] {how} in {}", path.display()));
         }
     }
     None
@@ -1518,6 +1523,13 @@ mod tests {
         );
         let found = patched_by_in(&app, "autumn-plugin-x", "=0.2.5", None).unwrap();
         assert!(found.contains("replace-with = \"vendored\""), "{found}");
+        // A direct redefinition of crates.io redirects it too.
+        write(
+            &app.join(".cargo/config.toml"),
+            "[source.crates-io]\nregistry = \"sparse+https://mirror.example.com/\"\n",
+        );
+        let found = patched_by_in(&app, "autumn-plugin-x", "=0.2.5", None).unwrap();
+        assert!(found.contains("redefines crates.io"), "{found}");
     }
 
     /// A `[workspace.dependencies]` default the package does not inherit is

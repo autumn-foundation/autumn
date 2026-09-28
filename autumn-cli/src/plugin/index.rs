@@ -912,8 +912,13 @@ pub fn staleness(index: &PluginIndex, against: &str) -> Vec<Finding> {
 /// Read a version or a simple requirement (`0.7.0`, `^0.7`, `=0.7.2`) as a
 /// concrete version. `None` for a range such as `>=0.6`.
 fn concrete(version: &str) -> Option<semver::Version> {
-    super::install::parse_version(version)
-        .map(|(major, minor, patch)| semver::Version::new(major, minor, patch))
+    // A full version keeps its prerelease: `0.7.0-alpha.1` is outside `0.7`,
+    // and reading it as `0.7.0` would admit it.
+    let full = version.trim().trim_start_matches(['=', '^', '~', ' ']);
+    semver::Version::parse(full).ok().or_else(|| {
+        super::install::parse_version(version)
+            .map(|(major, minor, patch)| semver::Version::new(major, minor, patch))
+    })
 }
 
 /// The highest version in `v`'s compatibility series.
@@ -1155,6 +1160,8 @@ mod tests {
         assert_eq!(listing.compat("0.6.0"), Compat::Incompatible);
         assert_eq!(listing.compat("0.8.0"), Compat::Incompatible);
         assert_eq!(listing.compat(">=0.6"), Compat::Unknown);
+        // A prerelease is not in the stable range Cargo matches it against.
+        assert_eq!(listing.compat("0.7.0-alpha.1"), Compat::Incompatible);
     }
 
     /// AC 4: a flagged listing is refused on the release it failed on and
