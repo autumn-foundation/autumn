@@ -75,4 +75,22 @@ if ! grep -Eq "MSRV \(${canonical}\)" "$ci"; then
   die "$ci msrv job name does not reference MSRV (${canonical})"
 fi
 
+# windows-tier1 job pin. This job installs a toolchain for itself
+# separately from the `msrv` job above — it does not inherit `msrv`'s pin
+# just because both live in the same file. It must track the canonical
+# MSRV directly: every scaffolded app's own rust-toolchain.toml pins the
+# literal MSRV version, and if this job's pin drifts from it, the first
+# `cargo` invocation inside the scaffolded app falls back to an implicit,
+# un-retried rustup toolchain install mid-journey — the exact race that
+# caused the "cargo.exe binary... is not applicable to the toolchain"
+# failures fixed in #2994.
+windows_tier1_block="$(awk '
+  /^  windows-tier1:/ { flag = 1 }
+  flag && /^  [A-Za-z]/ && !/^  windows-tier1:/ { flag = 0 }
+  flag
+' "$ci")"
+if ! grep -Eq "rust-toolchain@${canonical}\b" <<<"$windows_tier1_block"; then
+  die "$ci windows-tier1 job does not pin dtolnay/rust-toolchain@${canonical} (must match the canonical MSRV, not just the msrv job's own pin)"
+fi
+
 echo "MSRV alignment OK (${canonical})"
