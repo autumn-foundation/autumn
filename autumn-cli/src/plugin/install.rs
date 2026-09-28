@@ -455,6 +455,28 @@ pub fn locked_dependency_of(dir: &Path, package: &str, crate_name: &str) -> Opti
     versions.next().is_none().then_some(first)
 }
 
+/// The version of `crate_name` Cargo resolved for the package at `dir`, or
+/// for `package` when given: its own dependency edge in the workspace lock,
+/// else [`locked_version`]. Another member on another version does not make
+/// it ambiguous.
+#[must_use]
+pub fn locked_version_for(dir: &Path, package: Option<&str>, crate_name: &str) -> Option<String> {
+    let own = || {
+        let text = std::fs::read_to_string(manifest_path(dir)).ok()?;
+        let table = toml::from_str::<toml::Table>(&text).ok()?;
+        table
+            .get("package")?
+            .get("name")?
+            .as_str()
+            .map(str::to_owned)
+    };
+    package
+        .map(str::to_owned)
+        .or_else(own)
+        .and_then(|package| locked_dependency_of(dir, &package, crate_name))
+        .or_else(|| locked_version(dir, crate_name))
+}
+
 /// `manifest` with a `crate_name = { workspace = true }` entry replaced by the
 /// workspace root's `[workspace.dependencies]` entry, as Cargo resolves it.
 /// The root is the first ancestor of `root` (itself included) whose
@@ -690,44 +712,43 @@ fn canonical(name: &str) -> String {
 /// which is exactly what this repo's own conformance gate does — so the check
 /// is for a local source that is *not* patched, not for a local source.
 ///
-/// Manifests are read from `root` upward, because both the dependency and the
-/// patch table commonly live in an enclosing workspace manifest.
+/// Only what Cargo reads counts: the app's own entry, or the workspace
+/// root's `[workspace.dependencies]` entry it inherits, and a patch from the
+/// workspace root or a `.cargo/config.toml` ([`patched_by`]). A nearer
+/// manifest that is not the app's workspace root is ignored, as Cargo does.
 #[must_use]
 pub fn unpatched_local_framework(root: &Path) -> bool {
-    let mut local = false;
-    let mut patched = false;
-    let mut dir = Some(root);
-    while let Some(current) = dir {
-        if let Ok(content) = std::fs::read_to_string(current.join("Cargo.toml"))
-            && let Ok(table) = toml::from_str::<toml::Table>(&content)
-        {
-            for kind in ["dependencies", "workspace"] {
-                let deps = if kind == "workspace" {
-                    table.get(kind).and_then(|w| w.get("dependencies"))
-                } else {
-                    table.get(kind)
-                };
-                if let Some(entry) = deps
-                    .and_then(toml::Value::as_table)
-                    .and_then(|deps| deps.get("autumn-web"))
-                    .and_then(toml::Value::as_table)
-                    && (entry.contains_key("path") || entry.contains_key("git"))
-                {
-                    local = true;
-                }
-            }
-            if table
-                .get("patch")
-                .and_then(|patch| patch.get("crates-io"))
-                .and_then(toml::Value::as_table)
-                .is_some_and(|patched_crates| patched_crates.contains_key("autumn-web"))
-            {
-                patched = true;
-            }
-        }
-        dir = current.parent();
-    }
-    local && !patched
+    let read = |path: &Path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+    };
+    let is_local = |entry: &toml::Value| entry.get("path").is_some() || entry.get("git").is_some();
+    let Some(entry) = read(&manifest_path(root))
+        .and_then(|table| table.get("dependencies")?.get("autumn-web").cloned())
+    else {
+        return false;
+    };
+    let inherited = entry
+        .get("workspace")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+    let local = if inherited {
+        read(&workspace_root(root).join("Cargo.toml"))
+            .and_then(|table| {
+                table
+                    .get("workspace")?
+                    .get("dependencies")?
+                    .get("autumn-web")
+                    .cloned()
+            })
+            .is_some_and(|entry| is_local(&entry))
+    } else {
+        is_local(&entry)
+    };
+    // No pin to compare: any crates.io patch of `autumn-web` collapses the
+    // two copies.
+    local && patched_by(root, "autumn-web", "").is_none()
 }
 
 /// Whether `main_rs` already mounts `entry` **in code**.
@@ -1662,6 +1683,39 @@ maud = { version = "0.27", features = ["axum"] }
         let tmp = fake_project(SCAFFOLD_MAIN, cargo);
         assert!(!unpatched_local_framework(tmp.path()));
         assert!(plan_add(tmp.path(), admin(), "0.7.0").is_ok());
+    }
+
+    /// Only the app's workspace root counts: a nearer manifest that is not
+    /// it (here, an inner workspace the app names past) neither makes the
+    /// framework local nor patches it.
+    #[test]
+    fn only_the_workspace_root_decides_a_local_framework() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().join("outer");
+        let app = outer.join("inner").join("app");
+        write(
+            &outer.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"inner/app\"]\n\n\
+             [workspace.dependencies]\nautumn-web = { path = \"../autumn\" }\n",
+        );
+        write(
+            &outer.join("inner/Cargo.toml"),
+            "[workspace]\nmembers = []\n\n[patch.crates-io]\nautumn-web = { path = \"../x\" }\n",
+        );
+        write(
+            &app.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nworkspace = \"../..\"\n\n\
+             [dependencies]\nautumn-web = { workspace = true }\n",
+        );
+        assert!(unpatched_local_framework(&app));
+        // The patch in the real root does count.
+        write(
+            &outer.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"inner/app\"]\n\n\
+             [workspace.dependencies]\nautumn-web = { path = \"../autumn\" }\n\n\
+             [patch.crates-io]\nautumn-web = { path = \"../autumn\" }\n",
+        );
+        assert!(!unpatched_local_framework(&app));
     }
 
     /// A plain registry dependency is not a local checkout.

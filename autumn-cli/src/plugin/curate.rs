@@ -309,13 +309,31 @@ fn check_inspect_shape(listing: &Listing, report: &InspectReport) -> Result<(), 
             listing.name
         ));
     }
+    // Over a manifest's routes these checks pass or fail; `inspect` never
+    // skips them. A skip would hide a failure, and sandboxed listings are
+    // not re-verified.
     for required in ["route-attribution", "route-prefix", "route-collision"] {
-        if !report.conformance.checks.iter().any(|c| c.name == required) {
-            return Err(format!(
-                "the inspect report for `{}` has no `{required}` check; use a report from \
-                 `autumn plugin inspect --format json`",
-                listing.name
-            ));
+        match report
+            .conformance
+            .checks
+            .iter()
+            .find(|c| c.name == required)
+        {
+            None => {
+                return Err(format!(
+                    "the inspect report for `{}` has no `{required}` check; use a report from \
+                     `autumn plugin inspect --format json`",
+                    listing.name
+                ));
+            }
+            Some(check) if check.status == CheckStatus::Skip => {
+                return Err(format!(
+                    "the inspect report for `{}` skips `{required}`, which `autumn plugin \
+                     inspect` always runs; use an unedited report",
+                    listing.name
+                ));
+            }
+            Some(_) => {}
         }
     }
     // `inspect` emits every quota and limit. A report missing one would
@@ -1427,6 +1445,22 @@ mod tests {
         same.upgrade = None;
         same.artifact_sha256 = Some(l.artifact_sha256.clone());
         assert!(apply_inspect(&mut l, &same, "0.7.0", "2026-10-01").is_ok());
+    }
+
+    /// `inspect` always runs the route checks over the manifest. A report
+    /// that skips one was edited, and would hide a failure.
+    #[test]
+    fn an_inspect_report_that_skips_a_route_check_is_refused() {
+        for name in ["route-attribution", "route-prefix", "route-collision"] {
+            let mut r = inspect(true);
+            for c in &mut r.conformance.checks {
+                if c.name == name {
+                    c.status = CheckStatus::Skip;
+                }
+            }
+            let err = apply_inspect(&mut sandboxed(), &r, "0.7.0", "2026-10-01").unwrap_err();
+            assert!(err.contains(&format!("skips `{name}`")), "{err}");
+        }
     }
 
     /// AC 6: the scoped grants are recorded, not only capability names.

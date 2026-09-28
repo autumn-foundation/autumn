@@ -247,7 +247,12 @@ pub fn run(opts: &PluginCheckOptions<'_>) {
         },
         &routes,
     );
-    report.autumn_web = locked_autumn_web(std::path::Path::new("."), opts.package);
+    // `--bin` alone still names one package: the member that owns it.
+    let package = opts
+        .package
+        .map(str::to_owned)
+        .or_else(|| opts.bin.and_then(package_owning_bin));
+    report.autumn_web = locked_autumn_web(std::path::Path::new("."), package.as_deref());
 
     match opts.format {
         ReportFormat::Text => print!("{}", report.to_text_report()),
@@ -341,21 +346,37 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
 /// not make it ambiguous. `None` when there is no lockfile, or the version
 /// cannot be told apart.
 pub fn locked_autumn_web(dir: &std::path::Path, package: Option<&str>) -> Option<String> {
-    use crate::plugin::install;
-    let own = || {
-        let text = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
-        let table = toml::from_str::<toml::Table>(&text).ok()?;
-        table
-            .get("package")?
-            .get("name")?
-            .as_str()
-            .map(str::to_owned)
-    };
-    package
-        .map(str::to_owned)
-        .or_else(own)
-        .and_then(|package| install::locked_dependency_of(dir, &package, "autumn-web"))
-        .or_else(|| install::locked_version(dir, "autumn-web"))
+    crate::plugin::install::locked_version_for(dir, package, "autumn-web")
+}
+
+/// The workspace package with a `bin` target named `bin`, from `cargo
+/// metadata`. `None` when none or several do.
+fn package_owning_bin(bin: &str) -> Option<String> {
+    let output = std::process::Command::new("cargo")
+        .args(["metadata", "--format-version=1", "--no-deps"])
+        .output()
+        .ok()?;
+    let metadata = serde_json::from_slice(&output.stdout).ok()?;
+    package_of_bin(&metadata, bin)
+}
+
+fn package_of_bin(metadata: &serde_json::Value, bin: &str) -> Option<String> {
+    let mut owners = metadata["packages"]
+        .as_array()?
+        .iter()
+        .filter(|package| {
+            package["targets"].as_array().is_some_and(|targets| {
+                targets.iter().any(|target| {
+                    target["name"] == bin
+                        && target["kind"]
+                            .as_array()
+                            .is_some_and(|kinds| kinds.iter().any(|k| k == "bin"))
+                })
+            })
+        })
+        .filter_map(|package| package["name"].as_str());
+    let owner = owners.next()?;
+    owners.next().is_none().then(|| owner.to_owned())
 }
 
 /// What the child binary's stderr said about its plugin contracts.
@@ -1584,6 +1605,23 @@ mod contract_tests {
         )
         .unwrap();
         assert_eq!(locked_autumn_web(&app, None).as_deref(), Some("0.7.1"));
+    }
+
+    /// `--bin` without `-p` names the member that owns that binary.
+    #[test]
+    fn package_of_bin_finds_the_one_owner() {
+        let metadata = serde_json::json!({"packages": [
+            {"name": "host", "targets": [{"name": "host", "kind": ["bin"]}]},
+            {"name": "lib", "targets": [{"name": "host", "kind": ["lib"]}]},
+            {"name": "other", "targets": [{"name": "tool", "kind": ["bin"]}]},
+        ]});
+        assert_eq!(package_of_bin(&metadata, "host").as_deref(), Some("host"));
+        assert_eq!(package_of_bin(&metadata, "missing"), None);
+        let twice = serde_json::json!({"packages": [
+            {"name": "a", "targets": [{"name": "x", "kind": ["bin"]}]},
+            {"name": "b", "targets": [{"name": "x", "kind": ["bin"]}]},
+        ]});
+        assert_eq!(package_of_bin(&twice, "x"), None);
     }
 
     fn opts(contracts: &ContractDump) -> PluginCheckOptions<'_> {

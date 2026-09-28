@@ -845,7 +845,7 @@ pub fn check_listed_declaration(
                     index::sanitize(&declared)
                 ));
             }
-            let locked = install::locked_version(root, crate_name);
+            let locked = install::locked_version_for(root, None, crate_name);
             // Only a direct declaration's lock counts: a transitive copy
             // is not the dependency `plan_add` pins, and Cargo can resolve
             // the new `=release` pin alongside it.
@@ -914,7 +914,7 @@ fn app_version(root: &Path) -> Option<String> {
     };
     // What Cargo resolved, when it has: a `"0.7"` requirement may be 0.7.1.
     // A lock the manifest no longer admits is stale; the next build moves it.
-    if let Some(locked) = install::locked_version(root, "autumn-web") {
+    if let Some(locked) = install::locked_version_for(root, None, "autumn-web") {
         let current = declared
             .as_deref()
             .and_then(|req| semver::VersionReq::parse(req).ok())
@@ -1939,6 +1939,17 @@ mod tests {
             app_version(tmp.path())
         };
         assert_eq!(app("0.7", Some("0.7.3")).as_deref(), Some("0.7.3"));
+        // Another member on another version: the app's own edge decides.
+        let tmp = project_with("[package]\nname = \"a\"\n\n[dependencies]\nautumn-web = \"0.7\"\n");
+        std::fs::write(
+            tmp.path().join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"a\"\nversion = \"0.1.0\"\n\
+             dependencies = [\"autumn-web 0.7.1\"]\n\n\
+             [[package]]\nname = \"autumn-web\"\nversion = \"0.7.1\"\n\n\
+             [[package]]\nname = \"autumn-web\"\nversion = \"0.8.0\"\n",
+        )
+        .unwrap();
+        assert_eq!(app_version(tmp.path()).as_deref(), Some("0.7.1"));
         // A stale lock the manifest no longer admits is not the version.
         assert_eq!(app("0.8", Some("0.7.3")).as_deref(), Some("^0.8"));
         assert_eq!(app("=0.7.0", None).as_deref(), Some("0.7.0"));
