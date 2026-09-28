@@ -496,7 +496,9 @@ enforces `max_depth` (default 5) and same-record `reply_to`, and moves
 `comment_count` with the #1325 counter-cache primitive in the same transaction.
 `comment_thread` is one query at any depth; `delete_comment` cascades to the
 descendant subtree and is idempotent, and takes `parent_id` so a comment id
-alone is never authority over a comment on another record.
+alone is never authority over a comment on another record. With
+`soft_delete = false` it refuses (`422`) a subtree that has a reply on another
+record, because the `parent_id` cascade would delete that reply too.
 `recompute_comment_count` is the drift repair (`counter_cache_recompute` would
 be WRONG here — it keys on the fk column alone, which is shared across models).
 Like `react()`, all four take their own pooled connection — never hold a `Db`
@@ -1877,9 +1879,13 @@ ingress_ipv4     = ["203.0.113.10"]      # A records, for tenant APEX domains
 
 The app drives the journey through
 `autumn_web::custom_domain::CustomDomainRegistry` (published in `AppState`):
-`register(hostname, tenant, now)` connects one, `DnsInstructions::for_hostname`
-renders the exact record to show the tenant, and `list_for_tenant` renders
-status. States are `pending_dns` → `verified` → `issuing` → `active`; a stuck
+`register(hostname, tenant, now)` connects one, `DnsInstructions::for_domain`
+renders the exact records to show the tenant, and `list_for_tenant` renders
+status. A domain verifies only when it points at the ingress AND its
+`_autumn-challenge.<hostname>` TXT record carries the registration's
+`verification_token`; each registration mints a new token, so DNS a previous
+tenant left behind proves nothing. `active` domains from before the token are
+grandfathered. States are `pending_dns` → `verified` → `issuing` → `active`; a stuck
 domain carries `failure_reason`, and an `active` domain that fails renewal STAYS
 active and serving.
 

@@ -1019,8 +1019,9 @@ fn assert_bridge_reachable(ip: &str) {
 }
 
 /// The release id a host is currently serving: the basename of its `current`
-/// symlink — the exact identity `deploy status` reports (`release_id_from_dir` over
-/// `readlink -f current`), so the two can be compared directly.
+/// symlink. It is the release id that `deploy status` reports for a healthy host
+/// (`release_id_from_dir` over the resolved `current`). The test compares the two
+/// directly.
 fn current_release(ws: &Workspace, ssh_port: u16) -> String {
     let out = ws.ssh(
         ssh_port,
