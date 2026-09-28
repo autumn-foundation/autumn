@@ -611,7 +611,13 @@ impl Bundle {
                 Err(poisoned) => poisoned.into_inner(),
             };
             let last_warned = guard.get(&miss_key).copied().unwrap_or(stale);
-            if now.duration_since(last_warned) >= self.warn_dedup_window {
+            // A `last_warned` later than `now` comes from another clock
+            // domain (a bundle reused across `Sim`s, or into and out of one).
+            // Treat it as stale, so the warning is not silenced.
+            if now
+                .checked_duration_since(last_warned)
+                .is_none_or(|since| since >= self.warn_dedup_window)
+            {
                 guard.insert(miss_key, now);
                 true
             } else {
@@ -1319,6 +1325,24 @@ mod tests {
             messages.insert((*loc).to_owned(), m);
         }
         Bundle::from_messages(messages, cfg)
+    }
+
+    /// A `last_warned` from another clock domain (later than `now`) is stale,
+    /// so the miss warns again instead of staying silent (issue #2967).
+    #[test]
+    fn a_future_last_warned_does_not_silence_the_miss_warning() {
+        let cfg = cfg("en", &["en"]);
+        let bundle = bundle_with(&[("en", &[])], &cfg);
+        let key = ("en".to_owned(), "missing.key".to_owned());
+        let future = crate::time::ambient_instant() + Duration::from_secs(3600);
+        bundle
+            .miss_warnings
+            .lock()
+            .unwrap()
+            .insert(key.clone(), future);
+        bundle.record_miss("en", "missing.key");
+        let recorded = bundle.miss_warnings.lock().unwrap()[&key];
+        assert!(recorded < future, "the miss warned and reset the timestamp");
     }
 
     // ── Config ────────────────────────────────────────────────────

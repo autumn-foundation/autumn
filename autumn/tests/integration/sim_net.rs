@@ -207,3 +207,24 @@ async fn sim_net_latency_past_the_request_timeout_is_a_timeout(mut sim: Sim) {
         );
     }
 }
+
+/// Calls a relative path through a named client, with no base URL.
+#[get("/pay-relative")]
+async fn pay_relative(client: Client) -> String {
+    match client.named("payments").get("/charge").send().await {
+        Ok(response) => format!("ok: {}", response.text()),
+        Err(error) => format!("error: {error}"),
+    }
+}
+
+#[sim_test]
+async fn sim_net_relative_url_on_a_named_client_reaches_its_mock(mut sim: Sim) {
+    sim.net(SimNet::new());
+    let mut app = TestApp::new().routes(routes![pay_relative]);
+    let _mock = app
+        .http_mock("payments")
+        .get("/charge")
+        .respond_with(200, serde_json::json!("mocked"));
+    sim.build(app);
+    assert_eq!(call(&sim, "/pay-relative").await, "ok: \"mocked\"");
+}

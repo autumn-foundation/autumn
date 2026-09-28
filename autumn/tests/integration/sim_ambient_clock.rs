@@ -192,3 +192,18 @@ async fn sim_ambient_clock_concurrent_advances_count_once_each(sim: Sim) {
     assert_eq!(ambient_now(), sim_epoch() + chrono::Duration::hours(2));
     assert_eq!(ambient_monotonic().since_origin(), 2 * HOUR);
 }
+
+#[sim_test]
+async fn sim_ambient_clock_inner_sleep_before_a_cross_thread_drop_stays_inner(sim: Sim) {
+    // The inner sim is ambient while tokio sleeps an hour, with no clock read.
+    // Dropping it on another thread must not hand that hour to the outer sim.
+    let start = ambient_instant();
+    let inner = Sim::from_seed(sim.seed.wrapping_add(1));
+    tokio::time::sleep(HOUR).await;
+    std::thread::spawn(move || drop(inner)).join().unwrap();
+    assert_eq!(
+        ambient_instant().saturating_duration_since(start),
+        Duration::ZERO,
+        "the inner sim's hour is not on the outer timeline"
+    );
+}

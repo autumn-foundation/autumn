@@ -2105,8 +2105,7 @@ impl RequestBuilder {
     /// Send through the simulated network (issue #2967), with the attempts,
     /// backoff, 429 handling and per-attempt timeout of the real retry loop.
     async fn send_sim(self, net: &crate::sim::SimNet) -> Result<Response, ClientError> {
-        let url = reqwest::Url::parse(&self.url)
-            .map_err(|error| ClientError::InvalidUrl(format!("{}: {error}", self.url)))?;
+        let url = self.sim_url()?;
         let host = url
             .host_str()
             .ok_or_else(|| ClientError::InvalidUrl(format!("{}: no host", self.url)))?
@@ -2151,6 +2150,21 @@ impl RequestBuilder {
             return Ok(response);
         }
         unreachable!("the sim retry loop returns on its last attempt")
+    }
+
+    /// The absolute URL a sim call goes to. A relative URL on a named client
+    /// (`client.named("payments").get("/charge")`) goes to the host named by
+    /// the alias, as a named http mock would match it.
+    fn sim_url(&self) -> Result<reqwest::Url, ClientError> {
+        match (reqwest::Url::parse(&self.url), self.alias.as_deref()) {
+            (Ok(url), _) => Ok(url),
+            (Err(url::ParseError::RelativeUrlWithoutBase), Some(alias)) => {
+                let path = self.url.trim_start_matches('/');
+                reqwest::Url::parse(&format!("http://{alias}/{path}"))
+                    .map_err(|error| ClientError::InvalidUrl(format!("{}: {error}", self.url)))
+            }
+            (Err(error), _) => Err(ClientError::InvalidUrl(format!("{}: {error}", self.url))),
+        }
     }
 
     /// One attempt through the simulated network: the network, then the host

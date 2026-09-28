@@ -1428,8 +1428,8 @@ impl SimStack {
     /// Give the tokio time since the last settle to the ambient sim, and
     /// drop entries whose sim has dropped (on any thread).
     fn settle(&mut self) {
-        self.clocks.retain(|clock| clock.is_alive());
         if tokio::runtime::Handle::try_current().is_err() {
+            self.clocks.retain(|clock| clock.is_alive());
             return;
         }
         let now = tokio::time::Instant::now();
@@ -1441,6 +1441,9 @@ impl SimStack {
                 AmbientSimClock::add(&top.auto_advanced, moved.saturating_sub(explicit));
             }
         }
+        // Prune only after attributing: the time up to now belongs to the sim
+        // that was ambient, even if it has since dropped on another thread.
+        self.clocks.retain(|clock| clock.is_alive());
         if self.clocks.is_empty() {
             self.checkpoint = None;
             self.pending_advance = std::time::Duration::ZERO;
