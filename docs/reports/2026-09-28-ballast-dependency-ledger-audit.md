@@ -167,18 +167,28 @@ One new PR opened (`#2890`, `jsonwebtoken` 10.4.0 → 11.1.0, opened
 | #2615 | `dtolnay/rust-toolchain` 1.88.0→1.120.0 | 2026-09-07 | 21 days |
 | #2890 | `jsonwebtoken` 10.4.0→11.1.0 | 2026-09-21 | 7 days |
 
-The eight-PR structural core (2 GitHub Actions bumps, 6 Cargo semver-major
-bumps — the ones with no covering group at all) is unchanged and simply
-7–8 days older, for the same structural reason established
-over the last two passes: `dependabot.yml`'s `github-actions` ecosystem
-defines no groups at all, and the `rust-deps` catch-all group only covers
-`minor`/`patch` updates, so a pre-1.0 major bump on a `rust-deps`-scoped
-package (or any `github-actions` bump) is individual by design, not
-orphaned. Not something this pass acts on — a human review/merge decision on
-each, same as every prior pass concluded. Counting every PR in the table
-aged 21 days or older (not just the structural eight) gives **ten**: the
-eight-PR core plus `#2302` (35 days) and `#2615` (21 days) — same total as
-last pass's ten, just a week further along, not a narrower backlog.
+The structural core sharing "no covering group at a major version" is
+**nine** PRs, not eight — checked directly against `.github/dependabot.yml`:
+`validator` (`#2302`) matches `rust-deps`'s `"*"` pattern (not excluded by
+`axum*`/`diesel*`/`tokio`) the same way the other six Cargo majors do, and
+0.20.0→0.21.0 is a pre-1.0 major transition under the same convention, so
+`rust-deps`'s `update-types: [minor, patch]` excludes it from grouping for
+exactly the same reason. The nine-PR structural core is 2 GitHub Actions
+bumps (`#1891`, `#2081`) plus 7 Cargo semver-major bumps (`#1894`–`#1899`,
+`#2302`) — unchanged and simply 7–8 days older, for the same structural
+reason established over the last two passes: `dependabot.yml`'s
+`github-actions` ecosystem defines no groups at all, and the `rust-deps`
+catch-all group only covers `minor`/`patch` updates, so a pre-1.0 major
+bump on a `rust-deps`-scoped package (or any `github-actions` bump) is
+individual by design, not orphaned. Not something this pass acts on — a
+human review/merge decision on each, same as every prior pass concluded.
+Counting every PR in the table aged 21 days or older gives **ten**: the
+nine-PR structural core plus `#2615` (21 days, the "ask before" toolchain
+bump) — the same total as last pass's ten, but **not the same membership**:
+`#2179` (part of last pass's ten) has since merged, and `#2615` (only 14
+days old last pass, below its 28–69-day threshold then) has aged into this
+pass's range in its place. The total held at ten by coincidence of timing,
+not because the backlog stopped moving.
 
 **New this pass — rehearsed the newest queue entry rather than only listing
 it, since #2890 is exactly the shape of Upgrade this charter gates: a
@@ -223,7 +233,7 @@ suite — no forcing fact surfaced that would justify spending that budget
 this pass). Per the charter's Upgrade-class bar, a major needs a forcing
 fact beyond "staying current," and this rehearsal found none: no advisory
 closes, no EOL/security-support window applies, no graph shrinks. **This PR
-stays a human review call, same as the other six major-bump PRs in the
+stays a human review call, same as the other seven major-bump PRs in the
 queue** — but now with an actual rehearsal result attached instead of being
 another unexamined row in a table.
 
@@ -349,11 +359,13 @@ git checkout -- autumn/Cargo.toml Cargo.lock
    every Dependabot PR mechanically, but the reachability/forcing-fact
    judgment this pass just did by hand for one PR isn't run on the other
    ten automatically.
-6. Open Dependabot PR queue: 11 (was 13), 10 of them 21–77 days old — same
-   ten PRs as last pass (the eight-PR structural core plus `#2302` and
-   `#2615`), all just a week older, plus the new #2890 now rehearsed (see
-   evidence). Still a human call whether to merge, close, or act on any of
-   them; #2615 remains explicitly an "ask before" toolchain bump.
+6. Open Dependabot PR queue: 11 (was 13), 10 of them 21–77 days old — the
+   same *total* as last pass but **not the same PRs**: `#2179` merged out,
+   `#2615` aged in (see evidence). The nine-PR structural core (2 GitHub
+   Actions bumps, 7 Cargo semver-major bumps including `#2302`, corrected
+   this pass) plus `#2615` makes the ten. Plus the new #2890 now rehearsed
+   (see evidence). Still a human call whether to merge, close, or act on any
+   of them; #2615 remains explicitly an "ask before" toolchain bump.
 7. The `fuzz/` (71 packages) and `island-flock/` (31 packages) scheduled
    batches remain uncovered by any process — `dependabot.yml` unchanged
    since the decision was first raised. Same two options as every prior
