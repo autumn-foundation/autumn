@@ -9124,7 +9124,8 @@ fn index_listing(name: &str, extra: &str, status: &str, result: &str) -> String 
     format!(
         "[[plugin]]\nname = \"{name}\"\ndescription = \"{name} for tests\"\n\
          origin = \"community\"\nrepository = \"https://example.com/{name}\"\n\
-         version = \"0.3.0\"\nautumn_web = \"{series}\"\nstatus = \"{status}\"\n{extra}\n\
+         version = \"0.3.0\"\nautumn_web = \"{series}\"\nstatus = \"{status}\"\n\
+         prefix = \"/{name}\"\n{extra}\n\
          [plugin.conformance]\nresult = \"{result}\"\nautumn_web = \"{release}\"\n\
          checked = \"2026-09-27\"\n\n",
         series = env!("CARGO_PKG_VERSION")

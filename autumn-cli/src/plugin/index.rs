@@ -681,6 +681,25 @@ fn check_conformance(listing: &Listing, out: &mut Vec<String>) {
             out.push("an exempt result needs a `conformance.reason`".to_owned());
         }
     }
+    // Exempt, or a failure that kept its exemption: the catalog, not the
+    // listing, says whether the crate is a `Plugin` plugin-check can run.
+    let exempt_class =
+        result == CheckOutcome::Exempt || !listing.conformance.reason.trim().is_empty();
+    if exempt_class && !is_non_plugin(listing) {
+        out.push(
+            "only a first-party crate that is not a `Plugin` (the catalog mounts it with \
+             something other than `.plugin(`) can be exempt from plugin-check"
+                .to_owned(),
+        );
+    }
+}
+
+/// Whether the catalog mounts this first-party crate through something other
+/// than `.plugin(` (`autumn-storage-s3`: `.with_blob_store(`), so
+/// `plugin-check` has no `Plugin` to check.
+fn is_non_plugin(listing: &Listing) -> bool {
+    listing.origin == ListingOrigin::FirstParty
+        && super::catalog::lookup(&listing.name).is_some_and(|entry| entry.mount_call != ".plugin(")
 }
 
 fn check_tier(listing: &Listing, out: &mut Vec<String>) {
@@ -707,6 +726,19 @@ fn check_tier(listing: &Listing, out: &mut Vec<String>) {
 fn check_routes(listing: &Listing, out: &mut Vec<String>) {
     if listing.no_routes && !listing.prefix.is_empty() {
         out.push("`no_routes` and a `prefix` contradict each other".to_owned());
+    }
+    // plugin-check runs with `--prefix` or `--no-routes`; with neither, no
+    // prefix constraint would ever be evaluated.
+    if listing.trust == Trust::Native
+        && !is_non_plugin(listing)
+        && listing.prefix.is_empty()
+        && !listing.no_routes
+    {
+        out.push(
+            "a native plugin listing needs a `prefix`, or `no_routes = true` for one that mounts \
+             no routes"
+                .to_owned(),
+        );
     }
 }
 
@@ -911,7 +943,7 @@ mod tests {
             limits: BTreeMap::new(),
             status: Status::Listed,
             note: String::new(),
-            prefix: String::new(),
+            prefix: "/audit".to_owned(),
             no_routes: false,
             sensitive_routes: vec![],
             conformance: Conformance {
@@ -1561,6 +1593,37 @@ mod tests {
         listing.routes = vec!["GET /hello".to_owned(), "HEAD /hello".to_owned()];
         let label = listing.trust_label();
         assert!(label.contains("serves GET /hello, HEAD /hello"), "{label}");
+    }
+
+    /// Only a catalog crate that is not a `Plugin` can be exempt: a
+    /// `Plugin` listing cannot mark itself exempt to skip plugin-check.
+    #[test]
+    fn a_plugin_listing_cannot_be_exempt() {
+        let mut admin = native("autumn-admin-plugin", ListingOrigin::FirstParty);
+        admin.conformance.result = CheckOutcome::Exempt;
+        admin.conformance.reason = "trust me".to_owned();
+        let text = messages(&validate(&index_of(vec![admin])));
+        assert!(text.contains("not a `Plugin`"), "{text}");
+        let mut s3 = native("autumn-storage-s3", ListingOrigin::FirstParty);
+        s3.prefix.clear();
+        s3.conformance.result = CheckOutcome::Exempt;
+        s3.conformance.reason = "a BlobStore, not a Plugin".to_owned();
+        assert!(
+            validate(&index_of(vec![s3])).is_empty(),
+            "{:?}",
+            validate(&index_of(vec![]))
+        );
+    }
+
+    /// A native plugin listing names its route mode: a prefix, or none.
+    #[test]
+    fn a_native_listing_needs_a_route_mode() {
+        let mut listing = community();
+        listing.prefix.clear();
+        let text = messages(&validate(&index_of(vec![listing.clone()])));
+        assert!(text.contains("needs a `prefix`"), "{text}");
+        listing.no_routes = true;
+        assert!(validate(&index_of(vec![listing])).is_empty());
     }
 
     #[test]

@@ -92,6 +92,8 @@ checked = "2026-09-27"
 - A `sandboxed` listing has no `capabilities`, names an unknown one, has no
   64-hex `artifact_sha256`, or lacks any quota or limit `inspect` reports. A
   `native` listing has any of these fields.
+- A `native` plugin listing has neither a `prefix` nor `no_routes = true`, or
+  has both.
 - A text field holds a control, bidi or zero-width character.
 - The listing was not verified against the current release.
 
@@ -100,7 +102,8 @@ declared range.
 
 Only a first-party crate that is not a `Plugin` can be `exempt`. An example is
 `autumn-storage-s3`, a `BlobStore`. The re-verification compiles its mount
-instead.
+instead. `index check` takes this from the CLI's plugin catalog (the crate
+mounts through something other than `.plugin(`), not from the listing.
 
 ## Re-verification
 
