@@ -53,7 +53,8 @@ edits without applying them.
 ### Versions
 
 First-party plugins are released in lockstep with `autumn-web` and with the
-CLI, so the version `autumn plugin add` installs is the CLI's own. That makes
+CLI, so the version `autumn plugin add` installs is the CLI's own, pinned with
+`=` so Cargo builds exactly the release the index reviewed. That makes
 the version gate a statement about your toolchain: if your app is on an older
 `autumn-web`, the listing marks each first-party plugin `[needs autumn-web
 <series>]` and `add` refuses rather than writing a dependency that will not

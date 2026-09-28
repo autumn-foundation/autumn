@@ -810,8 +810,8 @@ pub fn check_listed_declaration(
             {
                 return Err(format!(
                     "Cargo.toml declares `{crate_name} = \"{}\"`, which excludes the verified \
-                     release {version}. Set `{crate_name} = \"{version}\"`, then re-run. No files \
-                     were changed.",
+                     release {version}. Set `{crate_name} = \"={version}\"`, then re-run. No \
+                     files were changed.",
                     index::sanitize(&declared)
                 ));
             }
@@ -875,6 +875,10 @@ fn source_label(source: &index::Source) -> String {
 
 /// The app's `autumn-web` version, or `None` when it cannot be determined.
 fn app_version(root: &Path) -> Option<String> {
+    // What Cargo resolved, when it has: a `"0.7"` requirement may be 0.7.1.
+    if let Some(locked) = install::locked_version(root, "autumn-web") {
+        return Some(locked);
+    }
     match install::app_autumn_web(root) {
         Ok(install::AppAutumnWeb::Version(version)) => Some(version),
         Ok(install::AppAutumnWeb::Unversioned) | Err(_) => None,

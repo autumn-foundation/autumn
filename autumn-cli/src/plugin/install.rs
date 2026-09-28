@@ -287,6 +287,16 @@ fn workspace_version_for(root: &Path, key: &str) -> Option<String> {
     None
 }
 
+/// `version` as an exact Cargo requirement: `=x.y.z`.
+#[must_use]
+pub fn exact_pin(version: &str) -> String {
+    if version.starts_with('=') {
+        version.to_owned()
+    } else {
+        format!("={version}")
+    }
+}
+
 /// The `[dependencies]` line `plugin add` writes (and prints).
 #[must_use]
 pub fn dependency_line(crate_name: &str, version: &str) -> String {
@@ -433,6 +443,7 @@ fn patched_by_in(
     cargo_home: Option<&Path>,
 ) -> Option<String> {
     let want = canonical(crate_name);
+    let pinned = semver::Version::parse(version.trim_start_matches('=')).ok();
     // Absolute, or the parents of `.` (what the CLI passes) are empty.
     let root = &std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
     let read = |path: &Path| {
@@ -442,7 +453,7 @@ fn patched_by_in(
     };
     let manifest = workspace_root(root).join("Cargo.toml");
     if let Some(table) = read(&manifest) {
-        if let Some(source) = crates_io_patch(&table, &want) {
+        if let Some(source) = crates_io_patch(&table, &want, pinned.as_ref()) {
             return Some(format!("[patch.{source}] in {}", manifest.display()));
         }
         if let Some(replace) = table.get("replace").and_then(toml::Value::as_table) {
@@ -466,7 +477,9 @@ fn patched_by_in(
     for dir in configs {
         for file in ["config.toml", "config"] {
             let path = dir.join(file);
-            if let Some(source) = read(&path).and_then(|table| crates_io_patch(&table, &want)) {
+            if let Some(source) =
+                read(&path).and_then(|table| crates_io_patch(&table, &want, pinned.as_ref()))
+            {
                 return Some(format!("[patch.{source}] in {}", path.display()));
             }
         }
@@ -477,7 +490,11 @@ fn patched_by_in(
 /// The `[patch.<source>]` key under which `table` patches the crates.io
 /// crate `want` (canonical). A `package` rename counts: `local = { package
 /// = "x", … }` patches `x`, whatever the key says.
-fn crates_io_patch(table: &toml::Table, want: &str) -> Option<String> {
+fn crates_io_patch(
+    table: &toml::Table,
+    want: &str,
+    pinned: Option<&semver::Version>,
+) -> Option<String> {
     let patch = table.get("patch")?.as_table()?;
     patch
         .iter()
@@ -489,7 +506,14 @@ fn crates_io_patch(table: &toml::Table, want: &str) -> Option<String> {
                         .get("package")
                         .and_then(toml::Value::as_str)
                         .unwrap_or(key);
-                    canonical(package) == want
+                    // A patch whose `version` excludes the pin cannot supply it.
+                    let usable = entry
+                        .get("version")
+                        .and_then(toml::Value::as_str)
+                        .and_then(|req| semver::VersionReq::parse(req).ok())
+                        .zip(pinned)
+                        .is_none_or(|(req, pinned)| req.matches(pinned));
+                    canonical(package) == want && usable
                 })
             })
         })
@@ -826,7 +850,7 @@ pub fn plan_add(
                         "could not find the `autumn_web::app()` builder chain in {} — nothing was changed",
                         main_path.display().to_string().replace('\\', "/")
                     ),
-                    dependency_line: dependency_line(entry.crate_name, version),
+                    dependency_line: dependency_line(entry.crate_name, &exact_pin(version)),
                     mount_snippet: entry.mount.trim_end_matches('\n').to_owned(),
                     steps: steps_for(entry),
                 });
@@ -843,7 +867,9 @@ pub fn plan_add(
     if let Some(updated_main) = mounted_src {
         plan.modify(main_path, updated_main);
     }
-    let spec = format!("\"{version}\"");
+    // Exact: the trust review and the conformance record describe this
+    // release, and a caret would let Cargo take a later, unreviewed patch.
+    let spec = format!("\"{}\"", exact_pin(version));
     let updated_manifest = crate::generate::model::ensure_cargo_dependencies(
         &manifest_src,
         &[(entry.crate_name, spec.as_str())],
@@ -1065,6 +1091,25 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    /// A `[patch]` entry whose `version` excludes the pin cannot supply it.
+    #[test]
+    fn a_patch_whose_version_excludes_the_pin_is_not_a_redirect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let with = |version: &str| {
+            write(
+                &tmp.path().join("Cargo.toml"),
+                &format!(
+                    "[package]\nname = \"a\"\n\n[patch.crates-io]\n\
+                     autumn-plugin-x = {{ path = \"../x\"{version} }}\n"
+                ),
+            );
+            patched_by_in(tmp.path(), "autumn-plugin-x", "=0.3.0", None)
+        };
+        assert_eq!(with(", version = \"0.2.0\""), None);
+        assert!(with(", version = \"0.3.0\"").is_some());
+        assert!(with("").is_some());
     }
 
     /// A `[replace]` key names one version: another version's replacement
@@ -1412,7 +1457,10 @@ maud = { version = "0.27", features = ["axum"] }
         plan.execute(crate::generate::Flags::default()).unwrap();
 
         let cargo = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
-        assert!(cargo.contains("autumn-admin-plugin = \"0.7.0\""), "{cargo}");
+        assert!(
+            cargo.contains("autumn-admin-plugin = \"=0.7.0\""),
+            "{cargo}"
+        );
 
         let main_rs = std::fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
         assert!(
@@ -1730,7 +1778,7 @@ maud = { version = "0.27", features = ["axum"] }
         else {
             panic!("expected the manual fallback");
         };
-        assert_eq!(dep, "autumn-admin-plugin = \"0.7.0\"");
+        assert_eq!(dep, "autumn-admin-plugin = \"=0.7.0\"");
         assert!(
             mount_snippet.contains("AdminPlugin::new()"),
             "{mount_snippet}"

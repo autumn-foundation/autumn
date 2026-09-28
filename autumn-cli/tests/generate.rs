@@ -9656,6 +9656,41 @@ fn write_proposed_index(
     }
 }
 
+/// Every listing whose recorded fields differ between the committed index and
+/// the one `record` proposes, ignoring `conformance.checked` (the run date).
+fn index_drift(committed: &str, proposed: &str) -> Vec<String> {
+    let listings = |text: &str| -> Vec<toml::Value> {
+        let table: toml::Table = toml::from_str(text).unwrap();
+        let mut plugins = table["plugin"].as_array().cloned().unwrap_or_default();
+        for plugin in &mut plugins {
+            if let Some(conformance) = plugin
+                .get_mut("conformance")
+                .and_then(toml::Value::as_table_mut)
+            {
+                conformance.remove("checked");
+            }
+        }
+        plugins
+    };
+    let (before, after) = (listings(committed), listings(proposed));
+    before
+        .iter()
+        .zip(&after)
+        .filter(|(b, a)| b != a)
+        .map(|(b, a)| {
+            format!(
+                "{}: the committed listing differs from what re-verification records.\n\
+                 committed: {b}\nrecorded:  {a}",
+                b["name"].as_str().unwrap_or("?")
+            )
+        })
+        .chain(
+            (before.len() != after.len())
+                .then(|| "the proposed index has another listing count".to_owned()),
+        )
+        .collect()
+}
+
 /// Issue #1625, AC 4: re-verify every live listing in the bundled index.
 ///
 /// For each listing: scaffold an app, `plugin add` it, then run
@@ -9679,10 +9714,12 @@ fn plugin_index_reverify_listings() {
         .filter(|l| l["origin"].as_str() == Some("first-party"))
         .filter_map(|l| l["name"].as_str())
         .collect();
-    let reports = std::env::var_os("PLUGIN_INDEX_REPORTS").map(std::path::PathBuf::from);
-    if let Some(dir) = &reports {
-        fs::create_dir_all(dir).unwrap();
-    }
+    // The reports and the proposed index are always written; without
+    // `$PLUGIN_INDEX_REPORTS` they go to a scratch dir.
+    let scratch = tempfile::tempdir().expect("reports dir");
+    let reports = std::env::var_os("PLUGIN_INDEX_REPORTS")
+        .map_or_else(|| scratch.path().to_path_buf(), std::path::PathBuf::from);
+    fs::create_dir_all(&reports).unwrap();
     let shared_target = tempfile::tempdir().expect("shared target dir");
     let target = shared_target.path().to_str().unwrap();
     let mut failures = Vec::new();
@@ -9707,8 +9744,8 @@ fn plugin_index_reverify_listings() {
             // flagged or delisted rather than left as it was.
             if is_exempt(listing) {
                 exempt_failed.push(name.to_owned());
-            } else if let Some(dir) = &reports {
-                let path = dir.join(format!("{name}.json"));
+            } else {
+                let path = reports.join(format!("{name}.json"));
                 let report = failed_install_report(name, "`plugin add` failed", &failure);
                 fs::write(&path, report.to_string()).unwrap();
                 written_reports.push(path);
@@ -9742,11 +9779,9 @@ fn plugin_index_reverify_listings() {
 
         let report = plugin_check_report(&project, listing, target);
         remove_app_binaries(Path::new(target), &name.replace('-', "_"));
-        if let Some(dir) = &reports {
-            let path = dir.join(format!("{name}.json"));
-            fs::write(&path, report.to_string()).unwrap();
-            written_reports.push(path);
-        }
+        let path = reports.join(format!("{name}.json"));
+        fs::write(&path, report.to_string()).unwrap();
+        written_reports.push(path);
         let passed = report["checks"]
             .as_array()
             .expect("checks")
@@ -9759,11 +9794,16 @@ fn plugin_index_reverify_listings() {
             ));
         }
     }
-    if let Some(dir) = &reports
-        && let Err(failure) =
-            write_proposed_index(dir, &src, &written_reports, &exempt_ok, &exempt_failed)
+    // The index `record` proposes must be the committed one (the run date
+    // aside): a hand-edited range, version, tier or status is drift, even
+    // when every check still passes.
+    if let Err(failure) =
+        write_proposed_index(&reports, &src, &written_reports, &exempt_ok, &exempt_failed)
     {
         failures.push(failure);
+    } else {
+        let proposed = fs::read_to_string(reports.join("index.toml")).unwrap();
+        failures.extend(index_drift(&src, &proposed));
     }
     assert!(
         failures.is_empty(),
