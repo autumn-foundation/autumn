@@ -93,12 +93,13 @@ behavior automatically.
 | DELETE | `/api/v1/pages/{id}` | Delete a page |
 | GET | `/api/v1/search?q=...` | Ranked keyword search via `autumn-search`, hydrated into `Page` rows |
 
-`PageHooks` only enqueues a reindex on create/update/delete, so **an existing
-database's pages are not indexed until this PR's migration lands and each page
-is next saved.** A fresh `cargo run -p wiki` starts with an empty table, so
-this only matters when adding the plugin to an already-populated wiki: run
-`autumn search reindex` once afterward to backfill (`docs/guide/search.md`'s
-"Backfill" section).
+`PageHooks` only enqueues a reindex on create/update/delete, so **existing
+pages are not indexed until each is next saved.** A fresh `cargo run -p wiki`
+starts with an empty table, so this only matters when adding the plugin to an
+already-populated wiki: run `autumn search reindex --package wiki` once from
+the workspace root to backfill (`docs/guide/search.md`'s "Backfill" section) —
+`--package` is required there since the workspace has more than one binary
+target and a bare `autumn search reindex` cannot choose between them.
 
 ### Docs (Markdown + SSG)
 
