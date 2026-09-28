@@ -336,6 +336,22 @@ pub fn declared_dependency_version(manifest: &str, crate_name: &str) -> Option<S
     }
 }
 
+/// Cargo's workspace root for the package at `dir`: the first directory from
+/// `dir` up whose `Cargo.toml` has a `[workspace]` table, or `dir` itself.
+/// `dir` is made absolute first: the CLI passes `.`, whose parents are empty.
+#[must_use]
+pub fn workspace_root(dir: &Path) -> PathBuf {
+    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    dir.ancestors()
+        .find(|d| {
+            std::fs::read_to_string(d.join("Cargo.toml"))
+                .ok()
+                .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+                .is_some_and(|table| table.contains_key("workspace"))
+        })
+        .map_or_else(|| dir.clone(), Path::to_path_buf)
+}
+
 /// `manifest` with a `crate_name = { workspace = true }` entry replaced by the
 /// workspace root's `[workspace.dependencies]` entry, as Cargo resolves it.
 /// The root is the first ancestor of `root` (itself included) whose
@@ -355,20 +371,15 @@ pub fn with_inherited_dependency(root: &Path, manifest: &str, crate_name: &str) 
     if !inherited {
         return manifest.to_owned();
     }
-    // Cargo's workspace root: the first ancestor with a `[workspace]` table.
-    let workspace_entry = root.ancestors().find_map(|dir| {
-        let text = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+    let workspace_entry = (|| {
+        let text = std::fs::read_to_string(workspace_root(root).join("Cargo.toml")).ok()?;
         let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
-        let workspace = doc.get("workspace")?;
-        // The root is found; a missing entry there is final.
-        Some(
-            workspace
-                .get("dependencies")
-                .and_then(|deps| deps.get(crate_name))
-                .cloned(),
-        )
-    });
-    let Some(Some(entry)) = workspace_entry else {
+        doc.get("workspace")?
+            .get("dependencies")?
+            .get(crate_name)
+            .cloned()
+    })();
+    let Some(entry) = workspace_entry else {
         return manifest.to_owned();
     };
     member["dependencies"][crate_name] = entry;
@@ -394,18 +405,14 @@ pub fn patched_by(root: &Path, crate_name: &str) -> Option<String> {
 /// [`patched_by`] with `$CARGO_HOME` given, so a test need not set it.
 fn patched_by_in(root: &Path, crate_name: &str, cargo_home: Option<&Path>) -> Option<String> {
     let want = canonical(crate_name);
+    // Absolute, or the parents of `.` (what the CLI passes) are empty.
+    let root = &std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
     let read = |path: &Path| {
         std::fs::read_to_string(path)
             .ok()
             .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
     };
-    // The workspace root: the first manifest from `root` up with a
-    // `[workspace]` table, or `root`'s own when there is none.
-    let manifest = root
-        .ancestors()
-        .map(|dir| dir.join("Cargo.toml"))
-        .find(|path| read(path).is_some_and(|table| table.contains_key("workspace")))
-        .unwrap_or_else(|| root.join("Cargo.toml"));
+    let manifest = workspace_root(root).join("Cargo.toml");
     if let Some(table) = read(&manifest) {
         if let Some(source) = crates_io_patch(&table, &want) {
             return Some(format!("[patch.{source}] in {}", manifest.display()));
@@ -984,6 +991,14 @@ mod tests {
     fn write(path: &Path, text: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
+    }
+
+    /// The CLI passes `.`: the walk must still reach the workspace root.
+    #[test]
+    fn workspace_root_resolves_a_relative_dir() {
+        // Tests run in the autumn-cli package; its workspace is the repo.
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        assert_eq!(workspace_root(Path::new(".")), repo);
     }
 
     /// Only a crates.io patch redirects a crates.io dependency.

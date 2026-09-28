@@ -328,13 +328,12 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
     }
 }
 
-/// The `autumn-web` version `Cargo.lock` resolved for the app in `dir`, or
-/// in the workspace root above it. `None` when there is no lockfile, or it
-/// locks more than one `autumn-web`.
+/// The `autumn-web` version the workspace's `Cargo.lock` resolved for the app
+/// in `dir`. Cargo uses the workspace root's lockfile, not a member's. `None`
+/// when there is no lockfile, or it locks more than one `autumn-web`.
 pub fn locked_autumn_web(dir: &std::path::Path) -> Option<String> {
-    let text = dir
-        .ancestors()
-        .find_map(|d| std::fs::read_to_string(d.join("Cargo.lock")).ok())?;
+    let root = crate::plugin::install::workspace_root(dir);
+    let text = std::fs::read_to_string(root.join("Cargo.lock")).ok()?;
     let lock = toml::from_str::<toml::Table>(&text).ok()?;
     let mut versions = lock
         .get("package")?
@@ -1499,6 +1498,12 @@ mod contract_tests {
         let tmp = tempfile::tempdir().unwrap();
         let app = tmp.path().join("app");
         std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("Cargo.toml"), "[package]\nname = \"app\"\n").unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n",
+        )
+        .unwrap();
         assert_eq!(locked_autumn_web(&app), None);
         let pkg = |v: &str| format!("[[package]]\nname = \"autumn-web\"\nversion = \"{v}\"\n\n");
         let lock = format!(
@@ -1506,6 +1511,13 @@ mod contract_tests {
             pkg("0.7.1")
         );
         std::fs::write(tmp.path().join("Cargo.lock"), &lock).unwrap();
+        assert_eq!(locked_autumn_web(&app).as_deref(), Some("0.7.1"));
+        // A stale member lockfile is not the one Cargo builds with.
+        std::fs::write(
+            app.join("Cargo.lock"),
+            format!("version = 4\n\n{}", pkg("0.1.0")),
+        )
+        .unwrap();
         assert_eq!(locked_autumn_web(&app).as_deref(), Some("0.7.1"));
         std::fs::write(
             tmp.path().join("Cargo.lock"),
