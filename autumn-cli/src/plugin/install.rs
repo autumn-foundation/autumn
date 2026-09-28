@@ -272,6 +272,27 @@ pub fn app_autumn_web(root: &Path) -> Result<AppAutumnWeb, PluginError> {
     }
 }
 
+/// Every distinct `autumn-web` requirement the project at `root` declares:
+/// its own, dev, build and target-specific tables, with `{ workspace = true }`
+/// entries resolved. Several means Cargo's choice depends on the target.
+#[must_use]
+pub fn declared_autumn_web_versions(root: &Path) -> Vec<String> {
+    let mut versions: Vec<String> = Vec::new();
+    for declaration in crate::doctor::autumn_web_declarations_at(root) {
+        let version = match declaration {
+            crate::doctor::AutumnWebDependency::Version(version) => Some(version),
+            crate::doctor::AutumnWebDependency::Inherited(key) => workspace_version_for(root, &key),
+            _ => None,
+        };
+        if let Some(version) = version.map(|v| v.trim().to_owned())
+            && !versions.contains(&version)
+        {
+            versions.push(version);
+        }
+    }
+    versions
+}
+
 /// The version a `{ workspace = true }` entry named `key` resolves to. Cargo
 /// reads it from the package's workspace root only, not from any nearer
 /// manifest that happens to have a `[workspace.dependencies]` table.
@@ -523,7 +544,8 @@ pub fn with_inherited_dependency(root: &Path, manifest: &str, crate_name: &str) 
 /// table is ignored), and `[patch]` also from every `.cargo/config.toml`
 /// from `root` up, and from `$CARGO_HOME`. Only a patch for the crates.io
 /// source counts: `[patch."<git url>"]` overrides that source alone.
-/// `[source]` replacement (vendoring) is not read.
+/// A `[source.crates-io] replace-with` in a config counts too: Cargo then
+/// takes every crates.io crate from the named source.
 #[must_use]
 pub fn patched_by(root: &Path, crate_name: &str, version: &str) -> Option<String> {
     let cargo_home = std::env::var_os("CARGO_HOME")
@@ -583,10 +605,25 @@ fn patched_by_in(
         // A config's relative paths resolve from the directory holding
         // its `.cargo` (for `$CARGO_HOME`, its parent).
         let base = dir.parent().unwrap_or(&dir);
-        if let Some(source) =
-            read(&path).and_then(|table| crates_io_patch(&table, &want, pinned.as_ref(), base))
-        {
+        let Some(table) = read(&path) else {
+            continue;
+        };
+        if let Some(source) = crates_io_patch(&table, &want, pinned.as_ref(), base) {
             return Some(format!("[patch.{source}] in {}", path.display()));
+        }
+        // Source replacement swaps crates.io itself: every crate, this one
+        // included, comes from the named source (a vendor dir, a mirror).
+        if let Some(with) = table
+            .get("source")
+            .and_then(|source| source.get("crates-io"))
+            .and_then(|source| source.get("replace-with"))
+            .and_then(toml::Value::as_str)
+        {
+            return Some(format!(
+                "[source.crates-io] replace-with = \"{}\" in {}",
+                super::index::sanitize(with),
+                path.display()
+            ));
         }
     }
     None
@@ -1394,6 +1431,22 @@ mod tests {
         );
         assert_eq!(patched_by_in(&app, "autumn-plugin-x", "=0.2.5", None), None);
         assert!(patched_by_in(&app, "autumn-plugin-x", "=0.2.0", None).is_some());
+    }
+
+    /// `[source.crates-io] replace-with` swaps crates.io itself.
+    #[test]
+    fn a_crates_io_source_replacement_is_a_redirect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app");
+        write(&app.join("Cargo.toml"), "[package]\nname = \"a\"\n");
+        assert_eq!(patched_by_in(&app, "autumn-plugin-x", "=0.2.5", None), None);
+        write(
+            &app.join(".cargo/config.toml"),
+            "[source.crates-io]\nreplace-with = \"vendored\"\n\n\
+             [source.vendored]\ndirectory = \"vendor\"\n",
+        );
+        let found = patched_by_in(&app, "autumn-plugin-x", "=0.2.5", None).unwrap();
+        assert!(found.contains("replace-with = \"vendored\""), "{found}");
     }
 
     /// A `[replace]` key names one version: another version's replacement

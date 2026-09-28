@@ -158,7 +158,8 @@ changes a file. Then:
   `Cargo.toml` already names the crate at another requirement, from a path,
   git or other registry, or renamed to another package, the command refuses
   and changes no file. It also refuses when a crates.io `[patch]` (in a manifest or
-  a `.cargo/config.toml`) or a `[replace]` table redirects the crate. For a first-party plugin, a `[patch]` to a local
+  a `.cargo/config.toml`), a `[replace]` table, or a `[source.crates-io]
+  replace-with` redirects the crate. For a first-party plugin, a `[patch]` to a local
   checkout only prints a notice: the trust review covers the crates.io
   release. A first-party plugin `Cargo.toml` already declares must also be the
   `=` pin of the reviewed release: `"0.7"` would take a later patch on the

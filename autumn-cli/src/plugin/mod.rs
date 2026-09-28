@@ -681,24 +681,23 @@ pub fn gate_listing(listing: &index::Listing, app: Option<&str>) -> Result<(), S
 }
 
 /// [`gate_listing`] against the app at `root`. A native community listing
-/// also needs the app's `autumn-web` version to check its range, so a path or
-/// git dependency no `Cargo.lock` resolves is refused. Outside a project the
-/// install fails later, with its own message.
+/// also needs the app's `autumn-web` version to check its range, so an app
+/// whose version cannot be read (a path or git dependency, or target-specific
+/// declarations of different versions) and that no `Cargo.lock` resolves is
+/// refused. Outside a project the install fails later, with its own message.
 fn gate_listing_in(listing: &index::Listing, root: &Path) -> Result<(), String> {
     let app = app_version(root);
     gate_listing(listing, app.as_deref())?;
     if app.is_none()
         && listing.origin != index::ListingOrigin::FirstParty
         && listing.trust == index::Trust::Native
-        && matches!(
-            install::app_autumn_web(root),
-            Ok(install::AppAutumnWeb::Unversioned)
-        )
+        && install::app_autumn_web(root).is_ok()
     {
         return Err(format!(
-            "`{}` {} supports autumn-web {}, but this app's autumn-web is a path or git \
-             dependency and no Cargo.lock names its version. Run `cargo generate-lockfile`, \
-             then re-run. No files were changed.",
+            "`{}` {} supports autumn-web {}, but this app's autumn-web version cannot be read \
+             (a path or git dependency, or target-specific declarations of different \
+             versions) and no Cargo.lock resolves it. Run `cargo generate-lockfile`, then \
+             re-run. No files were changed.",
             listing.name, listing.version, listing.autumn_web
         ));
     }
@@ -833,7 +832,7 @@ pub fn check_listed_declaration(
             if let Some(patch) = patched {
                 return Err(format!(
                     "{patch} redirects `{crate_name}`, but the index verified its crates.io \
-                     release `{version}`. Remove the patch entry, then re-run. No files were changed."
+                     release `{version}`. Remove that entry, then re-run. No files were changed."
                 ));
             }
             Ok(None)
@@ -933,9 +932,11 @@ fn source_label(source: &index::Source) -> String {
 
 /// The app's `autumn-web` version, or `None` when it cannot be determined.
 fn app_version(root: &Path) -> Option<String> {
-    let declared = match install::app_autumn_web(root) {
-        Ok(install::AppAutumnWeb::Version(req)) => Some(req.trim().to_owned()),
-        Ok(install::AppAutumnWeb::Unversioned) | Err(_) => None,
+    // One requirement, or none to go on: target-specific declarations of
+    // different versions leave the choice to the target Cargo builds for.
+    let declared = match install::declared_autumn_web_versions(root).as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
     };
     // What Cargo resolved, when it has: a `"0.7"` requirement may be 0.7.1.
     // A lock the manifest no longer admits is stale; the next build moves it.
@@ -1992,6 +1993,14 @@ mod tests {
         let listing = listed_community();
         let err = gate_listing_in(&listing, tmp.path()).unwrap_err();
         assert!(err.contains("path or git"), "{err}");
+        // Target-specific declarations of different versions: no one version.
+        let targets = project_with(
+            "[package]\nname = \"a\"\n\n\
+             [target.'cfg(windows)'.dependencies]\nautumn-web = \"0.7\"\n\n\
+             [target.'cfg(unix)'.dependencies]\nautumn-web = \"0.8\"\n",
+        );
+        assert_eq!(app_version(targets.path()), None);
+        assert!(gate_listing_in(&listing, targets.path()).is_err());
         std::fs::write(
             tmp.path().join("Cargo.lock"),
             format!(
