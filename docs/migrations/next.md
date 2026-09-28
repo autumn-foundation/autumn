@@ -1718,11 +1718,6 @@ soft delete. Wall time starts at the sim epoch, `2020-01-01T00:00:00Z`. A sim
 test that compares such a value with `Utc::now()` fails; compare it with the
 sim clock instead. Outside a `Sim`, nothing changes.
 
-Two webhook sites now read the app clock (`state.clock()`) instead of the OS
-clock: the `SignedWebhook` timestamp check and the outbound `t=` timestamp. A
-test that pins the app clock with `TestApp::with_clock` and signs a fixture
-with the real time now gets `401`. Sign the fixture with the pinned time.
-
 ### Sim: `run_to_idle` panics when the drain does not settle (#2967)
 
 Before, `Sim::run_to_idle` stopped after its step bound and gave no signal.

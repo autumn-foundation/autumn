@@ -435,7 +435,7 @@ impl WebhookOutboundManager {
                 max_attempts: 5,
                 is_dlq: false,
                 last_error: None,
-                timestamp: state.clock().now(),
+                timestamp: crate::time::ambient_now(),
             };
 
             // Register the initial attempt in local storage
@@ -591,7 +591,7 @@ pub fn deliver_webhook_job(
         if sub.status == WebhookSubscriptionStatus::Disabled {
             tracing::info!(subscription_id = %sub.id, "Webhook subscription is disabled; skipping delivery");
             log.last_error = Some("Subscription is disabled".to_owned());
-            log.timestamp = state.clock().now();
+            log.timestamp = crate::time::ambient_now();
             if is_replay {
                 log.is_dlq = true;
             }
@@ -602,7 +602,7 @@ pub fn deliver_webhook_job(
         if sub.status == WebhookSubscriptionStatus::Failed && !is_replay {
             tracing::info!(subscription_id = %sub.id, "Webhook subscription has failed; skipping delivery");
             log.last_error = Some("Subscription has failed due to consecutive errors".to_owned());
-            log.timestamp = state.clock().now();
+            log.timestamp = crate::time::ambient_now();
             manager.store().log_delivery(log).await?;
             return Ok(());
         }
@@ -611,7 +611,9 @@ pub fn deliver_webhook_job(
         }
 
         // Stripe-style payload signing: t=<timestamp>,v1=<signature>
-        let timestamp = state.clock().now().timestamp();
+        // The receiver checks `t=` against its own real clock, so sign with
+        // the ambient clock: real time outside a `Sim` (issue #2967).
+        let timestamp = crate::time::ambient_now().timestamp();
         let signing_payload = format!("{timestamp}.{}", log.payload);
         let signature = crate::security::config::hmac_sha256_hex(
             sub.secret.as_bytes(),
@@ -623,7 +625,7 @@ pub fn deliver_webhook_job(
         request_headers.insert("Content-Type".to_owned(), "application/json".to_owned());
         request_headers.insert("Autumn-Signature".to_owned(), signature_header.clone());
 
-        let start = state.monotonic();
+        let start = crate::time::ambient_monotonic();
         // `target_url` is a subscriber-chosen destination, not one the app
         // itself picked — exactly the case `ssrf_safe()` exists for. Without
         // it this POST carries none of the private/link-local/loopback/cloud-
@@ -649,8 +651,7 @@ pub fn deliver_webhook_job(
 
         let response = req.send().await;
         let elapsed = u64::try_from(
-            state
-                .monotonic()
+            crate::time::ambient_monotonic()
                 .saturating_duration_since(start)
                 .as_millis(),
         )
@@ -663,7 +664,7 @@ pub fn deliver_webhook_job(
         );
 
         log.elapsed_ms = elapsed;
-        log.timestamp = state.clock().now();
+        log.timestamp = crate::time::ambient_now();
         log.request_headers = request_headers;
 
         match response {

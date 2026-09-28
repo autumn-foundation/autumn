@@ -37,8 +37,7 @@
   [migration guide](docs/migrations/next.md)).
 - **sim-testing:** inside a `Sim`, framework code with no clock in scope
   (about 55 modules, and `#[repository]` soft-delete stamps) reads the sim's
-  virtual clock. Outside a `Sim`, nothing changes. The `SignedWebhook`
-  timestamp check and the outbound webhook `t=` timestamp read the app clock
-  (issue #2967, [migration guide](docs/migrations/next.md)).
+  virtual clock. Outside a `Sim`, nothing changes (issue #2967,
+  [migration guide](docs/migrations/next.md)).
 - **ci:** the single-threaded `sim_` step arms the liveness watchdog
   (`AUTUMN_SIM_LIVENESS_BUDGET_SECS`) (issue #2967).

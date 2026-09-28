@@ -555,7 +555,7 @@ async fn run_one_dataset(
     dataset: RetentionDataset,
     dry_run: bool,
 ) -> RetentionDatasetReport {
-    let started = state.monotonic();
+    let started = crate::time::ambient_monotonic();
     let effective = effective_retention(config, dataset);
     // A provisional cutoff, so a dataset with no database still reports one.
     // The sweep path replaces it with the instant Postgres itself resolved —
@@ -563,7 +563,7 @@ async fn run_one_dataset(
     let cutoff = effective
         .window
         .and_then(|window| chrono::Duration::from_std(window).ok())
-        .map(|window| state.clock().now() - window);
+        .map(|window| crate::time::ambient_now() - window);
 
     let mut report = RetentionDatasetReport {
         dataset: dataset.key().to_owned(),
@@ -583,7 +583,7 @@ async fn run_one_dataset(
 
     let (Some(window), Some(cutoff)) = (effective.window, cutoff) else {
         report.skipped = Some("no retention window configured".to_owned());
-        report.duration_ms = elapsed_ms(state, started);
+        report.duration_ms = elapsed_ms(started);
         return report;
     };
 
@@ -592,7 +592,7 @@ async fn run_one_dataset(
     let registry = state.extension::<GdprRegistry>();
     if let Some(reason) = legal_hold_for(dataset, registry.as_deref()) {
         report.skipped = Some(format!("legal hold: {reason}"));
-        report.duration_ms = elapsed_ms(state, started);
+        report.duration_ms = elapsed_ms(started);
         return report;
     }
 
@@ -626,7 +626,7 @@ async fn run_one_dataset(
         }
     }
 
-    report.duration_ms = elapsed_ms(state, started);
+    report.duration_ms = elapsed_ms(started);
     report
 }
 
@@ -668,10 +668,9 @@ fn backend_ttl_note(dataset: RetentionDataset, config: &AutumnConfig, window_sec
     note
 }
 
-fn elapsed_ms(state: &AppState, started: crate::time::MonotonicInstant) -> u64 {
+fn elapsed_ms(started: crate::time::MonotonicInstant) -> u64 {
     u64::try_from(
-        state
-            .monotonic()
+        crate::time::ambient_monotonic()
             .saturating_duration_since(started)
             .as_millis(),
     )

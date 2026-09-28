@@ -977,7 +977,11 @@ impl FromRequest<crate::AppState> for SignedWebhook {
                     "webhook body could not be read: {err}"
                 ))
             })?;
-        let received_at = UNIX_EPOCH + crate::time::clock_unix_duration(state.clock());
+        // The ambient clock: real time outside a `Sim`, as the provider signs
+        // with real time, and the sim clock inside one (issue #2967). Not the
+        // app clock: a test that pins `TestApp::with_clock` still signs with
+        // real time.
+        let received_at = crate::time::ambient_system_time();
         verify_request(&registry, &endpoint, &parts.headers, body, received_at)
             .await
             .map_err(WebhookVerifyError::into_autumn_error)

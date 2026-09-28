@@ -26698,9 +26698,10 @@ mod tests {
              `purge_deleted_after` up front: {task_info_region}"
         );
         assert!(
-            task_info_region.contains("chrono :: Utc :: now"),
-            "boot-time cutoff validation must use the real wall clock, since task_info() has \
-             no state/ClockSource parameter: {task_info_region}"
+            task_info_region.contains("time :: ambient_now"),
+            "boot-time cutoff validation must use the ambient clock (the real wall clock \
+             outside a `Sim`), since task_info() has no state/ClockSource parameter \
+             (#2967): {task_info_region}"
         );
     }
 

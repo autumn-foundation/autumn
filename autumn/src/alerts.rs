@@ -2101,7 +2101,7 @@ async fn evaluate_health(
     down_since: &mut HashMap<String, DateTime<Utc>>,
 ) {
     let results = state.health_indicator_registry().run_all().await;
-    let now = state.clock().now();
+    let now = crate::time::ambient_now();
     let grace = chrono::Duration::from_std(settings.health_grace)
         .unwrap_or_else(|_| chrono::Duration::seconds(60));
 
