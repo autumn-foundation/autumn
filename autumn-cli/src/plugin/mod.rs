@@ -984,16 +984,27 @@ fn app_version(root: &Path) -> Option<String> {
             return Some(locked);
         }
     }
-    // Unlocked: only a full `=x.y.z` is a version. Any other requirement is
-    // marked `^`/`~`, so `Listing::compat` judges the whole series it admits;
-    // `=0.7` matches every 0.7.x, so it becomes `~0.7`.
+    // Unlocked: only a full `=x.y.z` is a version. A bare version is marked
+    // `^`, so `Listing::compat` judges the whole series it admits; `=0.7`
+    // matches every 0.7.x, so it becomes `~0.7`. Anything else (`^0.7`, a
+    // range, a wildcard) passes through as written, for `Listing::compat` to
+    // read as an interval.
     let req = declared?;
     Some(match req.strip_prefix('=').map(str::trim) {
-        Some(exact) if exact.split('.').count() == 3 => exact.to_owned(),
-        Some(partial) => format!("~{partial}"),
-        None if req.starts_with(['^', '~']) => req,
-        None => format!("^{req}"),
+        Some(exact) if is_bare_version(exact) && exact.split('.').count() == 3 => exact.to_owned(),
+        Some(partial) if is_bare_version(partial) => format!("~{partial}"),
+        _ if is_bare_version(&req) => format!("^{req}"),
+        _ => req,
     })
+}
+
+/// Whether `req` is a version with no operator (`0.7`, `0.7.0-alpha.1`),
+/// which Cargo reads as a caret requirement.
+fn is_bare_version(req: &str) -> bool {
+    req.starts_with(|c: char| c.is_ascii_digit())
+        && semver::VersionReq::parse(req).is_ok_and(
+            |parsed| matches!(parsed.comparators.as_slice(), [one] if one.op == semver::Op::Caret),
+        )
 }
 
 /// Run `autumn plugin list`. Returns the process exit code.
@@ -2026,6 +2037,11 @@ mod tests {
         assert_eq!(app("=0.7.0", None).as_deref(), Some("0.7.0"));
         assert_eq!(app("=0.7", None).as_deref(), Some("~0.7"));
         assert_eq!(app("0.7", None).as_deref(), Some("^0.7"));
+        // A range or wildcard passes through, for `Listing::compat` to read
+        // as an interval; a caret is not doubled.
+        assert_eq!(app(">=0.7, <0.8", None).as_deref(), Some(">=0.7, <0.8"));
+        assert_eq!(app("0.7.*", None).as_deref(), Some("0.7.*"));
+        assert_eq!(app("^0.7", None).as_deref(), Some("^0.7"));
     }
 
     /// A first-party listing is lockstep, but not across a prerelease: a
@@ -2035,6 +2051,26 @@ mod tests {
         let admin = bundled().get("autumn-admin-plugin").expect("admin").clone();
         assert!(gate_listing(&admin, Some(&format!("{RELEASE}-alpha.1"))).is_err());
         assert!(gate_listing(&admin, Some(RELEASE)).is_ok());
+    }
+
+    /// An unlocked bounded range reaches `Listing::compat` as written, so a
+    /// community listing whose range contains it is not refused.
+    #[test]
+    fn a_community_listing_accepts_a_range_it_contains() {
+        let release = semver::Version::parse(RELEASE).unwrap();
+        let (major, minor) = (release.major, release.minor);
+        let mut listing = listed_community();
+        listing.autumn_web = format!("{major}.{minor}");
+        let inside = project_with(&format!(
+            "[package]\nname = \"a\"\n\n[dependencies]\nautumn-web = \">={major}.{minor}, <{major}.{next}\"\n",
+            next = minor + 1
+        ));
+        gate_listing_in(&listing, inside.path()).expect("the range is inside the listing's");
+        let wider = project_with(&format!(
+            "[package]\nname = \"a\"\n\n[dependencies]\nautumn-web = \">={major}.{minor}, <{major}.{next}\"\n",
+            next = minor + 2
+        ));
+        assert!(gate_listing_in(&listing, wider.path()).is_err());
     }
 
     /// A listed community crate needs the app's version: a path checkout with
