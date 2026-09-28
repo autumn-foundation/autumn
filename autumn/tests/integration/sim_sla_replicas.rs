@@ -724,3 +724,115 @@ async fn sim_sla_a_deadline_restored_while_its_check_runs_still_escalates() {
 
     job::clear_global_job_client();
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sim_sla_a_reconcile_retry_is_not_absorbed_by_a_running_check() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    // Wednesday 2020-01-01 09:00. The deadline on this calendar is 11:00.
+    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let clock = TickingClock::starting_at(start);
+    let store = RacingStore::new();
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    let app = replica(&clock, &store, &fired);
+    let sla = Sla::from_state(app.state()).unwrap();
+    let ob = Obligation::new("first_response", "ticket:1")
+        .within(BusinessDuration::hours(2))
+        .calendar("support");
+    sla.track(&ob).await.unwrap();
+    settle().await;
+    let key = ob.key();
+    let generation = store.inner.get(&key).await.unwrap().unwrap().generation;
+    let eleven = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
+    let later = Utc.with_ymd_and_hms(2020, 1, 1, 15, 0, 0).unwrap();
+    assert!(store.inner.set_due(&key, generation, later).await.unwrap());
+
+    // At 11:00 the old check reads the 15:00 record, then waits.
+    store.armed.store(true, Ordering::SeqCst);
+    let step = Duration::from_secs(2 * 3600);
+    clock.advance(step);
+    tokio::time::advance(step).await;
+    for _ in 0..16 {
+        if store.gets.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        settle().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(store.gets.load(Ordering::SeqCst), 1, "the check waits");
+
+    // A reconcile stored 11:00 but its enqueue failed. The retry sees an
+    // unchanged deadline and must still add a check.
+    assert!(store.inner.set_due(&key, generation, eleven).await.unwrap());
+    assert_eq!(sla.reconcile().await.unwrap(), 1);
+    let _ = store.get(&key).await.unwrap();
+    for _ in 0..4 {
+        settle().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert_eq!(*fired.lock().unwrap(), ["first_response/ticket:1"]);
+
+    job::clear_global_job_client();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sim_sla_an_on_time_met_clears_a_newer_claim_than_the_job_payload() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
+    let first_claim = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 1).unwrap();
+    let retry_claim = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 5).unwrap();
+    let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2020, 1, 1, 12, 0, 0).unwrap());
+    let store = RacingStore::new();
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    let app = replica(&clock, &store, &fired);
+    let ob = Obligation::new("first_response", "ticket:1")
+        .within(BusinessDuration::hours(2))
+        .calendar("support")
+        .starting_at(start)
+        .zone(chrono_tz::Tz::UTC);
+    let key = ob.key();
+    let generation = Uuid::from_u128(14);
+    store
+        .inner
+        .insert(ObligationRecord::new(ob, generation).with_due_at(due))
+        .await
+        .unwrap();
+    // The retry of the check holds the claim; the queued job has the first
+    // claim instant. Then a late `track` reports a reply before the deadline.
+    assert!(
+        store
+            .inner
+            .claim_escalation(&key, generation, due, retry_claim)
+            .await
+            .unwrap()
+    );
+    let met = Utc.with_ymd_and_hms(2020, 1, 1, 10, 30, 0).unwrap();
+    assert!(store.inner.mark_met(&key, generation, met).await.unwrap());
+
+    let breach = serde_json::json!({
+        "key": key,
+        "obligation": "first_response",
+        "subject": "ticket:1",
+        "calendar": "support",
+        "zone": "UTC",
+        "generation": generation,
+        "started_at": start,
+        "due_at": due,
+        "escalated_at": first_claim,
+    });
+    let client = app.state().extension::<job::JobClient>().unwrap();
+    client.enqueue(ESCALATE_JOB, breach).await.unwrap();
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    settle().await;
+
+    assert!(fired.lock().unwrap().is_empty(), "met on time: no breach");
+    let record = store.inner.get(&key).await.unwrap().unwrap();
+    assert_eq!(record.escalated_at, None, "the stored claim is released");
+
+    job::clear_global_job_client();
+}

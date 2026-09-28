@@ -83,9 +83,9 @@ struct CheckArgs {
     /// merged into that check.
     #[serde(default)]
     requeue: u32,
-    /// A random value when `reconcile` changed the stored deadline, else 0.
-    /// It is part of the unique key, so a check that runs for the same
-    /// deadline does not absorb the new check.
+    /// A random value for a check from `reconcile`, else 0. It is part of
+    /// the unique key, so a check that runs for the same deadline does not
+    /// absorb the new check.
     #[serde(default)]
     revision: u64,
 }
@@ -404,8 +404,8 @@ impl Sla {
     /// Call it once from the new version after a deploy that changes a
     /// calendar, for example from an `on_startup` hook. Without it, a record
     /// keeps the deadline that `track` stored. It is safe to call at any
-    /// time: for an unchanged deadline, a check that is already on the queue
-    /// is not added again. A changed deadline gets a new check.
+    /// time. Each call adds one check for each open record. An extra check
+    /// does no harm: only one claim can succeed.
     ///
     /// # Errors
     ///
@@ -422,17 +422,16 @@ impl Sla {
             if status.escalated_at.is_some() || status.state == ObligationState::Met {
                 continue;
             }
-            let revision = if record.due_at == Some(due) {
-                0
-            } else {
-                if !store.set_due(&status.key, record.generation, due).await? {
-                    // The record was escalated or replaced after the read.
-                    continue;
-                }
-                // A check for `due` can be running with an older read. A
-                // new unique key stops that check from absorbing this one.
-                self.state.entropy().next_u64().max(1)
-            };
+            if record.due_at != Some(due)
+                && !store.set_due(&status.key, record.generation, due).await?
+            {
+                // The record was escalated or replaced after the read.
+                continue;
+            }
+            // A check for `due` can be running with an older read, also
+            // after a failed earlier call. A new unique key stops that
+            // check from absorbing this one.
+            let revision = self.state.entropy().next_u64().max(1);
             self.schedule_check(&status.key, record.generation, due, revision)
                 .await?;
             scheduled = scheduled.saturating_add(1);
@@ -646,16 +645,20 @@ impl Sla {
     /// so, release the claim: this breach does not run.
     async fn met_on_time(&self, breach: &SlaBreach) -> Result<bool, SlaError> {
         let store = &self.engine.store;
-        let on_time = store.get(&breach.key).await?.is_some_and(|record| {
-            record.generation == breach.generation
-                && record
-                    .obligation
-                    .met()
-                    .is_some_and(|met| met <= breach.due_at)
-        });
-        if on_time {
+        let Some(record) = store.get(&breach.key).await? else {
+            return Ok(false);
+        };
+        let on_time = record.generation == breach.generation
+            && record
+                .obligation
+                .met()
+                .is_some_and(|met| met <= breach.due_at);
+        // Release the claim that the store holds. It can be newer than the
+        // one in `breach`: the unique key can keep an older job. A record
+        // met on time cannot be claimed again, so this is safe.
+        if on_time && let Some(claimed_at) = record.escalated_at {
             store
-                .release_escalation(&breach.key, breach.generation, breach.escalated_at)
+                .release_escalation(&breach.key, breach.generation, claimed_at)
                 .await?;
         }
         Ok(on_time)
