@@ -1703,6 +1703,9 @@ pub const PRE_MIGRATE_LABELS: &[&str] = &[
     // deploy paths precedes `migrate`.
     "upload",
     "stage-local-file",
+    // The driver puts the live-slot marker repair ahead of every builder op, like
+    // `install-proxy`.
+    LIVE_SLOT_REPAIR_LABEL,
 ];
 
 /// Whether a host that failed at `failed_step` had already run its migration.
@@ -3317,12 +3320,17 @@ pub fn live_slot_marker_repair_op(
     public_port: u16,
 ) -> DeployOp {
     let slot = canonical_slot(slot);
-    DeployOp::Run(record_live_slot(
-        cfg,
-        slot,
-        slot_app_port(public_port, slot),
-    ))
+    let mut repair = record_live_slot(cfg, slot, slot_app_port(public_port, slot));
+    repair.label = LIVE_SLOT_REPAIR_LABEL;
+    DeployOp::Run(repair)
 }
+
+/// The label of [`live_slot_marker_repair_op`].
+///
+/// It is not `record-live-slot`, the label of the same marker write after
+/// `migrate`: the repair always runs before `migrate`, and a failure there must
+/// not read as a moved schema (#2276).
+pub const LIVE_SLOT_REPAIR_LABEL: &str = "repair-live-slot";
 
 /// Build the bounded remote readiness-poll shell line: loop on
 /// `curl -fsS localhost:{port}/ready` until it succeeds or `timeout_secs`
@@ -7713,9 +7721,10 @@ mod tests {
                 );
             }
         }
-        // The driver splices host preparation ahead of everything (#1607), so it is
-        // pre-migrate too even though no builder emits it.
+        // The driver splices host preparation (#1607) and the marker repair ahead of
+        // everything, so both are pre-migrate even though no builder emits them.
         assert!(failed_before_migrating("install-proxy"));
+        assert!(failed_before_migrating(LIVE_SLOT_REPAIR_LABEL));
         // Anything unrecognised errs toward "the schema may have moved".
         assert!(!failed_before_migrating("readiness-gate"));
         assert!(!failed_before_migrating("some-future-op"));
@@ -7850,7 +7859,7 @@ mod tests {
         let op = live_slot_marker_repair_op(&cfg, decision.live_slot, 3000);
         match op {
             DeployOp::Run(cmd) => {
-                assert_eq!(cmd.label, "record-live-slot");
+                assert_eq!(cmd.label, LIVE_SLOT_REPAIR_LABEL);
                 assert!(
                     cmd.shell.contains(SLOT_BLUE) && cmd.shell.contains("3001"),
                     "repair op writes the proxy slot+port: {}",

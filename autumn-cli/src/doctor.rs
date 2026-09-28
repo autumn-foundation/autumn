@@ -4231,20 +4231,46 @@ pub fn check_rust_toolchain_impl(current_output: &str, required: &str) -> CheckR
 // ─── IO-dependent checks ──────────────────────────────────────────────────────
 
 fn check_rust_toolchain(msrv: &str) -> CheckResult {
-    match std::process::Command::new("rustc")
-        .arg("--version")
-        .output()
-    {
+    // `rustc` is rustup's shim, and doctor runs its checks at the same time. If
+    // the project pins a toolchain this machine lacks, rustup errors instead of
+    // installing it: concurrent installs leave a toolchain half-installed.
+    let mut rustc = std::process::Command::new("rustc");
+    rustc.arg("--version");
+    crate::deps::no_toolchain_installs(&mut rustc);
+    match rustc.output() {
         Ok(out) if out.status.success() => {
             let ver = String::from_utf8_lossy(&out.stdout).into_owned();
             check_rust_toolchain_impl(ver.trim(), msrv)
         }
-        _ => CheckResult {
+        Ok(out) => rust_toolchain_failure(&String::from_utf8_lossy(&out.stderr)),
+        Err(_) => CheckResult {
             name: "rust_toolchain",
             status: CheckStatus::Fail,
             detail: Some("`rustc --version` failed".into()),
             hint: Some("Install Rust via https://rustup.rs/"),
         },
+    }
+}
+
+/// The `rust_toolchain` result when `rustc --version` exits non-zero.
+///
+/// Rust can be installed while the project's pinned toolchain is not: rustup
+/// then says "toolchain '…' is not installed". That needs `rustup toolchain
+/// install`, not a fresh Rust install.
+fn rust_toolchain_failure(stderr: &str) -> CheckResult {
+    let reason = stderr.lines().map(str::trim).find(|line| !line.is_empty());
+    CheckResult {
+        name: "rust_toolchain",
+        status: CheckStatus::Fail,
+        detail: Some(reason.map_or_else(
+            || "`rustc --version` failed".to_owned(),
+            |reason| format!("`rustc --version` failed: {reason}"),
+        )),
+        hint: Some(if stderr.contains("is not installed") {
+            "Run `rustup toolchain install` in this project to install its pinned toolchain"
+        } else {
+            "Install Rust via https://rustup.rs/"
+        }),
     }
 }
 
@@ -4389,15 +4415,37 @@ fn check_tailwind_binary() -> CheckResult {
     // where `dev` expects it. Tolerant, not `resolve_target_directory`'s
     // hard-exit form: one unreadable check must not abort every other check
     // `doctor` still has to report.
-    let target_dir = crate::dev::try_resolve_target_directory()
-        .unwrap_or_else(|| std::path::PathBuf::from("target"));
-    let path = target_dir.join("autumn").join(if cfg!(windows) {
-        "tailwindcss.exe"
-    } else {
-        "tailwindcss"
-    });
+    let binary = |target_dir: std::path::PathBuf| {
+        target_dir.join("autumn").join(if cfg!(windows) {
+            "tailwindcss.exe"
+        } else {
+            "tailwindcss"
+        })
+    };
+    crate::dev::try_resolve_target_directory().map_or_else(tailwind_not_evaluated, |target_dir| {
+        check_tailwind_binary_at(&binary(target_dir))
+    })
+}
 
-    check_tailwind_binary_at(&path)
+/// The Tailwind check when `cargo metadata` could not name the target
+/// directory, for example because the pinned toolchain is not installed.
+///
+/// Any path doctor picked instead would be a guess: Cargo also reads
+/// `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR` and `[build] target-dir` from
+/// every `.cargo/config.toml` up the tree. Whatever is or is not at a guessed
+/// path says nothing about the binary `autumn setup` installed, so the check
+/// is not evaluated.
+fn tailwind_not_evaluated() -> CheckResult {
+    CheckResult {
+        name: "tailwind_binary",
+        status: CheckStatus::Pass,
+        detail: Some(
+            "not evaluated — `cargo metadata` could not name the target directory".to_owned(),
+        ),
+        hint: Some(
+            "Fix what stops `cargo metadata` (see the `rust_toolchain` check), then run `autumn doctor` again",
+        ),
+    }
 }
 
 fn check_stale_artifacts() -> CheckResult {
@@ -17869,6 +17917,68 @@ foo = "bar"
         assert!(r.detail.as_deref().unwrap_or("").contains("8080"));
     }
 
+    // ── no toolchain installs ────────────────────────────────────────────────
+
+    /// The body of the first `fn` whose signature starts with `signature`.
+    /// Line endings are normalized first: a Windows checkout has CRLF.
+    fn fn_body(source: &str, signature: &str) -> String {
+        let source = source.replace("\r\n", "\n");
+        let start = source.find(signature).expect("function present");
+        let end = source[start..].find("\n}\n").expect("function end");
+        source[start..start + end].to_owned()
+    }
+
+    #[test]
+    fn fn_body_reads_a_crlf_checkout() {
+        let source = "fn a() {\r\n    body();\r\n}\r\nfn b() {}\r\n";
+        assert_eq!(fn_body(source, "fn a("), "fn a() {\n    body();");
+    }
+
+    #[test]
+    fn doctor_checks_never_make_rustup_install_a_toolchain() {
+        // Regression, caught by the Windows Tier 1 journey: doctor runs its
+        // checks at the same time, and `rustc`/`cargo` there are rustup's shims,
+        // which install the project's pinned toolchain on first use. Several
+        // checks installing it at once left it half-installed, and the next
+        // `cargo` failed with "the 'cargo.exe' binary ... is not applicable to
+        // the '1.88.0' toolchain". A check must not install anything.
+        let doctor = include_str!("doctor.rs");
+        assert!(
+            fn_body(doctor, "fn check_rust_toolchain(msrv").contains("no_toolchain_installs(&mut"),
+            "the rust_toolchain check must forbid a toolchain install"
+        );
+        let dev = include_str!("dev.rs");
+        assert!(
+            fn_body(dev, "pub fn try_resolve_target_directory(")
+                .contains("no_toolchain_installs(&mut"),
+            "doctor's target-dir lookup must forbid a toolchain install"
+        );
+    }
+
+    #[test]
+    fn a_missing_pinned_toolchain_points_at_rustup_toolchain_install() {
+        let r = rust_toolchain_failure(
+            "error: toolchain '1.88.0-x86_64-pc-windows-msvc' is not installed\n\
+             help: run `rustup toolchain install` to install it\n",
+        );
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert_eq!(
+            r.detail.as_deref(),
+            Some(
+                "`rustc --version` failed: error: toolchain \
+                 '1.88.0-x86_64-pc-windows-msvc' is not installed"
+            )
+        );
+        assert!(r.hint.expect("a hint").contains("rustup toolchain install"));
+    }
+
+    #[test]
+    fn any_other_rustc_failure_still_points_at_installing_rust() {
+        let r = rust_toolchain_failure("");
+        assert_eq!(r.detail.as_deref(), Some("`rustc --version` failed"));
+        assert_eq!(r.hint, Some("Install Rust via https://rustup.rs/"));
+    }
+
     // ── check_rust_toolchain_impl ────────────────────────────────────────────
 
     #[test]
@@ -20000,6 +20110,16 @@ foo = "bar"
             r.detail.as_deref().unwrap_or("").contains("directory"),
             "detail should identify directory path, got {r:?}"
         );
+    }
+
+    #[test]
+    fn an_unknown_target_dir_leaves_the_tailwind_check_unevaluated() {
+        // `cargo metadata` gave no answer, so doctor does not know where Cargo
+        // builds. It must not judge the binary at any guessed path.
+        let r = tailwind_not_evaluated();
+        assert_eq!(r.status, CheckStatus::Pass);
+        let detail = r.detail.expect("a detail");
+        assert!(detail.contains("not evaluated"), "{detail}");
     }
 
     #[test]
