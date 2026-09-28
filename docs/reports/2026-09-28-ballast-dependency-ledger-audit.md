@@ -436,4 +436,17 @@ git checkout -- autumn/Cargo.toml Cargo.lock
    confirms no regression, but the actual open question (why `list` and
    `bans` can disagree at all — a `[graph]`/target-resolution difference
    between the two subcommands is the leading unconfirmed hypothesis) has
-   not been investigated further this pass. Still open.
+   not been investigated further this pass. Still open. **A second, adjacent
+   instance surfaced this pass via a Codex review comment**: `phf_codegen`
+   and `phf_generator` 0.11.3 exist in `Cargo.lock` (pulled by `terminfo` via
+   `termwiz`/`ratatui-termwiz`, from `autumn-cli`'s `ratatui` dependency),
+   but neither `cargo deny check bans` nor a plain `cargo tree -i
+   phf_codegen@0.11.3` (workspace-wide, `--all-features`) reaches that edge
+   — `bans` reports exactly 2 duplicate entries for each name (0.13.1,
+   0.14.0), not 3. Re-verified directly (`cargo deny check bans | grep -A3
+   "'phf_codegen'"`) before replying, so this pass's 76→84 attribution
+   stands, but *why* a lockfile entry can exist outside every graph query
+   this report runs against it is now two-for-two unexplained. Worth folding
+   into whatever investigates the `list`/`bans` gap, since it may be the
+   same underlying mechanism (a `[graph]`/target-resolution edge neither
+   subcommand's default invocation walks).
