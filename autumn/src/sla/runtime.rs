@@ -301,13 +301,13 @@ impl Sla {
             .starting_at(obligation.started_at().unwrap_or(now));
         let key = resolved.key();
         // Refuse before the insert, so a refused obligation leaves no record.
-        if resolved.status_with(calendar, zone, now).due_at.is_none() {
+        let Some(due_at) = resolved.status_with(calendar, zone, now).due_at else {
             return Err(SlaError::NoDeadline(key));
-        }
+        };
         let store = &self.engine.store;
         let generation = self.state.entropy().uuid_v4();
         let (mut record, created) = store
-            .insert(ObligationRecord::new(resolved, generation))
+            .insert(ObligationRecord::new(resolved, generation).with_due_at(due_at))
             .await?;
         // A new record has the met instant already. An older one gets it now.
         if !created && let Some(met) = obligation.met() {
@@ -386,14 +386,14 @@ impl Sla {
             .collect()
     }
 
-    /// Put a check job on the queue for each open record, at its deadline
-    /// on the current calendars. Returns the number of records it checked.
+    /// Store the deadline of each open record on the current calendars, and
+    /// put a check job on the queue there. Returns the number of records it
+    /// checked.
     ///
-    /// Call it once after a deploy that changes a calendar, for example from
-    /// an `on_startup` hook. A deadline that moved later is found by the old
-    /// check. A deadline that moved earlier needs this call. It is safe to
-    /// call at any time: a check that is already on the queue is not added
-    /// again.
+    /// Call it once from the new version after a deploy that changes a
+    /// calendar, for example from an `on_startup` hook. Without it, a record
+    /// keeps the deadline that `track` stored. It is safe to call at any
+    /// time: a check that is already on the queue is not added again.
     ///
     /// # Errors
     ///
@@ -402,16 +402,23 @@ impl Sla {
     pub async fn reconcile(&self) -> Result<usize, SlaError> {
         let now = self.now();
         let mut scheduled = 0_usize;
-        for record in self.engine.store.list().await? {
-            let status = self.status_of(&record, now)?;
-            if let Some(due) = status.due_at
-                && status.escalated_at.is_none()
-                && status.state != ObligationState::Met
-            {
-                self.schedule_check(&status.key, record.generation, due)
-                    .await?;
-                scheduled = scheduled.saturating_add(1);
+        let store = &self.engine.store;
+        for record in store.list().await? {
+            // The deadline on this replica's calendars, not the stored one.
+            let status = self.calendar_status(&record, now)?;
+            let Some(due) = status.due_at else { continue };
+            if status.escalated_at.is_some() || status.state == ObligationState::Met {
+                continue;
             }
+            if record.due_at != Some(due)
+                && !store.set_due(&status.key, record.generation, due).await?
+            {
+                // The record was escalated or replaced after the read.
+                continue;
+            }
+            self.schedule_check(&status.key, record.generation, due)
+                .await?;
+            scheduled = scheduled.saturating_add(1);
         }
         Ok(scheduled)
     }
@@ -439,7 +446,8 @@ impl Sla {
             .unwrap_or_else(|| self.state.config_arc().time_zone.default_tz())
     }
 
-    fn status_of(
+    /// The status of `record` on this replica's calendar.
+    fn calendar_status(
         &self,
         record: &ObligationRecord,
         now: DateTime<Utc>,
@@ -448,6 +456,33 @@ impl Sla {
         let zone = self.zone_of(&record.obligation, calendar);
         let mut status = record.obligation.status_with(calendar, zone, now);
         status.escalated_at = record.escalated_at;
+        Ok(status)
+    }
+
+    /// The status of `record`. The stored deadline, if set, decides the
+    /// deadline and the met or breached state. Thus a replica with an old
+    /// calendar agrees with the record.
+    fn status_of(
+        &self,
+        record: &ObligationRecord,
+        now: DateTime<Utc>,
+    ) -> Result<ObligationStatus, SlaError> {
+        let mut status = self.calendar_status(record, now)?;
+        if let Some(due) = record.due_at
+            && status.due_at != Some(due)
+        {
+            status.due_at = Some(due);
+            status.state = match status.met_at {
+                Some(met) if met <= due => ObligationState::Met,
+                Some(_) => ObligationState::Breached,
+                None if now >= due => ObligationState::Breached,
+                None if status.state == ObligationState::Breached => ObligationState::Running,
+                None => status.state,
+            };
+            if status.state == ObligationState::Breached {
+                status.remaining = std::time::Duration::ZERO;
+            }
+        }
         Ok(status)
     }
 

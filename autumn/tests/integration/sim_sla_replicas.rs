@@ -88,6 +88,15 @@ impl ObligationStore for RacingStore {
         })
     }
 
+    fn set_due<'a>(
+        &'a self,
+        key: &'a str,
+        generation: Uuid,
+        due_at: DateTime<Utc>,
+    ) -> StoreFuture<'a, bool> {
+        self.inner.set_due(key, generation, due_at)
+    }
+
     fn claim_escalation<'a>(
         &'a self,
         key: &'a str,
@@ -495,6 +504,64 @@ async fn sim_sla_a_track_that_loses_the_met_race_reads_the_stored_met() {
         .unwrap();
     assert_eq!(status.state, autumn_web::sla::ObligationState::Met);
     assert_eq!(status.met_at, Some(rival));
+
+    job::clear_global_job_client();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sim_sla_a_stale_calendar_does_not_claim_before_the_stored_deadline() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let old_due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
+    let new_due = Utc.with_ymd_and_hms(2020, 1, 1, 15, 0, 0).unwrap();
+    let clock = TickingClock::starting_at(start);
+    let store = RacingStore::new();
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    // This replica has the old calendar: its deadline is 11:00.
+    let app = replica(&clock, &store, &fired);
+
+    // A replica with a new calendar reconciled the record to 15:00.
+    let ob = Obligation::new("first_response", "ticket:1")
+        .within(BusinessDuration::hours(2))
+        .calendar("support")
+        .starting_at(start)
+        .zone(chrono_tz::Tz::UTC);
+    let generation = Uuid::from_u128(11);
+    store
+        .inner
+        .insert(ObligationRecord::new(ob.clone(), generation).with_due_at(new_due))
+        .await
+        .unwrap();
+    // The old check, at the old deadline.
+    let check = serde_json::json!({ "key": ob.key(), "generation": generation, "due_at": old_due });
+    let client = app.state().extension::<job::JobClient>().unwrap();
+    client
+        .enqueue_due(autumn_web::sla::CHECK_JOB, check, Some(old_due))
+        .await
+        .unwrap();
+
+    let step = Duration::from_secs(3 * 3600);
+    clock.advance(step);
+    tokio::time::advance(step).await;
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    settle().await;
+    assert!(
+        fired.lock().unwrap().is_empty(),
+        "not before the stored deadline"
+    );
+    let record = store.inner.get(&ob.key()).await.unwrap().unwrap();
+    assert!(record.escalated_at.is_none());
+
+    // At the stored deadline, the check escalates.
+    clock.advance(step);
+    tokio::time::advance(step).await;
+    settle().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    settle().await;
+    assert_eq!(*fired.lock().unwrap(), ["first_response/ticket:1"]);
 
     job::clear_global_job_client();
 }

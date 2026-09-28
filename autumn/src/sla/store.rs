@@ -24,6 +24,9 @@ pub struct ObligationRecord {
     pub generation: Uuid,
     /// The instant when the escalation was claimed.
     pub escalated_at: Option<DateTime<Utc>>,
+    /// The deadline that decides the escalation. `track` sets it, and
+    /// `Sla::reconcile` changes it. `None` means the calendar decides.
+    pub due_at: Option<DateTime<Utc>>,
 }
 
 impl ObligationRecord {
@@ -34,7 +37,15 @@ impl ObligationRecord {
             obligation,
             generation,
             escalated_at: None,
+            due_at: None,
         }
+    }
+
+    /// Set the stored deadline.
+    #[must_use]
+    pub const fn with_due_at(mut self, due_at: DateTime<Utc>) -> Self {
+        self.due_at = Some(due_at);
+        self
     }
 }
 
@@ -46,8 +57,9 @@ impl ObligationRecord {
 ///
 /// ```sql
 /// UPDATE sla_obligations SET escalated_at = $4
-/// WHERE key = $1 AND generation = $2
-///   AND escalated_at IS NULL AND (met_at IS NULL OR met_at > $3)
+/// WHERE key = $1 AND generation = $2 AND escalated_at IS NULL
+///   AND (due_at IS NULL OR due_at = $3)
+///   AND (met_at IS NULL OR met_at > $3)
 /// ```
 pub trait ObligationStore: Send + Sync + 'static {
     /// Add `record` if its key is new. Return the stored record, and `true`
@@ -68,9 +80,22 @@ pub trait ObligationStore: Send + Sync + 'static {
         at: DateTime<Utc>,
     ) -> StoreFuture<'a, bool>;
 
-    /// Set the escalation instant to `at` if the escalation is not set and
-    /// the obligation was not met by `due_at`. Return `true` if this call set
-    /// it.
+    /// Set the deadline to `due_at` if the escalation is not set. Return
+    /// `true` if this call set it.
+    fn set_due<'a>(
+        &'a self,
+        key: &'a str,
+        generation: Uuid,
+        due_at: DateTime<Utc>,
+    ) -> StoreFuture<'a, bool>;
+
+    /// Set the escalation instant to `at` if the escalation is not set, the
+    /// stored deadline is `due_at` (or not set), and the obligation was not
+    /// met by `due_at`. Return `true` if this call set it.
+    ///
+    /// The deadline condition stops a replica with an old calendar from a
+    /// claim before the deadline that [`Sla::reconcile`](super::Sla::reconcile)
+    /// stored.
     fn claim_escalation<'a>(
         &'a self,
         key: &'a str,
@@ -172,6 +197,22 @@ impl ObligationStore for MemoryObligationStore {
         Box::pin(async move { Ok(changed.await?.unwrap_or(false)) })
     }
 
+    fn set_due<'a>(
+        &'a self,
+        key: &'a str,
+        generation: Uuid,
+        due_at: DateTime<Utc>,
+    ) -> StoreFuture<'a, bool> {
+        let changed = self.with_instance(key, generation, |record| {
+            let open = record.escalated_at.is_none();
+            if open {
+                record.due_at = Some(due_at);
+            }
+            open
+        });
+        Box::pin(async move { Ok(changed.await?.unwrap_or(false)) })
+    }
+
     fn claim_escalation<'a>(
         &'a self,
         key: &'a str,
@@ -181,6 +222,7 @@ impl ObligationStore for MemoryObligationStore {
     ) -> StoreFuture<'a, bool> {
         let claimed = self.with_instance(key, generation, |record| {
             let open = record.escalated_at.is_none()
+                && record.due_at.is_none_or(|due| due == due_at)
                 && record.obligation.met().is_none_or(|met| met > due_at);
             if open {
                 record.escalated_at = Some(at);

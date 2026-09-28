@@ -781,6 +781,15 @@ impl ObligationStore for FlakyRelease {
         self.inner.mark_met(key, generation, at)
     }
 
+    fn set_due<'a>(
+        &'a self,
+        key: &'a str,
+        generation: uuid::Uuid,
+        due_at: DateTime<Utc>,
+    ) -> StoreFuture<'a, bool> {
+        self.inner.set_due(key, generation, due_at)
+    }
+
     fn claim_escalation<'a>(
         &'a self,
         key: &'a str,
@@ -839,4 +848,49 @@ async fn release_claim_gives_up_after_its_attempts() {
     let store = flaky_release(usize::MAX).await;
     let due = utc(2024, 1, 9, 15, 0);
     assert!(runtime::release_claim(&store, KEY, GEN, due).await.is_err());
+}
+
+#[tokio::test]
+async fn store_claims_only_at_the_stored_deadline() {
+    let store = MemoryObligationStore::new();
+    let old_due = utc(2024, 1, 9, 15, 0);
+    let new_due = utc(2024, 1, 10, 15, 0);
+    store
+        .insert(record(utc(2024, 1, 5, 15, 0), GEN).with_due_at(new_due))
+        .await
+        .unwrap();
+    // A replica with an old calendar computes an earlier deadline.
+    assert!(
+        !store
+            .claim_escalation(KEY, GEN, old_due, old_due)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .claim_escalation(KEY, GEN, new_due, new_due)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn store_sets_the_deadline_until_the_escalation() {
+    let store = store_with_one().await;
+    let due = utc(2024, 1, 9, 15, 0);
+    assert!(store.set_due(KEY, GEN, due).await.unwrap());
+    assert_eq!(store.get(KEY).await.unwrap().unwrap().due_at, Some(due));
+    assert!(store.claim_escalation(KEY, GEN, due, due).await.unwrap());
+    assert!(
+        !store
+            .set_due(KEY, GEN, utc(2024, 1, 10, 15, 0))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .set_due(KEY, uuid::Uuid::from_u128(9), due)
+            .await
+            .unwrap()
+    );
 }

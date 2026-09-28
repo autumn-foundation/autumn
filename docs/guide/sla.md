@@ -225,15 +225,21 @@ than one replica, put an `ObligationStore` on your database with
 `SlaPlugin::store`, and use it on all replicas.
 
 Each record has a `generation`, a unique id that `track` makes. The writes
-after the insert (`mark_met`, `claim_escalation`, `release_escalation`) must
-change the record only when the key and the generation both match, in one
-atomic step. Thus a slow call never
-changes a record that `forget` and a new `track` replaced. For example:
+after the insert (`mark_met`, `set_due`, `claim_escalation`,
+`release_escalation`) must change the record only when the key and the
+generation both match, in one atomic step. Thus a slow call never changes a
+record that `forget` and a new `track` replaced.
+
+Each record also keeps its deadline (`due_at`). `track` sets it, and
+`Sla::reconcile` changes it. A claim must match the stored deadline. Thus a
+replica with an old calendar, during a rolling deploy, cannot claim before
+the deadline that a new replica stored. For example:
 
 ```sql
 UPDATE sla_obligations SET escalated_at = $4
-WHERE key = $1 AND generation = $2
-  AND escalated_at IS NULL AND (met_at IS NULL OR met_at > $3)
+WHERE key = $1 AND generation = $2 AND escalated_at IS NULL
+  AND (due_at IS NULL OR due_at = $3)
+  AND (met_at IS NULL OR met_at > $3)
 ```
 
 ---
@@ -270,10 +276,10 @@ time.
 ## Limits
 
 - Calendars are set in code. There is no holiday import and no editor.
-- If a deploy changes a calendar, call `Sla::reconcile` once (for example,
-  from an `on_startup` hook). It puts a check on the queue at each open
-  record's new deadline. Without it, a deadline that moved earlier escalates
-  only at the old deadline.
+- If a deploy changes a calendar, call `Sla::reconcile` once from the new
+  version (for example, from an `on_startup` hook). It stores each open
+  record's new deadline and puts a check on the queue there. Without it, a
+  record keeps the deadline that `track` stored.
 - The clock stops only outside working time. A manual pause is not available.
 - A window cannot cross midnight. Use two windows, such as `"22:00-24:00"` and
   `"00:00-06:00"`.
