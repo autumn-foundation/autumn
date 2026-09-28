@@ -17936,10 +17936,18 @@ foo = "bar"
     // ── no toolchain installs ────────────────────────────────────────────────
 
     /// The body of the first `fn` whose signature starts with `signature`.
-    fn fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    /// Line endings are normalized first: a Windows checkout has CRLF.
+    fn fn_body(source: &str, signature: &str) -> String {
+        let source = source.replace("\r\n", "\n");
         let start = source.find(signature).expect("function present");
         let end = source[start..].find("\n}\n").expect("function end");
-        &source[start..start + end]
+        source[start..start + end].to_owned()
+    }
+
+    #[test]
+    fn fn_body_reads_a_crlf_checkout() {
+        let source = "fn a() {\r\n    body();\r\n}\r\nfn b() {}\r\n";
+        assert_eq!(fn_body(source, "fn a("), "fn a() {\n    body();");
     }
 
     #[test]
