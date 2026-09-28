@@ -2466,6 +2466,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install the scaffold's pinned toolchain
+        # The generated app's `rust-toolchain.toml` pins the workspace
+        # `rust-version` (the scaffold reads it from `CARGO_PKG_RUST_VERSION`)
+        # with rustfmt and clippy. Left to rustup's shim, the first tool the
+        # journey runs inside the app installs that toolchain on demand, and a
+        # half-finished install breaks the next `cargo build` (#1633). This job
+        # hit it twice in a row: once without `cargo.exe`, once without the
+        # target's `std`. Installing it up front keeps the journey off that
+        # path. `stable` stays the default for building the CLI.
+        run: |
+          $msrv = (Select-String -Path Cargo.toml -Pattern '^rust-version = "(.+)"').Matches[0].Groups[1].Value
+          if (-not $msrv) { throw "no rust-version in the workspace Cargo.toml" }
+          rustup toolchain install $msrv --profile minimal --component rustfmt,clippy
+          if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install $msrv failed with $LASTEXITCODE" }
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
 
