@@ -618,10 +618,11 @@ one. `ambient_monotonic()` readings are comparable only within one timeline.
 `ambient_instant()` joins the timelines one after the other: a `Sim` starts its
 instants at the latest instant already given out in the process. So state that
 outlives one `Sim` sees the next one's instants as later, and its TTLs and idle
-ages run on. The reverse is not covered: an outer `Sim` sees instants that a
-nested `Sim` stored as future ones. Keep state that stores ambient instants (a
-cache, a presence map) inside one `Sim`, and do not share it with a nested
-`Sim` or with code outside the sim.
+ages run on. After a nested `Sim` ends, the outer one's instants go on from
+where the nested one stopped, so on one thread an ambient instant never goes
+back. Instants from code outside the sim, or from a `Sim` on another thread, are
+not ordered this way: do not share state that stores ambient instants (a cache,
+a presence map) with those.
 
 If you write a custom `impl ClockSource` whose `now()` is virtual, you **must**
 also override `monotonic()`. The trait ships a default body that reads the real

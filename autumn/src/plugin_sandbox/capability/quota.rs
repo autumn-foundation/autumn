@@ -230,12 +230,6 @@ impl CapabilityRateLimiter {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let full = u64::from(self.per_second).saturating_mul(SCALE);
         let now = crate::time::ambient_instant();
-        // A `last` after `now` is from another timeline: the limiter was
-        // shared across a `Sim` boundary. Restart the refill clock at `now`,
-        // or the bucket never refills on this timeline (issue #2967).
-        if bucket.last > now {
-            bucket.last = now;
-        }
         let micros = u64::try_from(now.saturating_duration_since(bucket.last).as_micros())
             .unwrap_or(u64::MAX);
         // `as_micros` rather than `as_secs_f64`: the refill has to be monotone
@@ -294,8 +288,8 @@ mod tests {
         assert!(!limiter.try_take(capability), "drained");
         drop(guard);
 
-        // Back on the outer timeline, the last refill is in the future. One
-        // second here still refills one token.
+        // The outer timeline goes on from the nested one's, so no time has
+        // passed. One second here refills one token.
         assert!(!limiter.try_take(capability), "no time has passed yet");
         outer.advance(Duration::from_secs(1));
         assert!(limiter.try_take(capability), "one second refills one token");

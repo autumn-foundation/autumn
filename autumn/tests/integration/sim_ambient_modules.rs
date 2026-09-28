@@ -100,7 +100,7 @@ async fn sim_ambient_modules_idempotency_ttl_runs_on_into_the_next_sim(sim: Sim)
 }
 
 #[sim_test]
-async fn sim_ambient_modules_idempotency_entries_from_a_nested_sim_are_stale(sim: Sim) {
+async fn sim_ambient_modules_idempotency_ttl_runs_on_after_a_nested_sim(sim: Sim) {
     use autumn_web::idempotency::{IdempotencyStore, MemoryIdempotencyStore};
 
     let minute = Duration::from_secs(60);
@@ -109,20 +109,15 @@ async fn sim_ambient_modules_idempotency_entries_from_a_nested_sim_are_stale(sim
     inner.advance(Duration::from_secs(3600)).await;
     store.set("k", idempotency_record(), b"hash".to_vec(), minute);
     assert!(store.try_lock("lock", minute));
-    assert!(store.get("k").is_some(), "fresh on its own timeline");
     drop(inner);
 
-    // Back on the outer timeline, the inner sim's hour is in the future. An
-    // entry that expires more than twice its TTL from now is from another
-    // timeline.
-    assert!(
-        store.get("k").is_none(),
-        "the entry is from another timeline"
-    );
-    assert!(
-        store.try_lock("lock", minute),
-        "the lock is from another timeline"
-    );
+    // The outer sim's instants go on from the nested sim's. The entry and
+    // the lock live out their minute here, and no longer.
+    assert!(store.get("k").is_some(), "inside its TTL");
+    assert!(!store.try_lock("lock", minute), "still held");
+    sim.advance(minute + Duration::from_secs(1)).await;
+    assert!(store.get("k").is_none(), "its TTL ran out");
+    assert!(store.try_lock("lock", minute), "the lock ran out");
 }
 
 #[sim_test]

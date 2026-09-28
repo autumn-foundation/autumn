@@ -472,9 +472,7 @@ impl DirectoryShardRouter {
         {
             let cache = self.cache.read().ok()?;
             match cache.get(key) {
-                Some(entry) if crate::time::ttl_entry_is_fresh(entry.expires_at, now, self.ttl) => {
-                    return Some(entry.shard);
-                }
+                Some(entry) if entry.expires_at > now => return Some(entry.shard),
                 // Miss, or present-but-expired: fall through. `None` is returned
                 // either way; an expired entry is additionally evicted below so a
                 // long-running process doesn't retain every pinned tenant it has
@@ -487,10 +485,7 @@ impl DirectoryShardRouter {
         // the same `now`) so we don't drop a fresh entry written by `cache_put`
         // between releasing the read lock and taking the write lock.
         let mut cache = self.cache.write().ok()?;
-        if cache
-            .get(key)
-            .is_some_and(|entry| !crate::time::ttl_entry_is_fresh(entry.expires_at, now, self.ttl))
-        {
+        if cache.get(key).is_some_and(|entry| entry.expires_at <= now) {
             cache.remove(key);
         }
         None
@@ -503,9 +498,7 @@ impl DirectoryShardRouter {
     fn sweep_expired(&self) {
         if let Ok(mut cache) = self.cache.write() {
             let now = crate::time::ambient_instant();
-            cache.retain(|_, entry| {
-                crate::time::ttl_entry_is_fresh(entry.expires_at, now, self.ttl)
-            });
+            cache.retain(|_, entry| entry.expires_at > now);
         }
     }
 
@@ -689,11 +682,8 @@ impl ShardRuntime {
             .lock()
             .expect("shard runtime lock poisoned");
         let now = crate::time::ambient_instant();
-        // A check time later than `now` is from another timeline: recheck.
-        if checked_at.is_none_or(|at| {
-            now.checked_duration_since(at)
-                .is_none_or(|since| since >= PARITY_RECHECK_INTERVAL)
-        }) {
+        if checked_at.is_none_or(|at| now.saturating_duration_since(at) >= PARITY_RECHECK_INTERVAL)
+        {
             *checked_at = Some(now);
             true
         } else {

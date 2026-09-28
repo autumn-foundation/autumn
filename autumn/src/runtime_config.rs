@@ -1090,9 +1090,7 @@ pub mod pg {
             };
 
             let lookup = match cache.get(key) {
-                Some(cached)
-                    if crate::time::ttl_entry_is_fresh(cached.expires_at, now, self.cache_ttl) =>
-                {
+                Some(cached) if cached.expires_at > now => {
                     CachedRawLookup::Hit(cached.value.clone())
                 }
                 _ => CachedRawLookup::Miss,

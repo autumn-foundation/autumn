@@ -585,6 +585,41 @@ fn ambient_entry() -> Option<(Arc<dyn ClockSource>, Duration, Duration)> {
         .flatten()
 }
 
+thread_local! {
+    /// The latest instant an ambient clock gave out on this thread, as an
+    /// offset after `MONOTONIC_ORIGIN`.
+    static THREAD_LATEST_INSTANT: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(Duration::ZERO) };
+}
+
+/// Keep this thread's instants from going back.
+///
+/// A nested `Sim` starts its instants after the outer one's, and runs ahead.
+/// When it ends, the outer `Sim` would give out instants before the ones the
+/// nested `Sim` gave. Instead the outer clock's floor moves up, so it goes on
+/// from where the nested one stopped. Within one `Sim` the clock never goes
+/// back, so this changes nothing there.
+fn keep_thread_instants_forward(offset: Duration) -> Duration {
+    let latest = THREAD_LATEST_INSTANT
+        .try_with(std::cell::Cell::get)
+        .unwrap_or(Duration::ZERO);
+    let offset = if offset < latest {
+        let behind = latest.saturating_sub(offset);
+        let _ = AMBIENT.try_with(|stack| {
+            if let Ok(mut stack) = stack.try_borrow_mut()
+                && let Some(entry) = stack.last_mut()
+            {
+                entry.floor = entry.floor.saturating_add(behind);
+            }
+        });
+        latest
+    } else {
+        offset
+    };
+    let _ = THREAD_LATEST_INSTANT.try_with(|cell| cell.set(offset));
+    offset
+}
+
 /// Run `read` on the ambient clock, or on [`SystemClock`] when none is set.
 fn with_ambient<T>(read: impl FnOnce(&dyn ClockSource) -> T) -> T {
     match ambient_entry() {
@@ -606,12 +641,14 @@ fn with_ambient<T>(read: impl FnOnce(&dyn ClockSource) -> T) -> T {
 /// [`ambient_instant`] joins the timelines one after the other: a clock
 /// installed later starts its instants at the latest instant already given
 /// out. So state that outlives one `Sim` sees the next one's instants as
-/// later, and its TTLs and idle ages run on. The reverse is not covered: an
-/// outer `Sim` sees the instants a nested `Sim` stored as future ones. Keep
-/// state that stores ambient instants (a cache, a presence map) inside one
-/// `Sim`, and do not share it with a nested `Sim` or with code outside the
-/// sim. Process-global state reads the system clock instead (the global
-/// circuit-breaker registry does).
+/// later, and its TTLs and idle ages run on. After a nested `Sim` ends, the
+/// outer one's instants go on from where the nested one stopped. So on one
+/// thread an ambient instant never goes back, and no instant stored there is
+/// in the future. Instants from code outside the sim, or from a `Sim` on
+/// another thread, are not ordered this way. Do not share state that stores
+/// ambient instants (a cache, a presence map) with those. Process-global
+/// state reads the system clock instead (the global circuit-breaker registry
+/// does).
 ///
 /// Use it where framework code needs a clock but has none in scope. Prefer
 /// the app's injected clock ([`AppState::clock`](crate::state::AppState::clock),
@@ -649,16 +686,17 @@ pub fn ambient_monotonic() -> MonotonicInstant {
 /// Measure with `ambient_instant().saturating_duration_since(start)`, not
 /// `start.elapsed()`: `elapsed` reads the OS clock.
 ///
-/// Under a `Sim`, the instant is the sim's elapsed time after a floor fixed
+/// Under a `Sim`, the instant is the sim's elapsed time after a floor set
 /// when the sim started. The floor is never before an instant given out
-/// earlier, so instants from one `Sim` to the next go forward. See
+/// earlier, so instants from one `Sim` to the next go forward. It moves up
+/// after a nested `Sim` ends, so the outer one's instants do not go back. See
 /// [`AmbientClock`].
 #[must_use]
 pub fn ambient_instant() -> std::time::Instant {
     let offset = match ambient_entry() {
-        Some((clock, floor, start)) => {
-            floor.saturating_add(clock.monotonic().since_origin().saturating_sub(start))
-        }
+        Some((clock, floor, start)) => keep_thread_instants_forward(
+            floor.saturating_add(clock.monotonic().since_origin().saturating_sub(start)),
+        ),
         None => SystemClock.monotonic().since_origin(),
     };
     INSTANT_HIGH_WATER.fetch_max(
@@ -674,22 +712,6 @@ pub fn ambient_instant() -> std::time::Instant {
 /// virtual instant stored there would later be compared with real time.
 pub(crate) fn system_instant() -> std::time::Instant {
     *MONOTONIC_ORIGIN + SystemClock.monotonic().since_origin()
-}
-
-/// Whether a TTL cache entry that expires at `expires_at` is still fresh at
-/// `now`.
-///
-/// An entry expires at most `ttl` after the instant it was stored. `now` may
-/// have been read a little before that instant on another thread: callers
-/// read the clock before they take their lock. So an expiry up to `2 * ttl`
-/// after `now` is fresh. One further out was stored on another timeline (a
-/// nested `Sim` that ran ahead), and counts as stale.
-pub(crate) fn ttl_entry_is_fresh(
-    expires_at: std::time::Instant,
-    now: std::time::Instant,
-    ttl: Duration,
-) -> bool {
-    expires_at > now && expires_at.saturating_duration_since(now) <= ttl.saturating_mul(2)
 }
 
 /// The ambient wall-clock time as a [`std::time::SystemTime`]. Replaces
@@ -965,27 +987,25 @@ mod tests {
     }
 
     #[test]
-    fn a_ttl_entry_from_another_timeline_is_stale() {
-        let now = std::time::Instant::now();
-        let ttl = std::time::Duration::from_secs(60);
-        assert!(ttl_entry_is_fresh(now + ttl, now, ttl));
-        assert!(!ttl_entry_is_fresh(now, now, ttl), "expired");
-        assert!(
-            !ttl_entry_is_fresh(now + ttl * 10, now, ttl),
-            "an expiry far past now + ttl was stored on a later timeline"
-        );
-    }
+    fn an_outer_timeline_goes_on_after_a_nested_one() {
+        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let hour = std::time::Duration::from_secs(3600);
+        let outer = TickingClock::starting_at(epoch);
+        let _outer = install_ambient(Arc::new(outer.clone()));
+        let before = ambient_instant();
 
-    #[test]
-    fn a_ttl_entry_stored_just_after_now_is_fresh() {
-        // Another thread read `now`, then lost the race for the lock to a
-        // thread that stored its entry a moment later. That entry is live.
-        let now = std::time::Instant::now();
-        let ttl = std::time::Duration::from_secs(1);
-        let stored_at = now + std::time::Duration::from_millis(5);
-        assert!(ttl_entry_is_fresh(stored_at + ttl, now, ttl));
-        assert!(ttl_entry_is_fresh(now + ttl * 2, now, ttl));
-        assert!(!ttl_entry_is_fresh(now + ttl * 3, now, ttl));
+        let inner = TickingClock::starting_at(epoch);
+        let guard = install_ambient(Arc::new(inner.clone()));
+        inner.advance(hour);
+        let stored = ambient_instant();
+        assert!(stored.saturating_duration_since(before) >= hour);
+        drop(guard);
+
+        // Back on the outer clock, instants go on from the nested one's.
+        let back = ambient_instant();
+        assert!(back >= stored, "the outer timeline does not go back");
+        outer.advance(hour);
+        assert_eq!(ambient_instant().saturating_duration_since(back), hour);
     }
 
     #[test]
