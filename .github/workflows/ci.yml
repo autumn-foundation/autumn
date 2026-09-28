@@ -117,7 +117,7 @@ jobs:
         # check-panic-gate.sh verifies every gated module's feature is covered by an
         # enforcing CI clippy lane, so a feature dropped from here silently disarms
         # that module's deny block.
-        run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,collab,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme" --all-targets -- -D warnings
+        run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,collab,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme,i18n,presence" --all-targets -- -D warnings
       - name: Clippy (autumn-web, plugin-sandbox — panic gate)
         # `plugin-sandbox` (#1609) is not a default feature, so neither Clippy run
         # above compiles `plugin_sandbox`'s request-path modules and their
@@ -838,7 +838,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
-      - uses: taiki-e/install-action@v2.87.5
+      - uses: taiki-e/install-action@v2.87.11
         with:
           tool: cargo-deny@0.20.2
       # Advisories go through the shared gate (issue #1600) so PR CI, the
@@ -983,7 +983,16 @@ jobs:
         # The root cause is the tests' sensitivity to contention, which this
         # only sidesteps; making them robust under an oversubscribed pool is
         # worth its own issue.
+        #
+        # The liveness watchdog is armed here (issue #2967): a deadlocked
+        # `#[sim_test]` fails with its seed instead of hanging the job. It is
+        # safe only at `--test-threads=1`, because the paused clock also
+        # advances while a test waits on a lock another test thread holds. The
+        # budget is virtual time, so two years costs nothing and stays far
+        # above the longest `advance` in the suite (about two months).
         shell: bash
+        env:
+          AUTUMN_SIM_LIVENESS_BUDGET_SECS: "63072000"
         run: |
           set -euo pipefail
           cargo test --workspace -- sim_ --test-threads=1 | tee "${RUNNER_TEMP}/sim.log"
@@ -1692,31 +1701,7 @@ jobs:
             --skip serve_daemon_start_status_stop_over_unix_socket \
             --skip scaffolded_json_field_generates_compiles_inserts_and_selects \
             --skip scrubbed_database_migrates_clean_and_boots_the_app \
-            --skip documented_scaffold_example_builds_without_warnings \
-            --skip offsite_backup_upload_then_restore_round_trips \
-            --skip offsite_backup_uploads_large_artifact_via_multipart
-          # `offsite_backup_upload_then_restore_round_trips` and
-          # `offsite_backup_uploads_large_artifact_via_multipart` ARE Docker
-          # tests, quarantined here rather than left to fail in the sweep
-          # (2026-09-25, see docs/ci-health/quarantine-ledger.md's
-          # `quay.io/minio/minio` entry): `quay.io/minio/minio` — the fallback
-          # this repo switched to in #2740 after Docker Hub deleted the
-          # `minio/minio` org — now also rejects anonymous pulls (confirmed
-          # directly: an anonymous `quay.io/v2/auth` token for this repo comes
-          # back with `"actions":[]`, and a manifest GET with that token 401s,
-          # while the identical probe against `quay.io/prometheus/prometheus`
-          # succeeds — this is scoped to `minio/minio`, not a quay.io-wide
-          # outage). Total and deterministic, not a flake: 5/5 sampled
-          # `Test (Docker)` failures across independent PRs in the ~12h before
-          # this quarantine, plus this repo's own trunk-dev push, all hit this
-          # identical signature. No anonymously-pullable MinIO-compatible
-          # mirror was found to swap to (Docker Hub's `bitnami/minio` lists as
-          # active but currently serves zero pullable tags; `ghcr.io/minio/minio`
-          # also 401s) and swapping registries again without a Docker daemon to
-          # verify compatibility risks repeating the multi-PR collision the
-          # first registry swap caused — see the ledger entry for the human
-          # decision this needs (host a mirror, or pay for authenticated
-          # `quay.io` pulls) before restoring these two.
+            --skip documented_scaffold_example_builds_without_warnings
           # Consolidated `integration_tests` binary: discover-and-run ALL the
           # Docker/testcontainer `#[ignore]`d DB tests instead of a hand-curated
           # per-feature allowlist (#1923). Enabling `test-support` (testcontainers)
@@ -1778,13 +1763,7 @@ jobs:
             --ignored \
             --test-threads=1 \
             --skip per_request_overhead_is_under_50_microseconds_p99 \
-            --skip capture_overhead_on_a_successful_query_request \
-            --skip replicates_to_and_restores_from_a_real_s3_endpoint
-          # `replicates_to_and_restores_from_a_real_s3_endpoint` IS a Docker
-          # test, quarantined here for the same `quay.io/minio/minio`
-          # anonymous-pull outage as the two `offsite_backup` tests skipped in
-          # the `cli_tests` sweep above — see that skip's comment and
-          # docs/ci-health/quarantine-ledger.md for the full diagnosis.
+            --skip capture_overhead_on_a_successful_query_request
           # AC-7 deploy end-to-end (#1607, Slice 4): drives the real `autumn
           # deploy up`/`rollback` over ssh/scp against a privileged systemd
           # container (first deploy, zero-downtime redeploy, on-demand rollback,
@@ -1955,7 +1934,7 @@ jobs:
         # Pin @v2 and pass the tool explicitly. The bare @cargo-llvm-cov tag form can
         # resolve with an empty tool input and install nothing (broke the Fuzz
         # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
-        uses: taiki-e/install-action@v2.87.5
+        uses: taiki-e/install-action@v2.87.11
         with:
           tool: cargo-llvm-cov
       - name: Generate coverage (workspace catch-all)
@@ -2268,6 +2247,7 @@ jobs:
             --test sqlite_derivation \
             --test sqlite_money_ledger \
             --test sqlite_dependent_destroy \
+            --test sqlite_commentable \
             --test sqlite_tracked_sessions \
             --test sqlite_commit_hook_worker \
             --test sqlite_framework_migrations \
@@ -2465,21 +2445,26 @@ jobs:
       RUSTFLAGS: "-Clink-arg=/DEBUG:LongSymbolTruncate"
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install the scaffold's pinned toolchain
-        # The generated app's `rust-toolchain.toml` pins the workspace
-        # `rust-version` (the scaffold reads it from `CARGO_PKG_RUST_VERSION`)
-        # with rustfmt and clippy. Left to rustup's shim, the first tool the
-        # journey runs inside the app installs that toolchain on demand, and a
-        # half-finished install breaks the next `cargo build` (#1633). This job
-        # hit it twice in a row: once without `cargo.exe`, once without the
-        # target's `std`. Installing it up front keeps the journey off that
-        # path. `stable` stays the default for building the CLI.
-        run: |
-          $msrv = (Select-String -Path Cargo.toml -Pattern '^rust-version = "(.+)"').Matches[0].Groups[1].Value
-          if (-not $msrv) { throw "no rust-version in the workspace Cargo.toml" }
-          rustup toolchain install $msrv --profile minimal --component rustfmt,clippy
-          if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install $msrv failed with $LASTEXITCODE" }
+      # Pinned to the exact MSRV, not `@stable` (2026-09-28 finding, 🚦
+      # Semaphore): every scaffolded app's `rust-toolchain.toml` pins
+      # `channel = "1.88.0"` literally (autumn-cli/src/templates/rust-toolchain.toml.tmpl,
+      # rendered from Cargo.toml's `rust-version`), a DIFFERENT rustup toolchain
+      # name than "stable". When this job only installed `@stable`, the first
+      # `cargo`/`autumn` invocation inside the scaffolded `tier1_app` directory
+      # (during `autumn setup`, which shells out to `cargo metadata`) made
+      # rustup auto-install the separate "1.88.0-x86_64-pc-windows-msvc"
+      # toolchain on the fly. That on-demand install intermittently left a
+      # non-functional `cargo` component behind, failing every later `cargo`
+      # invocation in the job with `"the 'cargo.exe' binary, normally provided
+      # by the 'cargo' component, is not applicable to the '1.88.0-x86_64-pc-windows-msvc'
+      # toolchain"` — a rustup error, not an autumn/CLI defect. Confirmed by
+      # log content on 4 organic occurrences (runs 108204416273, 108534929493,
+      # 108821476268, 108842089677), all identical, all resolved once the
+      # `read_cargo_metadata` stderr fix (#2973) made the underlying rustup
+      # error visible. Installing the exact MSRV toolchain up front — the same
+      # thing the `msrv` job below already does — removes the on-demand
+      # install path entirely, so there is nothing left to race.
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
 
