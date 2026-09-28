@@ -1638,6 +1638,18 @@ mod contract_tests {
         )
         .unwrap();
         assert_eq!(locked_autumn_web(&app, None).as_deref(), Some("0.7.1"));
+        // Two edges from one package (an alias) cannot be told apart.
+        std::fs::write(
+            tmp.path().join("Cargo.lock"),
+            format!(
+                "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\"autumn-web 0.7.1\", \"autumn-web 0.6.0\"]\n\n{}{}",
+                pkg("0.7.1"),
+                pkg("0.6.0")
+            ),
+        )
+        .unwrap();
+        assert_eq!(locked_autumn_web(&app, None), None);
     }
 
     /// An omitted raw router fails the report, even when the listed routes

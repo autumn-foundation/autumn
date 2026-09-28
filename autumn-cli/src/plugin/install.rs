@@ -437,16 +437,21 @@ pub fn locked_dependency_of(dir: &Path, package: &str, crate_name: &str) -> Opti
     if owners.next().is_some() {
         return None;
     }
-    // An edge is `name`, or `name version` when the lock holds several.
-    let edge = owner
+    // An edge is `name`, or `name version` when the lock holds several. Two
+    // edges (a renamed alias, target-specific copies) cannot be told apart.
+    let mut edges = owner
         .get("dependencies")?
         .as_array()?
         .iter()
         .filter_map(toml::Value::as_str)
         .map(str::split_whitespace)
-        .find_map(|mut parts| {
+        .filter_map(|mut parts| {
             (canonical(parts.next()?) == canonical(crate_name)).then(|| parts.next())
-        })?;
+        });
+    let edge = edges.next()?;
+    if edges.next().is_some() {
+        return None;
+    }
     if let Some(version) = edge {
         return Some(version.to_owned());
     }
@@ -639,12 +644,31 @@ fn crates_io_patch(
         .map(|(source, _)| source.clone())
 }
 
-/// The `[package] version` of the crate at `dir`, when it is written there
-/// (not inherited from a workspace).
+/// The `[package] version` of the crate at `dir`, read from its workspace
+/// root's `[workspace.package]` when it is `version.workspace = true`.
 fn package_version(dir: &Path) -> Option<semver::Version> {
-    let text = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
-    let table = toml::from_str::<toml::Table>(&text).ok()?;
-    semver::Version::parse(table.get("package")?.get("version")?.as_str()?).ok()
+    let read = |path: &Path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+    };
+    let version = read(&dir.join("Cargo.toml"))?
+        .get("package")?
+        .get("version")?
+        .clone();
+    let version = match version {
+        toml::Value::String(version) => version,
+        inherited if inherited.get("workspace").and_then(toml::Value::as_bool) == Some(true) => {
+            read(&workspace_root(dir).join("Cargo.toml"))?
+                .get("workspace")?
+                .get("package")?
+                .get("version")?
+                .as_str()?
+                .to_owned()
+        }
+        _ => return None,
+    };
+    semver::Version::parse(&version).ok()
 }
 
 /// Whether a `[patch.<source>]` key names crates.io: its name, its git
@@ -1348,6 +1372,28 @@ mod tests {
         assert!(patched_by_in(&app, "autumn-plugin-x", "=0.2.5", None).is_some());
         checkout("0.2.0");
         assert_eq!(patched_by_in(&app, "autumn-plugin-x", "=0.2.5", None), None);
+    }
+
+    /// A checkout that inherits its version reads it from its workspace root.
+    #[test]
+    fn a_path_patch_reads_an_inherited_checkout_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app");
+        write(
+            &tmp.path().join("plugins/Cargo.toml"),
+            "[workspace]\nmembers = [\"x\"]\n\n[workspace.package]\nversion = \"0.2.0\"\n",
+        );
+        write(
+            &tmp.path().join("plugins/x/Cargo.toml"),
+            "[package]\nname = \"autumn-plugin-x\"\nversion.workspace = true\n",
+        );
+        write(
+            &app.join("Cargo.toml"),
+            "[package]\nname = \"a\"\n\n[patch.crates-io]\n\
+             autumn-plugin-x = { path = \"../plugins/x\" }\n",
+        );
+        assert_eq!(patched_by_in(&app, "autumn-plugin-x", "=0.2.5", None), None);
+        assert!(patched_by_in(&app, "autumn-plugin-x", "=0.2.0", None).is_some());
     }
 
     /// A `[replace]` key names one version: another version's replacement
