@@ -878,16 +878,22 @@ fn git_source(entry: &toml::Value) -> Option<FrameworkSource> {
     Some(FrameworkSource::Git { url, reference })
 }
 
-/// The sources crates.io patches of `autumn-web` point at, from the
-/// workspace root manifest and every applicable config.
+/// The sources the crates.io patches of `autumn-web` that Cargo applies
+/// point at. Cargo takes one patch for a crate: a nearer config overrides an
+/// ancestor's and `$CARGO_HOME`'s, and any config overrides the workspace
+/// manifest. So only the first file, in that order, that patches it counts;
+/// a patch it overrides unifies nothing.
 fn framework_patch_sources(root: &Path) -> Vec<FrameworkSource> {
     let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
     let workspace = workspace_root(&root);
-    let mut files = vec![(workspace.join("Cargo.toml"), workspace)];
-    files.extend(config_files(&root, cargo_home().as_deref()));
+    let mut files = config_files(&root, cargo_home().as_deref());
+    files.push((workspace.join("Cargo.toml"), workspace));
     let want = canonical("autumn-web");
     let mut dirs = Vec::new();
     for (file, base) in files {
+        if !dirs.is_empty() {
+            break;
+        }
         let Some(table) = std::fs::read_to_string(&file)
             .ok()
             .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
@@ -2401,6 +2407,34 @@ maud = { version = "0.27", features = ["axum"] }
         );
         assert!(!unpatched_local_framework(tmp.path()));
         assert!(plan_add(tmp.path(), admin(), "0.7.0").is_ok());
+    }
+
+    /// Cargo applies one patch per crate: a config overrides the manifest
+    /// (and a nearer config an ancestor's). A patch to the app's checkout
+    /// that another overrides does not unify the framework.
+    #[test]
+    fn an_overridden_framework_patch_does_not_count() {
+        let cargo = |patch: &str| {
+            format!(
+                "[package]\nname = \"demo\"\n\n\
+                 [dependencies]\nautumn-web = {{ path = \"autumn\" }}\n\n\
+                 [patch.crates-io]\nautumn-web = {{ path = \"{patch}\" }}\n"
+            )
+        };
+        let config = |tmp: &tempfile::TempDir, patch: &str| {
+            write(
+                &tmp.path().join(".cargo/config.toml"),
+                &format!("[patch.crates-io]\nautumn-web = {{ path = \"{patch}\" }}\n"),
+            );
+        };
+        // The manifest patches to the app's checkout, but the config wins.
+        let overridden = fake_project(SCAFFOLD_MAIN, &cargo("autumn"));
+        config(&overridden, "other");
+        assert!(unpatched_local_framework(overridden.path()));
+        // The config patches to the app's checkout over another manifest patch.
+        let effective = fake_project(SCAFFOLD_MAIN, &cargo("other"));
+        config(&effective, "autumn");
+        assert!(!unpatched_local_framework(effective.path()));
     }
 
     /// With no declared or locked version, a first-party install reads the
