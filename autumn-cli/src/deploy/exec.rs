@@ -2941,6 +2941,69 @@ pub fn probe_rollback_target_dir(
     probe_dir_state("probe-rollback-target", release_dir, exec)
 }
 
+/// Sentinel [`retry_drain_old`] prints when the old slot unit is stopped and
+/// disabled.
+const OLD_SLOT_STOPPED: &str = "stopped";
+
+/// Sentinel [`retry_drain_old`] prints for all other unit states.
+const OLD_SLOT_NOT_STOPPED: &str = "not-stopped";
+
+/// The state of the old slot unit after [`retry_drain_old`] (issue #2279).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OldSlotState {
+    /// The unit is loaded, `inactive` or `failed`, and `disabled`. No old process
+    /// runs, and none starts at boot.
+    Stopped,
+    /// The unit can run now or at boot (`active`, `deactivating`, `enabled`, …).
+    NotStopped,
+    /// The output is not a known sentinel. This proves nothing.
+    Unreadable,
+}
+
+/// Retry a failed `drain-old` one time, then read the old slot unit (issue
+/// #2279).
+///
+/// The old slot runs job workers and the scheduler. If it runs, work runs two
+/// times. The check reads each property with its own `systemctl show`, because
+/// one call does not keep the order of the properties:
+///
+/// - `LoadState=loaded`: a unit that is not found also shows `inactive`.
+/// - `ActiveState` is `inactive` or `failed`: `is-active` is false while the
+///   unit is `deactivating`.
+/// - `UnitFileState=disabled`: an enabled unit starts again at boot.
+///
+/// # Errors
+///
+/// Returns the executor's error if the command cannot run.
+pub fn retry_drain_old(
+    cfg: &ResolvedDeployConfig,
+    live_slot: &str,
+    exec: &impl DeployExecutor,
+) -> Result<OldSlotState, DeployExecError> {
+    let unit = shell_quote(&format!(
+        "{}.service",
+        slot_unit_name(&cfg.service_name, live_slot)
+    ));
+    let shell = format!(
+        "unit={unit}; \
+         systemctl disable --now \"$unit\" >/dev/null 2>&1; \
+         state=\"$(systemctl show --property=LoadState \"$unit\" 2>/dev/null) \
+         $(systemctl show --property=ActiveState \"$unit\" 2>/dev/null) \
+         $(systemctl show --property=UnitFileState \"$unit\" 2>/dev/null)\"; \
+         case \"$state\" in \
+         'LoadState=loaded ActiveState=inactive UnitFileState=disabled'|\
+         'LoadState=loaded ActiveState=failed UnitFileState=disabled') \
+         printf '%s' '{OLD_SLOT_STOPPED}' ;; \
+         *) printf '%s' '{OLD_SLOT_NOT_STOPPED}' ;; esac"
+    );
+    let out = exec.run(&RemoteCommand::new("drain-old-retry", shell))?;
+    Ok(match out.stdout.trim() {
+        OLD_SLOT_STOPPED => OldSlotState::Stopped,
+        OLD_SLOT_NOT_STOPPED => OldSlotState::NotStopped,
+        _ => OldSlotState::Unreadable,
+    })
+}
+
 /// The shared read-only `[ -d … ]` directory probe behind [`probe_release_dir`] and
 /// [`probe_rollback_target_dir`]: two printf sentinels, nothing else, and any other
 /// capture fails closed to [`ReleaseDirState::Unreadable`] (an empty capture is the
@@ -3806,14 +3869,17 @@ pub(crate) mod test_support {
     /// rollout — the structure cross-host ordering assertions read.
     pub(crate) type FleetTape = Rc<RefCell<Vec<(String, RecordedCall)>>>;
 
-    /// Command labels whose **stdout is parsed** by the caller, i.e. the read-only
-    /// probes. An unscripted probe is the single most dangerous silent hole in this
+    /// Command labels whose **stdout is parsed** by the caller: the read-only
+    /// probes, and `drain-old-retry`, which also mutates. Do not use this list as
+    /// a read-only allowlist.
+    ///
+    /// An unscripted probe is the single most dangerous silent hole in this
     /// fake: `run` returns `Ok` with EMPTY stdout for anything unscripted, and
     /// [`super::probe_deploy_state`] reads an empty section as
     /// [`super::DeployMode::First`] / `Absent`. A fleet test that forgets to script
     /// host N's probe would therefore exercise the first-deploy branch and still
     /// pass. [`RecordingExecutor::strict`] turns that into a loud panic.
-    pub(crate) const PROBE_LABELS: [&str; 7] = [
+    pub(crate) const PROBE_LABELS: [&str; 8] = [
         "proxy-compat-probe",
         "detect-current",
         "probe-release-dir",
@@ -3824,6 +3890,8 @@ pub(crate) mod test_support {
         // the running unit polls. Unscripted, it reads as "the unit could not be
         // read" and the fan-out would fail closed for the wrong reason.
         "detect-maintenance-flag",
+        // #2279: the fleet parses this one to decide if the old slot stopped.
+        "drain-old-retry",
     ];
 
     /// One recorded executor call. Uploads carry no local path: op building is
@@ -6444,6 +6512,54 @@ mod tests {
             probe_rollback_target_dir(previous, &garbled).unwrap(),
             ReleaseDirState::Unreadable,
             "an unexpected capture must fail closed, never degrade to Present"
+        );
+    }
+
+    #[test]
+    fn retry_drain_old_retries_once_and_reads_the_old_unit_state() {
+        // #2279: after a failed `drain-old`, try the stop again one time. Then
+        // read the old unit. Only a known sentinel shows the state.
+        let cfg = resolved();
+        let stopped = RecordingExecutor::new().with_stdout("drain-old-retry", "stopped\n");
+        assert_eq!(
+            retry_drain_old(&cfg, SLOT_BLUE, &stopped).unwrap(),
+            OldSlotState::Stopped,
+        );
+        let shell = stopped.shell_for("drain-old-retry").expect("retry ran");
+        assert_eq!(
+            shell,
+            "unit='myapp-blue.service'; \
+             systemctl disable --now \"$unit\" >/dev/null 2>&1; \
+             state=\"$(systemctl show --property=LoadState \"$unit\" 2>/dev/null) \
+             $(systemctl show --property=ActiveState \"$unit\" 2>/dev/null) \
+             $(systemctl show --property=UnitFileState \"$unit\" 2>/dev/null)\"; \
+             case \"$state\" in \
+             'LoadState=loaded ActiveState=inactive UnitFileState=disabled'|\
+             'LoadState=loaded ActiveState=failed UnitFileState=disabled') \
+             printf '%s' 'stopped' ;; \
+             *) printf '%s' 'not-stopped' ;; esac",
+            "retry the same stop, then read each property on its own line. \
+             `is-active` is false while the unit is `deactivating`. An enabled unit \
+             starts again at boot. A unit that is not found proves nothing.",
+        );
+        assert_eq!(stopped.run_labels(), vec!["drain-old-retry"]);
+
+        let not_stopped = RecordingExecutor::new().with_stdout("drain-old-retry", "not-stopped");
+        assert_eq!(
+            retry_drain_old(&cfg, SLOT_BLUE, &not_stopped).unwrap(),
+            OldSlotState::NotStopped,
+        );
+        for garbled in ["", "bash: -c: line 0", "stopped extra"] {
+            let exec = RecordingExecutor::new().with_stdout("drain-old-retry", garbled);
+            assert_eq!(
+                retry_drain_old(&cfg, SLOT_BLUE, &exec).unwrap(),
+                OldSlotState::Unreadable,
+                "output {garbled:?} proves nothing, so it must not read as stopped",
+            );
+        }
+        assert!(
+            test_support::PROBE_LABELS.contains(&"drain-old-retry"),
+            "the caller parses its stdout, so a strict fake must require a script"
         );
     }
 
