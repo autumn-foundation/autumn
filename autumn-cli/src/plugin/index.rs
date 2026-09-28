@@ -1018,8 +1018,9 @@ mod tests {
             let listing = index
                 .get(entry.crate_name)
                 .unwrap_or_else(|| panic!("{} has no listing", entry.crate_name));
+            // Any status: `record` may commit a failed re-verification as
+            // `incompatible` or `delisted`, and the gate above judges that.
             assert_eq!(listing.origin, ListingOrigin::FirstParty);
-            assert_eq!(listing.status, Status::Listed, "{}", entry.crate_name);
             assert_eq!(
                 listing.description, entry.summary,
                 "{} description drifted from the catalog",

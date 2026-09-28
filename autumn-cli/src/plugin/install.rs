@@ -374,17 +374,20 @@ pub fn workspace_root(dir: &Path) -> PathBuf {
                 return false;
             };
             // An excluded package is its own workspace; Cargo looks further up.
+            // An explicit `members` entry wins over `exclude`, as in Cargo's
+            // `is_excluded`: both are path prefixes, not globs.
             let relative = dir.strip_prefix(d).unwrap_or(&dir);
-            let excluded = workspace
-                .get("exclude")
-                .and_then(toml::Value::as_array)
-                .is_some_and(|paths| {
-                    paths
-                        .iter()
-                        .filter_map(toml::Value::as_str)
-                        .any(|path| relative.starts_with(Path::new(path.trim_start_matches("./"))))
-                });
-            !excluded
+            let listed = |key: &str| {
+                workspace
+                    .get(key)
+                    .and_then(toml::Value::as_array)
+                    .is_some_and(|paths| {
+                        paths.iter().filter_map(toml::Value::as_str).any(|path| {
+                            relative.starts_with(Path::new(path.trim_start_matches("./")))
+                        })
+                    })
+            };
+            !listed("exclude") || listed("members")
         })
         .map_or_else(|| dir.clone(), Path::to_path_buf)
 }
@@ -1127,6 +1130,20 @@ mod tests {
             app_autumn_web(&app),
             Ok(AppAutumnWeb::Version(v)) if v == "0.7"
         ));
+    }
+
+    /// An explicit member under an `exclude` prefix is still a member.
+    #[test]
+    fn an_explicit_member_wins_over_an_exclusion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::path::absolute(tmp.path()).unwrap();
+        let app = root.join("crates").join("app");
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\"]\nexclude = [\"crates\"]\n",
+        );
+        write(&app.join("Cargo.toml"), "[package]\nname = \"app\"\n");
+        assert_eq!(workspace_root(&app), root);
     }
 
     /// A package an ancestor workspace excludes is its own root.
