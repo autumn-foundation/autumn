@@ -308,6 +308,29 @@ fn a_skipped_local_day_keeps_the_day_before() {
 }
 
 #[test]
+fn a_skipped_local_day_has_no_working_time() {
+    // Samoa skipped Friday 2011-12-30. Its window must not move onto
+    // Saturday and count two times.
+    let apia: Tz = "Pacific/Apia".parse().unwrap();
+    let hours = "09:00-17:00".parse().unwrap();
+    let cal = BusinessCalendar::weekdays(hours).hours(Weekday::Sat, hours);
+    let start = apia
+        .with_ymd_and_hms(2011, 12, 29, 0, 0, 0)
+        .unwrap()
+        .with_timezone(&Utc);
+    let end = apia
+        .with_ymd_and_hms(2012, 1, 1, 0, 0, 0)
+        .unwrap()
+        .with_timezone(&Utc);
+    // Thursday 8h and Saturday 8h.
+    assert_eq!(cal.working_time(start, end, apia), 16 * HOUR);
+    let due = cal.deadline(start, 12 * HOUR, apia).unwrap();
+    let saturday_1pm = apia.with_ymd_and_hms(2011, 12, 31, 13, 0, 0).unwrap();
+    assert_eq!(due, saturday_1pm.with_timezone(&Utc));
+    assert_eq!(cal.working_time(start, due, apia), 12 * HOUR);
+}
+
+#[test]
 fn a_window_that_opens_in_a_dst_gap_moves_forward() {
     let ny: Tz = "America/New_York".parse().unwrap();
     // 2024-03-10 is a Sunday; 02:00-03:00 does not exist.

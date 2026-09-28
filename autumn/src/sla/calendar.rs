@@ -318,11 +318,16 @@ impl BusinessCalendar {
         self.windows
             .get(day_index(date.weekday()))
             .map(|windows| {
+                // A window stays inside its own local date. On a skipped
+                // date (a whole-day gap) every window moves past the end of
+                // the date, so the date has no working time.
+                let day_end = local_instant(date, DAY_SECS, zone);
                 let resolved: Vec<_> = windows
                     .iter()
                     .filter_map(|w| {
                         let start = local_instant(date, w.open, zone)?;
                         let end = local_instant(date, w.close, zone)?;
+                        let end = day_end.map_or(end, |day_end| end.min(day_end));
                         (end > start).then_some((start, end))
                     })
                     .collect();
