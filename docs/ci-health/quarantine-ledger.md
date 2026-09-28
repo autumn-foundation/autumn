@@ -2308,6 +2308,21 @@ without also filling in the intake form above.
   address the new line-567 signature above regardless (different assertion
   entirely). Track it against the rerun campaign above before treating this
   entry as resolved — "merged" is not the same as "verified."
+- **2026-09-28 update — another organic hit, same tracked line-686
+  signature, `Coverage (workspace)`/Linux.** Run 36393954592
+  (`claude/busy-cerf-qydnb2`, PR #2987, job id 108869635633, completed
+  2026-09-28T09:46:33Z): `test result: FAILED. 5 passed; 1 failed` in
+  `live_upgrade.rs`, panic at
+  `examples/hot-upgrade/tests/live_upgrade.rs:686:5` (the exact site
+  already tracked above, run through `MultiThread::block_on` this time —
+  the triggering PR's own commit switched an unrelated test,
+  `search_plugin_integration`, to a multi-thread runtime to fix a
+  different, already-diagnosed deadlock; `live_upgrade`'s own harness was
+  untouched by that PR and this is a coincidental same-day neighbor, not a
+  side effect of that fix). Not campaigned this pass (still no
+  CI-native rerun harness dispatched for this signature — same gap the
+  2026-09-10 update above already named). Recorded as a data point only;
+  no new mechanism claim beyond what is already tracked.
 
 ### `cache_stampede::swr_serves_stale_and_refreshes_in_background`
 
@@ -2596,4 +2611,85 @@ measured fix, and verification; not repeated here.
   lands directly in this ledger's own tracking PR, per this repo's
   established convention for a diagnosability gap found mid-triage.
 - **Skip mechanism**: none — this is a tracked signature, not a quarantine.
+- **2026-09-28 update — mechanism confirmed, n=2→n=4, fix applied this
+  pass.** The stderr fix (#2973, merged 2026-09-27) paid off immediately:
+  two more organic occurrences, run 108821476268
+  (`vesper/bugbash-2662-parent-pk-override`, 2026-09-28T07:08:33Z) and run
+  108842089677 (`vesper/bugbash-2445-capacity-probe-count`,
+  2026-09-28T08:18:57Z), ~70 minutes apart on two unrelated branches, both
+  now show the actual `cargo` error the generic message was hiding:
+  ```
+  ✗ Failed to read cargo metadata
+  error: the 'cargo.exe' binary, normally provided by the 'cargo' component, is not applicable to the '1.88.0-x86_64-pc-windows-msvc' toolchain
+  ```
+  Identical text both times.
+
+  **Mechanism, confirmed by source, not just the error string.** Every
+  scaffolded app's `rust-toolchain.toml` pins `channel = "1.88.0"`
+  literally — `autumn-cli/src/templates/rust-toolchain.toml.tmpl`:
+  `channel = "{{rust_version}}"`, substituted from `Cargo.toml`'s
+  `rust-version = "1.88.0"` (`autumn-cli/src/new.rs:227`,
+  `option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0")`) — a
+  *different* rustup toolchain identity than `"stable"`. The
+  `windows-tier1` job's own toolchain-install step
+  (`.github/workflows/ci.yml`, before this pass's fix) was
+  `dtolnay/rust-toolchain@stable`, which installs and names the toolchain
+  `stable-x86_64-pc-windows-msvc`, not `1.88.0-x86_64-pc-windows-msvc` —
+  even though `stable` currently resolves to rustc 1.88.0 (confirmed by
+  both failing runs' own `autumn doctor` output immediately above the
+  failure: `"rust_toolchain"` check passes with `"rustc 1.88.0 ≥ MSRV
+  1.88.0"`), rustup treats them as two distinct named toolchains. The
+  first `cargo`/`autumn` invocation inside the freshly-scaffolded
+  `tier1_app` directory (`autumn setup`, which shells out to `cargo
+  metadata` per `autumn-cli/src/build.rs:875`'s `read_cargo_metadata`) hits
+  that directory's `rust-toolchain.toml` override and makes rustup
+  auto-install the separate `1.88.0-x86_64-pc-windows-msvc` toolchain on
+  the fly — a network operation happening implicitly mid-command, with no
+  dedicated CI step, no retry, and no log visibility of its own. The `msrv`
+  job elsewhere in `ci.yml` avoids exactly this by installing
+  `dtolnay/rust-toolchain@1.88.0` directly; `windows-tier1` never did.
+  `"cargo.exe binary... not applicable to the toolchain"` is a known
+  rustup failure shape for a toolchain whose on-disk contents don't match
+  what its manifest claims — consistent with an on-demand install that
+  raced or partially completed under the same job that is simultaneously
+  building the full `autumn-web`/`managed-pg-bundled` dependency graph
+  (the LNK4318/PDB-limit comments already in this job's `env:` block
+  describe how resource-constrained this exact job already runs).
+
+  **Test-vs-product verdict: CI/build infrastructure, not a product or
+  test defect.** Nothing about `autumn setup`'s own logic, the scaffold's
+  generated `rust-toolchain.toml`, or the app it builds is wrong — pinning
+  the exact MSRV in every scaffolded project is deliberate, correct
+  behavior (the same file the `rust_toolchain_pins_channel_to_msrv` unit
+  test in `autumn-cli/src/new.rs` guards). The defect is entirely in this
+  one CI job's own toolchain provisioning: it installs `stable` for
+  itself and then lets a *different* pinned toolchain get resolved
+  implicitly, mid-journey, with no explicit install step.
+
+  **Fix, applied this pass**: `windows-tier1`'s toolchain step changed from
+  `dtolnay/rust-toolchain@stable` to `dtolnay/rust-toolchain@1.88.0` —
+  installing the exact toolchain the scaffolded app's own
+  `rust-toolchain.toml` will later request, so rustup never needs to
+  auto-install anything once the journey begins. This mirrors the `msrv`
+  job's own existing pattern one line above it in the same file, not a new
+  convention. No retry, no timeout change, no tolerance widened — the
+  on-demand install path is removed rather than made more forgiving.
+  Comment added at the change site records this diagnosis and the four
+  run IDs for the next person who touches this job.
+  **Verification**: `python3 -c "import yaml; yaml.safe_load(...)"`
+  confirms the edited `ci.yml` is still valid YAML; `actionlint` was not
+  available in this sandbox. No Windows runner available locally to
+  reproduce the original failure or to pre-verify the fix — **CI-native
+  verification is pending this PR's own `Windows Tier 1 journey` run**,
+  the same posture already used for the `postgresql_embedded`
+  `GITHUB_TOKEN` entry above. Revert check: not applicable in the rerun
+  sense (nothing about the scaffolded app's behavior changes on the
+  success path), but reverting the toolchain-pin edit would restore the
+  exact on-demand-install path all four occurrences hit.
+  **Status**: n=4 organic, mechanism confirmed by source + stderr, fix
+  applied, CI-native confirmation pending this PR's own Windows run. Not
+  quarantined — the job runs unchanged otherwise. Revisit once this PR's
+  own `Windows Tier 1 journey` run completes (pass confirms the fix;
+  another identical failure on this PR's own head would falsify the
+  diagnosis) or after a further ~1 week with zero repeats.
 
