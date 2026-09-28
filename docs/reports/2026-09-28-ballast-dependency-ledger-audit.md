@@ -341,9 +341,9 @@ cargo deny list --format json
 cargo metadata --format-version 1 --no-deps   # direct-dependency count
 
 # scheduled-batch check — never --workspace (always reports 0 in this repo)
-cargo update --dry-run --verbose | grep Locking
-(cd fuzz && cargo update --dry-run --verbose | grep Locking)
-(cd examples/island-flock && cargo update --dry-run --verbose | grep Locking)
+cargo update --dry-run --verbose 2>&1 | grep Locking
+(cd fuzz && cargo update --dry-run --verbose 2>&1 | grep Locking)
+(cd examples/island-flock && cargo update --dry-run --verbose 2>&1 | grep Locking)
 
 # waiver spot-checks
 cargo info rsa
