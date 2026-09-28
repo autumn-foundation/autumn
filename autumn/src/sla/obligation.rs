@@ -160,13 +160,14 @@ impl Obligation {
             ObligationState::Breached
         } else if met_at.is_some() {
             ObligationState::Met
-        } else if calendar.is_working(now, zone) {
+        } else if now >= started_at && calendar.is_working(now, zone) {
             ObligationState::Running
         } else {
+            // Outside working time, or the clock has not started yet.
             ObligationState::Paused
         };
         let resumes_at = (state == ObligationState::Paused)
-            .then(|| calendar.next_working_instant(now, zone))
+            .then(|| calendar.next_working_instant(now.max(started_at), zone))
             .flatten();
         ObligationStatus {
             key: self.key(),
@@ -200,7 +201,8 @@ impl Obligation {
 pub enum ObligationState {
     /// Open, and the clock runs now.
     Running,
-    /// Open, and the clock stops now (outside working time).
+    /// Open, and the clock stops now: outside working time, or before the
+    /// start.
     Paused,
     /// Met on or before the deadline.
     Met,

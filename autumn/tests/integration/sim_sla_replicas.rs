@@ -12,8 +12,8 @@ use std::time::Duration;
 use autumn_web::job;
 use autumn_web::prelude::*;
 use autumn_web::sla::{
-    BusinessCalendar, BusinessDuration, MemoryObligationStore, Obligation, ObligationRecord,
-    ObligationStore, Sla, SlaBreach, SlaError, SlaPlugin, StoreFuture,
+    BusinessCalendar, BusinessDuration, ESCALATE_JOB, MemoryObligationStore, Obligation,
+    ObligationRecord, ObligationStore, Sla, SlaBreach, SlaError, SlaPlugin, StoreFuture,
 };
 use autumn_web::test::{TestApp, TestClient};
 use autumn_web::time::TickingClock;
@@ -182,7 +182,8 @@ async fn sim_sla_two_replicas_escalate_once() {
     settle().await;
     store.armed.store(false, Ordering::SeqCst);
 
-    assert_eq!(store.gets.load(Ordering::SeqCst), 2, "both checks ran");
+    // Two checks read the store, then the escalate job reads it once.
+    assert_eq!(store.gets.load(Ordering::SeqCst), 3, "both checks ran");
     assert_eq!(
         store.claims.load(Ordering::SeqCst),
         2,
@@ -223,6 +224,68 @@ async fn sim_sla_track_rolls_back_only_the_record_it_made() {
     sla.track(&shared).await.unwrap();
     assert!(sla.track(&shared.clone().met_at(start)).await.is_err());
     assert!(sla.get(&shared.key()).await.unwrap().is_some());
+
+    job::clear_global_job_client();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sim_sla_on_time_met_after_the_claim_cancels_the_breach() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
+    let clock = TickingClock::starting_at(start);
+    let store = RacingStore::new();
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    let app = replica(&clock, &store, &fired);
+    let sla = Sla::from_state(app.state()).unwrap();
+    let ob = Obligation::new("first_response", "ticket:1")
+        .within(BusinessDuration::hours(2))
+        .calendar("support");
+    sla.track(&ob).await.unwrap();
+    let record = store.inner.get(&ob.key()).await.unwrap().unwrap();
+
+    // A check claimed the breach at 11:05. Then a late `track` wrote an
+    // on-time met instant (10:30) before the escalate job ran.
+    let claimed = due + chrono::Duration::minutes(5);
+    assert!(
+        store
+            .inner
+            .claim_escalation(&ob.key(), record.generation, due, claimed)
+            .await
+            .unwrap()
+    );
+    let met = Utc.with_ymd_and_hms(2020, 1, 1, 10, 30, 0).unwrap();
+    store
+        .inner
+        .mark_met(&ob.key(), record.generation, met)
+        .await
+        .unwrap();
+
+    let breach = serde_json::json!({
+        "key": ob.key(),
+        "obligation": "first_response",
+        "subject": "ticket:1",
+        "calendar": "support",
+        "zone": "UTC",
+        "generation": record.generation,
+        "started_at": start,
+        "due_at": due,
+        "escalated_at": claimed,
+    });
+    clock.advance(Duration::from_secs(3 * 3600));
+    let client = app.state().extension::<job::JobClient>().unwrap();
+    client.enqueue(ESCALATE_JOB, breach).await.unwrap();
+    settle().await;
+
+    assert!(
+        fired.lock().unwrap().is_empty(),
+        "the breach handler must not run"
+    );
+    let status = sla.get(&ob.key()).await.unwrap().unwrap();
+    assert_eq!(status.state, autumn_web::sla::ObligationState::Met);
+    assert_eq!(status.escalated_at, None, "the claim is released");
 
     job::clear_global_job_client();
 }

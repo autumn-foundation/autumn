@@ -164,7 +164,7 @@ hour moves forward by the length of the gap (02:30 becomes 03:30).
 
 | Field | Meaning |
 | --- | --- |
-| `state` | `Running`, `Paused`, `Met` or `Breached`. |
+| `state` | `Running`, `Paused` (outside working time or before the start), `Met` or `Breached`. |
 | `due_at` | The deadline. `None` when there is no deadline in one hundred years. |
 | `budget` | The budget as working time. |
 | `elapsed` | The working time used. |
@@ -190,6 +190,10 @@ deadline. At the deadline the check job reads the store:
 - If not, it claims the escalation in the store. Then it puts one
   `autumn_sla_escalate` job on the queue. That job runs your `on_breach`
   handler with a typed `SlaBreach`.
+
+Before the handler runs, the escalate job reads the record again. If a met
+instant on or before the deadline arrived in the meantime (a late `track`), it
+releases the claim and does not run the handler.
 
 An obligation that is met after the deadline is still a breach. It escalates
 even when the check job runs late. Thus the result does not change with the

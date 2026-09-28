@@ -500,6 +500,16 @@ fn status_with_no_start_starts_now() {
 }
 
 #[test]
+fn status_before_the_start_is_paused() {
+    // Monday 10:00 is working time, but the clock starts on Tuesday.
+    let ob = ticket(utc(2024, 1, 9, 9, 0));
+    let status = ob.status_with(&office(), Tz::UTC, utc(2024, 1, 8, 10, 0));
+    assert_eq!(status.state, ObligationState::Paused);
+    assert_eq!(status.elapsed, Duration::ZERO);
+    assert_eq!(status.resumes_at, Some(utc(2024, 1, 9, 9, 0)));
+}
+
+#[test]
 fn status_never_breaches_without_working_time() {
     let ob = ticket(utc(2024, 1, 5, 15, 0));
     let status = ob.status_with(&BusinessCalendar::new(), Tz::UTC, utc(2030, 1, 1, 0, 0));

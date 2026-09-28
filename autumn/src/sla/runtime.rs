@@ -568,6 +568,26 @@ impl Sla {
         Ok(())
     }
 
+    /// Whether the record of `breach` was met by its deadline after the
+    /// claim, for example by a late `track` with an earlier met instant. If
+    /// so, release the claim: this breach does not run.
+    async fn met_on_time(&self, breach: &SlaBreach) -> Result<bool, SlaError> {
+        let store = &self.engine.store;
+        let on_time = store.get(&breach.key).await?.is_some_and(|record| {
+            record.generation == breach.generation
+                && record
+                    .obligation
+                    .met()
+                    .is_some_and(|met| met <= breach.due_at)
+        });
+        if on_time {
+            store
+                .release_escalation(&breach.key, breach.generation, breach.escalated_at)
+                .await?;
+        }
+        Ok(on_time)
+    }
+
     fn handler_for(&self, obligation: &str) -> Option<BreachHandler> {
         self.engine
             .handlers
@@ -590,7 +610,11 @@ fn check_job(state: AppState, payload: Value) -> BreachFuture {
 fn escalate_job(state: AppState, payload: Value) -> BreachFuture {
     Box::pin(async move {
         let breach: SlaBreach = serde_json::from_value(payload)?;
-        let Some(handler) = Sla::from_state(&state)?.handler_for(&breach.obligation) else {
+        let sla = Sla::from_state(&state)?;
+        if sla.met_on_time(&breach).await? {
+            return Ok(());
+        }
+        let Some(handler) = sla.handler_for(&breach.obligation) else {
             tracing::warn!(key = %breach.key, "SLA breach has no handler");
             return Ok(());
         };
