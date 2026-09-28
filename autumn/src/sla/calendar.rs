@@ -318,17 +318,34 @@ impl BusinessCalendar {
         self.windows
             .get(day_index(date.weekday()))
             .map(|windows| {
-                windows
+                let resolved: Vec<_> = windows
                     .iter()
                     .filter_map(|w| {
                         let start = local_instant(date, w.open, zone)?;
                         let end = local_instant(date, w.close, zone)?;
                         (end > start).then_some((start, end))
                     })
-                    .collect()
+                    .collect();
+                // A daylight-saving gap can move one window onto another.
+                merge_instants(resolved)
             })
             .unwrap_or_default()
     }
+}
+
+/// Sort UTC intervals and merge the ones that overlap or touch.
+fn merge_instants(
+    mut intervals: Vec<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+    intervals.sort_unstable();
+    let mut merged: Vec<(DateTime<Utc>, DateTime<Utc>)> = Vec::with_capacity(intervals.len());
+    for (start, end) in intervals {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
 }
 
 const fn day_index(day: Weekday) -> usize {

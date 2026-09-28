@@ -133,6 +133,38 @@ fn working_time_counts_real_hours_on_a_dst_day() {
 }
 
 #[test]
+fn windows_that_a_dst_gap_moves_together_are_counted_once() {
+    let ny: Tz = "America/New_York".parse().unwrap();
+    // 2024-03-10 is a Sunday. 02:30-02:45 moves to 03:30-03:45, inside
+    // 03:00-04:00.
+    let cal = BusinessCalendar::new()
+        .hours(Weekday::Sun, "02:30-02:45".parse().unwrap())
+        .hours(Weekday::Sun, "03:00-04:00".parse().unwrap());
+    let start = ny
+        .with_ymd_and_hms(2024, 3, 10, 0, 0, 0)
+        .unwrap()
+        .with_timezone(&Utc);
+    let end = ny
+        .with_ymd_and_hms(2024, 3, 11, 0, 0, 0)
+        .unwrap()
+        .with_timezone(&Utc);
+    assert_eq!(cal.working_time(start, end, ny), HOUR);
+    let due = cal
+        .deadline(start, Duration::from_secs(20 * 60), ny)
+        .unwrap();
+    assert_eq!(
+        due,
+        ny.with_ymd_and_hms(2024, 3, 10, 3, 20, 0)
+            .unwrap()
+            .with_timezone(&Utc)
+    );
+    assert_eq!(
+        cal.working_time(start, due, ny),
+        Duration::from_secs(20 * 60)
+    );
+}
+
+#[test]
 fn overlapping_windows_merge() {
     let cal = BusinessCalendar::new()
         .hours(Weekday::Mon, "09:00-12:00".parse().unwrap())
