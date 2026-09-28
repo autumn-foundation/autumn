@@ -10037,7 +10037,10 @@ fn spawn_custom_domain_task(
         cache,
         certs: std::sync::Arc::clone(&store) as std::sync::Arc<dyn crate::acme::store::AcmeStore>,
         provider,
-        verifier: std::sync::Arc::new(crate::custom_domain::SystemDomainVerifier),
+        // `validate` already refused an unparseable entry at boot.
+        verifier: std::sync::Arc::new(crate::custom_domain::SystemDomainVerifier::new(
+            config.resolver_addrs().unwrap_or_default(),
+        )),
         issuer,
         limiter: std::sync::Arc::new(crate::custom_domain::IssuanceLimiter::new(
             config.issuance_per_domain_per_day,
