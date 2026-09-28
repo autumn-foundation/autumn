@@ -214,28 +214,61 @@ $ git diff Cargo.lock
   ...                      # every other dependency name/version identical
 ```
 
-**Finding: this bump changes nothing else in the graph.** `rsa` stays at
-0.9.10 under the `rust_crypto` feature Autumn already selects — the
-`RUSTSEC-2023-0071` waiver's ingress path (`rsa 0.9.10 -> jsonwebtoken ->
-autumn-web`) is untouched, so the hypothesis that this bump might close that
-waiver (worth checking specifically, since it shares a review-by date with
-this pass) is **false**, checked rather than assumed. Cross-checked v11's
-changelog breaking-change list (`insecure_disable_signature_validation`
-removed, `EncodingKey.inner`/`DecodingKey.as_bytes`/`try_get_hmac_secret`
-renamed or removed, `JwkUtils` renamed `KeyUtils`, `Jwk.thumbprint` now
-returns `Result`) against every `jsonwebtoken::` call site in
-`autumn/src/auth.rs` and `autumn/src/tenancy.rs` (`decode_header`,
-`DecodingKey::from_jwk`/`from_secret`, `Validation::new`/`default`,
-`decode`, `encode`, `EncodingKey::from_secret`, `Header::new`, the `jwk`
-types) — none of Autumn's usage touches a removed or renamed API. So this
-bump is very likely a clean, low-risk compile (not run through the full
-suite — no forcing fact surfaced that would justify spending that budget
-this pass). Per the charter's Upgrade-class bar, a major needs a forcing
-fact beyond "staying current," and this rehearsal found none: no advisory
-closes, no EOL/security-support window applies, no graph shrinks. **This PR
-stays a human review call, same as the other seven major-bump PRs in the
-queue** — but now with an actual rehearsal result attached instead of being
-another unexamined row in a table.
+**Finding, part one: the lockfile diff changes nothing else in the graph.**
+`rsa` stays at 0.9.10 under the `rust_crypto` feature Autumn already selects
+— the `RUSTSEC-2023-0071` waiver's ingress path (`rsa 0.9.10 -> jsonwebtoken
+-> autumn-web`) is untouched, so the hypothesis that this bump might close
+that waiver (worth checking specifically, since it shares a review-by date
+with this pass) is **false**, checked rather than assumed.
+
+**Finding, part two: it does not compile — this pass's first draft got this
+wrong and a Codex review comment on this PR caught it.** An earlier draft
+cross-checked only v11's changelog *breaking-change list* (removed/renamed
+APIs) against every `jsonwebtoken::` call site and, finding no match,
+concluded the bump was "very likely a clean, low-risk compile." That check
+missed an *additive* change: `jsonwebtoken::jwk::AlgorithmParameters` is
+`#[non_exhaustive]` in 11.1.0, and `jwk_allowed_algorithms`
+(`autumn/src/auth.rs:1447`, `#[cfg(feature = "oauth2")]`) matches it with
+four arms and no wildcard. Reproduced directly, not taken on the cited
+report's word: same scratch-copy rehearsal as before, then
+`cargo check -p autumn-web --no-default-features --features oauth2`:
+
+```
+error[E0004]: non-exhaustive patterns: `&_` not covered
+   --> autumn/src/auth.rs:1447:11
+    |
+1447|     match &jwk.algorithm {
+    |           ^^^^^^^^^^^^^^ pattern `&_` not covered
+note: `AlgorithmParameters` defined here
+   --> .../jsonwebtoken-11.1.0/src/jwk.rs:457:1
+    = note: `AlgorithmParameters` is marked as non-exhaustive, so a wildcard
+      `_` is necessary to match exhaustively
+```
+
+This exact break was already recorded in
+`docs/reports/2026-09-22-semaphore-ci-health-followup.md` (CI run
+35640495229 on the Dependabot branch itself, failing `Lint` and `MSRV`) —
+this pass's own reproduction confirms that finding still holds against
+today's `trunk-dev`, rather than assuming a six-day-old report is still
+accurate. A second, related gap in the same earlier draft: rehearsing only
+the root `Cargo.lock` is incomplete on its own, because `fuzz/Cargo.toml`
+path-depends on `autumn-web` and `fuzz/Cargo.lock` is currently pinned to
+`jsonwebtoken 10.4.0` — the advisory gate's `cargo fetch --locked` in
+`fuzz/` would go stale exactly as that same CI run's `Supply chain
+(cargo-deny)` job showed, so landing this bump needs `fuzz/Cargo.lock`
+regenerated alongside the root one, not just the root.
+
+So corrected: this PR is not a clean drop-in. It needs `jwk_allowed_algorithms`'s
+match given a wildcard arm (a real source change, not just a version bump)
+and both lockfiles regenerated, before it can build under the `oauth2`
+feature at all — a materially different, and more useful, finding for
+whoever reviews it than "no forcing fact found." Per the charter's
+Upgrade-class bar, a major still needs a forcing fact beyond "staying
+current," and none surfaced here (no advisory closes, no EOL/security-support
+window applies) — but "no forcing fact" was almost the least important thing
+this rehearsal found. **This PR stays a human review call, same as the other
+seven major-bump PRs in the queue** — but now with an actual, reproduced
+compile result attached instead of an assumption.
 
 **Discrepancy from follow-up 8, re-observed via this pass's own `git push`,
 and the count changed.** Last pass's `git push` printed "15 vulnerabilities
@@ -262,10 +295,13 @@ piece worth a human's attention regardless of how the moderates moved.
 None, for Ballast to act on directly this pass — the fourth consecutive
 pass reaching this conclusion. Every Tier-1 check reruns clean, every
 existing waiver's underlying fact is unchanged, the one rehearsed Upgrade
-candidate in the queue (`jsonwebtoken` 10→11) has no forcing fact, and the
-open follow-ups are still open human decisions (division of labor with
-Dependabot, satellite-graph batch ownership, the NCSA license-class
-question, the GitHub-native alert-count discrepancy).
+candidate in the queue (`jsonwebtoken` 10→11) has no forcing fact *and*
+does not currently compile under the `oauth2` feature (a real source fix
+plus a `fuzz/Cargo.lock` regeneration are needed before it's even
+buildable, not just "ask before"), and the open follow-ups are still open
+human decisions (division of labor with Dependabot, satellite-graph batch
+ownership, the NCSA license-class question, the GitHub-native alert-count
+discrepancy).
 
 ## 🔧 Change
 
@@ -324,6 +360,7 @@ cargo tree -p autumn-web --no-default-features --features "ws,presence,flash,cac
 # in autumn/Cargo.toml: jsonwebtoken = { version = "11.1.0", ... }
 cargo update -p jsonwebtoken --precise 11.1.0
 git diff Cargo.lock
+cargo check -p autumn-web --no-default-features --features oauth2  # reproduces E0004 at auth.rs:1447
 git checkout -- autumn/Cargo.toml Cargo.lock
 
 # Dependabot queue health (search via the GitHub API/MCP: author:app/dependabot is:open)
