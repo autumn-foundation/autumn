@@ -292,12 +292,26 @@ pub fn declared_autumn_web_versions(root: &Path) -> Vec<String> {
             tables.extend(KINDS.iter().filter_map(|kind| target.get(*kind)));
         }
     }
+    // `{ workspace = true }` takes the whole entry, `package` rename
+    // included, from the workspace root: resolve it before asking what it is.
+    let workspace_deps = std::fs::read_to_string(workspace_root(root).join("Cargo.toml"))
+        .ok()
+        .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+        .and_then(|table| table.get("workspace")?.get("dependencies").cloned());
     let mut versions: Vec<String> = Vec::new();
     for (key, entry) in tables
         .into_iter()
         .filter_map(toml::Value::as_table)
         .flat_map(|deps| deps.iter())
     {
+        let entry = if entry.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+            match workspace_deps.as_ref().and_then(|deps| deps.get(key)) {
+                Some(inherited) => inherited,
+                None => continue,
+            }
+        } else {
+            entry
+        };
         let is_framework = key == "autumn-web"
             || entry.get("package").and_then(toml::Value::as_str) == Some("autumn-web");
         if !is_framework {
@@ -308,12 +322,7 @@ pub fn declared_autumn_web_versions(root: &Path) -> Vec<String> {
             toml::Value::Table(fields) => fields
                 .get("version")
                 .and_then(toml::Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| {
-                    (fields.get("workspace").and_then(toml::Value::as_bool) == Some(true))
-                        .then(|| workspace_version_for(root, key))
-                        .flatten()
-                }),
+                .map(str::to_owned),
             _ => None,
         };
         if let Some(version) = version.map(|v| v.trim().to_owned())
@@ -1147,6 +1156,13 @@ pub fn plan_add_community(
             version: version.to_owned(),
         });
     }
+    // A crates.io plugin links the registry `autumn-web`: next to an
+    // unpatched local checkout it is a second framework, locked or not.
+    if unpatched_local_framework(root) {
+        return Err(PluginError::UnpatchedLocalFramework {
+            crate_name: crate_name.to_owned(),
+        });
+    }
     let manifest = manifest_path(root);
     let manifest_src = std::fs::read_to_string(&manifest)?;
     let snippet = super::catalog::community_mount_snippet(crate_name)
@@ -1519,6 +1535,14 @@ mod tests {
              [workspace]\n\n[workspace.dependencies]\nautumn-web = \"0.8\"\n",
         );
         assert_eq!(declared_autumn_web_versions(tmp.path()), ["0.8"]);
+        // A renamed inherited entry: the workspace names the package.
+        write(
+            &tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"a\"\n\n[dependencies]\nautumn = { workspace = true }\n\n\
+             [workspace]\n\n[workspace.dependencies]\n\
+             autumn = { package = \"autumn-web\", version = \"0.7\" }\n",
+        );
+        assert_eq!(declared_autumn_web_versions(tmp.path()), ["0.7"]);
     }
 
     /// A `[replace]` key names one version: another version's replacement
@@ -1887,6 +1911,20 @@ maud = { version = "0.27", features = ["axum"] }
              [patch.crates-io]\nautumn-web = { path = \"../autumn\" }\n",
         );
         assert!(!unpatched_local_framework(&app));
+    }
+
+    /// A listed community crate is refused next to an unpatched local
+    /// framework too, whatever the lockfile says.
+    #[test]
+    fn a_community_install_refuses_an_unpatched_local_framework() {
+        let cargo = "[package]\nname = \"demo\"\n\n\
+                     [dependencies]\nautumn-web = { path = \"../autumn\" }\n";
+        let tmp = fake_project(SCAFFOLD_MAIN, cargo);
+        let err = plan_add_community(tmp.path(), "autumn-plugin-x", "=0.3.0").unwrap_err();
+        assert!(
+            matches!(err, PluginError::UnpatchedLocalFramework { .. }),
+            "{err}"
+        );
     }
 
     /// A plain registry dependency is not a local checkout.
