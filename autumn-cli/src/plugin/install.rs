@@ -321,6 +321,19 @@ fn package_autumn_web_entries(root: &Path) -> Vec<(toml::Value, bool)> {
     entries
 }
 
+/// Whether the package declares `autumn-web` at least once with no version
+/// (a path or git entry) next to a versioned declaration. Which one a build
+/// takes depends on the target, so neither is the app's version by itself.
+#[must_use]
+pub fn mixed_autumn_web_declarations(root: &Path) -> bool {
+    let entries = package_autumn_web_entries(root);
+    let versioned = |entry: &toml::Value| {
+        entry.is_str() || entry.get("version").and_then(toml::Value::as_str).is_some()
+    };
+    entries.iter().any(|(entry, _)| versioned(entry))
+        && entries.iter().any(|(entry, _)| !versioned(entry))
+}
+
 /// Every distinct `autumn-web` requirement the package at `root` declares:
 /// its own, dev, build and target-specific tables, with `{ workspace = true }`
 /// entries resolved. A `[workspace.dependencies]` default the package does not
@@ -1231,9 +1244,18 @@ pub fn plan_add(
             .zip(semver::Version::parse(locked).ok())
             .is_none_or(|(req, version)| req.matches(&version))
     };
+    // An unversioned edge next to a versioned one is as ambiguous as two
+    // versions: only the lock says which the build takes.
+    let mixed = mixed_autumn_web_declarations(root);
     let app = match (declared.as_slice(), locked) {
         ([], locked) => locked,
-        ([one], Some(locked)) if admits(one, &locked) => Some(locked),
+        ([one], Some(locked)) if mixed || admits(one, &locked) => Some(locked),
+        ([one], None) if mixed => {
+            return Err(PluginError::AmbiguousAutumnWeb {
+                crate_name: entry.crate_name.to_owned(),
+                declared: format!("{one} and an unversioned path or git entry"),
+            });
+        }
         ([one], _) => Some(one.clone()),
         (_, Some(locked)) => Some(locked),
         (several, None) => {
@@ -2354,6 +2376,23 @@ maud = { version = "0.27", features = ["axum"] }
         .unwrap();
         let err = plan_add(tmp.path(), admin(), "0.7.0").unwrap_err();
         assert!(matches!(err, PluginError::Incompatible { .. }), "{err}");
+    }
+
+    /// An unversioned runtime edge next to a versioned dev edge is ambiguous:
+    /// the versioned one is not the app's version by itself.
+    #[test]
+    fn an_unversioned_edge_beside_a_versioned_one_is_ambiguous() {
+        let cargo = "[package]\nname = \"demo\"\n\n\
+                     [dependencies]\nautumn-web = { path = \"../autumn\" }\n\n\
+                     [dev-dependencies]\nautumn-web = \"0.7\"\n\n\
+                     [patch.crates-io]\nautumn-web = { path = \"../autumn\" }\n";
+        let tmp = fake_project(SCAFFOLD_MAIN, cargo);
+        assert!(mixed_autumn_web_declarations(tmp.path()));
+        let err = plan_add(tmp.path(), admin(), "0.7.0").unwrap_err();
+        assert!(
+            matches!(err, PluginError::AmbiguousAutumnWeb { .. }),
+            "{err}"
+        );
     }
 
     /// `paths` overrides in a config can replace any crate.

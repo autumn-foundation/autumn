@@ -947,8 +947,10 @@ fn source_label(source: &index::Source) -> String {
 fn app_version(root: &Path) -> Option<String> {
     // One requirement, or none to go on: target-specific declarations of
     // different versions leave the choice to the target Cargo builds for.
+    // An unversioned edge beside a versioned one is as ambiguous as two
+    // versions.
     let declared = match install::declared_autumn_web_versions(root).as_slice() {
-        [one] => Some(one.clone()),
+        [one] if !install::mixed_autumn_web_declarations(root) => Some(one.clone()),
         _ => None,
     };
     // What Cargo resolved, when it has: a `"0.7"` requirement may be 0.7.1.
@@ -2022,6 +2024,12 @@ mod tests {
              [target.'cfg(unix)'.dependencies]\nautumn-web = \"0.8\"\n",
         );
         assert_eq!(app_version(targets.path()), None);
+        // An unversioned runtime edge beside a versioned dev one: no version.
+        let mixed = project_with(
+            "[package]\nname = \"a\"\n\n[dependencies]\nautumn-web = { path = \"../autumn\" }\n\n\
+             [dev-dependencies]\nautumn-web = \"0.7\"\n",
+        );
+        assert_eq!(app_version(mixed.path()), None);
         assert!(gate_listing_in(&listing, targets.path()).is_err());
         std::fs::write(
             tmp.path().join("Cargo.lock"),
