@@ -719,8 +719,9 @@ only the injected `Clock`.
 - `SlaBreach` (serde) {`key`, `obligation`, `subject`, `calendar`, `zone`,
   `started_at`, `due_at`, `escalated_at`} — the typed escalation.
 - `ObligationStore` trait (`insert` → `(record, created)`, `get`, `list`,
-  `mark_met`, `claim_escalation`, `release_escalation`, `mark_scheduled`,
-  `remove_unscheduled`, `remove`);
+  `remove`, and the generation-bound writes `mark_met`, `claim_escalation`,
+  `release_escalation`, `mark_scheduled`, `remove_unscheduled`);
+  `ObligationRecord { obligation, generation, escalated_at, scheduled }`;
   `MemoryObligationStore` is the per-process default; replicas need one
   shared store. A breach met late still escalates.
 - `SlaError` {`InvalidHours`, `InvalidDuration`, `UnknownCalendar`,

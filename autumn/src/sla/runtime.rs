@@ -291,31 +291,36 @@ impl Sla {
             .met_at(None);
         let key = resolved.key();
         let store = &self.engine.store;
+        let generation = self.state.entropy().uuid_v4();
         let (record, created) = store
-            .insert(ObligationRecord::new(resolved.clone()))
+            .insert(ObligationRecord::new(resolved, generation))
             .await?;
-        let status = match self.mark_and_schedule(&key, record, obligation, now).await {
+        let status = match self.mark_and_schedule(&key, &record, obligation, now).await {
             Ok(status) => status,
             Err(err) => {
                 // Do not keep a record that this call made and could not
                 // schedule, unless another call scheduled it.
                 if created {
-                    store.remove_unscheduled(&key).await?;
+                    store.remove_unscheduled(&key, record.generation).await?;
                 }
                 return Err(err);
             }
         };
-        // Pin the record. If a failed creator removed it after our check job
-        // went on the queue, put it back for that job.
+        // Pin the instance that this call scheduled. If a failed creator
+        // removed it after our check job went on the queue, put the stored
+        // record back for that job.
         for _ in 0..PIN_ATTEMPTS {
-            if store.mark_scheduled(&key).await? {
+            if store.mark_scheduled(&key, record.generation).await? {
                 return Ok(status);
             }
-            store
-                .insert(ObligationRecord::new(resolved.clone()))
-                .await?;
+            let (current, _) = store.insert(record.clone()).await?;
+            if current.generation != record.generation {
+                // A `forget` and a new `track` replaced this instance. The
+                // new call owns the new record.
+                return Ok(status);
+            }
             if let Some(met) = obligation.met() {
-                store.mark_met(&key, met).await?;
+                store.mark_met(&key, record.generation, met).await?;
             }
         }
         Err(SlaError::Store(format!(
@@ -327,15 +332,19 @@ impl Sla {
     async fn mark_and_schedule(
         &self,
         key: &str,
-        mut record: ObligationRecord,
+        record: &ObligationRecord,
         obligation: &Obligation,
         now: DateTime<Utc>,
     ) -> Result<ObligationStatus, SlaError> {
-        let store = &self.engine.store;
+        let mut record = record.clone();
         if let Some(met) = obligation.met()
-            && store.mark_met(key, met).await?
+            && self
+                .engine
+                .store
+                .mark_met(key, record.generation, met)
+                .await?
         {
-            record = store.get(key).await?.unwrap_or(record);
+            record.obligation.set_met(met);
         }
         self.schedule(key, &record, now).await
     }
@@ -365,7 +374,10 @@ impl Sla {
     ///
     /// Returns an error for a store failure.
     pub async fn meet(&self, key: &str) -> Result<Option<ObligationStatus>, SlaError> {
-        self.engine.store.mark_met(key, self.now()).await?;
+        let store = &self.engine.store;
+        if let Some(record) = store.get(key).await? {
+            store.mark_met(key, record.generation, self.now()).await?;
+        }
         self.get(key).await
     }
 
@@ -499,9 +511,9 @@ impl Sla {
             _ => return Ok(()),
         };
         // Claim this instance only: a `forget` and `track` since the read
-        // makes a new record with another start.
+        // makes a new record with another generation.
         if !store
-            .claim_escalation(key, status.started_at, due_at, now)
+            .claim_escalation(key, record.generation, due_at, now)
             .await?
         {
             return Ok(());
@@ -519,7 +531,7 @@ impl Sla {
         };
         if let Err(err) = self.enqueue(ESCALATE_JOB, &breach, None).await {
             // Release the claim, so that the retry of this check can claim again.
-            if let Err(release) = store.release_escalation(key).await {
+            if let Err(release) = store.release_escalation(key, record.generation, now).await {
                 tracing::error!(
                     %key,
                     enqueue = %err,

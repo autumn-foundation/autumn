@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
+use uuid::Uuid;
 
 use super::{Obligation, SlaError};
 
@@ -18,6 +19,9 @@ pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, SlaError>> +
 pub struct ObligationRecord {
     /// The obligation. Its start instant and time zone are set.
     pub obligation: Obligation,
+    /// A unique id for this record. A `forget` and a new `track` of the same
+    /// key make a record with a new generation.
+    pub generation: Uuid,
     /// The instant when the escalation was claimed.
     pub escalated_at: Option<DateTime<Utc>>,
     /// Whether a `track` call finished on this record. A rollback does not
@@ -26,11 +30,12 @@ pub struct ObligationRecord {
 }
 
 impl ObligationRecord {
-    /// Make a record with no escalation that is not scheduled.
+    /// Make a new record with no escalation that is not scheduled.
     #[must_use]
-    pub const fn new(obligation: Obligation) -> Self {
+    pub const fn new(obligation: Obligation, generation: Uuid) -> Self {
         Self {
             obligation,
+            generation,
             escalated_at: None,
             scheduled: false,
         }
@@ -39,10 +44,15 @@ impl ObligationRecord {
 
 /// Storage of tracked obligations.
 ///
-/// For more than one replica, all replicas must use the same store, and
-/// [`claim_escalation`](Self::claim_escalation) must be atomic, for example
-/// `UPDATE … SET escalated_at = $4 WHERE key = $1 AND started_at = $2 AND
-/// escalated_at IS NULL AND (met_at IS NULL OR met_at > $3)`.
+/// For more than one replica, all replicas must use the same store. Each
+/// write that takes a `generation` must change the record only when the key
+/// and the generation both match, in one atomic step. For example:
+///
+/// ```sql
+/// UPDATE sla_obligations SET escalated_at = $4
+/// WHERE key = $1 AND generation = $2
+///   AND escalated_at IS NULL AND (met_at IS NULL OR met_at > $3)
+/// ```
 pub trait ObligationStore: Send + Sync + 'static {
     /// Add `record` if its key is new. Return the stored record, and `true`
     /// if this call created it. The check and the write must be atomic.
@@ -55,31 +65,42 @@ pub trait ObligationStore: Send + Sync + 'static {
     fn list(&self) -> StoreFuture<'_, Vec<ObligationRecord>>;
 
     /// Set the met instant if it is not set. Return `true` if it changed.
-    fn mark_met<'a>(&'a self, key: &'a str, at: DateTime<Utc>) -> StoreFuture<'a, bool>;
+    fn mark_met<'a>(
+        &'a self,
+        key: &'a str,
+        generation: Uuid,
+        at: DateTime<Utc>,
+    ) -> StoreFuture<'a, bool>;
 
-    /// Set the escalation instant to `at` if the record for `key` started at
-    /// `started_at` (the same instance), the escalation is not set, and the
-    /// obligation was not met by `due_at`. Return `true` if this call set it.
+    /// Set the escalation instant to `at` if the escalation is not set and
+    /// the obligation was not met by `due_at`. Return `true` if this call set
+    /// it.
     fn claim_escalation<'a>(
         &'a self,
         key: &'a str,
-        started_at: DateTime<Utc>,
+        generation: Uuid,
         due_at: DateTime<Utc>,
         at: DateTime<Utc>,
     ) -> StoreFuture<'a, bool>;
 
-    /// Clear the escalation instant after a failed enqueue.
-    fn release_escalation<'a>(&'a self, key: &'a str) -> StoreFuture<'a, ()>;
+    /// Clear the escalation instant after a failed enqueue, only if it is
+    /// still `claimed_at`.
+    fn release_escalation<'a>(
+        &'a self,
+        key: &'a str,
+        generation: Uuid,
+        claimed_at: DateTime<Utc>,
+    ) -> StoreFuture<'a, ()>;
 
-    /// Set `scheduled` on the record for `key`. Return `false` if there is
-    /// no record.
-    fn mark_scheduled<'a>(&'a self, key: &'a str) -> StoreFuture<'a, bool>;
+    /// Set `scheduled`. Return `false` if there is no such record.
+    fn mark_scheduled<'a>(&'a self, key: &'a str, generation: Uuid) -> StoreFuture<'a, bool>;
 
-    /// Remove the record for `key` only if it is not scheduled. The check and
-    /// the delete must be atomic. Return `true` if it removed the record.
-    fn remove_unscheduled<'a>(&'a self, key: &'a str) -> StoreFuture<'a, bool>;
+    /// Remove the record only if it is not scheduled. Return `true` if it
+    /// removed the record.
+    fn remove_unscheduled<'a>(&'a self, key: &'a str, generation: Uuid) -> StoreFuture<'a, bool>;
 
-    /// Remove the record for `key`. Return `true` if it existed.
+    /// Remove the record for `key`, whatever its generation. Return `true`
+    /// if it existed.
     fn remove<'a>(&'a self, key: &'a str) -> StoreFuture<'a, bool>;
 }
 
@@ -110,6 +131,22 @@ impl MemoryObligationStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner));
         Box::pin(std::future::ready(Ok(value)))
     }
+
+    /// Run `f` on the record for `key` if its generation is `generation`.
+    /// Return `None` if there is no such record.
+    fn with_instance<T: Send + 'static>(
+        &self,
+        key: &str,
+        generation: Uuid,
+        f: impl FnOnce(&mut ObligationRecord) -> T,
+    ) -> StoreFuture<'_, Option<T>> {
+        self.with(|records| {
+            records
+                .get_mut(key)
+                .filter(|record| record.generation == generation)
+                .map(f)
+        })
+    }
 }
 
 impl ObligationStore for MemoryObligationStore {
@@ -130,57 +167,65 @@ impl ObligationStore for MemoryObligationStore {
         self.with(|records| records.values().cloned().collect())
     }
 
-    fn mark_met<'a>(&'a self, key: &'a str, at: DateTime<Utc>) -> StoreFuture<'a, bool> {
-        self.with(|records| match records.get_mut(key) {
-            Some(record) if record.obligation.met().is_none() => {
+    fn mark_met<'a>(
+        &'a self,
+        key: &'a str,
+        generation: Uuid,
+        at: DateTime<Utc>,
+    ) -> StoreFuture<'a, bool> {
+        let changed = self.with_instance(key, generation, |record| {
+            let unset = record.obligation.met().is_none();
+            if unset {
                 record.obligation.set_met(at);
-                true
             }
-            _ => false,
-        })
+            unset
+        });
+        Box::pin(async move { Ok(changed.await?.unwrap_or(false)) })
     }
 
     fn claim_escalation<'a>(
         &'a self,
         key: &'a str,
-        started_at: DateTime<Utc>,
+        generation: Uuid,
         due_at: DateTime<Utc>,
         at: DateTime<Utc>,
     ) -> StoreFuture<'a, bool> {
-        self.with(|records| match records.get_mut(key) {
-            Some(record)
-                if record.obligation.started_at() == Some(started_at)
-                    && record.escalated_at.is_none()
-                    && record.obligation.met().is_none_or(|met| met > due_at) =>
-            {
+        let claimed = self.with_instance(key, generation, |record| {
+            let open = record.escalated_at.is_none()
+                && record.obligation.met().is_none_or(|met| met > due_at);
+            if open {
                 record.escalated_at = Some(at);
-                true
             }
-            _ => false,
-        })
+            open
+        });
+        Box::pin(async move { Ok(claimed.await?.unwrap_or(false)) })
     }
 
-    fn release_escalation<'a>(&'a self, key: &'a str) -> StoreFuture<'a, ()> {
-        self.with(|records| {
-            if let Some(record) = records.get_mut(key) {
+    fn release_escalation<'a>(
+        &'a self,
+        key: &'a str,
+        generation: Uuid,
+        claimed_at: DateTime<Utc>,
+    ) -> StoreFuture<'a, ()> {
+        let released = self.with_instance(key, generation, |record| {
+            if record.escalated_at == Some(claimed_at) {
                 record.escalated_at = None;
             }
-        })
+        });
+        Box::pin(async move { released.await.map(|_| ()) })
     }
 
-    fn mark_scheduled<'a>(&'a self, key: &'a str) -> StoreFuture<'a, bool> {
-        self.with(|records| {
-            records.get_mut(key).is_some_and(|record| {
-                record.scheduled = true;
-                true
-            })
-        })
+    fn mark_scheduled<'a>(&'a self, key: &'a str, generation: Uuid) -> StoreFuture<'a, bool> {
+        let marked = self.with_instance(key, generation, |record| record.scheduled = true);
+        Box::pin(async move { Ok(marked.await?.is_some()) })
     }
 
-    fn remove_unscheduled<'a>(&'a self, key: &'a str) -> StoreFuture<'a, bool> {
+    fn remove_unscheduled<'a>(&'a self, key: &'a str, generation: Uuid) -> StoreFuture<'a, bool> {
         self.with(|records| {
-            let unscheduled = records.get(key).is_some_and(|record| !record.scheduled);
-            unscheduled && records.remove(key).is_some()
+            let removable = records
+                .get(key)
+                .is_some_and(|record| record.generation == generation && !record.scheduled);
+            removable && records.remove(key).is_some()
         })
     }
 

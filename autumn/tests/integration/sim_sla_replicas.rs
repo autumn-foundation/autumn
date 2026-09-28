@@ -19,6 +19,7 @@ use autumn_web::test::{TestApp, TestClient};
 use autumn_web::time::TickingClock;
 use chrono::{DateTime, TimeZone, Utc};
 use tokio::sync::Barrier;
+use uuid::Uuid;
 
 /// A shared store. While armed, the first two `get` calls read, then wait for
 /// each other. Thus two checks read "not escalated" before either one claims.
@@ -65,34 +66,44 @@ impl ObligationStore for RacingStore {
         self.inner.list()
     }
 
-    fn mark_met<'a>(&'a self, key: &'a str, at: DateTime<Utc>) -> StoreFuture<'a, bool> {
+    fn mark_met<'a>(
+        &'a self,
+        key: &'a str,
+        generation: Uuid,
+        at: DateTime<Utc>,
+    ) -> StoreFuture<'a, bool> {
         if self.fail_mark_met.load(Ordering::SeqCst) {
             return Box::pin(std::future::ready(Err(SlaError::Store("down".to_owned()))));
         }
-        self.inner.mark_met(key, at)
+        self.inner.mark_met(key, generation, at)
     }
 
     fn claim_escalation<'a>(
         &'a self,
         key: &'a str,
-        started_at: DateTime<Utc>,
+        generation: Uuid,
         due_at: DateTime<Utc>,
         at: DateTime<Utc>,
     ) -> StoreFuture<'a, bool> {
         self.claims.fetch_add(1, Ordering::SeqCst);
-        self.inner.claim_escalation(key, started_at, due_at, at)
+        self.inner.claim_escalation(key, generation, due_at, at)
     }
 
-    fn release_escalation<'a>(&'a self, key: &'a str) -> StoreFuture<'a, ()> {
-        self.inner.release_escalation(key)
+    fn release_escalation<'a>(
+        &'a self,
+        key: &'a str,
+        generation: Uuid,
+        claimed_at: DateTime<Utc>,
+    ) -> StoreFuture<'a, ()> {
+        self.inner.release_escalation(key, generation, claimed_at)
     }
 
-    fn mark_scheduled<'a>(&'a self, key: &'a str) -> StoreFuture<'a, bool> {
-        self.inner.mark_scheduled(key)
+    fn mark_scheduled<'a>(&'a self, key: &'a str, generation: Uuid) -> StoreFuture<'a, bool> {
+        self.inner.mark_scheduled(key, generation)
     }
 
-    fn remove_unscheduled<'a>(&'a self, key: &'a str) -> StoreFuture<'a, bool> {
-        self.inner.remove_unscheduled(key)
+    fn remove_unscheduled<'a>(&'a self, key: &'a str, generation: Uuid) -> StoreFuture<'a, bool> {
+        self.inner.remove_unscheduled(key, generation)
     }
 
     fn remove<'a>(&'a self, key: &'a str) -> StoreFuture<'a, bool> {

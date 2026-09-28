@@ -489,115 +489,153 @@ fn zone_from_reads_names_and_options() {
 
 // ── MemoryObligationStore ────────────────────────────────────────────────────
 
-/// The start of the obligation that `record(START)` makes.
-const START: DateTime<Utc> = DateTime::from_timestamp(1_704_466_800, 0).unwrap();
+const KEY: &str = "first_response/ticket:1";
 
-fn record(start: DateTime<Utc>) -> ObligationRecord {
-    ObligationRecord::new(ticket(start).zone(Tz::UTC))
+/// The generation of the first record in each store test.
+const GEN: uuid::Uuid = uuid::Uuid::from_u128(1);
+
+fn record(start: DateTime<Utc>, generation: uuid::Uuid) -> ObligationRecord {
+    ObligationRecord::new(ticket(start).zone(Tz::UTC), generation)
+}
+
+async fn store_with_one() -> MemoryObligationStore {
+    let store = MemoryObligationStore::new();
+    store
+        .insert(record(utc(2024, 1, 5, 15, 0), GEN))
+        .await
+        .unwrap();
+    store
 }
 
 #[tokio::test]
 async fn store_insert_keeps_the_first_record() {
     let store = MemoryObligationStore::new();
-    let (first, created) = store.insert(record(utc(2024, 1, 5, 15, 0))).await.unwrap();
+    let (first, created) = store
+        .insert(record(utc(2024, 1, 5, 15, 0), GEN))
+        .await
+        .unwrap();
     assert!(created);
-    let (second, created) = store.insert(record(utc(2024, 1, 8, 9, 0))).await.unwrap();
+    let other = uuid::Uuid::from_u128(2);
+    let (second, created) = store
+        .insert(record(utc(2024, 1, 8, 9, 0), other))
+        .await
+        .unwrap();
     assert!(!created, "the second insert does not own the record");
     assert_eq!(first, second);
+    assert_eq!(second.generation, GEN);
     assert_eq!(store.list().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
 async fn store_claims_an_escalation_once() {
-    let store = MemoryObligationStore::new();
-    store.insert(record(utc(2024, 1, 5, 15, 0))).await.unwrap();
-    let key = "first_response/ticket:1";
+    let store = store_with_one().await;
     let due = utc(2024, 1, 9, 15, 0);
-    assert!(store.claim_escalation(key, START, due, due).await.unwrap());
-    assert!(!store.claim_escalation(key, START, due, due).await.unwrap());
-    store.release_escalation(key).await.unwrap();
-    assert!(store.claim_escalation(key, START, due, due).await.unwrap());
+    assert!(store.claim_escalation(KEY, GEN, due, due).await.unwrap());
+    assert!(!store.claim_escalation(KEY, GEN, due, due).await.unwrap());
+    // A release with another claim instant does nothing.
+    store
+        .release_escalation(KEY, GEN, utc(2024, 1, 1, 0, 0))
+        .await
+        .unwrap();
+    assert!(!store.claim_escalation(KEY, GEN, due, due).await.unwrap());
+    store.release_escalation(KEY, GEN, due).await.unwrap();
+    assert!(store.claim_escalation(KEY, GEN, due, due).await.unwrap());
 }
 
 #[tokio::test]
 async fn store_does_not_claim_a_met_or_missing_obligation() {
-    let store = MemoryObligationStore::new();
-    store.insert(record(utc(2024, 1, 5, 15, 0))).await.unwrap();
-    let key = "first_response/ticket:1";
+    let store = store_with_one().await;
     let due = utc(2024, 1, 9, 15, 0);
-    assert!(store.mark_met(key, utc(2024, 1, 8, 10, 0)).await.unwrap());
-    assert!(!store.mark_met(key, utc(2024, 1, 8, 11, 0)).await.unwrap());
-    assert!(!store.claim_escalation(key, START, due, due).await.unwrap());
     assert!(
-        !store
-            .claim_escalation("nope", START, due, due)
+        store
+            .mark_met(KEY, GEN, utc(2024, 1, 8, 10, 0))
             .await
             .unwrap()
     );
-    let stored = store.get(key).await.unwrap().unwrap();
+    assert!(
+        !store
+            .mark_met(KEY, GEN, utc(2024, 1, 8, 11, 0))
+            .await
+            .unwrap()
+    );
+    assert!(!store.claim_escalation(KEY, GEN, due, due).await.unwrap());
+    assert!(!store.claim_escalation("nope", GEN, due, due).await.unwrap());
+    let stored = store.get(KEY).await.unwrap().unwrap();
     assert_eq!(stored.obligation.met(), Some(utc(2024, 1, 8, 10, 0)));
 }
 
 #[tokio::test]
 async fn store_claims_an_obligation_met_after_the_deadline() {
-    let store = MemoryObligationStore::new();
-    store.insert(record(utc(2024, 1, 5, 15, 0))).await.unwrap();
-    let key = "first_response/ticket:1";
+    let store = store_with_one().await;
     let due = utc(2024, 1, 9, 15, 0);
-    store.mark_met(key, utc(2024, 1, 9, 16, 0)).await.unwrap();
-    assert!(
-        store
-            .claim_escalation(key, START, due, utc(2024, 1, 9, 17, 0))
-            .await
-            .unwrap()
-    );
+    store
+        .mark_met(KEY, GEN, utc(2024, 1, 9, 16, 0))
+        .await
+        .unwrap();
+    let later = utc(2024, 1, 9, 17, 0);
+    assert!(store.claim_escalation(KEY, GEN, due, later).await.unwrap());
 }
 
 #[tokio::test]
 async fn store_does_not_roll_back_a_scheduled_record() {
-    let store = MemoryObligationStore::new();
-    let key = "first_response/ticket:1";
     // Call A creates the record. Call B adopts it and pins it.
-    let (_, created) = store.insert(record(utc(2024, 1, 5, 15, 0))).await.unwrap();
-    assert!(created);
-    assert!(store.mark_scheduled(key).await.unwrap());
+    let store = store_with_one().await;
+    assert!(store.mark_scheduled(KEY, GEN).await.unwrap());
     // Call A fails later: its rollback must not remove B's record.
-    assert!(!store.remove_unscheduled(key).await.unwrap());
-    assert!(store.get(key).await.unwrap().is_some());
+    assert!(!store.remove_unscheduled(KEY, GEN).await.unwrap());
+    assert!(store.get(KEY).await.unwrap().is_some());
 }
 
 #[tokio::test]
 async fn store_rolls_back_an_unscheduled_record() {
-    let store = MemoryObligationStore::new();
-    let key = "first_response/ticket:1";
-    store.insert(record(utc(2024, 1, 5, 15, 0))).await.unwrap();
-    assert!(store.remove_unscheduled(key).await.unwrap());
+    let store = store_with_one().await;
+    assert!(store.remove_unscheduled(KEY, GEN).await.unwrap());
     assert!(
-        !store.mark_scheduled(key).await.unwrap(),
+        !store.mark_scheduled(KEY, GEN).await.unwrap(),
         "no record to pin"
     );
 }
 
 #[tokio::test]
-async fn store_does_not_claim_a_replaced_instance() {
-    let store = MemoryObligationStore::new();
-    let key = "first_response/ticket:1";
+async fn store_writes_touch_only_their_own_generation() {
+    // A slow call loaded generation GEN. Then `forget` and `track` made a
+    // new record with the same start but another generation.
+    let store = store_with_one().await;
+    store.remove(KEY).await.unwrap();
+    let new = uuid::Uuid::from_u128(2);
+    store
+        .insert(record(utc(2024, 1, 5, 15, 0), new))
+        .await
+        .unwrap();
     let due = utc(2024, 1, 9, 15, 0);
-    // A check read the instance that started at START. Then `forget` and
-    // `track` made a new instance.
-    store.insert(record(START)).await.unwrap();
-    store.remove(key).await.unwrap();
-    store.insert(record(utc(2024, 1, 8, 9, 0))).await.unwrap();
-    assert!(!store.claim_escalation(key, START, due, due).await.unwrap());
-    let stored = store.get(key).await.unwrap().unwrap();
-    assert_eq!(stored.escalated_at, None, "the new instance is not claimed");
+
+    assert!(!store.claim_escalation(KEY, GEN, due, due).await.unwrap());
+    assert!(!store.mark_met(KEY, GEN, due).await.unwrap());
+    assert!(!store.mark_scheduled(KEY, GEN).await.unwrap());
+    assert!(!store.remove_unscheduled(KEY, GEN).await.unwrap());
+    let stored = store.get(KEY).await.unwrap().unwrap();
+    assert_eq!(stored.generation, new);
+    assert_eq!(stored.escalated_at, None);
+    assert_eq!(stored.obligation.met(), None);
+    assert!(!stored.scheduled);
+
+    // The new claim is not released by the old instance.
+    assert!(store.claim_escalation(KEY, new, due, due).await.unwrap());
+    store.release_escalation(KEY, GEN, due).await.unwrap();
+    assert_eq!(
+        store.get(KEY).await.unwrap().unwrap().escalated_at,
+        Some(due)
+    );
 }
 
 #[tokio::test]
 async fn store_clones_share_records() {
     let store = MemoryObligationStore::new();
     let replica = store.clone();
-    store.insert(record(utc(2024, 1, 5, 15, 0))).await.unwrap();
+    store
+        .insert(record(utc(2024, 1, 5, 15, 0), GEN))
+        .await
+        .unwrap();
     assert!(
         replica
             .get("first_response/ticket:1")

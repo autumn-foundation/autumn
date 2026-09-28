@@ -211,12 +211,17 @@ is lost. The record keeps `escalated_at`, so `Sla::statuses` shows it.
 The default `MemoryObligationStore` is local to one process. A check job on
 one replica cannot see an obligation that another replica tracked. For more
 than one replica, put an `ObligationStore` on your database with
-`SlaPlugin::store`, and use it on all replicas. Make `insert`,
-`remove_unscheduled` and `claim_escalation` atomic, for example:
+`SlaPlugin::store`, and use it on all replicas.
+
+Each record has a `generation`, a unique id that `track` makes. The writes
+after the insert (`mark_met`, `claim_escalation`, `release_escalation`,
+`mark_scheduled`, `remove_unscheduled`) must change the record only when the
+key and the generation both match, in one atomic step. Thus a slow call never
+changes a record that `forget` and a new `track` replaced. For example:
 
 ```sql
 UPDATE sla_obligations SET escalated_at = $4
-WHERE key = $1 AND started_at = $2
+WHERE key = $1 AND generation = $2
   AND escalated_at IS NULL AND (met_at IS NULL OR met_at > $3)
 ```
 
