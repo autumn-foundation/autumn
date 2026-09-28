@@ -198,6 +198,19 @@ fn check_report_shape(report: &ConformanceReport, prefix: &str) -> Result<(), St
             ));
         }
     }
+    // A `route-prefix` pass proves only the prefix it tested: `--prefix /`
+    // admits every route, and is no evidence for `/admin`.
+    let normalized = |p: &str| p.trim_end_matches('/').to_owned();
+    if !prefix.is_empty() && report.prefix.as_deref().map(normalized) != Some(normalized(prefix)) {
+        return Err(format!(
+            "the report for `{name}` checked routes under {}, but the listing's prefix is \
+             `{prefix}`; re-run `autumn plugin-check --prefix {prefix}`",
+            report.prefix.as_deref().map_or_else(
+                || "no prefix".to_owned(),
+                |p| format!("`{}`", index::sanitize(p))
+            )
+        ));
+    }
     let contract_passed = report
         .checks
         .iter()
@@ -1041,6 +1054,8 @@ mod tests {
             ],
             contract,
             autumn_web: None,
+            // The prefix its `route-prefix` check tested: the fixtures'.
+            prefix: Some("/admin".to_owned()),
         }
     }
 
@@ -1049,6 +1064,27 @@ mod tests {
     }
 
     // ── apply_report ────────────────────────────────────────────────────
+
+    /// A `route-prefix` pass is evidence only for the prefix it tested:
+    /// `--prefix /` admits every route and cannot vouch for `/admin`.
+    #[test]
+    fn a_report_must_test_the_listings_prefix() {
+        let mut l = listing("autumn-admin-plugin");
+        assert_eq!(l.prefix, "/admin");
+        let before = l.clone();
+        let contract = Some(lockstep("autumn-admin-plugin", "0.7.0"));
+        for tested in [Some("/"), Some("/other"), None] {
+            let mut r = report("autumn-admin-plugin", true, contract.clone());
+            r.prefix = tested.map(str::to_owned);
+            let err = apply_report(&mut l, &r, "0.7.0", "2026-10-01").unwrap_err();
+            assert!(err.contains("/admin"), "{tested:?}: {err}");
+            assert_eq!(l, before);
+        }
+        // A trailing slash is the same prefix.
+        let mut r = report("autumn-admin-plugin", true, contract);
+        r.prefix = Some("/admin/".to_owned());
+        apply_report(&mut l, &r, "0.7.0", "2026-10-01").expect("the listing's prefix");
+    }
 
     /// AC 4: a pass on a new release refreshes the listing for it.
     #[test]
@@ -1381,6 +1417,7 @@ mod tests {
                 ],
                 contract: None,
                 autumn_web: None,
+                prefix: None,
             },
             // A baseline with nothing new: the new artifact asks for no more.
             upgrade: Some(delta(&[])),

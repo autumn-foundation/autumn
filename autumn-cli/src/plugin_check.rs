@@ -74,6 +74,10 @@ pub struct ConformanceReport {
     /// `Cargo.lock`. The plugin index records a report only for this release.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autumn_web: Option<String>,
+    /// The `--prefix` the `route-prefix` check tested. The plugin index
+    /// records a pass for a prefixed listing only when this is its prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
 }
 
 impl ConformanceReport {
@@ -350,6 +354,7 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
         checks,
         contract: declared.cloned(),
         autumn_web: None,
+        prefix: opts.expected_prefix.map(str::to_owned),
     }
 }
 
@@ -1326,6 +1331,7 @@ mod tests {
             ],
             contract: None,
             autumn_web: None,
+            prefix: None,
         };
         assert!(report.passed());
     }
@@ -1342,6 +1348,7 @@ mod tests {
             }],
             contract: None,
             autumn_web: None,
+            prefix: None,
         };
         assert!(!report.passed());
     }
@@ -1353,6 +1360,7 @@ mod tests {
             checks: vec![],
             contract: None,
             autumn_web: None,
+            prefix: None,
         };
         assert!(report.to_text_report().contains("autumn-admin-plugin"));
     }
@@ -1364,6 +1372,7 @@ mod tests {
             checks: vec![],
             contract: None,
             autumn_web: None,
+            prefix: None,
         };
         assert!(report.to_text_report().contains("PASS"));
     }
@@ -1380,6 +1389,7 @@ mod tests {
             }],
             contract: None,
             autumn_web: None,
+            prefix: None,
         };
         assert!(report.to_text_report().contains("FAIL"));
     }
@@ -1396,6 +1406,7 @@ mod tests {
             }],
             contract: None,
             autumn_web: None,
+            prefix: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1545,6 +1556,8 @@ mod tests {
         let routes = vec![make_route("GET", "/admin", "plugin:admin")];
         let report = build_report(&opts, &routes);
         assert!(report.checks.iter().any(|c| c.name == "route-prefix"));
+        // The report names the prefix it tested, for `plugin index record`.
+        assert_eq!(report.prefix.as_deref(), Some("/admin"));
     }
 
     #[test]
@@ -1666,6 +1679,7 @@ mod contract_tests {
             }],
             contract: None,
             autumn_web: None,
+            prefix: None,
         };
         fail_on_omitted_routers(&mut report, 0);
         assert!(report.passed());

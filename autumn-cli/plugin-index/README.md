@@ -100,7 +100,9 @@ checked = "2026-09-27"
 - The listing was not verified against the current release.
 
 `record` also refuses a passing report with no `plugin-contract` check or no
-declared range.
+declared range. For a listing with a `prefix`, it refuses a passing report
+unless `plugin-check` ran with that same `--prefix`: `--prefix /` admits
+every route and is no evidence for `/admin`.
 
 Only a first-party crate that is not a `Plugin` can be `exempt`. An example is
 `autumn-storage-s3`, a `BlobStore`. The re-verification compiles its mount
