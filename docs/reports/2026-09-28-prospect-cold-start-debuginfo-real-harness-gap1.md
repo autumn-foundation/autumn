@@ -241,16 +241,33 @@ follow-up needs, scoped from this assay's own stubs list:
   which debuginfo level is chosen — the existing budget has less headroom
   on ordinary hardware than a run of all-green scheduled gate executions
   might suggest.
-- Gates: `cold-start-latency.yml`'s own scheduled `measure` job is the
-  natural place a confirmatory n≥5 run belongs (via `workflow_dispatch`
-  with `runs: 5`), rather than another local sandbox apparatus — it
-  already runs on the right box class and already emits the JSON report
-  this analysis format consumes directly.
+- Gates: `cold-start-latency.yml`'s `measure` job is the natural place to
+  run this on the right box class, but **correction (caught by Codex review
+  on PR #2993): a single `workflow_dispatch` with `runs: 5` does not
+  reproduce this comparison.** The workflow checks out one ref and builds
+  whatever `[profile.dev]` is committed in that ref's own template — it
+  takes no input to toggle `debug`, so one dispatch measures only one
+  condition, not both, and cannot perform the baseline→`debug=1`→baseline
+  reversal this assay used to separate the effect from drift. A real
+  confirmatory follow-up needs **two separate dispatches** (`runs: 5`
+  each): one against `trunk-dev` as-is (baseline) and one against a branch
+  carrying the `[profile.dev] debug = 1` template change, comparing their
+  JSON reports — accepting that CI runners are ephemeral and shared
+  per-dispatch, not a single reused box, so the within-box reversal check
+  this local assay could do is not directly available; a same-day pair of
+  dispatches is the closest practical substitute for controlling
+  session-wide drift.
 
 ## 🔬 Reproduce
 
 ```bash
-# From a clean checkout on this workspace's current trunk-dev tip.
+# Pinned to this PR's actual base commit (caught by Codex review on PR
+# #2993: an earlier draft of this recipe said "current trunk-dev tip," a
+# floating reference that resolves to different template/harness/
+# dependency code as trunk-dev advances, defeating reproduction of the
+# numbers this report reports):
+#   git worktree add --detach /tmp/prospect-coldstart-repro c304e8f89c7a3c7f1fb58c23bf4175904633eb5d
+#   cd /tmp/prospect-coldstart-repro
 # IMPORTANT (caught by Codex review on PR #2993): each `--runs 1` sample
 # below must write to its OWN output path — repeating the same fixed path,
 # as an earlier draft of this recipe did, silently overwrites the previous
