@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 autumn-web = { path = "../../autumn", features = ["markdown"] }
+autumn-search = { path = "../../autumn-search" }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.9", features = ["postgres"] }

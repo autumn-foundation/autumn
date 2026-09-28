@@ -14,6 +14,28 @@ pub mod repositories;
 pub mod routes;
 mod schema;
 
+/// Mount `autumn-search` on `Page`.
+///
+/// `Page` is already `#[searchable]` (docs/guide/full-text-search.md's core
+/// `tsvector` column + `#[repository(searchable)]`'s hand-rolled `/search`
+/// route, both left untouched). This adds the plugin layer *on top* of that
+/// primitive: ranked, paginated keyword queries through one engine-agnostic
+/// client, kept in sync by `PageHooks`'s `after_*_commit` methods
+/// (`src/hooks.rs`) rather than a second, competing index. See
+/// `docs/guide/search.md` and issue #2320's T3 Gap 6, which named this
+/// pairing as the fix.
+///
+/// A function here (not inlined in `main.rs`) for the same reason
+/// `all_routes()` is: the binary and any test that mounts this app need the
+/// identical plugin instance, and `models::Page` is a private module that
+/// only code inside this crate can name.
+#[must_use]
+pub fn search_plugin() -> autumn_search::SearchPlugin {
+    autumn_search::SearchPlugin::new()
+        .postgres()
+        .index::<models::Page>()
+}
+
 /// Every route the application serves.
 ///
 /// Defined here rather than inline in `main` so the binary and any test that
@@ -31,6 +53,7 @@ pub fn all_routes() -> Vec<autumn_web::Route> {
         routes::pages::transition_status,
         routes::pages::history,
         routes::pages::search,
+        routes::pages::search_ranked,
         routes::collections::list,
         routes::collections::new_form,
         routes::collections::create,

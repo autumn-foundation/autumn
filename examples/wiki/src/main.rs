@@ -15,6 +15,7 @@ const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 async fn main() {
     autumn_web::app()
         .migrations(MIGRATIONS)
+        .plugin(wiki::search_plugin())
         .routes(wiki::all_routes())
         .static_routes(static_routes![wiki::routes::docs::show])
         .run()
