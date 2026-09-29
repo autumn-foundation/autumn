@@ -808,3 +808,29 @@ fn structural_overhead_counts_domain_index_entries() {
     assert_eq!(structural.resident_cells, ids.len());
     assert_eq!(structural.tenant_id_capacity_bytes, 3 * id_bytes);
 }
+
+/// Regression: under a stream of one-off, request-controlled tenant ids with a
+/// bounded resident cache, dead domain-index entries must be swept rather than
+/// accumulating one owned key per id forever. Live evicted domains survive.
+#[test]
+fn domain_index_stays_bounded_under_tenant_churn() {
+    let registry = TenantCellRegistry::with_limits(1, None);
+    let live = registry.get_or_create("live", 1_000);
+    let evicted = registry.evict("live").expect("live tenant was resident");
+
+    for i in 0..10_000 {
+        drop(registry.get_or_create(&format!("one-off-{i}"), 1_000));
+    }
+    assert!(
+        registry.accounting_domain_count() <= 256,
+        "dead domains must be swept: {} indexed",
+        registry.accounting_domain_count()
+    );
+
+    // The evicted-but-live domain was never swept: re-creation rejoins it.
+    let charge = live.try_charge(600).expect("fits");
+    let rejoined = registry.get_or_create("live", 1_000);
+    assert_eq!(rejoined.tracked_bytes(), 600);
+    drop(charge);
+    drop((live, evicted, rejoined));
+}

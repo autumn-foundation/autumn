@@ -207,6 +207,10 @@ impl std::error::Error for TenantAllocationError {
     }
 }
 
+/// Minimum domain-index size before a dead-entry sweep runs, so a small
+/// registry never pays for one.
+const DOMAIN_SWEEP_FLOOR: usize = 64;
+
 /// Fixed bytes charged per scratch entry to cover the map's per-entry overhead:
 /// the `String` and `Vec` structs stored inline in the bucket array plus an
 /// amortized bucket slot / control byte. Charging this bounds the *number* of
@@ -718,6 +722,12 @@ struct RegistryInner {
     /// Re-creation for the same tenant upgrades this entry instead of minting a
     /// zero-usage generation that could admit a second full quota.
     domains: Mutex<HashMap<String, Weak<TenantCellInner>>>,
+    /// Domain-index size at which the next dead-entry sweep runs. Only read and
+    /// written under the `domains` lock; see [`DOMAIN_SWEEP_FLOOR`].
+    domain_sweep_at: AtomicUsize,
+    /// High-water backing-bucket estimate for the domain index, for the same
+    /// reason as `registry_bucket_high_water`.
+    domain_bucket_high_water: AtomicUsize,
     /// High-water backing-bucket estimate. Removing entries can consume
     /// tombstones and lower `HashMap::capacity()` without shrinking its backing
     /// allocation, so the current capacity alone is insufficient.
@@ -772,6 +782,8 @@ impl TenantCellRegistry {
             inner: Arc::new(RegistryInner {
                 cells: RwLock::new(HashMap::new()),
                 domains: Mutex::new(HashMap::new()),
+                domain_sweep_at: AtomicUsize::new(DOMAIN_SWEEP_FLOOR),
+                domain_bucket_high_water: AtomicUsize::new(0),
                 registry_bucket_high_water: AtomicUsize::new(0),
                 global_tracked: Arc::new(AtomicUsize::new(0)),
                 max_cells,
@@ -897,12 +909,17 @@ impl TenantCellRegistry {
             }
             let cell = live_domain.map_or_else(
                 || {
+                    self.sweep_dead_domains_locked(&mut domains);
                     let cell = Arc::new(TenantCell::new(
                         tenant_id.to_string(),
                         quota_bytes,
                         Arc::clone(&self.inner.global_tracked),
                     ));
                     domains.insert(tenant_id.to_string(), Arc::downgrade(&cell.inner));
+                    self.inner.domain_bucket_high_water.fetch_max(
+                        Self::estimated_bucket_count(domains.capacity()),
+                        Ordering::Relaxed,
+                    );
                     cell
                 },
                 |inner| {
@@ -1098,9 +1115,9 @@ impl TenantCellRegistry {
             .filter_map(|id| domains.get_key_value(id.as_str()))
             .map(|(key, _)| key.capacity())
             .collect();
-        // Current capacity (not a high-water mark) is a lower bound on the
-        // domain index's backing buckets.
-        let domain_bucket_count = Self::estimated_bucket_count(domains.capacity());
+        // Sweeps lower the index's `capacity()` without shrinking its
+        // allocation, so read the high-water mark inserts maintain.
+        let domain_bucket_count = self.inner.domain_bucket_high_water.load(Ordering::Relaxed);
         let domain_bucket_bytes = domain_bucket_count.saturating_sub(domains.len())
             * std::mem::size_of::<DomainEntry>()
             + domain_bucket_count;
@@ -1149,6 +1166,42 @@ impl TenantCellRegistry {
             registry_bucket_bytes,
             total_bytes,
         }
+    }
+
+    /// Drop dead entries from the domain index once it has doubled since the
+    /// last sweep.
+    ///
+    /// A stream of distinct, request-controlled tenant ids would otherwise
+    /// leave one dead `Weak` and owned key per id forever, since a stale entry
+    /// is only removed when that same id is requested again. Sweeping when the
+    /// index reaches twice its post-sweep size keeps it within a constant
+    /// factor of the live domains while costing amortized O(1) per insert — a
+    /// sweep on every miss would be quadratic under churn. Must be called with
+    /// the `domains` lock held.
+    fn sweep_dead_domains_locked(&self, domains: &mut HashMap<String, Weak<TenantCellInner>>) {
+        if domains.len() < self.inner.domain_sweep_at.load(Ordering::Relaxed) {
+            return;
+        }
+        domains.retain(|_, domain| domain.strong_count() > 0);
+        self.inner.domain_sweep_at.store(
+            domains.len().saturating_mul(2).max(DOMAIN_SWEEP_FLOOR),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Number of accounting domains the registry still indexes: every resident
+    /// cell, every evicted-but-live domain, and dead entries not yet swept.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the domain index lock is poisoned.
+    #[must_use]
+    pub fn accounting_domain_count(&self) -> usize {
+        self.inner
+            .domains
+            .lock()
+            .expect("tenant cell domain index lock poisoned")
+            .len()
     }
 
     /// Convert std's effective element capacity into the current `SwissTable`

@@ -196,9 +196,12 @@ does **not** reset that request's state or hand it a fresh empty cell: the
   its memory reclaiming on drop, and the eviction takes effect for subsequent
   requests. If a subsequent request arrives before those references drop, it
   rebinds the still-live accounting domain and observes its usage; eviction
-  cannot reset the counter or permit overlapping full-quota generations. The
-  registry also exposes `len()`, `is_empty()`, and
-`total_tracked_bytes()` for observability.
+  cannot reset the counter or permit overlapping full-quota generations.
+  Index entries for domains whose every handle has dropped are swept once the
+  index has doubled since the last sweep (amortized O(1) per new tenant), so a
+  stream of one-off, request-controlled tenant ids cannot grow it without
+  bound. The registry also exposes `len()`, `is_empty()`,
+  `accounting_domain_count()`, and `total_tracked_bytes()` for observability.
 
 ### Resident-cell structural overhead
 
@@ -212,19 +215,22 @@ every entry.
 
 The lower-bound estimate sums the current platform's `size_of` layouts for `TenantCell` and
 `TenantCellInner` (including atomics, the scratch-map header, and mutex), both
-per-cell `Arc` counter headers, occupied registry entries, both tenant-id
-allocation capacities, and amortized spare registry buckets plus control bytes.
+per-cell `Arc` counter headers, occupied registry entries plus each resident
+cell's accounting-domain index entry, all three tenant-id allocation capacities
+(registry key, domain-index key, and the cell's own id), and amortized spare
+buckets plus control bytes for both the registry and the domain index.
 Because `HashMap::capacity()` is an **element capacity**, not a bucket count,
 the model rounds it up to the current SwissTable implementation's power-of-two
 backing bucket count. For this workload that means 1,792 elements map to 2,048
 buckets, including the load-factor-reserved slots. The registry retains that
-bucket estimate as a high-water mark: removals can consume tombstones and lower
+bucket estimate as a high-water mark for each map: removals (and dead
+domain-index sweeps) can consume tombstones and lower
 the map's reported element capacity without shrinking its backing allocation,
 so recomputing solely from the current capacity would undercount churned
 registries.
 It also reports the one-off registry allocation separately. On 64-bit Linux,
-the 1,000-cell smoke test currently measures **257 lower-bound structural bytes
-per cell** plus a **168-byte one-off registry structure** (257,752 bytes total);
+the 1,000-cell smoke test currently measures **336 lower-bound structural bytes
+per cell** plus a **240-byte one-off registry structure** (336,408 bytes total);
 run the
 following command to reproduce the exact number for a toolchain/platform:
 
