@@ -1205,6 +1205,7 @@ fn check_derivation_name(key: &syn::Ident, value: &str) -> syn::Result<()> {
 }
 
 /// Parse one `#[derivation(Parent, ...)]` attribute body.
+#[allow(clippy::too_many_lines)]
 fn parse_derivation_attr(attr: &syn::Attribute) -> syn::Result<DerivationDecl> {
     use syn::parse::ParseStream;
 
@@ -3637,7 +3638,7 @@ fn emit_association_items(
 /// `reaction_of`'s target probe) gain a second, tenant-filtered arm, selected
 /// at runtime from `M2mConnSource::__autumn_m2m_tenant_scope()`. A model
 /// without the column emits none of it and is byte-for-byte unchanged.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn emit_votable_items(
     model_ident: &syn::Ident,
     table_ident: &syn::Ident,
