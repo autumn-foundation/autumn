@@ -158,7 +158,7 @@ pub fn write_owner_only(path: &Path, data: &[u8]) -> std::io::Result<()> {
 pub async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> std::io::Result<T> + Send + 'static,
 ) -> std::io::Result<T> {
-    match tokio::task::spawn_blocking(f).await {
+    match crate::time::spawn_blocking(f).await {
         Ok(result) => result,
         Err(join_error) => Err(std::io::Error::other(join_error)),
     }
