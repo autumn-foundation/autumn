@@ -192,13 +192,61 @@ fn launch_editor(
     editor: &str,
     file: &std::path::Path,
 ) -> std::io::Result<std::process::ExitStatus> {
-    let mut parts = editor.split_whitespace();
-    let program = parts.next().unwrap_or("vi");
-    let extra_args: Vec<&str> = parts.collect();
+    let (program, extra_args) = parse_editor_command(editor).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("could not parse editor command {editor:?} (unbalanced quotes?)"),
+        )
+    })?;
     std::process::Command::new(program)
         .args(extra_args)
         .arg(file)
         .status()
+}
+
+/// Split an `$VISUAL` / `$EDITOR` value into the program and its arguments.
+///
+/// Naive whitespace splitting runs the wrong binary when the editor path
+/// contains a space (`C:\Program Files\Editor\edit.exe` would execute
+/// `C:\Program`), so:
+///
+/// - a value that names an existing file is the program verbatim, spaces and
+///   all, with no extra arguments;
+/// - on Unix the value is split with POSIX shell quoting rules (`shlex`), so
+///   `"/opt/my editor/bin/ed" --wait` resolves to the quoted path;
+/// - on Windows (where `\` is a path separator, not an escape) a leading
+///   double-quoted segment is the program and the rest is split on whitespace.
+///
+/// Returns `None` for an empty command or unbalanced quotes, so the caller
+/// refuses to launch rather than guessing.
+fn parse_editor_command(editor: &str) -> Option<(String, Vec<String>)> {
+    let trimmed = editor.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if std::path::Path::new(trimmed).is_file() {
+        return Some((trimmed.to_owned(), Vec::new()));
+    }
+    let mut parts = split_editor_words(trimmed)?.into_iter();
+    let program = parts.next()?;
+    Some((program, parts.collect()))
+}
+
+#[cfg(not(windows))]
+fn split_editor_words(editor: &str) -> Option<Vec<String>> {
+    shlex::split(editor)
+}
+
+#[cfg(windows)]
+fn split_editor_words(editor: &str) -> Option<Vec<String>> {
+    if let Some(rest) = editor.strip_prefix('"') {
+        let (program, args) = rest.split_once('"')?;
+        let mut words = vec![program.to_owned()];
+        words.extend(args.split_whitespace().map(str::to_owned));
+        Some(words)
+    } else {
+        Some(editor.split_whitespace().map(str::to_owned).collect())
+    }
 }
 
 fn zero_file(path: &PathBuf) {
@@ -280,6 +328,46 @@ mod tests {
                 assert_eq!(editor, "vi");
             }
         });
+    }
+
+    #[test]
+    fn parse_editor_command_splits_program_and_arguments() {
+        assert_eq!(
+            parse_editor_command("code --wait"),
+            Some(("code".to_owned(), vec!["--wait".to_owned()]))
+        );
+    }
+
+    #[test]
+    fn parse_editor_command_rejects_empty_and_unbalanced_values() {
+        assert_eq!(parse_editor_command(""), None);
+        assert_eq!(parse_editor_command("   "), None);
+        assert_eq!(parse_editor_command("\"/opt/my editor --wait"), None);
+    }
+
+    #[test]
+    fn parse_editor_command_keeps_quoted_program_with_spaces_whole() {
+        assert_eq!(
+            parse_editor_command("\"/opt/my editor/bin/ed\" --wait"),
+            Some((
+                "/opt/my editor/bin/ed".to_owned(),
+                vec!["--wait".to_owned()]
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_editor_command_treats_existing_path_with_spaces_as_program() {
+        // Regression: `split_whitespace` turned `<dir>/my editor` into the
+        // program `<dir>/my`, running a different binary than the user named.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("my editor");
+        std::fs::write(&path, b"").unwrap();
+        let editor = path.to_str().unwrap();
+        assert_eq!(
+            parse_editor_command(editor),
+            Some((editor.to_owned(), Vec::new()))
+        );
     }
 
     #[test]
