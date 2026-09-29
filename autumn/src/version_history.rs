@@ -47,6 +47,14 @@
 //! Test-fixture teardown uses `VersionHistoryStore::__test_clear_for_record`,
 //! which is **not** part of the stable public API.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -668,12 +676,7 @@ pub async fn append_version_history(
     {
         use diesel::sql_types::TimestamptzSqlite;
 
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "no AppState is reachable here to consult the injected clock (autumn #1797); \
-                      this preserves the generated code's previous behaviour verbatim"
-        )]
-        let recorded_at = Utc::now();
+        let recorded_at = crate::time::ambient_now();
 
         diesel::sql_query(SQLITE_INSERT_SQL)
             .bind::<Text, _>(write.table_name)

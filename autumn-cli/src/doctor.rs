@@ -2004,6 +2004,158 @@ pub fn check_custom_domain_dns_impl(probe: &CustomDomainProbe) -> CheckResult {
     }
 }
 
+/// What `autumn doctor` read at a pending domain's ownership TXT record
+/// (#2642).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustomDomainTxt {
+    /// A resolver saw this registration's token.
+    Present,
+    /// Resolvers answered, and no TXT value is published.
+    Missing,
+    /// Resolvers answered with TXT values, none of them this registration's
+    /// token.
+    Stale {
+        /// How many values were seen.
+        values: usize,
+    },
+    /// No resolver answered.
+    Unanswerable(String),
+}
+
+/// One pending domain's ownership record, for [`check_custom_domain_txt_impl`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomDomainOwnershipProbe {
+    /// The registered hostname.
+    pub hostname: String,
+    /// The tenant it belongs to.
+    pub tenant: String,
+    /// The registration's token.
+    pub token: String,
+    /// What the TXT lookup found.
+    pub txt: CustomDomainTxt,
+}
+
+/// Grade TXT answers from several resolvers against `token` (pure).
+///
+/// The runtime passes a domain when ANY server shows the token, so doctor
+/// does the same: one stale cache must not read as a missing record.
+#[must_use]
+pub fn grade_custom_domain_txt(
+    token: &str,
+    answers: &[Result<Vec<String>, String>],
+) -> CustomDomainTxt {
+    let mut last_error = "no resolvers are configured".to_owned();
+    let mut answered = false;
+    let mut values = 0;
+    for answer in answers {
+        match answer {
+            Ok(seen) if seen.iter().any(|v| v.trim() == token) => return CustomDomainTxt::Present,
+            Ok(seen) => {
+                answered = true;
+                values = values.max(seen.len());
+            }
+            Err(e) => last_error.clone_from(e),
+        }
+    }
+    match (answered, values) {
+        (false, _) => CustomDomainTxt::Unanswerable(last_error),
+        (true, 0) => CustomDomainTxt::Missing,
+        (true, values) => CustomDomainTxt::Stale { values },
+    }
+}
+
+/// Grade one pending domain's ownership TXT record (pure; injectable).
+///
+/// A separate check from `custom_domain_dns`, so an operator can tell "the
+/// address record is wrong" from "the address is right, the TXT token is
+/// missing or stale". Each is a Warn: a pending domain is expected to be
+/// incomplete for a while.
+#[must_use]
+pub fn check_custom_domain_txt_impl(probe: &CustomDomainOwnershipProbe) -> CheckResult {
+    let CustomDomainOwnershipProbe {
+        hostname,
+        tenant,
+        token,
+        txt,
+    } = probe;
+    let record = autumn_web::custom_domain::verification_record_name(hostname);
+    let publish = "Publish the TXT record from the domain's DNS instructions; the address record \
+                   alone does not verify a domain";
+    match txt {
+        CustomDomainTxt::Present => CheckResult {
+            name: "custom_domain_txt",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "{record} carries the ownership token for {hostname} (tenant {tenant})"
+            )),
+            hint: None,
+        },
+        CustomDomainTxt::Missing => CheckResult {
+            name: "custom_domain_txt",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "{hostname} (tenant {tenant}) is pending_dns: its ownership TXT record is not \
+                 published. Expected `{record}` TXT `{token}`"
+            )),
+            hint: Some(publish),
+        },
+        CustomDomainTxt::Stale { values } => CheckResult {
+            name: "custom_domain_txt",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "{hostname} (tenant {tenant}) is pending_dns: {record} carries {values} value(s), \
+                 none of them this registration's token `{token}`. A token from an earlier \
+                 registration proves nothing for this one"
+            )),
+            hint: Some(publish),
+        },
+        CustomDomainTxt::Unanswerable(reason) => CheckResult {
+            name: "custom_domain_txt",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "cannot read {record} for {hostname} (tenant {tenant}): {reason}"
+            )),
+            hint: Some(
+                "Check [server.tls.acme.custom_domains] resolvers and that outbound DNS (UDP/53) \
+                 is allowed",
+            ),
+        },
+    }
+}
+
+/// Read `hostname`'s ownership TXT record the way the runtime does, and grade
+/// it against `token`.
+///
+/// Uses the runtime's lookup: the zone's authoritative servers too, not only
+/// `resolvers`. A recursive resolver can cache a negative answer from before
+/// the tenant published, and doctor must not warn about a record the runtime
+/// already sees.
+#[cfg(feature = "tls")]
+#[must_use]
+pub fn resolve_custom_domain_txt(
+    hostname: &str,
+    token: &str,
+    resolvers: &[std::net::SocketAddr],
+) -> CustomDomainTxt {
+    use autumn_web::acme::dns::resolver::{UdpDnsLookup, txt_values};
+
+    let record = autumn_web::custom_domain::verification_record_name(hostname);
+    let lookup = UdpDnsLookup::new(std::time::Duration::from_secs(3));
+    let answer = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(txt_values(
+            &record,
+            resolvers,
+            &lookup,
+            std::time::Duration::from_secs(6),
+        )),
+        Err(e) => Err(format!("could not start a runtime for the TXT lookup: {e}")),
+    };
+    grade_custom_domain_txt(token, &[answer])
+}
+
 /// Grade port 80 on one ingress target, for tenant custom domains.
 ///
 /// Deliberately independent of the deployment certificate's challenge mode.
@@ -2143,7 +2295,11 @@ pub fn resolve_custom_domain_dns(
     // that prose is reworded.
     let verdict = grade_dns_verification(&ObservedTarget::Addresses(observed.clone()), &expected);
     match verdict {
-        VerificationOutcome::PointsHere => CustomDomainDns::PointsHere,
+        // The address grader never returns `OwnershipUnproven`; the TXT token
+        // is graded by `custom_domain_txt`.
+        VerificationOutcome::PointsHere | VerificationOutcome::OwnershipUnproven { .. } => {
+            CustomDomainDns::PointsHere
+        }
         VerificationOutcome::Unresolved => CustomDomainDns::Unresolved,
         VerificationOutcome::PointsElsewhere { .. } => CustomDomainDns::PointsElsewhere {
             seen: observed
@@ -2178,7 +2334,7 @@ fn resolve_addresses(host: &str) -> Vec<std::net::IpAddr> {
 
 /// Read the custom-domain registry off disk, where the runtime store writes it.
 ///
-/// Returns `(hostname, tenant, status)` per record, sorted. A file that will
+/// Returns `(hostname, tenant, status, token)` per record, sorted. A file that will
 /// not parse is skipped — the same treatment the runtime store gives it — so
 /// one corrupt record does not blind the check to the rest.
 #[must_use]
@@ -2214,6 +2370,7 @@ pub fn read_custom_domain_registry(store_dir: &std::path::Path) -> CustomDomainR
                 domain.hostname,
                 domain.tenant,
                 domain.status.as_str().to_owned(),
+                domain.verification_token,
             )),
             // The runtime skips a record it cannot read and serves the rest, so
             // doctor counts it rather than failing the run over it.
@@ -2232,8 +2389,9 @@ pub fn read_custom_domain_registry(store_dir: &std::path::Path) -> CustomDomainR
 /// the runtime skips, serving the rest).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CustomDomainRegistryRead {
-    /// `(hostname, tenant, status)` per readable record, sorted.
-    pub domains: Vec<(String, String, String)>,
+    /// `(hostname, tenant, status, ownership token)` per readable record,
+    /// sorted. The token is `None` on a record stored before tokens existed.
+    pub domains: Vec<(String, String, String, Option<String>)>,
     /// Why the directory could not be enumerated, if it could not.
     pub unreadable: Option<String>,
     /// Records that could not be read or parsed, one message each.
@@ -4073,20 +4231,46 @@ pub fn check_rust_toolchain_impl(current_output: &str, required: &str) -> CheckR
 // ─── IO-dependent checks ──────────────────────────────────────────────────────
 
 fn check_rust_toolchain(msrv: &str) -> CheckResult {
-    match std::process::Command::new("rustc")
-        .arg("--version")
-        .output()
-    {
+    // `rustc` is rustup's shim, and doctor runs its checks at the same time. If
+    // the project pins a toolchain this machine lacks, rustup errors instead of
+    // installing it: concurrent installs leave a toolchain half-installed.
+    let mut rustc = std::process::Command::new("rustc");
+    rustc.arg("--version");
+    crate::deps::no_toolchain_installs(&mut rustc);
+    match rustc.output() {
         Ok(out) if out.status.success() => {
             let ver = String::from_utf8_lossy(&out.stdout).into_owned();
             check_rust_toolchain_impl(ver.trim(), msrv)
         }
-        _ => CheckResult {
+        Ok(out) => rust_toolchain_failure(&String::from_utf8_lossy(&out.stderr)),
+        Err(_) => CheckResult {
             name: "rust_toolchain",
             status: CheckStatus::Fail,
             detail: Some("`rustc --version` failed".into()),
             hint: Some("Install Rust via https://rustup.rs/"),
         },
+    }
+}
+
+/// The `rust_toolchain` result when `rustc --version` exits non-zero.
+///
+/// Rust can be installed while the project's pinned toolchain is not: rustup
+/// then says "toolchain '…' is not installed". That needs `rustup toolchain
+/// install`, not a fresh Rust install.
+fn rust_toolchain_failure(stderr: &str) -> CheckResult {
+    let reason = stderr.lines().map(str::trim).find(|line| !line.is_empty());
+    CheckResult {
+        name: "rust_toolchain",
+        status: CheckStatus::Fail,
+        detail: Some(reason.map_or_else(
+            || "`rustc --version` failed".to_owned(),
+            |reason| format!("`rustc --version` failed: {reason}"),
+        )),
+        hint: Some(if stderr.contains("is not installed") {
+            "Run `rustup toolchain install` in this project to install its pinned toolchain"
+        } else {
+            "Install Rust via https://rustup.rs/"
+        }),
     }
 }
 
@@ -4224,13 +4408,44 @@ fn tailwind_file_is_executable(_path: &std::path::Path, _metadata: &std::fs::Met
 }
 
 fn check_tailwind_binary() -> CheckResult {
-    let path = if cfg!(windows) {
-        std::path::PathBuf::from("target/autumn/tailwindcss.exe")
-    } else {
-        std::path::PathBuf::from("target/autumn/tailwindcss")
+    // Resolve the SAME `<target_dir>/autumn` directory `autumn setup` writes
+    // to and `autumn dev`/the scaffold's `build.rs` read from (issue #2457):
+    // a `target`-relative literal reports the binary missing whenever
+    // `CARGO_TARGET_DIR` points elsewhere, even though `setup` put it exactly
+    // where `dev` expects it. Tolerant, not `resolve_target_directory`'s
+    // hard-exit form: one unreadable check must not abort every other check
+    // `doctor` still has to report.
+    let binary = |target_dir: std::path::PathBuf| {
+        target_dir.join("autumn").join(if cfg!(windows) {
+            "tailwindcss.exe"
+        } else {
+            "tailwindcss"
+        })
     };
+    crate::dev::try_resolve_target_directory().map_or_else(tailwind_not_evaluated, |target_dir| {
+        check_tailwind_binary_at(&binary(target_dir))
+    })
+}
 
-    check_tailwind_binary_at(&path)
+/// The Tailwind check when `cargo metadata` could not name the target
+/// directory, for example because the pinned toolchain is not installed.
+///
+/// Any path doctor picked instead would be a guess: Cargo also reads
+/// `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR` and `[build] target-dir` from
+/// every `.cargo/config.toml` up the tree. Whatever is or is not at a guessed
+/// path says nothing about the binary `autumn setup` installed, so the check
+/// is not evaluated.
+fn tailwind_not_evaluated() -> CheckResult {
+    CheckResult {
+        name: "tailwind_binary",
+        status: CheckStatus::Pass,
+        detail: Some(
+            "not evaluated — `cargo metadata` could not name the target directory".to_owned(),
+        ),
+        hint: Some(
+            "Fix what stops `cargo metadata` (see the `rust_toolchain` check), then run `autumn doctor` again",
+        ),
+    }
 }
 
 fn check_stale_artifacts() -> CheckResult {
@@ -9829,6 +10044,11 @@ pub fn run(opts: DoctorOptions) {
                     .chain(ing.ipv6.iter().map(ToString::to_string))
                     .collect()
             });
+            #[cfg(feature = "tls")]
+            let txt_resolvers = cd_cfg
+                .as_ref()
+                .and_then(|cd| cd.resolver_addrs().ok())
+                .unwrap_or_default();
             let registry_read = registered.clone();
             tasks.push(Box::new(move || {
                 check_custom_domains_config_impl(
@@ -9861,11 +10081,31 @@ pub fn run(opts: DoctorOptions) {
                 // The ingress every registered domain is graded against — the
                 // deployment's, not this CLI host's.
                 let probe_ingress = cd_ingress.unwrap_or_default();
-                for (index, (hostname, tenant, status)) in registered
+                for (index, (hostname, tenant, status, token)) in registered
                     .into_iter()
                     .take(MAX_CUSTOM_DOMAIN_PROBES)
                     .enumerate()
                 {
+                    // A pending domain also needs its ownership TXT token
+                    // (#2642). A settled one proved it already, and a record
+                    // with no token is either grandfathered or given one at
+                    // the next start.
+                    #[cfg(feature = "tls")]
+                    if let (Some(token), "pending_dns") = (token, status.as_str()) {
+                        let (hostname, tenant) = (hostname.clone(), tenant.clone());
+                        let resolvers = txt_resolvers.clone();
+                        tasks.push(Box::new(move || {
+                            let txt = resolve_custom_domain_txt(&hostname, &token, &resolvers);
+                            check_custom_domain_txt_impl(&CustomDomainOwnershipProbe {
+                                hostname,
+                                tenant,
+                                token,
+                                txt,
+                            })
+                        }));
+                    }
+                    #[cfg(not(feature = "tls"))]
+                    let _ = token;
                     let probe_ingress = probe_ingress.clone();
                     tasks.push(Box::new(move || {
                         let dns = resolve_custom_domain_dns(&hostname, &probe_ingress);
@@ -13898,6 +14138,7 @@ pub struct Vault {
                         format!("d{i}.clientco.com"),
                         "tenant-a".to_owned(),
                         "active".to_owned(),
+                        None,
                     )
                 })
                 .collect(),
@@ -14230,6 +14471,54 @@ pub struct Vault {
         );
     }
 
+    // #2642: a pending domain's TXT token is graded apart from its address.
+    #[test]
+    fn the_txt_grader_tells_missing_from_stale_from_present() {
+        let ok = |values: &[&str]| Ok(values.iter().map(|v| (*v).to_owned()).collect());
+        assert_eq!(
+            grade_custom_domain_txt("tok", &[Err("timeout".to_owned()), ok(&["tok"])]),
+            CustomDomainTxt::Present
+        );
+        assert_eq!(
+            grade_custom_domain_txt("tok", &[ok(&[])]),
+            CustomDomainTxt::Missing
+        );
+        assert_eq!(
+            grade_custom_domain_txt("tok", &[ok(&["old-token"]), ok(&[])]),
+            CustomDomainTxt::Stale { values: 1 }
+        );
+        assert_eq!(
+            grade_custom_domain_txt("tok", &[Err("REFUSED".to_owned())]),
+            CustomDomainTxt::Unanswerable("REFUSED".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_txt_check_names_the_record_and_the_token_to_publish() {
+        let probe = |txt| CustomDomainOwnershipProbe {
+            hostname: "app.clientco.com".to_owned(),
+            tenant: "tenant-b".to_owned(),
+            token: "tok".to_owned(),
+            txt,
+        };
+        let present = check_custom_domain_txt_impl(&probe(CustomDomainTxt::Present));
+        assert_eq!(present.name, "custom_domain_txt");
+        assert_eq!(present.status, CheckStatus::Pass);
+
+        let missing = check_custom_domain_txt_impl(&probe(CustomDomainTxt::Missing));
+        assert_eq!(missing.status, CheckStatus::Warn);
+        let detail = missing.detail.unwrap();
+        assert!(detail.contains("not published"), "{detail}");
+        assert!(
+            detail.contains("`_autumn-challenge.app.clientco.com` TXT `tok`"),
+            "{detail}"
+        );
+
+        let stale = check_custom_domain_txt_impl(&probe(CustomDomainTxt::Stale { values: 1 }));
+        assert_eq!(stale.status, CheckStatus::Warn);
+        assert!(stale.detail.unwrap().contains("earlier registration"));
+    }
+
     #[test]
     fn the_registry_reader_skips_unreadable_records_and_sorts() {
         let dir = tempfile::tempdir().unwrap();
@@ -14272,6 +14561,8 @@ pub struct Vault {
         );
         assert_eq!(records[0].0, "a.clientco.com");
         assert_eq!(records[1].0, "b.clientco.com");
+        // Records from before #2642 carry no token.
+        assert_eq!(records[0].3, None);
     }
 
     #[test]
@@ -17685,6 +17976,68 @@ foo = "bar"
         assert!(r.detail.as_deref().unwrap_or("").contains("8080"));
     }
 
+    // ── no toolchain installs ────────────────────────────────────────────────
+
+    /// The body of the first `fn` whose signature starts with `signature`.
+    /// Line endings are normalized first: a Windows checkout has CRLF.
+    fn fn_body(source: &str, signature: &str) -> String {
+        let source = source.replace("\r\n", "\n");
+        let start = source.find(signature).expect("function present");
+        let end = source[start..].find("\n}\n").expect("function end");
+        source[start..start + end].to_owned()
+    }
+
+    #[test]
+    fn fn_body_reads_a_crlf_checkout() {
+        let source = "fn a() {\r\n    body();\r\n}\r\nfn b() {}\r\n";
+        assert_eq!(fn_body(source, "fn a("), "fn a() {\n    body();");
+    }
+
+    #[test]
+    fn doctor_checks_never_make_rustup_install_a_toolchain() {
+        // Regression, caught by the Windows Tier 1 journey: doctor runs its
+        // checks at the same time, and `rustc`/`cargo` there are rustup's shims,
+        // which install the project's pinned toolchain on first use. Several
+        // checks installing it at once left it half-installed, and the next
+        // `cargo` failed with "the 'cargo.exe' binary ... is not applicable to
+        // the '1.88.0' toolchain". A check must not install anything.
+        let doctor = include_str!("doctor.rs");
+        assert!(
+            fn_body(doctor, "fn check_rust_toolchain(msrv").contains("no_toolchain_installs(&mut"),
+            "the rust_toolchain check must forbid a toolchain install"
+        );
+        let dev = include_str!("dev.rs");
+        assert!(
+            fn_body(dev, "pub fn try_resolve_target_directory(")
+                .contains("no_toolchain_installs(&mut"),
+            "doctor's target-dir lookup must forbid a toolchain install"
+        );
+    }
+
+    #[test]
+    fn a_missing_pinned_toolchain_points_at_rustup_toolchain_install() {
+        let r = rust_toolchain_failure(
+            "error: toolchain '1.88.0-x86_64-pc-windows-msvc' is not installed\n\
+             help: run `rustup toolchain install` to install it\n",
+        );
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert_eq!(
+            r.detail.as_deref(),
+            Some(
+                "`rustc --version` failed: error: toolchain \
+                 '1.88.0-x86_64-pc-windows-msvc' is not installed"
+            )
+        );
+        assert!(r.hint.expect("a hint").contains("rustup toolchain install"));
+    }
+
+    #[test]
+    fn any_other_rustc_failure_still_points_at_installing_rust() {
+        let r = rust_toolchain_failure("");
+        assert_eq!(r.detail.as_deref(), Some("`rustc --version` failed"));
+        assert_eq!(r.hint, Some("Install Rust via https://rustup.rs/"));
+    }
+
     // ── check_rust_toolchain_impl ────────────────────────────────────────────
 
     #[test]
@@ -19908,6 +20261,16 @@ foo = "bar"
             r.detail.as_deref().unwrap_or("").contains("directory"),
             "detail should identify directory path, got {r:?}"
         );
+    }
+
+    #[test]
+    fn an_unknown_target_dir_leaves_the_tailwind_check_unevaluated() {
+        // `cargo metadata` gave no answer, so doctor does not know where Cargo
+        // builds. It must not judge the binary at any guessed path.
+        let r = tailwind_not_evaluated();
+        assert_eq!(r.status, CheckStatus::Pass);
+        let detail = r.detail.expect("a detail");
+        assert!(detail.contains("not evaluated"), "{detail}");
     }
 
     #[test]

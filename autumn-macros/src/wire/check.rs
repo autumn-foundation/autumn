@@ -247,7 +247,10 @@ mod tests {
             vec![ViolationKind::RequestFieldMissing("sku".to_owned())]
         );
         // Naming it at the call site settles it.
-        assert!(check(&site(&["id"], Some(&["name", "sku"])), &e).is_empty());
+        assert_eq!(
+            check(&site(&["id"], Some(&["name", "sku"])), &e),
+            [] as [Violation; 0]
+        );
     }
 
     /// `#[serde(skip_serializing)]` on a field the callee requires: the request

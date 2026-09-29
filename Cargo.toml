@@ -1,5 +1,5 @@
 [workspace]
-members = ["autumn", "autumn-macros", "autumn-cli", "autumn-schema-core", "autumn-admin-plugin", "autumn-media-plugin", "autumn-storage-s3", "autumn-cache-redis", "autumn-search", "autumn-edge", "autumn-plugin-reference", "autumn-billing", "examples/hello", "examples/edge-greeting", "examples/hot-upgrade", "examples/flock", "examples/todo-app", "examples/collab-notes", "examples/blog", "examples/cms", "examples/bookmarks", "examples/bookmarks-distributed", "examples/bookmarks-sharded", "examples/wiki", "examples/reddit-clone", "examples/saas", "examples/teams", "examples/media-room", "examples/invoice", "examples/react-graphql", "examples/mesh-catalog", "examples/mesh-storefront", "benchmarks/runtime/gate", "example-e2e"]
+members = ["autumn", "autumn-macros", "autumn-macros-model", "autumn-macros-repository", "autumn-macros-support", "autumn-cli", "autumn-schema-core", "autumn-admin-plugin", "autumn-media-plugin", "autumn-storage-s3", "autumn-cache-redis", "autumn-search", "autumn-edge", "autumn-plugin-reference", "autumn-billing", "examples/hello", "examples/edge-greeting", "examples/hot-upgrade", "examples/flock", "examples/todo-app", "examples/collab-notes", "examples/blog", "examples/cms", "examples/bookmarks", "examples/bookmarks-distributed", "examples/bookmarks-sharded", "examples/wiki", "examples/reddit-clone", "examples/saas", "examples/teams", "examples/media-room", "examples/invoice", "examples/react-graphql", "examples/mesh-catalog", "examples/mesh-storefront", "benchmarks/runtime/gate", "example-e2e"]
 # The cargo-fuzz crate builds only under nightly with sanitizers and pulls
 # `autumn` in as a path dependency. Excluding it keeps `cargo build/test
 # --workspace` (and the publish gate) untouched; `fuzz/Cargo.toml` is also its
@@ -68,6 +68,12 @@ rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"]
 socket2 = { version = "0.6", features = ["all"] }
 diesel = { version = "2", features = ["sqlite", "postgres"] }
 pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
+# Hold the bundled libpq source below 0.3.12. `pq-src` 0.3.12 (libpq 18.6)
+# calls `timingsafe_bcmp`, which glibc does not have, so every binary that
+# links it fails with an undefined symbol. Remove this pin when a fixed
+# release is out. `pq-sys` (below `autumn-web`'s `db` feature) accepts
+# `>=0.2, <0.4`, so the pin changes no other crate.
+pq-src = { version = ">=0.3, <0.3.12", default-features = false }
 # `async-connection-wrapper` provides the sync diesel API (incl. running
 # diesel_migrations) over an async connection — used to run startup
 # migrations and wait checks through the rustls TLS connector, since the

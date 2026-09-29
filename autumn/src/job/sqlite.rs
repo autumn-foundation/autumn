@@ -341,7 +341,66 @@ pub(super) async fn ensure_schema(pool: &SqlitePool) -> AutumnResult<()> {
             "sqlite jobs schema setup failed: {error}"
         )));
     }
+    // A connection the pool opened before this point can hold a cached schema
+    // that predates `idx_autumn_jobs_unique_inflight`. SQLite does not reload
+    // it, so the enqueue upsert cannot resolve its partial-index target and
+    // fails with "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
+    // constraint" — a real failure on a correct database. The tracking store
+    // opens such a connection: it writes the status record before the first
+    // enqueue. Drop every idle connection once, here, so the pool serves only
+    // connections opened after the queue schema exists. This runs once per
+    // process, behind the schema cell.
+    drop(conn);
+    let _ = pool.retain(|_, _| false);
     Ok(())
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::{CountRow, ensure_schema};
+    use crate::config::DatabaseConfig;
+    use crate::db::create_pool;
+    use diesel_async::RunQueryDsl as _;
+
+    /// A connection the app opened before the queue schema existed holds a
+    /// cached schema without `idx_autumn_jobs_unique_inflight`, and `SQLite`
+    /// does not reload it, so the enqueue upsert cannot resolve its
+    /// partial-index target on that connection. `ensure_schema` must therefore
+    /// leave no such connection in the pool.
+    #[tokio::test]
+    async fn ensure_schema_evicts_connections_opened_before_it() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let db = tmp.path().join("jobs.db");
+        let config = DatabaseConfig {
+            url: Some(format!("sqlite://{}", db.display())),
+            ..Default::default()
+        };
+        let pool = create_pool(&config)
+            .expect("the sqlite pool builds")
+            .expect("a url is configured");
+
+        {
+            let mut conn = pool.get().await.expect("a connection");
+            let _: Vec<CountRow> = diesel::sql_query("SELECT 1 AS count")
+                .load(&mut *conn)
+                .await
+                .expect("the connection reads");
+        }
+        assert!(
+            pool.status().available >= 1,
+            "the connection opened above is back in the pool"
+        );
+
+        ensure_schema(&pool)
+            .await
+            .expect("the queue schema is created");
+
+        assert_eq!(
+            pool.status().available,
+            0,
+            "a connection opened before the queue schema must not stay pooled"
+        );
+    }
 }
 
 /// Insert a job row, honoring the declared uniqueness window.
