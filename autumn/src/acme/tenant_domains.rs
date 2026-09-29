@@ -397,7 +397,7 @@ impl PruneOnlyCustomDomainPruner {
     /// can be identified: an id is a hash, so the deployment's own certificate
     /// (and any other) is left alone by construction — we delete only ids that
     /// no longer appear in the registry AND are not the configured cert.
-    fn prune_orphan_certs(&self, dry_run: bool) -> Result<u64, String> {
+    async fn prune_orphan_certs(&self, dry_run: bool) -> Result<u64, String> {
         let Some(fs) = self.cert_store_paths.as_ref() else {
             // A non-filesystem store cannot be enumerated through this seam.
             return Ok(0);
@@ -414,10 +414,24 @@ impl PruneOnlyCustomDomainPruner {
         let stored = fs
             .list_certs()
             .map_err(|e| format!("failed to enumerate stored certificates: {e}"))?;
+        //
+        // The snapshot is the in-memory index AND a fresh read of the store.
+        // The index alone is only as current as this process's own writes: a
+        // one-shot `autumn db retention` loaded it at startup, and a serving
+        // process sharing the store may have registered and issued a hostname
+        // since. Its pair would then be in `stored` while its record is missing
+        // from a stale index, and an active tenant's certificate would be
+        // deleted. A record either view knows keeps its certificate.
+        let fresh = self
+            .registry
+            .stored_records()
+            .await
+            .map_err(|e| format!("failed to re-read the custom-domain registry: {e}"))?;
         let live: std::collections::HashSet<String> = self
             .registry
             .list()
             .into_iter()
+            .chain(fresh)
             .map(|d| cert_id_for(&d.hostname).as_str().to_owned())
             .collect();
         let mut removed = 0;
@@ -469,11 +483,30 @@ impl crate::custom_domain::CustomDomainPruner for PruneOnlyCustomDomainPruner {
                 );
             }
             let mut removed = 0_u64;
+            // What the store holds NOW, not only what this process's index
+            // saw at load: another process sharing the store (a serving app
+            // while a one-shot `autumn db retention` runs) may have verified
+            // or re-registered a hostname since. A candidate must still be the
+            // same abandoned registration in the store, or it is left alone.
+            let fresh: std::collections::HashMap<String, crate::custom_domain::CustomDomain> = self
+                .registry
+                .stored_records()
+                .await
+                .map_err(|e| format!("failed to re-read the custom-domain registry: {e}"))?
+                .into_iter()
+                .map(|d| (d.hostname.clone(), d))
+                .collect();
             // Abandoned connections: a tenant was handed DNS instructions and
             // never published the record. Nothing else ever deletes these.
             for domain in self.registry.list() {
+                let still_abandoned_in_store = fresh.get(&domain.hostname).is_some_and(|stored| {
+                    stored.status == domain.status
+                        && stored.tenant == domain.tenant
+                        && stored.registered_at_unix == domain.registered_at_unix
+                });
                 if domain.status == crate::custom_domain::DomainStatus::PendingDns
                     && domain.registered_at_unix < cutoff_unix
+                    && still_abandoned_in_store
                 {
                     if dry_run {
                         removed += 1;
@@ -498,7 +531,7 @@ impl crate::custom_domain::CustomDomainPruner for PruneOnlyCustomDomainPruner {
             // Orphaned certificates: a pair whose hostname is no longer
             // registered at all. Pruned regardless of the cutoff — there is no
             // record left to age.
-            removed += self.prune_orphan_certs(dry_run)?;
+            removed += self.prune_orphan_certs(dry_run).await?;
             Ok(removed)
         })
     }

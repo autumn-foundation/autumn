@@ -1048,6 +1048,43 @@ impl CustomDomainRegistry {
         Ok(loaded)
     }
 
+    /// [`load`](Self::load) without the boot-time migration: hydrate the index
+    /// from the store and write nothing back. Returns how many records loaded.
+    ///
+    /// For a process that only inspects the registry — a one-shot
+    /// `autumn db retention` report — where giving a pre-token record its
+    /// token (and with it a new status and registration time) would turn a
+    /// read-only command into a write that changes the very eligibility it is
+    /// reporting on. The serving process migrates those records at its own
+    /// boot.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's read error.
+    pub async fn load_without_migration(&self) -> io::Result<usize> {
+        let records = self.store.load_all().await?;
+        let (loaded, _legacy) = self.hydrate_index(records);
+        self.hydrated
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(loaded)
+    }
+
+    /// Read every record straight from the store, bypassing the in-memory
+    /// index.
+    ///
+    /// The index is only as fresh as this process's own writes. Another
+    /// process sharing the store — a serving app while a one-shot
+    /// `autumn db retention` runs — registers, verifies and issues without
+    /// this index ever hearing of it, so anything destructive decided from
+    /// the index alone can act on a registration it cannot see.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's read error.
+    pub async fn stored_records(&self) -> io::Result<Vec<CustomDomain>> {
+        self.store.load_all().await
+    }
+
     /// Give a record stored before ownership tokens a token, and send it back
     /// to `PendingDns` to prove it. Returns whether it applied.
     ///

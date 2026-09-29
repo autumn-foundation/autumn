@@ -7330,6 +7330,7 @@ impl AppBuilder {
             config.server.tls.as_ref().and_then(|tls| tls.acme.as_ref()),
             config.tenancy.base_domain.as_deref(),
             &state,
+            mode != FrameworkRetentionMode::Report,
         )
         .await;
         // The app's own state initializers are what install the GDPR registry
@@ -10039,6 +10040,7 @@ async fn install_custom_domain_retention_pruner(
     acme: Option<&crate::config::AcmeConfig>,
     tenancy_base_domain: Option<&str>,
     state: &AppState,
+    migrate: bool,
 ) {
     let Some(acme_cfg) = acme else {
         return;
@@ -10058,7 +10060,16 @@ async fn install_custom_domain_retention_pruner(
         )
         .with_reserved(custom_domain_reserved_names(acme_cfg, tenancy_base_domain)),
     );
-    match registry.load().await {
+    // A report (`--dry-run` or no flag) must write nothing: `load` gives a
+    // pre-token record its ownership token, which also resets its status and
+    // registration time — the very fields retention eligibility is judged on.
+    // Only a purge, which is about to write anyway, runs the boot migration.
+    let loaded = if migrate {
+        registry.load().await
+    } else {
+        registry.load_without_migration().await
+    };
+    match loaded {
         Ok(count) => tracing::info!(count, "loaded tenant custom domains"),
         // A registry that cannot be read is not fatal to the deployment: its
         // own certificate still serves. It IS fatal to pruning, though — an
@@ -20039,6 +20050,7 @@ mod unix_socket_tests {
             Some(&acme_with_custom_domains(true)),
             None,
             &state,
+            true,
         )
         .await;
         assert!(
@@ -20055,6 +20067,7 @@ mod unix_socket_tests {
             Some(&acme_with_custom_domains(false)),
             None,
             &state,
+            true,
         )
         .await;
         assert!(
@@ -20065,7 +20078,7 @@ mod unix_socket_tests {
 
         // No ACME at all: nothing is installed.
         let state = crate::state::AppState::for_test();
-        super::install_custom_domain_retention_pruner(None, None, &state).await;
+        super::install_custom_domain_retention_pruner(None, None, &state, true).await;
         assert!(
             state
                 .extension::<std::sync::Arc<dyn crate::custom_domain::CustomDomainPruner>>()
