@@ -1908,7 +1908,7 @@ fn generate_derived_query_for_source(
                 #query_source
                     #(#filters)*
                     #soft_delete_filter
-                    .load::<#model_name>(&mut conn)
+                    .select(#model_name::as_select()).load::<#model_name>(&mut conn)
                     .await
                     .map_err(::autumn_web::AutumnError::from)
             }
@@ -1933,14 +1933,9 @@ fn generate_derived_query_for_source(
                     #(#confidential_guards)*
                     #(#encode_lets)*
                     // The derived soft-delete / timestamp write has no `AppState`
-                    // in scope, so it cannot reach the injected clock. The allow is
-                    // emitted into the expansion so a determinism deny-lint never
-                    // fires in the *calling* crate, whose author did not write this
-                    // code. Known-open gap, tracked as an autumn #1797 follow-up.
-                    // Keep the emitted `reason` SHORT: it is repeated in every
-                    // generated method in every downstream crate.
-                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-                    let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                    // in scope. The ambient clock follows a running `Sim` (autumn
+                    // #2967), and is the system clock otherwise.
+                    let __now = ::autumn_web::time::ambient_now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::reexports::diesel::update(
                         #query_source #(#filters)* .filter(#table_ident::deleted_at.is_null())
@@ -4260,10 +4255,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 if let ::core::option::Option::Some(t) = __ledger_tenant_id {
                     query
                         .filter(#table_ident::tenant_id.eq(t))
-                        .first::<#model_name>(&mut conn)
+                        .select(#model_name::as_select()).first::<#model_name>(&mut conn)
                         .await
                 } else {
-                    query.first::<#model_name>(&mut conn).await
+                    query.select(#model_name::as_select()).first::<#model_name>(&mut conn).await
                 }
             }
         }
@@ -4273,7 +4268,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let _ = __ledger_tenant_id;
                 #table_ident::table
                     .find(record_id)
-                    .first::<#model_name>(&mut conn)
+                    .select(#model_name::as_select()).first::<#model_name>(&mut conn)
                     .await
             }
         }
@@ -6262,7 +6257,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::__private::scoped_immediate_transaction::<T, ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                     async move {
                         let row = ::autumn_web::maybe_for_update!(#table_ident::table
-                            .find(id))
+                            .find(id).select(#model_name::as_select()))
 
                             .first::<#model_name>(conn)
                             .await
@@ -6500,12 +6495,12 @@ fn emit_hooked_save(config: &RepoConfig, inputs: &HookedSaveInputs<'_>) -> Hooke
                             let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                                 ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                     .values(::autumn_web::tenancy::TenantInsertable::tenant_values(input.clone(), t))
-                                    .get_result::<#model_name>(conn)
+                                    .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                     .await
                             } else {
                                 ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                     .values(input)
-                                    .get_result::<#model_name>(conn)
+                                    .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                     .await
                             }
                             .map_err(::autumn_web::AutumnError::from)?;
@@ -6630,12 +6625,12 @@ fn emit_hooked_save(config: &RepoConfig, inputs: &HookedSaveInputs<'_>) -> Hooke
                             let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                                 ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                     .values(::autumn_web::tenancy::TenantInsertable::tenant_values(input.clone(), t))
-                                    .get_result::<#model_name>(conn)
+                                    .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                     .await
                             } else {
                                 ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                     .values(input)
-                                    .get_result::<#model_name>(conn)
+                                    .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                     .await
                             }
                             .map_err(::autumn_web::AutumnError::from)?;
@@ -6683,7 +6678,7 @@ fn emit_hooked_save(config: &RepoConfig, inputs: &HookedSaveInputs<'_>) -> Hooke
 
                             let record = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(input)
-                                .get_result::<#model_name>(conn)
+                                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                                 .map_err(::autumn_web::AutumnError::from)?;
 
@@ -6809,7 +6804,7 @@ fn emit_hooked_save(config: &RepoConfig, inputs: &HookedSaveInputs<'_>) -> Hooke
 
                             let record = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(input)
-                                .get_result::<#model_name>(conn)
+                                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                                 .map_err(::autumn_web::AutumnError::from)?;
 
@@ -6845,7 +6840,7 @@ fn emit_hooked_save(config: &RepoConfig, inputs: &HookedSaveInputs<'_>) -> Hooke
 
                             let record = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(input)
-                                .get_result::<#model_name>(conn)
+                                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                                 .map_err(::autumn_web::AutumnError::from)?;
 
@@ -6962,9 +6957,9 @@ fn emit_hooked_update(config: &RepoConfig, inputs: &HookedUpdateInputs<'_>) -> H
                             {
                                 let load_query = #table_ident::table.find(id);
                                 let current = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                    ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
+                                    ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t)).select(#model_name::as_select())).first::<#model_name>(conn).await
                                 } else {
-                                    ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
+                                    ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).first::<#model_name>(conn).await
                                 }
                                 .optional()
                                 .map_err(::autumn_web::AutumnError::from)?
@@ -7001,12 +6996,12 @@ fn emit_hooked_update(config: &RepoConfig, inputs: &HookedUpdateInputs<'_>) -> H
                                 let updated = if let ::core::option::Option::Some(ref t) = tenant_id {
                                     ::autumn_web::reexports::diesel::update(update_target.filter(#table_ident::tenant_id.eq(t)))
                                         .set(proposed.clone())
-                                        .get_result::<#model_name>(conn)
+                                        .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                         .await
                                 } else {
                                     ::autumn_web::reexports::diesel::update(update_target)
                                         .set(proposed.clone())
-                                        .get_result::<#model_name>(conn)
+                                        .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                         .await
                                 }
                                 .map_err(::autumn_web::AutumnError::from)?;
@@ -7014,9 +7009,9 @@ fn emit_hooked_update(config: &RepoConfig, inputs: &HookedUpdateInputs<'_>) -> H
                             } else {
                                 let load_query = #table_ident::table.find(id);
                                 let current = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                    ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
+                                    ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t)).select(#model_name::as_select())).first::<#model_name>(conn).await
                                 } else {
-                                    ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
+                                    ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).first::<#model_name>(conn).await
                                 }
                                 .optional()
                                 .map_err(::autumn_web::AutumnError::from)?
@@ -7039,12 +7034,12 @@ fn emit_hooked_update(config: &RepoConfig, inputs: &HookedUpdateInputs<'_>) -> H
                                 let updated = if let ::core::option::Option::Some(ref t) = tenant_id {
                                     ::autumn_web::reexports::diesel::update(update_target.filter(#table_ident::tenant_id.eq(t)))
                                         .set(proposed.clone())
-                                        .get_result::<#model_name>(conn)
+                                        .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                         .await
                                 } else {
                                     ::autumn_web::reexports::diesel::update(update_target)
                                         .set(proposed.clone())
-                                        .get_result::<#model_name>(conn)
+                                        .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                         .await
                                 }
                                 .map_err(::autumn_web::AutumnError::from)?;
@@ -7175,9 +7170,9 @@ fn emit_hooked_update(config: &RepoConfig, inputs: &HookedUpdateInputs<'_>) -> H
                             {
                                 let load_query = #table_ident::table.find(id);
                                 let current = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                    ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
+                                    ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t)).select(#model_name::as_select())).first::<#model_name>(conn).await
                                 } else {
-                                    ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
+                                    ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).first::<#model_name>(conn).await
                                 }
                                 .optional()
                                 .map_err(::autumn_web::AutumnError::from)?
@@ -7214,12 +7209,12 @@ fn emit_hooked_update(config: &RepoConfig, inputs: &HookedUpdateInputs<'_>) -> H
                                 let updated = if let ::core::option::Option::Some(ref t) = tenant_id {
                                     ::autumn_web::reexports::diesel::update(update_target.filter(#table_ident::tenant_id.eq(t)))
                                         .set(proposed.clone())
-                                        .get_result::<#model_name>(conn)
+                                        .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                         .await
                                 } else {
                                     ::autumn_web::reexports::diesel::update(update_target)
                                         .set(proposed.clone())
-                                        .get_result::<#model_name>(conn)
+                                        .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                         .await
                                 }
                                 .map_err(::autumn_web::AutumnError::from)?;
@@ -7227,9 +7222,9 @@ fn emit_hooked_update(config: &RepoConfig, inputs: &HookedUpdateInputs<'_>) -> H
                             } else {
                                 let load_query = #table_ident::table.find(id);
                                 let current = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                    ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
+                                    ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t)).select(#model_name::as_select())).first::<#model_name>(conn).await
                                 } else {
-                                    ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
+                                    ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).first::<#model_name>(conn).await
                                 }
                                 .optional()
                                 .map_err(::autumn_web::AutumnError::from)?
@@ -7252,12 +7247,12 @@ fn emit_hooked_update(config: &RepoConfig, inputs: &HookedUpdateInputs<'_>) -> H
                                 let updated = if let ::core::option::Option::Some(ref t) = tenant_id {
                                     ::autumn_web::reexports::diesel::update(update_target.filter(#table_ident::tenant_id.eq(t)))
                                         .set(proposed.clone())
-                                        .get_result::<#model_name>(conn)
+                                        .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                         .await
                                 } else {
                                     ::autumn_web::reexports::diesel::update(update_target)
                                         .set(proposed.clone())
-                                        .get_result::<#model_name>(conn)
+                                        .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                         .await
                                 }
                                 .map_err(::autumn_web::AutumnError::from)?;
@@ -7310,7 +7305,7 @@ fn emit_hooked_update(config: &RepoConfig, inputs: &HookedUpdateInputs<'_>) -> H
                                 // no concurrent writer can commit between our
                                 // version check and the UPDATE below.
                                 let current = ::autumn_web::maybe_for_update!(#table_ident::table
-                                    .find(id))
+                                    .find(id).select(#model_name::as_select()))
 
                                     .first::<#model_name>(conn)
                                     .await
@@ -7341,14 +7336,14 @@ fn emit_hooked_update(config: &RepoConfig, inputs: &HookedUpdateInputs<'_>) -> H
                                 let proposed = draft.into_after();
                                 let updated = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
                                     .set(proposed.clone())
-                                    .get_result::<#model_name>(conn)
+                                    .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                     .await
                                     .map_err(::autumn_web::AutumnError::from)?;
                                 (updated, ::core::option::Option::Some(__vh_before_inner))
                             } else {
                                 // Load current record
                                 let current = ::autumn_web::maybe_for_update!(#table_ident::table
-                                    .find(id))
+                                    .find(id).select(#model_name::as_select()))
 
                                     .first::<#model_name>(conn)
                                     .await
@@ -7365,7 +7360,7 @@ fn emit_hooked_update(config: &RepoConfig, inputs: &HookedUpdateInputs<'_>) -> H
                                 let proposed = draft.into_after();
                                 let updated = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
                                     .set(proposed.clone())
-                                    .get_result::<#model_name>(conn)
+                                    .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                     .await
                                     .map_err(::autumn_web::AutumnError::from)?;
                                 (updated, ::core::option::Option::Some(__vh_before_inner))
@@ -7496,7 +7491,7 @@ fn emit_hooked_update(config: &RepoConfig, inputs: &HookedUpdateInputs<'_>) -> H
                                 changes.__autumn_lock_version_expected()
                             {
                                 let current = ::autumn_web::maybe_for_update!(#table_ident::table
-                                    .find(id))
+                                    .find(id).select(#model_name::as_select()))
 
                                     .first::<#model_name>(conn)
                                     .await
@@ -7527,14 +7522,14 @@ fn emit_hooked_update(config: &RepoConfig, inputs: &HookedUpdateInputs<'_>) -> H
                                 let proposed = draft.into_after();
                                 let updated = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
                                     .set(proposed.clone())
-                                    .get_result::<#model_name>(conn)
+                                    .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                     .await
                                     .map_err(::autumn_web::AutumnError::from)?;
                                 (updated, __vh_before)
                             } else {
                                 let current = #table_ident::table
                                     .find(id)
-                                    .first::<#model_name>(conn)
+                                    .select(#model_name::as_select()).first::<#model_name>(conn)
                                     .await
                                     .optional()
                                     .map_err(::autumn_web::AutumnError::from)?
@@ -7549,7 +7544,7 @@ fn emit_hooked_update(config: &RepoConfig, inputs: &HookedUpdateInputs<'_>) -> H
                                 let proposed = draft.into_after();
                                 let updated = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
                                     .set(proposed.clone())
-                                    .get_result::<#model_name>(conn)
+                                    .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                     .await
                                     .map_err(::autumn_web::AutumnError::from)?;
                                 (updated, __vh_before)
@@ -7586,7 +7581,7 @@ fn emit_hooked_update(config: &RepoConfig, inputs: &HookedUpdateInputs<'_>) -> H
                                 changes.__autumn_lock_version_expected()
                             {
                                 let current = ::autumn_web::maybe_for_update!(#table_ident::table
-                                    .find(id))
+                                    .find(id).select(#model_name::as_select()))
 
                                     .first::<#model_name>(conn)
                                     .await
@@ -7616,13 +7611,13 @@ fn emit_hooked_update(config: &RepoConfig, inputs: &HookedUpdateInputs<'_>) -> H
                                 let proposed = draft.into_after();
                                 ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
                                     .set(proposed.clone())
-                                    .get_result::<#model_name>(conn)
+                                    .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                     .await
                                     .map_err(::autumn_web::AutumnError::from)?
                             } else {
                                 let current = #table_ident::table
                                     .find(id)
-                                    .first::<#model_name>(conn)
+                                    .select(#model_name::as_select()).first::<#model_name>(conn)
                                     .await
                                     .optional()
                                     .map_err(::autumn_web::AutumnError::from)?
@@ -7636,7 +7631,7 @@ fn emit_hooked_update(config: &RepoConfig, inputs: &HookedUpdateInputs<'_>) -> H
                                 let proposed = draft.into_after();
                                 ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
                                     .set(proposed.clone())
-                                    .get_result::<#model_name>(conn)
+                                    .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                     .await
                                     .map_err(::autumn_web::AutumnError::from)?
                             };
@@ -7698,8 +7693,7 @@ fn emit_hooked_delete(config: &RepoConfig, inputs: &HookedDeleteInputs<'_>) -> H
     // Both paths still fire before_delete / after_delete_commit hooks.
     let hooked_delete_mutation_stmt = if config.soft_delete {
         quote! {
-            #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-            let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+            let __now = ::autumn_web::time::ambient_now().naive_utc();
             let __autumn_deleted = ::autumn_web::reexports::diesel::update(
                 #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null())
             )
@@ -7782,9 +7776,9 @@ fn emit_hooked_delete(config: &RepoConfig, inputs: &HookedDeleteInputs<'_>) -> H
                             // hooks only run when the row is actually deletable.
                             let load_query = #table_ident::table.find(id) #sd_filter;
                             let record = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
+                                ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t)).select(#model_name::as_select())).first::<#model_name>(conn).await
                             } else {
-                                ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
+                                ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).first::<#model_name>(conn).await
                             }
                             .optional()
                             .map_err(::autumn_web::AutumnError::from)?
@@ -7838,9 +7832,9 @@ fn emit_hooked_delete(config: &RepoConfig, inputs: &HookedDeleteInputs<'_>) -> H
 
                             let load_query = #table_ident::table.find(id);
                             let record = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
+                                ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t)).select(#model_name::as_select())).first::<#model_name>(conn).await
                             } else {
-                                ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
+                                ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).first::<#model_name>(conn).await
                             }
                             .optional()
                             .map_err(::autumn_web::AutumnError::from)?
@@ -7889,7 +7883,7 @@ fn emit_hooked_delete(config: &RepoConfig, inputs: &HookedDeleteInputs<'_>) -> H
 
                         // Load current record for before_delete context.
                         let load_query = #table_ident::table.find(id) #sd_filter;
-                        let record = ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
+                        let record = ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).first::<#model_name>(conn).await
                         .optional()
                         .map_err(::autumn_web::AutumnError::from)?
                         .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
@@ -7950,7 +7944,7 @@ fn emit_hooked_delete(config: &RepoConfig, inputs: &HookedDeleteInputs<'_>) -> H
                         let mut ctx = MutationContext::new(MutationOp::Delete);
 
                         let load_query = #table_ident::table.find(id);
-                        let record = ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
+                        let record = ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).first::<#model_name>(conn).await
                         .optional()
                         .map_err(::autumn_web::AutumnError::from)?
                         .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
@@ -7988,7 +7982,7 @@ fn emit_hooked_delete(config: &RepoConfig, inputs: &HookedDeleteInputs<'_>) -> H
                         let mut ctx = MutationContext::new(MutationOp::Delete);
 
                         let load_query = #table_ident::table.find(id);
-                        let record = ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
+                        let record = ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).first::<#model_name>(conn).await
                         .optional()
                         .map_err(::autumn_web::AutumnError::from)?
                         .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
@@ -8079,7 +8073,7 @@ fn emit_hooked_insert_many(
                     pg => {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                             .values(values)
-                            .get_results::<#model_name>(conn)
+                            .returning(#model_name::as_select()).get_results::<#model_name>(conn)
                             .await
                     },
                     sqlite => {
@@ -8089,7 +8083,7 @@ fn emit_hooked_insert_many(
                         for __autumn_row in values {
                             match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(__autumn_row)
-                                .get_result::<#model_name>(conn)
+                                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                             {
                                 ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
@@ -8104,7 +8098,7 @@ fn emit_hooked_insert_many(
                     pg => {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                             .values(chunk.to_vec())
-                            .get_results::<#model_name>(conn)
+                            .returning(#model_name::as_select()).get_results::<#model_name>(conn)
                             .await
                     },
                     sqlite => {
@@ -8114,7 +8108,7 @@ fn emit_hooked_insert_many(
                         for __autumn_row in chunk.to_vec() {
                             match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(__autumn_row)
-                                .get_result::<#model_name>(conn)
+                                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                             {
                                 ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
@@ -8134,7 +8128,7 @@ fn emit_hooked_insert_many(
                     pg => {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                             .values(chunk.to_vec())
-                            .get_results::<#model_name>(conn)
+                            .returning(#model_name::as_select()).get_results::<#model_name>(conn)
                             .await
                     },
                     sqlite => {
@@ -8144,7 +8138,7 @@ fn emit_hooked_insert_many(
                         for __autumn_row in chunk.to_vec() {
                             match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(__autumn_row)
-                                .get_result::<#model_name>(conn)
+                                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                             {
                                 ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
@@ -8470,7 +8464,7 @@ fn emit_hooked_insert_many(
                     pg => {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                             .values(values)
-                            .get_results::<#model_name>(conn)
+                            .returning(#model_name::as_select()).get_results::<#model_name>(conn)
                             .await
                     },
                     sqlite => {
@@ -8480,7 +8474,7 @@ fn emit_hooked_insert_many(
                         for __autumn_row in values {
                             match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(__autumn_row)
-                                .get_result::<#model_name>(conn)
+                                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                             {
                                 ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
@@ -8496,7 +8490,7 @@ fn emit_hooked_insert_many(
                     pg => {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                             .values(values)
-                            .get_results::<#model_name>(conn)
+                            .returning(#model_name::as_select()).get_results::<#model_name>(conn)
                             .await
                     },
                     sqlite => {
@@ -8506,7 +8500,7 @@ fn emit_hooked_insert_many(
                         for __autumn_row in values {
                             match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(__autumn_row)
-                                .get_result::<#model_name>(conn)
+                                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                             {
                                 ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
@@ -8527,7 +8521,7 @@ fn emit_hooked_insert_many(
                     pg => {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                             .values(values)
-                            .get_results::<#model_name>(conn)
+                            .returning(#model_name::as_select()).get_results::<#model_name>(conn)
                             .await
                     },
                     sqlite => {
@@ -8537,7 +8531,7 @@ fn emit_hooked_insert_many(
                         for __autumn_row in values {
                             match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(__autumn_row)
-                                .get_result::<#model_name>(conn)
+                                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                             {
                                 ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
@@ -8557,12 +8551,12 @@ fn emit_hooked_insert_many(
                     let values = ::autumn_web::tenancy::TenantInsertable::tenant_values(item.0.clone(), t);
                     ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                         .values(values)
-                        .get_result::<#model_name>(conn)
+                        .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                         .await
                 } else {
                     ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                         .values(item.0.clone())
-                        .get_result::<#model_name>(conn)
+                        .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                         .await
                 }
             }
@@ -8570,7 +8564,7 @@ fn emit_hooked_insert_many(
             quote! {
                 ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                     .values(item.0.clone())
-                    .get_result::<#model_name>(conn)
+                    .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                     .await
             }
         };
@@ -9120,14 +9114,14 @@ fn emit_hooked_mutate_many(
         let load_expr = if config.tenant_scoped {
             quote! {
                 if let ::core::option::Option::Some(t) = tenant_id {
-                    ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).load::<#model_name>(conn).await
+                    ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t)).select(#model_name::as_select())).load::<#model_name>(conn).await
                 } else {
-                    ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
+                    ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).load::<#model_name>(conn).await
                 }
             }
         } else {
             quote! {
-                ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
+                ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).load::<#model_name>(conn).await
             }
         };
 
@@ -9146,12 +9140,12 @@ fn emit_hooked_mutate_many(
                 if let ::core::option::Option::Some(t) = tenant_id {
                     ::autumn_web::reexports::diesel::update(update_target.filter(#table_ident::tenant_id.eq(t)))
                         .set(proposed)
-                        .get_result::<#model_name>(conn)
+                        .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                         .await
                 } else {
                     ::autumn_web::reexports::diesel::update(update_target)
                         .set(proposed)
-                        .get_result::<#model_name>(conn)
+                        .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                         .await
                 }
             }
@@ -9159,7 +9153,7 @@ fn emit_hooked_mutate_many(
             quote! {
                 ::autumn_web::reexports::diesel::update(update_target)
                     .set(proposed)
-                    .get_result::<#model_name>(conn)
+                    .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                     .await
             }
         };
@@ -9611,28 +9605,28 @@ fn emit_hooked_mutate_many(
             if config.soft_delete {
                 quote! {
                     if let ::core::option::Option::Some(t) = tenant_id {
-                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t)).filter(#table_ident::deleted_at.is_null())).load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t)).filter(#table_ident::deleted_at.is_null()).select(#model_name::as_select())).load::<#model_name>(conn).await
                     } else {
-                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::deleted_at.is_null())).load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::deleted_at.is_null()).select(#model_name::as_select())).load::<#model_name>(conn).await
                     }
                 }
             } else {
                 quote! {
                     if let ::core::option::Option::Some(t) = tenant_id {
-                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t)).select(#model_name::as_select())).load::<#model_name>(conn).await
                     } else {
-                        ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).load::<#model_name>(conn).await
                     }
                 }
             }
         } else {
             if config.soft_delete {
                 quote! {
-                    ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::deleted_at.is_null())).load::<#model_name>(conn).await
+                    ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::deleted_at.is_null()).select(#model_name::as_select())).load::<#model_name>(conn).await
                 }
             } else {
                 quote! {
-                    ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
+                    ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).load::<#model_name>(conn).await
                 }
             }
         };
@@ -9855,8 +9849,7 @@ fn emit_hooked_mutate_many(
 
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-                    let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                    let __now = ::autumn_web::time::ambient_now().naive_utc();
 
                     #delete_many_tx_bind ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
@@ -10608,12 +10601,12 @@ fn emit_plain_save_update(
             let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                 ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                     .values(::autumn_web::tenancy::TenantInsertable::tenant_values(new.clone(), t))
-                    .get_result::<#model_name>(conn)
+                    .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                     .await
             } else {
                 ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                     .values(new.clone())
-                    .get_result::<#model_name>(conn)
+                    .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                     .await
             }
             .map_err(::autumn_web::AutumnError::from)?;
@@ -10627,7 +10620,7 @@ fn emit_plain_save_update(
             #cc_serialize
             let record = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                 .values(new.clone())
-                .get_result::<#model_name>(conn)
+                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                 .await
                 .map_err(::autumn_web::AutumnError::from)?;
             #cc_after_insert
@@ -10664,12 +10657,12 @@ fn emit_plain_save_update(
                 let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                     ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                         .values(::autumn_web::tenancy::TenantInsertable::tenant_values(new.clone(), t))
-                        .get_result::<#model_name>(conn)
+                        .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                         .await
                 } else {
                     ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                         .values(new.clone())
-                        .get_result::<#model_name>(conn)
+                        .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                         .await
                 }
                 .map_err(::autumn_web::AutumnError::from)?;
@@ -10714,7 +10707,7 @@ fn emit_plain_save_update(
                 #cc_serialize
                 let record = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                     .values(new.clone())
-                    .get_result::<#model_name>(conn)
+                    .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                     .await
                     .map_err(::autumn_web::AutumnError::from)?;
                 #vh_insert
@@ -10793,7 +10786,7 @@ fn emit_plain_save_update(
     let knob_load_and_validate_in_tx = if config.validate_on_update_fetch {
         quote! {
             let __merged_current = #table_ident::table.find(id)
-                .first::<#model_name>(conn)
+                .select(#model_name::as_select()).first::<#model_name>(conn)
                 .await
                 #not_found_to_404 ?;
             { let _ = <::autumn_web::hooks::UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&__merged_current, changes)?; }
@@ -10807,9 +10800,9 @@ fn emit_plain_save_update(
     let knob_load_and_validate_tenant_in_tx = if config.validate_on_update_fetch {
         quote! {
             let __merged_current = if let ::core::option::Option::Some(ref t) = tenant_id {
-                #table_ident::table.find(id).filter(#table_ident::tenant_id.eq(t)).first::<#model_name>(conn).await
+                #table_ident::table.find(id).filter(#table_ident::tenant_id.eq(t)).select(#model_name::as_select()).first::<#model_name>(conn).await
             } else {
-                #table_ident::table.find(id).first::<#model_name>(conn).await
+                #table_ident::table.find(id).select(#model_name::as_select()).first::<#model_name>(conn).await
             }
             #not_found_to_404 ?;
             { let _ = <::autumn_web::hooks::UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&__merged_current, changes)?; }
@@ -10837,12 +10830,12 @@ fn emit_plain_save_update(
             let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                 ::autumn_web::reexports::diesel::update(update_target.filter(#table_ident::tenant_id.eq(t)))
                     .set(diesel_changeset)
-                    .get_result::<#model_name>(conn)
+                    .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                     .await
             } else {
                 ::autumn_web::reexports::diesel::update(update_target)
                     .set(diesel_changeset)
-                    .get_result::<#model_name>(conn)
+                    .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                     .await
             }
             .map_err(::autumn_web::AutumnError::from)?;
@@ -10859,6 +10852,7 @@ fn emit_plain_save_update(
             let update_target = #table_ident::table.find(id);
             let record = ::autumn_web::reexports::diesel::update(update_target)
                 .set(diesel_changeset)
+                .returning(#model_name::as_select())
                 .get_result::<#model_name>(conn)
                 .await
                 .map_err(::autumn_web::AutumnError::from)?;
@@ -10899,9 +10893,9 @@ fn emit_plain_save_update(
                         changes.__autumn_lock_version_expected()
                     {
                         let c = if let ::core::option::Option::Some(ref t) = tenant_id {
-                            ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t)).select(#model_name::as_select())).first::<#model_name>(conn).await
                         } else {
-                            ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).first::<#model_name>(conn).await
                         }
                         .optional()
                         .map_err(::autumn_web::AutumnError::from)?
@@ -10922,9 +10916,9 @@ fn emit_plain_save_update(
                         c
                     } else {
                         if let ::core::option::Option::Some(ref t) = tenant_id {
-                            ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t)).select(#model_name::as_select())).first::<#model_name>(conn).await
                         } else {
-                            ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).first::<#model_name>(conn).await
                         }
                         .optional()
                         .map_err(::autumn_web::AutumnError::from)?
@@ -10941,12 +10935,12 @@ fn emit_plain_save_update(
                     let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                         ::autumn_web::reexports::diesel::update(update_target.filter(#table_ident::tenant_id.eq(t)))
                             .set(diesel_changeset)
-                            .get_result::<#model_name>(conn)
+                            .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                             .await
                     } else {
                         ::autumn_web::reexports::diesel::update(update_target)
                             .set(diesel_changeset)
-                            .get_result::<#model_name>(conn)
+                            .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                             .await
                     }
                     .map_err(::autumn_web::AutumnError::from)?;
@@ -10986,9 +10980,9 @@ fn emit_plain_save_update(
                         // version check and the UPDATE below.
                         let load_query = #table_ident::table.find(id);
                         let current = if let ::core::option::Option::Some(ref t) = tenant_id {
-                            ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t)).select(#model_name::as_select())).first::<#model_name>(conn).await
                         } else {
-                            ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).first::<#model_name>(conn).await
                         }
                         .optional()
                         .map_err(::autumn_web::AutumnError::from)?
@@ -11020,12 +11014,12 @@ fn emit_plain_save_update(
                         let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                             ::autumn_web::reexports::diesel::update(update_target.filter(#table_ident::tenant_id.eq(t)))
                                 .set(diesel_changeset)
-                                .get_result::<#model_name>(conn)
+                                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                         } else {
                             ::autumn_web::reexports::diesel::update(update_target)
                                 .set(diesel_changeset)
-                                .get_result::<#model_name>(conn)
+                                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                         }
                         .map_err(::autumn_web::AutumnError::from)?;
@@ -11065,7 +11059,7 @@ fn emit_plain_save_update(
                     let current = if let ::core::option::Option::Some(expected_version) =
                         changes.__autumn_lock_version_expected()
                     {
-                        let c = ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
+                        let c = ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).first::<#model_name>(conn).await
                             .optional()
                             .map_err(::autumn_web::AutumnError::from)?
                             .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
@@ -11086,7 +11080,7 @@ fn emit_plain_save_update(
                         }
                         c
                     } else {
-                        ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).first::<#model_name>(conn).await
                             .optional()
                             .map_err(::autumn_web::AutumnError::from)?
                             .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
@@ -11098,6 +11092,7 @@ fn emit_plain_save_update(
                     let update_target = #table_ident::table.find(id);
                     let record = ::autumn_web::reexports::diesel::update(update_target)
                         .set(diesel_changeset)
+                        .returning(#model_name::as_select())
                         .get_result::<#model_name>(conn)
                         .await
                         .map_err(::autumn_web::AutumnError::from)?;
@@ -11126,7 +11121,7 @@ fn emit_plain_save_update(
                     async move {
                         #cc_capture
                         let load_query = #table_ident::table.find(id);
-                        let current = ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
+                        let current = ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).first::<#model_name>(conn).await
                         .optional()
                         .map_err(::autumn_web::AutumnError::from)?
                         .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
@@ -11152,6 +11147,7 @@ fn emit_plain_save_update(
                         let update_target = #table_ident::table.find(id);
                         let record = ::autumn_web::reexports::diesel::update(update_target)
                             .set(diesel_changeset)
+                            .returning(#model_name::as_select())
                             .get_result::<#model_name>(conn)
                             .await
                             .map_err(::autumn_web::AutumnError::from)?;
@@ -11318,16 +11314,15 @@ fn emit_plain_delete(config: &RepoConfig, inputs: &PlainDeleteInputs<'_>) -> Pla
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                 #tenant_id_setup
-                #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-                let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                let __now = ::autumn_web::time::ambient_now().naive_utc();
                 let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
                     #cc_before_delete
                     let load_query = #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null());
                     let record = if let ::core::option::Option::Some(ref t) = tenant_id {
-                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t)).select(#model_name::as_select())).first::<#model_name>(conn).await
                     } else {
-                        ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).first::<#model_name>(conn).await
                     }
                     .optional()
                     .map_err(::autumn_web::AutumnError::from)?
@@ -11362,8 +11357,7 @@ fn emit_plain_delete(config: &RepoConfig, inputs: &PlainDeleteInputs<'_>) -> Pla
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 #tenant_id_setup
-                #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-                let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                let __now = ::autumn_web::time::ambient_now().naive_utc();
                 let mut conn = self.__autumn_acquire_conn().await?;
                 #cc_delete_tenant_soft_wrap
             }
@@ -11389,9 +11383,9 @@ fn emit_plain_delete(config: &RepoConfig, inputs: &PlainDeleteInputs<'_>) -> Pla
                     #cc_before_delete
                     let load_query = #table_ident::table.find(id);
                     let record = if let ::core::option::Option::Some(ref t) = tenant_id {
-                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t)).select(#model_name::as_select())).first::<#model_name>(conn).await
                     } else {
-                        ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).first::<#model_name>(conn).await
                     }
                     .optional()
                     .map_err(::autumn_web::AutumnError::from)?
@@ -11445,13 +11439,12 @@ fn emit_plain_delete(config: &RepoConfig, inputs: &PlainDeleteInputs<'_>) -> Pla
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
-                #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-                let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                let __now = ::autumn_web::time::ambient_now().naive_utc();
                 let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
                     #cc_before_delete
                     let record = ::autumn_web::maybe_for_update!(#table_ident::table.find(id)
-                        .filter(#table_ident::deleted_at.is_null()))
+                        .filter(#table_ident::deleted_at.is_null()).select(#model_name::as_select()))
 
                         .first::<#model_name>(conn)
                         .await
@@ -11481,8 +11474,7 @@ fn emit_plain_delete(config: &RepoConfig, inputs: &PlainDeleteInputs<'_>) -> Pla
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-                let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                let __now = ::autumn_web::time::ambient_now().naive_utc();
                 let mut conn = self.__autumn_acquire_conn().await?;
                 #cc_delete_soft_wrap
             }
@@ -11506,7 +11498,7 @@ fn emit_plain_delete(config: &RepoConfig, inputs: &PlainDeleteInputs<'_>) -> Pla
             let mut conn = self.__autumn_acquire_conn().await?;
             ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
                 #cc_before_delete
-                let record = ::autumn_web::maybe_for_update!(#table_ident::table.find(id))
+                let record = ::autumn_web::maybe_for_update!(#table_ident::table.find(id).select(#model_name::as_select()))
 
                     .first::<#model_name>(conn)
                     .await
@@ -11625,7 +11617,7 @@ fn emit_plain_insert_many(
                     pg => {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                             .values(values)
-                            .get_results::<#model_name>(conn)
+                            .returning(#model_name::as_select()).get_results::<#model_name>(conn)
                             .await
                     },
                     sqlite => {
@@ -11635,7 +11627,7 @@ fn emit_plain_insert_many(
                         for __autumn_row in values {
                             match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(__autumn_row)
-                                .get_result::<#model_name>(conn)
+                                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                             {
                                 ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
@@ -11650,7 +11642,7 @@ fn emit_plain_insert_many(
                     pg => {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                             .values(chunk.to_vec())
-                            .get_results::<#model_name>(conn)
+                            .returning(#model_name::as_select()).get_results::<#model_name>(conn)
                             .await
                     },
                     sqlite => {
@@ -11660,7 +11652,7 @@ fn emit_plain_insert_many(
                         for __autumn_row in chunk.to_vec() {
                             match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(__autumn_row)
-                                .get_result::<#model_name>(conn)
+                                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                             {
                                 ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
@@ -11718,7 +11710,7 @@ fn emit_plain_insert_many(
                     pg => {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                             .values(values)
-                            .get_results::<#model_name>(conn)
+                            .returning(#model_name::as_select()).get_results::<#model_name>(conn)
                             .await
                     },
                     sqlite => {
@@ -11728,7 +11720,7 @@ fn emit_plain_insert_many(
                         for __autumn_row in values {
                             match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(__autumn_row)
-                                .get_result::<#model_name>(conn)
+                                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                             {
                                 ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
@@ -11743,7 +11735,7 @@ fn emit_plain_insert_many(
                     pg => {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                             .values(chunk.to_vec())
-                            .get_results::<#model_name>(conn)
+                            .returning(#model_name::as_select()).get_results::<#model_name>(conn)
                             .await
                     },
                     sqlite => {
@@ -11753,7 +11745,7 @@ fn emit_plain_insert_many(
                         for __autumn_row in chunk.to_vec() {
                             match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(__autumn_row)
-                                .get_result::<#model_name>(conn)
+                                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                             {
                                 ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
@@ -11808,7 +11800,7 @@ fn emit_plain_insert_many(
                     pg => {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                             .values(chunk.to_vec())
-                            .get_results::<#model_name>(conn)
+                            .returning(#model_name::as_select()).get_results::<#model_name>(conn)
                             .await
                     },
                     sqlite => {
@@ -11818,7 +11810,7 @@ fn emit_plain_insert_many(
                         for __autumn_row in chunk.to_vec() {
                             match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(__autumn_row)
-                                .get_result::<#model_name>(conn)
+                                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                             {
                                 ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
@@ -11865,7 +11857,7 @@ fn emit_plain_insert_many(
                     pg => {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                             .values(chunk.to_vec())
-                            .get_results::<#model_name>(conn)
+                            .returning(#model_name::as_select()).get_results::<#model_name>(conn)
                             .await
                     },
                     sqlite => {
@@ -11875,7 +11867,7 @@ fn emit_plain_insert_many(
                         for __autumn_row in chunk.to_vec() {
                             match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(__autumn_row)
-                                .get_result::<#model_name>(conn)
+                                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                             {
                                 ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
@@ -11952,7 +11944,7 @@ fn emit_plain_insert_many(
                     pg => {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                             .values(values)
-                            .get_results::<#model_name>(conn)
+                            .returning(#model_name::as_select()).get_results::<#model_name>(conn)
                             .await
                     },
                     sqlite => {
@@ -11962,7 +11954,7 @@ fn emit_plain_insert_many(
                         for __autumn_row in values {
                             match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(__autumn_row)
-                                .get_result::<#model_name>(conn)
+                                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                             {
                                 ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
@@ -11977,7 +11969,7 @@ fn emit_plain_insert_many(
                     pg => {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                             .values(chunk.to_vec())
-                            .get_results::<#model_name>(conn)
+                            .returning(#model_name::as_select()).get_results::<#model_name>(conn)
                             .await
                     },
                     sqlite => {
@@ -11987,7 +11979,7 @@ fn emit_plain_insert_many(
                         for __autumn_row in chunk.to_vec() {
                             match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(__autumn_row)
-                                .get_result::<#model_name>(conn)
+                                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                             {
                                 ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
@@ -12005,7 +11997,7 @@ fn emit_plain_insert_many(
                     pg => {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                             .values(chunk.to_vec())
-                            .get_results::<#model_name>(conn)
+                            .returning(#model_name::as_select()).get_results::<#model_name>(conn)
                             .await
                     },
                     sqlite => {
@@ -12015,7 +12007,7 @@ fn emit_plain_insert_many(
                         for __autumn_row in chunk.to_vec() {
                             match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(__autumn_row)
-                                .get_result::<#model_name>(conn)
+                                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                             {
                                 ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
@@ -12034,12 +12026,12 @@ fn emit_plain_insert_many(
                     let values = ::autumn_web::tenancy::TenantInsertable::tenant_values(item.clone(), t);
                     ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                         .values(values)
-                        .get_result::<#model_name>(conn)
+                        .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                         .await
                 } else {
                     ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                         .values(item.clone())
-                        .get_result::<#model_name>(conn)
+                        .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                         .await
                 }
             }
@@ -12047,7 +12039,7 @@ fn emit_plain_insert_many(
             quote! {
                 ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                     .values(item.clone())
-                    .get_result::<#model_name>(conn)
+                    .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                     .await
             }
         };
@@ -12279,14 +12271,14 @@ fn emit_plain_mutate_many(
         let vh_load_before_map_no_lock_expr = if config.tenant_scoped {
             quote! {
                 if let ::core::option::Option::Some(t) = tenant_id {
-                    ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).load::<#model_name>(conn).await
+                    ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t)).select(#model_name::as_select())).load::<#model_name>(conn).await
                 } else {
-                    ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
+                    ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).load::<#model_name>(conn).await
                 }
             }
         } else {
             quote! {
-                ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
+                ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).load::<#model_name>(conn).await
             }
         };
         let vh_load_before_map_no_lock = if config.versioned {
@@ -12331,14 +12323,14 @@ fn emit_plain_mutate_many(
         let load_expr = if config.tenant_scoped {
             quote! {
                 if let ::core::option::Option::Some(t) = tenant_id {
-                    ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).load::<#model_name>(conn).await
+                    ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t)).select(#model_name::as_select())).load::<#model_name>(conn).await
                 } else {
-                    ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
+                    ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).load::<#model_name>(conn).await
                 }
             }
         } else {
             quote! {
-                ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
+                ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).load::<#model_name>(conn).await
             }
         };
 
@@ -12352,12 +12344,13 @@ fn emit_plain_mutate_many(
                     }
                     ::autumn_web::reexports::diesel::update(#table_ident::table.filter(#table_ident::id.eq_any(chunk)).filter(#table_ident::tenant_id.eq(t)))
                         .set(diesel_changeset)
+                        .returning(#model_name::as_select())
                         .get_results::<#model_name>(conn)
                         .await
                 } else {
                     ::autumn_web::reexports::diesel::update(#table_ident::table.filter(#table_ident::id.eq_any(chunk)))
                         .set(changes.__to_changeset())
-                        .get_results::<#model_name>(conn)
+                        .returning(#model_name::as_select()).get_results::<#model_name>(conn)
                         .await
                 }
             }
@@ -12365,7 +12358,7 @@ fn emit_plain_mutate_many(
             quote! {
                 ::autumn_web::reexports::diesel::update(#table_ident::table.filter(#table_ident::id.eq_any(chunk)))
                     .set(changes.__to_changeset())
-                    .get_results::<#model_name>(conn)
+                    .returning(#model_name::as_select()).get_results::<#model_name>(conn)
                     .await
             }
         };
@@ -12479,9 +12472,9 @@ fn emit_plain_mutate_many(
                         .filter(#table_ident::id.eq_any(chunk))
                         #soft_delete_filter;
                     let chunk_rows = if let ::core::option::Option::Some(t) = tenant_id {
-                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t)).select(#model_name::as_select())).load::<#model_name>(conn).await
                     } else {
-                        ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).load::<#model_name>(conn).await
                     }
                     .map_err(::autumn_web::AutumnError::from)?;
                 }
@@ -12490,7 +12483,7 @@ fn emit_plain_mutate_many(
                     let load_query = #table_ident::table
                         .filter(#table_ident::id.eq_any(chunk))
                         #soft_delete_filter;
-                    let chunk_rows = ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
+                    let chunk_rows = ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).load::<#model_name>(conn).await
                         .map_err(::autumn_web::AutumnError::from)?;
                 }
             };
@@ -12693,8 +12686,7 @@ fn emit_plain_mutate_many(
 
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-                    let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                    let __now = ::autumn_web::time::ambient_now().naive_utc();
 
                     #delete_many_tx_bind ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
@@ -12893,13 +12885,13 @@ fn emit_plain_mutate_many(
                 if let ::core::option::Option::Some(ref t) = tenant_id {
                     ::autumn_web::maybe_for_update!(#table_ident::table
                         .filter(#table_ident::id.eq_any(&chunk_ids))
-                        .filter(#table_ident::tenant_id.eq(t.clone())))
+                        .filter(#table_ident::tenant_id.eq(t.clone())).select(#model_name::as_select()))
 
                         .load::<#model_name>(conn)
                         .await
                 } else {
                     ::autumn_web::maybe_for_update!(#table_ident::table
-                        .filter(#table_ident::id.eq_any(&chunk_ids)))
+                        .filter(#table_ident::id.eq_any(&chunk_ids)).select(#model_name::as_select()))
 
                         .load::<#model_name>(conn)
                         .await
@@ -12908,7 +12900,7 @@ fn emit_plain_mutate_many(
         } else {
             quote! {
                 ::autumn_web::maybe_for_update!(#table_ident::table
-                    .filter(#table_ident::id.eq_any(&chunk_ids)))
+                    .filter(#table_ident::id.eq_any(&chunk_ids)).select(#model_name::as_select()))
 
                     .load::<#model_name>(conn)
                     .await
@@ -12975,14 +12967,14 @@ fn emit_plain_mutate_many(
                         if let ::core::option::Option::Some(ref t) = tenant_id {
                             ::autumn_web::maybe_for_update!(#table_ident::table
                                 .filter(#table_ident::id.eq_any(&__autumn_dropped_ids))
-                                .filter(#table_ident::tenant_id.eq(t.clone())))
+                                .filter(#table_ident::tenant_id.eq(t.clone())).select(#model_name::as_select()))
 
                                 .load::<#model_name>(conn)
                                 .await
                                 .map_err(::autumn_web::AutumnError::from)?
                         } else {
                             ::autumn_web::maybe_for_update!(#table_ident::table
-                                .filter(#table_ident::id.eq_any(&__autumn_dropped_ids)))
+                                .filter(#table_ident::id.eq_any(&__autumn_dropped_ids)).select(#model_name::as_select()))
 
                                 .load::<#model_name>(conn)
                                 .await
@@ -13417,8 +13409,7 @@ fn emit_dependent_cascade(
                             ),
                         );
                     }
-                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-                    let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                    let __now = ::autumn_web::time::ambient_now().naive_utc();
                     ::autumn_web::reexports::diesel::update(
                         #table_ident::table.find(__cid).filter(#table_ident::deleted_at.is_null())
                     )
@@ -13431,8 +13422,7 @@ fn emit_dependent_cascade(
         } else if config.soft_delete {
             quote! {
                 #destroy_count_bind = if __parent_soft {
-                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-                    let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                    let __now = ::autumn_web::time::ambient_now().naive_utc();
                     ::autumn_web::reexports::diesel::update(
                         #table_ident::table.find(__cid).filter(#table_ident::deleted_at.is_null())
                     )
@@ -13982,7 +13972,7 @@ fn emit_dependent_cascade(
                 // `None`, skip the hard delete, and leave the row to FK-fail the
                 // parent DELETE. The id set is authoritative for the parent kind,
                 // and the row is locked with `for_update`.
-                let __record = ::autumn_web::maybe_for_update!(#table_ident::table.find(__cid))
+                let __record = ::autumn_web::maybe_for_update!(#table_ident::table.find(__cid).select(#model_name::as_select()))
                     .first::<#model_name>(conn)
                     .await
                     .optional()
@@ -14273,10 +14263,10 @@ fn emit_dependent_cascade(
                 #delete_many_live_filter;
             let __autumn_dep_rows: ::std::vec::Vec<#model_name> =
                 if let ::core::option::Option::Some(t) = tenant_id {
-                    ::autumn_web::maybe_for_update!(__autumn_dep_q.filter(#table_ident::tenant_id.eq(t)))
+                    ::autumn_web::maybe_for_update!(__autumn_dep_q.filter(#table_ident::tenant_id.eq(t)).select(#model_name::as_select()))
                         .load::<#model_name>(conn).await
                 } else {
-                    ::autumn_web::maybe_for_update!(__autumn_dep_q).load::<#model_name>(conn).await
+                    ::autumn_web::maybe_for_update!(__autumn_dep_q.select(#model_name::as_select())).load::<#model_name>(conn).await
                 }
                 .map_err(::autumn_web::AutumnError::from)?;
         }
@@ -14285,7 +14275,7 @@ fn emit_dependent_cascade(
             let __autumn_dep_rows: ::std::vec::Vec<#model_name> =
                 ::autumn_web::maybe_for_update!(#table_ident::table
                     .filter(#table_ident::id.eq_any(chunk))
-                    #delete_many_live_filter)
+                    #delete_many_live_filter.select(#model_name::as_select()))
 
                     .load::<#model_name>(conn).await
                     .map_err(::autumn_web::AutumnError::from)?;
@@ -15198,7 +15188,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     let mut conn = self.__autumn_acquire_read_conn().await?;
                     #table_ident::table
-                        .load::<#model_name>(&mut conn)
+                        .select(#model_name::as_select()).load::<#model_name>(&mut conn)
                         .await
                         .map_err(::autumn_web::AutumnError::from)
                 }
@@ -15210,7 +15200,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
                     let mut conn = self.__autumn_acquire_read_conn().await?;
                     #table_ident::table
                         .filter(#table_ident::deleted_at.is_not_null())
-                        .load::<#model_name>(&mut conn)
+                        .select(#model_name::as_select()).load::<#model_name>(&mut conn)
                         .await
                         .map_err(::autumn_web::AutumnError::from)
                 }
@@ -15357,9 +15347,9 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
                             #cc_before_restore
                             let load_query = #table_ident::table.find(id);
                             let record = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
+                                ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t)).select(#model_name::as_select())).first::<#model_name>(conn).await
                             } else {
-                                ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
+                                ::autumn_web::maybe_for_update!(load_query.select(#model_name::as_select())).first::<#model_name>(conn).await
                             }
                             .optional()
                             .map_err(::autumn_web::AutumnError::from)?
@@ -15370,12 +15360,12 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
                             let __restored = if let ::core::option::Option::Some(ref t) = tenant_id {
                                 ::autumn_web::reexports::diesel::update(update_query.filter(#table_ident::tenant_id.eq(t)))
                                     .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
-                                    .get_result::<#model_name>(conn)
+                                    .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                     .await
                             } else {
                                 ::autumn_web::reexports::diesel::update(update_query)
                                     .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
-                                    .get_result::<#model_name>(conn)
+                                    .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                     .await
                             }
                             .optional()
@@ -15440,11 +15430,11 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
                     let query = #table_ident::table;
                     if let ::core::option::Option::Some(ref t) = tenant_id {
                         query.filter(#table_ident::tenant_id.eq(t))
-                            .load::<#model_name>(&mut conn)
+                            .select(#model_name::as_select()).load::<#model_name>(&mut conn)
                             .await
                     } else {
                         query
-                            .load::<#model_name>(&mut conn)
+                            .select(#model_name::as_select()).load::<#model_name>(&mut conn)
                             .await
                     }
                     .map_err(::autumn_web::AutumnError::from)
@@ -15460,11 +15450,11 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
                     let query = #table_ident::table.filter(#table_ident::deleted_at.is_not_null());
                     if let ::core::option::Option::Some(ref t) = tenant_id {
                         query.filter(#table_ident::tenant_id.eq(t))
-                            .load::<#model_name>(&mut conn)
+                            .select(#model_name::as_select()).load::<#model_name>(&mut conn)
                             .await
                     } else {
                         query
-                            .load::<#model_name>(&mut conn)
+                            .select(#model_name::as_select()).load::<#model_name>(&mut conn)
                             .await
                     }
                     .map_err(::autumn_web::AutumnError::from)
@@ -15540,7 +15530,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
                         let mut conn = self.__autumn_acquire_conn().await?;
                         ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
                             #cc_before_restore
-                            let record = ::autumn_web::maybe_for_update!(#table_ident::table.find(id))
+                            let record = ::autumn_web::maybe_for_update!(#table_ident::table.find(id).select(#model_name::as_select()))
                                 .first::<#model_name>(conn)
                                 .await
                                 .optional()
@@ -15550,7 +15540,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
                                 ))?;
                             let __restored = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
                                 .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
-                                .get_result::<#model_name>(conn)
+                                .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                                 .optional()
                                 .map_err(::autumn_web::AutumnError::from)?
@@ -15599,6 +15589,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
                     let mut conn = self.__autumn_acquire_read_conn().await?;
                     let query = #table_ident::table;
                     query
+                        .select(#model_name::as_select())
                         .load::<#model_name>(&mut conn)
                         .await
                         .map_err(::autumn_web::AutumnError::from)
@@ -15610,6 +15601,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
                     let mut conn = self.__autumn_acquire_read_conn().await?;
                     let query = #table_ident::table.filter(#table_ident::deleted_at.is_not_null());
                     query
+                        .select(#model_name::as_select())
                         .load::<#model_name>(&mut conn)
                         .await
                         .map_err(::autumn_web::AutumnError::from)
@@ -15657,14 +15649,14 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
             if let ::core::option::Option::Some(ref t) = tenant_id {
                 query.filter(#table_ident::tenant_id.eq(t))
                     #sd_filter
-                    .first::<#model_name>(&mut conn)
+                    .select(#model_name::as_select()).first::<#model_name>(&mut conn)
                     .await
                     .optional()
                     .map_err(::autumn_web::AutumnError::from)
             } else {
                 query
                     #sd_filter
-                    .first::<#model_name>(&mut conn)
+                    .select(#model_name::as_select()).first::<#model_name>(&mut conn)
                     .await
                     .optional()
                     .map_err(::autumn_web::AutumnError::from)
@@ -15675,7 +15667,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
             #table_ident::table
                 .find(id)
                 #sd_filter
-                .first::<#model_name>(&mut conn)
+                .select(#model_name::as_select()).first::<#model_name>(&mut conn)
                 .await
                 .optional()
                 .map_err(::autumn_web::AutumnError::from)
@@ -15695,13 +15687,13 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
             if let ::core::option::Option::Some(ref t) = tenant_id {
                 query.filter(#table_ident::tenant_id.eq(t))
                     #sd_filter
-                    .load::<#model_name>(&mut conn)
+                    .select(#model_name::as_select()).load::<#model_name>(&mut conn)
                     .await
                     .map_err(::autumn_web::AutumnError::from)
             } else {
                 query
                     #sd_filter
-                    .load::<#model_name>(&mut conn)
+                    .select(#model_name::as_select()).load::<#model_name>(&mut conn)
                     .await
                     .map_err(::autumn_web::AutumnError::from)
             }
@@ -15710,7 +15702,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
         quote! {
             #table_ident::table
                 #sd_filter
-                .load::<#model_name>(&mut conn)
+                .select(#model_name::as_select()).load::<#model_name>(&mut conn)
                 .await
                 .map_err(::autumn_web::AutumnError::from)
         }
@@ -16321,6 +16313,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
                 #second_stage_soft_delete_filter
                 #second_stage_tenant_filter
                 let records = records_query
+                    .select(#model_name::as_select())
                     .load::<#model_name>(&mut conn)
                     .await?;
 
@@ -16591,6 +16584,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
                 #second_stage_soft_delete_filter
                 #second_stage_tenant_filter
                 let records = records_query
+                    .select(#model_name::as_select())
                     .load::<#model_name>(&mut conn)
                     .await?;
 
@@ -16992,6 +16986,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
                 #second_stage_tenant_filter
                 #second_stage_owner_filter
                 let records = records_query
+                    .select(#model_name::as_select())
                     .load::<#model_name>(&mut conn)
                     .await?;
 
@@ -18079,13 +18074,13 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
                     ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                         .values(::autumn_web::tenancy::TenantInsertable::tenant_values(#values.clone(), __t))
                         .on_conflict_do_nothing()
-                        .get_result::<#model_name>(#conn)
+                        .returning(#model_name::as_select()).get_result::<#model_name>(#conn)
                         .await
                 } else {
                     ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                         .values(#values.clone())
                         .on_conflict_do_nothing()
-                        .get_result::<#model_name>(#conn)
+                        .returning(#model_name::as_select()).get_result::<#model_name>(#conn)
                         .await
                 }
                 .optional()
@@ -18096,7 +18091,7 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
                 ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                     .values(#values.clone())
                     .on_conflict_do_nothing()
-                    .get_result::<#model_name>(#conn)
+                    .returning(#model_name::as_select()).get_result::<#model_name>(#conn)
                     .await
                     .optional()
                     .map_err(::autumn_web::AutumnError::from)?
@@ -18753,9 +18748,9 @@ fn emit_write_bodies(
             quote! {
                 let __load_query = #table_ident::table.find(id) #sd_filter;
                 let #parent_record_bind = if let ::core::option::Option::Some(ref t) = tenant_id {
-                    ::autumn_web::maybe_for_update!(__load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
+                    ::autumn_web::maybe_for_update!(__load_query.filter(#table_ident::tenant_id.eq(t)).select(#model_name::as_select())).first::<#model_name>(conn).await
                 } else {
-                    ::autumn_web::maybe_for_update!(__load_query).first::<#model_name>(conn).await
+                    ::autumn_web::maybe_for_update!(__load_query.select(#model_name::as_select())).first::<#model_name>(conn).await
                 }
                 .optional()
                 .map_err(::autumn_web::AutumnError::from)?
@@ -18765,7 +18760,7 @@ fn emit_write_bodies(
             }
         } else {
             quote! {
-                let #parent_record_bind = ::autumn_web::maybe_for_update!(#table_ident::table.find(id) #sd_filter)
+                let #parent_record_bind = ::autumn_web::maybe_for_update!(#table_ident::table.find(id) #sd_filter.select(#model_name::as_select()))
 
                     .first::<#model_name>(conn)
                     .await
@@ -18808,8 +18803,7 @@ fn emit_write_bodies(
                 }
             };
             quote! {
-                #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-                let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                let __now = ::autumn_web::time::ambient_now().naive_utc();
                 #tenant_scoped_update
                 if __count == 0 {
                     return Err(::autumn_web::AutumnError::not_found_msg(
@@ -22212,7 +22206,7 @@ mod tests {
         // instead of a bare `.for_update()` chain. The lock must still be
         // applied to the load that precedes `before_delete`.
         let delete_lock = delete_generated
-            .find("maybe_for_update ! (load_query)")
+            .find("maybe_for_update ! (load_query . select (Post :: as_select ()))")
             .expect(
                 "delete path should lock the row (maybe_for_update! seam) before before_delete",
             );
@@ -23132,7 +23126,9 @@ mod tests {
         .to_string();
         let destroy_arm = dependent_destroy_arm(&generated);
         assert!(
-            destroy_arm.contains("maybe_for_update ! (comments :: table . find (__cid))"),
+            destroy_arm.contains(
+                "maybe_for_update ! (comments :: table . find (__cid) . select (Comment :: as_select ()))"
+            ),
             "the per-ID reload must load the selected id straight into the \
              maybe_for_update! lock wrapper, with no deleted_at filter that could \
              drop a pre-soft-deleted child: {destroy_arm}"
@@ -24310,6 +24306,41 @@ mod tests {
         );
     }
 
+    /// #2854: every generated read must project the model's own column list
+    /// (`Model::as_select()`) instead of decoding the table's physical column
+    /// order positionally. A model whose field order differs from its `table!`
+    /// column order would otherwise come back with fields swapped.
+    #[test]
+    fn repository_macro_reads_project_model_as_select() {
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+
+        for signature in ["async fn find_all", "async fn find_by_id"] {
+            let body = generated_fn(&generated, signature);
+            assert!(
+                body.contains("select (Post :: as_select ())"),
+                "{signature} must select Post::as_select(): {body}"
+            );
+        }
+    }
+
+    /// #2854: `INSERT`/`UPDATE ... RETURNING` must project the model's own
+    /// column list instead of decoding `RETURNING *` positionally into the
+    /// model — same hazard as the reads, on the write side.
+    #[test]
+    fn repository_macro_writes_return_model_as_select() {
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+
+        for signature in ["async fn save", "async fn update"] {
+            let body = generated_fn(&generated, signature);
+            assert!(
+                body.contains("returning (Post :: as_select ())"),
+                "{signature} must return Post::as_select(): {body}"
+            );
+        }
+    }
+
     /// The generated text for one `async fn`, from its signature to the start of
     /// the next one (or end of input).
     ///
@@ -25010,11 +25041,11 @@ mod tests {
         // `.for_update()` chain. That branch must still lock the row before the
         // history diff (`INSERT INTO _autumn_version_history`) is computed.
         let no_expected_branch = generated
-            .find("} else { :: autumn_web :: maybe_for_update ! (load_query)")
+            .find("} else { :: autumn_web :: maybe_for_update ! (load_query . select (Post :: as_select ()))")
             .expect("versioned update should have a no-expected-version load branch");
         let section = &generated[no_expected_branch..];
         let lock_pos = section
-            .find("maybe_for_update ! (load_query)")
+            .find("maybe_for_update ! (load_query . select (Post :: as_select ()))")
             .expect("versioned update must lock the row (maybe_for_update! seam) before computing history diff");
         let first_pos = section
             .find(". first :: < Post >")
@@ -26667,9 +26698,10 @@ mod tests {
              `purge_deleted_after` up front: {task_info_region}"
         );
         assert!(
-            task_info_region.contains("chrono :: Utc :: now"),
-            "boot-time cutoff validation must use the real wall clock, since task_info() has \
-             no state/ClockSource parameter: {task_info_region}"
+            task_info_region.contains("time :: ambient_now"),
+            "boot-time cutoff validation must use the ambient clock (the real wall clock \
+             outside a `Sim`), since task_info() has no state/ClockSource parameter \
+             (#2967): {task_info_region}"
         );
     }
 

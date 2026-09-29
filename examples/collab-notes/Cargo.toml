@@ -19,10 +19,15 @@ tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
 example-e2e = { path = "../../example-e2e" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [[test]]
 name = "smoke"
 path = "tests/system/smoke.rs"
+
+[[test]]
+name = "a11y"
+path = "tests/a11y.rs"
 
 [lints.rust]
 unsafe_code = "forbid"

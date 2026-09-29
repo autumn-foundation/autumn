@@ -6,6 +6,8 @@
 //! post's terms *and* the affected terms' post counts. Handlers call these; they
 //! never open a transaction themselves.
 
+use std::collections::HashSet;
+
 use autumn_web::AutumnError;
 use autumn_web::AutumnResult;
 use diesel::prelude::*;
@@ -178,7 +180,9 @@ pub async fn update_post_with_revision(
                      hierarchy lock",
                 ));
             }
-            validate_parent(conn, Some(post_id), &post.post_type, parent_id).await?;
+            validate_parent(conn, Some(post_id), &post.post_type, parent_id)
+                .await?
+                .into_result()?;
         }
 
         // The same invariants `PostHooks::before_update` enforces. This path
@@ -218,7 +222,7 @@ pub async fn update_post_with_revision(
         // After the write, inside this transaction, so a refusal rolls the edit
         // back: the page's full path is only settled once the slug and the
         // parent are both stored, and this statement is what stores them.
-        guard_page_path(conn, post_id).await?;
+        guard_page_path(conn, post_id).await?.into_result()?;
         // And the custom-type shape, which the insert allocator already checks.
         // Renaming an existing item is the other way onto a claimed path, and
         // guarding only creation left it open.
@@ -639,7 +643,19 @@ pub async fn set_post_terms(
         // Ascending id order, and every fan-out over terms uses the same order,
         // so two transactions touching overlapping sets can never hold the
         // halves of each other's cycle.
-        lock_terms(conn, &affected).await?;
+        let locked = lock_terms(conn, &affected).await?;
+
+        // A caller's `term_ids` can be stale by the time this transaction
+        // runs -- the id was resolved earlier (an editor's form round trip,
+        // or an import's up-front batch resolution of every post's term
+        // references) and the term was deleted in between. `lock_terms`
+        // already tolerates that for locking/recounting purposes (see its
+        // own doc comment); filtering `wanted` down to what it actually
+        // found does the same for the insert below, so a deleted term is
+        // silently dropped from the post's assignment instead of the insert
+        // failing its foreign key.
+        let locked_ids: HashSet<i64> = locked.into_iter().collect();
+        wanted.retain(|id| locked_ids.contains(id));
 
         diesel::delete(post_terms::table.filter(post_terms::post_id.eq(post_id)))
             .execute(conn)
@@ -693,21 +709,21 @@ pub async fn set_post_terms(
 /// the loop's `.optional()`; `recount_term` reaches the same conclusion for
 /// the one lock it still takes per row (see its own doc comment for why that
 /// one stays unbatched).
-async fn lock_terms(conn: &mut AsyncPgConnection, term_ids: &[i64]) -> AutumnResult<()> {
+async fn lock_terms(conn: &mut AsyncPgConnection, term_ids: &[i64]) -> AutumnResult<Vec<i64>> {
     let mut ordered = term_ids.to_vec();
     ordered.sort_unstable();
     ordered.dedup();
     if ordered.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    let _locked: Vec<i64> = terms::table
+    let locked: Vec<i64> = terms::table
         .filter(terms::id.eq_any(&ordered))
         .select(terms::id)
         .order(terms::id.asc())
         .for_update()
         .load(conn)
         .await?;
-    Ok(())
+    Ok(locked)
 }
 
 /// Rebuild the counts of every term a post is filed under.
@@ -948,11 +964,41 @@ pub async fn moderate_comment(
             }
         }
 
+        // Which approved replies the thread page already cannot show, so the
+        // check after the update can tell what *this* approval evicted.
+        let unreadable_before: std::collections::HashSet<i64> = if target == "approved" {
+            unrendered_approved_replies(conn, comment.post_id)
+                .await?
+                .into_iter()
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
         let saved: Comment = diesel::update(comments::table.find(comment_id))
             .set(comments::status.eq(&target))
             .returning(Comment::as_returning())
             .get_result(conn)
             .await?;
+
+        // Approving a reply onto a thread past the page's comment budget would
+        // count a comment no reader can reach — the same state the write path
+        // refuses to create. Refuse the approval instead; the moderator can
+        // spam or delete the reply.
+        //
+        // The whole thread is re-checked, not just this row: an older reply
+        // approved onto a full page sorts into the window and can evict a newer
+        // one that was already showing.
+        if target == "approved"
+            && unrendered_approved_replies(conn, saved.post_id)
+                .await?
+                .iter()
+                .any(|id| !unreadable_before.contains(id))
+        {
+            return Err(AutumnError::unprocessable_msg(
+                "This conversation has reached its display limit, so this reply cannot be shown",
+            ));
+        }
 
         // Hiding a comment hides the thread under it. `assemble_thread` builds
         // from the roots down, so a reply whose parent is no longer approved
@@ -1083,11 +1129,42 @@ pub async fn create_comment(
 
         let approved = new.status == "approved";
         let post_id = new.post_id;
+        // What the thread page already cannot show, so the check after the
+        // insert can tell what *this* comment evicted.
+        let unreadable_before: std::collections::HashSet<i64> = if approved {
+            unrendered_approved_replies(conn, post_id)
+                .await?
+                .into_iter()
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
         let saved: Comment = diesel::insert_into(comments::table)
             .values(&new)
             .returning(Comment::as_returning())
             .get_result(conn)
             .await?;
+        // A comment that pushes another out of a renderable window must not be
+        // accepted. `approved_thread_page` caps a page at `MAX_THREAD_COMMENTS`,
+        // keeping the oldest rows at the level where the budget runs out, so
+        // past the cap an approved reply would be counted in `comment_count`
+        // but appear on no page — and so would an existing reply that a new
+        // root displaces, since a page loads every root before any descendant.
+        // Refusing here — inside the transaction, under the post's lock — rolls
+        // the insert back; the alternative is a comment the site counts but no
+        // reader can reach. The whole thread is re-checked, root or reply. A
+        // pending comment is neither rendered nor counted until a moderator
+        // approves it; `moderate_comment` applies the same check then.
+        if approved
+            && unrendered_approved_replies(conn, post_id)
+                .await?
+                .iter()
+                .any(|id| !unreadable_before.contains(id))
+        {
+            return Err(AutumnError::unprocessable_msg(
+                "This conversation has reached its display limit",
+            ));
+        }
         // Recomputed under the post's lock rather than incremented. A bare
         // `+ 1` is safe against another increment, but not against a
         // concurrent moderation recomputing the whole count from a snapshot
@@ -2447,39 +2524,101 @@ pub async fn ensure_unique_slug(
     let shadowed_by_a_route = !nested_page
         && BARE_PATH_TYPES.contains(&post_type)
         && segment_claim(desired, None).is_some();
-    let mut candidate = if shadowed_by_a_route {
+
+    // The first candidate the original suffix-at-a-time loop would have
+    // queried: `desired` itself, or `desired-2` when `shadowed_by_a_route`
+    // (that slug is reserved by a route rather than by another row, so the
+    // search starts one suffix further in).
+    let first_candidate = if shadowed_by_a_route {
         format!("{desired}-2")
     } else {
         desired.to_owned()
     };
-    for suffix in 2..=200u32 {
-        let mut query = posts::table
-            .filter(posts::slug.eq(candidate.clone()))
-            .filter(posts::post_type.eq_any(&competing_types))
-            .into_boxed();
-        // Siblings only, for a nested page — and for a top-level page or a
-        // post, the bare-path namespace, which nested pages are not in.
-        query = match parent_id {
-            Some(parent) if nested_page => query.filter(posts::parent_id.eq(parent)),
-            _ if BARE_PATH_TYPES.contains(&post_type) => {
-                query.filter(posts::post_type.eq("post").or(posts::parent_id.is_null()))
-            }
-            _ => query,
-        };
-        if let Some(id) = exclude_id {
-            query = query.filter(posts::id.ne(id));
-        }
-        let taken: i64 = query.count().get_result(conn).await?;
-        if taken == 0 {
-            return Ok(candidate);
-        }
-        candidate = format!("{desired}-{suffix}");
+
+    // The overwhelming common case is zero collisions: a title nobody has
+    // used before frees on the very first candidate. Probing that one alone
+    // — the same single-value, index-backed shape the original loop's first
+    // iteration used, and the only string this path allocates — keeps that
+    // case exactly as cheap as before: no wider `= ANY(...)` query the
+    // planner might resolve with a sequential scan, and no wasted formatting
+    // of the ~198 suffixes that turn out not to be needed. Only a collision
+    // here falls through to building and batching the rest of the candidate
+    // list, and it is *that* path — not the common one — that this fix is
+    // for.
+    let mut probe = posts::table
+        .filter(posts::slug.eq(&first_candidate))
+        .filter(posts::post_type.eq_any(&competing_types))
+        .into_boxed();
+    probe = apply_slug_scope(probe, post_type, parent_id, nested_page, exclude_id);
+    let first_taken: i64 = probe.count().get_result(conn).await?;
+    if first_taken == 0 {
+        return Ok(first_candidate);
     }
-    // 200 collisions on one slug is not a naming accident. Refuse rather than
-    // loop or silently overwrite.
-    Err(AutumnError::unprocessable_msg(
-        "Too many posts share this slug; choose a different one",
-    ))
+
+    // Reached only on a collision. The rest of the candidates the original
+    // loop would have queried, in the same order and with the same
+    // off-by-one boundary: `desired-200` is never itself reached (the
+    // loop's `2..=200` range, combined with its check-then-advance
+    // structure, means the last candidate it ever queries is
+    // `desired-199`), so 199 taken candidates — not 200 — is what exhausts
+    // the search. The original loop also rechecks `desired-2` a second time
+    // via its carried-over candidate in the `shadowed_by_a_route` case, a
+    // redundant, idempotent recheck (the same string can't become "more
+    // taken" the second time) that is dropped here rather than reproduced.
+    let first_suffix = if shadowed_by_a_route { 3 } else { 2 };
+    let remaining: Vec<String> = (first_suffix..=199u32)
+        .map(|suffix| format!("{desired}-{suffix}"))
+        .collect();
+
+    let mut query = posts::table
+        .filter(posts::slug.eq_any(&remaining))
+        .filter(posts::post_type.eq_any(&competing_types))
+        .into_boxed();
+    query = apply_slug_scope(query, post_type, parent_id, nested_page, exclude_id);
+    // One round trip for the rest of the candidate list, instead of one per
+    // suffix: every existing row that holds ANY remaining candidate, in a
+    // single query, then the first candidate not among them wins in Rust —
+    // the same "first free wins" rule the original loop applied one probe
+    // at a time.
+    let taken: HashSet<String> = query
+        .select(posts::slug)
+        .load(conn)
+        .await?
+        .into_iter()
+        .collect();
+
+    remaining
+        .into_iter()
+        .find(|candidate| !taken.contains(candidate))
+        // 199 collisions on one slug is not a naming accident. Refuse rather
+        // than loop further or silently overwrite.
+        .ok_or_else(|| {
+            AutumnError::unprocessable_msg("Too many posts share this slug; choose a different one")
+        })
+}
+
+/// Siblings only, for a nested page — and for a top-level page or a post,
+/// the bare-path namespace, which nested pages are not in. Shared between
+/// `ensure_unique_slug`'s fast-path single probe and its batched fallback so
+/// the two stay scoped identically.
+fn apply_slug_scope<'a>(
+    mut query: posts::BoxedQuery<'a, diesel::pg::Pg>,
+    post_type: &str,
+    parent_id: Option<i64>,
+    nested_page: bool,
+    exclude_id: Option<i64>,
+) -> posts::BoxedQuery<'a, diesel::pg::Pg> {
+    query = match parent_id {
+        Some(parent) if nested_page => query.filter(posts::parent_id.eq(parent)),
+        _ if BARE_PATH_TYPES.contains(&post_type) => {
+            query.filter(posts::post_type.eq("post").or(posts::parent_id.is_null()))
+        }
+        _ => query,
+    };
+    if let Some(id) = exclude_id {
+        query = query.filter(posts::id.ne(id));
+    }
+    query
 }
 
 /// The deepest page hierarchy the site will address.
@@ -2557,6 +2696,50 @@ pub async fn post_by_id(conn: &mut AsyncPgConnection, post_id: i64) -> AutumnRes
         .optional()?)
 }
 
+/// The verdict of a parent-link or settled-path check.
+///
+/// [`validate_parent`] and [`guard_page_path`] return this instead of a bare
+/// `AutumnResult<()>` so callers that must keep going on a refusal — the
+/// importer's [`set_post_parent`] — can tell "the editor would not accept this
+/// link" apart from "the database failed". Collapsing both into one `Err` made
+/// an operational failure (a query error, a timeout, a dropped connection)
+/// look like a deliberate orphaning: the import reported the page as left at
+/// the top level and marked it complete, instead of failing and staying
+/// resumable.
+pub enum ParentCheck {
+    /// The link is one the editor would accept.
+    Accept,
+    /// An expected refusal, with the editor-facing reason.
+    Decline(String),
+}
+
+impl ParentCheck {
+    /// The editor-facing outcome: accept silently, or raise the refusal as the
+    /// 422 the editor already showed for it. An operational failure never
+    /// reaches here — it is already an `Err`.
+    pub fn into_result(self) -> AutumnResult<()> {
+        match self {
+            ParentCheck::Accept => Ok(()),
+            ParentCheck::Decline(reason) => Err(AutumnError::unprocessable_msg(reason)),
+        }
+    }
+}
+
+/// Map a parent validation for the importer: an expected refusal is a skipped
+/// link, an operational failure fails the import so it stays resumable.
+///
+/// `set_post_parent` and the creation-path validation both apply this, so the
+/// distinction between "the backup asked for something we cannot link" and
+/// "the database failed" lives in one place. Pure — and generic over the
+/// error — so the distinction is unit-tested without a database.
+pub fn import_parent_outcome<E>(check: Result<ParentCheck, E>) -> Result<bool, E> {
+    match check {
+        Ok(ParentCheck::Accept) => Ok(true),
+        Ok(ParentCheck::Decline(_)) => Ok(false),
+        Err(op) => Err(op),
+    }
+}
+
 /// Refuse a page whose full path a framework route already serves.
 ///
 /// Checked *after* the write, inside the caller's transaction, so it rolls the
@@ -2566,11 +2749,20 @@ pub async fn post_by_id(conn: &mut AsyncPgConnection, post_id: i64) -> AutumnRes
 ///
 /// A bare slug is caught long before this by `ensure_unique_slug`; what this
 /// adds is the nested case, which only a page can reach.
-pub async fn guard_page_path(conn: &mut AsyncPgConnection, post_id: i64) -> AutumnResult<()> {
+///
+/// Returns a [`ParentCheck`] rather than `AutumnResult<()>`: a refused path is
+/// an expected outcome the importer handles, while a database failure must
+/// propagate — see [`ParentCheck`].
+pub async fn guard_page_path(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+) -> Result<ParentCheck, AutumnError> {
     for path in page_paths_under(conn, post_id).await? {
-        guard_claimed_path(&path, "page")?;
+        if is_claimed_page_path(&path) {
+            return Ok(ParentCheck::Decline(claimed_path_message(&path, "page")));
+        }
     }
-    Ok(())
+    Ok(ParentCheck::Accept)
 }
 
 /// Every canonical page path a hierarchy edit at `post_id` settles: the edited
@@ -2635,6 +2827,18 @@ async fn page_path_of(
     Ok(Some(segments))
 }
 
+/// The refusal reason for a path a framework route already serves.
+///
+/// Shared by [`guard_claimed_path`] and [`guard_page_path`] so both report the
+/// same words for the same refusal.
+fn claimed_path_message(segments: &[String], what: &str) -> String {
+    format!(
+        "/{} is served by this site's health probe, so a {what} there would never be \
+         reachable",
+        segments.join("/")
+    )
+}
+
 /// Refuse content whose URL a framework route already serves.
 ///
 /// Pure, and separate from `guard_page_path`, because a page's ancestry is the
@@ -2647,10 +2851,8 @@ async fn page_path_of(
 /// keeps producing: the fix applied where the finding pointed and nowhere else.
 pub fn guard_claimed_path(segments: &[String], what: &str) -> AutumnResult<()> {
     if is_claimed_page_path(segments) {
-        return Err(AutumnError::unprocessable_msg(format!(
-            "/{} is served by this site's health probe, so a {what} there would never be \
-             reachable",
-            segments.join("/")
+        return Err(AutumnError::unprocessable_msg(claimed_path_message(
+            segments, what,
         )));
     }
     Ok(())
@@ -2707,12 +2909,16 @@ pub async fn descendant_ids(
 /// than `page_ancestry` walks, whose canonical URL then starts mid-tree and
 /// resolves to nothing. `post_id` is `None` when creating (no row to cycle
 /// back to yet).
+///
+/// Returns a [`ParentCheck`] rather than `AutumnResult<()>`: a refused parent
+/// is an expected outcome the importer handles, while a database failure must
+/// propagate — see [`ParentCheck`].
 pub async fn validate_parent(
     conn: &mut AsyncPgConnection,
     post_id: Option<i64>,
     post_type: &str,
     candidate_parent_id: i64,
-) -> AutumnResult<()> {
+) -> Result<ParentCheck, AutumnError> {
     // The parent must be a live row of the SAME hierarchical type. The foreign
     // key only says "some post", so a crafted form could name a normal post:
     // `page_ancestry` would then put that row's slug in the canonical URL while
@@ -2725,19 +2931,21 @@ pub async fn validate_parent(
         .await
         .optional()?;
     let Some(parent) = parent else {
-        return Err(AutumnError::unprocessable_msg("That parent does not exist"));
+        return Ok(ParentCheck::Decline(
+            "That parent does not exist".to_owned(),
+        ));
     };
     if parent.post_type != post_type || parent.status == "trash" {
-        return Err(AutumnError::unprocessable_msg(
-            "A parent must be another item of the same type, and not in the trash",
+        return Ok(ParentCheck::Decline(
+            "A parent must be another item of the same type, and not in the trash".to_owned(),
         ));
     }
 
     if let Some(post_id) = post_id
         && would_create_cycle(conn, post_id, candidate_parent_id).await?
     {
-        return Err(AutumnError::unprocessable_msg(
-            "A page cannot be placed under itself or one of its own children",
+        return Ok(ParentCheck::Decline(
+            "A page cannot be placed under itself or one of its own children".to_owned(),
         ));
     }
     // The depth that matters is the *deepest descendant's*, not the moved
@@ -2753,11 +2961,11 @@ pub async fn validate_parent(
         None => 0,
     };
     if depth_under(conn, candidate_parent_id).await? + moved_height >= MAX_PAGE_DEPTH {
-        return Err(AutumnError::unprocessable_msg(format!(
+        return Ok(ParentCheck::Decline(format!(
             "Pages can be nested at most {MAX_PAGE_DEPTH} levels deep"
         )));
     }
-    Ok(())
+    Ok(ParentCheck::Accept)
 }
 
 /// Re-parent a post. Used by the importer's ancestry pass.
@@ -2772,6 +2980,10 @@ pub async fn validate_parent(
 /// Invalid links are skipped rather than raised: an import that aborts part-way
 /// leaves the site half-restored, which is worse than one page landing at the
 /// top level. The caller reports the count.
+///
+/// An operational failure while checking is not a skipped link: it propagates,
+/// so the import fails and stays resumable instead of reporting the page as
+/// deliberately orphaned and marking it complete.
 pub async fn set_post_parent(
     conn: &mut AsyncPgConnection,
     post_id: i64,
@@ -2802,10 +3014,13 @@ pub async fn set_post_parent(
     let outcome = conn
         .transaction(async move |conn| {
             lock_page_hierarchy(conn).await?;
-            if validate_parent(conn, Some(post_id), &post.post_type, parent_id)
-                .await
-                .is_err()
-            {
+            // An expected refusal declines the link; an operational failure is
+            // already an `Err` and fails the import — staying resumable —
+            // instead of reporting the page as deliberately orphaned. See
+            // `import_parent_outcome`.
+            if !import_parent_outcome(
+                validate_parent(conn, Some(post_id), &post.post_type, parent_id).await,
+            )? {
                 return Err(ParentRefused::Declined);
             }
             diesel::update(posts::table.find(post_id))
@@ -2815,7 +3030,7 @@ pub async fn set_post_parent(
             // Re-parenting is the other way a page's path changes — and the
             // descendants' paths with it, which is what `guard_page_path`
             // walks.
-            if guard_page_path(conn, post_id).await.is_err() {
+            if !import_parent_outcome(guard_page_path(conn, post_id).await)? {
                 return Err(ParentRefused::Declined);
             }
             Ok::<_, ParentRefused>(true)
@@ -3688,9 +3903,12 @@ pub async fn import_revisions(
         diesel::delete(revisions::table.filter(revisions::post_id.eq(post_id)))
             .execute(conn)
             .await?;
-        for revision in &keep {
-            diesel::insert_into(revisions::table)
-                .values((
+        // One multi-row INSERT for the whole batch (`keep` is bounded by
+        // `REVISION_LIMIT`), not one round trip per kept revision.
+        let rows: Vec<_> = keep
+            .iter()
+            .map(|revision| {
+                (
                     revisions::post_id.eq(post_id),
                     revisions::title.eq(&revision.title),
                     revisions::excerpt.eq(&revision.excerpt),
@@ -3704,10 +3922,13 @@ pub async fn import_revisions(
                     // Explicit, like a comment's: a history whose timestamps all
                     // say "the moment of the restore" is not a history.
                     revisions::created_at.eq(revision.created_at),
-                ))
-                .execute(conn)
-                .await?;
-        }
+                )
+            })
+            .collect();
+        diesel::insert_into(revisions::table)
+            .values(rows)
+            .execute(conn)
+            .await?;
         Ok::<_, AutumnError>(keep.len())
     })
     .await
@@ -3720,7 +3941,11 @@ pub async fn import_revisions(
 /// row came from *in this database*, so a file carrying them would make the next
 /// restore treat a fresh row as one it had already finished — and skip its
 /// terms, status and ancestry forever.
-pub const INTERNAL_META_KEYS: &[&str] = &[IMPORT_SOURCE_SLUG_KEY, IMPORT_COMPLETED_KEY];
+pub const INTERNAL_META_KEYS: &[&str] = &[
+    IMPORT_SOURCE_SLUG_KEY,
+    IMPORT_COMPLETED_KEY,
+    IMPORT_COMMENTS_RESTORED_KEY,
+];
 
 /// Restore a post's custom fields.
 ///
@@ -3755,13 +3980,24 @@ pub async fn import_post_meta(
         )
         .execute(conn)
         .await?;
-        for (key, value) in &fields {
+        // Multi-row INSERTs, not one round trip per custom field: a file's
+        // per-post field count is unbounded (a plugin-heavy WordPress export
+        // routinely carries dozens), so this is chunked like `import_terms`'s
+        // batched insert rather than assumed to always fit one statement.
+        const CHUNK: usize = 1000;
+        for chunk in fields.chunks(CHUNK) {
+            let rows: Vec<_> = chunk
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        post_meta::post_id.eq(post_id),
+                        post_meta::meta_key.eq(key),
+                        post_meta::meta_value.eq(value),
+                    )
+                })
+                .collect();
             diesel::insert_into(post_meta::table)
-                .values((
-                    post_meta::post_id.eq(post_id),
-                    post_meta::meta_key.eq(key),
-                    post_meta::meta_value.eq(value),
-                ))
+                .values(rows)
                 .execute(conn)
                 .await?;
         }
@@ -3846,6 +4082,106 @@ pub async fn mark_imports_complete(
         .execute(conn)
         .await?;
     Ok(())
+}
+
+/// The `post_meta` key marking a post's discussion as restored from its file.
+///
+/// `import_comments` used to treat "the post already has a comment" as "its
+/// discussion is already restored". A crash — or a concurrent visitor comment
+/// — between the status transition committing and the comment import running
+/// made the retry skip the backup's whole thread and mark the post done,
+/// permanently losing the discussion. The marker is written in the same
+/// transaction as the comment rows, so the two cannot disagree, and a retry
+/// consults the marker instead of the comment count.
+pub const IMPORT_COMMENTS_RESTORED_KEY: &str = "_import_comments_restored";
+
+/// Whether this post's discussion has already been restored from its file.
+///
+/// Consulted by `import_comments` instead of the comment count: a visitor's
+/// comment is also a comment, and must not read as a finished import.
+async fn comments_import_completed(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+) -> AutumnResult<bool> {
+    Ok(post_meta::table
+        .filter(post_meta::post_id.eq(post_id))
+        .filter(post_meta::meta_key.eq(IMPORT_COMMENTS_RESTORED_KEY))
+        .select(post_meta::id)
+        .first::<i64>(conn)
+        .await
+        .optional()?
+        .is_some())
+}
+
+/// Record that a post's discussion has been restored from its file.
+///
+/// Written in the same transaction as the comment rows it describes — a
+/// failure anywhere rolls both back, so a retry never sees one without the
+/// other.
+async fn record_import_comments_restored(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+) -> AutumnResult<()> {
+    diesel::insert_into(post_meta::table)
+        .values((
+            post_meta::post_id.eq(post_id),
+            post_meta::meta_key.eq(IMPORT_COMMENTS_RESTORED_KEY),
+            post_meta::meta_value.eq("1"),
+        ))
+        .on_conflict_do_nothing()
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Batch-resolve `(taxonomy, slug)` term references to the id of the local
+/// term they name -- one to a few chunked `slug = ANY(...)` queries total,
+/// grouped by taxonomy, rather than one single-row lookup per reference.
+///
+/// Mirrors `import_terms`'s own batching one call up: this call's terms
+/// pass has already created every term the file itself declares, so by the
+/// time the posts pass runs, every reference a post carries either already
+/// exists or names nothing this site has -- there is nothing left to insert
+/// here, only to look up. A reference naming no local term is simply absent
+/// from the result, matching what the old per-post `find_by_slug` lookup
+/// found (nothing, once filtered to the right taxonomy in application code).
+///
+/// Grouped by taxonomy so the round trips scale with the site's registered-
+/// taxonomy count (usually low single digits), not with how many term
+/// references the file's posts carry in total -- a heavily-tagged blog's
+/// backup can carry many more references than distinct taxonomies.
+pub async fn resolve_term_refs<'a, I>(
+    conn: &mut AsyncPgConnection,
+    wanted: I,
+) -> AutumnResult<std::collections::HashMap<(String, String), i64>>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    use std::collections::{HashMap, HashSet};
+
+    const CHUNK: usize = 1000;
+
+    let mut by_taxonomy: HashMap<&'a str, HashSet<&'a str>> = HashMap::new();
+    for (taxonomy, slug) in wanted {
+        by_taxonomy.entry(taxonomy).or_default().insert(slug);
+    }
+
+    let mut by_key: HashMap<(String, String), i64> = HashMap::new();
+    for (taxonomy, slugs) in by_taxonomy {
+        let slugs: Vec<&str> = slugs.into_iter().collect();
+        for chunk in slugs.chunks(CHUNK) {
+            let rows: Vec<(String, String, i64)> = terms::table
+                .filter(terms::taxonomy.eq(taxonomy))
+                .filter(terms::slug.eq_any(chunk.iter().copied()))
+                .select((terms::taxonomy, terms::slug, terms::id))
+                .load(conn)
+                .await?;
+            for (row_taxonomy, row_slug, row_id) in rows {
+                by_key.insert((row_taxonomy, row_slug), row_id);
+            }
+        }
+    }
+    Ok(by_key)
 }
 
 /// The imported rows a previous run finished.
@@ -4370,7 +4706,7 @@ async fn insert_with_unique_slug(
                     .returning(Post::as_returning())
                     .get_result(conn)
                     .await?;
-                guard_page_path(conn, saved.id).await?;
+                guard_page_path(conn, saved.id).await?.into_result()?;
                 // A custom type is addressed under its own prefix, so its items
                 // mint a nested path too — `/product/widget` is as claimable as
                 // `/about/team`, and needs no walk to work out.
@@ -4431,11 +4767,15 @@ pub struct ImportedComment {
 ///
 /// Returns how many comments this call created.
 ///
-/// Skipped entirely when the post already has any comment. An import that says
-/// it skips existing content must not append a second copy of a thread to a
-/// post that already carries one — and unlike a post, a comment has no natural
-/// key to dedupe on, so "this post already has a discussion" is the honest
-/// guard. It is also what makes a re-run of a half-finished import safe.
+/// Skipped entirely when the discussion was already restored — recorded under
+/// [`IMPORT_COMMENTS_RESTORED_KEY`] in the same transaction as the rows, so
+/// the two cannot disagree. An import that says it skips existing content must
+/// not append a second copy of a thread to a post that already carries one —
+/// and unlike a post, a comment has no natural key to dedupe on, so the
+/// completion record is the honest guard. It is also what makes a re-run of a
+/// half-finished import safe: the old "the post already has a comment" read a
+/// concurrent visitor's comment as a finished import and dropped the backup's
+/// whole thread.
 pub async fn import_comments(
     conn: &mut AsyncPgConnection,
     post_id: i64,
@@ -4477,24 +4817,84 @@ pub async fn import_comments(
             return Ok(0);
         }
 
-        let existing: i64 = comments::table
-            .filter(comments::post_id.eq(post_id))
-            .count()
-            .get_result(conn)
-            .await?;
-        if existing > 0 {
+        // The completion record, not the comment count, says whether the
+        // discussion is already restored: a visitor's comment is also a
+        // comment, and must not read as a finished import.
+        if comments_import_completed(conn, post_id).await? {
             return Ok(0);
         }
 
+        // Comments already on the post that the file also carries. An import
+        // interrupted before the completion marker existed committed its rows
+        // without the record, and a hand-restored comment looks the same. Each
+        // such row is matched one-for-one and reused as the parent of its
+        // replies instead of being inserted again, so a retry neither appends
+        // the thread a second time nor drops the rest of it because a single
+        // row happened to be there already.
+        //
+        // The key is the row's whole identity as the restore would write it:
+        // resolved parent (its tree position), account, display name, contact
+        // email and URL, status,
+        // trimmed body and timestamp (microseconds, Postgres' precision).
+        // Siblings that differ in any of these are different comments and are
+        // never swapped for one another. A visitor's comment never matches.
+        type LegacyKey = (
+            Option<i64>,
+            Option<i64>,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+        );
+        let mut existing: std::collections::HashMap<LegacyKey, Vec<i64>> =
+            std::collections::HashMap::new();
+        // Newest id first so `pop` hands out the oldest: identical siblings
+        // were inserted in file order, and take their rows back in that order.
+        let present: Vec<Comment> = comments::table
+            .filter(comments::post_id.eq(post_id))
+            .order(comments::id.desc())
+            .select(Comment::as_select())
+            .load(conn)
+            .await?;
+        for row in present {
+            existing
+                .entry((
+                    row.parent_id,
+                    row.author_id,
+                    row.author_name.trim().to_owned(),
+                    row.author_email.clone(),
+                    row.author_url.clone(),
+                    row.status.clone(),
+                    row.body.trim().to_owned(),
+                    row.created_at.and_utc().timestamp_micros(),
+                ))
+                .or_default()
+                .push(row.id);
+        }
+
+        // What the thread page already cannot show, so the check after the
+        // restore rejects only what *this* import made unreadable: a retry on a
+        // post that was over the window before must not fail forever on it.
+        let unreadable_before: std::collections::HashSet<i64> =
+            unrendered_approved_replies(conn, post_id)
+                .await?
+                .into_iter()
+                .collect();
+
         let mut created = 0usize;
-        let mut level: Vec<(Option<i64>, &ImportedComment)> =
-            incoming.iter().map(|c| (None, c)).collect();
+        // Each entry carries whether its parent is approved (roots have none
+        // to hide behind), so an approved reply is never restored under a
+        // parent no reader can see.
+        let mut level: Vec<(Option<i64>, bool, &ImportedComment)> =
+            incoming.iter().map(|c| (None, true, c)).collect();
         for _ in 0..=MAX_COMMENT_DEPTH {
             if level.is_empty() {
                 break;
             }
-            let mut next: Vec<(Option<i64>, &ImportedComment)> = Vec::new();
-            for (parent_id, comment) in level {
+            let mut next: Vec<(Option<i64>, bool, &ImportedComment)> = Vec::new();
+            for (parent_id, parent_approved, comment) in level {
                 let mut new = crate::models::NewComment {
                     post_id,
                     parent_id,
@@ -4523,6 +4923,36 @@ pub async fn import_comments(
                 if crate::hooks::validate_comment(&mut new).is_err() {
                     continue;
                 }
+                if let Some(id) = existing
+                    .get_mut(&(
+                        new.parent_id,
+                        new.author_id,
+                        new.author_name.clone(),
+                        new.author_email.clone(),
+                        new.author_url.clone(),
+                        new.status.clone(),
+                        new.body.clone(),
+                        comment.created_at.and_utc().timestamp_micros(),
+                    ))
+                    .and_then(Vec::pop)
+                {
+                    let approved = new.status == "approved";
+                    for reply in &comment.replies {
+                        next.push((Some(id), approved, reply));
+                    }
+                    continue;
+                }
+                // `assemble_thread` builds from the roots down, so an approved
+                // reply under a parent that is pending, spam or trashed could
+                // never be attached — counted, but unreadable — and the
+                // per-comment paths refuse to create that state. Restored as
+                // `pending` instead: the moderator sees it, and approving the
+                // parent first is the order `moderate_comment` demands. Applied
+                // only to rows this call inserts; a row already on the post is
+                // matched as it stands.
+                if new.status == "approved" && !parent_approved {
+                    new.status = "pending".to_owned();
+                }
                 // `created_at` explicitly, not the column default. A thread
                 // restored with every timestamp set to the moment of the
                 // restore has lost its chronology — and the renderer orders by
@@ -4545,8 +4975,9 @@ pub async fn import_comments(
                     .get_result(conn)
                     .await?;
                 created += 1;
+                let approved = saved.status == "approved";
                 for reply in &comment.replies {
-                    next.push((Some(saved.id), reply));
+                    next.push((Some(saved.id), approved, reply));
                 }
             }
             level = next;
@@ -4556,7 +4987,32 @@ pub async fn import_comments(
         // the renderer draws `MAX_COMMENT_DEPTH` levels, and a reply grafted
         // somewhere it does not belong is worse than one that is absent.
 
+        // An approved reply the thread page cannot show must not be restored:
+        // it would be counted but permanently unreadable — the same state
+        // `create_comment` and `moderate_comment` refuse. Checked against the
+        // finished discussion, not row by row: the renderer orders a whole
+        // level by `(created_at, id)` while rows land grouped by parent, so a
+        // later, older row can evict a reply that passed when it was inserted.
+        // Failing here rolls the discussion back with the status transition
+        // waiting on it, instead of publishing a thread with a hole in it.
+        // Every approved reply on the post, not just the rows this call
+        // inserted: older backup rows can fill a page's window and push out a
+        // visitor reply that was visible before the merge.
+        if let Some(id) = unrendered_approved_replies(conn, post_id)
+            .await?
+            .into_iter()
+            .find(|id| !unreadable_before.contains(id))
+        {
+            return Err(AutumnError::unprocessable_msg(format!(
+                "comment {id} is beyond the display budget and cannot be shown"
+            )));
+        }
+
         recount_post_comments(conn, post_id).await?;
+        // In the same transaction as the rows: a crash between them would
+        // leave the marker without the discussion, and the retry would skip
+        // what was never restored.
+        record_import_comments_restored(conn, post_id).await?;
         Ok::<_, AutumnError>(created)
     })
     .await
@@ -5081,6 +5537,79 @@ pub async fn approved_comment_is_rendered(
     Ok(page.comments.iter().any(|row| row.id == comment_id))
 }
 
+/// Whether an approved reply would actually appear on its thread page.
+///
+/// `approved_thread_page` caps a page at [`MAX_THREAD_COMMENTS`], keeping the
+/// oldest rows at the level where the budget runs out — so past the cap, a
+/// newly approved reply is counted in `comment_count` but appears on no page:
+/// accepted and unreadable. Every write path that makes a reply approved —
+/// [`create_comment`] landing it approved, [`moderate_comment`] approving it,
+/// and [`import_comments`] restoring it — refuses rather than create that
+/// state. The check composes the same two helpers the public thread page uses
+/// ([`approved_thread_page_of`] and [`approved_comment_is_rendered`]), so it
+/// cannot drift from the renderer.
+///
+/// The comment write paths run it under the post's row lock, inside the
+/// transaction, so the verdict and the state change are atomic: two concurrent
+/// replies cannot both see room for one and leave one of them unreadable. The
+/// import holds the same lock through its own transaction, and a refusal
+/// rolls the whole restore back.
+pub async fn approved_reply_is_renderable(
+    conn: &mut AsyncPgConnection,
+    comment_id: i64,
+) -> AutumnResult<bool> {
+    let Some(page) = approved_thread_page_of(conn, comment_id).await? else {
+        // Both callers have just written the comment with an approved parent
+        // under the post's lock, so it always has a page here.
+        return Ok(true);
+    };
+    approved_comment_is_rendered(conn, comment_id, page).await
+}
+
+/// Every approved reply on a post that no thread page renders.
+///
+/// The batch form of [`approved_reply_is_renderable`], for callers that must
+/// vet a whole discussion at once. It replays the renderer's own
+/// [`approved_thread_page`] once per root page and compares the rendered ids to
+/// the post's approved replies, so a thread of thousands of comments costs a
+/// few queries per page instead of several per reply. A post whose approved
+/// comments all fit one page's budget skips even that: nothing can truncate.
+pub async fn unrendered_approved_replies(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+) -> AutumnResult<Vec<i64>> {
+    if approved_comment_count(conn, post_id).await? <= MAX_THREAD_COMMENTS {
+        return Ok(Vec::new());
+    }
+    let replies: Vec<i64> = comments::table
+        .filter(comments::post_id.eq(post_id))
+        .filter(comments::status.eq("approved"))
+        .filter(comments::parent_id.is_not_null())
+        .order(comments::id.asc())
+        .select(comments::id)
+        .load(conn)
+        .await?;
+    // No approved reply, nothing a page can truncate: a root always fits. A
+    // popular root-only discussion skips the page replay entirely.
+    if replies.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut rendered: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut offset = 0_i64;
+    loop {
+        let page = approved_thread_page(conn, post_id, offset, THREAD_ROOTS_PER_PAGE).await?;
+        rendered.extend(page.comments.iter().map(|c| c.id));
+        offset += THREAD_ROOTS_PER_PAGE;
+        if offset >= page.total_roots {
+            break;
+        }
+    }
+    Ok(replies
+        .into_iter()
+        .filter(|id| !rendered.contains(id))
+        .collect())
+}
+
 /// Which page of a post's approved thread a comment appears on, if any.
 ///
 /// A comment is rendered on the page its *root* is on, so this walks up to the
@@ -5572,5 +6101,41 @@ mod slug_shape_tests {
             !claimed(&["about"]) && !claimed(&["hello-world"]),
             "and the seeded content beside it is untouched"
         );
+    }
+}
+
+#[cfg(test)]
+mod parent_check_tests {
+    use super::{ParentCheck, import_parent_outcome};
+
+    /// A stand-in operational failure: the point is that it is *some* error,
+    /// not what it says.
+    #[derive(Debug, PartialEq)]
+    struct DbDown;
+
+    #[test]
+    fn into_result_accepts_silently_and_raises_refusals() {
+        assert!(ParentCheck::Accept.into_result().is_ok());
+        assert!(ParentCheck::Decline("no".to_owned()).into_result().is_err());
+    }
+
+    #[test]
+    fn import_parent_outcome_keeps_refusal_and_failure_apart() {
+        // An accepted link applies...
+        assert_eq!(
+            import_parent_outcome::<DbDown>(Ok(ParentCheck::Accept)),
+            Ok(true)
+        );
+        // ...an expected refusal is a skipped link, not an error...
+        assert_eq!(
+            import_parent_outcome::<DbDown>(Ok(ParentCheck::Decline("gone".to_owned()))),
+            Ok(false)
+        );
+        // ...and an operational failure propagates unchanged: it must fail the
+        // import and stay resumable, never read as a deliberate orphaning.
+        // (`set_post_parent` turns this `Err` into its `Failed` variant through
+        // `From`; the database half of that is covered by
+        // `set_post_parent_distinguishes_refusal_from_failure`.)
+        assert_eq!(import_parent_outcome::<DbDown>(Err(DbDown)), Err(DbDown));
     }
 }

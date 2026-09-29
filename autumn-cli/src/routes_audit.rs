@@ -316,11 +316,17 @@ fn method_is_safe(method: &str, safe_methods: &[String]) -> bool {
 
 /// Whether `path` matches one of the configured CSRF exemption prefixes.
 ///
-/// Mirrors the runtime `CsrfLayer` exemption predicate
-/// (`autumn/src/security/csrf.rs`): a prefix matches on an exact equality, or a
-/// prefix match whose boundary is a `/` (either the prefix ends with `/`, or the
-/// remainder starts with `/`). Route paths in the manifest are already
-/// normalized, so no dot-segment cleaning is required here.
+/// Mirrors the runtime `CsrfLayer`/`BotProtectionLayer`/`SubmitTokenLayer`
+/// exemption predicate, which lives once, shared, as
+/// `autumn::security::path::is_exempt_path` (`autumn/src/security/path.rs`): a
+/// prefix matches on an exact equality, or a prefix match whose boundary is a
+/// `/` (either the prefix ends with `/`, or the remainder starts with `/`).
+/// This copy exists because `security::path` is `pub(crate)` inside
+/// `autumn-web` and this CLI command runs at build time over a static route
+/// manifest rather than a live request — exporting the predicate publicly to
+/// close this gap is a public-API decision for a human, not this pass. Route
+/// paths in the manifest are already normalized, so no dot-segment cleaning is
+/// required here. Keep this in sync with `is_exempt_path` by hand.
 fn path_is_exempt(path: &str, exempt_paths: &[String]) -> bool {
     exempt_paths.iter().any(|prefix| {
         if path == prefix {
