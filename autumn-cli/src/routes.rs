@@ -266,47 +266,70 @@ pub fn print_json(routes: &[RouteInfo]) {
     println!("{json}");
 }
 
-/// Build a Postman Collection v2.1.0 JSON representation of the routes.
-pub fn build_postman_collection(routes: &[RouteInfo]) -> serde_json::Value {
-    let mut item = Vec::new();
+/// Default value of the `base_url` collection variable in a Postman export.
+const POSTMAN_DEFAULT_BASE_URL: &str = "http://localhost:3000";
 
-    for route in routes {
-        // Convert Axum path parameters like `/users/{id}` to Postman format `/users/:id`
-        // We only do a naive replacement if they are well-formed single segment braces.
-        let mut postman_path = String::new();
-
-        for c in route.path.chars() {
-            if c == '{' {
-                postman_path.push(':');
-            } else if c == '}' {
-                // Ignore closing braces in path
-            } else {
-                postman_path.push(c);
-            }
+/// Translate one axum path segment into Postman syntax.
+///
+/// A whole-segment capture — `{id}` or the wildcard `{*rest}` — becomes a
+/// Postman path variable `:id` / `:rest`, and its name is returned. Anything
+/// else is literal text, with axum's `{{` / `}}` brace escapes unescaped.
+fn postman_segment(segment: &str) -> (String, Option<String>) {
+    if let Some(inner) = segment
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .filter(|inner| !inner.starts_with('{') && !inner.ends_with('}'))
+    {
+        let name = inner.strip_prefix('*').unwrap_or(inner);
+        if !name.is_empty() && !name.contains(['{', '}']) {
+            return (format!(":{name}"), Some(name.to_owned()));
         }
+    }
+    (segment.replace("{{", "{").replace("}}", "}"), None)
+}
 
-        let path_segments: Vec<&str> = postman_path.trim_matches('/').split('/').collect();
-
-        let req = serde_json::json!({
-            "name": route.handler,
-            "request": {
-                "method": route.method,
-                "url": {
-                    "raw": format!("{{{{base_url}}}}{postman_path}"),
-                    "host": ["{{base_url}}"],
-                    "path": path_segments
+/// Build a Postman Collection v2.1.0 JSON representation of the routes.
+///
+/// Requests are addressed against a `{{base_url}}` collection variable
+/// (defaulting to [`POSTMAN_DEFAULT_BASE_URL`]), and each path capture is
+/// declared as a request `url.variable` so Postman shows an editable field.
+pub fn build_postman_collection(routes: &[RouteInfo]) -> serde_json::Value {
+    let item: Vec<serde_json::Value> = routes
+        .iter()
+        .map(|route| {
+            let mut segments = Vec::new();
+            let mut variables = Vec::new();
+            for segment in route.path.split('/').filter(|s| !s.is_empty()) {
+                let (text, variable) = postman_segment(segment);
+                segments.push(text);
+                if let Some(key) = variable {
+                    variables.push(serde_json::json!({ "key": key, "value": "" }));
                 }
             }
-        });
 
-        item.push(req);
-    }
+            serde_json::json!({
+                "name": route.handler,
+                "request": {
+                    "method": route.method,
+                    "url": {
+                        "raw": format!("{{{{base_url}}}}/{}", segments.join("/")),
+                        "host": ["{{base_url}}"],
+                        "path": segments,
+                        "variable": variables,
+                    }
+                }
+            })
+        })
+        .collect();
 
     serde_json::json!({
         "info": {
             "name": "Autumn Routes Export",
             "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
         },
+        "variable": [
+            { "key": "base_url", "value": POSTMAN_DEFAULT_BASE_URL }
+        ],
         "item": item
     })
 }
@@ -820,6 +843,37 @@ mod tests {
         let segments = post_route["request"]["url"]["path"].as_array().unwrap();
         assert_eq!(segments[0], "posts");
         assert_eq!(segments[1], ":id");
+        assert_eq!(
+            post_route["request"]["url"]["variable"],
+            serde_json::json!([{ "key": "id", "value": "" }])
+        );
+        assert_eq!(
+            collection["variable"],
+            serde_json::json!([{ "key": "base_url", "value": "http://localhost:3000" }])
+        );
+    }
+
+    #[test]
+    fn postman_wildcard_escapes_and_root() {
+        let routes = vec![
+            make_route("GET", "/static/{*path}", "user"),
+            make_route("GET", "/lit/{{raw}}", "user"),
+            make_route("GET", "/", "user"),
+        ];
+        let collection = build_postman_collection(&routes);
+        let items = collection["item"].as_array().unwrap();
+
+        let wildcard = &items[0]["request"]["url"];
+        assert_eq!(wildcard["raw"], "{{base_url}}/static/:path");
+        assert_eq!(wildcard["variable"][0]["key"], "path");
+
+        let escaped = &items[1]["request"]["url"];
+        assert_eq!(escaped["raw"], "{{base_url}}/lit/{raw}");
+        assert_eq!(escaped["variable"], serde_json::json!([]));
+
+        let root = &items[2]["request"]["url"];
+        assert_eq!(root["raw"], "{{base_url}}/");
+        assert_eq!(root["path"], serde_json::json!([]));
     }
 
     // ── resolve_binary_from_metadata ──────────────────────────────────────
