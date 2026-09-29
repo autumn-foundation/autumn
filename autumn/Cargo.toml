@@ -1369,7 +1369,3 @@ workspace = true
 [[test]]
 name = "tls_client_auth_metrics"
 path = "tests/tls_client_auth_metrics.rs"
-
-[[test]]
-name = "chaos_tracking_store_loom"
-path = "tests/chaos_tracking_store_loom.rs"
