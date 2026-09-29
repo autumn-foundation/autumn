@@ -774,6 +774,8 @@ pub fn emit_commentable_items(
          \n\
          - `404` when `comment_id` is not a comment on **this** record, or the \
          record is not visible.\n\
+         - `422` with `soft_delete = false` when the subtree is too deep, or \
+         has a reply on another record. The call removes nothing.\n\
          - Any database error."
     );
 
