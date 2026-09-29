@@ -2,7 +2,7 @@
 //! the keys defined in each `i18n/<locale>.ftl` (Fluent) file.
 //!
 //! autumn ships first-class Fluent i18n (`Locale::t("key")`, `t_with(...)`,
-//! and the [`t!`] macro), but the only signal that a key is missing from a
+//! and the `t!` macro), but the only signal that a key is missing from a
 //! locale is a *runtime* miss ([`Bundle::miss_count`] increments and a warning
 //! fires when a real user hits the page). This command surfaces those problems
 //! at build/CI time instead:
@@ -206,7 +206,7 @@ pub fn scan_project(root: &Path) -> ScanResult {
     result
 }
 
-fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+pub fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -243,7 +243,7 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// translations live — are still found. A `syn`-`Visit` walk would stop at the
 /// outer `html!` invocation and never see the `t!` calls inside its token
 /// stream. A file that fails to tokenize is skipped silently.
-fn scan_source(src: &str, file: &str, result: &mut ScanResult) {
+pub fn scan_source(src: &str, file: &str, result: &mut ScanResult) {
     let Ok(stream) = TokenStream::from_str(src) else {
         return;
     };
@@ -352,7 +352,7 @@ fn scan_stream(stream: &TokenStream, file: &str, result: &mut ScanResult) {
 
 /// Whether the identifier at `trees[i]` is preceded by a real `::` path
 /// separator — two consecutive `:` [`Punct`](TokenTree::Punct) tokens, the
-/// first (`trees[i - 2]`) joined to the second with [`Spacing::Joint`], which is
+/// first (`trees[i - 2]`) joined to the second with [`Spacing::Joint`](proc_macro2::Spacing::Joint), which is
 /// how `::` tokenizes.
 ///
 /// The caller has already confirmed `trees[i - 1]` is a `:` punct. A lone `:`
@@ -1192,6 +1192,9 @@ mod tests {
             supported_locales: vec![default.to_owned()],
             fallback_chain: chain.iter().map(|s| (*s).to_owned()).collect(),
             dir: "i18n".to_owned(),
+            locale_prefix_enabled: false,
+            locale_prefix_exclude: vec![],
+            locale_prefix_exclude_exact: vec![],
         }
     }
 
@@ -2131,6 +2134,9 @@ mod tests {
             supported_locales: vec!["en".to_owned(), "es".to_owned()],
             fallback_chain: Vec::new(),
             dir: "i18n".to_owned(),
+            locale_prefix_enabled: false,
+            locale_prefix_exclude: vec![],
+            locale_prefix_exclude_exact: vec![],
         };
         let report = build_report(&scan, &config, &per_locale);
 

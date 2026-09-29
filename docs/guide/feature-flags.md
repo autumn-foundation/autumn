@@ -26,10 +26,20 @@ In production, replace `InMemoryFlagStore` with the Postgres-backed store so
 that flags survive restarts and propagate across replicas:
 
 ```rust
-use autumn_web::feature_flags::pg::PgFlagStore;
+use autumn_web::feature_flags::{InMemoryFlagStore, FlagStore, pg::PgFlagStore};
+use std::sync::Arc;
+
+// `from_database_config` yields `None` unless the configured primary names
+// Postgres — this store opens a `PgConnection` and notifies through
+// `pg_notify`, so it cannot serve a `sqlite://` target.
+let store: Arc<dyn FlagStore> = PgFlagStore::from_database_config(&config.database)
+    .map_or_else(
+        || Arc::new(InMemoryFlagStore::new()) as Arc<dyn FlagStore>,
+        |store| Arc::new(store) as Arc<dyn FlagStore>,
+    );
 
 autumn_web::app()
-    .with_flag_store(PgFlagStore::new(&config.database.primary_url))
+    .with_flag_store(store)
     .run()
     .await;
 ```

@@ -200,15 +200,22 @@ let next_states: Vec<&str> = Order::__AUTUMN_SM_STATUS_TRANSITIONS
   hyphens). Use underscores: `in_progress`, not `in-progress`.
 - The transition graph is not validated for reachability or completeness. Dead
   states and disconnected subgraphs compile fine — they just can never be
-  reached at runtime.
+  reached at runtime. For a graph proven sound at compile time, declare the
+  states with [`#[lifecycle]`](lifecycle.md) and bind the field to it with
+  `#[state_machine(lifecycle = <Enum>)]`.
 
 ---
 
 ## Wiki example
 
-The wiki example ships a `Page` model with `draft`, `published`, and `archived`
-states. `#[state_machine]` is added to its `status` field and the
-`PageHooks::before_update` implementation enforces valid transitions, so a
-direct API call or form submission cannot skip `draft → published → archived`
-or jump backward. See `examples/wiki/src/models.rs` and
-`examples/wiki/src/hooks.rs`.
+[`examples/wiki`](../../examples/wiki) ships a `Page` model with `draft`,
+`published`, and `archived` states. `#[state_machine]` is added to its `status`
+field and the `PageHooks::before_update` implementation enforces valid
+transitions, so a direct API call or form submission cannot skip
+`draft → published → archived` or jump backward. Each edge also declares a
+[transition effect](transition-effects.md) (`on = "record_publish_revision"` /
+`on = "record_archive_revision"`) that appends the audit `Revision` inside the
+transition's transaction, and the `transition_status` handler drives the
+effectful `transition_status_to_on_conn` under `Db::tx_with` so the status change
+and its audit row commit atomically. See `examples/wiki/src/models.rs` and
+`examples/wiki/src/routes/pages.rs`.

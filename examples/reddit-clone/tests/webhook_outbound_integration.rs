@@ -95,7 +95,7 @@ async fn test_reddit_registration_triggers_outbound_webhook() {
         concurrency: None,
         handler: autumn_web::webhook_outbound::deliver_webhook_job,
     });
-    job::start_runtime(jobs, state, &shutdown, &config).unwrap();
+    job::start_runtime(jobs, state, &shutdown, &config, true).unwrap();
 
     // 5. Fire a POST request to /register to trigger the user.created webhook event
     let response = app
