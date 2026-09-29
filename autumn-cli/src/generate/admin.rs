@@ -90,6 +90,11 @@ pub struct AdminOptions {
     /// per mode. Every other path routes through `serialize_as` and never needs
     /// to know (issue #1340).
     pub encrypted_deterministic: Vec<String>,
+    /// The plan is for `autumn destroy admin`, not `generate`. The
+    /// model-AST `#[translatable]` refusal (#2291) guards what a generated
+    /// admin would do at runtime, so it must not stop the removal of an admin
+    /// generated before the field became `#[translatable]`.
+    pub for_destroy: bool,
 }
 
 /// The generated statement that back-fills absent encrypted keys before the
@@ -232,7 +237,14 @@ pub fn plan_admin_with_options(
     // refuse the bare string the admin's text control produces. Detect it from
     // the model AST (mirroring `detect_encrypted_fields` above) and refuse any
     // submitted field bound to one, no matter how the DSL token is spelled.
-    let model_translatable = detect_translatable_fields(&model_source, &pascal_name);
+    //
+    // Generation only: destroying an admin generated before the field became
+    // `#[translatable]` must still be able to reach `Plan::revert`.
+    let model_translatable = if options.for_destroy {
+        Vec::new()
+    } else {
+        detect_translatable_fields(&model_source, &pascal_name)
+    };
     reject_translatable_fields(&fields, &model_translatable)?;
     // Issue #1340: the MODEL is the only source of truth for whether a column is
     // encrypted at rest — `#[encrypted]` is what puts the `serialize_as` wrapper
@@ -1673,6 +1685,29 @@ mod tests {
                 "token `{token}` on a #[translatable] model field must be refused, got: {err}"
             );
         }
+    }
+
+    /// #2291: the model-AST refusal is generation-only. `destroy admin` for an
+    /// admin generated before the field became `#[translatable]` must still
+    /// plan, or its files could never be removed while the model exists.
+    #[test]
+    fn destroy_plan_ignores_a_model_translatable_field() {
+        let model_source = "#[autumn_web::model]\n\
+            pub struct Post {\n\
+            \x20   #[id]\n\
+            \x20   pub id: i64,\n\
+            \x20   #[translatable]\n\
+            \x20   pub title: autumn_web::i18n::Translated,\n\
+            }\n";
+        let tmp = project_with_model_source("post", model_source);
+        let options = AdminOptions {
+            for_destroy: true,
+            ..Default::default()
+        };
+        assert!(
+            plan_admin_with_options(tmp.path(), "Post", &["title:String".into()], &options).is_ok(),
+            "destroying an admin must not be blocked by the generation-only guard"
+        );
     }
 
     /// #2291 regression guard: a plain model with a plain token must NOT be
