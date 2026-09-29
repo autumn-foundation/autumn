@@ -11168,12 +11168,18 @@ async fn resolve_shard_set(
             #[cfg(feature = "sqlite")]
             {
                 // Scope the lock-wait wording to a `cache=shared` shard when
-                // any shard is one (issue #2881).
-                let target = config
-                    .database
-                    .shards
+                // any shard is one (issue #2881). Each returned topology pairs
+                // positionally with its configured shard; prefer the target
+                // the provider actually resolved, as the control-pool guard
+                // does.
+                let target = topologies
                     .iter()
-                    .map(|shard| shard.primary_url.as_str())
+                    .zip(&config.database.shards)
+                    .map(|(topology, shard)| {
+                        topology
+                            .migration_url()
+                            .unwrap_or(shard.primary_url.as_str())
+                    })
                     .find(|url| crate::db::sqlite_target_is_shared_cache(url))
                     .unwrap_or_default();
                 crate::db::reject_sqlite_statement_timeout(

@@ -1509,7 +1509,8 @@ fn sqlite_target_is_memory(target: &str) -> bool {
 pub(crate) fn sqlite_target_is_shared_cache(target: &str) -> bool {
     // Only an exact `cache=shared` query pair enables shared cache; a path or
     // another parameter merely containing that text does not.
-    target
+    let without_fragment = target.split_once('#').map_or(target, |(head, _)| head);
+    without_fragment
         .split_once('?')
         .is_some_and(|(_, query)| query.split('&').any(|pair| pair == "cache=shared"))
 }
@@ -4990,6 +4991,10 @@ mod tests {
             "file:/srv/app.db?note=cache=shared"
         ));
         assert!(!sqlite_target_is_shared_cache("file:app?cache=sharedly"));
+        // A URI fragment is not part of the query (SQLite ignores it).
+        assert!(sqlite_target_is_shared_cache(
+            "file:mem?mode=memory&cache=shared#tag"
+        ));
     }
 
     // The `statement_timeout` rejection must not claim `busy_timeout` bounds
