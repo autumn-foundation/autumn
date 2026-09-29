@@ -312,7 +312,7 @@ impl PostgresSearchStore {
     ///   loop always rejected with `DimensionMismatch` (#2311). Only the
     ///   pgvector-mode + physical-`embedding_vec`-column combination
     ///   rejects; other modes keep the row loop's existing behavior
-    ///   (a stale column copy is repaired by NULLing it, not by failing
+    ///   (a stale column copy is repaired by `NULL`ing it, not by failing
     ///   the batch).
     /// - **the batch is split into chunks sized so no single statement can
     ///   approach Postgres's 65,535 bind-parameter limit**, using each
@@ -857,7 +857,7 @@ fn dedupe_by_id(documents: &[IndexedDocument], keep_first: bool) -> Vec<&Indexed
 /// still applies: only the pgvector-mode + physical-`embedding_vec`-column
 /// combination rejects a width mismatch. Every other combination keeps the
 /// loop's existing behavior — notably the portable/`Array` mode, where a
-/// stale `embedding_vec` copy left by a previous width is repaired by NULLing
+/// stale `embedding_vec` copy left by a previous width is repaired by `NULL`ing
 /// it rather than failing the batch.
 fn validate_embedding_widths(
     documents: &[IndexedDocument],
@@ -875,13 +875,13 @@ fn validate_embedding_widths(
         return Ok(());
     }
     for document in documents {
-        if let Some(embedding) = document.embedding.as_deref() {
-            if embedding.len() != width {
-                return Err(SearchError::DimensionMismatch {
-                    expected: width,
-                    actual: embedding.len(),
-                });
-            }
+        if let Some(embedding) = document.embedding.as_deref()
+            && embedding.len() != width
+        {
+            return Err(SearchError::DimensionMismatch {
+                expected: width,
+                actual: embedding.len(),
+            });
         }
     }
     Ok(())
@@ -2053,18 +2053,16 @@ mod tests {
         doc(id).with_embedding(vec![0.0; width])
     }
 
-    fn pgvector_mode() -> Option<VectorMode> {
-        Some(VectorMode::PgVector { dimensions: 4 })
-    }
+    const PGVECTOR_MODE: Option<VectorMode> = Some(VectorMode::PgVector { dimensions: 4 });
 
-    fn assert_dimension_mismatch(error: SearchError, expected: usize, actual: usize) {
+    fn assert_dimension_mismatch(error: &SearchError, expected: usize, actual: usize) {
         assert!(
             matches!(
                 error,
                 SearchError::DimensionMismatch {
                     expected: exp,
                     actual: act
-                } if exp == expected && act == actual
+                } if *exp == expected && *act == actual
             ),
             "{error:?}"
         );
@@ -2080,9 +2078,9 @@ mod tests {
             doc_with_embedding(1, 3), // bad width, loses the coin flip
             doc_with_embedding(1, 4), // valid, survives dedup
         ];
-        let error = validate_embedding_widths(&documents, Some(4), pgvector_mode())
+        let error = validate_embedding_widths(&documents, Some(4), PGVECTOR_MODE)
             .expect_err("a wrong-width embedding must be rejected");
-        assert_dimension_mismatch(error, 4, 3);
+        assert_dimension_mismatch(&error, 4, 3);
     }
 
     #[test]
@@ -2094,9 +2092,9 @@ mod tests {
             doc_with_embedding(1, 4), // valid, survives dedup
             doc_with_embedding(1, 3), // bad width, loses the coin flip
         ];
-        let error = validate_embedding_widths(&documents, Some(4), pgvector_mode())
+        let error = validate_embedding_widths(&documents, Some(4), PGVECTOR_MODE)
             .expect_err("a wrong-width embedding must be rejected");
-        assert_dimension_mismatch(error, 4, 3);
+        assert_dimension_mismatch(&error, 4, 3);
     }
 
     #[test]
@@ -2106,7 +2104,7 @@ mod tests {
             doc_with_embedding(2, 4),
             doc(3), // no embedding at all is fine
         ];
-        validate_embedding_widths(&documents, Some(4), pgvector_mode())
+        validate_embedding_widths(&documents, Some(4), PGVECTOR_MODE)
             .expect("a clean batch must validate");
     }
 
@@ -2126,7 +2124,7 @@ mod tests {
         // `None` width means the `embedding_vec` column is absent and must
         // stay out of the write entirely — nothing to validate against.
         let documents = vec![doc_with_embedding(1, 3)];
-        validate_embedding_widths(&documents, None, pgvector_mode())
+        validate_embedding_widths(&documents, None, PGVECTOR_MODE)
             .expect("no physical column means no validation");
     }
 
