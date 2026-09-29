@@ -10,6 +10,8 @@ x-bookmarks-base: &bookmarks-base
     # Copy .env.example to .env and set AUTUMN_SECURITY__SIGNING_SECRET there.
     AUTUMN_SECURITY__SIGNING_SECRET: "${AUTUMN_SECURITY__SIGNING_SECRET:?AUTUMN_SECURITY__SIGNING_SECRET is required — see .env.example}"
   restart: unless-stopped
+  networks:
+    - bookmarks
 
 services:
   bookmarks-migrate:
@@ -21,6 +23,8 @@ services:
         condition: service_healthy
 
   postgres-primary:
+    networks:
+      - bookmarks
     image: postgres:16
     environment:
       POSTGRES_DB: bookmarks_distributed
@@ -52,6 +56,8 @@ services:
       start_period: 10s
 
   postgres-replica:
+    networks:
+      - bookmarks
     image: postgres:16
     environment:
       PGDATA: /var/lib/postgresql/data
@@ -83,6 +89,8 @@ services:
       start_period: 15s
 
   redis:
+    networks:
+      - bookmarks
     image: redis:6-alpine
     ports:
       - "6379:6379"
@@ -95,6 +103,23 @@ services:
 
   bookmarks-1:
     <<: *bookmarks-base
+    networks:
+      bookmarks:
+        # Fixed address so the peer has something dialable to advertise —
+        # `[cluster]` parses socket addresses and does not resolve hostnames.
+        ipv4_address: 172.28.0.11
+    environment:
+      AUTUMN_PROFILE: docker
+      AUTUMN_MANIFEST_DIR: /app/examples/bookmarks-distributed
+      AUTUMN_SECURITY__SIGNING_SECRET: "${AUTUMN_SECURITY__SIGNING_SECRET:?AUTUMN_SECURITY__SIGNING_SECRET is required — see .env.example}"
+      # Every node in a cluster must present the same secret; a frame signed
+      # with any other key is dropped and counted on
+      # autumn_cluster_frames_rejected_total{reason="mac"}.
+      AUTUMN_CLUSTER__SECRET: "${AUTUMN_CLUSTER__SECRET:?AUTUMN_CLUSTER__SECRET is required — see .env.example}"
+      AUTUMN_CLUSTER__NODE_ID: web-1
+      AUTUMN_CLUSTER__ADVERTISE_ADDR: 172.28.0.11:7946
+      # No seed peers: this is the node that gets dialed. It learns its
+      # peer from the first authenticated push it accepts.
     depends_on:
       bookmarks-migrate:
         condition: service_completed_successfully
@@ -107,6 +132,24 @@ services:
 
   bookmarks-2:
     <<: *bookmarks-base
+    networks:
+      bookmarks:
+        # Fixed address so the peer has something dialable to advertise —
+        # `[cluster]` parses socket addresses and does not resolve hostnames.
+        ipv4_address: 172.28.0.12
+    environment:
+      AUTUMN_PROFILE: docker
+      AUTUMN_MANIFEST_DIR: /app/examples/bookmarks-distributed
+      AUTUMN_SECURITY__SIGNING_SECRET: "${AUTUMN_SECURITY__SIGNING_SECRET:?AUTUMN_SECURITY__SIGNING_SECRET is required — see .env.example}"
+      # Every node in a cluster must present the same secret; a frame signed
+      # with any other key is dropped and counted on
+      # autumn_cluster_frames_rejected_total{reason="mac"}.
+      AUTUMN_CLUSTER__SECRET: "${AUTUMN_CLUSTER__SECRET:?AUTUMN_CLUSTER__SECRET is required — see .env.example}"
+      AUTUMN_CLUSTER__NODE_ID: web-2
+      AUTUMN_CLUSTER__ADVERTISE_ADDR: 172.28.0.12:7946
+      # `seed_peers` is a dial list, not a membership list: seeding one
+      # direction is enough, so only this replica dials.
+      AUTUMN_CLUSTER__SEED_PEERS: "172.28.0.11:7946"
     depends_on:
       bookmarks-migrate:
         condition: service_completed_successfully
@@ -118,6 +161,8 @@ services:
         condition: service_healthy
 
   load-balancer:
+    networks:
+      - bookmarks
     image: nginx:1.27-alpine
     depends_on:
       - bookmarks-1
@@ -127,6 +172,16 @@ services:
     volumes:
       - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     restart: unless-stopped
+
+networks:
+  # An explicit, statically-addressed bridge network. Compose's default
+  # network would do for everything except `[cluster]`, whose advertise
+  # address must be an IP literal — so the two replicas get fixed ones.
+  bookmarks:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
 
 volumes:
   pgdata-primary:

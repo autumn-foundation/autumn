@@ -47,9 +47,16 @@
 //! encoding of `"<flag_name>:<actor_id>"` and are therefore stable across
 //! restarts and replicas.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -70,10 +77,7 @@ pub struct FlagChangeRecord {
 
 impl FlagChangeRecord {
     fn now(key: &str, mutation: impl Into<String>, actor: Option<&str>) -> Self {
-        let timestamp_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let timestamp_secs = crate::time::clock_unix_secs(&crate::time::AmbientClock);
         Self {
             key: key.to_owned(),
             mutation: mutation.into(),
@@ -498,9 +502,16 @@ pub mod pg {
         }
 
         /// Create a store from Autumn's primary database configuration.
+        ///
+        /// Returns `None` when no primary URL is configured, and — since it
+        /// opens a `diesel::PgConnection` and notifies through `pg_notify` —
+        /// when the configured target does not name Postgres. Screening here
+        /// turns "a driver-level connection error on the first flag read" into
+        /// "this backend has no Postgres flag store", which is what the
+        /// operator can act on.
         #[must_use]
         pub fn from_database_config(config: &crate::config::DatabaseConfig) -> Option<Self> {
-            config.effective_primary_url().map(Self::new)
+            config.effective_primary_postgres_url().map(Self::new)
         }
 
         fn connect(&self) -> Result<diesel::PgConnection, FlagStoreError> {
@@ -509,7 +520,7 @@ pub mod pg {
         }
 
         fn cached(&self, key: &str) -> CacheLookup {
-            let now = Instant::now();
+            let now = crate::time::ambient_instant();
             let Ok(cache) = self.cache.read() else {
                 return CacheLookup::Miss;
             };
@@ -523,7 +534,8 @@ pub mod pg {
             if self.cache_ttl.is_zero() {
                 return;
             }
-            let Some(expires_at) = Instant::now().checked_add(self.cache_ttl) else {
+            let Some(expires_at) = crate::time::ambient_instant().checked_add(self.cache_ttl)
+            else {
                 return;
             };
             if let Ok(mut cache) = self.cache.write() {
@@ -588,6 +600,12 @@ pub mod pg {
                 // but such long-running writes are far outside the norm.
                 // Invalidating the same key twice is always safe (idempotent).
                 const OVERLAP_SECS: i64 = 5;
+                // Postgres stamps `changed_at` with its own real clock, so the
+                // cursor reads the real clock too.
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "cursor is compared with Postgres changed_at, a real clock"
+                )]
                 let now_secs = || {
                     i64::try_from(
                         std::time::SystemTime::now()
@@ -1821,5 +1839,52 @@ mod tests {
 
         let flags = Flags::from_request_parts(&mut parts, &state).await.unwrap();
         assert_eq!(flags.actor_id.as_deref(), Some("user:123"));
+    }
+
+    // ── Backend screening on the Postgres-only store ──────────────────────
+
+    // `PgFlagStore` opens a `diesel::PgConnection` and writes through
+    // `pg_notify` — it cannot serve any other backend. Building one from a
+    // SQLite target used to succeed and fail on first use with a driver-level
+    // connection error naming Postgres, which is not a diagnosis an operator
+    // who configured `sqlite://` can act on.
+    #[cfg(feature = "db")]
+    #[test]
+    fn pg_flag_store_refuses_a_non_postgres_target() {
+        use crate::config::DatabaseConfig;
+
+        let sqlite = DatabaseConfig {
+            primary_url: Some("sqlite:///var/lib/app.db".to_owned()),
+            ..Default::default()
+        };
+        assert!(
+            pg::PgFlagStore::from_database_config(&sqlite).is_none(),
+            "a SQLite target has no Postgres flag store"
+        );
+
+        // Fails closed: a target no backend claims is refused too.
+        let unclassifiable = DatabaseConfig {
+            primary_url: Some("/var/lib/app.db".to_owned()),
+            ..Default::default()
+        };
+        assert!(
+            pg::PgFlagStore::from_database_config(&unclassifiable).is_none(),
+            "an unclassifiable target has no Postgres flag store"
+        );
+
+        // Both Postgres spellings still build.
+        for url in [
+            "postgres://localhost/app",
+            "host=db user=app dbname=app sslmode=require",
+        ] {
+            let pg_config = DatabaseConfig {
+                primary_url: Some(url.to_owned()),
+                ..Default::default()
+            };
+            assert!(
+                pg::PgFlagStore::from_database_config(&pg_config).is_some(),
+                "{url} is a Postgres target"
+            );
+        }
     }
 }

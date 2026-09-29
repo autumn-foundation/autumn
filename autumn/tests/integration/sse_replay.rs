@@ -680,37 +680,63 @@ async fn stream_resumable_cold_serializes_only_live_events() {
 async fn concurrent_publish_around_resume_has_no_dup_or_skip() {
     use std::sync::{Arc, Barrier};
 
-    // Track that the interleaving genuinely lands the boundary message in BOTH
-    // the replay snapshot and the live tail across trials — otherwise one branch
-    // is dead code and the test proves nothing.
-    let mut saw_replay = false;
-    let mut saw_live = false;
+    // Which side of the seam the boundary message (m11) is forced onto for a
+    // trial. The two deterministic orderings prove BOTH branches are exercised
+    // regardless of runner scheduling; `Race` additionally stresses the real
+    // lock contention that a barrier releases both threads into at once.
+    enum SeamOrdering {
+        /// Publish m11 *before* resuming: it is already in the replay buffer, so
+        /// the snapshot must include it (replay branch).
+        PublishThenResume,
+        /// Resume *before* m11 exists: the snapshot is empty and m11 must arrive
+        /// on the live subscriber (live-tail branch).
+        ResumeThenPublish,
+        /// Genuine race: a barrier releases publisher and resumer together so
+        /// their contention for the replay lock is real; whichever wins, the
+        /// exactly-once correctness assertions below must still hold.
+        Race,
+    }
 
-    // Run many trials; a barrier releases the publisher and the resumer at the
-    // same instant so their contention for the replay lock is a real race.
-    for _ in 0..256 {
+    // Run one seam trial under `ordering`. Publishes m11 around a
+    // resume-from-seq-10 and asserts m11 is delivered exactly once — either in
+    // the replay snapshot OR as the first live event, never both, never neither,
+    // with a consistent `next_live_id`. Returns `true` when m11 landed in the
+    // replay snapshot (replay branch), `false` when it arrived live (live-tail
+    // branch), so the caller can prove both branches are covered.
+    async fn run_seam_trial(ordering: &SeamOrdering) -> bool {
         let channels = Channels::new(256);
         let topic = "seam";
         for i in 1..=10 {
             publish(&channels, topic, &format!("m{i}"));
         }
-
-        // Publish m11 (the boundary message) concurrently with resume-from-10.
-        // The barrier makes both threads reach the contended replay lock together
-        // so which one wins varies from trial to trial.
-        let barrier = Arc::new(Barrier::new(2));
-        let bg = {
-            let channels = channels.clone();
-            let barrier = Arc::clone(&barrier);
-            tokio::task::spawn_blocking(move || {
-                barrier.wait();
-                publish(&channels, topic, "m11");
-            })
-        };
         let epoch = topic_epoch(&channels, topic);
-        barrier.wait();
-        let mut handle = channels.resume(topic, Some(EventId { epoch, seq: 10 }));
-        bg.await.unwrap();
+
+        let mut handle = match ordering {
+            SeamOrdering::PublishThenResume => {
+                publish(&channels, topic, "m11");
+                channels.resume(topic, Some(EventId { epoch, seq: 10 }))
+            }
+            SeamOrdering::ResumeThenPublish => {
+                let handle = channels.resume(topic, Some(EventId { epoch, seq: 10 }));
+                publish(&channels, topic, "m11");
+                handle
+            }
+            SeamOrdering::Race => {
+                let barrier = Arc::new(Barrier::new(2));
+                let bg = {
+                    let channels = channels.clone();
+                    let barrier = Arc::clone(&barrier);
+                    tokio::task::spawn_blocking(move || {
+                        barrier.wait();
+                        publish(&channels, topic, "m11");
+                    })
+                };
+                barrier.wait();
+                let handle = channels.resume(topic, Some(EventId { epoch, seq: 10 }));
+                bg.await.unwrap();
+                handle
+            }
+        };
 
         // m11 is delivered exactly once: either in the replay snapshot OR as the
         // first live event — never both, never neither.
@@ -721,13 +747,12 @@ async fn concurrent_publish_around_resume_has_no_dup_or_skip() {
         );
 
         if in_replay.contains(&11) {
-            saw_replay = true;
             // Delivered via replay; the live subscriber must not repeat it.
             assert_eq!(handle.next_live_id, 12);
             publish(&channels, topic, "m12");
             assert_eq!(handle.subscriber.recv().await.unwrap().as_str(), "m12");
+            true
         } else {
-            saw_live = true;
             // Not in replay → must arrive live as the very next event, id 11.
             assert_eq!(handle.next_live_id, 11);
             let live = tokio::time::timeout(Duration::from_secs(1), handle.subscriber.recv())
@@ -735,16 +760,28 @@ async fn concurrent_publish_around_resume_has_no_dup_or_skip() {
                 .expect("m11 must arrive live")
                 .unwrap();
             assert_eq!(live.as_str(), "m11");
+            false
         }
     }
 
-    // The whole point of the race: over the trials the boundary message must
-    // have landed on BOTH sides of the seam, so neither branch is dead.
+    // Deterministically exercise BOTH sides of the seam — no reliance on runner
+    // scheduling to hit each branch (the old flaky guard).
+    let saw_replay = run_seam_trial(&SeamOrdering::PublishThenResume).await;
+    let saw_live = !run_seam_trial(&SeamOrdering::ResumeThenPublish).await;
     assert!(
-        saw_replay && saw_live,
-        "interleaving must exercise both the replay and the live-tail branch \
-         (saw_replay={saw_replay}, saw_live={saw_live})"
+        saw_replay,
+        "publish-then-resume must land m11 in the replay snapshot"
     );
+    assert!(
+        saw_live,
+        "resume-then-publish must deliver m11 on the live tail"
+    );
+
+    // Additional genuine-race trials stress the contended replay lock; the
+    // exactly-once assertions inside each trial hold whichever side wins.
+    for _ in 0..256 {
+        run_seam_trial(&SeamOrdering::Race).await;
+    }
 }
 
 // ── AC#1/AC#2: monotonic ids, bounded buffer ──────────────────────────────────

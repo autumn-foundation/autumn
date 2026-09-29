@@ -8,6 +8,13 @@
     clippy::cast_precision_loss,
     clippy::collapsible_if
 )]
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -107,6 +114,10 @@ pub enum CircuitBreakerError<E> {
 pub struct CircuitBreaker {
     name: String,
     pub(crate) inner: Arc<Mutex<CircuitBreakerInner>>,
+    /// Read the system clock, never a `Sim`'s. Set for breakers in the
+    /// process-global registry: they outlive any `Sim`, so a virtual instant
+    /// stored in one would later be compared with real time (issue #2967).
+    system_clock: bool,
 }
 
 pub(crate) struct CircuitBreakerInner {
@@ -170,6 +181,24 @@ impl CircuitBreaker {
                 half_open_in_flight: 0,
                 config,
             })),
+            system_clock: false,
+        }
+    }
+
+    /// A breaker on the system clock. See the `system_clock` field.
+    fn new_on_system_clock(name: impl Into<String>, config: CircuitBreakerPolicy) -> Self {
+        Self {
+            system_clock: true,
+            ..Self::new(name, config)
+        }
+    }
+
+    /// The current instant on this breaker's clock.
+    fn now(&self) -> Instant {
+        if self.system_clock {
+            crate::time::system_instant()
+        } else {
+            crate::time::ambient_instant()
         }
     }
 
@@ -189,7 +218,7 @@ impl CircuitBreaker {
 
     pub fn state(&self) -> CircuitState {
         let mut inner = self.lock_inner();
-        let now = Instant::now();
+        let now = self.now();
         if inner.state == CircuitState::Open {
             if let Some(until) = inner.open_until {
                 if now >= until {
@@ -218,14 +247,14 @@ impl CircuitBreaker {
     pub fn failure_ratio(&self) -> f64 {
         let mut inner = self.lock_inner();
         let window = inner.config.sample_window;
-        inner.clean_history(window, Instant::now());
+        inner.clean_history(window, self.now());
         inner.failure_ratio()
     }
 
     #[allow(clippy::significant_drop_tightening)]
     pub(crate) fn before_call(&self) -> Result<(), CircuitBreakerError<()>> {
         let mut inner = self.lock_inner();
-        let now = Instant::now();
+        let now = self.now();
 
         if inner.state == CircuitState::Open {
             if let Some(until) = inner.open_until {
@@ -256,7 +285,7 @@ impl CircuitBreaker {
 
     pub(crate) fn after_call(&self, success: bool) {
         let mut inner = self.lock_inner();
-        let now = Instant::now();
+        let now = self.now();
         let window = inner.config.sample_window;
         inner.clean_history(window, now);
 
@@ -367,12 +396,25 @@ impl Drop for CircuitBreakerGuard {
 
 pub struct CircuitBreakerRegistry {
     breakers: Mutex<HashMap<String, CircuitBreaker>>,
+    /// Create breakers on the system clock. True only for the process-global
+    /// registry.
+    system_clock: bool,
 }
 
 impl CircuitBreakerRegistry {
     pub fn new() -> Self {
         Self {
             breakers: Mutex::new(HashMap::new()),
+            system_clock: false,
+        }
+    }
+
+    /// Create a breaker for this registry's clock.
+    fn create(&self, name: &str, config: CircuitBreakerPolicy) -> CircuitBreaker {
+        if self.system_clock {
+            CircuitBreaker::new_on_system_clock(name, config)
+        } else {
+            CircuitBreaker::new(name, config)
         }
     }
 
@@ -389,7 +431,7 @@ impl CircuitBreakerRegistry {
         let mut breakers = self.lock_breakers();
         breakers
             .entry(name.to_owned())
-            .or_insert_with(|| CircuitBreaker::new(name, config))
+            .or_insert_with(|| self.create(name, config))
             .clone()
     }
 
@@ -403,7 +445,7 @@ impl CircuitBreakerRegistry {
             breaker.update_config(config);
             breaker.clone()
         } else {
-            let breaker = CircuitBreaker::new(name, config);
+            let breaker = self.create(name, config);
             breakers.insert(name.to_owned(), breaker.clone());
             breaker
         }
@@ -424,8 +466,13 @@ impl CircuitBreakerRegistry {
 
 static REGISTRY: std::sync::OnceLock<CircuitBreakerRegistry> = std::sync::OnceLock::new();
 
+/// The process-global registry. Its breakers read the system clock, because
+/// they outlive any `Sim` (issue #2967).
 pub fn global_registry() -> &'static CircuitBreakerRegistry {
-    REGISTRY.get_or_init(CircuitBreakerRegistry::new)
+    REGISTRY.get_or_init(|| CircuitBreakerRegistry {
+        system_clock: true,
+        ..CircuitBreakerRegistry::new()
+    })
 }
 
 pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -802,16 +849,39 @@ mod tests {
             open_duration: Duration::ZERO,
             half_open_trial_count: 1,
         };
-        let breaker = CircuitBreaker::new("transition_panic_test", policy);
-
         // Panic mid-transition (Closed -> Open) while holding the lock; this
         // both poisons the mutex and interrupts `transition_to`.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tracing::subscriber::with_default(PanickingSubscriber, || {
-                breaker.after_call(false);
-            });
-        }));
-        assert!(result.is_err());
+        //
+        // `tracing` callsite `Interest` is a single value cached per callsite
+        // across the WHOLE PROCESS, combined from every concurrently active
+        // dispatcher. `cargo test` runs this alongside thousands of other
+        // unit tests in the same binary, dozens of which install their own
+        // scoped subscribers, so the transition callsite can occasionally be
+        // (re-)cached as "not interested" in the narrow window between this
+        // thread's dispatcher registering and the event firing -- and then
+        // the subscriber never runs and nothing panics. Rebuilding the cache
+        // and re-firing on a fresh breaker converges almost immediately in
+        // practice (the same remedy `router.rs`'s access-log test uses), so
+        // retry a few times rather than flake.
+        let mut breaker = None;
+        for attempt in 1..=5 {
+            let candidate = CircuitBreaker::new("transition_panic_test", policy.clone());
+            tracing::callsite::rebuild_interest_cache();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tracing::subscriber::with_default(PanickingSubscriber, || {
+                    candidate.after_call(false);
+                });
+            }));
+            if result.is_err() {
+                breaker = Some(candidate);
+                break;
+            }
+            assert!(
+                attempt < 5,
+                "the panicking subscriber never observed the transition event after {attempt} attempts"
+            );
+        }
+        let breaker = breaker.expect("a poisoned breaker");
         assert!(breaker.inner.is_poisoned());
 
         // The interrupted transition must still be complete: `open_until` was

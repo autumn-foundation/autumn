@@ -219,3 +219,96 @@ async fn custom_layer_sees_request_id() {
         "custom layer must observe the same request ID that RequestIdLayer wrote to the response"
     );
 }
+
+// ── Test 4: registration order between two user layers (#2198) ───────────
+
+/// Stamps its label onto a request header, appending to whatever an outer
+/// layer already wrote. The request path runs OUTERMOST-first, so the header
+/// the handler sees spells out the nesting order directly.
+///
+/// Generic over the inner service, like any real-world Tower layer.
+#[derive(Clone)]
+struct StampLayer(&'static str);
+
+impl<S> tower::Layer<S> for StampLayer {
+    type Service = StampService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        StampService {
+            inner,
+            label: self.0,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct StampService<S> {
+    inner: S,
+    label: &'static str,
+}
+
+impl<S> Service<Request<Body>> for StampService<S>
+where
+    S: Service<Request<Body>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: Request<Body>) -> Self::Future {
+        let stamped = req
+            .headers()
+            .get("x-stamp")
+            .and_then(|value| value.to_str().ok())
+            .map_or_else(
+                || self.label.to_owned(),
+                |prev| format!("{prev},{}", self.label),
+            );
+        req.headers_mut().insert(
+            "x-stamp",
+            axum::http::HeaderValue::from_str(&stamped).expect("label is ASCII"),
+        );
+        self.inner.call(req)
+    }
+}
+
+#[get("/stamped")]
+async fn stamped_handler(headers: axum::http::HeaderMap) -> String {
+    headers
+        .get("x-stamp")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("<none>")
+        .to_owned()
+}
+
+/// Two user layers, so the assertion is about their order RELATIVE TO EACH
+/// OTHER rather than relative to a framework layer.
+///
+/// The documented contract is that the FIRST registered layer ends up
+/// OUTERMOST — matching `tower::ServiceBuilder`. Nothing else pins this
+/// between two user layers, and #2198 changed how the run is composed (from
+/// one `Router::layer` call per registration, iterated in reverse, to a single
+/// hand-folded `ComposedRegisteredLayers`), where a wrong fold direction still
+/// compiles and still type-checks. Only this assertion catches a reversal.
+#[tokio::test]
+async fn first_registered_layer_is_outermost_among_user_layers() {
+    let client = TestApp::new()
+        .routes(routes![stamped_handler])
+        .layer(StampLayer("first"))
+        .layer(StampLayer("second"))
+        .build();
+
+    let resp = client.get("/stamped").send().await;
+    resp.assert_status(200);
+    assert_eq!(
+        resp.text(),
+        "first,second",
+        "the first registered layer must wrap the second, so on the request \
+         path `first` stamps before `second`; `second,first` means the \
+         registration run was composed in the wrong direction"
+    );
+}

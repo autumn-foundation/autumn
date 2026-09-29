@@ -42,6 +42,14 @@
 //! - **Auditable**: every mutation records actor, old value, new value, and timestamp.
 //! - **Schema-enforced**: unknown keys are rejected; type drift is caught on write.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -743,10 +751,7 @@ impl ConfigChangeRecord {
         new_value: Option<ConfigValue>,
         actor: Option<&str>,
     ) -> Self {
-        let timestamp_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let timestamp_secs = crate::time::clock_unix_secs(&crate::time::AmbientClock);
         Self {
             key: key.to_owned(),
             old_value,
@@ -1054,10 +1059,12 @@ pub mod pg {
         /// Create a store from Autumn's primary/write database configuration.
         ///
         /// Returns `None` when neither `database.primary_url` nor the legacy
-        /// `database.url` field is configured.
+        /// `database.url` field is configured, and — since it opens a
+        /// `diesel::PgConnection` and takes `pg_advisory_xact_lock` — when the
+        /// configured target does not name Postgres.
         #[must_use]
         pub fn from_database_config(config: &crate::config::DatabaseConfig) -> Option<Self> {
-            config.effective_primary_url().map(Self::new)
+            config.effective_primary_postgres_url().map(Self::new)
         }
 
         /// Return the configured Postgres connection URL.
@@ -1077,7 +1084,7 @@ pub mod pg {
         }
 
         fn cached_raw(&self, key: &str) -> CachedRawLookup {
-            let now = Instant::now();
+            let now = crate::time::ambient_instant();
             let Ok(cache) = self.raw_cache.read() else {
                 return CachedRawLookup::Miss;
             };
@@ -1098,7 +1105,8 @@ pub mod pg {
                 return;
             }
 
-            let Some(expires_at) = Instant::now().checked_add(self.cache_ttl) else {
+            let Some(expires_at) = crate::time::ambient_instant().checked_add(self.cache_ttl)
+            else {
                 return;
             };
 
@@ -2527,5 +2535,52 @@ mod tests {
     fn regex_char_class_matches_digits() {
         assert!(regex_matches("[0-9]+", "42"));
         assert!(!regex_matches("[0-9]+", "abc"));
+    }
+
+    // ── Backend screening on the Postgres-only store ──────────────────────
+
+    // `PgConfigStore` opens a `diesel::PgConnection` and takes
+    // `pg_advisory_xact_lock(1, hashtext($1))` — it cannot serve any other backend. Building one from a
+    // SQLite target used to succeed and fail on first use with a driver-level
+    // connection error naming Postgres, which is not a diagnosis an operator
+    // who configured `sqlite://` can act on.
+    #[cfg(feature = "db")]
+    #[test]
+    fn pg_config_store_refuses_a_non_postgres_target() {
+        use crate::config::DatabaseConfig;
+
+        let sqlite = DatabaseConfig {
+            primary_url: Some("sqlite:///var/lib/app.db".to_owned()),
+            ..Default::default()
+        };
+        assert!(
+            pg::PgConfigStore::from_database_config(&sqlite).is_none(),
+            "a SQLite target has no Postgres config store"
+        );
+
+        // Fails closed: a target no backend claims is refused too.
+        let unclassifiable = DatabaseConfig {
+            primary_url: Some("/var/lib/app.db".to_owned()),
+            ..Default::default()
+        };
+        assert!(
+            pg::PgConfigStore::from_database_config(&unclassifiable).is_none(),
+            "an unclassifiable target has no Postgres config store"
+        );
+
+        // Both Postgres spellings still build.
+        for url in [
+            "postgres://localhost/app",
+            "host=db user=app dbname=app sslmode=require",
+        ] {
+            let pg_config = DatabaseConfig {
+                primary_url: Some(url.to_owned()),
+                ..Default::default()
+            };
+            assert!(
+                pg::PgConfigStore::from_database_config(&pg_config).is_some(),
+                "{url} is a Postgres target"
+            );
+        }
     }
 }

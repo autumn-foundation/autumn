@@ -57,15 +57,24 @@
 //! key_prefix = "myapp:rate_limit"
 //! ```
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use lru::LruCache;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Instant;
 
+use crate::time::{ClockSource, SystemClock};
 use axum::http::{HeaderValue, Request, Response, StatusCode};
+use chrono::{DateTime, Utc};
 use http::header::{CONTENT_TYPE, HeaderName, RETRY_AFTER};
 use tower::{Layer, Service};
 
@@ -141,7 +150,11 @@ enum Decision {
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
     tokens: f64,
-    last_refill: Instant,
+    /// Wall-clock instant of the last refill, read from the injected
+    /// [`ClockSource`]. Stored as a `DateTime<Utc>` (rather than a monotonic
+    /// `Instant`) so deterministic test/sim clocks can drive refill under
+    /// virtual time.
+    last_refill: DateTime<Utc>,
 }
 
 /// Per-key token bucket state stored in-process.
@@ -168,11 +181,11 @@ impl MemoryStore {
     }
 
     #[allow(clippy::significant_drop_tightening)]
-    fn decide(&self, key: &str, now: Instant, burst: f64, refill_per_sec: f64) -> Decision {
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+    fn decide(&self, key: &str, now: DateTime<Utc>, burst: f64, refill_per_sec: f64) -> Decision {
+        // `now` already comes from the injected clock, so derive the Unix
+        // timestamp used in the `x-ratelimit-reset` / `retry-after` headers from
+        // it directly (rather than reaching for `SystemTime::now()` off-seam).
+        let now_unix = u64::try_from(now.timestamp()).unwrap_or(0);
 
         let tokens_after = {
             let mut buckets = match self.buckets.lock() {
@@ -185,8 +198,11 @@ impl MemoryStore {
                 last_refill: now,
             });
 
-            let elapsed = now
-                .saturating_duration_since(bucket.last_refill)
+            // Clamp a negative delta (a backwards wall-clock jump) to zero so it
+            // yields no refill — fail-safe, mirroring the Lua's `math.max(0, …)`.
+            let elapsed = (now - bucket.last_refill)
+                .to_std()
+                .unwrap_or(std::time::Duration::ZERO)
                 .as_secs_f64();
             bucket.tokens = elapsed.mul_add(refill_per_sec, bucket.tokens).min(burst);
             bucket.last_refill = now;
@@ -249,6 +265,9 @@ struct RedisStore {
     failure_mode: RateLimitBackendFailure,
     /// Set to `true` once on the first Redis error; reset when it recovers.
     outage_logged: Arc<std::sync::atomic::AtomicBool>,
+    /// Injected wall-clock; supplies the timestamp handed to the Lua script and
+    /// the reset/retry-after header values. Defaults to [`SystemClock`].
+    clock: Arc<dyn ClockSource>,
 }
 
 #[cfg(feature = "redis")]
@@ -259,6 +278,7 @@ impl Clone for RedisStore {
             key_prefix: self.key_prefix.clone(),
             failure_mode: self.failure_mode,
             outage_logged: Arc::clone(&self.outage_logged),
+            clock: Arc::clone(&self.clock),
         }
     }
 }
@@ -279,28 +299,26 @@ impl RedisStore {
         connection: redis::aio::ConnectionManager,
         key_prefix: String,
         failure_mode: RateLimitBackendFailure,
+        clock: Arc<dyn ClockSource>,
     ) -> Self {
         Self {
             connection,
             key_prefix,
             failure_mode,
             outage_logged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            clock,
         }
     }
 
     async fn decide(&self, key: &str, burst: f64, refill_per_sec: f64) -> Option<Decision> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let now_unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        // Timestamps come from the injected clock (not `SystemTime::now()`), so
+        // a deterministic test/sim clock drives the Redis token bucket too. The
+        // Lua script still receives the timestamp as a Rust-computed `ARGV`, so
+        // no change to `rate_limit.lua` is required.
+        let now_unix = crate::time::clock_unix_secs(self.clock.as_ref());
 
         let redis_key = format!("{}:{}", self.key_prefix, key);
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
+        let now_ms = crate::time::clock_unix_duration(self.clock.as_ref()).as_millis();
 
         let script = redis::Script::new(RATE_LIMIT_LUA);
         let result: redis::RedisResult<Vec<i64>> = {
@@ -391,6 +409,27 @@ enum BucketBackend {
     Redis(RedisStore),
 }
 
+impl BucketBackend {
+    /// Point this backend at a different clock. The in-memory store reads `now`
+    /// per-call (passed into `decide`), so only the Redis store — which holds
+    /// its own clock handle — needs updating.
+    #[cfg_attr(
+        not(feature = "redis"),
+        allow(
+            clippy::needless_pass_by_ref_mut,
+            clippy::needless_pass_by_value,
+            unused_variables
+        )
+    )]
+    fn set_clock(&mut self, clock: Arc<dyn ClockSource>) {
+        match self {
+            Self::Memory(_) => {}
+            #[cfg(feature = "redis")]
+            Self::Redis(store) => store.clock = clock,
+        }
+    }
+}
+
 // ── Limiter (shared state) ────────────────────────────────────────────────────
 
 #[allow(clippy::type_complexity)]
@@ -415,7 +454,6 @@ impl std::fmt::Debug for TierHookFn {
 }
 
 /// Shared rate limiter state.
-#[derive(Debug)]
 struct Limiter {
     refill_per_sec: f64,
     burst: f64,
@@ -434,6 +472,29 @@ struct Limiter {
     /// leave it `false` so an MCP replay still consumes their route-specific
     /// bucket, exactly as the equivalent direct HTTP call would.
     honors_mcp_exempt: bool,
+    /// Injected wall-clock driving token refill. Defaults to [`SystemClock`]
+    /// (byte-identical to the pre-injection behavior); the production
+    /// construction sites in `router.rs` swap in `AppState`'s clock via
+    /// [`RateLimitLayer::with_clock`] so deterministic sim tests can exhaust and
+    /// refill buckets under virtual time.
+    clock: Arc<dyn ClockSource>,
+}
+
+impl std::fmt::Debug for Limiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Limiter")
+            .field("refill_per_sec", &self.refill_per_sec)
+            .field("burst", &self.burst)
+            .field("burst_header", &self.burst_header)
+            .field("resolver", &self.resolver)
+            .field("key_strategy", &self.key_strategy)
+            .field("tiers", &self.tiers)
+            .field("tier_hook", &self.tier_hook)
+            .field("path_overrides", &self.path_overrides)
+            .field("backend", &self.backend)
+            .field("honors_mcp_exempt", &self.honors_mcp_exempt)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Limiter {
@@ -444,6 +505,14 @@ impl Limiter {
     fn from_config_with_resolver(
         config: &RateLimitConfig,
         top_level_resolver: Option<ProxyResolver>,
+    ) -> Self {
+        Self::from_config_with_resolver_and_clock(config, top_level_resolver, Arc::new(SystemClock))
+    }
+
+    fn from_config_with_resolver_and_clock(
+        config: &RateLimitConfig,
+        top_level_resolver: Option<ProxyResolver>,
+        clock: Arc<dyn ClockSource>,
     ) -> Self {
         let burst = f64::from(config.burst.max(1));
         let refill_per_sec = config.requests_per_second.max(f64::MIN_POSITIVE);
@@ -473,7 +542,7 @@ impl Limiter {
             })
         });
 
-        let backend = Self::build_backend(config);
+        let backend = Self::build_backend(config, &clock);
 
         Self {
             refill_per_sec,
@@ -486,10 +555,14 @@ impl Limiter {
             path_overrides: Vec::new(),
             backend,
             honors_mcp_exempt: false,
+            clock,
         }
     }
 
-    fn build_backend(config: &RateLimitConfig) -> BucketBackend {
+    fn build_backend(
+        config: &RateLimitConfig,
+        #[cfg_attr(not(feature = "redis"), allow(unused_variables))] clock: &Arc<dyn ClockSource>,
+    ) -> BucketBackend {
         if config.backend == RateLimitBackend::Redis {
             #[cfg(not(feature = "redis"))]
             {
@@ -503,7 +576,7 @@ impl Limiter {
         #[cfg(feature = "redis")]
         if config.backend == RateLimitBackend::Redis {
             if let Some(url) = config.redis.url.as_deref().filter(|u| !u.trim().is_empty()) {
-                match redis::Client::open(url) {
+                match crate::redis_tls::open_client(url) {
                     Ok(client) => {
                         match redis::aio::ConnectionManager::new_lazy_with_config(
                             client,
@@ -514,12 +587,15 @@ impl Limiter {
                                     conn,
                                     config.redis.key_prefix.clone(),
                                     config.on_backend_failure,
+                                    Arc::clone(clock),
                                 ));
                             }
                             Err(err) => {
                                 tracing::warn!(
                                     error = %err,
-                                    url = %url,
+                                    // Redacted: a managed Redis carries its
+                                    // access key in the URL (#2172).
+                                    url = %crate::redis_tls::redact_url(url),
                                     "rate-limit Redis backend: failed to create \
                                      connection manager; falling back to memory"
                                 );
@@ -527,9 +603,14 @@ impl Limiter {
                         }
                     }
                     Err(err) => {
+                        // No `url` field here, redacted or otherwise: this arm
+                        // fires when the URL failed to PARSE, so its shape is
+                        // exactly what a redactor has least purchase on, and
+                        // the `redis` error text names the problem without
+                        // echoing the value. The key is not worth the
+                        // diagnostic (#2172).
                         tracing::warn!(
                             error = %err,
-                            url = %url,
                             "rate-limit Redis backend: invalid Redis URL; \
                              falling back to memory"
                         );
@@ -574,13 +655,17 @@ impl Limiter {
 
         let raw_key = self.extract_key(req)?;
 
+        // Fold the ambient tenant into the *bucket* key only — `raw_key` stays
+        // unqualified below for the tier hook. See `tenant_qualify_bucket_key`.
+        let tenant_qualified_key = tenant_qualify_bucket_key(self.key_strategy, &raw_key);
+
         // Namespace the bucket key by the active path prefix so that different
         // path overrides get independent token buckets (avoids burst-value
         // collision when /strict and /normal share the same client IP).
         let key = if key_ns.is_empty() {
-            raw_key.clone()
+            tenant_qualified_key
         } else {
-            format!("{key_ns}\0{raw_key}")
+            format!("{key_ns}\0{tenant_qualified_key}")
         };
 
         let mut burst = opt_burst.unwrap_or(self.burst);
@@ -636,7 +721,7 @@ impl Limiter {
     #[allow(clippy::unused_async)]
     async fn decide(&self, key: &str, burst: f64, rps: f64) -> Option<Decision> {
         match &self.backend {
-            BucketBackend::Memory(store) => Some(store.decide(key, Instant::now(), burst, rps)),
+            BucketBackend::Memory(store) => Some(store.decide(key, self.clock.now(), burst, rps)),
             #[cfg(feature = "redis")]
             BucketBackend::Redis(store) => store.decide(key, burst, rps).await,
         }
@@ -651,6 +736,73 @@ fn strip_key_prefix(key: &str) -> &str {
     key.strip_prefix("token:")
         .or_else(|| key.strip_prefix("principal:"))
         .unwrap_or(key)
+}
+
+/// Fold the ambient tenant into a `principal:`-keyed bucket key before it is
+/// used to look up a token bucket.
+///
+/// `AuthenticatedPrincipal` keys on whatever identity value the app stored at
+/// login (`session.get(auth_session_key)`, see `RequireAuth`/`RequireApiToken`
+/// and the `populate_rate_limit_principal`/`__check_throttle` fallbacks) — and
+/// that value is not guaranteed unique across tenants. Autumn's own sharding
+/// guide documents that per-tenant primary keys are shard-local `BIGSERIAL`s
+/// (docs/guide/sharding.md), so the first user provisioned on two different
+/// tenants' shards both land on `id = 1`. Every `tenant_scoped` repository
+/// operation resolves `CURRENT_TENANT` ambiently to avoid exactly this; the
+/// bucket key must too, or one tenant's user can exhaust another tenant's
+/// bucket purely by sharing a principal id.
+///
+/// Deliberately returns the *bucket* key only — the tier-hook-visible value
+/// (`strip_key_prefix`'s output, passed to `with_tier_hook`) must stay the
+/// bare principal id the documented hook signature promises, so callers must
+/// keep using the original, unqualified `raw_key` for that. The `"principal:"`
+/// prefix is preserved (rather than replaced) so `key_class_label` still
+/// recognizes the key as an authenticated principal in logs/responses.
+///
+/// A no-op for `Ip`/`ApiToken` keys, and for the unauthenticated-IP fallback
+/// (`raw_key` does not start with `"principal:"` at all in that case): none
+/// of those carry a tenant-collision-prone identity, and none can ever
+/// collide with a `"principal:"`-prefixed key by construction.
+///
+/// Both remaining `AuthenticatedPrincipal` cases — tenant resolved, or
+/// tenant absent — route through the *same* explicit tagged encoding rather
+/// than returning `raw_key` unchanged in the no-tenant case. That matters
+/// because `id` (and, when present, `tenant`)
+/// are arbitrary app-supplied strings with no excluded byte: `tenancy.rs`'s
+/// `"session"`/`"jwt"` source arms only reject an empty-after-trim tenant
+/// value, and `RateLimitPrincipal` wraps an unrestricted `String` (a
+/// username or email, not necessarily a framework-generated numeric id). If
+/// the no-tenant case had stayed as bare `principal:<id>`, an attacker able
+/// to choose their own `id` on a tenant-absent request (an app not using
+/// `[tenancy]`, or one authenticated request to a `tenancy.public_paths`
+/// route) could craft `id` to reproduce byte-for-byte whatever a *different*
+/// tenant+id pair's tagged encoding would render, colliding with that real
+/// tenant-scoped user's bucket. Tagging both cases with a literal,
+/// input-independent marker — `t` (tenant present) vs `n` (no tenant) —
+/// immediately after `principal:` makes the two families disjoint no matter
+/// what either string contains: which literal byte gets written there is
+/// chosen by which branch of the `match` runs, not by any value an attacker
+/// controls, so a `t`-tagged key can never equal an `n`-tagged one. Within
+/// the `t` case, the tenant is still length-prefixed
+/// (`principal:t<tenant.len()>:<tenant><id>`) rather than delimited, for the
+/// same reason `\0`/`:` delimiters were rejected in earlier rounds:
+/// decoding never searches the tenant/id bytes for a separator, so their
+/// content can never change where the boundary falls. `tenant.len()` is a
+/// byte length, matching the byte slice taken at decode time.
+fn tenant_qualify_bucket_key(key_strategy: KeyStrategy, raw_key: &str) -> String {
+    let Some(id) = (key_strategy == KeyStrategy::AuthenticatedPrincipal)
+        .then(|| raw_key.strip_prefix("principal:"))
+        .flatten()
+    else {
+        return raw_key.to_owned();
+    };
+    match crate::tenancy::CURRENT_TENANT.try_with(Clone::clone) {
+        Ok(Some(tenant)) => {
+            let tenant_len = tenant.len();
+            format!("principal:t{tenant_len}:{tenant}{id}")
+        }
+        _ => format!("principal:n:{id}"),
+    }
 }
 
 /// Extract the key string from the `Authorization: Bearer <token>` header.
@@ -872,6 +1024,24 @@ impl RateLimitLayer {
             limiter: Arc::new(limiter),
         }
     }
+
+    /// Drive token refill from the supplied [`ClockSource`] instead of the
+    /// default [`SystemClock`].
+    ///
+    /// Wired at the production construction sites in `router.rs` with
+    /// `AppState`'s injected clock, so a deterministic test/sim clock can
+    /// exhaust a bucket and then refill it under virtual time (via
+    /// `Sim::advance` / `TestClient::advance_clock`) with zero real sleep. Under
+    /// the default `SystemClock` the limiter behaves exactly as before.
+    #[must_use]
+    pub fn with_clock(self, clock: Arc<dyn ClockSource>) -> Self {
+        let mut limiter = Arc::try_unwrap(self.limiter).unwrap_or_else(|arc| (*arc).deep_clone());
+        limiter.backend.set_clock(Arc::clone(&clock));
+        limiter.clock = clock;
+        Self {
+            limiter: Arc::new(limiter),
+        }
+    }
 }
 
 impl Limiter {
@@ -888,6 +1058,7 @@ impl Limiter {
             path_overrides: self.path_overrides.clone(),
             backend: self.backend.clone(),
             honors_mcp_exempt: self.honors_mcp_exempt,
+            clock: Arc::clone(&self.clock),
         }
     }
 }
@@ -927,18 +1098,16 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        // A `RateLimitExempt` request is a genuine full bypass of *every*
-        // limiter (framework-default and user path-override alike), matching the
-        // marker's documented contract, so it is honored here unconditionally —
-        // regardless of `honors_mcp_exempt`.
+        // A `RateLimitExempt` request is a genuine full bypass of every limiter,
+        // framework-default and user path-override alike, matching the marker's documented
+        // contract, so it is honored unconditionally, whatever `honors_mcp_exempt` says.
         //
-        // A `RateLimitEnvelopeCounted` request is the narrower MCP-replay marker:
-        // it was already counted at the `/mcp` envelope, so only this framework
-        // default limiter — which shares the envelope's bucket (`honors_mcp_exempt`
-        // true) — skips it to avoid double-counting. A user-installed limiter
-        // (e.g. a per-path override added via `AppBuilder::layer`) leaves
-        // `honors_mcp_exempt` false so the replay still consumes its
-        // route-specific bucket, exactly as a direct call.
+        // A `RateLimitEnvelopeCounted` request is the narrower MCP-replay marker: it was
+        // already counted at the `/mcp` envelope, so only this framework default limiter,
+        // which shares the envelope's bucket with `honors_mcp_exempt` true, skips it to
+        // avoid double-counting. A user-installed limiter, such as a per-path override
+        // added via `AppBuilder::layer`, leaves `honors_mcp_exempt` false, so the replay
+        // still consumes its route-specific bucket exactly as a direct call would.
         if req.extensions().get::<RateLimitExempt>().is_some()
             || (self.limiter.honors_mcp_exempt
                 && req.extensions().get::<RateLimitEnvelopeCounted>().is_some())
@@ -998,20 +1167,19 @@ where
                     reset_at_unix,
                 }) => {
                     let mut response = inner.call(req).await?;
-                    // The global limiter allowed this request (consuming a
-                    // token), so its informational `x-ratelimit-*` quota
-                    // headers belong on the response. But the inner service may
-                    // have set its own rate-limit headers — most notably a
-                    // per-route `#[throttle]` guard, whose 429 carries
-                    // route-specific `x-ratelimit-*`/`retry-after` values
-                    // (remaining: 0, the route's limit). Overwriting those with
-                    // the global bucket's numbers would mislead clients into
-                    // thinking quota remains. So insert each global header only
-                    // when the inner response does not already carry it: a
-                    // throttle 429 (which sets all three) keeps its own values,
-                    // while a plain user-handler response — including a user
-                    // 429 that consumed a global token but set no rate-limit
-                    // headers — still receives the global quota metadata.
+                    // The global limiter allowed this request, consuming a token,
+                    // so its informational `x-ratelimit-*` quota headers belong on
+                    // the response. But the inner service may have set its own —
+                    // most notably a per-route `#[throttle]` guard, whose 429
+                    // carries route-specific `x-ratelimit-*` and `retry-after`
+                    // values with remaining 0 and the route's limit. Overwriting
+                    // those with the global bucket's numbers would mislead clients
+                    // into thinking quota remains. So insert each global header only
+                    // when the inner response does not already carry it: a throttle
+                    // 429, which sets all three, keeps its own values, while a plain
+                    // user-handler response — including a user 429 that consumed a
+                    // global token but set no rate-limit headers — still receives the
+                    // global quota metadata.
                     let headers = response.headers_mut();
                     if !headers.contains_key(X_RATELIMIT_LIMIT) {
                         headers.insert(X_RATELIMIT_LIMIT, burst_for_header);
@@ -1089,6 +1257,18 @@ pub fn __throttle_registry_reset() {
     }
 }
 
+/// Process-global lock serializing tests that exercise the shared
+/// `#[throttle]` limiter registry.
+///
+/// Because [`__throttle_registry_reset`] clears the entire process-wide
+/// registry, a test that resets mid-run could drop a limiter another test is
+/// concurrently relying on, and per-principal buckets can otherwise bleed
+/// between the parallel integration tests. Each registry-touching test takes
+/// this lock FIRST, then resets, and holds the guard for the whole test so no
+/// sibling mutates the registry during its assertions. Mirrors
+/// [`crate::circuit_breaker::TEST_LOCK`].
+pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn build_throttle_limiter(
     global: &RateLimitConfig,
     trusted_proxies: &TrustedProxiesConfig,
@@ -1096,6 +1276,7 @@ fn build_throttle_limiter(
     limit: u32,
     per_secs: u64,
     key: KeyStrategy,
+    clock: Arc<dyn ClockSource>,
 ) -> Arc<Limiter> {
     // On the Redis backend every per-route limiter shares one connection and,
     // by default, the single `redis.key_prefix`; the bucket key handed to
@@ -1152,7 +1333,11 @@ fn build_throttle_limiter(
         None
     };
 
-    Arc::new(Limiter::from_config_with_resolver(&cfg, top_level_resolver))
+    Arc::new(Limiter::from_config_with_resolver_and_clock(
+        &cfg,
+        top_level_resolver,
+        clock,
+    ))
 }
 
 /// Stable fingerprint of every config input `build_throttle_limiter` bakes into
@@ -1261,19 +1446,18 @@ fn resolve_throttle_params(
             key,
         } => {
             let key = key.unwrap_or(config.key_strategy);
-            // INLINE throttles isolate PER MOUNTED ROUTE PATH. The compile-time
-            // `route_id` (`module_path!()::fn_name`) is identical for a single
-            // handler mounted at more than one path — e.g. the same `routes![…]`
-            // reused under two `AppBuilder::scoped` prefixes, or versioned mounts
-            // — so keying on `route_id` alone would let traffic to one mounted
-            // path drain the other's bucket. Fold the RUNTIME matched path into
-            // the registry namespace so each mount gets its own bucket. When no
-            // `MatchedPath` is available (fallbacks / unnested routes) fall back
-            // to the bare `route_id`, preserving prior behavior.
+            // Inline throttles isolate per mounted route path. The compile-time
+            // `route_id` (`module_path!()::fn_name`) is identical for a single handler
+            // mounted at more than one path — the same `routes![…]` reused under two
+            // `AppBuilder::scoped` prefixes, or versioned mounts — so keying on
+            // `route_id` alone would let traffic to one mounted path drain the other's
+            // bucket. Fold the runtime matched path into the registry namespace so each
+            // mount gets its own bucket. With no `MatchedPath` available, for fallbacks
+            // and unnested routes, fall back to the bare `route_id`.
             //
-            // NAMED throttles do the OPPOSITE (see the `Named` arm below): a named
-            // limiter is a deliberately shared, centrally-named bucket, so it is
-            // keyed by name only and multiple routes referencing it share it.
+            // Named throttles do the opposite (see the `Named` arm below): a named
+            // limiter is a deliberately shared, centrally-named bucket, so it is keyed by
+            // name only and several routes referencing it share it.
             let registry_key = matched_path.map_or_else(
                 || format!("route:{route_id}"),
                 |path| format!("route:{route_id}@{path}"),
@@ -1409,6 +1593,13 @@ fn build_rate_limited_response(
 /// build their own `RateLimitLayer` instead.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
+// `clippy::result_large_err` (armed by rustc 1.98) measures the `Err` variant at
+// 128 bytes — that is `axum::response::Response`'s own size, not something this
+// crate chose. Returning a ready-made rejection response IS the idiom here, and
+// boxing it would add an allocation to every rejection path to satisfy a size
+// heuristic. Allowed at the site rather than workspace-wide so the lint stays
+// armed for error types we do control.
+#[allow(clippy::result_large_err)]
 pub async fn __check_throttle(
     state: &crate::AppState,
     route_id: &'static str,
@@ -1427,7 +1618,7 @@ pub async fn __check_throttle(
         return Ok(());
     }
 
-    let config = state.config();
+    let config = state.config_arc();
     let rl_config = &config.security.rate_limit;
     let trusted_proxies = &config.security.trusted_proxies;
 
@@ -1493,6 +1684,7 @@ pub async fn __check_throttle(
                 limit,
                 per_secs,
                 key_strategy,
+                Arc::clone(&state.clock),
             )
         }))
     };
@@ -1502,6 +1694,10 @@ pub async fn __check_throttle(
         // ConnectInfo). Bypass — matches how the tower layer handles this.
         return Ok(());
     };
+    // Same tenant fold-in the global tower layer applies (see
+    // `tenant_qualify_bucket_key`) — `#[throttle(key = "principal")]` shares
+    // the same `extract_key` derivation and the same cross-tenant collision.
+    let bucket_key = tenant_qualify_bucket_key(key_strategy, &bucket_key);
 
     let burst = f64::from(limit.max(1));
     let rps = throttle_rps(limit.max(1), per_secs);
@@ -1532,6 +1728,7 @@ mod tests {
     use axum::body::Body;
     use axum::extract::ConnectInfo;
     use axum::routing::get;
+    use chrono::TimeZone;
     use std::net::{IpAddr, SocketAddr};
     use std::time::Duration;
     use tower::ServiceExt;
@@ -1746,7 +1943,11 @@ mod tests {
             backend: RateLimitBackend::Memory,
             ..Default::default()
         };
-        let backend = Limiter::build_backend(&config);
+        let backend = Limiter::build_backend(
+            &config,
+            &(std::sync::Arc::new(crate::time::SystemClock)
+                as std::sync::Arc<dyn crate::time::ClockSource>),
+        );
         assert!(matches!(backend, BucketBackend::Memory(_)));
     }
 
@@ -1761,14 +1962,18 @@ mod tests {
             },
             ..Default::default()
         };
-        let backend = Limiter::build_backend(&config);
+        let backend = Limiter::build_backend(
+            &config,
+            &(std::sync::Arc::new(crate::time::SystemClock)
+                as std::sync::Arc<dyn crate::time::ClockSource>),
+        );
         assert!(matches!(backend, BucketBackend::Memory(_)));
     }
 
     #[test]
     fn memory_store_retry_after_calculation() {
         let store = MemoryStore::new();
-        let now = Instant::now();
+        let now = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
         // Burst 1.0, Refill 0.1 tokens/sec (10 sec per token)
         let _ = store.decide("ip1", now, 1.0, 0.1); // Consumes 1.0, bucket.tokens = 0.0
 
@@ -1781,7 +1986,7 @@ mod tests {
         }
 
         // 5 seconds later, bucket.tokens = 0.5. Deficit = 0.5. Secs = 0.5 / 0.1 = 5.0
-        let later = now + Duration::from_secs(5);
+        let later = now + chrono::Duration::seconds(5);
         match store.decide("ip1", later, 1.0, 0.1) {
             Decision::Denied {
                 retry_after_secs, ..
@@ -1790,7 +1995,7 @@ mod tests {
         }
 
         // 9.5 seconds later, bucket.tokens = 0.95. Deficit = 0.05. Secs = 0.05 / 0.1 = 0.5 -> ceil -> 1.0
-        let even_later = now + Duration::from_millis(9500);
+        let even_later = now + chrono::Duration::milliseconds(9500);
         match store.decide("ip1", even_later, 1.0, 0.1) {
             Decision::Denied {
                 retry_after_secs, ..
@@ -2258,6 +2463,124 @@ mod tests {
     }
 
     #[test]
+    fn tenant_qualify_bucket_key_tags_when_tenant_absent() {
+        assert_eq!(
+            tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:user-42"),
+            "principal:n:user-42"
+        );
+    }
+
+    #[test]
+    fn tenant_qualify_bucket_key_ip_fallback_is_noop() {
+        // `raw_key` never starts with "principal:" here (the caller never
+        // resolved a `RateLimitPrincipal`), so it passes through untouched —
+        // and can never collide with a tagged key, which always does.
+        assert_eq!(
+            tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "1.2.3.4"),
+            "1.2.3.4"
+        );
+    }
+
+    #[test]
+    fn tenant_qualify_bucket_key_tenant_present_and_absent_families_are_disjoint() {
+        // Regression for Codex's PR #2653 follow-up: round 2's fix left the
+        // tenant-absent case as bare `principal:<id>`, so an attacker able to
+        // choose their own `id` on a tenant-absent request (no `[tenancy]`,
+        // or a `tenancy.public_paths` route) could craft it to reproduce
+        // byte-for-byte whatever a *different* real tenant+id pair's
+        // round-2-encoded key would render — using their own example,
+        // tenant="a" id="bc" rendered as "principal:tenant[1]=abc", exactly
+        // what an id of "tenant[1]=abc" on a tenant-absent request would
+        // also render. The `t`/`n` tag makes the two families disjoint
+        // regardless of what either string contains.
+        let tenant_present = crate::tenancy::CURRENT_TENANT
+            .sync_scope(Some("a".to_owned()), || {
+                tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:bc")
+            });
+        let tenant_absent =
+            tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:t1:abc");
+        assert_ne!(
+            tenant_present, tenant_absent,
+            "a tenant-qualified key must never equal a tenant-absent key, however the \
+             tenant-absent request's principal id is crafted"
+        );
+    }
+
+    #[test]
+    fn tenant_qualify_bucket_key_is_noop_for_non_principal_strategies() {
+        crate::tenancy::CURRENT_TENANT.sync_scope(Some("tenant-a".to_owned()), || {
+            assert_eq!(
+                tenant_qualify_bucket_key(KeyStrategy::Ip, "1.2.3.4"),
+                "1.2.3.4"
+            );
+            assert_eq!(
+                tenant_qualify_bucket_key(KeyStrategy::ApiToken, "token:abc"),
+                "token:abc"
+            );
+        });
+    }
+
+    #[test]
+    fn tenant_qualify_bucket_key_folds_in_tenant() {
+        crate::tenancy::CURRENT_TENANT.sync_scope(Some("tenant-a".to_owned()), || {
+            let key =
+                tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:user-42");
+            assert!(
+                key.starts_with("principal:"),
+                "must stay classifiable as an authenticated-principal key: {key}"
+            );
+            assert_ne!(
+                key, "principal:user-42",
+                "must differ from the unqualified key once a tenant is ambient"
+            );
+        });
+    }
+
+    #[test]
+    fn tenant_qualify_bucket_key_does_not_confuse_tenant_and_id_boundaries_with_colons() {
+        // Regression: a `:`-joined "tenant:id" is not injective — tenant="a:b"
+        // id="c" and tenant="a" id="b:c" both render as "a:b:c". Codex flagged
+        // this on PR #2653; the fix is the length-prefixed encoding in
+        // `tenant_qualify_bucket_key`'s doc comment.
+        let key_1 = crate::tenancy::CURRENT_TENANT.sync_scope(Some("a:b".to_owned()), || {
+            tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:c")
+        });
+        let key_2 = crate::tenancy::CURRENT_TENANT.sync_scope(Some("a".to_owned()), || {
+            tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:b:c")
+        });
+        assert_ne!(
+            key_1, key_2,
+            "tenant \"a:b\" + id \"c\" must not produce the same bucket key as tenant \"a\" + \
+             id \"b:c\""
+        );
+    }
+
+    #[test]
+    fn tenant_qualify_bucket_key_does_not_confuse_tenant_and_id_boundaries_with_nul() {
+        // A `\0`-joined encoding is only injective if `\0` can never appear in
+        // either component. Header-sourced tenants can't carry one (rejected
+        // at the `HeaderValue` layer), but `tenancy.rs`'s `"session"`/`"jwt"`
+        // arms only reject an empty-after-trim value, so a session- or
+        // JWT-claim-sourced tenant CAN contain `\0` — and so can the
+        // app-supplied `RateLimitPrincipal` id. Codex flagged this as a
+        // follow-up on PR #2653 after the `:` -> `\0` fix; the length-prefix
+        // encoding is injective regardless of what bytes either string
+        // contains, so tenant="a" id="b\0c" must not collide with
+        // tenant="a\0b" id="c".
+        let key_1 = crate::tenancy::CURRENT_TENANT.sync_scope(Some("a".to_owned()), || {
+            tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:b\0c")
+        });
+        let key_2 = crate::tenancy::CURRENT_TENANT.sync_scope(Some("a\0b".to_owned()), || {
+            tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:c")
+        });
+        assert_ne!(
+            key_1, key_2,
+            "tenant \"a\" + id \"b\\0c\" must not produce the same bucket key as tenant \
+             \"a\\0b\" + id \"c\""
+        );
+    }
+
+    #[test]
     fn key_strategy_extract_api_token_with_header() {
         let config = RateLimitConfig {
             key_strategy: KeyStrategy::ApiToken,
@@ -2329,7 +2652,7 @@ mod tests {
     #[tokio::test]
     async fn redis_store_debug_format() {
         use super::super::config::RateLimitBackendFailure;
-        let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+        let client = crate::redis_tls::open_client("redis://127.0.0.1/").unwrap();
         let connection = redis::aio::ConnectionManager::new_lazy_with_config(
             client,
             redis::aio::ConnectionManagerConfig::new(),
@@ -2339,6 +2662,7 @@ mod tests {
             connection,
             "test_prefix".to_string(),
             RateLimitBackendFailure::FailOpen,
+            std::sync::Arc::new(crate::time::SystemClock),
         );
         let dbg = format!("{store:?}");
         assert!(dbg.contains("RedisStore"));
@@ -2433,9 +2757,33 @@ mod tests {
         };
         let tp = TrustedProxiesConfig::default();
 
-        let route_a = build_throttle_limiter(&global, &tp, "route:a", 5, 60, KeyStrategy::Ip);
-        let route_b = build_throttle_limiter(&global, &tp, "route:b", 5, 60, KeyStrategy::Ip);
-        let named = build_throttle_limiter(&global, &tp, "named:login", 5, 60, KeyStrategy::Ip);
+        let route_a = build_throttle_limiter(
+            &global,
+            &tp,
+            "route:a",
+            5,
+            60,
+            KeyStrategy::Ip,
+            std::sync::Arc::new(crate::time::SystemClock),
+        );
+        let route_b = build_throttle_limiter(
+            &global,
+            &tp,
+            "route:b",
+            5,
+            60,
+            KeyStrategy::Ip,
+            std::sync::Arc::new(crate::time::SystemClock),
+        );
+        let named = build_throttle_limiter(
+            &global,
+            &tp,
+            "named:login",
+            5,
+            60,
+            KeyStrategy::Ip,
+            std::sync::Arc::new(crate::time::SystemClock),
+        );
         let global_limiter = Limiter::from_config(&global);
 
         // (i) two different routes for the same client → different Redis keyspace.
@@ -2471,7 +2819,15 @@ mod tests {
             trusted_hops: Some(1),
             trust_forwarded_headers: true,
         };
-        let limiter = build_throttle_limiter(&global, &tp, "route:x", 5, 60, KeyStrategy::Ip);
+        let limiter = build_throttle_limiter(
+            &global,
+            &tp,
+            "route:x",
+            5,
+            60,
+            KeyStrategy::Ip,
+            std::sync::Arc::new(crate::time::SystemClock),
+        );
 
         // XFF: real client, then one proxy hop; the TCP peer is the load balancer.
         let req = req_with_connect_info("1.1.1.1, 2.2.2.2", "9.9.9.9:4000");
@@ -2498,7 +2854,15 @@ mod tests {
             trusted_hops: Some(1),
             trust_forwarded_headers: true,
         };
-        let limiter = build_throttle_limiter(&global, &tp, "route:y", 5, 60, KeyStrategy::Ip);
+        let limiter = build_throttle_limiter(
+            &global,
+            &tp,
+            "route:y",
+            5,
+            60,
+            KeyStrategy::Ip,
+            std::sync::Arc::new(crate::time::SystemClock),
+        );
 
         let req = req_with_connect_info("1.1.1.1, 2.2.2.2", "9.9.9.9:4000");
         // Legacy resolver (trust_forwarded_headers = true, no hops/ranges) uses
@@ -2632,7 +2996,15 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             Arc::clone(reg.entry(cache_key).or_insert_with(|| {
-                build_throttle_limiter(&global, &tp, route, 5, 60, key_strategy)
+                build_throttle_limiter(
+                    &global,
+                    &tp,
+                    route,
+                    5,
+                    60,
+                    key_strategy,
+                    std::sync::Arc::new(crate::time::SystemClock),
+                )
             }))
         };
 

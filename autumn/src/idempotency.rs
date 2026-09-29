@@ -1,3 +1,28 @@
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
+
 use bytes::Bytes;
 use futures::StreamExt as FuturesStreamExt;
 
@@ -5,7 +30,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -49,7 +74,7 @@ fn compute_body_hash(bytes: &[u8], content_type: Option<&[u8]>) -> Vec<u8> {
 
 fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
     bytes.as_ref().iter().fold(
-        String::with_capacity(bytes.as_ref().len() * 2),
+        String::with_capacity(bytes.as_ref().len().saturating_mul(2)),
         |mut out, byte| {
             use std::fmt::Write as _;
             let _ = write!(out, "{byte:02x}");
@@ -77,23 +102,61 @@ fn push_storage_key_component(hasher: &mut sha2::Sha256, label: &str, value: &[u
     hasher.update(b";");
 }
 
-/// Namespace the cache key by method, path, a stable principal digest, and the
-/// client-supplied idempotency key.
+/// The tenant Autumn's own tenancy middleware resolved for the in-flight
+/// request, if any.
+///
+/// Read from the [`CURRENT_TENANT`](crate::tenancy::CURRENT_TENANT) task-local
+/// rather than from a request header, which is what makes it safe to key on:
+/// the value is the framework's *resolution* under `[tenancy] source`
+/// (`header`, `subdomain`, `session`, `jwt`), not a string the client can
+/// restate at will. A legitimate retry from the same tenant therefore
+/// reproduces the same component and still finds its cached response, while a
+/// request that resolved to a different tenant lands in a different slot
+/// instead of replaying that tenant's stored mutation.
+///
+/// `None` — tenancy disabled, or a `[tenancy] public_paths` route the
+/// middleware exempts before it scopes anything — pushes no component at all,
+/// so every storage key an app without tenancy computes is byte-identical to
+/// the one it computed before this existed.
+fn current_tenant_scope() -> Option<String> {
+    crate::tenancy::CURRENT_TENANT
+        .try_with(std::clone::Clone::clone)
+        .ok()
+        .flatten()
+}
+
+/// Namespace the cache key by method, path, the resolved tenant, a stable
+/// principal digest, and the client-supplied idempotency key.
 ///
 /// Namespacing by method+path prevents cross-endpoint cache collisions (P2).
 /// Namespacing by session scope prevents cross-principal collisions (P1) for
-/// cookie-backed authenticated sessions. Request headers, including
-/// `Authorization`, are intentionally excluded: client-controlled headers must
-/// not let a retry force a fresh miss after a successful mutation. Opaque route
-/// layers that resolve tenants, bearer principals, or policy state must use the
-/// fail-closed replay path instead of storage-key partitioning. Each component
-/// is length-delimited inside a SHA-256 digest so raw `:` bytes in paths or
-/// client-controlled keys cannot synthesize another storage key.
+/// cookie-backed authenticated sessions, and namespacing by the
+/// framework-resolved tenant prevents them across tenants — for `header`,
+/// `subdomain` and `jwt` tenancy the two requests are otherwise
+/// indistinguishable to this key (same method, same target, and for a
+/// token-authenticated API the same empty session scope), so tenant B replaying
+/// tenant A's key would be served tenant A's stored response with the handler —
+/// and every `tenant_scoped` repository predicate inside it — never running.
+///
+/// Request headers, including `Authorization` *and* the configured tenant
+/// header, are intentionally excluded: client-controlled headers must not let a
+/// retry force a fresh miss after a successful mutation. That is exactly why
+/// the tenant is taken from the middleware's task-local resolution rather than
+/// from the wire. Opaque route layers that resolve their own tenants, bearer
+/// principals, or policy state must still use the fail-closed replay path
+/// instead of storage-key partitioning. Each component is length-delimited
+/// inside a SHA-256 digest so raw `:` bytes in paths or client-controlled keys
+/// cannot synthesize another storage key.
 #[derive(Clone)]
 struct StorageKeyContext {
     idempotency_key: String,
     method: Method,
     target: String,
+    /// Captured once, on the request path, while the tenancy middleware's
+    /// task-local scope is still established — the alias keys computed later
+    /// (see [`DeferredIdempotencyCommit::add_session_alias`]) must land in the
+    /// same tenant's namespace as the primary key.
+    tenant: Option<String>,
 }
 
 impl StorageKeyContext {
@@ -106,15 +169,17 @@ impl StorageKeyContext {
             idempotency_key,
             method: parts.method.clone(),
             target,
+            tenant: current_tenant_scope(),
         }
     }
 
-    fn storage_key(&self, session_id: Option<&str>) -> String {
+    fn storage_key(&self, session_id: Option<&str>, tenant_override: Option<&str>) -> String {
         build_storage_key(
             &self.idempotency_key,
             self.method.as_str(),
             &self.target,
             session_id,
+            tenant_override.or(self.tenant.as_deref()),
         )
     }
 }
@@ -124,6 +189,7 @@ fn build_storage_key(
     method: &str,
     target: &str,
     session_id: Option<&str>,
+    tenant: Option<&str>,
 ) -> String {
     let principal = principal_scope_digest(session_id);
     let mut hasher = sha2::Sha256::new();
@@ -131,6 +197,12 @@ fn build_storage_key(
     push_storage_key_component(&mut hasher, "target", target.as_bytes());
     push_storage_key_component(&mut hasher, "scope-header-count", b"0");
     push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
+    // Pushed only when a tenant was resolved, so an app that does not use
+    // tenancy keeps the exact keys it had before — no cache-wide miss, and no
+    // duplicate execution of a mutation retried across an upgrade.
+    if let Some(tenant) = tenant {
+        push_storage_key_component(&mut hasher, "tenant", tenant.as_bytes());
+    }
     push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
     format!("v2:{}", hex_lower(hasher.finalize()))
 }
@@ -444,11 +516,6 @@ struct MemoryInFlightLock {
     expires_at: Instant,
 }
 
-/// Clamp horizon (~10 years) used when a caller-supplied TTL would overflow
-/// `Instant + Duration`. This constant is itself always representable when
-/// added to a fresh `Instant`, so it can never re-trigger the overflow.
-const SATURATING_DEADLINE_HORIZON_SECS: u64 = 10 * 365 * 24 * 3600;
-
 /// Compute an expiry `Instant` for `ttl`, saturating instead of panicking on
 /// overflow.
 ///
@@ -457,14 +524,10 @@ const SATURATING_DEADLINE_HORIZON_SECS: u64 = 10 * 365 * 24 * 3600;
 /// `Duration::from_secs(u64::MAX)` (which is entirely attacker-influenceable
 /// via configured TTLs) triggers this. Instead of panicking we clamp the
 /// deadline to ~10 years out (far enough that the entry is effectively
-/// non-expiring), falling back to `now` only in the astronomically unlikely
-/// event that even the clamped horizon is not representable.
+/// non-expiring). See [`crate::time_math::saturating_deadline`], which the
+/// job and job-tracking modules share.
 fn saturating_deadline(ttl: Duration) -> Instant {
-    let now = Instant::now();
-    now.checked_add(ttl).unwrap_or_else(|| {
-        now.checked_add(Duration::from_secs(SATURATING_DEADLINE_HORIZON_SECS))
-            .unwrap_or(now)
-    })
+    crate::time_math::saturating_deadline(crate::time::ambient_instant(), ttl)
 }
 
 impl MemoryIdempotencyStore {
@@ -482,8 +545,13 @@ impl MemoryIdempotencyStore {
 impl IdempotencyStore for MemoryIdempotencyStore {
     fn get(&self, key: &str) -> Option<IdempotencyEntry> {
         // Release the read lock immediately after cloning.
-        let entry = self.entries.read().unwrap().get(key).cloned();
-        entry.filter(|e| e.expires_at > Instant::now())
+        let entry = self
+            .entries
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .cloned();
+        entry.filter(|e| e.expires_at > crate::time::ambient_instant())
     }
 
     fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {
@@ -492,13 +560,13 @@ impl IdempotencyStore for MemoryIdempotencyStore {
             body_hash,
             expires_at: saturating_deadline(ttl),
         };
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
         entries.insert(key.to_owned(), entry);
         // Periodically evict expired entries to bound memory growth for
         // long-running processes. O(N) scan is amortised over every 128 writes.
         let n = self.write_count.fetch_add(1, Ordering::Relaxed);
         if n.is_multiple_of(128) {
-            let now = Instant::now();
+            let now = crate::time::ambient_instant();
             entries.retain(|_, v| v.expires_at > now);
         }
     }
@@ -508,8 +576,11 @@ impl IdempotencyStore for MemoryIdempotencyStore {
     }
 
     fn try_lock_owned(&self, key: &str, owner: &str, lock_ttl: Duration) -> bool {
-        let now = Instant::now();
-        let mut in_flight = self.in_flight.write().unwrap();
+        let now = crate::time::ambient_instant();
+        let mut in_flight = self
+            .in_flight
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         // Check only the requested key's active in-flight marker.
         if let Some(lock) = in_flight.get(key)
             && lock.expires_at > now
@@ -534,11 +605,17 @@ impl IdempotencyStore for MemoryIdempotencyStore {
     }
 
     fn unlock(&self, key: &str) {
-        self.in_flight.write().unwrap().remove(key);
+        self.in_flight
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(key);
     }
 
     fn unlock_owned(&self, key: &str, owner: &str) {
-        let mut in_flight = self.in_flight.write().unwrap();
+        let mut in_flight = self
+            .in_flight
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         if in_flight
             .get(key)
             .is_some_and(|lock| lock.owner.as_str() == owner)
@@ -560,7 +637,7 @@ mod redis_store {
         IdempotencyEntry, IdempotencyRecord, IdempotencyStore, IdempotencyStoreError,
         saturating_deadline,
     };
-    use redis::{AsyncCommands, Client, aio::ConnectionManager, aio::ConnectionManagerConfig};
+    use redis::{AsyncCommands, aio::ConnectionManager, aio::ConnectionManagerConfig};
     use serde::{Deserialize, Serialize};
     use std::time::Duration;
 
@@ -601,7 +678,7 @@ mod redis_store {
                      [idempotency.redis] url in autumn.toml."
                         .to_owned()
                 })?;
-            let client = Client::open(url).map_err(|e| e.to_string())?;
+            let client = crate::redis_tls::open_client(url).map_err(|e| e.to_string())?;
             let connection =
                 ConnectionManager::new_lazy_with_config(client, ConnectionManagerConfig::new())
                     .map_err(|e| e.to_string())?;
@@ -931,9 +1008,16 @@ where
             return Box::pin(async move { Ok(replay.into_response()) });
         }
 
-        let clone = self.inner.clone();
-        let mut inner = std::mem::replace(&mut self.inner, clone);
-        Box::pin(async move { inner.call(req).await })
+        // The overwhelming majority of requests carry no replay marker (only
+        // the capsule replay driver ever sets one), so this runs for nearly
+        // every request through this layer. Nothing here needs `self.inner`
+        // cloned into an owned value first: `self.inner.call(req)` can be
+        // boxed directly instead of cloning `self.inner` (a
+        // `BoxCloneSyncService` at this point in the stack, whose `Clone`
+        // impl allocates a fresh box) purely to move the clone into an
+        // `async move` block that immediately `.await`s it and does nothing
+        // else.
+        Box::pin(self.inner.call(req))
     }
 }
 
@@ -959,6 +1043,7 @@ pub struct IdempotencyLayer {
     replay_through_inner: bool,
     fail_closed_on_replay: bool,
     metrics: Option<crate::middleware::MetricsCollector>,
+    entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
 impl IdempotencyLayer {
@@ -972,7 +1057,19 @@ impl IdempotencyLayer {
             replay_through_inner: false,
             fail_closed_on_replay: false,
             metrics: None,
+            entropy: Arc::new(crate::entropy::OsEntropy),
         }
+    }
+
+    /// Inject the entropy source used to mint in-flight lock owner ids.
+    ///
+    /// Defaults to [`crate::entropy::OsEntropy`]; the framework threads the
+    /// app's seeded source here so lock ids replay deterministically under a
+    /// fixed simulation seed.
+    #[must_use]
+    pub fn with_entropy(mut self, entropy: Arc<dyn crate::entropy::Entropy>) -> Self {
+        self.entropy = entropy;
+        self
     }
 
     #[must_use]
@@ -1020,6 +1117,7 @@ impl<S> Layer<S> for IdempotencyLayer {
             replay_through_inner: self.replay_through_inner,
             fail_closed_on_replay: self.fail_closed_on_replay,
             metrics: self.metrics.clone(),
+            entropy: self.entropy.clone(),
         }
     }
 }
@@ -1036,6 +1134,7 @@ pub struct IdempotencyService<S> {
     replay_through_inner: bool,
     fail_closed_on_replay: bool,
     metrics: Option<crate::middleware::MetricsCollector>,
+    entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
 struct IdempotencyRequestConfig {
@@ -1045,6 +1144,7 @@ struct IdempotencyRequestConfig {
     replay_through_inner: bool,
     fail_closed_on_replay: bool,
     metrics: Option<crate::middleware::MetricsCollector>,
+    entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
 impl<S> Service<Request<Body>> for IdempotencyService<S>
@@ -1076,11 +1176,16 @@ where
             replay_through_inner: self.replay_through_inner,
             fail_closed_on_replay: self.fail_closed_on_replay,
             metrics: self.metrics.clone(),
+            entropy: self.entropy.clone(),
         };
         Box::pin(handle_idempotent_request(inner, config, req))
     }
 }
 
+#[allow(
+    clippy::unwrap_used,
+    reason = "infallible: response built from static status/body"
+)]
 fn request_body_too_large_response() -> Response<Body> {
     Response::builder()
         .status(StatusCode::PAYLOAD_TOO_LARGE)
@@ -1090,6 +1195,10 @@ fn request_body_too_large_response() -> Response<Body> {
         .unwrap()
 }
 
+#[allow(
+    clippy::unwrap_used,
+    reason = "infallible: response built from static status/body"
+)]
 fn in_flight_conflict_response() -> Response<Body> {
     Response::builder()
         .status(StatusCode::CONFLICT)
@@ -1101,6 +1210,10 @@ fn in_flight_conflict_response() -> Response<Body> {
         .unwrap()
 }
 
+#[allow(
+    clippy::unwrap_used,
+    reason = "infallible: response built from static status/body"
+)]
 fn replay_requires_inner_stop_response() -> Response<Body> {
     Response::builder()
         .status(StatusCode::CONFLICT)
@@ -1110,6 +1223,10 @@ fn replay_requires_inner_stop_response() -> Response<Body> {
         .unwrap()
 }
 
+#[allow(
+    clippy::unwrap_used,
+    reason = "infallible: response built from static status/body"
+)]
 pub(crate) fn persistence_failed_response() -> Response<Body> {
     Response::builder()
         .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -1209,7 +1326,7 @@ impl DeferredIdempotencyCommit {
         let Some(mut state) = self
             .inner
             .lock()
-            .expect("deferred idempotency commit lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .take()
         else {
             return Ok(());
@@ -1257,16 +1374,26 @@ impl DeferredIdempotencyCommit {
         Ok(())
     }
 
-    fn add_session_alias(&self, session_id: Option<&str>, primary_replay_after_guard_denial: bool) {
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("deferred idempotency commit lock poisoned");
+    fn add_session_alias(
+        &self,
+        session_id: Option<&str>,
+        primary_replay_after_guard_denial: bool,
+        tenant_override: Option<&str>,
+    ) {
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(state) = guard.as_mut() else {
             return;
         };
 
-        let storage_key = state.key_context.storage_key(session_id);
+        // Only honor the override when the request that produced this commit
+        // itself resolved a tenant. Tenancy resolution is a property of the
+        // *path*, not of session content — a `[tenancy] public_paths` route
+        // (or a request under a non-session tenancy source) computes no
+        // tenant now and never will on retry, however a handler mutates the
+        // session. Forcing a tenant into that alias would make it un-matchable
+        // by any future request to the same always-exempt path.
+        let tenant_override = tenant_override.filter(|_| state.key_context.tenant.is_some());
+        let storage_key = state.key_context.storage_key(session_id, tenant_override);
         if primary_replay_after_guard_denial && storage_key != state.storage_key {
             state.primary_replay_after_guard_denial = true;
         }
@@ -1285,7 +1412,7 @@ impl DeferredIdempotencyCommit {
         let Some(mut state) = self
             .inner
             .lock()
-            .expect("deferred idempotency commit lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .take()
         else {
             return;
@@ -1306,13 +1433,30 @@ pub(crate) fn finalize_deferred_session_commit(
     commit.commit_with_final_headers(response.headers())
 }
 
+/// Register the storage key a retry presenting `session_id` will compute as
+/// an alias of the primary key, so that retry replays the response instead of
+/// re-executing the mutation.
+///
+/// `tenant_override`, when set, is the tenant `[tenancy] source = "session"`
+/// will resolve for that retry — read live from the finalized session data
+/// rather than the tenant captured before the handler ran, which a handler
+/// that itself changes the tenancy session key (an org switch, a
+/// tenant-scoped login) may have just moved. `None` leaves the alias in the
+/// same tenant namespace as the primary key, which is correct for every
+/// other tenancy source and for a session mutation that doesn't touch the
+/// tenancy session key.
 pub(crate) fn add_deferred_session_replay_key(
     response: &Response<Body>,
     session_id: Option<&str>,
     primary_replay_after_guard_denial: bool,
+    tenant_override: Option<&str>,
 ) {
     if let Some(commit) = response.extensions().get::<DeferredIdempotencyCommit>() {
-        commit.add_session_alias(session_id, primary_replay_after_guard_denial);
+        commit.add_session_alias(
+            session_id,
+            primary_replay_after_guard_denial,
+            tenant_override,
+        );
     }
 }
 
@@ -1334,10 +1478,17 @@ fn request_idempotency_key(req: &Request<Body>) -> Option<String> {
     (!key.is_empty()).then(|| key.to_owned())
 }
 
-fn in_flight_lock_owner() -> String {
-    uuid::Uuid::new_v4().to_string()
+fn in_flight_lock_owner(entropy: &dyn crate::entropy::Entropy) -> String {
+    entropy.uuid_v4().to_string()
 }
 
+// `clippy::result_large_err` (armed by rustc 1.98) measures the `Err` variant at
+// 128 bytes — that is `axum::response::Response`'s own size, not something this
+// crate chose. Returning a ready-made rejection response IS the idiom here, and
+// boxing it would add an allocation to every rejection path to satisfy a size
+// heuristic. Allowed at the site rather than workspace-wide so the lint stays
+// armed for error types we do control.
+#[allow(clippy::result_large_err)]
 async fn prepare_idempotency_request(
     idempotency_key: String,
     req: Request<Body>,
@@ -1345,9 +1496,9 @@ async fn prepare_idempotency_request(
     let (mut parts, body) = req.into_parts();
     let key_context = StorageKeyContext::from_parts(idempotency_key.clone(), &parts);
     let session_id = storage_session_id_for_parts(&parts).await;
-    let storage_key = key_context.storage_key(session_id.as_deref());
+    let storage_key = key_context.storage_key(session_id.as_deref(), None);
     let stale_cookie_storage_key = stale_cookie_session_id_for_parts(&parts).and_then(|id| {
-        let key = key_context.storage_key(Some(&id));
+        let key = key_context.storage_key(Some(&id), None);
         (key != storage_key).then_some(key)
     });
     parts.extensions.insert(IdempotencyContext::new(
@@ -1397,12 +1548,13 @@ fn stale_cookie_fallback_in_flight(
     store: &dyn IdempotencyStore,
     prepared: &PreparedIdempotencyRequest,
     in_flight_ttl: Duration,
+    entropy: &dyn crate::entropy::Entropy,
 ) -> bool {
     let Some(key) = prepared.stale_cookie_storage_key.as_deref() else {
         return false;
     };
 
-    let owner = in_flight_lock_owner();
+    let owner = in_flight_lock_owner(entropy);
     if store.try_lock_owned(key, &owner, in_flight_ttl) {
         store.unlock_owned(key, &owner);
         false
@@ -1443,6 +1595,7 @@ where
         replay_through_inner,
         fail_closed_on_replay,
         metrics,
+        entropy,
     } = config;
 
     if !is_mutating_method(req.method()) {
@@ -1482,7 +1635,7 @@ where
         }
     }
 
-    if stale_cookie_fallback_in_flight(store.as_ref(), &prepared, in_flight_ttl) {
+    if stale_cookie_fallback_in_flight(store.as_ref(), &prepared, in_flight_ttl, entropy.as_ref()) {
         tracing::debug!(
             idempotency.key = %prepared.idempotency_key,
             "Stale session cookie idempotency key already in flight — returning 409"
@@ -1494,7 +1647,7 @@ where
     }
 
     // ── In-flight check (concurrent duplicate) ─────────────────────────────
-    let lock_owner = in_flight_lock_owner();
+    let lock_owner = in_flight_lock_owner(entropy.as_ref());
     if !store.try_lock_owned(&prepared.storage_key, &lock_owner, in_flight_ttl) {
         tracing::debug!(
             idempotency.key = %prepared.idempotency_key,
@@ -1747,10 +1900,15 @@ where
             idempotency.key = %idempotency_key,
             "Idempotency payload mismatch — returning 422"
         );
-        return Ok(Response::builder()
+        #[allow(
+            clippy::unwrap_used,
+            reason = "infallible: response built from static status/body"
+        )]
+        let response = Response::builder()
             .status(StatusCode::UNPROCESSABLE_ENTITY)
             .body(Body::from("idempotency key reused with different payload"))
-            .unwrap());
+            .unwrap();
+        return Ok(response);
     }
 
     if fail_closed_on_replay {
@@ -1784,15 +1942,44 @@ where
     Ok(replay.into_response())
 }
 
+#[allow(
+    clippy::unwrap_used,
+    reason = "infallible: response built from static status/body"
+)]
+fn corrupted_replay_record_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .body(Body::from(
+            "stored idempotency replay record is invalid or corrupted",
+        ))
+        .unwrap()
+}
+
 fn response_from_record(record: IdempotencyRecord) -> Response<Body> {
     let mut builder = Response::builder().status(record.status);
     for (name, value) in &record.headers {
         builder = builder.header(name.as_str(), value.as_slice());
     }
-    builder
+    // The status, header names/values, and body all originate from the
+    // idempotency store, which may be a custom or corrupted backend. An
+    // invalid stored status (e.g. `0` or `> 999`) or invalid header bytes
+    // makes the builder stash an error that surfaces here. A corrupted replay
+    // record must not crash request handling: fall back to an internal-error
+    // response instead of panicking.
+    match builder
         .header(X_IDEMPOTENT_REPLAYED, "true")
         .body(Body::from(record.body))
-        .unwrap()
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "Stored idempotency replay record produced an invalid response; \
+                 returning 500 instead of replaying"
+            );
+            corrupted_replay_record_response()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1803,6 +1990,31 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::Mutex;
     use tower::ServiceExt;
+
+    /// W3 (issue #1797): the in-flight lock owner id is minted from the injected
+    /// entropy source, so a fixed seed reproduces the exact lock-owner stream.
+    #[test]
+    fn in_flight_lock_owner_is_deterministic_under_seeded_entropy() {
+        use crate::entropy::SeededEntropy;
+
+        let a = SeededEntropy::new(0x5eed);
+        let b = SeededEntropy::new(0x5eed);
+        for _ in 0..5 {
+            assert_eq!(
+                in_flight_lock_owner(&a),
+                in_flight_lock_owner(&b),
+                "same seed ⇒ identical lock-owner stream"
+            );
+        }
+        // The owner is a well-formed v4 UUID string.
+        let owner = in_flight_lock_owner(&SeededEntropy::new(1));
+        assert!(uuid::Uuid::parse_str(&owner).is_ok());
+        // A different seed diverges.
+        assert_ne!(
+            in_flight_lock_owner(&SeededEntropy::new(1)),
+            in_flight_lock_owner(&SeededEntropy::new(2)),
+        );
+    }
 
     #[derive(Clone, Default)]
     struct RecordingStore {
@@ -1843,6 +2055,49 @@ mod tests {
         fn unlock(&self, key: &str) {
             self.record_key(key);
         }
+    }
+
+    #[test]
+    fn poisoned_lock_does_not_break_subsequent_requests() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let store = MemoryIdempotencyStore::new(Duration::from_secs(60));
+
+        // Simulate a request handler that panics while holding one of the
+        // store's internal locks, poisoning it. Without poison recovery this
+        // would make every later request that touches `entries` panic too.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = store
+                .entries
+                .write()
+                .expect("first acquisition is not poisoned");
+            panic!("simulated handler panic while holding the idempotency lock");
+        }));
+        assert!(result.is_err(), "the induced panic should have unwound");
+        assert!(
+            store.entries.is_poisoned(),
+            "holding the write lock across a panic must poison it",
+        );
+
+        // A subsequent normal store round-trip must still succeed, proving the
+        // `unwrap_or_else(PoisonError::into_inner)` recovery keeps shared state
+        // usable for later requests (AC4 lock-poisoning recovery contract).
+        let record = IdempotencyRecord {
+            status: 200,
+            headers: Vec::new(),
+            body: b"ok".to_vec(),
+            metadata: Vec::new(),
+        };
+        store.set("k", record, b"body-hash".to_vec(), Duration::from_secs(60));
+        let fetched = store.get("k");
+        assert!(
+            fetched.is_some(),
+            "store must remain usable after a poisoned lock (into_inner recovery)",
+        );
+        assert_eq!(
+            fetched.expect("entry present after recovery").record.body,
+            b"ok",
+        );
     }
 
     fn idempotent_post(path: &str, key: &str, body: &'static str) -> Request<Body> {
@@ -1897,6 +2152,39 @@ mod tests {
         push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
         push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
         format!("v2:{}", hex_lower(hasher.finalize()))
+    }
+
+    /// An app that does not use tenancy must keep byte-identical storage keys,
+    /// so upgrading cannot turn an in-flight client retry into a second
+    /// execution of an already-committed mutation.
+    #[test]
+    fn storage_key_without_a_resolved_tenant_is_unchanged() {
+        assert_eq!(
+            build_storage_key("pay-once", "POST", "/payments", None, None),
+            expected_storage_key("POST", "/payments", None, "pay-once")
+        );
+    }
+
+    /// Two tenants sharing a key, a target and (for a token-authenticated API)
+    /// an empty session scope must not share a cache slot.
+    #[test]
+    fn storage_key_partitions_by_resolved_tenant() {
+        let tenant_a = build_storage_key("pay-once", "POST", "/payments", None, Some("tenant-a"));
+        let tenant_b = build_storage_key("pay-once", "POST", "/payments", None, Some("tenant-b"));
+        let untenanted = build_storage_key("pay-once", "POST", "/payments", None, None);
+
+        assert_ne!(tenant_a, tenant_b, "tenants must not share a storage key");
+        assert_ne!(tenant_a, untenanted);
+        assert_ne!(tenant_b, untenanted);
+    }
+
+    /// The tenant component is length-delimited like every other one, so a
+    /// tenant id carrying the separator cannot spell another tenant's slot.
+    #[test]
+    fn storage_key_tenant_component_is_length_delimited() {
+        let split = build_storage_key("pay-once", "POST", "/payments", None, Some("a:b"));
+        let shifted = build_storage_key("pay-once:a", "POST", "/payments", None, Some("b"));
+        assert_ne!(split, shifted);
     }
 
     #[test]
@@ -2192,5 +2480,47 @@ mod tests {
             observed.1,
             expected_storage_key("POST", "/payments", None, "pay-once")
         );
+    }
+
+    #[test]
+    fn corrupted_stored_record_does_not_panic_on_replay() {
+        // A store backend (custom or corrupted) can hand back a record whose
+        // stored status is out of the valid HTTP range and whose headers carry
+        // invalid bytes. Replaying it must not panic — it must surface an
+        // internal-error response instead.
+        let corrupted = IdempotencyRecord {
+            status: 1000,
+            headers: vec![("inv\nalid".to_owned(), vec![0x00, 0x0a])],
+            body: b"stored body".to_vec(),
+            metadata: Vec::new(),
+        };
+
+        let response = IdempotencyReplayResponse { record: corrupted }.into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a corrupted replay record must fall back to a 500 recovery response"
+        );
+        assert!(
+            response.headers().get(X_IDEMPOTENT_REPLAYED).is_none(),
+            "the recovery response must not masquerade as a successful replay"
+        );
+    }
+
+    #[test]
+    fn invalid_stored_status_alone_does_not_panic_on_replay() {
+        // Even with otherwise-valid headers, an out-of-range status byte must
+        // not crash replay handling.
+        let corrupted = IdempotencyRecord {
+            status: 0,
+            headers: vec![("content-type".to_owned(), b"text/plain".to_vec())],
+            body: b"stored body".to_vec(),
+            metadata: Vec::new(),
+        };
+
+        let response = response_from_record(corrupted);
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
