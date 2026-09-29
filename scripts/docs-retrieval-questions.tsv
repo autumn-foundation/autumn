@@ -155,6 +155,33 @@ rp_id	docs/guide/authentication.md
 # heading is a change to that section's structure and anchors, on its own
 # evidence, not a ride on this one.
 
+# --- Capturing a diagnostic snapshot --------------------------------------
+# All three failed cold before this change. `autumn export` — the command that
+# writes a running app's health/metrics/tasks/loggers to one JSON file —
+# appeared on NO reader-facing page across all 164 guide pages; it was one of
+# the six entries on `check-docs-cli-coverage.sh`'s triaged backlog, entered
+# there with the note that "the likeliest reader is someone assembling a
+# support ticket, which is the worst moment to find nothing." Coverage, not
+# findability: there was no second page splitting the rank, there was no page.
+#
+# "diagnostic snapshot", "export diagnostics" and "bug report" landed nowhere.
+# The bare word "diagnostics" landed on four pages, none of them an answer —
+# `constela.md`'s "Diagnostics are a repair prompt", `dev-loop-latency.md`'s
+# "Regression Diagnostics", `getting-started.md`'s "Route collision
+# diagnostics" and `tls.md`'s "Failure diagnostics" — so the reader who did
+# search got four wrong answers rather than silence.
+diagnostic snapshot	docs/guide/deployment.md
+export diagnostics	docs/guide/deployment.md
+bug report	docs/guide/deployment.md
+# "diagnostics" alone is deliberately NOT admitted. It would pass the moment
+# the section lands — the gate asks only that the named page be AMONG the hits
+# — while the four mis-landings above are all still there, so the row would go
+# green over a defect it does not measure. Narrowing it is a findability
+# question about four other pages' headings, on its own evidence, not a ride
+# here. "support bundle" and "collect diagnostics" are not admitted either:
+# closing them means a heading spelled for the matcher rather than the reader,
+# the same reasoning as "gzip", "incoming email" and "policy generator" above.
+
 # --- CORS -----------------------------------------------------------------
 # All ten failed cold before this change, over all 150 guide pages. `[cors]` is
 # a five-key config section with its own env overrides and a config-load
@@ -206,3 +233,55 @@ preflight	docs/guide/cors.md
 # spelled for the matcher rather than the reader, which is the practice the
 # "gzip" and "policy generator" notes above refuse. "cors configuration" and
 # "enable cors" carry the same intent and are both admitted.
+
+# --- Which URL goes in which probe ----------------------------------------
+# Six of the eleven spellings below failed cold over all 165 guide pages, and
+# the answer was never missing: `docs/guide/cloud-native.md` carried a "##
+# Probes" section listing `/live`, `/ready`, `/startup`, `/health` and mapping
+# each to its probe, correctly, in body text. The heading was the single word
+# "Probes", so the words a reader actually types — the `livenessProbe` and
+# `readinessProbe` keys they are filling in, in a manifest, right now — matched
+# no slug, H1 or heading anywhere in the corpus.
+#
+# Findability, not coverage: there was no second page splitting the rank and
+# nothing to write. The fix is rung 4, a retitle of that one heading, pages +0.
+#
+# Five pages hand-route this question in prose, which is what a live class
+# looks like when the page that owns it does not announce itself:
+# `hot-upgrades.md` ("readiness/liveness probes and drain budgets" — the
+# cross-reference author reached for the words the target heading never used),
+# `jobs.md`, `route-auth-coverage.md`, `cloud-native.md`'s own split-topology
+# section, and `tutorial/10-configuration.md`.
+#
+# The one mis-landing sent readers somewhere narrower than their question:
+# "health check" landed only on `fleet-deploys.md`'s "1. Health-check
+# `/ready`. Never `/live`" — correct advice, scoped to gating a fleet rollout,
+# on a page a reader configuring a container is not looking for.
+#
+# The stakes are why this outranked the rest of the ranked list. `/health` is a
+# readiness answer (`health::handler` delegates to `probe::readiness_response`,
+# so it is `/ready`'s checks and status), and it turns `503` when a dependency
+# is down. A liveness probe pointed at it kills a process that was only waiting
+# for its database, so a recoverable outage becomes a restart loop — the exact
+# failure separate probes exist to prevent, and what the section's own "do not
+# point all three at `/health`" warning was left implying without saying.
+liveness probe	docs/guide/cloud-native.md
+readiness probe	docs/guide/cloud-native.md
+startup probe	docs/guide/cloud-native.md
+liveness	docs/guide/cloud-native.md
+readiness	docs/guide/cloud-native.md
+probe	docs/guide/cloud-native.md
+# "probe" passed at the baseline, on the heading this change renames. It is
+# admitted as a regression guard, the same reason the set at the top of this
+# file exists.
+#
+# "kubernetes probe", "healthcheck", "health endpoint" and "ready endpoint"
+# still miss and are deliberately NOT admitted. Closing them means words in the
+# heading for the matcher rather than the reader: the section is
+# platform-agnostic (it serves ECS and systemd too), so naming Kubernetes in it
+# would be false precision, and "endpoint"/"healthcheck" are spellings no page
+# here has a reason to use. Same reasoning as "gzip", "policy generator" and
+# "configure cors" above. "health check" keeps landing on `fleet-deploys.md`,
+# which is a phrasing question about the word "health" — a different class,
+# owned by `health-indicators.md` as much as by this page, and it gets its own
+# change on its own evidence.

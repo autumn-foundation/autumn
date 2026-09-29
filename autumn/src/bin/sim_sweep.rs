@@ -1,11 +1,12 @@
 //! `sim-sweep`: the CI-facing driver for [`autumn_web::sim::sweep::sweep_proptest`]
 //! (sim-testing W6 PR3, issue #1797).
 //!
-//! Sweeps a batch of seeds, sequentially, against a small, self-contained,
-//! deliberately **correct** account demo scenario (mirroring
+//! Sweeps a batch of seeds, sequentially, against the deliberately **correct**
+//! account demo scenario in `autumn_web::sim::scenario` (mirroring
 //! `tests/sim_op_driver.rs`'s worked example, but with the `Withdraw`
-//! floor-check bug fixed) — proving the seed-sweep mechanism itself scales to
-//! many seeds without false positives. It is a smoke check for the harness,
+//! floor-check bug fixed), proving the seed-sweep mechanism itself scales to
+//! many seeds without false positives. The `sim_ops` cargo-fuzz target drives
+//! the same `Op` vocabulary (issue #2967). It is a smoke check for the harness,
 //! not a real app-level property; the `sim_sweep_driver` `DoD` test proves the
 //! mechanism catches a *genuine* invariant break, using the intentionally
 //! buggy variant of this same model.
@@ -28,50 +29,10 @@
 //! first failing seed's shrunk op-sequence plus a replay command, or the
 //! unsatisfied `sometimes!` labels, on a failing or vacuous sweep.
 
+use autumn_web::sim::scenario::{apply_ops, ops_strategy};
 use autumn_web::sim::sweep::{SweepOutcome, sweep_proptest};
-use autumn_web::{always, sometimes};
-use proptest::prelude::*;
 
 const DEFAULT_SEED_COUNT: u64 = 256;
-
-/// The demo scenario this binary sweeps: a toy account op, mirroring
-/// `tests/sim_op_driver.rs`'s `Deposit`/`Withdraw` worked example.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Op {
-    Deposit(u32),
-    Withdraw(u32),
-}
-
-impl Arbitrary for Op {
-    type Parameters = ();
-    type Strategy = BoxedStrategy<Self>;
-
-    fn arbitrary_with((): ()) -> Self::Strategy {
-        prop_oneof![
-            (1u32..100).prop_map(Op::Deposit),
-            (1u32..100).prop_map(Op::Withdraw),
-        ]
-        .boxed()
-    }
-}
-
-/// Applies `ops` to a starting-from-zero balance and asserts the invariant
-/// "balance never goes negative" via `always!`.
-///
-/// Unlike `tests/sim_op_driver.rs`'s deliberately buggy twin, `Withdraw` here
-/// floors at zero (`amount.min(balance)`) instead of subtracting
-/// unconditionally — this binary's own sweep is expected to stay green.
-fn apply_ops(ops: &[Op]) {
-    let mut balance: i64 = 0;
-    for op in ops {
-        match *op {
-            Op::Deposit(amount) => balance += i64::from(amount),
-            Op::Withdraw(amount) => balance -= i64::from(amount).min(balance),
-        }
-        always!(balance >= 0, "balance went negative: {balance}");
-        sometimes!(balance == 0, "balance-returned-to-zero");
-    }
-}
 
 /// The seeds to sweep, from the raw `AUTUMN_SIM_SEED_START` and
 /// `AUTUMN_SIM_SEEDS` values. An unset or unparseable value takes its default
@@ -103,7 +64,7 @@ fn main() {
         std::env::var("AUTUMN_SIM_SEEDS").ok().as_deref(),
     );
     let count = seeds.end - seeds.start;
-    let strategy = proptest::collection::vec(any::<Op>(), 1..32);
+    let strategy = ops_strategy();
     println!(
         "sim-sweep: sweeping {count} seed(s) ({}..{}) against the account demo scenario",
         seeds.start, seeds.end,
