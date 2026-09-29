@@ -48,6 +48,14 @@ autumn routes --format json --user-only --method POST --filter /posts
 
 Capture stdout, stderr, and exit code.
 
+When the user asks for a **diagram** of the routes (Mermaid, a flowchart, a
+picture for a README or PR), use the Mermaid format instead of JSON and hand
+back the output verbatim in a ```` ```mermaid ```` block — the same filters apply:
+
+```bash
+autumn routes --format mermaid --user-only
+```
+
 ## Output handling
 
 Parse the JSON array and present a clean table grouped by handler file or
