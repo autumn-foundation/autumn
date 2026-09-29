@@ -4795,36 +4795,39 @@ pub async fn import_comments(
             return Ok(0);
         }
 
-        // Comments already on the post that the file also carries, keyed by
-        // trimmed body and timestamp (microseconds, Postgres' precision). An
-        // import interrupted before the completion marker existed committed
-        // its rows without the record, and a hand-restored comment looks the
-        // same. Each such row is matched one-for-one within its tree position (same
-        // resolved parent) and reused as the parent of its replies instead of being inserted again, so a retry neither
-        // appends the thread a second time nor drops the rest of it because a
-        // single row happened to be there already. A visitor's comment never
-        // matches a backup row.
-        let mut existing: std::collections::HashMap<(Option<i64>, String, i64), Vec<i64>> =
+        // Comments already on the post that the file also carries. An import
+        // interrupted before the completion marker existed committed its rows
+        // without the record, and a hand-restored comment looks the same. Each
+        // such row is matched one-for-one and reused as the parent of its
+        // replies instead of being inserted again, so a retry neither appends
+        // the thread a second time nor drops the rest of it because a single
+        // row happened to be there already.
+        //
+        // The key is the row's whole identity as the restore would write it:
+        // resolved parent (its tree position), account, display name, status,
+        // trimmed body and timestamp (microseconds, Postgres' precision).
+        // Siblings that differ in any of these are different comments and are
+        // never swapped for one another. A visitor's comment never matches.
+        type LegacyKey = (Option<i64>, Option<i64>, String, String, String, i64);
+        let mut existing: std::collections::HashMap<LegacyKey, Vec<i64>> =
             std::collections::HashMap::new();
-        let present: Vec<(i64, Option<i64>, String, chrono::NaiveDateTime)> = comments::table
+        let present: Vec<Comment> = comments::table
             .filter(comments::post_id.eq(post_id))
-            .select((
-                comments::id,
-                comments::parent_id,
-                comments::body,
-                comments::created_at,
-            ))
+            .select(Comment::as_select())
             .load(conn)
             .await?;
-        for (id, parent, body, at) in present {
+        for row in present {
             existing
                 .entry((
-                    parent,
-                    body.trim().to_owned(),
-                    at.and_utc().timestamp_micros(),
+                    row.parent_id,
+                    row.author_id,
+                    row.author_name.trim().to_owned(),
+                    row.status.clone(),
+                    row.body.trim().to_owned(),
+                    row.created_at.and_utc().timestamp_micros(),
                 ))
                 .or_default()
-                .push(id);
+                .push(row.id);
         }
 
         let mut created = 0usize;
@@ -4867,6 +4870,9 @@ pub async fn import_comments(
                 if let Some(id) = existing
                     .get_mut(&(
                         new.parent_id,
+                        new.author_id,
+                        new.author_name.clone(),
+                        new.status.clone(),
                         new.body.clone(),
                         comment.created_at.and_utc().timestamp_micros(),
                     ))
