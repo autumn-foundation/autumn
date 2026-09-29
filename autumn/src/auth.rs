@@ -122,7 +122,7 @@ const DEFAULT_BCRYPT_COST: u32 = 12;
 /// ```
 pub async fn hash_password(password: &str) -> crate::AutumnResult<String> {
     let password = password.to_string();
-    tokio::task::spawn_blocking(move || {
+    crate::time::spawn_blocking(move || {
         bcrypt::hash(password, DEFAULT_BCRYPT_COST)
             .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))
     })
@@ -163,7 +163,7 @@ pub async fn verify_password(password: &str, hash: &str) -> crate::AutumnResult<
         "$2b$12$KIXe8K4j1sH6/xH.x9d71uJ5Jk8t6O4m6Q110g4H8y1r6J6O6O6O6".to_string()
     };
 
-    let result = tokio::task::spawn_blocking(move || bcrypt::verify(&password, &hash_to_verify))
+    let result = crate::time::spawn_blocking(move || bcrypt::verify(&password, &hash_to_verify))
         .await
         .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))?;
 
