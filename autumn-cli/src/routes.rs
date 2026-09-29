@@ -3,7 +3,8 @@
 //! Compiles the target binary (debug profile), runs it with
 //! `AUTUMN_DUMP_ROUTES=1`, and parses the JSON route listing from its
 //! stdout. Applies any user-requested filters, then displays the result
-//! as either a human-readable table or machine-readable JSON.
+//! as a human-readable table, machine-readable JSON, or a Mermaid.js
+//! flowchart (`--format mermaid`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,6 +18,8 @@ use crate::text_width::display_width;
 pub enum OutputFormat {
     Table,
     Json,
+    /// A Mermaid.js flowchart: client → method/path → middleware → handler.
+    Mermaid,
 }
 
 impl std::str::FromStr for OutputFormat {
@@ -26,8 +29,9 @@ impl std::str::FromStr for OutputFormat {
         match s.to_lowercase().as_str() {
             "table" => Ok(Self::Table),
             "json" => Ok(Self::Json),
+            "mermaid" | "mmd" => Ok(Self::Mermaid),
             other => Err(format!(
-                "unknown format '{other}'; expected 'table' or 'json'"
+                "unknown format '{other}'; expected 'table', 'json' or 'mermaid'"
             )),
         }
     }
@@ -107,6 +111,7 @@ pub fn run(opts: &RoutesOptions<'_>) {
     match &opts.format {
         OutputFormat::Table => print_table(&routes),
         OutputFormat::Json => print_json(&routes),
+        OutputFormat::Mermaid => print!("{}", render_mermaid(&routes)),
     }
 }
 
@@ -261,6 +266,51 @@ pub fn print_json(routes: &[RouteInfo]) {
     let json =
         serde_json::to_string_pretty(routes).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
     println!("{json}");
+}
+
+/// Render routes as a Mermaid.js flowchart (`graph TD`).
+///
+/// Each route becomes a `Client -- METHOD --> path` edge followed by a
+/// `path --> handler` edge labelled with the route's middleware. Node ids are
+/// positional (`R0`/`H0`, …) so arbitrary paths never have to be valid Mermaid
+/// identifiers; every label is entity-escaped by [`mermaid_label`].
+pub fn render_mermaid(routes: &[RouteInfo]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::from("graph TD\n    Client((Client))\n");
+    for (i, route) in routes.iter().enumerate() {
+        let method = mermaid_label(&route.method);
+        let path = mermaid_label(&route.path);
+        let handler = mermaid_label(&route.handler);
+        let middleware = if route.middleware.is_empty() {
+            String::new()
+        } else {
+            format!("|\"{}\"|", mermaid_label(&route.middleware.join(", ")))
+        };
+        let _ = writeln!(out, "    Client -- \"{method}\" --> R{i}[\"{path}\"]");
+        let _ = writeln!(out, "    R{i} -->{middleware} H{i}[\"{handler}\"]");
+    }
+    out
+}
+
+/// Escape text for use inside a quoted Mermaid label.
+///
+/// Mermaid has no backslash escapes: a `"` ends the label and `|`, `<`, `>`
+/// and `#` are syntax, so each is written as a Mermaid entity code instead.
+fn mermaid_label(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("#quot;"),
+            '#' => out.push_str("#35;"),
+            '|' => out.push_str("#124;"),
+            '<' => out.push_str("#lt;"),
+            '>' => out.push_str("#gt;"),
+            '\n' | '\r' => out.push(' '),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 // ── Binary discovery (mirrored from build.rs) ──────────────────────────────
@@ -550,6 +600,58 @@ mod tests {
         assert_eq!(f, OutputFormat::Json);
         let f: OutputFormat = "Table".parse().unwrap();
         assert_eq!(f, OutputFormat::Table);
+    }
+
+    #[test]
+    fn parse_format_mermaid() {
+        let f: OutputFormat = "mermaid".parse().unwrap();
+        assert_eq!(f, OutputFormat::Mermaid);
+        let f: OutputFormat = "MMD".parse().unwrap();
+        assert_eq!(f, OutputFormat::Mermaid);
+    }
+
+    #[test]
+    fn render_mermaid_links_client_path_middleware_and_handler() {
+        let mut secured = make_route("POST", "/api/posts", "user");
+        secured.handler = "create_post".to_owned();
+        secured.middleware = vec!["secured".to_owned(), "cached(60s)".to_owned()];
+        let mut open = make_route("GET", "/api/posts", "user");
+        open.handler = "list_posts".to_owned();
+
+        let mmd = render_mermaid(&[open, secured]);
+        assert!(mmd.starts_with("graph TD\n    Client((Client))\n"), "{mmd}");
+        assert!(
+            mmd.contains("    Client -- \"GET\" --> R0[\"/api/posts\"]\n"),
+            "{mmd}"
+        );
+        assert!(mmd.contains("    R0 --> H0[\"list_posts\"]\n"), "{mmd}");
+        assert!(
+            mmd.contains("    Client -- \"POST\" --> R1[\"/api/posts\"]\n"),
+            "{mmd}"
+        );
+        assert!(
+            mmd.contains("    R1 -->|\"secured, cached(60s)\"| H1[\"create_post\"]\n"),
+            "{mmd}"
+        );
+    }
+
+    #[test]
+    fn render_mermaid_escapes_label_syntax() {
+        let mut route = make_route("GET", "/a\"b|c#<d>", "user");
+        route.handler = "h\"x".to_owned();
+        route.middleware = vec!["m|n".to_owned()];
+
+        let mmd = render_mermaid(&[route]);
+        assert!(
+            mmd.contains("R0[\"/a#quot;b#124;c#35;#lt;d#gt;\"]"),
+            "{mmd}"
+        );
+        assert!(mmd.contains("-->|\"m#124;n\"| H0[\"h#quot;x\"]"), "{mmd}");
+    }
+
+    #[test]
+    fn render_mermaid_with_no_routes_is_just_the_client() {
+        assert_eq!(render_mermaid(&[]), "graph TD\n    Client((Client))\n");
     }
 
     #[test]

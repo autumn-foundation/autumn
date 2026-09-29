@@ -44,7 +44,7 @@ POST      /api/posts                  api_create_post          user
 | `--filter <FILTER>` | Show only routes whose path starts with FILTER |
 | `--method <METHOD,...>` | Restrict to one or more HTTP methods (comma-separated, e.g. `GET,POST`) |
 | `--user-only` | Hide framework-internal routes (`/actuator/*`, probes, htmx assets) |
-| `--format <FORMAT>` | Output format: `table` (default) or `json` |
+| `--format <FORMAT>` | Output format: `table` (default), `json`, or `mermaid` |
 
 ## Filtering routes
 
@@ -114,6 +114,30 @@ Each entry in the JSON array follows this schema:
 | `"user"` | Registered directly by the application |
 | `"plugin:<name>"` | Registered by a named Autumn plugin (e.g. `"plugin:autumn-admin"`) |
 | `"framework"` | Registered by the Autumn framework itself |
+
+## Mermaid diagram
+
+Render the route table as a [Mermaid.js](https://mermaid.js.org/) flowchart —
+client → method/path → middleware → handler — for a README, an architecture
+doc, or a pull-request description:
+
+```bash
+autumn routes --format mermaid > routes.mmd
+autumn routes --user-only --format mermaid   # skip framework routes
+```
+
+```mermaid
+graph TD
+    Client((Client))
+    Client -- "GET" --> R0["/api/posts"]
+    R0 --> H0["api_list_posts"]
+    Client -- "POST" --> R1["/api/posts"]
+    R1 -->|"secured"| H1["api_create_post"]
+```
+
+The filters above apply, so `--filter /api` draws just that subtree. Labels are
+escaped with Mermaid entity codes (`#quot;`, `#124;`, …), so any path or
+middleware label renders as written.
 
 ## WebSocket routes
 
