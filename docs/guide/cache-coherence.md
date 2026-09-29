@@ -567,7 +567,7 @@ the coherence registration is placed inside the function body precisely so an
 | `--all-features` | build the audited binary with every feature |
 | `--no-default-features` | build the audited binary without default features |
 | `--release` | build and audit the release binary (`target/release`) |
-| `--profile NAME` | build and audit under a Cargo profile (`target/NAME`; `dev` is `target/debug`) |
+| `--profile NAME` | build and audit under a Cargo profile (`target/NAME`; `dev`/`test` use `target/debug`, `bench` `target/release`) |
 
 **Audit the feature set you deploy.** The manifest describes the binary that
 produced it. A `#[cached]` read or a `#[repository]` write behind a feature the

@@ -473,14 +473,19 @@ impl CargoProfile {
 
     /// The `target/` subdirectory Cargo places this profile's artifacts in.
     ///
-    /// Cargo's own rule: `dev` builds into `target/debug`, `release` into
+    /// Cargo's own `dir-name` rule: the built-in `dev` and `test` profiles
+    /// build into `target/debug`, `release` and `bench` into
     /// `target/release`, and any other profile name into `target/<name>`.
     #[must_use]
     pub fn artifact_dir(&self) -> &str {
         if self.release {
             "release"
         } else if let Some(name) = &self.profile {
-            if name == "dev" { "debug" } else { name }
+            match name.as_str() {
+                "dev" | "test" => "debug",
+                "release" | "bench" => "release",
+                other => other,
+            }
         } else {
             "debug"
         }
@@ -1268,6 +1273,21 @@ mod tests {
         assert_eq!(p.to_args(), vec!["--profile", "dev"]);
         assert_eq!(p.artifact_dir(), "debug");
         assert_eq!(resolve_profile_dir(&p), "debug");
+    }
+
+    /// Cargo's other built-ins: `test` inherits `dev`'s directory and
+    /// `bench` inherits `release`'s, so neither has a `target/<name>`.
+    #[test]
+    fn the_test_and_bench_profiles_resolve_to_their_inherited_dirs() {
+        for (name, dir) in [("test", "debug"), ("bench", "release")] {
+            let p = CargoProfile {
+                release: false,
+                profile: Some(name.to_string()),
+            };
+            assert_eq!(p.to_args(), vec!["--profile", name]);
+            assert_eq!(p.artifact_dir(), dir, "{name}");
+            assert_eq!(resolve_profile_dir(&p), dir, "{name}");
+        }
     }
 
     #[test]
