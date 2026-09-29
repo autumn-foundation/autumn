@@ -1,5 +1,9 @@
 //! Bitemporal, tamper-evident record ledger for `#[repository]` writes (issue #1699).
 //!
+//! This ledger records the **history of a row**. For money, see
+//! [`crate::money::ledger`], which is a double-entry store with a balance
+//! invariant. The two are unrelated.
+//!
 //! Autumn already records raw change history (`crate::version_history`, #700),
 //! but a column-level diff log cannot be *queried as state*. This module
 //! promotes that history to a ledger: every write to an opted-in entity appends

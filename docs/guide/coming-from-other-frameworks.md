@@ -268,9 +268,10 @@ sensitive = true`, so a `404` there means the profile has not enabled it
 rather than that you have the path wrong.
 
 Like Spring Boot's `loggers` actuator endpoint, Autumn's logger levels reload
-live -- `LogLevels::set_logger_level(name, level)` flips a target's level at
-runtime (with `current_level()` / `logger_overrides()` to inspect), no restart
-required. And just as `/actuator/info` surfaces git/build info, Autumn's
+live: `PUT /actuator/loggers/{name}` changes the running `tracing` subscriber,
+no restart required — see [Change log levels at
+runtime](logging-pii.md#change-log-levels-at-runtime-without-a-restart) for the
+request and response shapes and the sensitive-mode requirement. And just as `/actuator/info` surfaces git/build info, Autumn's
 `/actuator/info` carries a `BuildProvenance` (git SHA plus build metadata) via
 `build_provenance()`.
 

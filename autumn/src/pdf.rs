@@ -51,21 +51,18 @@
 //!
 //! # Nesting depth limit
 //!
-//! Layout walks the parsed HTML tree recursively, so element nesting is
-//! capped at **512 levels**. The parser itself is iterative and stack-safe —
-//! adversarially deep markup can't blow the stack — but the layout walker's
-//! per-level recursion is deliberately bounded as defense in depth against
-//! pathological (adversarial or accidental) nesting, e.g. a runaway
-//! wrapper-per-iteration template bug or a recursively-rendered comment
-//! thread piped through [`Pdf::from_html`](crate::pdf::Pdf::from_html).
+//! The layout walker stops at 512 levels of tag nesting. This is defense
+//! against very deep HTML. Content past this depth does not render — the
+//! one exception to the "degrades gracefully" promise above.
 //!
-//! Content nested deeper than the cap is **omitted** from the PDF — never
-//! silently: every render that truncates anything emits one `tracing::warn!`
-//! naming the cap, so a runaway template shows up in your logs instead of
-//! vanishing without a trace. 512 levels of literal nesting is far beyond
-//! anything a hand-written or generated invoice-style document reaches; if
-//! you ever see the warning, the HTML source almost certainly has a nesting
-//! bug worth fixing at the source.
+//! When this happens, [`render`](crate::pdf::Pdf::render) still returns normal, valid
+//! PDF bytes — it does not return an error. Each render that hits the cap
+//! logs one `tracing::warn!` event at target `autumn::pdf`, so you can
+//! detect truncation from your log pipeline.
+//!
+//! A typical scaffold view (headings, paragraphs, tables) stays far under
+//! 512 levels. Recursive content — a comment thread, a nested reply tree —
+//! can reach it.
 //!
 //! # Determinism
 //!

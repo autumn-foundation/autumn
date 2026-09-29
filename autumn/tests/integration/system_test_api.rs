@@ -6,6 +6,15 @@
 //!
 //! Run:
 //!   cargo test -p autumn-web --features system-tests --test `system_test_api`
+//!
+//! # Why `SystemTest::build()` is awaited behind `Box::pin`
+//!
+//! Its future holds an `AppState`, twice, and sat 16 bytes under
+//! `clippy::large_futures`'s 16384-byte limit. Any field added to `AppState`
+//! — issue #1806 added one 8-byte handle — therefore failed `Lint` in a file
+//! that had nothing to do with the change, and the reader of that failure
+//! learns nothing about the real cause. Boxing moves the future to the heap,
+//! so the size of `AppState` stops being this file's business.
 
 #![cfg(feature = "system-tests")]
 
@@ -173,9 +182,7 @@ async fn system_test_boots_and_visits_page() {
         "<html><body><h1 id='greeting'>Hello from system test</h1></body></html>"
     }
 
-    let runner = SystemTest::new()
-        .routes(routes![index])
-        .build()
+    let runner = Box::pin(SystemTest::new().routes(routes![index]).build())
         .await
         .expect("failed to start system test runner");
 
@@ -198,12 +205,14 @@ async fn assertion_failure_writes_artifacts() {
         "<html><body><p>Only this text</p></body></html>"
     }
 
-    let runner = SystemTest::new()
-        .routes(routes![index])
-        .artifact_dir("/tmp/autumn-system-test-artifacts")
-        .build()
-        .await
-        .expect("start runner");
+    let runner = Box::pin(
+        SystemTest::new()
+            .routes(routes![index])
+            .artifact_dir("/tmp/autumn-system-test-artifacts")
+            .build(),
+    )
+    .await
+    .expect("start runner");
 
     let page = runner.page().await.expect("open page");
     page.visit("/").await.expect("visit");
@@ -253,9 +262,7 @@ async fn expect_hx_settle_waits_for_htmx() {
         "<span>Swapped!</span>"
     }
 
-    let runner = SystemTest::new()
-        .routes(routes![index, swap])
-        .build()
+    let runner = Box::pin(SystemTest::new().routes(routes![index, swap]).build())
         .await
         .expect("start");
 
@@ -299,11 +306,13 @@ async fn click_triggering_full_page_navigation_does_not_break_polling() {
         "Navigated successfully"
     }
 
-    let runner = SystemTest::new()
-        .routes(routes![form_page, submit, done])
-        .build()
-        .await
-        .expect("start");
+    let runner = Box::pin(
+        SystemTest::new()
+            .routes(routes![form_page, submit, done])
+            .build(),
+    )
+    .await
+    .expect("start");
 
     let page = runner.page().await.expect("page");
     page.visit("/").await.expect("visit");
@@ -342,12 +351,14 @@ async fn custom_layer_is_visible_to_route_handlers_in_the_browser() {
         format!("<html><body><h1>Tenant: {}</h1></body></html>", tenant.0)
     }
 
-    let runner = SystemTest::new()
-        .routes(routes![index])
-        .layer(axum::middleware::from_fn(scope_to_tenant))
-        .build()
-        .await
-        .expect("start runner");
+    let runner = Box::pin(
+        SystemTest::new()
+            .routes(routes![index])
+            .layer(axum::middleware::from_fn(scope_to_tenant))
+            .build(),
+    )
+    .await
+    .expect("start runner");
 
     let page = runner.page().await.expect("open page");
     page.visit("/").await.expect("visit");
@@ -383,9 +394,7 @@ async fn attach_visits_externally_running_server() {
         "<html><body><h1>Externally booted</h1></body></html>"
     }
 
-    let server = SystemTest::new()
-        .routes(routes![index])
-        .build()
+    let server = Box::pin(SystemTest::new().routes(routes![index]).build())
         .await
         .expect("boot stand-in server");
     let base_url = server.base_url().to_string();
@@ -419,9 +428,7 @@ async fn expect_no_console_errors_fails_on_uncaught_exception() {
         "<html><body><h1>Page loads fine</h1></body></html>"
     }
 
-    let runner = SystemTest::new()
-        .routes(routes![index])
-        .build()
+    let runner = Box::pin(SystemTest::new().routes(routes![index]).build())
         .await
         .expect("start runner");
 
@@ -457,9 +464,7 @@ async fn expect_no_console_errors_passes_on_clean_page() {
         "<html><body><h1>All good</h1></body></html>"
     }
 
-    let runner = SystemTest::new()
-        .routes(routes![index])
-        .build()
+    let runner = Box::pin(SystemTest::new().routes(routes![index]).build())
         .await
         .expect("start runner");
 
@@ -484,9 +489,7 @@ async fn console_errors_returns_accumulated_messages() {
         "<html><body><h1>Page loads fine</h1></body></html>"
     }
 
-    let runner = SystemTest::new()
-        .routes(routes![index])
-        .build()
+    let runner = Box::pin(SystemTest::new().routes(routes![index]).build())
         .await
         .expect("start runner");
 

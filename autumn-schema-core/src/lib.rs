@@ -577,7 +577,10 @@ impl ColumnType {
             // object, so the declarative lane manages it exactly like any other
             // text column. Without it here the parser skips the column and the
             // diff refuses to emit `CREATE TABLE` for the whole model.
-            "String" | "Translated" => Some(Self::Text),
+            // `CollabText` is a `#[collaborative]` CRDT document (issue #1806);
+            // like `Translated` its storage is a plain `TEXT` column holding
+            // JSON, so the declarative lane manages it as a text column.
+            "String" | "Translated" | "CollabText" => Some(Self::Text),
             "i32" => Some(Self::Int32),
             "i64" => Some(Self::Int64),
             "bool" => Some(Self::Bool),

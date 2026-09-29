@@ -9,15 +9,14 @@
 use autumn_web::AutumnResult;
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::response::Response;
+use diesel_async::AsyncPgConnection;
 use serde::{Deserialize, Serialize};
 
 use crate::capabilities::Capability;
 use crate::content;
 use crate::models::NewPost;
 use crate::plugins::{Action, do_action};
-use crate::repositories::{
-    AttachmentRepository as _, PostRepository as _, TermRepository as _, UserRepository as _,
-};
+use crate::repositories::{AttachmentRepository as _, PostRepository as _, UserRepository as _};
 use crate::require_capability;
 
 use super::super::site::{Csrf, Repos};
@@ -261,20 +260,74 @@ pub struct ExportTermRef {
 /// `(taxonomy, slug)` — an id from another installation means nothing — and one
 /// the destination does not have is skipped rather than created, because an
 /// import restores content and the taxonomy list is the site's own.
-async fn resolve_import_terms(repos: &Repos, post: &ExportPost) -> AutumnResult<Vec<i64>> {
-    let mut term_ids = Vec::new();
-    for reference in &post.terms {
-        if let Some(term) = repos
-            .terms
-            .find_by_slug(reference.slug.clone())
-            .await?
-            .into_iter()
-            .find(|t| t.taxonomy == reference.taxonomy)
-        {
-            term_ids.push(term.id);
-        }
+///
+/// Looked up against `term_ids`, which `content::resolve_term_refs` builds
+/// once for every post in the file up front — this used to be its own
+/// `find_by_slug` round trip per term reference, so a heavily-tagged import
+/// paid one single-row SELECT per (post, term) pair instead of a handful of
+/// batched queries for the whole file.
+///
+/// A reference this post carries but the up-front map does not is not
+/// necessarily nonexistent, only unresolved *as of that snapshot* — an
+/// import is one HTTP request spanning real wall-clock time across
+/// potentially thousands of posts, and someone else's unrelated write
+/// (creating a term under the same `(taxonomy, slug)` a not-yet-processed
+/// post references) can land in between. So the first post to encounter a
+/// miss re-checks it against the live table; whatever that one extra check
+/// finds (or does not find) is cached into `term_ids` and `checked` for
+/// every later post naming the same reference. `checked` is what makes
+/// that a one-time check per distinct missing key rather than a recheck
+/// per post: without it, many posts sharing one reference this site
+/// genuinely does not have -- an easy shape, e.g. a deprecated tag the
+/// destination dropped, still named by hundreds of posts in the backup --
+/// would each treat it as a fresh miss and requery, silently degrading
+/// back to the O(posts) round trip this whole batching pass exists to
+/// remove.
+///
+/// A term deleted and recreated under the same key in the window between
+/// a key's one check and the end of the import is not covered by this
+/// check-once strategy — closing that too would mean rechecking every
+/// cache *hit* on every post, i.e. a query per reference regardless of
+/// outcome, which is the exact per-reference round trip this batching
+/// exists to remove. `set_post_terms` already drops a since-deleted id
+/// rather than failing its foreign key (see its own doc comment), so that
+/// residual case fails soft — the post ends up untagged for that one
+/// reference, the same outcome an outright missing term produces —
+/// rather than aborting the import.
+async fn resolve_import_terms(
+    conn: &mut AsyncPgConnection,
+    term_ids: &mut std::collections::HashMap<(String, String), i64>,
+    checked: &mut std::collections::HashSet<(String, String)>,
+    post: &ExportPost,
+) -> AutumnResult<Vec<i64>> {
+    use std::collections::HashSet;
+
+    let misses: HashSet<(String, String)> = post
+        .terms
+        .iter()
+        .map(|reference| (reference.taxonomy.clone(), reference.slug.clone()))
+        .filter(|key| !term_ids.contains_key(key) && !checked.contains(key))
+        .collect();
+    if !misses.is_empty() {
+        let refreshed = content::resolve_term_refs(
+            conn,
+            misses
+                .iter()
+                .map(|(taxonomy, slug)| (taxonomy.as_str(), slug.as_str())),
+        )
+        .await?;
+        term_ids.extend(refreshed);
+        checked.extend(misses);
     }
-    Ok(term_ids)
+    Ok(post
+        .terms
+        .iter()
+        .filter_map(|reference| {
+            term_ids
+                .get(&(reference.taxonomy.clone(), reference.slug.clone()))
+                .copied()
+        })
+        .collect())
 }
 
 /// `open`, matching the column default, for a file that predates the field.
@@ -1366,6 +1419,32 @@ pub async fn import(
         })
         .await?;
 
+    // Every `(taxonomy, slug)` a post in the file names, resolved to a local
+    // term id in one batched pass rather than a lookup per post. The terms
+    // pass just above has already created every term the file itself
+    // declares, so this is a pure read: a reference naming no local term
+    // (this site doesn't have that taxonomy or slug) is simply absent below,
+    // the same outcome the old per-post `find_by_slug` lookup produced.
+    let mut term_ids_by_ref = repos
+        .with_conn(async |conn| {
+            content::resolve_term_refs(
+                conn,
+                payload
+                    .posts
+                    .iter()
+                    .flat_map(|post| post.terms.iter())
+                    .map(|reference| (reference.taxonomy.as_str(), reference.slug.as_str())),
+            )
+            .await
+        })
+        .await?;
+    // Distinct `(taxonomy, slug)` keys `resolve_import_terms` has already
+    // spent one live re-check on during the loop below (a miss against the
+    // up-front snapshot above) -- whether that check found the term or not.
+    // Without this, a reference many posts share but this site genuinely
+    // does not have would be re-queried by every one of them.
+    let mut checked_term_refs = std::collections::HashSet::new();
+
     // Attachment metadata first, so posts can reference it. Matched by slug —
     // the same "ids mean nothing across installations" rule the author and
     // parent references follow. A row already present is left alone rather than
@@ -1630,7 +1709,7 @@ pub async fn import(
             // it to the ancestry pass. The marker commits before that work, so
             // a failure in between leaves exactly this state, and a retry that
             // only skipped would never repair it.
-            let term_ids = resolve_import_terms(&repos, post).await?;
+            //
             // Same mapping the creation path uses: a retry of a backup whose
             // schedules have since elapsed must not be refused either.
             let wanted_status = import_status(&post.status, post.published_at).to_owned();
@@ -1639,6 +1718,13 @@ pub async fn import(
             let transitioned = repos
                 .with_conn(async |conn| {
                     use diesel_async::AsyncConnection as _;
+                    let term_ids = resolve_import_terms(
+                        conn,
+                        &mut term_ids_by_ref,
+                        &mut checked_term_refs,
+                        post,
+                    )
+                    .await?;
                     conn.transaction(async move |conn| {
                         content::set_post_terms(conn, ours_id, term_ids).await?;
                         if wanted_status != current_status {
@@ -1750,7 +1836,6 @@ pub async fn import(
             published_at: post.published_at,
         };
 
-        let term_ids = resolve_import_terms(&repos, post).await?;
         // The terms and the transition commit together. They were separate
         // transactions after an already-committed insert, so a failure in
         // either left the post present but unfinished — and the dedupe above
@@ -1783,6 +1868,9 @@ pub async fn import(
         let outcome = repos
             .with_conn(async |conn| {
                 use diesel_async::AsyncConnection as _;
+                let term_ids =
+                    resolve_import_terms(conn, &mut term_ids_by_ref, &mut checked_term_refs, post)
+                        .await?;
                 conn.transaction(async move |conn| {
                     // The parent resolved above is only *used* if it is one the
                     // editor would accept — a live row of the same type, no

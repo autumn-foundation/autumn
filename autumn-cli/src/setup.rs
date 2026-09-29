@@ -2,7 +2,10 @@
 //!
 //! Downloads the correct platform-specific Tailwind CSS standalone binary,
 //! verifies its SHA-256 checksum against the `sha256sums.txt` file published with
-//! each release, and installs it to `target/autumn/tailwindcss`.
+//! each release, and installs it to `<target-dir>/autumn/tailwindcss` (or
+//! `.exe` on Windows) — `<target-dir>` is `cargo metadata`'s
+//! `target_directory`, the same resolution `autumn dev` and the scaffold's
+//! generated `build.rs` use, so all three agree when `CARGO_TARGET_DIR` is set.
 
 use std::fs;
 use std::io::Write;
@@ -50,12 +53,19 @@ pub enum SetupError {
     /// Failed to parse `sha256sums.txt`.
     #[error("failed to parse checksum file: {0}")]
     ChecksumParse(String),
+
+    /// Could not resolve the Cargo target directory via `cargo metadata`.
+    #[error("could not resolve target directory: {0}")]
+    TargetDir(String),
 }
 
 /// Run the `autumn setup` subcommand.
 ///
-/// Downloads Tailwind CSS to `target/autumn/tailwindcss` (or `.exe` on Windows).
-/// If the binary already exists and `force` is false, exits early.
+/// Downloads Tailwind CSS to `<target-dir>/autumn/tailwindcss` (or `.exe` on
+/// Windows), honoring `CARGO_TARGET_DIR` via `cargo metadata`.
+/// If the binary already exists, the version marker names the current pin,
+/// and `force` is false, exits early; a stale or missing marker triggers a
+/// re-download so a pin bump actually lands (issue #2387).
 pub fn run(force: bool) {
     if let Err(e) = execute(force) {
         eprintln!("Error: {e}");
@@ -63,15 +73,62 @@ pub fn run(force: bool) {
     }
 }
 
+/// Name of the sidecar file recording which Tailwind pin is on disk.
+///
+/// `execute` short-circuits only when this marker sits next to the binary and
+/// names the current pin. Older CLIs wrote no marker, so a marker-less binary
+/// is treated as an unknown version and re-downloaded once — the first run
+/// under this CLI self-heals every existing checkout (issue #2387).
+const VERSION_MARKER_FILE: &str = ".tailwindcss.version";
+
+/// Read the version marker, if any. The contents are trimmed so a trailing
+/// newline (or stray whitespace) never counts as a different version.
+fn read_installed_version(marker_path: &Path) -> Option<String> {
+    fs::read_to_string(marker_path)
+        .ok()
+        .map(|s| s.trim().to_owned())
+}
+
+/// Record the installed pin next to the binary.
+fn write_version_marker(marker_path: &Path) -> Result<(), SetupError> {
+    fs::write(marker_path, format!("{TAILWIND_VERSION}\n"))?;
+    Ok(())
+}
+
+/// The reuse decision: reuse only when NOT forced and the on-disk marker
+/// names the current pin. A stale or missing marker means re-download.
+fn should_reuse_binary(force: bool, installed: Option<&str>) -> bool {
+    !force && installed.is_some_and(|v| v == TAILWIND_VERSION)
+}
+
 /// Inner implementation so tests can call this without `process::exit`.
 fn execute(force: bool) -> Result<(), SetupError> {
     let binary_name = detect_platform(std::env::consts::OS, std::env::consts::ARCH)?;
-    let install_dir = PathBuf::from("target/autumn");
+    let install_dir = target_autumn_dir()?;
     let dest = install_path(&install_dir);
+    let marker_path = install_dir.join(VERSION_MARKER_FILE);
 
     if !force && dest.exists() {
-        println!("Tailwind CLI already installed at {}", dest.display());
-        return Ok(());
+        let installed = read_installed_version(&marker_path);
+        if should_reuse_binary(force, installed.as_deref()) {
+            println!(
+                "Tailwind CLI {TAILWIND_VERSION} already installed at {}",
+                dest.display()
+            );
+            return Ok(());
+        }
+        // A stale marker (pin bumped) or no marker at all (binary installed
+        // by an older CLI): re-download so the bump actually lands. The
+        // re-download self-heals marker-less installs, and the marker written
+        // below makes the next run a fast no-op again.
+        match installed.as_deref() {
+            Some(stale) => println!(
+                "Installed Tailwind CLI {stale} does not match pinned {TAILWIND_VERSION}; re-downloading..."
+            ),
+            None => println!(
+                "Tailwind CLI binary has no version marker; re-downloading {TAILWIND_VERSION}..."
+            ),
+        }
     }
 
     fs::create_dir_all(&install_dir)?;
@@ -93,7 +150,14 @@ fn execute(force: bool) -> Result<(), SetupError> {
     #[cfg(unix)]
     set_executable(&dest)?;
 
-    println!("Tailwind CLI installed to {}", dest.display());
+    // Record the pin only once the binary is fully in place: a failed
+    // install must never leave a marker for a binary that is not there.
+    write_version_marker(&marker_path)?;
+
+    println!(
+        "Tailwind CLI {TAILWIND_VERSION} installed to {}",
+        dest.display()
+    );
     Ok(())
 }
 
@@ -121,6 +185,21 @@ fn install_path(dir: &Path) -> PathBuf {
     } else {
         dir.join("tailwindcss")
     }
+}
+
+/// The `autumn/` install directory, resolved the SAME way `autumn dev` (and
+/// the scaffold's generated `build.rs`) resolve it — via `cargo metadata`'s
+/// `target_directory` — rather than a `target`-relative literal.
+///
+/// Before this, `setup` wrote to `./target/autumn` unconditionally while
+/// `dev` looked in `$CARGO_TARGET_DIR/autumn` whenever that variable was set
+/// (common in CI, shared-cache setups, and workspaces): `setup` would
+/// "succeed" while writing the binary somewhere `dev` and the generated
+/// `build.rs` would never look, so the CSS rebuild silently never ran.
+fn target_autumn_dir() -> Result<PathBuf, SetupError> {
+    crate::dev::resolve_target_directory()
+        .map(|dir| dir.join("autumn"))
+        .map_err(SetupError::TargetDir)
 }
 
 fn fetch_expected_checksum(url: &str, binary_name: &str) -> Result<String, SetupError> {
@@ -337,6 +416,23 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  ./tailwindcss-
     }
 
     #[test]
+    fn target_autumn_dir_agrees_with_dev_and_cargo_metadata() {
+        // `autumn dev`'s `find_tailwind_cli` and the scaffold's generated
+        // `build.rs` both resolve the install directory from the ACTUAL
+        // Cargo target directory (via `cargo metadata` / `OUT_DIR`), not a
+        // `target`-relative literal. Pinning that `setup` lands on the same
+        // `<target_dir>/autumn` — via the same `resolve_target_directory`
+        // helper `dev` uses — is what keeps the three from drifting apart
+        // again under `CARGO_TARGET_DIR` (issue #2457).
+        let dir = target_autumn_dir().expect("resolve target/autumn dir");
+        assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some("autumn"));
+        assert_eq!(
+            dir.parent(),
+            crate::dev::resolve_target_directory().ok().as_deref(),
+        );
+    }
+
+    #[test]
     #[ignore = "requires network access to download Tailwind binary"]
     fn download_and_verify_tailwind() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -360,5 +456,72 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  ./tailwindcss-
             "binary too small: {} bytes",
             meta.len()
         );
+    }
+
+    // Issue #2387: a pin bump must replace the binary without --force, while
+    // the same-pin second run stays a fast no-op.
+    #[test]
+    fn reuse_decision_matches_marker_and_force() {
+        // Marker names the current pin, not forced: reuse.
+        assert!(should_reuse_binary(false, Some(TAILWIND_VERSION)));
+        // Stale marker: the pin moved on, so re-download.
+        assert!(!should_reuse_binary(false, Some("v4.1.0")));
+        // No marker: a binary an older CLI installed is an unknown version.
+        assert!(!should_reuse_binary(false, None));
+        // --force always re-downloads, even when the marker is current.
+        assert!(!should_reuse_binary(true, Some(TAILWIND_VERSION)));
+        assert!(!should_reuse_binary(true, None));
+    }
+
+    #[test]
+    fn version_marker_round_trips() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join(VERSION_MARKER_FILE);
+
+        // Absent marker: unknown install, must not reuse.
+        assert_eq!(read_installed_version(&marker), None);
+        assert!(!should_reuse_binary(
+            false,
+            read_installed_version(&marker).as_deref()
+        ));
+
+        write_version_marker(&marker).unwrap();
+        assert_eq!(
+            read_installed_version(&marker).as_deref(),
+            Some(TAILWIND_VERSION)
+        );
+        assert!(should_reuse_binary(
+            false,
+            read_installed_version(&marker).as_deref()
+        ));
+    }
+
+    #[test]
+    fn stale_version_marker_does_not_reuse() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join(VERSION_MARKER_FILE);
+        fs::write(&marker, "v4.1.0\n").unwrap();
+
+        assert_eq!(read_installed_version(&marker).as_deref(), Some("v4.1.0"));
+        assert!(!should_reuse_binary(
+            false,
+            read_installed_version(&marker).as_deref()
+        ));
+    }
+
+    #[test]
+    fn marker_whitespace_does_not_change_the_version() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join(VERSION_MARKER_FILE);
+        fs::write(&marker, format!("  {TAILWIND_VERSION}  \n")).unwrap();
+
+        assert_eq!(
+            read_installed_version(&marker).as_deref(),
+            Some(TAILWIND_VERSION)
+        );
+        assert!(should_reuse_binary(
+            false,
+            read_installed_version(&marker).as_deref()
+        ));
     }
 }

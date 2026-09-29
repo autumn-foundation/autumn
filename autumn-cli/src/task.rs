@@ -59,20 +59,32 @@ pub fn apply_managed_pg_env(cmd: &mut Command, package: Option<&str>) {
     }
 }
 
+/// Strip the one-shot dump modes that `AppBuilder::run` dispatches before
+/// `AUTUMN_LIST_TASKS` / `AUTUMN_RUN_TASK` from a child command's inherited
+/// environment.
+///
+/// `Command` inherits this process's environment by default, and any of these
+/// left over in the CLI's own environment would hijack the task invocation:
+/// the child would print a manifest where the task listing JSON is expected,
+/// or exit 0 after printing a manifest without ever running the task
+/// (`AUTUMN_DUMP_CACHE_COHERENCE` in particular — issue #2370).
+fn clear_competing_dump_modes(command: &mut Command) {
+    command
+        .env_remove(crate::data_flow::DUMP_ENV)
+        .env_remove(crate::agents::DUMP_ENV)
+        .env_remove(crate::graph::DUMP_ENV)
+        .env_remove(crate::cache_audit::DUMP_ENV);
+}
+
 fn list_tasks(binary: &std::path::Path, opts: &TaskOptions<'_>) {
     let mut command = Command::new(binary);
     command
         .env("AUTUMN_LIST_TASKS", "1")
-        // Dispatched earlier than `AUTUMN_LIST_TASKS` in
-        // `AppBuilder::run`, so an inherited one would print a manifest
-        // where the task listing JSON is expected.
-        .env_remove(crate::data_flow::DUMP_ENV)
-        .env_remove(crate::agents::DUMP_ENV)
-        .env_remove(crate::graph::DUMP_ENV)
         .env("AUTUMN_ENV", opts.profile)
         .env("AUTUMN_PROFILE", opts.profile)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
+    clear_competing_dump_modes(&mut command);
     apply_managed_pg_env(&mut command, opts.package);
     let output = command.output().unwrap_or_else(|error| {
         eprintln!("Failed to run {}: {error}", binary.display());
@@ -112,18 +124,13 @@ fn run_task(binary: &std::path::Path, opts: &TaskOptions<'_>) {
     let mut command = Command::new(binary);
     command
         .env("AUTUMN_RUN_TASK", name)
-        // Dispatched earlier than `AUTUMN_RUN_TASK` in `AppBuilder::run`,
-        // so an inherited one would exit 0 after printing a manifest
-        // without ever running the task.
-        .env_remove(crate::data_flow::DUMP_ENV)
-        .env_remove(crate::agents::DUMP_ENV)
-        .env_remove(crate::graph::DUMP_ENV)
         .env("AUTUMN_TASK_ARGS_JSON", args_json)
         .env("AUTUMN_ENV", opts.profile)
         .env("AUTUMN_PROFILE", opts.profile)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    clear_competing_dump_modes(&mut command);
     apply_managed_pg_env(&mut command, opts.package);
     let status = command.status().unwrap_or_else(|error| {
         eprintln!("Failed to run {}: {error}", binary.display());
@@ -162,6 +169,39 @@ fn print_task_table(tasks: &[TaskListing]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_competing_dump_modes_removes_every_earlier_mode_var() {
+        // Each of these is dispatched before AUTUMN_LIST_TASKS /
+        // AUTUMN_RUN_TASK in AppBuilder::run's dispatch chain, so any one
+        // left in the CLI's own environment would hijack `autumn task`:
+        // the child would print a manifest where the task listing JSON is
+        // expected, or exit 0 without ever running the task
+        // (AUTUMN_DUMP_CACHE_COHERENCE in particular — issue #2370).
+        let competing = [
+            crate::data_flow::DUMP_ENV,
+            crate::agents::DUMP_ENV,
+            crate::graph::DUMP_ENV,
+            crate::cache_audit::DUMP_ENV,
+        ];
+        let mut command = Command::new("true");
+        for var in competing {
+            command.env(var, "1");
+        }
+
+        clear_competing_dump_modes(&mut command);
+
+        for var in competing {
+            let value = command
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(var));
+            assert_eq!(
+                value,
+                Some((std::ffi::OsStr::new(var), None)),
+                "{var} must be explicitly removed: {value:?}"
+            );
+        }
+    }
 
     #[test]
     fn format_task_table_includes_names_and_descriptions() {
