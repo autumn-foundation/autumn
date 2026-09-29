@@ -1224,7 +1224,7 @@ fn is_own_pg_type(target: &str, ty: &ColumnType) -> bool {
         ColumnType::Decimal { .. } => &["numeric", "decimal"],
         ColumnType::Opaque { .. } => &[],
     };
-    if names.iter().any(|n| *n == target) {
+    if names.contains(&target) {
         return true;
     }
     // An opaque column's own type is whatever Postgres reported for it.
@@ -2882,7 +2882,7 @@ mod tests {
         use crate::schema::diff::{DiffOptions, diff_schema};
         use crate::schema::parse::parse_model_source;
 
-        let src = r#"
+        let src = r"
             #[autumn_web::model]
             pub struct Post {
                 #[id]
@@ -2890,7 +2890,7 @@ mod tests {
                 #[translatable]
                 pub title: autumn_web::i18n::Translated,
             }
-        "#;
+        ";
         let desired = parse_model_source(src, Backend::Postgres).expect("parse");
 
         // Simulate the introspected baseline: the DB stores `DEFAULT '{}'`,
