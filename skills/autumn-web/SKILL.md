@@ -2712,7 +2712,11 @@ async fn build_report() -> AutumnResult<String> {
 - Eviction — manual `TenantCellRegistry::evict(tenant_id)` or automatic
   (`max_cells`/`idle_ttl_secs`) — reclaims tracked bytes on `Drop`; an in-flight
   request keeps its own cached `Arc<TenantCell>` to completion, so evicting
-  mid-request never resets a running request's state. This is a tracked-bytes
+  mid-request never resets a running request's state. While any handle is still
+  live, the next `get_or_create` for that tenant **resurrects** the same
+  domain (quota counter and scratch store) rather than minting a fresh one —
+  eviction ends cache residency, not the accounting lifetime, so do not rely on
+  it to give the next request a clean slate or purge scratch immediately. This is a tracked-bytes
   accounting boundary via `tracked_bytes()` / `total_tracked_bytes()`, **not**
   RSS — allocations made outside the cell API are invisible by design.
 

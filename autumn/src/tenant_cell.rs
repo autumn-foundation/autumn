@@ -554,6 +554,9 @@ struct RegistryInner {
     /// tombstones and lower `HashMap::capacity()` without shrinking its backing
     /// allocation, so the current capacity alone is insufficient.
     registry_bucket_high_water: AtomicUsize,
+    /// The same high-water estimate for the lifecycle map, which keeps its
+    /// backing allocation as tombstones are swept.
+    lifecycle_bucket_high_water: AtomicUsize,
     global_tracked: Arc<AtomicUsize>,
     /// Maximum number of resident cells; least-recently-used cells are evicted
     /// once the count exceeds this. `0` disables the bound (unlimited).
@@ -618,6 +621,7 @@ impl TenantCellRegistry {
             inner: Arc::new(RegistryInner {
                 state: RwLock::new(RegistryState::default()),
                 registry_bucket_high_water: AtomicUsize::new(0),
+                lifecycle_bucket_high_water: AtomicUsize::new(0),
                 global_tracked: Arc::new(AtomicUsize::new(0)),
                 max_cells,
                 idle_ttl,
@@ -759,6 +763,10 @@ impl TenantCellRegistry {
         state
             .lifecycle
             .insert(tenant_id.to_string(), Arc::downgrade(&cell.inner));
+        self.inner.lifecycle_bucket_high_water.fetch_max(
+            Self::estimated_bucket_count(state.lifecycle.capacity()),
+            Ordering::Relaxed,
+        );
         state
             .resident
             .insert(tenant_id.to_string(), Arc::clone(&cell));
@@ -1023,9 +1031,13 @@ impl TenantCellRegistry {
             .map(|(key, cell)| key.capacity() + cell.inner.tenant_id.capacity())
             .sum::<usize>()
             + resident_lifecycle_key_capacities.iter().sum::<usize>();
-        // The lifecycle map's current capacity (not a high-water mark) is a
-        // lower bound on its backing buckets.
-        let lifecycle_bucket_count = Self::estimated_bucket_count(state.lifecycle.capacity());
+        // Like the resident map, sweeping tombstones can lower the lifecycle
+        // map's `capacity()` without shrinking its allocation, so read the
+        // high-water mark that inserts maintain under the write guard.
+        let lifecycle_bucket_count = self
+            .inner
+            .lifecycle_bucket_high_water
+            .load(Ordering::Relaxed);
         let lifecycle_bucket_bytes = lifecycle_bucket_count.saturating_sub(state.lifecycle.len())
             * std::mem::size_of::<LifecycleEntry>()
             + lifecycle_bucket_count;
