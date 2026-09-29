@@ -678,7 +678,7 @@ fn a_file_missing_the_expected_columns_is_refused_whole() {
         "the derivation helper must be emitted:\n{routes}"
     );
     assert!(
-        routes.contains("(<Post as autumn_web::data::csv::CsvSchema>::csv_columns())"),
+        routes.contains("<Post as autumn_web::data::csv::CsvSchema>::csv_columns()"),
         "the required set must be derived from the LIVE schema:\n{routes}"
     );
     assert!(
@@ -731,7 +731,7 @@ fn the_required_columns_are_derived_from_the_live_schema() {
     );
     let helper = fn_slice(&routes, "csv_required_columns");
     assert!(
-        helper.contains("(<Post as autumn_web::data::csv::CsvSchema>::csv_columns())"),
+        helper.contains("<Post as autumn_web::data::csv::CsvSchema>::csv_columns()"),
         "the helper must read the live schema:\n{helper}"
     );
     // Intersected with the columns the form can set, rather than the live
@@ -748,6 +748,12 @@ fn the_required_columns_are_derived_from_the_live_schema() {
     assert!(
         !body.contains("CSV_IGNORED_COLUMNS"),
         "subtracting the ignored columns would require an export-only column:\n{body}"
+    );
+    // An export that drops every settable column must not switch the
+    // wrong-file guard off: the helper falls back to the settable columns.
+    assert!(
+        body.contains("if live.is_empty() {") && body.contains("SETTABLE.to_vec()"),
+        "an empty live intersection must still require the settable columns:\n{body}"
     );
     // The header check calls the helper — the trimmed comparison is unchanged.
     let import = handler_slice(&routes, "import");

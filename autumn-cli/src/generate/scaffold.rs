@@ -10628,11 +10628,21 @@ const CSV_REQUIRED_COLUMNS_FN: &str = r"/// The columns an uploaded file must ca
 fn csv_required_columns() -> Vec<&'static str> {
     // The columns `{Pascal}Form` carries, as generated.
     const SETTABLE: &[&str] = &[__SETTABLE_COLUMNS__];
-    (<__PASCAL__ as autumn_web::data::csv::CsvSchema>::csv_columns())
+    let exported = <__PASCAL__ as autumn_web::data::csv::CsvSchema>::csv_columns();
+    let live: Vec<&'static str> = exported
         .iter()
         .copied()
         .filter(|column| SETTABLE.contains(column))
-        .collect()
+        .collect();
+    // A hand-written `csv_columns()` that exports none of the settable columns
+    // would leave nothing to require, and an unrelated file would then decode
+    // into rows of defaults. Keep the wrong-file guard armed: require what the
+    // form can set, which such an export cannot supply anyway.
+    if live.is_empty() {
+        SETTABLE.to_vec()
+    } else {
+        live
+    }
 }
 
 ";
