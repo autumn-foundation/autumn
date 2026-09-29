@@ -4084,6 +4084,39 @@ async fn comments_import_completed(
         .is_some())
 }
 
+/// Whether the post already carries a comment the file also carries.
+///
+/// The compatibility path for imports interrupted before
+/// [`IMPORT_COMMENTS_RESTORED_KEY`] existed: their rows were committed, the
+/// record never was.
+async fn legacy_import_present(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+    incoming: &[ImportedComment],
+) -> AutumnResult<bool> {
+    fn flatten<'a>(cs: &'a [ImportedComment], out: &mut Vec<&'a ImportedComment>) {
+        for c in cs {
+            out.push(c);
+            flatten(&c.replies, out);
+        }
+    }
+    let existing: Vec<(String, chrono::NaiveDateTime)> = comments::table
+        .filter(comments::post_id.eq(post_id))
+        .select((comments::body, comments::created_at))
+        .load(conn)
+        .await?;
+    if existing.is_empty() {
+        return Ok(false);
+    }
+    let mut all = Vec::new();
+    flatten(incoming, &mut all);
+    Ok(all.iter().any(|c| {
+        existing
+            .iter()
+            .any(|(b, t)| *b == c.body && *t == c.created_at)
+    }))
+}
+
 /// Record that a post's discussion has been restored from its file.
 ///
 /// Written in the same transaction as the comment rows it describes — a
@@ -4795,7 +4828,18 @@ pub async fn import_comments(
             return Ok(0);
         }
 
+        // A discussion restored by a build that predates the marker has its
+        // rows but not the record. A retry of that import would append the
+        // whole thread a second time, so recognise it by content: a comment
+        // already on the post with the same body and timestamp as one the file
+        // carries. A visitor's comment never matches a backup row.
+        if legacy_import_present(conn, post_id, &incoming).await? {
+            record_import_comments_restored(conn, post_id).await?;
+            return Ok(0);
+        }
+
         let mut created = 0usize;
+        let mut approved_replies: Vec<i64> = Vec::new();
         let mut level: Vec<(Option<i64>, &ImportedComment)> =
             incoming.iter().map(|c| (None, c)).collect();
         for _ in 0..=MAX_COMMENT_DEPTH {
@@ -4854,23 +4898,8 @@ pub async fn import_comments(
                     .get_result(conn)
                     .await?;
                 created += 1;
-                // An approved reply the thread page cannot show must not be
-                // restored: it would be counted but permanently unreadable —
-                // the same state `create_comment` and `moderate_comment`
-                // refuse. Failing here rolls the discussion back with the
-                // status transition waiting on it, instead of publishing a
-                // thread with a hole in it. Per-row is exact: rows land
-                // oldest-first at each level, so a row the partial thread
-                // already drops cannot fit the finished one, and a row it
-                // keeps cannot be pushed out by the newer rows still to come.
-                if saved.parent_id.is_some()
-                    && saved.status == "approved"
-                    && !approved_reply_is_renderable(conn, saved.id).await?
-                {
-                    return Err(AutumnError::unprocessable_msg(format!(
-                        "comment {} is beyond the display budget and cannot be shown",
-                        saved.id
-                    )));
+                if saved.parent_id.is_some() && saved.status == "approved" {
+                    approved_replies.push(saved.id);
                 }
                 for reply in &comment.replies {
                     next.push((Some(saved.id), reply));
@@ -4882,6 +4911,22 @@ pub async fn import_comments(
         // Replies past the cap are dropped rather than flattened onto the root:
         // the renderer draws `MAX_COMMENT_DEPTH` levels, and a reply grafted
         // somewhere it does not belong is worse than one that is absent.
+
+        // An approved reply the thread page cannot show must not be restored:
+        // it would be counted but permanently unreadable — the same state
+        // `create_comment` and `moderate_comment` refuse. Checked against the
+        // finished discussion, not row by row: the renderer orders a whole
+        // level by `(created_at, id)` while rows land grouped by parent, so a
+        // later, older row can evict a reply that passed when it was inserted.
+        // Failing here rolls the discussion back with the status transition
+        // waiting on it, instead of publishing a thread with a hole in it.
+        for id in approved_replies {
+            if !approved_reply_is_renderable(conn, id).await? {
+                return Err(AutumnError::unprocessable_msg(format!(
+                    "comment {id} is beyond the display budget and cannot be shown"
+                )));
+            }
+        }
 
         recount_post_comments(conn, post_id).await?;
         // In the same transaction as the rows: a crash between them would

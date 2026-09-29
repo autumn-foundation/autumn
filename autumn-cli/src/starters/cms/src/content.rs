@@ -180,7 +180,9 @@ pub async fn update_post_with_revision(
                      hierarchy lock",
                 ));
             }
-            validate_parent(conn, Some(post_id), &post.post_type, parent_id).await?;
+            validate_parent(conn, Some(post_id), &post.post_type, parent_id)
+                .await?
+                .into_result()?;
         }
 
         // The same invariants `PostHooks::before_update` enforces. This path
@@ -220,7 +222,7 @@ pub async fn update_post_with_revision(
         // After the write, inside this transaction, so a refusal rolls the edit
         // back: the page's full path is only settled once the slug and the
         // parent are both stored, and this statement is what stores them.
-        guard_page_path(conn, post_id).await?;
+        guard_page_path(conn, post_id).await?.into_result()?;
         // And the custom-type shape, which the insert allocator already checks.
         // Renaming an existing item is the other way onto a claimed path, and
         // guarding only creation left it open.
@@ -968,6 +970,19 @@ pub async fn moderate_comment(
             .get_result(conn)
             .await?;
 
+        // Approving a reply onto a thread past the page's comment budget would
+        // count a comment no reader can reach — the same state the write path
+        // refuses to create. Refuse the approval instead; the moderator can
+        // spam or delete the reply.
+        if target == "approved"
+            && saved.parent_id.is_some()
+            && !approved_reply_is_renderable(conn, saved.id).await?
+        {
+            return Err(AutumnError::unprocessable_msg(
+                "This conversation has reached its display limit, so this reply cannot be shown",
+            ));
+        }
+
         // Hiding a comment hides the thread under it. `assemble_thread` builds
         // from the roots down, so a reply whose parent is no longer approved
         // can never be attached or rendered — while it stayed `approved` and
@@ -1102,6 +1117,25 @@ pub async fn create_comment(
             .returning(Comment::as_returning())
             .get_result(conn)
             .await?;
+        // A reply that cannot enter a renderable window must not be accepted.
+        // `approved_thread_page` caps a page at `MAX_THREAD_COMMENTS`,
+        // keeping the oldest rows at the level where the budget runs out, so
+        // past the cap this reply would be counted in `comment_count` but
+        // appear on no page. Refusing here — inside the transaction, under the
+        // post's lock — rolls the insert back; the alternative is a comment
+        // the site counts but no reader can reach. Roots always fit (see the
+        // assertion above `approved_comment_is_rendered`), so only replies are
+        // checked. A pending reply is neither rendered nor counted until a
+        // moderator approves it; `moderate_comment` applies the same check
+        // then.
+        if approved
+            && saved.parent_id.is_some()
+            && !approved_reply_is_renderable(conn, saved.id).await?
+        {
+            return Err(AutumnError::unprocessable_msg(
+                "This conversation has reached its display limit",
+            ));
+        }
         // Recomputed under the post's lock rather than incremented. A bare
         // `+ 1` is safe against another increment, but not against a
         // concurrent moderation recomputing the whole count from a snapshot
@@ -2633,6 +2667,50 @@ pub async fn post_by_id(conn: &mut AsyncPgConnection, post_id: i64) -> AutumnRes
         .optional()?)
 }
 
+/// The verdict of a parent-link or settled-path check.
+///
+/// [`validate_parent`] and [`guard_page_path`] return this instead of a bare
+/// `AutumnResult<()>` so callers that must keep going on a refusal — the
+/// importer's [`set_post_parent`] — can tell "the editor would not accept this
+/// link" apart from "the database failed". Collapsing both into one `Err` made
+/// an operational failure (a query error, a timeout, a dropped connection)
+/// look like a deliberate orphaning: the import reported the page as left at
+/// the top level and marked it complete, instead of failing and staying
+/// resumable.
+pub enum ParentCheck {
+    /// The link is one the editor would accept.
+    Accept,
+    /// An expected refusal, with the editor-facing reason.
+    Decline(String),
+}
+
+impl ParentCheck {
+    /// The editor-facing outcome: accept silently, or raise the refusal as the
+    /// 422 the editor already showed for it. An operational failure never
+    /// reaches here — it is already an `Err`.
+    pub fn into_result(self) -> AutumnResult<()> {
+        match self {
+            ParentCheck::Accept => Ok(()),
+            ParentCheck::Decline(reason) => Err(AutumnError::unprocessable_msg(reason)),
+        }
+    }
+}
+
+/// Map a parent validation for the importer: an expected refusal is a skipped
+/// link, an operational failure fails the import so it stays resumable.
+///
+/// `set_post_parent` and the creation-path validation both apply this, so the
+/// distinction between "the backup asked for something we cannot link" and
+/// "the database failed" lives in one place. Pure — and generic over the
+/// error — so the distinction is unit-tested without a database.
+pub fn import_parent_outcome<E>(check: Result<ParentCheck, E>) -> Result<bool, E> {
+    match check {
+        Ok(ParentCheck::Accept) => Ok(true),
+        Ok(ParentCheck::Decline(_)) => Ok(false),
+        Err(op) => Err(op),
+    }
+}
+
 /// Refuse a page whose full path a framework route already serves.
 ///
 /// Checked *after* the write, inside the caller's transaction, so it rolls the
@@ -2642,11 +2720,20 @@ pub async fn post_by_id(conn: &mut AsyncPgConnection, post_id: i64) -> AutumnRes
 ///
 /// A bare slug is caught long before this by `ensure_unique_slug`; what this
 /// adds is the nested case, which only a page can reach.
-pub async fn guard_page_path(conn: &mut AsyncPgConnection, post_id: i64) -> AutumnResult<()> {
+///
+/// Returns a [`ParentCheck`] rather than `AutumnResult<()>`: a refused path is
+/// an expected outcome the importer handles, while a database failure must
+/// propagate — see [`ParentCheck`].
+pub async fn guard_page_path(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+) -> Result<ParentCheck, AutumnError> {
     for path in page_paths_under(conn, post_id).await? {
-        guard_claimed_path(&path, "page")?;
+        if is_claimed_page_path(&path) {
+            return Ok(ParentCheck::Decline(claimed_path_message(&path, "page")));
+        }
     }
-    Ok(())
+    Ok(ParentCheck::Accept)
 }
 
 /// Every canonical page path a hierarchy edit at `post_id` settles: the edited
@@ -2711,6 +2798,18 @@ async fn page_path_of(
     Ok(Some(segments))
 }
 
+/// The refusal reason for a path a framework route already serves.
+///
+/// Shared by [`guard_claimed_path`] and [`guard_page_path`] so both report the
+/// same words for the same refusal.
+fn claimed_path_message(segments: &[String], what: &str) -> String {
+    format!(
+        "/{} is served by this site's health probe, so a {what} there would never be \
+         reachable",
+        segments.join("/")
+    )
+}
+
 /// Refuse content whose URL a framework route already serves.
 ///
 /// Pure, and separate from `guard_page_path`, because a page's ancestry is the
@@ -2723,10 +2822,8 @@ async fn page_path_of(
 /// keeps producing: the fix applied where the finding pointed and nowhere else.
 pub fn guard_claimed_path(segments: &[String], what: &str) -> AutumnResult<()> {
     if is_claimed_page_path(segments) {
-        return Err(AutumnError::unprocessable_msg(format!(
-            "/{} is served by this site's health probe, so a {what} there would never be \
-             reachable",
-            segments.join("/")
+        return Err(AutumnError::unprocessable_msg(claimed_path_message(
+            segments, what,
         )));
     }
     Ok(())
@@ -2783,12 +2880,16 @@ pub async fn descendant_ids(
 /// than `page_ancestry` walks, whose canonical URL then starts mid-tree and
 /// resolves to nothing. `post_id` is `None` when creating (no row to cycle
 /// back to yet).
+///
+/// Returns a [`ParentCheck`] rather than `AutumnResult<()>`: a refused parent
+/// is an expected outcome the importer handles, while a database failure must
+/// propagate — see [`ParentCheck`].
 pub async fn validate_parent(
     conn: &mut AsyncPgConnection,
     post_id: Option<i64>,
     post_type: &str,
     candidate_parent_id: i64,
-) -> AutumnResult<()> {
+) -> Result<ParentCheck, AutumnError> {
     // The parent must be a live row of the SAME hierarchical type. The foreign
     // key only says "some post", so a crafted form could name a normal post:
     // `page_ancestry` would then put that row's slug in the canonical URL while
@@ -2801,19 +2902,21 @@ pub async fn validate_parent(
         .await
         .optional()?;
     let Some(parent) = parent else {
-        return Err(AutumnError::unprocessable_msg("That parent does not exist"));
+        return Ok(ParentCheck::Decline(
+            "That parent does not exist".to_owned(),
+        ));
     };
     if parent.post_type != post_type || parent.status == "trash" {
-        return Err(AutumnError::unprocessable_msg(
-            "A parent must be another item of the same type, and not in the trash",
+        return Ok(ParentCheck::Decline(
+            "A parent must be another item of the same type, and not in the trash".to_owned(),
         ));
     }
 
     if let Some(post_id) = post_id
         && would_create_cycle(conn, post_id, candidate_parent_id).await?
     {
-        return Err(AutumnError::unprocessable_msg(
-            "A page cannot be placed under itself or one of its own children",
+        return Ok(ParentCheck::Decline(
+            "A page cannot be placed under itself or one of its own children".to_owned(),
         ));
     }
     // The depth that matters is the *deepest descendant's*, not the moved
@@ -2829,11 +2932,11 @@ pub async fn validate_parent(
         None => 0,
     };
     if depth_under(conn, candidate_parent_id).await? + moved_height >= MAX_PAGE_DEPTH {
-        return Err(AutumnError::unprocessable_msg(format!(
+        return Ok(ParentCheck::Decline(format!(
             "Pages can be nested at most {MAX_PAGE_DEPTH} levels deep"
         )));
     }
-    Ok(())
+    Ok(ParentCheck::Accept)
 }
 
 /// Re-parent a post. Used by the importer's ancestry pass.
@@ -2848,6 +2951,10 @@ pub async fn validate_parent(
 /// Invalid links are skipped rather than raised: an import that aborts part-way
 /// leaves the site half-restored, which is worse than one page landing at the
 /// top level. The caller reports the count.
+///
+/// An operational failure while checking is not a skipped link: it propagates,
+/// so the import fails and stays resumable instead of reporting the page as
+/// deliberately orphaned and marking it complete.
 pub async fn set_post_parent(
     conn: &mut AsyncPgConnection,
     post_id: i64,
@@ -2878,10 +2985,13 @@ pub async fn set_post_parent(
     let outcome = conn
         .transaction(async move |conn| {
             lock_page_hierarchy(conn).await?;
-            if validate_parent(conn, Some(post_id), &post.post_type, parent_id)
-                .await
-                .is_err()
-            {
+            // An expected refusal declines the link; an operational failure is
+            // already an `Err` and fails the import — staying resumable —
+            // instead of reporting the page as deliberately orphaned. See
+            // `import_parent_outcome`.
+            if !import_parent_outcome(
+                validate_parent(conn, Some(post_id), &post.post_type, parent_id).await,
+            )? {
                 return Err(ParentRefused::Declined);
             }
             diesel::update(posts::table.find(post_id))
@@ -2891,7 +3001,7 @@ pub async fn set_post_parent(
             // Re-parenting is the other way a page's path changes — and the
             // descendants' paths with it, which is what `guard_page_path`
             // walks.
-            if guard_page_path(conn, post_id).await.is_err() {
+            if !import_parent_outcome(guard_page_path(conn, post_id).await)? {
                 return Err(ParentRefused::Declined);
             }
             Ok::<_, ParentRefused>(true)
@@ -3802,7 +3912,11 @@ pub async fn import_revisions(
 /// row came from *in this database*, so a file carrying them would make the next
 /// restore treat a fresh row as one it had already finished — and skip its
 /// terms, status and ancestry forever.
-pub const INTERNAL_META_KEYS: &[&str] = &[IMPORT_SOURCE_SLUG_KEY, IMPORT_COMPLETED_KEY];
+pub const INTERNAL_META_KEYS: &[&str] = &[
+    IMPORT_SOURCE_SLUG_KEY,
+    IMPORT_COMPLETED_KEY,
+    IMPORT_COMMENTS_RESTORED_KEY,
+];
 
 /// Restore a post's custom fields.
 ///
@@ -3935,6 +4049,89 @@ pub async fn mark_imports_complete(
         .collect();
     diesel::insert_into(post_meta::table)
         .values(rows)
+        .on_conflict_do_nothing()
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// The `post_meta` key marking a post's discussion as restored from its file.
+///
+/// `import_comments` used to treat "the post already has a comment" as "its
+/// discussion is already restored". A crash — or a concurrent visitor comment
+/// — between the status transition committing and the comment import running
+/// made the retry skip the backup's whole thread and mark the post done,
+/// permanently losing the discussion. The marker is written in the same
+/// transaction as the comment rows, so the two cannot disagree, and a retry
+/// consults the marker instead of the comment count.
+pub const IMPORT_COMMENTS_RESTORED_KEY: &str = "_import_comments_restored";
+
+/// Whether this post's discussion has already been restored from its file.
+///
+/// Consulted by `import_comments` instead of the comment count: a visitor's
+/// comment is also a comment, and must not read as a finished import.
+async fn comments_import_completed(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+) -> AutumnResult<bool> {
+    Ok(post_meta::table
+        .filter(post_meta::post_id.eq(post_id))
+        .filter(post_meta::meta_key.eq(IMPORT_COMMENTS_RESTORED_KEY))
+        .select(post_meta::id)
+        .first::<i64>(conn)
+        .await
+        .optional()?
+        .is_some())
+}
+
+/// Whether the post already carries a comment the file also carries.
+///
+/// The compatibility path for imports interrupted before
+/// [`IMPORT_COMMENTS_RESTORED_KEY`] existed: their rows were committed, the
+/// record never was.
+async fn legacy_import_present(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+    incoming: &[ImportedComment],
+) -> AutumnResult<bool> {
+    fn flatten<'a>(cs: &'a [ImportedComment], out: &mut Vec<&'a ImportedComment>) {
+        for c in cs {
+            out.push(c);
+            flatten(&c.replies, out);
+        }
+    }
+    let existing: Vec<(String, chrono::NaiveDateTime)> = comments::table
+        .filter(comments::post_id.eq(post_id))
+        .select((comments::body, comments::created_at))
+        .load(conn)
+        .await?;
+    if existing.is_empty() {
+        return Ok(false);
+    }
+    let mut all = Vec::new();
+    flatten(incoming, &mut all);
+    Ok(all.iter().any(|c| {
+        existing
+            .iter()
+            .any(|(b, t)| *b == c.body && *t == c.created_at)
+    }))
+}
+
+/// Record that a post's discussion has been restored from its file.
+///
+/// Written in the same transaction as the comment rows it describes — a
+/// failure anywhere rolls both back, so a retry never sees one without the
+/// other.
+async fn record_import_comments_restored(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+) -> AutumnResult<()> {
+    diesel::insert_into(post_meta::table)
+        .values((
+            post_meta::post_id.eq(post_id),
+            post_meta::meta_key.eq(IMPORT_COMMENTS_RESTORED_KEY),
+            post_meta::meta_value.eq("1"),
+        ))
         .on_conflict_do_nothing()
         .execute(conn)
         .await?;
@@ -4513,7 +4710,7 @@ async fn insert_with_unique_slug(
                     .returning(Post::as_returning())
                     .get_result(conn)
                     .await?;
-                guard_page_path(conn, saved.id).await?;
+                guard_page_path(conn, saved.id).await?.into_result()?;
                 // A custom type is addressed under its own prefix, so its items
                 // mint a nested path too — `/product/widget` is as claimable as
                 // `/about/team`, and needs no walk to work out.
@@ -4574,11 +4771,15 @@ pub struct ImportedComment {
 ///
 /// Returns how many comments this call created.
 ///
-/// Skipped entirely when the post already has any comment. An import that says
-/// it skips existing content must not append a second copy of a thread to a
-/// post that already carries one — and unlike a post, a comment has no natural
-/// key to dedupe on, so "this post already has a discussion" is the honest
-/// guard. It is also what makes a re-run of a half-finished import safe.
+/// Skipped entirely when the discussion was already restored — recorded under
+/// [`IMPORT_COMMENTS_RESTORED_KEY`] in the same transaction as the rows, so
+/// the two cannot disagree. An import that says it skips existing content must
+/// not append a second copy of a thread to a post that already carries one —
+/// and unlike a post, a comment has no natural key to dedupe on, so the
+/// completion record is the honest guard. It is also what makes a re-run of a
+/// half-finished import safe: the old "the post already has a comment" read a
+/// concurrent visitor's comment as a finished import and dropped the backup's
+/// whole thread.
 pub async fn import_comments(
     conn: &mut AsyncPgConnection,
     post_id: i64,
@@ -4620,16 +4821,25 @@ pub async fn import_comments(
             return Ok(0);
         }
 
-        let existing: i64 = comments::table
-            .filter(comments::post_id.eq(post_id))
-            .count()
-            .get_result(conn)
-            .await?;
-        if existing > 0 {
+        // The completion record, not the comment count, says whether the
+        // discussion is already restored: a visitor's comment is also a
+        // comment, and must not read as a finished import.
+        if comments_import_completed(conn, post_id).await? {
+            return Ok(0);
+        }
+
+        // A discussion restored by a build that predates the marker has its
+        // rows but not the record. A retry of that import would append the
+        // whole thread a second time, so recognise it by content: a comment
+        // already on the post with the same body and timestamp as one the file
+        // carries. A visitor's comment never matches a backup row.
+        if legacy_import_present(conn, post_id, &incoming).await? {
+            record_import_comments_restored(conn, post_id).await?;
             return Ok(0);
         }
 
         let mut created = 0usize;
+        let mut approved_replies: Vec<i64> = Vec::new();
         let mut level: Vec<(Option<i64>, &ImportedComment)> =
             incoming.iter().map(|c| (None, c)).collect();
         for _ in 0..=MAX_COMMENT_DEPTH {
@@ -4688,6 +4898,9 @@ pub async fn import_comments(
                     .get_result(conn)
                     .await?;
                 created += 1;
+                if saved.parent_id.is_some() && saved.status == "approved" {
+                    approved_replies.push(saved.id);
+                }
                 for reply in &comment.replies {
                     next.push((Some(saved.id), reply));
                 }
@@ -4699,7 +4912,27 @@ pub async fn import_comments(
         // the renderer draws `MAX_COMMENT_DEPTH` levels, and a reply grafted
         // somewhere it does not belong is worse than one that is absent.
 
+        // An approved reply the thread page cannot show must not be restored:
+        // it would be counted but permanently unreadable — the same state
+        // `create_comment` and `moderate_comment` refuse. Checked against the
+        // finished discussion, not row by row: the renderer orders a whole
+        // level by `(created_at, id)` while rows land grouped by parent, so a
+        // later, older row can evict a reply that passed when it was inserted.
+        // Failing here rolls the discussion back with the status transition
+        // waiting on it, instead of publishing a thread with a hole in it.
+        for id in approved_replies {
+            if !approved_reply_is_renderable(conn, id).await? {
+                return Err(AutumnError::unprocessable_msg(format!(
+                    "comment {id} is beyond the display budget and cannot be shown"
+                )));
+            }
+        }
+
         recount_post_comments(conn, post_id).await?;
+        // In the same transaction as the rows: a crash between them would
+        // leave the marker without the discussion, and the retry would skip
+        // what was never restored.
+        record_import_comments_restored(conn, post_id).await?;
         Ok::<_, AutumnError>(created)
     })
     .await
@@ -5224,6 +5457,35 @@ pub async fn approved_comment_is_rendered(
     Ok(page.comments.iter().any(|row| row.id == comment_id))
 }
 
+/// Whether an approved reply would actually appear on its thread page.
+///
+/// `approved_thread_page` caps a page at [`MAX_THREAD_COMMENTS`], keeping the
+/// oldest rows at the level where the budget runs out — so past the cap, a
+/// newly approved reply is counted in `comment_count` but appears on no page:
+/// accepted and unreadable. Every write path that makes a reply approved —
+/// [`create_comment`] landing it approved, [`moderate_comment`] approving it,
+/// and [`import_comments`] restoring it — refuses rather than create that
+/// state. The check composes the same two helpers the public thread page uses
+/// ([`approved_thread_page_of`] and [`approved_comment_is_rendered`]), so it
+/// cannot drift from the renderer.
+///
+/// The comment write paths run it under the post's row lock, inside the
+/// transaction, so the verdict and the state change are atomic: two concurrent
+/// replies cannot both see room for one and leave one of them unreadable. The
+/// import holds the same lock through its own transaction, and a refusal
+/// rolls the whole restore back.
+pub async fn approved_reply_is_renderable(
+    conn: &mut AsyncPgConnection,
+    comment_id: i64,
+) -> AutumnResult<bool> {
+    let Some(page) = approved_thread_page_of(conn, comment_id).await? else {
+        // Both callers have just written the comment with an approved parent
+        // under the post's lock, so it always has a page here.
+        return Ok(true);
+    };
+    approved_comment_is_rendered(conn, comment_id, page).await
+}
+
 /// Which page of a post's approved thread a comment appears on, if any.
 ///
 /// A comment is rendered on the page its *root* is on, so this walks up to the
@@ -5715,5 +5977,41 @@ mod slug_shape_tests {
             !claimed(&["about"]) && !claimed(&["hello-world"]),
             "and the seeded content beside it is untouched"
         );
+    }
+}
+
+#[cfg(test)]
+mod parent_check_tests {
+    use super::{ParentCheck, import_parent_outcome};
+
+    /// A stand-in operational failure: the point is that it is *some* error,
+    /// not what it says.
+    #[derive(Debug, PartialEq)]
+    struct DbDown;
+
+    #[test]
+    fn into_result_accepts_silently_and_raises_refusals() {
+        assert!(ParentCheck::Accept.into_result().is_ok());
+        assert!(ParentCheck::Decline("no".to_owned()).into_result().is_err());
+    }
+
+    #[test]
+    fn import_parent_outcome_keeps_refusal_and_failure_apart() {
+        // An accepted link applies...
+        assert_eq!(
+            import_parent_outcome::<DbDown>(Ok(ParentCheck::Accept)),
+            Ok(true)
+        );
+        // ...an expected refusal is a skipped link, not an error...
+        assert_eq!(
+            import_parent_outcome::<DbDown>(Ok(ParentCheck::Decline("gone".to_owned()))),
+            Ok(false)
+        );
+        // ...and an operational failure propagates unchanged: it must fail the
+        // import and stay resumable, never read as a deliberate orphaning.
+        // (`set_post_parent` turns this `Err` into its `Failed` variant through
+        // `From`; the database half of that is covered by
+        // `set_post_parent_distinguishes_refusal_from_failure`.)
+        assert_eq!(import_parent_outcome::<DbDown>(Err(DbDown)), Err(DbDown));
     }
 }
