@@ -507,8 +507,12 @@ fn build_isr_state(manifest: &StaticManifest) -> HashMap<String, IsrRouteState> 
 /// `multipart/…; boundary=Aa` recorded at build time would compare equal to a
 /// regenerated `boundary=aa`, so ISR would overwrite the body while every
 /// request still advertised the old boundary — exactly the undecodable-response
-/// desync this check exists to prevent. `charset` is the one exception: RFC 2046
-/// §4.1.2 defines its values as case-insensitive.
+/// desync this check exists to prevent. The exceptions are the parameters
+/// whose *values* their own specifications define as case-insensitive: `charset`
+/// (RFC 2046 §4.1.2) and the parameters whose value is itself a media type —
+/// `type` on `multipart/related` (RFC 2387 §3.1), `protocol` on
+/// `multipart/signed` and `multipart/encrypted` (RFC 1847 §§2.1, 2.2). See
+/// [`parameter_value_case_insensitive`].
 ///
 /// Quoted values are unquoted (decoding quoted-pairs, so `boundary="a\b"` and
 /// `boundary=ab` agree), and `;` inside quotes does not split a parameter.
@@ -575,9 +579,42 @@ fn decode_quoted_pairs(raw_value: &str) -> Cow<'_, str> {
     Cow::Owned(decoded)
 }
 
+/// Whether a MIME parameter's *value* is case-insensitive per its own
+/// specification.
+///
+/// Parameter-value case sensitivity is defined per parameter by its own
+/// specification, not by a single well-known name. This is the whitelist
+/// `normalize_content_type` applies when canonicalizing:
+///
+/// - `charset` — case-insensitive on every media type (RFC 2046 §4.1.2);
+/// - `type` on `multipart/related` (RFC 2387 §3.1) and `protocol` on
+///   `multipart/signed` / `multipart/encrypted` (RFC 1847 §§2.1, 2.2) — the
+///   parameters whose value is itself a media type. Media types are
+///   case-insensitive (RFC 9110 §8.3), so `type="TEXT/HTML"` and
+///   `type="text/html"` denote the same thing there.
+///
+/// Everything else keeps its value byte-verbatim. `boundary` in particular
+/// stays case-sensitive: a build-time `boundary=Aa` matching a regenerated
+/// `boundary=aa` would let ISR overwrite a body whose advertised boundary no
+/// longer decodes it. `type` and `protocol` on any other media type are
+/// likewise verbatim — no specification gives them media-type semantics there.
+fn parameter_value_case_insensitive(media_type: &str, name: &str) -> bool {
+    if name == "charset" {
+        return true;
+    }
+    match name {
+        "type" => media_type == "multipart/related",
+        "protocol" => matches!(media_type, "multipart/signed" | "multipart/encrypted"),
+        _ => false,
+    }
+}
+
 /// Canonical form of a `Content-Type` for comparison: the lowercased media type
-/// followed by its parameters as sorted `name=value` pairs, names lowercased and
-/// values left alone apart from unquoting (see [`content_type_equivalent`]).
+/// followed by its parameters as sorted `name=value` pairs, names lowercased,
+/// and values left alone apart from unquoting — except parameters whose value
+/// is case-insensitive per its own specification (see
+/// [`parameter_value_case_insensitive`]), which are lowercased too.
+/// See [`content_type_equivalent`].
 fn normalize_content_type(value: &str) -> Vec<String> {
     let mut segments = split_unquoted_semicolons(value).into_iter();
     let media_type = segments.next().unwrap_or("").trim().to_ascii_lowercase();
@@ -600,7 +637,7 @@ fn normalize_content_type(value: &str) -> Vec<String> {
             // Unquote quoted values, decoding quoted-pairs so e.g.
             // `boundary="a\b"` and `boundary="ab"` normalize the same.
             let unquoted = decode_quoted_pairs(raw_value);
-            if name == "charset" {
+            if parameter_value_case_insensitive(&media_type, &name) {
                 format!("{name}={}", unquoted.to_ascii_lowercase())
             } else {
                 format!("{name}={unquoted}")
@@ -1246,8 +1283,67 @@ mod tests {
         ));
     }
 
-    /// Parameter values other than `charset` are case-sensitive, and their
-    /// interior spacing is their own. Flattening them would be a bug in the
+    /// A parameter whose value is itself a media type is case-insensitive:
+    /// `type` on `multipart/related` (RFC 2387 §3.1), `protocol` on
+    /// `multipart/signed` and `multipart/encrypted` (RFC 1847 §§2.1, 2.2). A harmless
+    /// reserialization between `autumn build` and regeneration — a layer that
+    /// rewrites the header, a library that normalizes media-type case — must
+    /// not freeze the route the way a raw byte comparison would.
+    #[test]
+    fn content_type_equivalent_treats_media_type_valued_type_parameter_case_insensitively() {
+        // The bug: these denote the same thing but normalized differently.
+        assert!(content_type_equivalent(
+            r#"multipart/related; type="TEXT/HTML""#,
+            r#"multipart/related; type="text/html""#
+        ));
+        assert!(content_type_equivalent(
+            "multipart/related; TYPE=Text/Html",
+            "multipart/related; type=text/html"
+        ));
+        // Same rule for the RFC 1847 types, whose media-type-valued parameter
+        // is `protocol` (§§2.1, 2.2).
+        assert!(content_type_equivalent(
+            r#"multipart/signed; protocol="APPLICATION/PKCS7-SIGNATURE""#,
+            r#"multipart/signed; protocol="application/pkcs7-signature""#
+        ));
+        assert!(content_type_equivalent(
+            r#"multipart/encrypted; protocol="APPLICATION/PGP-ENCRYPTED""#,
+            r#"multipart/encrypted; protocol="application/pgp-encrypted""#
+        ));
+        // …and there `type` has no media-type semantics, so it stays verbatim,
+        // as does `protocol` on `multipart/related`.
+        assert!(!content_type_equivalent(
+            "multipart/signed; type=BAR",
+            "multipart/signed; type=bar"
+        ));
+        assert!(!content_type_equivalent(
+            "multipart/related; protocol=BAR",
+            "multipart/related; protocol=bar"
+        ));
+
+        // Must not regress: a genuinely different media type value still
+        // compares unequal.
+        assert!(!content_type_equivalent(
+            r#"multipart/related; type="text/html""#,
+            r#"multipart/related; type="application/json""#
+        ));
+        // `type` on a media type where no specification gives it media-type
+        // semantics keeps its value verbatim.
+        assert!(!content_type_equivalent(
+            "application/example; type=BAR",
+            "application/example; type=bar"
+        ));
+        // And `boundary` stays case-sensitive on multipart types too.
+        assert!(!content_type_equivalent(
+            "multipart/related; type=text/html; boundary=Aa",
+            "multipart/related; type=text/html; boundary=aa"
+        ));
+    }
+
+    /// Parameter values are case-sensitive except where their own specification
+    /// says otherwise (`charset` everywhere; `type`/`protocol` where the value is
+    /// a media type — see [`parameter_value_case_insensitive`]), and their interior
+    /// spacing is their own. Flattening them would be a bug in the
     /// dangerous direction: a recorded `boundary=Aa` matching a regenerated
     /// `boundary=aa` lets ISR overwrite the body while every request still
     /// advertises the old boundary, making the multipart response undecodable.
