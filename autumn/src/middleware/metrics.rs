@@ -6,6 +6,13 @@
 //!
 //! Metrics are exposed via the `/actuator/metrics` endpoint.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
 // #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
@@ -628,7 +635,7 @@ where
             collector: Some(self.collector.clone()),
             method,
             route,
-            start: Instant::now(),
+            start: crate::time::ambient_instant(),
         }
     }
 }
@@ -674,8 +681,12 @@ where
         match this.inner.poll(cx) {
             Poll::Ready(Ok(response)) => {
                 if let Some(collector) = this.collector.take() {
-                    let latency_ms =
-                        u64::try_from(this.start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    let latency_ms = u64::try_from(
+                        crate::time::ambient_instant()
+                            .saturating_duration_since(*this.start)
+                            .as_millis(),
+                    )
+                    .unwrap_or(u64::MAX);
                     let method_str = this.method.as_str();
                     let route_str = this.route.as_ref().map_or(
                         super::access_log::UNMATCHED_ROUTE,

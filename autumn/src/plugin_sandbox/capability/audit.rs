@@ -28,6 +28,14 @@
 //! to contain, in a place with different access rules — and an operator asking
 //! "what did it do" is asking about shape, not contents.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::{Mutex, PoisonError};
@@ -128,7 +136,7 @@ impl PluginActivityLog {
 
     /// Record everything one request's runtime gathered.
     pub fn ingest(&self, plugin: &str, events: impl IntoIterator<Item = CapabilityEvent>) {
-        let now = Instant::now();
+        let now = crate::time::ambient_instant();
         // What this ring evicts to make room, carried out of the critical
         // section rather than recorded inside it: the two locks are never held
         // at once, so neither orders the other and no future reader can
@@ -169,13 +177,13 @@ impl PluginActivityLog {
             return;
         }
         let mut ring = self.dropped.lock().unwrap_or_else(PoisonError::into_inner);
-        note_dropped(&mut ring, Instant::now(), plugin, dropped);
+        note_dropped(&mut ring, crate::time::ambient_instant(), plugin, dropped);
     }
 
     /// What `plugin` did within `window`.
     #[must_use]
     pub fn summary(&self, plugin: &str, window: Duration) -> ActivitySummary {
-        let cutoff = Instant::now();
+        let cutoff = crate::time::ambient_instant();
         let mut summary = ActivitySummary {
             plugin: plugin.to_owned(),
             window,
@@ -449,6 +457,40 @@ mod tests {
             target: "cart".to_owned(),
             outcome,
         }
+    }
+
+    #[test]
+    fn a_log_from_a_nested_timeline_ages_out_on_the_outer_one() {
+        use std::sync::Arc;
+
+        use chrono::TimeZone as _;
+
+        use crate::time::{TickingClock, install_ambient};
+
+        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let hour = Duration::from_secs(3600);
+        let log = PluginActivityLog::new();
+        let outer = TickingClock::starting_at(epoch);
+        let _outer = install_ambient(Arc::new(outer.clone()));
+
+        // Two hours into a nested timeline, the plugin calls and drops calls.
+        let inner = TickingClock::starting_at(epoch);
+        let guard = install_ambient(Arc::new(inner.clone()));
+        inner.advance(2 * hour);
+        log.ingest("shop", [event("kv-get", CapabilityOutcome::Allowed)]);
+        log.ingest_dropped("shop", 3);
+        drop(guard);
+
+        // The outer timeline goes on from there: those calls were just now.
+        let summary = log.summary("shop", hour);
+        assert_eq!(summary.allowed.get("kv-get").copied(), Some(1));
+        assert_eq!(summary.dropped, 3);
+
+        // An hour and a second later they are out of the last hour.
+        outer.advance(hour + Duration::from_secs(1));
+        let summary = log.summary("shop", hour);
+        assert_eq!(summary.allowed.get("kv-get"), None);
+        assert_eq!(summary.dropped, 0);
     }
 
     #[test]
