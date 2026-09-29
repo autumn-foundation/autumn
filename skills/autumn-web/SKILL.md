@@ -206,7 +206,7 @@ maud = { version = "0.27", features = ["axum"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-validator = { version = "0.20", features = ["derive"] }
+validator = { version = "0.21", features = ["derive"] }
 ```
 
 Use `pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }`

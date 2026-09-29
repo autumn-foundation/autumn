@@ -1982,6 +1982,8 @@ enum Commands {
     ///
     ///   autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin \
     ///       --sensitive-route /admin:"Role: admin required"
+    ///   autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin \
+    ///       --intentional-root /webhook
     ///   autumn plugin-check --plugin-name autumn-admin-plugin --deny-experimental
     #[command(verbatim_doc_comment)]
     PluginCheck {
@@ -1997,6 +1999,13 @@ enum Commands {
         /// Expected route prefix for all plugin routes (e.g. `/admin`).
         #[arg(long, value_name = "PREFIX")]
         prefix: Option<String>,
+        /// Declare a path as an intentional root-level route, exempting it
+        /// from the route-prefix check (exact path match, e.g. `/webhook`).
+        /// Mirrors the library API's
+        /// `ConformanceConfig::intentional_root_route` (issue #2828).
+        /// Repeatable.
+        #[arg(long, value_name = "PATH")]
+        intentional_root: Vec<String>,
         /// Declare a sensitive route with its auth/profile gating mechanism.
         /// Format: `PATH_PREFIX:DESCRIPTION` (e.g. `/admin:Role admin required`).
         /// Repeatable.
@@ -5619,6 +5628,7 @@ fn run_command(command: Commands) {
             bin,
             plugin_name,
             prefix,
+            intentional_root,
             sensitive_route,
             format,
             deny_experimental,
@@ -5628,7 +5638,7 @@ fn run_command(command: Commands) {
                 package.as_deref(),
                 bin.as_deref(),
                 &plugin_name,
-                prefix.as_deref(),
+                (prefix.as_deref(), &intentional_root),
                 &sensitive_route,
                 &format,
                 (deny_experimental, no_routes),
@@ -5933,7 +5943,7 @@ fn run_plugin_check_command(
     package: Option<&str>,
     bin: Option<&str>,
     plugin_name: &str,
-    prefix: Option<&str>,
+    (prefix, intentional_root): (Option<&str>, &[String]),
     sensitive_route_args: &[String],
     format: &str,
     (deny_experimental, no_routes): (bool, bool),
@@ -5963,6 +5973,7 @@ fn run_plugin_check_command(
         bin,
         plugin_name,
         expected_prefix: prefix,
+        intentional_root_routes: intentional_root,
         sensitive_routes: &sensitive_routes,
         format: fmt,
         // Populated by `run` from the built binary's contract dump.
@@ -6633,6 +6644,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 password,
                 select: select_specs,
                 exclude,
+                for_destroy: mode == ApplyMode::Destroy,
                 // Encrypted-column flags are auto-detected from the model source.
                 ..Default::default()
             };
@@ -10003,6 +10015,46 @@ mod tests {
         }
     }
 
+    /// `--intentional-root` is repeatable and defaults to empty
+    /// (issue #2828: CLI parity with the library's
+    /// `ConformanceConfig::intentional_root_route`).
+    #[test]
+    fn parse_plugin_check_with_intentional_root() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin-check",
+            "--plugin-name",
+            "autumn-admin-plugin",
+            "--prefix",
+            "/admin",
+            "--intentional-root",
+            "/webhook",
+            "--intentional-root",
+            "/healthz",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::PluginCheck {
+                intentional_root, ..
+            } => {
+                assert_eq!(intentional_root, vec!["/webhook", "/healthz"]);
+            }
+            _ => panic!("expected PluginCheck"),
+        }
+
+        let default =
+            Cli::try_parse_from(["autumn", "plugin-check", "--plugin-name", "myplugin"]).unwrap();
+        match default.command {
+            Commands::PluginCheck {
+                intentional_root, ..
+            } => assert!(
+                intentional_root.is_empty(),
+                "no --intentional-root means nothing is exempt"
+            ),
+            _ => panic!("expected PluginCheck"),
+        }
+    }
+
     #[test]
     fn parse_plugin_check_with_package() {
         let cli = Cli::try_parse_from([
@@ -10173,11 +10225,13 @@ mod tests {
                 bin,
                 plugin_name,
                 prefix,
+                intentional_root,
                 sensitive_route,
                 format,
                 deny_experimental,
                 no_routes,
             } => {
+                assert!(intentional_root.is_empty(), "no root routes by default");
                 assert!(!deny_experimental, "the flag defaults off");
                 assert!(!no_routes, "the flag defaults off");
                 assert_eq!(package.as_deref(), Some("my-app"));
