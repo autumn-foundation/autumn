@@ -1171,7 +1171,7 @@ impl CertReloader {
         // filesystem and must not run on a tokio worker. On a `JoinError` (the
         // blocking pool shutting down) just skip the tick and retry next time.
         let stat_mtimes = |cert: PathBuf, key: PathBuf| {
-            tokio::task::spawn_blocking(move || file_mtimes(&cert, &key))
+            crate::time::spawn_blocking(move || file_mtimes(&cert, &key))
         };
 
         // The baseline was taken when the served certificate was loaded, so a
@@ -1198,7 +1198,7 @@ impl CertReloader {
             let cert_path = self.cert_path.clone();
             let key_path = self.key_path.clone();
             let provider = Arc::clone(&self.provider);
-            let loaded = tokio::task::spawn_blocking(move || {
+            let loaded = crate::time::spawn_blocking(move || {
                 load_certified_key(&cert_path, &key_path, &provider, now_unix())
             })
             .await;

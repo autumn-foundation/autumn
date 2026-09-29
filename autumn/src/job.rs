@@ -2304,6 +2304,8 @@ async fn run_job_handler_inner(
     payload: Value,
     final_attempt: bool,
 ) -> JobExecutionOutcome {
+    // A job run is work a sim drain must see (issue #2967).
+    crate::sim::note_drain_progress();
     // Tracked jobs carry their args wrapped in an envelope keyed by a hash of
     // the polling token (never the raw token). Strip it here — the single
     // choke point all three backends run handlers through — so the handler

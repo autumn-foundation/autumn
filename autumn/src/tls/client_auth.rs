@@ -741,7 +741,7 @@ impl ClientTrustReloader {
     async fn poll_once(&mut self) {
         let bundle = self.ca_bundle_path.clone();
         let crl = self.crl_path.clone();
-        let seen = match tokio::task::spawn_blocking(move || trust_mtimes(&bundle, crl.as_deref()))
+        let seen = match crate::time::spawn_blocking(move || trust_mtimes(&bundle, crl.as_deref()))
             .await
         {
             Ok(mtimes) => mtimes,
@@ -761,7 +761,7 @@ impl ClientTrustReloader {
         let crl = self.crl_path.clone();
         let mode = self.mode;
         let provider = Arc::clone(&self.provider);
-        let built = tokio::task::spawn_blocking(move || {
+        let built = crate::time::spawn_blocking(move || {
             build_from_paths(&bundle, crl.as_deref(), mode, &provider)
         })
         .await;

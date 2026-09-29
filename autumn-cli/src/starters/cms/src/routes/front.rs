@@ -884,7 +884,11 @@ pub async fn unlock(
 /// would disagree and the ancestor lookup would come up empty, truncating
 /// the permalink. Starting one level up avoids the mismatch entirely, and
 /// costs one fewer batched query per request than re-fetching the leaves.
-async fn permalinks_for(
+///
+/// `pub(crate)`: also used by `api::list_posts`, which lists posts the same
+/// way `listing()` does and had the identical unbatched-ancestor-walk defect
+/// (Ledger, docs/reports/2026-09-27-ledger-cms-api-permalink-ancestry-batch).
+pub(crate) async fn permalinks_for(
     repos: &Repos,
     posts: &[Post],
     settings: &Settings,
