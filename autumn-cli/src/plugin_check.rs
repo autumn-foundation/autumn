@@ -78,6 +78,12 @@ pub struct ConformanceReport {
     /// records a pass for a prefixed listing only when this is its prefix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
+    /// Root-level paths `--intentional-root` exempted from `route-prefix`
+    /// (issue #2828). A pass that leans on them is not evidence for a plugin
+    /// index listing, which cannot replay the exemption, so curation refuses
+    /// such a report.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intentional_root: Vec<String>,
 }
 
 impl ConformanceReport {
@@ -369,6 +375,7 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
         contract: declared.cloned(),
         autumn_web: None,
         prefix: opts.expected_prefix.map(str::to_owned),
+        intentional_root: opts.intentional_root_routes.to_vec(),
     }
 }
 
@@ -1360,6 +1367,7 @@ mod tests {
             contract: None,
             autumn_web: None,
             prefix: None,
+            intentional_root: Vec::new(),
         };
         assert!(report.passed());
     }
@@ -1377,6 +1385,7 @@ mod tests {
             contract: None,
             autumn_web: None,
             prefix: None,
+            intentional_root: Vec::new(),
         };
         assert!(!report.passed());
     }
@@ -1389,6 +1398,7 @@ mod tests {
             contract: None,
             autumn_web: None,
             prefix: None,
+            intentional_root: Vec::new(),
         };
         assert!(report.to_text_report().contains("autumn-admin-plugin"));
     }
@@ -1401,6 +1411,7 @@ mod tests {
             contract: None,
             autumn_web: None,
             prefix: None,
+            intentional_root: Vec::new(),
         };
         assert!(report.to_text_report().contains("PASS"));
     }
@@ -1418,6 +1429,7 @@ mod tests {
             contract: None,
             autumn_web: None,
             prefix: None,
+            intentional_root: Vec::new(),
         };
         assert!(report.to_text_report().contains("FAIL"));
     }
@@ -1435,6 +1447,7 @@ mod tests {
             contract: None,
             autumn_web: None,
             prefix: None,
+            intentional_root: Vec::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1621,6 +1634,11 @@ mod tests {
             .expect("route-prefix check ran");
         assert_eq!(check.status, CheckStatus::Pass);
         assert!(check.diagnostics.is_empty());
+        // The report names what it exempted, so the plugin index can tell a
+        // pass that leaned on the exemption from one that did not.
+        assert_eq!(report.intentional_root, vec!["/webhook".to_owned()]);
+        let json = serde_json::to_value(&report).expect("serialize");
+        assert_eq!(json["intentional_root"], serde_json::json!(["/webhook"]));
     }
 
     /// The exemption is an exact-path match, like the library's: declaring
@@ -1808,6 +1826,7 @@ mod contract_tests {
             contract: None,
             autumn_web: None,
             prefix: None,
+            intentional_root: Vec::new(),
         };
         fail_on_omitted_routers(&mut report, 0);
         assert!(report.passed());

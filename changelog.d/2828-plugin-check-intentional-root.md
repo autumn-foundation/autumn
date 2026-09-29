@@ -10,3 +10,6 @@
   are now exempt; the fail message names the exemption. The sandboxed
   `autumn plugin inspect` lane passes an empty list — the WASM manifest has
   no intentional-root spelling yet, left as a follow-up.
+  The JSON report lists the exempted paths under `intentional_root`, and
+  `autumn plugin index record` refuses a passing report that relied on them,
+  since an index listing cannot record the exemption for reverification.
