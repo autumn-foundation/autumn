@@ -4515,6 +4515,34 @@ pub async fn menus_page(
         .await?)
 }
 
+/// Where a menu sits in `menus_page`'s ordering (0-based), or `None` if it is
+/// gone — so a screen that must show one menu can open on the page holding it.
+pub async fn menu_position(
+    conn: &mut AsyncPgConnection,
+    menu_id: i64,
+) -> AutumnResult<Option<i64>> {
+    let Some(name) = menus::table
+        .find(menu_id)
+        .select(menus::name)
+        .first::<String>(conn)
+        .await
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        menus::table
+            .filter(
+                menus::name
+                    .lt(&name)
+                    .or(menus::name.eq(&name).and(menus::id.lt(menu_id))),
+            )
+            .count()
+            .get_result(conn)
+            .await?,
+    ))
+}
+
 /// How many menus the site holds, for the pager.
 pub async fn menu_count(conn: &mut AsyncPgConnection) -> AutumnResult<i64> {
     Ok(menus::table.count().get_result(conn).await?)

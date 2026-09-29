@@ -10,6 +10,6 @@
   and everything typed into the card. Each now redisplays the Appearance
   screen at 422 with the card's values kept, the reason shown in the card
   (`role="alert"`, tied to the first field with `aria-describedby`) and that
-  field focused. The item form carries the menu page it was rendered on, so
-  the message lands next to the menu that caused it. The label input also
+  field focused. The Appearance screen reopens on the page that holds the menu that
+  refused the item, so the message is always beside it. The label input also
   gained the `maxlength` its model already declares.

@@ -63,11 +63,6 @@ pub struct MenuItemForm {
     /// root and the multi-level menu the theme draws was unreachable.
     #[serde(default)]
     pub parent_id: String,
-    /// The page of menus the form was rendered on, so a rejected submission
-    /// redisplays the same page and the message lands next to the menu that
-    /// caused it rather than on a page that may not list that menu at all.
-    #[serde(default)]
-    pub page: String,
 }
 
 #[derive(Deserialize)]
@@ -262,7 +257,6 @@ async fn appearance_page(
                                  class="grid grid-cols-1 sm:grid-cols-5 gap-2 text-sm \
                                         border-t border-gray-100 pt-3" {
                                             (csrf.input())
-                                input type="hidden" name="page" value=(page);
                                 @if let Some((_, message)) = refused {
                                     p class="sm:col-span-5 text-red-700 whitespace-pre-line"
                                       id=(format!("item-error-{}", menu.id)) role="alert" {
@@ -570,9 +564,19 @@ async fn redisplay_rejected(
     repos: &Repos,
     user: &User,
     csrf: &Csrf,
-    page: Option<usize>,
     rejected: &Rejected<'_>,
 ) -> AutumnResult<Response> {
+    // Open on the page that holds the menu, as it is now: menus are ordered by
+    // name, so another administrator's new menu can push this one onto a
+    // different page than the form was rendered on, and the message would then
+    // land on a page that does not list it.
+    let page = match rejected {
+        Rejected::MenuItem { menu_id, .. } => repos
+            .with_conn(async |conn| content::menu_position(conn, *menu_id).await)
+            .await?
+            .and_then(|position| usize::try_from(position / MENUS_PER_PAGE + 1).ok()),
+        Rejected::Widget { .. } => None,
+    };
     let body = appearance_page(
         repos,
         csrf,
@@ -662,13 +666,11 @@ pub async fn create_menu_item(
 ) -> AutumnResult<Response> {
     let user = require_capability!(repos, session, csrf, Capability::EditThemeOptions);
     let parse = |raw: &str| raw.trim().parse::<i64>().ok().filter(|v| *v > 0);
-    let page = form.page.trim().parse::<usize>().ok();
     let reject = async |message: &str| {
         redisplay_rejected(
             &repos,
             &user,
             &csrf,
-            page,
             &Rejected::MenuItem {
                 menu_id,
                 form: &form,
@@ -756,7 +758,6 @@ pub async fn create_widget(
             &repos,
             &user,
             &csrf,
-            None,
             &Rejected::Widget {
                 form: &form,
                 message,

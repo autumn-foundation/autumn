@@ -14896,6 +14896,42 @@ async fn a_refused_menu_item_or_widget_is_redisplayed_with_its_input() {
     assert_eq!(widgets, 30, "only the widgets that fit were stored");
 }
 
+/// A refused item is redisplayed beside its own menu even when that menu is
+/// not on the first page of the Appearance screen — the page is resolved from
+/// the menu, not from the (possibly stale) page the form was rendered on.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_refused_item_on_a_later_menu_page_still_shows_its_message() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    for n in 1..=21 {
+        client
+            .post("/admin/appearance/menus")
+            .header("cookie", &cookie)
+            .form(&form(&[
+                ("name", &format!("Menu {n:02}")),
+                ("location", ""),
+            ]))
+            .send()
+            .await
+            .assert_status(303);
+    }
+
+    // Menu 21 is id 21 and sorts last: page 2 at 20 menus per page.
+    let refused = client
+        .post("/admin/appearance/menus/21/items")
+        .header("cookie", &cookie)
+        .form(&form(&[("label", " "), ("url", "/kept")]))
+        .send()
+        .await;
+    refused.assert_status(422);
+    refused
+        .assert_body_contains("A menu item needs a label")
+        .assert_body_contains("Menu 21")
+        .assert_body_contains(r#"value="/kept""#);
+}
+
 /// Only one menu can hold a theme location, under concurrency.
 ///
 /// The replacement cleared the incumbent and inserted, with nothing
