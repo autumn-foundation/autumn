@@ -536,7 +536,7 @@ fn plan_model_with_options_impl(
     if metadata.has_validator_rules() {
         deps.push((
             "validator",
-            "{ version = \"0.20\", features = [\"derive\"] }",
+            "{ version = \"0.21\", features = [\"derive\"] }",
         ));
     }
     if schema_fields.iter().any(|f| f.kind.is_decimal()) {
