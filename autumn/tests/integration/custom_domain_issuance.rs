@@ -2432,6 +2432,9 @@ async fn a_failed_order_for_a_hostname_that_changed_hands_spares_the_new_tenant(
 #[derive(Debug)]
 struct FailingReregisterIssuer {
     registry: Arc<CustomDomainRegistry>,
+    /// Also prove the successor's DNS before failing, so it is `Verified` —
+    /// an orderable state — when the dead order's failure lands.
+    verify_successor: bool,
 }
 
 impl DomainIssuer for FailingReregisterIssuer {
@@ -2443,6 +2446,12 @@ impl DomainIssuer for FailingReregisterIssuer {
                 .register(hostname, "tenant-a", NOW + 1)
                 .await
                 .unwrap();
+            if self.verify_successor {
+                self.registry
+                    .record_verified(hostname, NOW + 1)
+                    .await
+                    .unwrap();
+            }
             Err("the CA rejected the order".to_owned())
         })
     }
@@ -2471,6 +2480,7 @@ async fn a_failed_order_for_a_hostname_that_was_re_registered_spares_the_new_gen
         TableVerifier::new(&[("app.clientco.com", points_here())]),
         Arc::new(FailingReregisterIssuer {
             registry: Arc::clone(&registry),
+            verify_successor: false,
         }) as Arc<dyn DomainIssuer>,
     );
     task.reporter = Arc::new(move |message: String| sink.lock().unwrap().push(message));
@@ -2498,6 +2508,54 @@ async fn a_failed_order_for_a_hostname_that_was_re_registered_spares_the_new_gen
         record.next_attempt_unix.is_none(),
         "the re-registered generation must not wait out a backoff it did not earn"
     );
+    assert!(
+        alerts.lock().unwrap().is_empty(),
+        "a failure belonging to a dead registration must not page an operator"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_order_spares_a_re_registered_successor_that_is_already_verified() {
+    // Status alone cannot tell registrations apart: the successor here is
+    // `Verified` — orderable — when the dead order's failure lands, so only
+    // the per-registration token keeps the stale failure off it.
+    let dir = tempfile::tempdir().unwrap();
+    let certs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::new(MemoryCustomDomainStore::new()),
+        10,
+    ));
+    registry.load().await.unwrap();
+    let cache = Arc::new(CustomDomainCertCache::new(4));
+    let alerts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&alerts);
+    let mut task = task_over(
+        Arc::clone(&registry),
+        cache,
+        certs,
+        TableVerifier::new(&[("app.clientco.com", points_here())]),
+        Arc::new(FailingReregisterIssuer {
+            registry: Arc::clone(&registry),
+            verify_successor: true,
+        }) as Arc<dyn DomainIssuer>,
+    );
+    task.reporter = Arc::new(move |message: String| sink.lock().unwrap().push(message));
+
+    registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    task.tick(NOW).await;
+
+    let record = registry.get("app.clientco.com").unwrap();
+    assert_eq!(record.registered_at_unix, NOW + 1);
+    assert_eq!(record.status, DomainStatus::Verified);
+    assert!(
+        record.failure_reason.is_none(),
+        "a verified successor must not show the dead order's error: {record:?}"
+    );
+    assert_eq!(record.consecutive_failures, 0);
+    assert!(record.next_attempt_unix.is_none());
     assert!(
         alerts.lock().unwrap().is_empty(),
         "a failure belonging to a dead registration must not page an operator"

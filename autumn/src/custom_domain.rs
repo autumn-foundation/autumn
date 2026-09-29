@@ -1541,6 +1541,45 @@ impl CustomDomainRegistry {
         .await
     }
 
+    /// [`record_failure_for`](Self::record_failure_for), but only while the
+    /// stored record is still the registration the order ran against: same
+    /// `tenant`, same ownership `token`. Returns whether it applied.
+    ///
+    /// Owner and status alone cannot tell two registrations apart. A tenant
+    /// that offboards and re-registers the SAME hostname while an order is in
+    /// flight gets a fresh record, and once that successor is itself
+    /// `Verified`, `Issuing` or `Active`, a late failure from the dead order
+    /// would pass both checks and charge the successor its reason, backoff and
+    /// alert — or reset an in-flight `Issuing` back to `Verified`. Each
+    /// registration mints its own token, so comparing it pins the generation.
+    /// `None` matches only a grandfathered record that has no token either.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's write error.
+    pub async fn record_failure_for_registration(
+        &self,
+        hostname: &str,
+        tenant: &str,
+        token: Option<&str>,
+        now_unix: i64,
+        reason: impl Into<String>,
+        backoff_secs: i64,
+    ) -> io::Result<bool> {
+        self.fail(
+            hostname,
+            |d| {
+                d.tenant == tenant
+                    && d.verification_token.as_deref() == token
+                    && Self::is_orderable_state(d.status)
+            },
+            now_unix,
+            reason,
+            backoff_secs,
+        )
+        .await
+    }
+
     /// The failure-writing core of [`record_failure`](Self::record_failure)
     /// and its guarded variants. `guard` runs inside the write lock, against the record as
     /// it is at write time — never against a snapshot taken before an await.
