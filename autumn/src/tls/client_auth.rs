@@ -492,9 +492,11 @@ fn crl_coverage_gaps_in(
     // against the child's CRL, so demanding one of its own would refuse a
     // bundle that ships root + intermediate. Only the bottom tier needs cover.
     let is_parent = |ca: &x509_parser::certificate::X509Certificate<'_>| {
+        let parent = ca.subject().as_raw();
         cas.iter().any(|child| {
-            child.subject().as_raw() != ca.subject().as_raw()
-                && child.issuer().as_raw() == ca.subject().as_raw()
+            let (subject, issuer) = (child.subject().as_raw(), child.issuer().as_raw());
+            subject != parent
+                && issuer == parent
                 && child.verify_signature(Some(ca.public_key())).is_ok()
         })
     };
