@@ -41,6 +41,14 @@
 //! one shared sequence keeps a seeded run deterministic and distinct no matter
 //! how tasks are scheduled across threads.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use chrono::{DateTime, Utc};
@@ -318,7 +326,7 @@ pub fn decimal_f64() -> f64 {
 ///
 /// In deterministic mode the offset is subtracted from a fixed base instant
 /// (`2024-01-01T00:00:00Z`) so golden data is reproducible; otherwise it is
-/// subtracted from [`Utc::now`].
+/// subtracted from [`ambient_now`](crate::time::ambient_now).
 #[must_use]
 pub fn recent_datetime() -> DateTime<Utc> {
     const THIRTY_DAYS_SECS: i64 = 30 * 24 * 60 * 60;
@@ -328,7 +336,7 @@ pub fn recent_datetime() -> DateTime<Utc> {
     let base = if is_deterministic() {
         DateTime::<Utc>::UNIX_EPOCH + chrono::Duration::seconds(DETERMINISTIC_BASE_EPOCH_SECS)
     } else {
-        Utc::now()
+        crate::time::ambient_now()
     };
     base - chrono::Duration::seconds(offset)
 }

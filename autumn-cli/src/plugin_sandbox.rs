@@ -140,6 +140,9 @@ pub struct Report {
     pub grants: ReportGrants,
     /// The per-request capability quotas the manifest declares.
     pub quotas: std::collections::BTreeMap<String, u32>,
+    /// The per-request resource limits the manifest declares: fuel, memory,
+    /// body sizes, timeout and concurrency. A raised one is new authority.
+    pub limits: std::collections::BTreeMap<String, u64>,
     /// Classes of authority this build denies unconditionally.
     pub denied: Vec<String>,
     /// The routes it serves.
@@ -166,6 +169,14 @@ pub struct Report {
     /// (issue #1632). `None` when no previous artifact was named.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upgrade: Option<ConsentDelta>,
+    /// The artifact digest of the `--against` baseline, so a reader can tell
+    /// which approved artifact `upgrade` was computed from (#1625). `None`
+    /// when no previous artifact was named.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upgrade_against: Option<String>,
+    /// The `autumn-web` whose sandbox `loads` was checked in: this CLI's. The
+    /// plugin index records a report only for this release (#1625).
+    pub autumn_web: String,
 }
 
 /// Authority the sandbox denies unconditionally in this version.
@@ -271,6 +282,12 @@ impl Report {
                 .into_iter()
                 .map(|(field, value)| (field.to_owned(), value))
                 .collect(),
+            limits: manifest
+                .limits
+                .fields()
+                .into_iter()
+                .map(|(field, value)| (field.to_owned(), u64::try_from(value).unwrap_or(u64::MAX)))
+                .collect(),
             // Only the classes this build cannot grant *at all*, minus anything
             // this manifest was actually granted. A screen that printed "no
             // database access" under a manifest holding `db` would be a consent
@@ -303,6 +320,8 @@ impl Report {
             conformance: conformance(manifest),
             consent: manifest.consent_summary(),
             upgrade: None,
+            upgrade_against: None,
+            autumn_web: autumn_web::plugin_contract::AUTUMN_WEB_VERSION.to_owned(),
         }
     }
 
@@ -501,6 +520,8 @@ fn conformance(manifest: &SandboxManifest) -> ConformanceReport {
             // fail every sandboxed artifact over a contract that cannot exist
             // for one. `false` leaves the check a `Skip`.
             deny_experimental: false,
+            // A manifest serves its declared routes: never routeless.
+            no_routes: false,
         },
         &routes,
     );
@@ -574,6 +595,7 @@ pub fn run_inspect(path: &Path, format: &ReportFormat, against: Option<&Path>) {
             std::process::exit(1);
         }
         report.upgrade = Some(artifact.manifest().consent_delta_from(previous.manifest()));
+        report.upgrade_against = previous.artifact_digest().ok();
     }
     match format {
         ReportFormat::Text => print!("{}", report.to_text()),
@@ -735,6 +757,13 @@ job_types = ["reindex"]
             serde_json::from_str(&report.to_json().expect("json")).expect("parses");
         assert_eq!(value["grants"]["hosts"][0], "api.example.com");
         assert!(value["quotas"]["outbound_calls"].is_number());
+        // Resource limits are authority too (#1625): a reviewer diffs them.
+        assert!(value["limits"]["fuel"].is_number());
+        assert!(value["limits"]["max_concurrency"].is_number());
+        assert_eq!(
+            value["autumn_web"],
+            autumn_web::plugin_contract::AUTUMN_WEB_VERSION
+        );
     }
 
     #[test]
