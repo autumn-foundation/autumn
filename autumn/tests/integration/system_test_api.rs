@@ -6,6 +6,15 @@
 //!
 //! Run:
 //!   cargo test -p autumn-web --features system-tests --test `system_test_api`
+//!
+//! # Why `SystemTest::build()` is awaited behind `Box::pin`
+//!
+//! Its future holds an `AppState`, twice, and sat 16 bytes under
+//! `clippy::large_futures`'s 16384-byte limit. Any field added to `AppState`
+//! — issue #1806 added one 8-byte handle — therefore failed `Lint` in a file
+//! that had nothing to do with the change, and the reader of that failure
+//! learns nothing about the real cause. Boxing moves the future to the heap,
+//! so the size of `AppState` stops being this file's business.
 
 #![cfg(feature = "system-tests")]
 
@@ -16,7 +25,6 @@ use autumn_web::system_test::{BrowserCheck, SystemTest, SystemTestError};
 #[test]
 fn browser_check_reports_result() {
     let result = BrowserCheck::run();
-    // Always returns a result; variant depends on whether Chrome is installed.
     match result {
         BrowserCheck::Found { path, version } => {
             assert!(!path.as_os_str().is_empty());
@@ -29,6 +37,36 @@ fn browser_check_reports_result() {
             );
         }
     }
+}
+
+/// #1456: a host where a candidate path holds a *usable* browser must never
+/// report `NotFound`. Without this the whole check passes in both directions,
+/// so the reported bug — a false `BrowserNotFound` on a box with Chrome
+/// installed — would stay green on the very runner that reproduces it.
+///
+/// Usability is decided by `probe_version`, not by `is_file()`: on POSIX an
+/// existing candidate may be non-executable, a stale wrapper, or exit
+/// non-zero, all of which the probe rejects on purpose, so `NotFound` is the
+/// correct answer there. (On Windows the probe *is* file existence plus an
+/// `.exe` extension, which is exactly the #1456 behaviour this pins.) What is
+/// asserted is the invariant that binds the two together: if any candidate
+/// probes successfully, the check that walks those candidates must find it.
+#[test]
+fn a_usable_browser_is_never_reported_as_missing() {
+    let usable: Vec<_> = autumn_web::browser_detect::browser_candidates()
+        .into_iter()
+        .filter(|p| autumn_web::browser_detect::probe_version(p).is_some())
+        .collect();
+    if usable.is_empty() {
+        return; // genuinely no usable browser on this host; nothing to assert
+    }
+
+    let check = BrowserCheck::run();
+    assert!(
+        check.is_found(),
+        "these browser binaries probe successfully on this host but the check \
+         reported them missing: {usable:?}\n{check}"
+    );
 }
 
 #[test]
@@ -76,6 +114,39 @@ fn system_test_builder_has_expected_methods() {
     }
 }
 
+// ── Custom middleware layers (#1456, issue 3) ──────────────────────────────
+//
+// Apps whose routes depend on global middleware (e.g. a database
+// tenant-scoping layer) previously had no way to register it on the runner,
+// forcing callers to clone and map layers onto individual handlers before
+// passing them to `.routes()`. `SystemTest::layer` must accept any Tower
+// layer that `AppBuilder::layer` accepts, and be chainable with the rest of
+// the builder in any order.
+
+// Compile-only: this asserts the public `.layer()` surface exists, takes the
+// same `IntoAppLayer` values as `AppBuilder::layer`, is chainable with the
+// other builder methods, and can be called more than once. It is deliberately
+// *not* a `#[test]` — rustc type-checks the body whether or not it ever runs,
+// so wrapping it would only inflate the passing count with an assertion-free
+// test that reads like behavioural coverage.
+#[expect(dead_code, reason = "compile-time API-shape assertion; never called")]
+fn assert_layer_api_shape() {
+    async fn passthrough(
+        req: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        next.run(req).await
+    }
+
+    let _builder = SystemTest::new()
+        .layer(axum::middleware::from_fn(passthrough))
+        .artifact_dir("/tmp/artifacts")
+        // Not just `from_fn`: an off-the-shelf tower-http layer must satisfy
+        // the same bound, as it does on `AppBuilder::layer`.
+        .layer(tower_http::cors::CorsLayer::permissive())
+        .hx_settle_timeout(std::time::Duration::from_millis(500));
+}
+
 // ── SystemTestError formatting ─────────────────────────────────────────────
 
 #[test]
@@ -111,9 +182,7 @@ async fn system_test_boots_and_visits_page() {
         "<html><body><h1 id='greeting'>Hello from system test</h1></body></html>"
     }
 
-    let runner = SystemTest::new()
-        .routes(routes![index])
-        .build()
+    let runner = Box::pin(SystemTest::new().routes(routes![index]).build())
         .await
         .expect("failed to start system test runner");
 
@@ -136,12 +205,14 @@ async fn assertion_failure_writes_artifacts() {
         "<html><body><p>Only this text</p></body></html>"
     }
 
-    let runner = SystemTest::new()
-        .routes(routes![index])
-        .artifact_dir("/tmp/autumn-system-test-artifacts")
-        .build()
-        .await
-        .expect("start runner");
+    let runner = Box::pin(
+        SystemTest::new()
+            .routes(routes![index])
+            .artifact_dir("/tmp/autumn-system-test-artifacts")
+            .build(),
+    )
+    .await
+    .expect("start runner");
 
     let page = runner.page().await.expect("open page");
     page.visit("/").await.expect("visit");
@@ -191,9 +262,7 @@ async fn expect_hx_settle_waits_for_htmx() {
         "<span>Swapped!</span>"
     }
 
-    let runner = SystemTest::new()
-        .routes(routes![index, swap])
-        .build()
+    let runner = Box::pin(SystemTest::new().routes(routes![index, swap]).build())
         .await
         .expect("start");
 
@@ -237,11 +306,13 @@ async fn click_triggering_full_page_navigation_does_not_break_polling() {
         "Navigated successfully"
     }
 
-    let runner = SystemTest::new()
-        .routes(routes![form_page, submit, done])
-        .build()
-        .await
-        .expect("start");
+    let runner = Box::pin(
+        SystemTest::new()
+            .routes(routes![form_page, submit, done])
+            .build(),
+    )
+    .await
+    .expect("start");
 
     let page = runner.page().await.expect("page");
     page.visit("/").await.expect("visit");
@@ -251,6 +322,49 @@ async fn click_triggering_full_page_navigation_does_not_break_polling() {
     page.expect_text("Navigated successfully").await.expect(
         "text on the post-redirect page must be visible without the poll \
          aborting on a transient destroyed-execution-context error",
+    );
+}
+
+/// End-to-end proof for #1456 issue 3: a layer registered with
+/// `SystemTest::layer` runs inside the served stack and its request
+/// extensions reach the route handlers, so a real browser sees middleware
+/// output rendered in the page — the exact shape of the reporter's
+/// tenant-scoping middleware.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn custom_layer_is_visible_to_route_handlers_in_the_browser() {
+    use autumn_web::prelude::*;
+
+    #[derive(Clone)]
+    struct TenantId(&'static str);
+
+    async fn scope_to_tenant(
+        mut req: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        req.extensions_mut().insert(TenantId("acme-corp"));
+        next.run(req).await
+    }
+
+    #[get("/")]
+    async fn index(axum::Extension(tenant): axum::Extension<TenantId>) -> String {
+        format!("<html><body><h1>Tenant: {}</h1></body></html>", tenant.0)
+    }
+
+    let runner = Box::pin(
+        SystemTest::new()
+            .routes(routes![index])
+            .layer(axum::middleware::from_fn(scope_to_tenant))
+            .build(),
+    )
+    .await
+    .expect("start runner");
+
+    let page = runner.page().await.expect("open page");
+    page.visit("/").await.expect("visit");
+    page.expect_text("Tenant: acme-corp").await.expect(
+        "the handler must observe the extension inserted by the layer \
+         registered via SystemTest::layer",
     );
 }
 
@@ -280,9 +394,7 @@ async fn attach_visits_externally_running_server() {
         "<html><body><h1>Externally booted</h1></body></html>"
     }
 
-    let server = SystemTest::new()
-        .routes(routes![index])
-        .build()
+    let server = Box::pin(SystemTest::new().routes(routes![index]).build())
         .await
         .expect("boot stand-in server");
     let base_url = server.base_url().to_string();
@@ -316,9 +428,7 @@ async fn expect_no_console_errors_fails_on_uncaught_exception() {
         "<html><body><h1>Page loads fine</h1></body></html>"
     }
 
-    let runner = SystemTest::new()
-        .routes(routes![index])
-        .build()
+    let runner = Box::pin(SystemTest::new().routes(routes![index]).build())
         .await
         .expect("start runner");
 
@@ -354,9 +464,7 @@ async fn expect_no_console_errors_passes_on_clean_page() {
         "<html><body><h1>All good</h1></body></html>"
     }
 
-    let runner = SystemTest::new()
-        .routes(routes![index])
-        .build()
+    let runner = Box::pin(SystemTest::new().routes(routes![index]).build())
         .await
         .expect("start runner");
 
@@ -381,9 +489,7 @@ async fn console_errors_returns_accumulated_messages() {
         "<html><body><h1>Page loads fine</h1></body></html>"
     }
 
-    let runner = SystemTest::new()
-        .routes(routes![index])
-        .build()
+    let runner = Box::pin(SystemTest::new().routes(routes![index]).build())
         .await
         .expect("start runner");
 
