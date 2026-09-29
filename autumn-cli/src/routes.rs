@@ -266,7 +266,6 @@ pub fn print_json(routes: &[RouteInfo]) {
     println!("{json}");
 }
 
-/// Print routes as a Postman Collection v2.1.0 JSON.
 /// Build a Postman Collection v2.1.0 JSON representation of the routes.
 pub fn build_postman_collection(routes: &[RouteInfo]) -> serde_json::Value {
     let mut item = Vec::new();
