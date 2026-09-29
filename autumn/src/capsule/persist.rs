@@ -27,6 +27,13 @@
 //! returns `None`: a capsule that cannot be written must never turn a 500 into
 //! a worse 500.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
 // #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
@@ -203,7 +210,7 @@ pub(crate) fn persist_pinned(
     prune(
         &dir,
         retained_before_write(settings.max_capsules),
-        Utc::now(),
+        crate::time::ambient_now(),
     );
     let pin = pin_for_reporting(&path);
     if let Err(error) = write_atomically(&dir, &path, &json) {
@@ -366,7 +373,7 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
     Some(Capsule {
         format_version: CAPSULE_FORMAT_VERSION,
         id: scope.id().to_owned(),
-        captured_at: Utc::now(),
+        captured_at: crate::time::ambient_now(),
         autumn_version: env!("CARGO_PKG_VERSION").to_owned(),
         app: AppInfo {
             name: settings.app_name.clone(),
@@ -980,7 +987,7 @@ mod tests {
         // `reporting::dispatch` hands persistence to `spawn_blocking`, so the
         // whole scope has to survive the trip to another thread and the write
         // has to land there — not just when it runs inline on the worker.
-        let written = tokio::task::spawn_blocking(move || {
+        let written = crate::time::spawn_blocking(move || {
             persist(
                 &scope,
                 CapsuleOutcome::Status {

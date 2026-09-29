@@ -1214,6 +1214,14 @@ pub fn candidate_teardown_ops(
 /// This must NOT be used for a redeploy: the redeploy teardown deliberately
 /// leaves the old release's `current`/live-slot markers intact because that old
 /// release is still serving.
+///
+/// Builds ONLY the app-teardown chain — never the proxy route. The fleet
+/// compensation case (issue #2270) removes the route as its OWN, separate step
+/// after this succeeds; see
+/// [`compensate_teardown`](crate::deploy::compensate_teardown) for why: folding
+/// it in here would let a transport failure on the route step (which carries no
+/// op label at all) masquerade as an ordinary op failure earlier in this chain,
+/// when in truth every op here would already have succeeded.
 #[must_use]
 pub fn first_deploy_teardown_ops(
     cfg: &ResolvedDeployConfig,
@@ -1695,6 +1703,9 @@ pub const PRE_MIGRATE_LABELS: &[&str] = &[
     // deploy paths precedes `migrate`.
     "upload",
     "stage-local-file",
+    // The driver puts the live-slot marker repair ahead of every builder op, like
+    // `install-proxy`.
+    LIVE_SLOT_REPAIR_LABEL,
 ];
 
 /// Whether a host that failed at `failed_step` had already run its migration.
@@ -2332,8 +2343,8 @@ const NO_PROXY_UNIT_SENTINEL: &str = "---autumn-no-proxy-unit---";
 /// refuse guard never fires on synthetic input).
 const PROXY_OPTIONS_DELIM: &str = "---autumn-kamal-proxy-options---";
 
-/// Delimiter appended after the `shared/proxy-options` marker, before
-/// `readlink -f {app_dir}/current` (issue #1621, AC-6), so all five sections ride
+/// Delimiter appended after the `shared/proxy-options` marker, before the
+/// checked `current` target (issue #1621, AC-6), so all five sections ride
 /// in ONE round-trip. Its ABSENCE (a host deployed before this feature, older
 /// recorded output, or a scripted test) leaves an empty section →
 /// [`DeployProbe::current_release_dir`] `None` — "unknown", never a guessed id.
@@ -2376,9 +2387,10 @@ pub struct DeployProbe {
     /// The release dir the host's `current` symlink resolves to (#1621, AC-6); its
     /// basename is the deployed release id ([`release_id_from_dir`]).
     ///
-    /// `None` when the symlink is absent, dangling, or the probe output predates
-    /// this section — reported as "unknown", never guessed. `deploy status` and the
-    /// fleet `maintenance` fan-out read it; the rollout path ignores it.
+    /// `None` if the symlink is absent or dangling, if its target is not a
+    /// directory directly in `releases/` (#2277), or if the probe output has no
+    /// such section. `None` means "unknown". The CLI never guesses the release.
+    /// Only `deploy status` reads it.
     pub current_release_dir: Option<String>,
 }
 
@@ -2465,6 +2477,9 @@ pub fn probe_deploy_state(
     cfg: &ResolvedDeployConfig,
     exec: &impl DeployExecutor,
 ) -> Result<DeployProbe, DeployExecError> {
+    // The last section prints the target of `current` only if the target is a
+    // directory directly in `releases/`. GNU `readlink -f` also resolves a
+    // dangling link (#2277). Thus the shell must check the result.
     let shell = format!(
         "if [ -L {current} ]; then printf 'redeploy:'; cat {marker} 2>/dev/null || printf '{blue}'; \
          else printf 'first'; fi; \
@@ -2476,8 +2491,10 @@ pub fn probe_deploy_state(
          printf '\\n{opts_delim}\\n'; \
          cat {opts_marker} 2>/dev/null || true; \
          printf '\\n{current_delim}\\n'; \
-         readlink -f {current} 2>/dev/null || true",
+         d=$(readlink -f {current} 2>/dev/null) && r=$(readlink -f {releases} 2>/dev/null) \
+         && [ -d \"$d\" ] && [ \"${{d%/*}}\" = \"$r\" ] && printf '%s' \"$d\" || true",
         current = shell_quote(&cfg.current_symlink()),
+        releases = shell_quote(&cfg.releases_dir()),
         marker = shell_quote(&live_slot_marker(cfg)),
         blue = SLOT_BLUE,
         delim = PROXY_LIST_DELIM,
@@ -2505,7 +2522,7 @@ pub fn probe_deploy_state(
                     .split_once(PROXY_OPTIONS_DELIM)
                     .unwrap_or((after_unit, ""));
                 // …and the options section further splits into the marker `cat` and the
-                // `readlink -f current` result (#1621). A missing delimiter (a host
+                // checked `current` target (#1621). A missing delimiter (a host
                 // deployed before this feature, or a scripted test) leaves an empty
                 // current section → `None` = "release unknown", never a guessed id.
                 let (opts_section, current_section) = after_opts
@@ -2549,10 +2566,10 @@ pub fn probe_deploy_state(
     })
 }
 
-/// Parse the probe's `readlink -f {app_dir}/current` section (#1621, AC-6).
+/// Parse the probe's checked `current` target section (#1621, AC-6).
 ///
-/// Empty (absent/dangling symlink, or a probe capture predating this section) →
-/// `None`. Anything else is the resolved release DIR, trimmed of surrounding
+/// Empty (no release dir behind `current`, see [`probe_deploy_state`], or a
+/// probe capture predating this section) → `None`. Anything else is the resolved release DIR, trimmed of surrounding
 /// whitespace/newlines. Deliberately NOT fail-closed: this section is read-only
 /// reporting, and refusing to report a status because a symlink is unreadable would
 /// make `deploy status` useless on exactly the drifted host it exists to surface.
@@ -2927,6 +2944,69 @@ pub fn probe_rollback_target_dir(
     probe_dir_state("probe-rollback-target", release_dir, exec)
 }
 
+/// Sentinel [`retry_drain_old`] prints when the old slot unit is stopped and
+/// disabled.
+const OLD_SLOT_STOPPED: &str = "stopped";
+
+/// Sentinel [`retry_drain_old`] prints for all other unit states.
+const OLD_SLOT_NOT_STOPPED: &str = "not-stopped";
+
+/// The state of the old slot unit after [`retry_drain_old`] (issue #2279).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OldSlotState {
+    /// The unit is loaded, `inactive` or `failed`, and `disabled`. No old process
+    /// runs, and none starts at boot.
+    Stopped,
+    /// The unit can run now or at boot (`active`, `deactivating`, `enabled`, …).
+    NotStopped,
+    /// The output is not a known sentinel. This proves nothing.
+    Unreadable,
+}
+
+/// Retry a failed `drain-old` one time, then read the old slot unit (issue
+/// #2279).
+///
+/// The old slot runs job workers and the scheduler. If it runs, work runs two
+/// times. The check reads each property with its own `systemctl show`, because
+/// one call does not keep the order of the properties:
+///
+/// - `LoadState=loaded`: a unit that is not found also shows `inactive`.
+/// - `ActiveState` is `inactive` or `failed`: `is-active` is false while the
+///   unit is `deactivating`.
+/// - `UnitFileState=disabled`: an enabled unit starts again at boot.
+///
+/// # Errors
+///
+/// Returns the executor's error if the command cannot run.
+pub fn retry_drain_old(
+    cfg: &ResolvedDeployConfig,
+    live_slot: &str,
+    exec: &impl DeployExecutor,
+) -> Result<OldSlotState, DeployExecError> {
+    let unit = shell_quote(&format!(
+        "{}.service",
+        slot_unit_name(&cfg.service_name, live_slot)
+    ));
+    let shell = format!(
+        "unit={unit}; \
+         systemctl disable --now \"$unit\" >/dev/null 2>&1; \
+         state=\"$(systemctl show --property=LoadState \"$unit\" 2>/dev/null) \
+         $(systemctl show --property=ActiveState \"$unit\" 2>/dev/null) \
+         $(systemctl show --property=UnitFileState \"$unit\" 2>/dev/null)\"; \
+         case \"$state\" in \
+         'LoadState=loaded ActiveState=inactive UnitFileState=disabled'|\
+         'LoadState=loaded ActiveState=failed UnitFileState=disabled') \
+         printf '%s' '{OLD_SLOT_STOPPED}' ;; \
+         *) printf '%s' '{OLD_SLOT_NOT_STOPPED}' ;; esac"
+    );
+    let out = exec.run(&RemoteCommand::new("drain-old-retry", shell))?;
+    Ok(match out.stdout.trim() {
+        OLD_SLOT_STOPPED => OldSlotState::Stopped,
+        OLD_SLOT_NOT_STOPPED => OldSlotState::NotStopped,
+        _ => OldSlotState::Unreadable,
+    })
+}
+
 /// The shared read-only `[ -d … ]` directory probe behind [`probe_release_dir`] and
 /// [`probe_rollback_target_dir`]: two printf sentinels, nothing else, and any other
 /// capture fails closed to [`ReleaseDirState::Unreadable`] (an empty capture is the
@@ -3240,12 +3320,17 @@ pub fn live_slot_marker_repair_op(
     public_port: u16,
 ) -> DeployOp {
     let slot = canonical_slot(slot);
-    DeployOp::Run(record_live_slot(
-        cfg,
-        slot,
-        slot_app_port(public_port, slot),
-    ))
+    let mut repair = record_live_slot(cfg, slot, slot_app_port(public_port, slot));
+    repair.label = LIVE_SLOT_REPAIR_LABEL;
+    DeployOp::Run(repair)
 }
+
+/// The label of [`live_slot_marker_repair_op`].
+///
+/// It is not `record-live-slot`, the label of the same marker write after
+/// `migrate`: the repair always runs before `migrate`, and a failure there must
+/// not read as a moved schema (#2276).
+pub const LIVE_SLOT_REPAIR_LABEL: &str = "repair-live-slot";
 
 /// Build the bounded remote readiness-poll shell line: loop on
 /// `curl -fsS localhost:{port}/ready` until it succeeds or `timeout_secs`
@@ -3792,14 +3877,17 @@ pub(crate) mod test_support {
     /// rollout — the structure cross-host ordering assertions read.
     pub(crate) type FleetTape = Rc<RefCell<Vec<(String, RecordedCall)>>>;
 
-    /// Command labels whose **stdout is parsed** by the caller, i.e. the read-only
-    /// probes. An unscripted probe is the single most dangerous silent hole in this
+    /// Command labels whose **stdout is parsed** by the caller: the read-only
+    /// probes, and `drain-old-retry`, which also mutates. Do not use this list as
+    /// a read-only allowlist.
+    ///
+    /// An unscripted probe is the single most dangerous silent hole in this
     /// fake: `run` returns `Ok` with EMPTY stdout for anything unscripted, and
     /// [`super::probe_deploy_state`] reads an empty section as
     /// [`super::DeployMode::First`] / `Absent`. A fleet test that forgets to script
     /// host N's probe would therefore exercise the first-deploy branch and still
     /// pass. [`RecordingExecutor::strict`] turns that into a loud panic.
-    pub(crate) const PROBE_LABELS: [&str; 7] = [
+    pub(crate) const PROBE_LABELS: [&str; 8] = [
         "proxy-compat-probe",
         "detect-current",
         "probe-release-dir",
@@ -3810,6 +3898,8 @@ pub(crate) mod test_support {
         // the running unit polls. Unscripted, it reads as "the unit could not be
         // read" and the fan-out would fail closed for the wrong reason.
         "detect-maintenance-flag",
+        // #2279: the fleet parses this one to decide if the old slot stopped.
+        "drain-old-retry",
     ];
 
     /// One recorded executor call. Uploads carry no local path: op building is
@@ -5907,6 +5997,21 @@ mod tests {
     }
 
     #[test]
+    fn first_deploy_teardown_never_touches_the_proxy_route() {
+        // Issue #2270: the proxy route is removed as its OWN separate step by
+        // the fleet driver (`compensate_teardown`), never folded into this app-
+        // only chain — see the function's own doc comment for why.
+        let cfg = resolved();
+        let plan = SlotPlan::first(3000);
+        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan);
+        let labels: Vec<&str> = teardown.iter().map(DeployOp::label).collect();
+        assert!(
+            !labels.iter().any(|l| l.contains("proxy")),
+            "this chain must never run a proxy op: {labels:?}"
+        );
+    }
+
+    #[test]
     fn first_deploy_teardown_records_the_torn_down_result() {
         // #1621 (AC-6, audit gap G3). A first-deploy teardown returns the host to nothing
         // installed — that is what `CompensatedTeardown` means. Leaving
@@ -6419,6 +6524,54 @@ mod tests {
     }
 
     #[test]
+    fn retry_drain_old_retries_once_and_reads_the_old_unit_state() {
+        // #2279: after a failed `drain-old`, try the stop again one time. Then
+        // read the old unit. Only a known sentinel shows the state.
+        let cfg = resolved();
+        let stopped = RecordingExecutor::new().with_stdout("drain-old-retry", "stopped\n");
+        assert_eq!(
+            retry_drain_old(&cfg, SLOT_BLUE, &stopped).unwrap(),
+            OldSlotState::Stopped,
+        );
+        let shell = stopped.shell_for("drain-old-retry").expect("retry ran");
+        assert_eq!(
+            shell,
+            "unit='myapp-blue.service'; \
+             systemctl disable --now \"$unit\" >/dev/null 2>&1; \
+             state=\"$(systemctl show --property=LoadState \"$unit\" 2>/dev/null) \
+             $(systemctl show --property=ActiveState \"$unit\" 2>/dev/null) \
+             $(systemctl show --property=UnitFileState \"$unit\" 2>/dev/null)\"; \
+             case \"$state\" in \
+             'LoadState=loaded ActiveState=inactive UnitFileState=disabled'|\
+             'LoadState=loaded ActiveState=failed UnitFileState=disabled') \
+             printf '%s' 'stopped' ;; \
+             *) printf '%s' 'not-stopped' ;; esac",
+            "retry the same stop, then read each property on its own line. \
+             `is-active` is false while the unit is `deactivating`. An enabled unit \
+             starts again at boot. A unit that is not found proves nothing.",
+        );
+        assert_eq!(stopped.run_labels(), vec!["drain-old-retry"]);
+
+        let not_stopped = RecordingExecutor::new().with_stdout("drain-old-retry", "not-stopped");
+        assert_eq!(
+            retry_drain_old(&cfg, SLOT_BLUE, &not_stopped).unwrap(),
+            OldSlotState::NotStopped,
+        );
+        for garbled in ["", "bash: -c: line 0", "stopped extra"] {
+            let exec = RecordingExecutor::new().with_stdout("drain-old-retry", garbled);
+            assert_eq!(
+                retry_drain_old(&cfg, SLOT_BLUE, &exec).unwrap(),
+                OldSlotState::Unreadable,
+                "output {garbled:?} proves nothing, so it must not read as stopped",
+            );
+        }
+        assert!(
+            test_support::PROBE_LABELS.contains(&"drain-old-retry"),
+            "the caller parses its stdout, so a strict fake must require a script"
+        );
+    }
+
+    #[test]
     fn strict_recording_executor_refuses_to_fake_an_unscripted_probe() {
         // #1621 (plan §9.2): the fake returns Ok+EMPTY stdout for anything
         // unscripted, and every probe parser reads empty as "absent / first
@@ -6805,6 +6958,170 @@ mod tests {
             probe.current_release_dir.is_none(),
             "an empty current section is unknown, not an empty release id"
         );
+    }
+
+    // Linux-only, with the two tests below: they run the probe shell with GNU
+    // `readlink -f` and make symlinks with `std::os::unix::fs`. The deploy target
+    // is Ubuntu.
+
+    /// Runs the real `detect-current` shell on a local `app_dir`. Returns the
+    /// parsed probe (#2277).
+    #[cfg(target_os = "linux")]
+    fn probe_local_app_dir(app_dir: &Path) -> (ResolvedDeployConfig, DeployProbe) {
+        let mut cfg = resolved();
+        cfg.app_dir = app_dir.to_str().expect("utf-8 temp dir").to_owned();
+        let render = RecordingExecutor::new();
+        probe_deploy_state(&cfg, &render).expect("probe renders");
+        let shell = render.shell_for("detect-current").expect("probe ran");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&shell)
+            .output()
+            .expect("run probe shell");
+        assert!(
+            out.status.success(),
+            "probe shell must not fail: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+        let replay = RecordingExecutor::new().with_stdout("detect-current", stdout);
+        let probe = probe_deploy_state(&cfg, &replay).expect("probe parses");
+        (cfg, probe)
+    }
+
+    /// Makes `{root}/{name}` with the directories `releases/r1/sub` and
+    /// `releases2/r1`, and the file `releases/file`. Links `current` to `target`.
+    #[cfg(target_os = "linux")]
+    fn app_dir_with_current(root: &Path, name: &str, target: &Path) -> std::path::PathBuf {
+        let app = root.join(name);
+        std::fs::create_dir_all(app.join("releases/r1/sub")).expect("mk release");
+        std::fs::create_dir_all(app.join("releases2/r1")).expect("mk sibling");
+        std::fs::write(app.join("releases/file"), b"").expect("mk file");
+        std::os::unix::fs::symlink(target, app.join("current")).expect("link current");
+        app
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_names_a_release_only_when_current_resolves_to_a_release_dir() {
+        // #2277: `readlink -f` resolves a dangling link, so the probe named a
+        // release that is not installed. Only a directory directly in `releases/`
+        // is a release. Mode detection must not change.
+        let tree = tempfile::tempdir().expect("temp dir");
+        let root = tree.path();
+        let outside = root.join("outside/r9");
+        std::fs::create_dir_all(&outside).expect("mk outside dir");
+
+        let rows: [(&str, &Path, Option<&str>); 7] = [
+            ("relative", Path::new("releases/r1"), Some("r1")),
+            ("dangling", Path::new("releases/gone"), None),
+            ("outside", &outside, None),
+            ("file", Path::new("releases/file"), None),
+            ("releases-root", Path::new("releases"), None),
+            ("deep", Path::new("releases/r1/sub"), None),
+            ("sibling", Path::new("releases2/r1"), None),
+        ];
+        for (name, target, want) in rows {
+            let (_, probe) = probe_local_app_dir(&app_dir_with_current(root, name, target));
+            assert!(
+                matches!(probe.mode, DeployMode::Redeploy { .. }),
+                "{name}: `[ -L current ]` still decides the mode"
+            );
+            assert_eq!(
+                probe
+                    .current_release_dir
+                    .as_deref()
+                    .and_then(release_id_from_dir),
+                want,
+                "{name}: {:?}",
+                probe.current_release_dir
+            );
+        }
+
+        // An absolute link into the tree resolves.
+        let abs = root.join("absolute");
+        let (_, probe) = probe_local_app_dir(&app_dir_with_current(
+            root,
+            "absolute",
+            &abs.join("releases/r1"),
+        ));
+        assert_eq!(
+            probe
+                .current_release_dir
+                .as_deref()
+                .and_then(release_id_from_dir),
+            Some("r1")
+        );
+
+        // A symlinked `app_dir` is not drift. The shell resolves both paths the
+        // same way.
+        let real = app_dir_with_current(root, "real", Path::new("releases/r1"));
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).expect("link app dir");
+        let (_, probe) = probe_local_app_dir(&alias);
+        assert_eq!(
+            probe
+                .current_release_dir
+                .as_deref()
+                .and_then(release_id_from_dir),
+            Some("r1"),
+            "a symlinked app dir still names its release"
+        );
+
+        // A symlinked `releases/` directory is not drift.
+        let store = root.join("store");
+        std::fs::create_dir_all(store.join("r2")).expect("mk store release");
+        let linked = root.join("linked");
+        std::fs::create_dir_all(&linked).expect("mk app dir");
+        std::os::unix::fs::symlink(&store, linked.join("releases")).expect("link releases");
+        std::os::unix::fs::symlink("releases/r2", linked.join("current")).expect("link current");
+        let (_, probe) = probe_local_app_dir(&linked);
+        assert_eq!(
+            probe
+                .current_release_dir
+                .as_deref()
+                .and_then(release_id_from_dir),
+            Some("r2"),
+            "a symlinked releases dir still names its release"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dangling_current_is_state_drift_end_to_end() {
+        // #2277: probe shell → `HostStatus` → `fleet_drift`. A dangling `current`
+        // must give `DRIFT_RELEASE_UNREADABLE`. Then `deploy status --strict` fails.
+        use super::super::fleet::{DRIFT_RELEASE_UNREADABLE, HostStatus, ReleaseId, fleet_drift};
+
+        let tree = tempfile::tempdir().expect("temp dir");
+        let app = app_dir_with_current(tree.path(), "app", Path::new("releases/gone"));
+        let (cfg, deploy) = probe_local_app_dir(&app);
+        let probe = HostStatusProbe {
+            deploy,
+            ready_code: Some(200),
+            shared_maintenance_flag: false,
+            maintenance: MaintenanceStatus::Off,
+            maintenance_flag_source: MaintenanceFlagSource::Shared,
+            last_deploy: None,
+        };
+        let status = HostStatus::from_probe(&cfg, 3000, &probe);
+        assert_eq!(
+            status.release,
+            ReleaseId::Unknown,
+            "the status names no release"
+        );
+
+        // `contains`, not equality: the shell also reads this machine's proxy unit,
+        // which can add other drift rows.
+        let report = fleet_drift(&[status]);
+        assert!(
+            report
+                .state_drift
+                .contains(&("203.0.113.10".to_owned(), DRIFT_RELEASE_UNREADABLE)),
+            "{:?}",
+            report.state_drift
+        );
+        assert!(report.drifted(), "`--strict` must exit non-zero");
     }
 
     /// Full five-section `detect-current` stdout for a redeploy host on `release`.
@@ -7310,7 +7627,9 @@ mod tests {
         "Usage:\n  kamal-proxy deploy SERVICE [flags]\n\nFlags:\n  \
          --target host:port\n  --health-check-path string\n  --host strings\n  \
          --tls\n  --deploy-timeout duration\n  --drain-timeout duration\n  \
-         --force\n"
+         --force\n\
+         ---autumn-kamal-proxy-remove-help---\
+         Usage:\n  kamal-proxy remove SERVICE [flags]\n"
     }
 
     #[test]
@@ -7327,6 +7646,9 @@ mod tests {
                 DeployOp::Run(RemoteCommand::new("noop", "true"))
             }
             fn flip_op(&self, _service: &str, _new_upstream: &str) -> DeployOp {
+                DeployOp::Run(RemoteCommand::new("noop", "true"))
+            }
+            fn deregister_op(&self, _service: &str) -> DeployOp {
                 DeployOp::Run(RemoteCommand::new("noop", "true"))
             }
             // compat_probe() and binary_install_ops() use the trait defaults → None.
@@ -7399,9 +7721,10 @@ mod tests {
                 );
             }
         }
-        // The driver splices host preparation ahead of everything (#1607), so it is
-        // pre-migrate too even though no builder emits it.
+        // The driver splices host preparation (#1607) and the marker repair ahead of
+        // everything, so both are pre-migrate even though no builder emits them.
         assert!(failed_before_migrating("install-proxy"));
+        assert!(failed_before_migrating(LIVE_SLOT_REPAIR_LABEL));
         // Anything unrecognised errs toward "the schema may have moved".
         assert!(!failed_before_migrating("readiness-gate"));
         assert!(!failed_before_migrating("some-future-op"));
@@ -7492,6 +7815,9 @@ mod tests {
             fn flip_op(&self, service: &str, new_upstream: &str) -> DeployOp {
                 self.0.flip_op(service, new_upstream)
             }
+            fn deregister_op(&self, service: &str) -> DeployOp {
+                self.0.deregister_op(service)
+            }
             fn compat_probe(&self) -> Option<super::super::proxy::ProxyCompatProbe> {
                 self.0.compat_probe()
             }
@@ -7533,7 +7859,7 @@ mod tests {
         let op = live_slot_marker_repair_op(&cfg, decision.live_slot, 3000);
         match op {
             DeployOp::Run(cmd) => {
-                assert_eq!(cmd.label, "record-live-slot");
+                assert_eq!(cmd.label, LIVE_SLOT_REPAIR_LABEL);
                 assert!(
                     cmd.shell.contains(SLOT_BLUE) && cmd.shell.contains("3001"),
                     "repair op writes the proxy slot+port: {}",

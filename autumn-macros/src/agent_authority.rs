@@ -3352,11 +3352,9 @@ fn is_framework_prologue_call(call: &ExprCall) -> bool {
     // `crate = "..."` override (#1828) means an earlier-expanded guard's own
     // (already-finalized) prologue call is rooted at the actively resolved
     // name instead.
-    let rooted = path
-        .path
-        .segments
-        .first()
-        .is_some_and(|first| first.ident == crate::crate_path::current_target_path_segment());
+    let rooted = path.path.segments.first().is_some_and(|first| {
+        first.ident == autumn_macros_support::crate_path::current_target_path_segment()
+    });
     rooted
         && path.path.segments.len() > 1
         && path

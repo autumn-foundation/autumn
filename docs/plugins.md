@@ -37,10 +37,12 @@ autumn plugin list                      # what can I install, at what version?
 autumn plugin add autumn-admin-plugin   # dependency + mount + next steps
 ```
 
-`autumn plugin list` shows every first-party plugin with the version compatible
-with your app's `autumn-web`, plus community crates it finds on crates.io under
-the `autumn-plugin-` naming convention below. Add `--json` for machine-readable
-output, or `--offline` to skip the crates.io lookup.
+`autumn plugin list` reads the [plugin index](#the-plugin-index) first. It
+shows each listed plugin with the version compatible with your app's
+`autumn-web`, its trust class, its API tier and its last conformance result.
+Then it shows crates it finds on crates.io under the `autumn-plugin-` naming
+convention below, marked `[unlisted: not verified]`. Add `--json` for
+machine-readable output, or `--offline` to skip the crates.io lookup.
 
 `autumn plugin add` is safe to re-run: a second `add` of the same plugin
 reports that it is already installed and changes nothing. It refuses — before
@@ -51,7 +53,8 @@ edits without applying them.
 ### Versions
 
 First-party plugins are released in lockstep with `autumn-web` and with the
-CLI, so the version `autumn plugin add` installs is the CLI's own. That makes
+CLI, so the version `autumn plugin add` installs is the CLI's own, pinned with
+`=` so Cargo builds exactly the release the index reviewed. That makes
 the version gate a statement about your toolchain: if your app is on an older
 `autumn-web`, the listing marks each first-party plugin `[needs autumn-web
 <series>]` and `add` refuses rather than writing a dependency that will not
@@ -115,6 +118,94 @@ autumn_web::app()
     .run()
     .await;
 ```
+
+## The plugin index
+
+The plugin index is a curated list of plugins in this repository:
+[`autumn-cli/plugin-index/index.toml`](../autumn-cli/plugin-index/index.toml).
+Maintainers review each listing in a pull request. The CLI embeds the file.
+The index holds no plugin code. A listing points at crates.io, or at the
+repository of a sandboxed plugin.
+
+Each listing records:
+
+| Fact | Where it comes from |
+|---|---|
+| Name and one-line description | The crate. |
+| Supported `autumn-web` range | The plugin's `Plugin::contract`. |
+| Last conformance result | An `autumn plugin-check --format json` report, and the release it ran on. |
+| Trust class | `full trust: native code` for a `Plugin` crate, or the capability manifest of a [sandboxed plugin](./guide/sandboxed-plugins.md). |
+| API tier | `stable`, or `experimental` with the [experimental surfaces](#depending-on-experimental-surface) it uses. |
+
+`autumn plugin list` shows these facts at discovery time:
+
+```text
+Listed in the Autumn plugin index:
+  autumn-admin-plugin  0.7.0  Out-of-the-box admin panel plugin for autumn-web applications
+      first-party · full trust: native code · stable API · plugin-check pass on autumn-web 0.7.0
+  autumn-plugin-feed   0.3.0  Live feeds  [EXPERIMENTAL API]
+      community · full trust: native code · experimental API: … · plugin-check pass on autumn-web 0.7.0
+
+Unlisted (not in the plugin index, not verified):
+  autumn-plugin-other  0.1.0  Something  [unlisted: not verified]
+```
+
+`autumn plugin add` prints the same facts as a trust review **before** it
+changes a file. Then:
+
+- A listed community crate installs at the version the index verified,
+  pinned with `=`. There is no crates.io lookup, so `--offline` works. If
+  `Cargo.toml` already names the crate at another requirement, from a path,
+  git or other registry, or renamed to another package, the command refuses
+  and changes no file. It also refuses when a crates.io `[patch]` (in a manifest or
+  a `.cargo/config.toml`), a `[replace]` table, a `[source.crates-io]`
+  table (a `replace-with` or a redefinition), a `CARGO_SOURCE_CRATES_IO_*`
+  environment variable, or a `paths` override redirects the crate. For a first-party plugin, a `[patch]` to a local
+  checkout only prints a notice: the trust review covers the crates.io
+  release. A first-party plugin `Cargo.toml` already declares must also be the
+  `=` pin of the reviewed release: `"0.7"` would take a later patch on the
+  next `cargo update`.
+- A listing that failed re-verification is refused, with the reason. It is
+  also refused when the app's `autumn-web` version is not a plain version.
+- A community listing is refused when the app's `autumn-web` requirement may
+  resolve outside the listing's range: `"=0.7"` with no `Cargo.lock` may be
+  0.7.1, which a `=0.7.0` listing was never checked on. A bounded range the
+  listing's range contains, such as `">=0.7, <0.8"` against `0.7`, is
+  accepted.
+- A first-party plugin is refused when, with no `Cargo.lock`, the app's
+  `autumn-web` requirement admits another release series too:
+  `">=0.6, <0.9"` may build the app on 0.8 next to a 0.7 plugin. With
+  `autumn new --starter`, the listing is also checked against the starter's
+  own `autumn-web` pin, a prerelease pin included.
+- A sandboxed listing is not wired. The command prints the review steps
+  (`autumn plugin inspect`, `SandboxedPlugin::from_file`), changes no file,
+  and exits 2.
+- An unlisted crate gets an `UNLISTED` warning, then installs as before.
+
+Flags in `plugin list`:
+
+| Flag | Meaning |
+|---|---|
+| `[EXPERIMENTAL API]` | The plugin uses experimental plugin surface. It can break in any release. |
+| `[incompatible: failed re-verification]` | The plugin failed `plugin-check` on a newer release. `add` refuses it. |
+| `[not verified on autumn-web X]` | The last run was on another release series than your app. |
+| `[unlisted: not verified]` | A crates.io result with no listing. Nothing about it is verified. |
+
+CI re-verifies each listing. It runs `autumn plugin-check` on each change to
+the index, to a first-party plugin or to the framework, on each release bump,
+and each week. A listing that fails is flagged `incompatible`. A listing that
+fails on two different releases is delisted. `autumn plugin index check`
+fails when a listing was not verified against the current release. So a
+release cannot ship a stale index.
+
+To use a different index file (a mirror, or a fork), set
+`AUTUMN_PLUGIN_INDEX=<path>`. The CLI refuses a file that breaks an admission
+rule. `plugin add` and `new --with` also refuse a first-party listing that
+pins another release than the CLI's, before showing its trust facts: a
+first-party install is always the CLI's own release.
+
+To list your own plugin, see
+[Submit for listing](#4-submit-for-listing).
 
 ## Removing a plugin
 
@@ -231,6 +322,11 @@ Community `autumn-plugin-<name>` crates work here too, with the same
 dependency-only rule: the dependency is written, the mount is printed for you to
 paste.
 
+`--with` reads the [plugin index](#the-plugin-index) the same way `plugin add`
+does. It prints the trust review first. A listed community crate is pinned to
+its verified version with `=`. A flagged or sandboxed listing is refused before
+the scaffold writes a file.
+
 `--with` composes with `--starter`. One difference: a starter brings its own
 `Cargo.toml`, so its `autumn-web` pin is not knowable until the starter has been
 fetched. Names are still resolved before anything is written, but a starter
@@ -303,7 +399,8 @@ Native plugins are not deprecated by that lane and are not going anywhere.
 | Third-party (lives on crates.io) | `autumn-plugin-<name>` | `<Name>Plugin` |
 
 Third-party crates keep the `autumn-plugin-` prefix so the ecosystem
-is easy to search on crates.io. First-party crates reverse the order so
+is easy to search on crates.io. That search is only the fallback. Users find
+verified plugins in the [plugin index](#the-plugin-index). First-party crates reverse the order so
 they cluster with the crate they extend.
 
 The second row is what `autumn-storage-s3`, `autumn-cache-redis`, and
@@ -673,7 +770,7 @@ This checks:
 | Check | What it verifies |
 |-------|-----------------|
 | `installability` | Binary compiles and route manifest is produced |
-| `route-attribution` | Every plugin route carries `plugin:<your-name>` source |
+| `route-attribution` | Every plugin route carries `plugin:<your-name>` source. When routes carry only the contract's registered name (the default `Plugin::name()`), the route checks use that name. With `--no-routes` (a plugin that mounts none, such as a cache), skips when no route carries either name, and fails if one does. Without it, no routes found fails. It also fails when the app mounts a raw `.merge()` or an undeclared `.nest()` router: its routes were never listed, so no check saw them |
 | `route-prefix` | Every plugin route lives under the declared prefix, or is declared as an intentional root route via `--intentional-root PATH` (repeatable; exact path match) |
 | `route-collision` | No two routes share (method, path); names the conflicting handlers and sources |
 | `sensitive-surfaces` | Routes with admin/debug/credential/operator/secret/metrics paths are declared with auth mechanisms |
@@ -737,7 +834,7 @@ mod conformance_tests {
 
 ### 3. Publishing checklist
 
-Work through this list before `cargo publish`:
+Work through this list, then publish and submit for listing:
 
 - [ ] **Crate name** — follows the `autumn-<name>-plugin` (first-party) or
   `autumn-plugin-<name>` (third-party) convention
@@ -766,6 +863,23 @@ Work through this list before `cargo publish`:
   whether your plugin is designed to be registered more than once
 - [ ] **Existing app compatibility** — downstream apps that only consume
   the plugin continue to compile and run unchanged after each release
+- [ ] **Publish** — `cargo publish`
+- [ ] **Submit for listing** — see [step 4](#4-submit-for-listing)
+
+### 4. Submit for listing
+
+A published crate is not yet listed. Users see it only as an unlisted,
+unverified crates.io result. To list it, open a pull request that adds it to
+the [plugin index](#the-plugin-index). Follow
+[`autumn-cli/plugin-index/README.md`](../autumn-cli/plugin-index/README.md).
+
+The index grants a listing only when:
+
+- `autumn plugin-check` passes on the current `autumn-web` release, and
+- `Plugin::contract` declares the supported `autumn-web` range.
+
+`autumn plugin index record` writes your JSON report into the listing, and
+`autumn plugin index check` is the gate the pull request must pass.
 
 ### Reference example: `autumn-admin-plugin`
 
