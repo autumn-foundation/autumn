@@ -250,6 +250,18 @@ pub struct CacheAuditArgs {
     /// Build the audited binary without default Cargo features.
     #[arg(long)]
     no_default_features: bool,
+    /// Audit the release binary rather than the debug one (issue #2363).
+    ///
+    /// The manifest describes the binary that produced it: a `#[cached]` read
+    /// behind `#[cfg(not(debug_assertions))]` exists only in a release build.
+    /// Audit the profile you deploy.
+    #[arg(long, conflicts_with = "profile")]
+    release: bool,
+    /// Audit the binary built under this Cargo profile (a custom
+    /// `[profile.<NAME>]` builds into `target/<NAME>`; `dev` into
+    /// `target/debug`).
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
 }
 
 /// Arguments for `autumn data-flow`.
@@ -5177,6 +5189,10 @@ fn run_command(command: Commands) {
                 json: args.json,
                 strict: args.strict,
                 features,
+                profile: routes::CargoProfile {
+                    release: args.release,
+                    profile: args.profile,
+                },
             });
         }
         Commands::Openapi(OpenApiSubcommands::Export(args)) => {
@@ -9151,9 +9167,41 @@ mod tests {
                 assert!(args.features.is_empty());
                 assert!(!args.all_features);
                 assert!(!args.no_default_features);
+                // No flag keeps the debug build existing callers audit.
+                assert!(!args.release);
+                assert!(args.profile.is_none());
             }
             _ => panic!("expected Cache audit subcommand"),
         }
+    }
+
+    /// The audited build has to be the profile that ships (issue #2363): a
+    /// read behind `#[cfg(not(debug_assertions))]` exists only in release.
+    #[test]
+    fn parse_cache_audit_forwards_the_cargo_profile_selection() {
+        let cli = Cli::try_parse_from(["autumn", "cache", "audit", "--release"]).unwrap();
+        match cli.command {
+            Commands::Cache(CacheSubcommands::Audit(args)) => {
+                assert!(args.release);
+                assert!(args.profile.is_none());
+            }
+            _ => panic!("expected Cache audit subcommand"),
+        }
+
+        let cli = Cli::try_parse_from(["autumn", "cache", "audit", "--profile", "ci"]).unwrap();
+        match cli.command {
+            Commands::Cache(CacheSubcommands::Audit(args)) => {
+                assert!(!args.release);
+                assert_eq!(args.profile.as_deref(), Some("ci"));
+            }
+            _ => panic!("expected Cache audit subcommand"),
+        }
+
+        // Cargo rejects `--release --profile`; refuse it before building.
+        assert!(
+            Cli::try_parse_from(["autumn", "cache", "audit", "--release", "--profile", "ci"])
+                .is_err()
+        );
     }
 
     /// The manifest describes the binary that produced it, so the audited
