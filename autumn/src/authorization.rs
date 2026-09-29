@@ -72,7 +72,7 @@ pub trait ProvideAuthorizationState: Send + Sync {
     #[cfg(feature = "db")]
     fn pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>;
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>;
 }
 
 /// Boxed future returned by [`Policy`] and [`Scope`] methods so the
@@ -116,8 +116,7 @@ pub struct PolicyContext {
     /// that need to consult related rows (e.g. group membership)
     /// can borrow a connection here.
     #[cfg(feature = "db")]
-    pub pool:
-        Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
+    pub pool: Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>,
 
     /// Registered [`Policy`] / [`Scope`] map, cloned from
     /// `AppState`. Lets the [`Scoped`] blanket trait resolve a
@@ -137,6 +136,44 @@ impl PolicyContext {
     /// instead.
     pub async fn from_session(session: &Session, auth_session_key: &str) -> Self {
         let user_id = session.get(auth_session_key).await;
+
+        // Seed the ambient current actor (#1383) with the authenticated session
+        // user, mirroring how `auth.rs` publishes the principal next to
+        // `log::context::set_user_id`. This is the single seam that covers every
+        // `#[repository(policy = ...)]` route which gates on a
+        // session-authenticated policy check but is NOT also wrapped by
+        // `RequireAuth`/`#[secured]`/an API-token bearer (the three existing
+        // `set_actor` sites) — without this, such a route's versioned writes
+        // would fall back to `SYSTEM_ACTOR` even though a real user is in scope.
+        //
+        // This session seed is only a *fallback*: it never overrides an
+        // already-established principal. If a stronger actor is already in scope
+        // — an API-token bearer, `RequireAuth`/`#[secured]`, or an explicit
+        // `with_actor(...)` scope — `Current::actor()` is already `Some`, so we
+        // skip the seed and the stronger actor wins (a request carrying both a
+        // bearer token and a session cookie stays attributed to the token
+        // principal). It also never overrides an explicit `AuditEvent` actor or a
+        // `before_*` hook's `ctx.actor`, which are applied downstream.
+        //
+        // In-request but with nothing yet published, the empty `CURRENT_ACTOR`
+        // scope makes `Current::actor()` return `None` (an in-scope unset does not
+        // consult the process default), so a pure policy+session route still gets
+        // seeded here. `set_actor` is a no-op outside an established request scope,
+        // so this stays panic-safe for non-request callers (e.g. hand-rolled
+        // policy unit tests), and it never publishes for an anonymous session
+        // (guarded on `Some`).
+        //
+        // Impersonation (#1394): when the session carries an impersonator, that
+        // operator — not the user the request resolves as — is the principal
+        // responsible for the writes this policy check gates.
+        if crate::current::Current::actor().is_none()
+            && let Some(user_id) = &user_id
+        {
+            crate::current::Current::set_actor(
+                crate::auth::impersonation::audit_actor_id(session, user_id).await,
+            );
+        }
+
         let role = session.get("role").await;
         let roles = role.into_iter().collect();
         Self {
@@ -237,6 +274,46 @@ impl PolicyContext {
         self
     }
 
+    /// The verified mTLS client identity of the connection this request arrived
+    /// on (issue #1640), when one was presented and verified.
+    ///
+    /// Machine identity, alongside the session user and token scopes: an
+    /// `#[authorize]` policy can decide on the calling *service*, not just the
+    /// calling person. `None` for every request over a connection with no
+    /// verified client certificate, and outside a request entirely.
+    ///
+    /// Read from the ambient request scope the HTTPS listener establishes
+    /// rather than carried as a field, so `PolicyContext` keeps the shape user
+    /// code constructs by hand. Like
+    /// [`Current::actor`](crate::current::Current::actor), it is scoped to the
+    /// task serving the request: a policy check moved onto a `tokio::spawn`ed
+    /// task sees `None`. A test injects one with
+    /// [`with_client_identity`](crate::tls::client_auth::with_client_identity).
+    #[cfg(feature = "tls")]
+    #[must_use]
+    pub fn client_identity(
+        &self,
+    ) -> Option<std::sync::Arc<crate::tls::client_auth::ClientIdentity>> {
+        crate::tls::client_auth::current_client_identity()
+    }
+
+    /// Whether the request arrived over a connection with a verified client
+    /// certificate.
+    #[cfg(feature = "tls")]
+    #[must_use]
+    pub fn has_client_identity(&self) -> bool {
+        self.client_identity().is_some()
+    }
+
+    /// Whether the verified client certificate carries `san`, e.g.
+    /// `ctx.client_has_san("URI:spiffe://acme/svc/orders")`. `false` when there
+    /// is no verified identity.
+    #[cfg(feature = "tls")]
+    #[must_use]
+    pub fn client_has_san(&self, san: &str) -> bool {
+        self.client_identity().is_some_and(|id| id.has_san(san))
+    }
+
     /// Build a fully-populated [`PolicyContext`] from `AppState` + `Session`,
     /// additionally threading the authenticating token's granted scopes (from
     /// the [`crate::auth::ApiTokenScopes`] request extension) into the context.
@@ -262,7 +339,7 @@ impl PolicyContext {
     #[must_use]
     pub fn with_pool(
         mut self,
-        pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
     ) -> Self {
         self.pool = Some(pool);
         self
@@ -375,15 +452,16 @@ pub trait Scope<R: Send + Sync + 'static>: Send + Sync + 'static {
     fn list<'a>(
         &'a self,
         _ctx: &'a PolicyContext,
-        _conn: &'a mut diesel_async::AsyncPgConnection,
+        _conn: &'a mut crate::db::RuntimeConnection,
     ) -> BoxFuture<'a, crate::AutumnResult<Vec<R>>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
 
 /// `Scope` companion that compiles when the `db` feature is off.
-/// The `db`-gated form takes `&mut AsyncPgConnection`; this one
-/// has no connection arg.
+/// The `db`-gated form takes `&mut RuntimeConnection` (the runtime
+/// pool connection — `AsyncPgConnection` by default, the `SQLite`
+/// wrapper under `--features sqlite`); this one has no connection arg.
 #[cfg(not(feature = "db"))]
 pub trait Scope<R: Send + Sync + 'static>: Send + Sync + 'static {
     fn list<'a>(&'a self, _ctx: &'a PolicyContext) -> BoxFuture<'a, crate::AutumnResult<Vec<R>>> {
@@ -419,7 +497,7 @@ impl<R: Send + Sync + 'static> ScopeQuery<'_, R> {
     /// scope's own errors otherwise.
     pub async fn load(
         self,
-        conn: &mut diesel_async::AsyncPgConnection,
+        conn: &mut crate::db::RuntimeConnection,
     ) -> crate::AutumnResult<Vec<R>> {
         let scope = self.ctx.policy_registry.scope::<R>().ok_or_else(|| {
             crate::AutumnError::from(std::io::Error::other(format!(
@@ -989,6 +1067,47 @@ mod tests {
         }
     }
 
+    // ── mTLS machine identity (#1640) ───────────────────────────────
+
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn client_identity_is_absent_outside_an_mtls_request() {
+        let c = ctx(Some("1"), None);
+        assert!(c.client_identity().is_none());
+        assert!(!c.has_client_identity());
+        assert!(!c.client_has_san("URI:spiffe://acme/svc/orders"));
+    }
+
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn a_policy_can_decide_on_the_verified_machine_identity() {
+        use std::sync::Arc;
+
+        use crate::tls::client_auth::{ClientIdentity, with_client_identity};
+
+        let identity = Arc::new(ClientIdentity::new_for_test(
+            "svc-orders",
+            vec!["URI:spiffe://acme/svc/orders".to_owned()],
+        ));
+
+        with_client_identity(Some(identity), async {
+            let c = ctx(None, None);
+            assert!(c.has_client_identity());
+            assert!(c.client_has_san("URI:spiffe://acme/svc/orders"));
+            assert!(!c.client_has_san("URI:spiffe://acme/svc/billing"));
+            assert_eq!(
+                c.client_identity()
+                    .expect("identity in scope")
+                    .common_name(),
+                Some("svc-orders")
+            );
+        })
+        .await;
+
+        // The scope ends with the request: nothing leaks to the next one.
+        assert!(!ctx(None, None).has_client_identity());
+    }
+
     #[tokio::test]
     async fn default_impls_deny() {
         struct EmptyPolicy;
@@ -1138,6 +1257,58 @@ mod tests {
         assert!(!c.has_scope("posts:read"));
     }
 
+    #[tokio::test]
+    async fn from_session_seeds_current_actor_for_authenticated_user() {
+        // Mirrors the request path: the log-context middleware establishes an
+        // empty current-actor scope, then a session-authenticated policy check
+        // resolves the user via `from_session`. Even without RequireAuth /
+        // #[secured] / an API-token bearer having fired, the resolved user must
+        // become the ambient actor so versioned writes attribute to them rather
+        // than falling back to SYSTEM_ACTOR (#1383).
+        crate::current::scope_request(async {
+            assert_eq!(crate::current::Current::actor(), None);
+            let session = session_with(Some("42"), Some("editor"));
+            let c = PolicyContext::from_session(&session, "user_id").await;
+            assert_eq!(c.user_id.as_deref(), Some("42"));
+            assert_eq!(crate::current::Current::actor(), Some("42".to_owned()));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn from_session_leaves_current_actor_none_for_anonymous() {
+        // An anonymous session must never publish an actor, so unauthenticated
+        // requests behave exactly as before this feature existed.
+        crate::current::scope_request(async {
+            let session = session_with(None, None);
+            let c = PolicyContext::from_session(&session, "user_id").await;
+            assert!(c.user_id.is_none());
+            assert_eq!(crate::current::Current::actor(), None);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn from_session_does_not_override_existing_actor() {
+        // The session seed is only a fallback. When a stronger principal is
+        // already established — an API-token bearer, RequireAuth/#[secured], or an
+        // explicit `with_actor(...)` scope — `from_session` must NOT clobber it,
+        // even if the request also carries a session cookie for a different user.
+        crate::current::scope_request(async {
+            crate::current::Current::set_actor("token-principal".to_owned());
+            let session = session_with(Some("42"), Some("editor"));
+            let c = PolicyContext::from_session(&session, "user_id").await;
+            // The session user is still resolved into the context...
+            assert_eq!(c.user_id.as_deref(), Some("42"));
+            // ...but the already-established principal wins as the ambient actor.
+            assert_eq!(
+                crate::current::Current::actor(),
+                Some("token-principal".to_owned())
+            );
+        })
+        .await;
+    }
+
     #[test]
     fn forbidden_response_status_and_message_round_trip() {
         assert_eq!(
@@ -1278,7 +1449,7 @@ mod tests {
         #[cfg(feature = "db")]
         fn pool(
             &self,
-        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
         {
             None
         }

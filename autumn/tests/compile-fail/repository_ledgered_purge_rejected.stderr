@@ -1,0 +1,5 @@
+error[E0599]: no method named `purge` found for reference `&PgLedgeredPurgeNoteRepository` in the current scope
+  --> tests/compile-fail/repository_ledgered_purge_rejected.rs:41:10
+   |
+41 |     repo.purge(1).await.expect("no such method");
+   |          ^^^^^ method not found in `&PgLedgeredPurgeNoteRepository`

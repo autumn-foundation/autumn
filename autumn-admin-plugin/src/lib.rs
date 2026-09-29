@@ -35,17 +35,21 @@
 mod auth;
 pub mod experiments;
 pub mod feature_flags;
+mod impersonation;
 mod registry;
 mod routes;
 mod templates;
 pub mod tokens;
 mod traits;
 
+pub use impersonation::{AdminImpersonation, impersonation_banner_for};
 pub use registry::AdminRegistry;
+pub use templates::{IMPERSONATION_BANNER_CSS, ImpersonationBanner, impersonation_banner};
 pub use traits::{
     AdminAction, AdminError, AdminField, AdminFieldKind, AdminFuture, AdminHistoryEntry,
     AdminHistoryPage, AdminImportError, AdminImportReport, AdminImportRowResult, AdminModel,
     CsvImportMode, ListParams, ListResult, SelectOption, SortDirection,
+    dispatch_restore_purge_or_unhandled,
 };
 
 /// Common downstream imports for implementing admin models.
@@ -53,7 +57,7 @@ pub mod prelude {
     pub use crate::{
         AdminError, AdminField, AdminFieldKind, AdminFuture, AdminHistoryEntry, AdminHistoryPage,
         AdminImportRowResult, AdminModel, CsvImportMode, ListParams, ListResult, SelectOption,
-        SortDirection,
+        SortDirection, dispatch_restore_purge_or_unhandled,
     };
 }
 
@@ -61,6 +65,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use autumn_web::app::AppBuilder;
+use autumn_web::auth::impersonation::ImpersonationGate;
 use autumn_web::plugin::Plugin;
 use autumn_web::route_listing::RouteInfo;
 use autumn_web::runtime_config::RuntimeConfigService;
@@ -85,6 +90,10 @@ pub struct AdminPlugin {
     /// Defaults to [`autumn_web::step_up::DEFAULT_MAX_AGE_SECS`].
     /// Override with [`AdminPlugin::with_step_up_max_age`].
     step_up_max_age_secs: u64,
+    /// Authorization gate for user impersonation, installed by
+    /// [`AdminPlugin::with_impersonation`]. `None` (the default) leaves the
+    /// impersonation routes unmounted entirely.
+    impersonation: Option<ImpersonationGate>,
 }
 
 impl AdminPlugin {
@@ -105,6 +114,7 @@ impl AdminPlugin {
             runtime_config: None,
             step_up_mutations: false,
             step_up_max_age_secs: autumn_web::step_up::DEFAULT_MAX_AGE_SECS,
+            impersonation: None,
         }
     }
 
@@ -214,6 +224,50 @@ impl AdminPlugin {
         self.step_up_max_age_secs = secs;
         self
     }
+
+    /// Enable **user impersonation** ("log in as this user") for this admin
+    /// panel, gated by `gate` (issue #1394).
+    ///
+    /// Opt-in in two senses. Without this call the impersonation routes are not
+    /// mounted at all, *and* the core primitive
+    /// ([`autumn_web::auth::impersonation`]) default-denies — so an app can
+    /// never acquire impersonation by accident. With it, two routes appear:
+    ///
+    /// | Route | Guard |
+    /// |---|---|
+    /// | `POST {prefix}/impersonate` (body: `user_id`) | admin role + step-up (if enabled) + `gate` |
+    /// | `POST {prefix}/impersonate/stop` | none — reverting must always work |
+    ///
+    /// Every admin page then renders the persistent "Viewing as … — Stop
+    /// impersonating" banner. Put the same banner in your **application**
+    /// layout with [`impersonation_banner_for`] so it is visible on the pages
+    /// the operator is actually looking at.
+    ///
+    /// **Requires an audit sink.** `begin_impersonation` refuses with `500`
+    /// unless the app has an [`AuditLogger`](autumn_web::audit::AuditLogger)
+    /// carrying at least one sink, because an unrecorded identity swap is the
+    /// exact failure this feature exists to prevent. The plugin logs an error at
+    /// startup when the sink is missing.
+    ///
+    /// The gate is also where an app enforces its own boundaries — in
+    /// particular tenancy, which the framework cannot infer: the policy
+    /// receives the full [`PolicyContext`](autumn_web::authorization::PolicyContext),
+    /// session and DB pool included.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::auth::impersonation::ImpersonationGate;
+    ///
+    /// AdminPlugin::new()
+    ///     .register(UserAdmin::default())
+    ///     .with_impersonation(ImpersonationGate::allow_roles(["admin"]))
+    /// ```
+    #[must_use]
+    pub fn with_impersonation(mut self, gate: ImpersonationGate) -> Self {
+        self.impersonation = Some(gate);
+        self
+    }
 }
 
 impl Default for AdminPlugin {
@@ -223,6 +277,15 @@ impl Default for AdminPlugin {
 }
 
 impl Plugin for AdminPlugin {
+    /// This plugin ships in lockstep with `autumn-web` — see
+    /// [`lockstep_contract`](autumn_web::plugin_contract::lockstep_contract).
+    fn contract(&self) -> Option<autumn_web::plugin_contract::PluginContract> {
+        Some(autumn_web::plugin_contract::lockstep_contract(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ))
+    }
+
     fn name(&self) -> Cow<'static, str> {
         Cow::Borrowed("autumn-admin-plugin")
     }
@@ -237,6 +300,7 @@ impl Plugin for AdminPlugin {
             runtime_config,
             step_up_mutations,
             step_up_max_age_secs,
+            impersonation,
         } = self;
         let has_config = runtime_config.is_some();
         // "config" slug only conflicts when the runtime-config routes are mounted.
@@ -244,6 +308,14 @@ impl Plugin for AdminPlugin {
             !(has_config && registry.get("config").is_some()),
             "autumn-admin: model slug 'config' conflicts with the mounted runtime-config \
              routes; rename the model or don't call with_runtime_config",
+        );
+        // Same hazard the "config" guard above covers: `POST {prefix}/impersonate`
+        // is a literal route, so a model registered at that slug would silently
+        // lose its create endpoint to the impersonation handler.
+        assert!(
+            !(impersonation.is_some() && registry.get("impersonate").is_some()),
+            "autumn-admin: model slug 'impersonate' conflicts with the mounted \
+             impersonation routes; rename the model or don't call with_impersonation",
         );
         let registry = Arc::new(registry);
         let router = routes::admin_router(
@@ -255,6 +327,7 @@ impl Plugin for AdminPlugin {
             runtime_config,
             step_up_mutations,
             step_up_max_age_secs,
+            impersonation.is_some(),
         );
 
         tracing::info!(
@@ -269,8 +342,42 @@ impl Plugin for AdminPlugin {
 
         // Declare routes for `autumn routes` listing. The underlying Axum router
         // is added via nest() which is opaque to route enumeration, so we
-        // explicitly register route metadata here.
-        let declared = admin_route_infos(&prefix, has_config);
+        // explicitly register route metadata here. Because the declared routes'
+        // paths all fall under the nest prefix, `autumn routes audit` treats this
+        // mount as covered (enumerable) instead of an omitted, unprovable raw
+        // router that would false-fail the gate.
+        let declared = admin_route_infos(
+            &prefix,
+            has_config,
+            require_role.as_deref(),
+            impersonation.is_some(),
+        );
+
+        let app = match impersonation {
+            // Publish the gate so the core primitive can find it. Registered
+            // here rather than asked of the application, so `with_impersonation`
+            // is the single opt-in.
+            // `impersonation_gate` registers the gate and reports a
+            // self-destructive `auth.session_key` at boot; the audit-sink check
+            // below is the plugin's own addition.
+            Some(gate) => app.impersonation_gate(gate).state_initializer(|state| {
+                // Surface the audit requirement at startup rather than at the
+                // first impersonation attempt: `begin_impersonation` refuses
+                // with 500 without a sink, and a 500 in front of a support
+                // engineer is a worse place to learn this than a boot log.
+                let audited = state
+                    .extension::<autumn_web::audit::AuditLogger>()
+                    .is_some_and(|logger| logger.is_enabled());
+                if !audited {
+                    tracing::error!(
+                        "🍂 Autumn Admin: impersonation is enabled but no audit sink is \
+                         configured; every attempt will be refused. Register one with \
+                         `AppBuilder::with_audit_sink(...)`."
+                    );
+                }
+            }),
+            None => app,
+        };
 
         app.nest(&prefix, router).declare_plugin_routes(declared)
     }
@@ -284,7 +391,29 @@ impl Plugin for AdminPlugin {
 ///
 /// Kept in sync with `routes::admin_router` — update here when routes are
 /// added or removed from the admin router.
-pub(crate) fn admin_route_infos(prefix: &str, has_config: bool) -> Vec<RouteInfo> {
+///
+/// `require_role` mirrors [`AdminPlugin::require_role`]: the whole admin router
+/// is wrapped in role-check middleware, so every declared route inherits that
+/// posture. When a role is required the routes classify [`Gated`] (carrying the
+/// role) rather than `Unclassified`; when the plugin's auth is explicitly
+/// disabled (`None`) they classify [`Public`]. Without this, the default admin
+/// plugin would false-fail `autumn routes audit` out of the box, since declared
+/// routes otherwise inherit `Unclassified` from `RouteInfo::default()`.
+///
+/// [`Gated`]: autumn_web::route_listing::RouteClassification::Gated
+/// [`Public`]: autumn_web::route_listing::RouteClassification::Public
+pub(crate) fn admin_route_infos(
+    prefix: &str,
+    has_config: bool,
+    require_role: Option<&str>,
+    has_impersonation: bool,
+) -> Vec<RouteInfo> {
+    use autumn_web::route_listing::RouteClassification;
+
+    let (classification, roles) = require_role.map_or_else(
+        || (RouteClassification::Public, Vec::new()),
+        |role| (RouteClassification::Gated, vec![role.to_owned()]),
+    );
     let mut entries: Vec<(&str, String)> = vec![
         ("GET", prefix.to_string()),
         ("GET", format!("{prefix}/jobs")),
@@ -301,6 +430,9 @@ pub(crate) fn admin_route_infos(prefix: &str, has_config: bool) -> Vec<RouteInfo
             ("GET", format!("{prefix}/config/{{key}}/history")),
         ]);
     }
+    if has_impersonation {
+        entries.push(("POST", format!("{prefix}/impersonate")));
+    }
     entries.extend([
         ("GET", format!("{prefix}/{{slug}}")),
         ("POST", format!("{prefix}/{{slug}}")),
@@ -316,6 +448,15 @@ pub(crate) fn admin_route_infos(prefix: &str, has_config: bool) -> Vec<RouteInfo
         ("POST", format!("{prefix}/{{slug}}/actions")),
         ("GET", format!("{prefix}{}", *routes::ADMIN_JS_PATH)),
     ]);
+    // The revert route is intentionally ungated (see `routes::admin_router`),
+    // so it is declared separately as `Public` rather than inheriting the admin
+    // role — declaring it `Gated` would make the route audit assert a guard
+    // that genuinely is not there.
+    let ungated: Vec<(&str, String)> = if has_impersonation {
+        vec![("POST", format!("{prefix}/impersonate/stop"))]
+    } else {
+        Vec::new()
+    };
     entries
         .into_iter()
         .map(|(method, path)| RouteInfo {
@@ -323,12 +464,41 @@ pub(crate) fn admin_route_infos(prefix: &str, has_config: bool) -> Vec<RouteInfo
             path,
             handler: format!("admin::{}", method.to_lowercase()),
             source: autumn_web::route_listing::RouteSource::User, // overwritten by declare_plugin_routes
-            middleware: vec![],
-            api_version: None,
-            status: None,
-            sunset_opt_out: None,
+            classification,
+            roles: roles.clone(),
+            ..Default::default()
         })
+        .chain(ungated.into_iter().map(|(method, path)| RouteInfo {
+            method: method.to_owned(),
+            path,
+            handler: format!("admin::{}", method.to_lowercase()),
+            source: autumn_web::route_listing::RouteSource::User,
+            classification: RouteClassification::Public,
+            roles: Vec::new(),
+            ..Default::default()
+        }))
         .collect()
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::AdminPlugin;
+    use autumn_web::plugin::Plugin;
+
+    #[test]
+    fn contract_declares_lockstep_with_own_crate() {
+        let contract = AdminPlugin::new().contract().expect("a contract");
+        assert_eq!(contract.plugin, env!("CARGO_PKG_NAME"));
+        assert_eq!(
+            contract.plugin_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            contract.autumn_web.as_deref(),
+            Some(autumn_web::plugin_contract::lockstep_range(env!("CARGO_PKG_VERSION")).as_str())
+        );
+        assert!(contract.experimental_surfaces.is_empty());
+    }
 }
 
 // ── Conformance reference tests ────────────────────────────────────────────
@@ -356,7 +526,7 @@ mod conformance_tests {
     }
 
     fn admin_routes_with_config(prefix: &str, has_config: bool) -> Vec<RouteInfo> {
-        super::admin_route_infos(prefix, has_config)
+        super::admin_route_infos(prefix, has_config, Some("admin"), true)
             .into_iter()
             .map(|mut r| {
                 r.source = RouteSource::Plugin(PLUGIN_NAME.to_owned());
@@ -455,6 +625,93 @@ mod conformance_tests {
         }
     }
 
+    /// The default admin plugin guards its whole router with role-check
+    /// middleware, so its declared routes must classify `Gated` (carrying the
+    /// role) — not `Unclassified` — or `autumn routes audit` would false-fail
+    /// every protected admin route out of the box (#1604).
+    #[test]
+    fn admin_plugin_declared_routes_classify_gated_with_role() {
+        use autumn_web::route_listing::RouteClassification;
+
+        let routes = super::admin_route_infos("/admin", true, Some("admin"), false);
+        assert!(!routes.is_empty());
+        for r in &routes {
+            assert_eq!(
+                r.classification,
+                RouteClassification::Gated,
+                "admin route {} {} should be Gated, got {:?}",
+                r.method,
+                r.path,
+                r.classification
+            );
+            assert_eq!(
+                r.roles,
+                vec!["admin".to_owned()],
+                "admin route {} {} should carry the required role",
+                r.method,
+                r.path
+            );
+        }
+    }
+
+    /// The impersonation routes are declared only when
+    /// [`AdminPlugin::with_impersonation`] was called, and the revert route is
+    /// declared `Public` because it is deliberately mounted outside the role
+    /// gate (see `routes::admin_router`) — declaring it `Gated` would make the
+    /// route audit assert a guard that is not there.
+    #[test]
+    fn impersonation_routes_are_declared_only_when_enabled() {
+        use autumn_web::route_listing::RouteClassification;
+
+        let off = super::admin_route_infos("/admin", false, Some("admin"), false);
+        assert!(
+            !off.iter().any(|r| r.path.contains("/impersonate")),
+            "no impersonation routes without the opt-in"
+        );
+
+        let on = super::admin_route_infos("/admin", false, Some("admin"), true);
+        let begin = on
+            .iter()
+            .find(|r| r.path == "/admin/impersonate")
+            .expect("begin route declared");
+        assert_eq!(begin.method, "POST");
+        assert_eq!(begin.classification, RouteClassification::Gated);
+        assert_eq!(begin.roles, vec!["admin".to_owned()]);
+
+        let stop = on
+            .iter()
+            .find(|r| r.path == "/admin/impersonate/stop")
+            .expect("revert route declared");
+        assert_eq!(stop.method, "POST");
+        assert_eq!(
+            stop.classification,
+            RouteClassification::Public,
+            "the revert route is ungated on purpose"
+        );
+        assert!(stop.roles.is_empty());
+    }
+
+    /// When the plugin's auth is explicitly disabled (`require_role(None)`) the
+    /// declared routes classify `Public` — still a proven posture, so the audit
+    /// gate passes rather than flagging them `Unclassified`.
+    #[test]
+    fn admin_plugin_declared_routes_classify_public_when_role_disabled() {
+        use autumn_web::route_listing::RouteClassification;
+
+        let routes = super::admin_route_infos("/admin", true, None, false);
+        assert!(!routes.is_empty());
+        for r in &routes {
+            assert_eq!(
+                r.classification,
+                RouteClassification::Public,
+                "admin route {} {} should be Public when auth disabled",
+                r.method,
+                r.path
+            );
+            assert!(r.roles.is_empty(), "public route should carry no roles");
+        }
+    }
+
     #[test]
     fn admin_plugin_has_no_route_collisions_in_isolation() {
         let routes = admin_routes("/admin");
@@ -528,10 +785,7 @@ mod conformance_tests {
             path: "/admin".to_owned(),
             handler: "host::admin_redirect".to_owned(),
             source: RouteSource::User,
-            middleware: vec![],
-            api_version: None,
-            status: None,
-            sunset_opt_out: None,
+            ..Default::default()
         });
         let (result, diagnostics) = autumn_web::plugin_conformance::check_collisions(&routes);
         assert_eq!(

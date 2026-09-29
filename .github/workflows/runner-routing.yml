@@ -1,0 +1,51 @@
+name: runner-routing
+
+# Reusable workflow: decides whether a heavy job runs on the self-hosted
+# Hetzner runner set or falls back to GitHub-hosted ubuntu-latest.
+#
+# Two gates, BOTH must pass to use self-hosted:
+#   1. BASE-REPO-CONTROLLED event — a push / workflow_dispatch / schedule, whose
+#      workflow DEFINITION comes from the base repo. A pull_request NEVER routes
+#      to self-hosted: for a PR, GitHub executes the workflow files from the PR
+#      head, which a fork controls — so a fork could edit this routing file (or a
+#      caller's runs-on) to emit the self-hosted labels and defeat any
+#      in-workflow trust check. The boundary is therefore STRUCTURAL (which
+#      events may reach this lane at all), not a fork-editable comparison.
+#      (autumn is public.)
+#   2. OPT-IN — the repo variable AUTUMN_SELF_HOSTED_HEAVY == "1". Unsetting or
+#      changing it instantly reverts every heavy lane to ubuntu-latest (the
+#      one-switch fallback when the box is down or being rebuilt).
+on:
+  workflow_call:
+    outputs:
+      heavy_runs_on:
+        description: "JSON runs-on value for heavy trusted lanes."
+        value: ${{ jobs.pick.outputs.heavy_runs_on }}
+
+jobs:
+  pick:
+    runs-on: ubuntu-latest
+    outputs:
+      heavy_runs_on: ${{ steps.pick.outputs.heavy_runs_on }}
+    steps:
+      - id: pick
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          OPT_IN: ${{ vars.AUTUMN_SELF_HOSTED_HEAVY }}
+        run: |
+          set -euo pipefail
+          # Only events whose workflow DEFINITION comes from the base repo may
+          # select the self-hosted lane: push, workflow_dispatch, schedule. A
+          # pull_request runs the workflow files from the PR head — which a fork
+          # controls — so a fork could edit this file (or a caller's runs-on) to
+          # emit the self-hosted labels and defeat any in-workflow trust check.
+          # Therefore pull_request NEVER routes to self-hosted, by construction.
+          case "$EVENT_NAME" in
+            push|workflow_dispatch|schedule) base_repo_event=true ;;
+            *)                               base_repo_event=false ;;
+          esac
+          if [ "$base_repo_event" = true ] && [ "${OPT_IN:-}" = "1" ]; then
+            echo 'heavy_runs_on=["self-hosted","hetzner","linux","x64"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'heavy_runs_on=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+          fi

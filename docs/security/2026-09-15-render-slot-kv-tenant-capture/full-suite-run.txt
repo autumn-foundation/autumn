@@ -1,0 +1,30 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.65s
+     Running tests/integration_tests.rs (target/debug/deps/integration_tests-347d6fc992bee7fb)
+
+running 23 tests
+test integration::plugin_sandbox_capabilities::a_granted_slot_yields_a_sanitized_fragment ... ok
+test integration::plugin_sandbox_capabilities::a_call_parsed_from_a_rejected_write_never_reaches_a_backend ... ok
+test integration::plugin_sandbox_capabilities::a_capability_with_no_backend_is_denied_rather_than_quietly_succeeding ... ok
+test integration::plugin_sandbox_capabilities::a_capability_plugin_still_serves_its_own_prefix ... ok
+test integration::plugin_sandbox_capabilities::a_hostile_or_broken_hook_omits_the_fragment_rather_than_breaking_the_page ... ok
+test integration::plugin_sandbox_capabilities::a_plugin_without_the_render_capability_fills_no_slot ... ok
+test integration::plugin_sandbox_capabilities::a_plugin_over_its_quota_does_not_stop_a_host_route_on_the_same_router ... ok
+test integration::plugin_sandbox_capabilities::a_page_renders_the_good_plugins_fragment_and_omits_the_bad_ones ... ok
+test integration::plugin_sandbox_capabilities::a_row_read_back_can_be_written_back_without_stripping_the_hosts_column ... ok
+test integration::plugin_sandbox_capabilities::a_quota_bust_denies_the_call_without_touching_another_plugin_or_a_host_route ... ok
+test integration::plugin_sandbox_capabilities::a_trapping_hook_omits_the_fragment ... ok
+test integration::plugin_sandbox_capabilities::a_value_a_plugin_stores_round_trips_through_the_wire ... ok
+test integration::plugin_sandbox_capabilities::an_operator_can_answer_what_this_plugin_did ... ok
+test integration::plugin_sandbox_capabilities::growing_the_vocabulary_added_not_one_import_to_a_module ... ok
+test integration::plugin_sandbox_capabilities::one_reference_plugin_reaches_every_subsystem_over_the_wire ... ok
+test integration::plugin_sandbox_capabilities::one_tenants_writes_are_unreadable_from_another_tenants_request ... ok
+test integration::plugin_sandbox_capabilities::a_reply_the_guest_reads_gives_its_budget_back ... ok
+test integration::plugin_sandbox_capabilities::the_tenant_a_mounted_plugin_binds_to_is_the_requests_own ... ok
+test integration::plugin_sandbox_capabilities::the_escape_corpus_is_contained_end_to_end ... ok
+test integration::plugin_sandbox_capabilities::the_tenant_a_render_hooks_kv_write_lands_under_is_the_callers_own ... ok
+test integration::plugin_sandbox_capabilities::two_plugins_sharing_a_store_cannot_be_named_onto_one_table ... ok
+test integration::plugin_sandbox_capabilities::a_guest_that_never_reads_its_replies_is_stopped_rather_than_growing_the_host ... ok
+test integration::plugin_sandbox_capabilities::a_slow_hook_omits_the_fragment_rather_than_holding_the_page ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 2052 filtered out; finished in 3.70s
+
