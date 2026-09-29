@@ -6644,7 +6644,7 @@ mod tests {
         // psql cannot see the difference.
         assert_eq!(
             &lines[..2],
-            &[r#"\setenv PGHOSTADDR"#, r#"\setenv PGSERVICE"#],
+            &[r"\setenv PGHOSTADDR", r"\setenv PGSERVICE"],
             "the boundary must clear libpq's environment-routed endpoint knobs first: {lines:?}"
         );
         let line = lines.join("\n");
@@ -6973,7 +6973,15 @@ mod tests {
             );
         }
 
-        // An unsampled target emits nothing: no capture, no assertions.
+    }
+
+    /// An unsampled target emits nothing: no capture, no assertions.
+    #[test]
+    fn an_unsampled_target_prints_no_postconditions() {
+        use super::sample::{SampleInputs, SampleRules, build_plan};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let rules = SampleRules::default();
         let empty = build_plan(&SampleInputs {
             roots: &[],
             seed: 7,
