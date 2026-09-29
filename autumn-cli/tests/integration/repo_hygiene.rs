@@ -9291,13 +9291,14 @@ fn capacity_contract_scheduled_probe_uses_declared_defaults() {
         }
         if indent == 6 && trimmed.ends_with(':') {
             input_name = Some(trimmed.trim_end_matches(':').to_string());
-        } else if indent == 8 && trimmed.starts_with("default:") {
-            if let Some(name) = input_name.take() {
-                let value = trimmed["default:".len()..]
-                    .trim()
-                    .trim_matches(|c| c == '"' || c == '\'');
-                declared.insert(name, value.to_string());
-            }
+        } else if indent == 8
+            && trimmed.starts_with("default:")
+            && let Some(name) = input_name.take()
+        {
+            let value = trimmed["default:".len()..]
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'');
+            declared.insert(name, value.to_string());
         }
     }
     assert!(
@@ -9329,7 +9330,7 @@ fn capacity_contract_scheduled_probe_uses_declared_defaults() {
                 let fallback = fallback.trim_start();
                 let quote = fallback.chars().next();
                 assert!(
-                    matches!(quote, Some('\'') | Some('"')),
+                    matches!(quote, Some('\'' | '"')),
                     "capacity-contract.yml line {}: `inputs.{name}` fallback must be a quoted literal",
                     lineno + 1,
                 );
