@@ -1268,6 +1268,200 @@ both crates for you and keeps the paths you already write.
 that no codemod may add on the reader's behalf, and the right answer for most
 readers is to depend on `autumn-web` instead, which is a design decision.
 
+### Widgets: widget CSS classes are now `autumn-`-prefixed (#2354)
+
+**Why:** several widgets emitted unprefixed class hooks (`card`,
+`card-header`, `stat-card`, `active`, …) that the widget stylesheet
+(`/static/css/autumn-widgets.css`) never styled — so the `/_stories`
+previews and any app linking only the bundle rendered those widgets
+unstyled, and generic hooks like `active` collided with app CSS. Every
+widget-emitted class now lives in the `autumn-*` namespace and is backed by
+a rule in the widget stylesheet.
+
+**You are affected only if your own CSS or JS targets the old hooks.**
+Widget output is unchanged apart from the class names.
+
+**Before (`{X.Y}`):**
+
+```css
+.card { border: 1px solid #e5e7eb; }
+.card-header { font-weight: 600; }
+a.active { color: red; }
+```
+
+**After (`{(X+1).0}`):**
+
+```css
+.autumn-card { border: 1px solid #e5e7eb; }
+.autumn-card__header { font-weight: 600; }
+a.autumn-active { color: red; }
+```
+
+Full mapping: `card` → `autumn-card`, `card-header` →
+`autumn-card__header`, `card-title` → `autumn-card__title`, `card-body` →
+`autumn-card__body`, `card-footer` → `autumn-card__footer`, `stat-card` →
+`autumn-stat-card`, `stat-label` → `autumn-stat-card__label`, `stat-value` →
+`autumn-stat-card__value`, `stat-link` → `autumn-stat-card__link`,
+`search-empty` → `autumn-search-empty`, `autocomplete-empty` →
+`autumn-autocomplete-empty`, `alert__icon-svg` → `autumn-alert__icon-svg`,
+`active` → `autumn-active` (on `nav_link()` output only).
+
+**Automation:** `manual` — the selectors live in the reader's own
+stylesheets, which no codemod may rewrite on their behalf.
+### autumn-billing: `Customer.user_id` is tenant-scoped under tenancy
+
+**Why:** `SessionUser`/`Entitled<R>` keyed every `autumn-billing` store lookup
+on the bare session user id, with no tenant component. That id is only
+guaranteed unique WITHIN one tenant — a sharded, `tenant_scoped` `User`
+model's row id is a **shard-local** `BIGSERIAL` (`docs/guide/sharding.md`),
+so two different tenants routinely produce the identical id — while
+`BillingPlugin` always resolves the app's one primary connection pool, never
+a per-shard one. An app combining `BillingPlugin` with tenancy could have one
+tenant's user read, and through the hosted Stripe portal potentially manage,
+another tenant's subscription the instant both users' ids collided. See
+`docs/security/2026-09-23-billing-cross-tenant-identity-collision/`.
+
+**You are affected only if your app enables Autumn's tenancy feature AND
+mounts `BillingPlugin`.** An app without tenancy enabled sees no change at
+all — `Customer.user_id` is computed exactly as before.
+
+For an affected app, `Customer.user_id` — and therefore whatever
+[`BillingHooks::recipient_for`](../../autumn-billing/src/hooks.rs) receives —
+is now an opaque, tenant-scoped identity rather than the bare session id.
+Recover the raw id with
+[`autumn_billing::gate::strip_tenant_scope`](../../autumn-billing/src/gate.rs);
+the exact wire format is deliberately not documented here — it is not public
+API and is not guaranteed stable. The **default** `recipient_for`
+implementation already calls it, so it needs no change. A custom override
+that assumed the bare session id under tenancy needs the same one-line
+change:
+
+```diff
+ fn recipient_for(&self, user_id: &str) -> Option<i64> {
+-    user_id.parse().ok()
++    autumn_billing::gate::strip_tenant_scope(user_id).parse().ok()
+ }
+```
+
+**Every pre-existing `billing_customers` row keyed by a bare, unscoped
+`user_id` goes dark, immediately, on upgrade** — not "eventually" or
+"indistinguishably": every lookup now keys on the tenant-scoped identity, so
+`customer_by_user` misses the row on the very next request, and `Entitled<R>`
+reports `entitled: false` for an already-paying user until it is relinked.
+This is not only the app newly enabling tenancy on top of existing billing
+data — **it is every tenancy-enabled app upgrading `autumn-billing` past
+this fix**, including one that already ran tenancy and `BillingPlugin`
+together before this release: pre-fix, `Customer.user_id` was never
+tenant-scoped regardless of when tenancy was turned on, so every row any
+such app has today is a bare id. Nothing relinks it automatically:
+`upsert_customer` deliberately never replaces an existing `user_id` link (see
+its doc), so even a fresh checkout does not repair the row — it creates a
+**second** provider customer instead, which can produce a duplicate Stripe
+subscription. Relink every pre-existing row explicitly — before upgrading if
+you can stage it, immediately after if you cannot — with the tenant you
+already know it belongs to from your own records:
+
+```rust
+let service = autumn_billing::BillingService::require(&state)?;
+let scoped_id = autumn_billing::gate::scope_identity(tenant, &legacy_user_id);
+service
+    .store()
+    .relink_customer(&customer_id, scoped_id, Utc::now())
+    .await?;
+```
+
+`relink_customer` is the one store method allowed to overwrite an existing
+link — restricted to operator-driven migrations for exactly this reason (see
+its doc on [`BillingStore`](../../autumn-billing/src/store/mod.rs)); nothing
+in request-handling or webhook code calls it. It returns
+`BillingError::Conflict` if `scoped_id` already links a different customer
+(for example, a fresh checkout already created one under the new id before
+you relinked the old row) — resolve that by hand, since it means two
+provider customers now exist for the one legacy row.
+
+`relink_customer` is a **new method on the `BillingStore` trait**, which an
+app can implement its own backend against (`BillingPlugin::store`). It has a
+default implementation returning `BillingError::Unsupported`, specifically
+so a `BillingStore` implemented before this method existed keeps compiling
+unchanged — this is source-compatible for every implementor, tenancy or not.
+A custom store that wants to support the relink recipe above needs to
+override it; `MemoryBillingStore` and `DbBillingStore` already do.
+
+**A caller of `Billing::current_subscription`, `is_entitled`, or `require`
+directly** — outside `SessionUser`/`Entitled<R>`, which already resolve the
+right value internally — must pass the same tenant-scoped identity these
+three methods key their store lookup on. If your own code resolves "the
+current user" some other way (your own auth extractor, a background job) and
+calls one of these three with that bare id under tenancy, it silently misses
+an otherwise-paying user's row and denies entitlement — nothing in these
+methods' `user_id: &str` signature stops you from passing the wrong one.
+Pass whatever `Billing::current_user`/`session_user_id` already returned for
+this request, or build the identity explicitly with
+`autumn_billing::gate::scope_identity(tenant, &raw_user_id)` when you don't
+have that value at hand.
+
+**Automation:** `manual` — a custom `recipient_for` override, if one exists,
+needs the diff above; every pre-existing `billing_customers` row of every
+tenancy-enabled app running `BillingPlugin` — whether tenancy was just
+turned on or has been running alongside billing all along — needs the
+`relink_customer` call above; a direct caller of `current_subscription`/
+`is_entitled`/`require` needs the scoped-identity fix above; the default
+`recipient_for` implementation, `SessionUser`/`Entitled<R>`, and every other
+consumer of `Customer.user_id` need no change.
+
+
+### http_client: `ClientError` is `#[non_exhaustive]` and gains `SimNetwork` (#2967)
+
+**Why:** the simulated network (`sim::SimNet`) fails calls with drops,
+partitions, timeouts and unknown hosts. A real `reqwest::Error` cannot be built
+for these, so they need their own variant. The enum is now
+`#[non_exhaustive]`, so the next new variant is not a breaking change.
+
+You are affected only if you `match` on `ClientError` with no wildcard arm.
+Outside a `Sim` with a `SimNet`, the variant never occurs.
+
+**Before (`{X.Y}`):**
+
+```rust
+match error {
+    ClientError::Request(_) => retry(),
+    ClientError::Json(_) => bad_payload(),
+    // … every other variant, no `_` arm
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+match error {
+    ClientError::Request(_) | ClientError::SimNetwork(_) => retry(),
+    ClientError::Json(_) => bad_payload(),
+    _ => give_up(), // required: the enum is `#[non_exhaustive]`
+}
+```
+
+**Automation:** `manual` — the right arm depends on what your code does with a
+network failure.
+
+### Sim: `SimClock` and `SimApp` are no longer public (#2967)
+
+**Why:** no public API returned either type, so no code could hold one.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::sim::{Sim, SimApp, SimClock};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::sim::Sim;
+// Reach the app with `sim.client()` and time with `sim.advance(..)`.
+```
+
+**Automation:** `manual` — delete the import; nothing else can have used the
+types.
 
 ## Plugin authors
 
@@ -1514,6 +1708,23 @@ Other changes that still compile but behave differently at runtime. Examples:
 - Error responses adopted a new JSON shape.
 - A default middleware is now ordered differently.
 - A scheduled task now runs on a different worker.
+
+### Sim: framework code reads the sim clock (#2967)
+
+Inside a `Sim`, framework code with no clock in scope now reads the sim's
+virtual clock (`time::ambient_now` and its siblings), not the OS clock. This
+covers about 55 modules and the `deleted_at` stamp `#[repository]` writes for a
+soft delete. Wall time starts at the sim epoch, `2020-01-01T00:00:00Z`. A sim
+test that compares such a value with `Utc::now()` fails; compare it with the
+sim clock instead. Outside a `Sim`, nothing changes.
+
+### Sim: `run_to_idle` panics when the drain does not settle (#2967)
+
+Before, `Sim::run_to_idle` stopped after its step bound and gave no signal.
+Now, when work still runs in the last rounds of the drain (for example, a job
+that enqueues itself again), it panics with a `sim drain stall` message and
+the seed. A test that relied on the silent stop fails with that message. Fix
+the endless work, or call `Sim::try_run_to_idle` and handle the `SimStall`.
 
 ## Deprecations retained from `{X.Y}`
 

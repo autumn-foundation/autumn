@@ -5,6 +5,14 @@
 //! Autumn models audit writes as append-only events sent to one or more
 //! sinks (database, SIEM adapter, dedicated file, etc.).
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::future::Future;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -70,7 +78,7 @@ impl AuditEvent {
         status: AuditStatus,
     ) -> Self {
         Self {
-            timestamp: Utc::now(),
+            timestamp: crate::time::ambient_now(),
             actor_id: actor_id.into(),
             action: action.into(),
             target_resource_id: target_resource_id.into(),
@@ -457,6 +465,10 @@ impl AuditSink for JsonlFileAuditSink {
             // extension, between `audit.log` and `audit.jsonl` in one
             // directory — and `File::create` truncates, so the loser's
             // partial write gets renamed over the archive.
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "real nanoseconds keep the temp name unique on the real filesystem; a paused virtual clock repeats them"
+            )]
             let temp_path = self.path.with_file_name(format!(
                 "{}.{}.{}.autumn-retention.tmp",
                 self.path.file_name().map_or_else(

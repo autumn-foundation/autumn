@@ -112,6 +112,7 @@ Looking for the API reference instead? That is
 - [Cookie Consent](cookie-consent.md) — the consent gate, the banner, and the withdraw flow
 - [Bot Protection and CAPTCHA](bot-protection.md) — keeping automated traffic off a form or route
 - [TLS and HTTPS](tls.md) — certificates, ACME, and terminating TLS
+- [CORS and Cross-Origin Requests](cors.md) — letting a browser on another origin read your responses
 - [Data Retention for Framework-Owned Data](data-retention.md) — bounding the tables Autumn itself creates
 - [Data-Retention Sweeps](retention-sweeps.md) — auto-purging your own tables on a schedule
 - [Data Scrubbing](data-scrubbing.md) — turning a production backup into an anonymized staging copy
@@ -139,7 +140,7 @@ Looking for the API reference instead? That is
 
 ## Mail
 
-- [Mail](mail.md) — mailers, templates, previews, and delivery
+- [Mail](mail.md) — mailers, templates, previews, delivery, and receiving inbound email
 - [Mail Compliance](mail-compliance.md) — `List-Unsubscribe` and the one-click unsubscribe route
 
 ## APIs, webhooks and integrations
@@ -158,6 +159,7 @@ Looking for the API reference instead? That is
 - [Money and the Ledger](money.md) — holding amounts without rounding them away, and moving money without double-charging or losing it
 - [A/B Experiments](experiments.md) — assigning users to variants and reading the results
 - [Feature Flags](feature-flags.md) — turning a feature on for some users and not others
+- [SLA Obligations and Business Calendars](sla.md) — deadlines in business time that pause on weekends and holidays and escalate once (`sla` feature)
 - [Admin Panel](admin.md) — the generated CRUD backoffice, and restricting who reaches it
 
 ## Content, SEO and localization
@@ -199,7 +201,7 @@ Looking for the API reference instead? That is
 - [In-Place Upgrades](hot-upgrades.md) — replacing the running binary without losing connections
 - [Daemon Mode](daemon.md) — `autumn serve` as a long-running service
 - [Maintenance Mode](maintenance-mode.md) — taking the app offline deliberately, with probes still answering
-- [Cloud-Native Autumn](cloud-native.md) — containers, Kubernetes, and the twelve-factor surface
+- [Cloud-Native Autumn](cloud-native.md) — containers, Kubernetes, liveness/readiness probes, and the twelve-factor surface
 - [Embedded Clustering](clustering.md) — two-node clustering with no external dependency
 - [Per-Tenant Memory Cells](tenant-cells.md) — bounding per-tenant memory, with deterministic eviction
 - [Runtime Configuration](runtime-config.md) — `autumn.toml`, profiles, and environment overrides

@@ -727,7 +727,8 @@ failure landed relative to the **go-live step** — `proxy-flip` on a redeploy,
 |---|---|---|
 | At or before go-live, on a redeploy | Previous release still serving (the candidate was torn down) | Already clean — nothing to undo |
 | At or before go-live, on a first deploy | Nothing serving (the candidate was torn down) | Already clean — nothing to undo |
-| After go-live, in housekeeping (`record-proxy-options`, `drain-old`, `prune`) | **Live and healthy on the new release** | **Warn and keep rolling** — the host is fine; only bookkeeping failed |
+| After go-live, in housekeeping (`record-proxy-options`, `prune`, or `drain-old` when the retry proves the old slot stopped) | **Live and healthy on the new release** | **Warn and keep rolling** — the host is fine; only bookkeeping failed |
+| After go-live, at `drain-old`, and the retry does not prove the old slot stopped | Live on the new release; the old slot may still run | Halt and compensate, this host included — see below |
 | After go-live, at `commit-markers` | Live on the new release, markers mid-transaction | Halt, and **never** auto-roll this host back — the rollback target cannot be trusted |
 | After go-live, anything else | Live on the new release | Halt and compensate, this host included |
 
@@ -764,6 +765,19 @@ A **degraded** host — live and healthy on the new release, but whose post-cuto
 housekeeping failed — is worth repairing promptly: a failed `record-proxy-options`
 makes the **next** deploy of that host fail closed. A redeploy of that host
 repairs it, and the run's final line says how many hosts finished degraded.
+
+A failed `drain-old` is different. The old slot runs job workers and the
+scheduler. If it runs, scheduled tasks and jobs run two times. So the rollout
+retries `drain-old` one time and then reads the old unit. The old slot is
+stopped only when the unit is loaded, its `ActiveState` is `inactive` or
+`failed`, and its `UnitFileState` is `disabled` (an enabled unit starts again at
+boot). Then the host is degraded and the rollout continues.
+
+All other results halt the rollout: the unit can still run, the output is not
+known, or the host does not answer. The rollout then compensates, like any
+other post-go-live failure. With `--no-rollback`, it stops and changes nothing.
+The output names the risk. While the host stays on the new release, the `risk`
+field of the halt alert names it too.
 
 Every exit path — success, halt, or halt-plus-compensation — ends with the
 per-host `Fleet state:` table, printed **after** any compensation so it describes
@@ -899,39 +913,36 @@ surprises:
 
   Stderr text only; the failure and its exit code are unchanged.
 
+- **A failed single-host deploy now names a migrated schema (#2276).** A deploy
+  can fail at or after `migrate` and before the cutover. The candidate is torn
+  down, but the migration stays applied. The error now has one more line:
+
+  ```
+  ⚠️  any migration that ran was NOT rolled back. The previous release now runs
+  on the migrated schema. Make sure that it works with that schema.
+  ```
+
+  A failed *first* deploy leaves no release serving, so it gets this line:
+
+  ```
+  ⚠️  any migration that ran was NOT rolled back. No release is serving. Fix the
+  cause, then run `autumn deploy up` again.
+  ```
+
+  The fleet's [schema notes](#the-three-schema-notes-on-the-fleet-state-summary)
+  use the same rules. A failure before `migrate` (for example, a failed upload)
+  adds no line. A failure after the cutover adds no line, because the new
+  release runs on the new schema. The remote commands, the exit code and the
+  first line of the error do not change.
+
 One further change is invisible on a single host and listed only for
 completeness: a post-cutover failure is now wrapped in an error type that records
 which step it landed on, so the fleet driver can decide whether that host may be
-auto-rolled-back. Its `Display` delegates to the wrapped error verbatim, so the
-single-host path prints byte-for-byte what it printed before.
+auto-rolled-back. Its `Display` delegates to the wrapped error verbatim, so a
+post-cutover failure prints the same message as before.
 
 `autumn deploy --help` was also rewritten, and `up`/`rollback` gained `--only`
 and `--no-rollback`; no existing flag changed meaning.
-
-> **Known limitation — a single-host deploy that fails after its migration ran
-> says nothing about the schema (#2276).** On one host, a failure at any point is
-> reported as the plain per-host error and the command returns right there: the
-> single-host path deliberately keeps its pre-fleet output byte-for-byte, so it
-> renders no `Fleet state:` summary and therefore none of
-> [the three schema notes](#the-three-schema-notes-on-the-fleet-state-summary).
-> If the failure landed *after* `migrate` but before the cutover — a
-> `readiness-gate` timeout is the ordinary shape — the candidate is torn down and
-> your previous release keeps serving, **against the already-migrated schema**,
-> with nothing on screen saying so. The fleet path does warn in exactly this
-> situation; the single-host path does not yet. This is tracked as
-> [#2276](https://github.com/autumn-foundation/autumn/issues/2276) and is not fixed. Until
-> it is: after any failed single-host `deploy up`, check `autumn migrate status`
-> before assuming the failure left nothing behind — and write expand/contract
-> migrations so the still-serving release fits the migrated schema either way.
->
-> Since a **first** deploy migrates too
-> ([Migration ordering](#migration-ordering-first-deploy-included)), this now has a
-> second shape: a single-host *first* deploy that migrates and then fails its
-> readiness gate tears the release down and leaves **nothing serving at all**
-> against a schema that has already moved. The same advice applies, and more
-> sharply — `autumn migrate status` is how you find out, and the fix for the next
-> attempt is usually just re-running `autumn deploy up`, which is idempotent about
-> an already-applied migration.
 
 ### Rollback
 
@@ -1018,6 +1029,8 @@ Each row carries: mode (`deployed` / `not deployed` / `unreachable` /
 live slot, the `/ready` status code, the maintenance flag
 (`maintenance ON` / `maintenance off` / `maintenance ?`), the proxy's bound
 port, that host's last deploy result, and any per-host drift reasons.
+A deployed host whose `/ready` is not `2xx`, or gives no answer, shows ⚠️. This
+is not drift, so `--strict` does not fail on it.
 
 > **The maintenance cell reports the flag file that host's *running* slot unit
 > polls.** It is resolved on the host from the live slot unit's
@@ -1067,7 +1080,9 @@ Two kinds of drift are reported, and they are deliberately separate:
   marker is unreadable (the next deploy of that host will refuse); the installed
   proxy unit binds a different public port than `[server] port` configures; no
   release is deployed on this host while the rest of the fleet is serving one;
-  the host has a `current` symlink but the release behind it could not be read;
+  the host has a `current` symlink but the release behind it could not be read
+  (the link is dangling, or its target is not a directory directly in
+  `releases/`);
   and the two maintenance-probe reasons —
 
   - `the live slot unit could not be read, so which maintenance flag file this
@@ -1410,6 +1425,19 @@ online-safe snapshot of the file with no external tools.
   post-cutover bookkeeping failed. Repair it before the next deploy — a redeploy
   of that host does — because a failed `record-proxy-options` makes the next
   deploy of that host fail closed.
+- **The rollout halted at `drain-old`.** The retry could not show that the old
+  slot stopped, so it can run scheduled tasks and jobs a second time.
+  Compensation rolls the host back to one running slot. With `--no-rollback`,
+  or if compensation failed, stop the old slot by hand:
+
+  ```bash
+  ssh root@10.0.0.2 'cut -f1 /srv/autumn/myapp/shared/live-slot'   # e.g. green
+  ssh root@10.0.0.2 'systemctl disable --now myapp-blue.service'  # the OTHER slot
+  ssh root@10.0.0.2 'systemctl show --property=ActiveState --property=UnitFileState myapp-blue.service'
+  ```
+
+  Make sure the output shows `inactive` and `disabled`. Then run
+  `autumn deploy up` again, or `autumn deploy rollback --only <host>`.
 - **`release directory … already exists`** — the one-second release id was reused
   by a fast re-run. Wait a second and re-run `autumn deploy up`, or remove that
   directory if you are certain it is stale.
@@ -1454,15 +1482,6 @@ online-safe snapshot of the file with no external tools.
   down-migration mid-flip would run exactly the SQL nothing reviews. Use
   expand/contract migrations so a rolled-back binary still fits the migrated
   schema.
-- **A failed *single-host* deploy never warns that the schema moved** (#2276) —
-  including a failed *first* deploy, which since #1607 migrates before it starts
-  the release, and so can leave a moved schema with nothing serving.
-  A fleet ends every run with a `Fleet state:` summary that names the
-  binaries-versus-schema state; the single-host path returns the per-host error
-  directly and renders no summary, so a failure after `migrate` but before the
-  cutover leaves the previous release serving against the migrated schema with
-  nothing saying so. See
-  [What fleet support changed for an existing single-host deploy](#what-fleet-support-changed-for-an-existing-single-host-deploy).
 - **Host identity is compared literally.** Duplicate `[deploy] hosts` entries are
   refused after trimming, but two DNS names for the same machine are not detected
   — the same limitation `autumn migrate` has for duplicate target URLs.
@@ -2974,6 +2993,116 @@ Autumn does not add implicitly.
 
 ---
 
+## Capturing a diagnostic snapshot for a bug report (`autumn export`)
+
+`autumn export` reads a **running** app over HTTP and writes one JSON file —
+the thing to attach to a bug report or an incident ticket, so you are not
+hand-assembling four `curl` outputs and hoping you got them all.
+
+```console
+$ autumn export --url http://your-host:3000 --output autumn-diag.json
+Exporting diagnostics from http://your-host:3000
+Successfully exported diagnostics to autumn-diag.json
+```
+
+Both flags are optional: `--url` defaults to `http://localhost:3000`, and
+`--output` to `autumn-diag.json` in the working directory. It runs once and
+exits rather than streaming — for a live view of the same app, see
+`autumn monitor` under [Next steps](#next-steps).
+
+Do not confuse it with `autumn openapi export` (writes your API schema) or
+`autumn data export` (writes model rows as CSV). Neither is a diagnostic
+snapshot.
+
+### What the file contains
+
+A `timestamp` (Unix seconds), the `url` it read, and the verbatim JSON body of
+four actuator endpoints under those four keys:
+
+| Key | Endpoint | Mounted |
+| --- | --- | --- |
+| `health` | `/actuator/health` | always |
+| `metrics` | `/actuator/metrics` | always |
+| `tasks` | `/actuator/tasks` | only when `actuator.sensitive = true` |
+| `loggers` | `/actuator/loggers` | only when `actuator.sensitive = true` |
+
+**The four readings are not simultaneous, and `timestamp` is not when they were
+taken.** `autumn export` requests the endpoints one after another over a
+blocking client with a five-second timeout each, so a slow app can put several
+seconds between the first reading and the last; `timestamp` is recorded *after*
+all four have returned, which makes it the moment collection finished. Treat
+the file as a bundle of four readings taken in the order the table lists them,
+not as one coherent instant — in particular, do not read `metrics` and `tasks` as
+describing the same moment when diagnosing a race or a spike.
+
+A snapshot is **operational data about your app**, not a sanitized report:
+`/actuator/loggers` names your modules and their levels, `/actuator/tasks`
+names your scheduled work and its recent runs, and `/actuator/health` carries
+the per-component `details` map unless `health.detailed = false`, which is
+[the `prod` default](health-indicators.md#hiding-details-in-production). Read
+the file before attaching it to anything public.
+
+### It fails outright against a hardened production app
+
+The `dev` profile sets `actuator.sensitive = true`; every other profile
+leaves it at its **`false`** default — the shape [recommended
+above](#prometheus-metrics-for-platform-scraping) — and an actuator path that
+is not mounted answers `404`. `autumn export` treats *any* endpoint it cannot
+read as fatal: it writes no file at all, prints the first failure, and exits
+`1`.
+
+```console
+$ autumn export --url http://your-host:3000
+Exporting diagnostics from http://your-host:3000
+Failed to fetch tasks from http://your-host:3000: HTTP 404 Not Found
+```
+
+So the command works as shipped against a dev app, and against staging or
+production only where `actuator.sensitive = true` — and, either way, only at
+the default actuator prefix (below). There is no partial snapshot and no flag
+to ask for one.
+
+`sensitive` is a single app-wide switch, not a per-endpoint or per-listener
+one: turning it on to take a snapshot also mounts `/actuator/env`,
+`/actuator/configprops`, `/actuator/jobs` and `/actuator/shadow`, which is the
+posture the section above exists to talk you out of. Either take the snapshot
+from an environment that already runs with `sensitive = true`, or collect the
+two always-mounted endpoints by hand:
+
+```console
+$ curl -s http://your-host:3000/actuator/health
+$ curl -s http://your-host:3000/actuator/metrics
+```
+
+### It also requires the default actuator prefix
+
+`autumn export` builds its four URLs by appending `/actuator/health`,
+`/actuator/metrics`, `/actuator/tasks` and `/actuator/loggers` to whatever
+`--url` you pass. That prefix is a literal in the command, so it does **not**
+follow `[actuator] prefix` or `AUTUMN_ACTUATOR__PREFIX`. Under a custom prefix
+every endpoint moves — including the two that are always mounted — so `export`
+fails on the very first one, whatever `sensitive` is set to:
+
+```console
+# the app mounts its actuator at /ops
+$ autumn export --url http://your-host:3000
+Exporting diagnostics from http://your-host:3000
+Failed to fetch health from http://your-host:3000: HTTP 404 Not Found
+```
+
+Pointing `--url` at the prefix does not help — that asks for
+`/ops/actuator/health` — so under a custom prefix there is no invocation of
+`autumn export` that works. Collect the endpoints at your own prefix instead:
+
+```console
+$ curl -s http://your-host:3000/ops/health
+$ curl -s http://your-host:3000/ops/metrics
+$ curl -s http://your-host:3000/ops/tasks     # sensitive = true only
+$ curl -s http://your-host:3000/ops/loggers   # sensitive = true only
+```
+
+---
+
 ## Run locally with Docker Compose (app + Postgres)
 
 Scaffold a `docker-compose.yml` with an app service, a one-shot migration job,
@@ -3194,7 +3323,9 @@ workflow, the replacement strategies, and the full drill.
 Once the container is running:
 
 - **Monitor**: `autumn monitor --url http://your-host:3000` for a live TUI
-  dashboard of metrics, logs, and routes.
+  dashboard of metrics, logs, and routes. For a one-shot snapshot written to a
+  file instead — what a bug report wants attached — see [Capturing a diagnostic
+  snapshot](#capturing-a-diagnostic-snapshot-for-a-bug-report-autumn-export).
 - **Scale**: add `min_machines_running = 1` in `fly.toml` to keep a warm
   instance; use `pool_size` in `autumn.production.toml.example` to tune
   database concurrency.
