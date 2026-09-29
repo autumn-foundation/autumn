@@ -2631,15 +2631,12 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
         }
         // The sections whose leading count (or size) is the whole answer. The
         // rest need their entries walked and are handled above.
+        let leading_count = || leb128(wasm, after_size).map(|(count, _)| count);
         match id {
-            IMPORT_SECTION => {
-                import_count = import_count.saturating_add(leb128(wasm, after_size)?.0);
-            }
-            FUNCTION_SECTION => {
-                function_count = function_count.saturating_add(leb128(wasm, after_size)?.0);
-            }
+            IMPORT_SECTION => import_count = import_count.saturating_add(leading_count()?),
+            FUNCTION_SECTION => function_count = function_count.saturating_add(leading_count()?),
             GLOBAL_SECTION => {
-                global_count = global_count.saturating_add(leb128(wasm, after_size)?.0);
+                global_count = global_count.saturating_add(leading_count()?);
                 // The initializers are an instruction stream, not data —
                 // extended-const lets one global's expression run to
                 // arbitrary length — so their bytes count toward the
@@ -2647,9 +2644,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
                 // section's do. Counted from the header: no walk needed.
                 global_bytes = global_bytes.saturating_add(size);
             }
-            MEMORY_SECTION => {
-                memory_count = memory_count.saturating_add(leb128(wasm, after_size)?.0);
-            }
+            MEMORY_SECTION => memory_count = memory_count.saturating_add(leading_count()?),
             CODE_SECTION => code_bytes = code_bytes.saturating_add(size),
             START_SECTION => has_start = true,
             _ => {}
