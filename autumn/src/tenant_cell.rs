@@ -79,9 +79,11 @@ pub struct TenantCellStructuralOverhead {
     /// Payloads of the `Arc<TenantCellInner>` allocations. This includes the
     /// atomics, scratch-map header, mutex, and global-gauge `Arc` pointer.
     pub tenant_cell_inner_bytes: usize,
-    /// Inline `String` and `Arc<TenantCell>` values in occupied map buckets.
+    /// Inline values in occupied map buckets: each resident `(String,
+    /// Arc<TenantCell>)` entry plus its `(String, Weak<_>)` lifecycle record.
     pub registry_entry_bytes: usize,
-    /// Heap capacity of both copies of every tenant id (registry key and cell).
+    /// Heap capacity of every copy of each resident tenant id (resident key,
+    /// lifecycle key, and the cell's own id).
     pub tenant_id_capacity_bytes: usize,
     /// Two strong/weak counter pairs: one for each per-cell `Arc` allocation.
     pub arc_header_bytes: usize,
@@ -93,8 +95,8 @@ pub struct TenantCellStructuralOverhead {
     /// `SwissTable` implementation's power-of-two backing bucket estimate.
     pub registry_bucket_count: usize,
     /// Lower bound for unoccupied backing slots plus one control byte per
-    /// bucket. This excludes the implementation's trailing control group and
-    /// allocation padding.
+    /// bucket, across the resident map and the lifecycle map. This excludes
+    /// the implementation's trailing control group and allocation padding.
     pub registry_bucket_bytes: usize,
     /// Sum of all deterministic lower-bound structural components.
     pub total_bytes: usize,
@@ -991,9 +993,12 @@ impl TenantCellRegistry {
         // the stable structural model used here, not an allocator measurement.
         const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
         type RegistryEntry = (String, Arc<TenantCell>);
+        type LifecycleEntry = (String, Weak<TenantCellInner>);
 
-        // Lifecycle records for evicted-but-in-flight cells are excluded: they
-        // are not resident, and omitting them keeps this a lower bound.
+        // Every resident cell also owns a lifecycle record (its own tenant-id
+        // key plus a `Weak`), so those are counted with it. Lifecycle records
+        // for evicted-but-in-flight cells and the cleanup queue are excluded:
+        // they are not resident, and omitting them keeps this a lower bound.
         let state = self
             .inner
             .state
@@ -1006,11 +1011,24 @@ impl TenantCellRegistry {
             + 2 * ARC_HEADER;
         let tenant_cell_bytes = resident_cells * std::mem::size_of::<TenantCell>();
         let tenant_cell_inner_bytes = resident_cells * std::mem::size_of::<TenantCellInner>();
-        let registry_entry_bytes = resident_cells * std::mem::size_of::<RegistryEntry>();
+        let resident_lifecycle_key_capacities: Vec<usize> = cells
+            .keys()
+            .filter_map(|id| state.lifecycle.get_key_value(id.as_str()))
+            .map(|(key, _)| key.capacity())
+            .collect();
+        let registry_entry_bytes = resident_cells * std::mem::size_of::<RegistryEntry>()
+            + resident_lifecycle_key_capacities.len() * std::mem::size_of::<LifecycleEntry>();
         let tenant_id_capacity_bytes = cells
             .iter()
             .map(|(key, cell)| key.capacity() + cell.inner.tenant_id.capacity())
-            .sum();
+            .sum::<usize>()
+            + resident_lifecycle_key_capacities.iter().sum::<usize>();
+        // The lifecycle map's current capacity (not a high-water mark) is a
+        // lower bound on its backing buckets.
+        let lifecycle_bucket_count = Self::estimated_bucket_count(state.lifecycle.capacity());
+        let lifecycle_bucket_bytes = lifecycle_bucket_count.saturating_sub(state.lifecycle.len())
+            * std::mem::size_of::<LifecycleEntry>()
+            + lifecycle_bucket_count;
         let arc_header_bytes = resident_cells * 2 * ARC_HEADER;
         let registry_element_capacity = cells.capacity();
         // Read allocation history while the map's read guard is still held.
@@ -1025,7 +1043,8 @@ impl TenantCellRegistry {
         drop(state);
         let registry_bucket_bytes = (registry_bucket_count - resident_cells)
             * std::mem::size_of::<RegistryEntry>()
-            + registry_bucket_count;
+            + registry_bucket_count
+            + lifecycle_bucket_bytes;
         let total_bytes = registry_fixed_bytes
             + tenant_cell_bytes
             + tenant_cell_inner_bytes
