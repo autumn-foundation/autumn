@@ -222,7 +222,7 @@ impl MirrorSelector {
     /// (`http_body::Body::is_end_stream`, read by the caller — the decision
     /// point never sees the body itself): `true` means the body is
     /// definitely empty. Together with the header check in
-    /// [`request_carries_body`] this catches both declared bodies and
+    /// `request_carries_body` this catches both declared bodies and
     /// *undeclared* ones — frames with no `Content-Length` or
     /// `Transfer-Encoding`, reachable on HTTP/2 (issue #2332). When in doubt
     /// the request sits out: a skipped mirror costs coverage, a mirrored
