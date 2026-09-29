@@ -1578,7 +1578,8 @@ fn sqlite_target_is_read_only(target: &str) -> bool {
 /// parameter merely containing that text does not.
 #[cfg(feature = "sqlite")]
 fn sqlite_target_is_shared_cache(target: &str) -> bool {
-    target
+    let without_fragment = target.split_once('#').map_or(target, |(head, _)| head);
+    without_fragment
         .split_once('?')
         .is_some_and(|(_, query)| query.split('&').any(|pair| pair == "cache=shared"))
 }
@@ -5115,6 +5116,10 @@ mod tests {
             "file:/srv/app.db?note=cache=shared"
         ));
         assert!(!sqlite_target_is_shared_cache("file:app?cache=sharedly"));
+        // A URI fragment is not part of the query (SQLite ignores it).
+        assert!(sqlite_target_is_shared_cache(
+            "file:mem?mode=memory&cache=shared#tag"
+        ));
     }
 
     // `sqlite_target_is_any_in_memory` is the broader predicate the
