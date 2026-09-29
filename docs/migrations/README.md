@@ -16,8 +16,8 @@ request and in the publish gate. See
 - [`0.5.0.md`](0.5.0.md) — `autumn-web 0.4.x → 0.5.0`
 - [`0.6.0.md`](0.6.0.md) — `autumn-web 0.5.x → 0.6.0`
 - [`0.7.0.md`](0.7.0.md) — `autumn-web 0.6.x → 0.7.0`
-- [`next.md`](next.md) — rolling draft for `## [Unreleased]`, renamed to
-  `<version>.md` at release time
+- [`next.md`](next.md) — rolling draft for everything not released yet,
+  renamed to `<version>.md` at release time
 
 - [`TEMPLATE.md`](TEMPLATE.md) — template for new migration guides. Copy this
   when starting the guide for the next release.
@@ -47,8 +47,12 @@ carry their backfill notes. With no list at all, the prose *is* the entry.
 ```
 
 Every breaking entry must link its own guide, so a reader lands on the fix path
-straight from the changelog line. Entries under `## [Unreleased]` link
-[`next.md`](next.md).
+straight from the changelog line. An unreleased entry links [`next.md`](next.md).
+
+An unreleased entry lives in its own file under
+[`changelog.d/`](../../changelog.d/README.md), not in `CHANGELOG.md` — one file
+per PR, so two PRs never conflict over the note. The gate reads the fragments
+together with the changelog, so a break is gated in review either way.
 
 If a change is *not* breaking, say so in the words the gate recognises —
 "non-breaking", "no breaking change", "without breaking …" — and the line
@@ -133,7 +137,8 @@ It fails when:
   unmarked break cannot hide from the coverage check). Bullets and ordinary
   paragraphs are both read — prose is not a way around the convention;
 - a section with a breaking entry has no guide at `docs/migrations/<version>.md`
-  (or `next.md` for `## [Unreleased]`). A release candidate section
+  (or `next.md` for `## [Unreleased]`, which includes every `changelog.d/`
+  fragment). A release candidate section
   (`## [0.7.0-rc.1]`) is gated against its release's guide, `0.7.0.md`;
 - a breaking entry does not *link* its guide — a bare path mention is not a
   link, the reader has to be able to click through. The destination is parsed,

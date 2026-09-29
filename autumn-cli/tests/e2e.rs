@@ -212,15 +212,18 @@ fn generated_project_compiles_runs_and_serves() {
 /// at the checkout with a `[patch.crates-io]` override (exactly what
 /// [`patch_generated_cargo_toml`] does above) instead of building against
 /// the stale-pinned published crate.
-#[test]
-#[ignore = "slow: compiles a fresh Rust project — run with `cargo test -p autumn-cli -- --ignored`"]
-fn generated_project_compiles_against_published_autumn_web() {
-    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+/// Runs `autumn new test-app` in a fresh temp dir and asserts it succeeded.
+/// Shared by both tests below so the "does `autumn new` itself work"
+/// question and the "does the published `autumn-web` still accept what it
+/// scaffolds" question can be gated separately in CI (see
+/// `quickstart-gate.yml`'s `local-dev-quickstart` job): the former is a real
+/// CLI regression whenever it fails, the latter is expected to fail between
+/// releases (this doc comment's own mechanism section).
+fn run_autumn_new_against_published(temp_dir: &std::path::Path) -> std::path::PathBuf {
     let autumn_bin = env!("CARGO_BIN_EXE_autumn");
-
     let new_output = Command::new(autumn_bin)
         .args(["new", "test-app"])
-        .current_dir(temp_dir.path())
+        .current_dir(temp_dir)
         .output()
         .expect("failed to run `autumn new`");
 
@@ -231,8 +234,30 @@ fn generated_project_compiles_against_published_autumn_web() {
         String::from_utf8_lossy(&new_output.stderr),
     );
 
-    let project_dir = temp_dir.path().join("test-app");
+    let project_dir = temp_dir.join("test-app");
     assert!(project_dir.join("Cargo.toml").is_file());
+    project_dir
+}
+
+/// `autumn new` itself must always succeed against the published CLI's own
+/// scaffold logic, independent of whether the resulting project *builds*
+/// against crates.io — a source-built CLI's `new` command has no version
+/// pin to drift against, so a failure here is always a real regression in
+/// `autumn-cli`, never the expected release-cadence gap the sibling test
+/// below tolerates. Kept separate (and hard-gated in CI) so that gap can
+/// never mask an unrelated break in `autumn new` itself.
+#[test]
+#[ignore = "slow: compiles a fresh Rust project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn autumn_new_succeeds_against_published_autumn_web() {
+    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    run_autumn_new_against_published(temp_dir.path());
+}
+
+#[test]
+#[ignore = "slow: compiles a fresh Rust project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_project_compiles_against_published_autumn_web() {
+    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let project_dir = run_autumn_new_against_published(temp_dir.path());
 
     // No [patch.crates-io] here, deliberately: this project must build
     // exactly as `autumn new` left it, against the real crates.io

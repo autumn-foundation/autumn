@@ -14,17 +14,20 @@ SemVer contract.
 
 | Crate | Directory | Publish Order | Notes |
 |---|---|---|---|
-| `autumn-macros` | `autumn-macros/` | 1 | No Autumn runtime deps; must publish first. |
-| `autumn-schema-core` | `autumn-schema-core/` | 2 | No Autumn runtime deps. `autumn-cli` pins it. |
-| `autumn-edge` | `autumn-edge/` | 3 | Depends on `autumn-macros`. `autumn-web` pins it — **optionally**, but cargo still requires an optional dependency to resolve on crates.io, so it must precede `autumn-web`. |
-| `autumn-web` | `autumn/` | 4 | Depends on `autumn-macros` and `autumn-edge`. |
-| `autumn-cli` | `autumn-cli/` | 5 | Depends on `autumn-schema-core`. Independent of `autumn-web` at crate level. |
-| `autumn-admin-plugin` | `autumn-admin-plugin/` | 6 | Depends on `autumn-web`. |
-| `autumn-media-plugin` | `autumn-media-plugin/` | 6 | Depends on `autumn-web`. |
-| `autumn-storage-s3` | `autumn-storage-s3/` | 6 | Depends on `autumn-web`. |
-| `autumn-cache-redis` | `autumn-cache-redis/` | 6 | Depends on `autumn-web`. |
-| `autumn-search` | `autumn-search/` | 6 | Depends on `autumn-web`. |
-| `autumn-billing` | `autumn-billing/` | 6 | Depends on `autumn-web`. |
+| `autumn-macros-support` | `autumn-macros-support/` | 1 | No Autumn runtime deps. Every macro crate pins it, so it must publish first. |
+| `autumn-macros` | `autumn-macros/` | 2 | Depends on `autumn-macros-support`. |
+| `autumn-macros-model` | `autumn-macros-model/` | 2 | Depends on `autumn-macros-support`. `autumn-web` pins it **optionally**, so it must precede `autumn-web`. |
+| `autumn-macros-repository` | `autumn-macros-repository/` | 2 | Depends on `autumn-macros-support`. `autumn-web` pins it **optionally**, so it must precede `autumn-web`. |
+| `autumn-schema-core` | `autumn-schema-core/` | 3 | No Autumn runtime deps. `autumn-cli` pins it. |
+| `autumn-edge` | `autumn-edge/` | 4 | Depends on `autumn-macros`. `autumn-web` pins it — **optionally**, but cargo still requires an optional dependency to resolve on crates.io, so it must precede `autumn-web`. |
+| `autumn-web` | `autumn/` | 5 | Depends on `autumn-macros`, the two macro shards and `autumn-edge`. |
+| `autumn-cli` | `autumn-cli/` | 6 | Depends on `autumn-schema-core`. Independent of `autumn-web` at crate level. |
+| `autumn-admin-plugin` | `autumn-admin-plugin/` | 7 | Depends on `autumn-web`. |
+| `autumn-media-plugin` | `autumn-media-plugin/` | 7 | Depends on `autumn-web`. |
+| `autumn-storage-s3` | `autumn-storage-s3/` | 7 | Depends on `autumn-web`. |
+| `autumn-cache-redis` | `autumn-cache-redis/` | 7 | Depends on `autumn-web`. |
+| `autumn-search` | `autumn-search/` | 7 | Depends on `autumn-web`. |
+| `autumn-billing` | `autumn-billing/` | 7 | Depends on `autumn-web`. |
 
 This table is the same set, in the same order, as `CRATES` in
 [`scripts/check-publish-dry-run.sh`](../scripts/check-publish-dry-run.sh) —
@@ -35,7 +38,10 @@ other gate scripts currently carry **narrower** lists —
 `autumn-schema-core`, `autumn-edge`, `autumn-media-plugin` and `autumn-billing`
 (the last has no published baseline yet). Those crates are
 therefore published without a metadata or SemVer check today; widening both
-lists is worth doing, but it does not change the publish order above.
+lists is worth doing, but it does not change the publish order above. The
+three crates the macro split added (#2809) are in all four lists, because a
+crate `autumn-web` pins by version has to publish, and an unchecked new crate
+is the one most likely to publish wrong.
 
 All crates share a single workspace version (`[workspace.package].version` in
 `Cargo.toml`). They are always released together at the same version.
@@ -318,6 +324,27 @@ pushed code — the workspace `[patch.crates-io]` override means no other CI job
 sees the published `autumn-web`), so a red push run means new users are broken
 today, not that the commit is bad.
 
+## Plugin Index Re-verification
+
+Each release re-verifies the [plugin index](plugins.md#the-plugin-index)
+(issue #1625). After the version bump, `autumn plugin index check` fails,
+because each listing was verified on the old release. Two `autumn-cli` unit
+tests run the same gate and also fail:
+`the_bundled_index_passes_the_gate_for_this_release` and
+`run_check_passes_the_bundled_index_on_this_release`.
+
+- [ ] Run the re-verification and keep the reports:
+  `PLUGIN_INDEX_REPORTS=<dir> cargo test -p autumn-cli --test generate plugin_index_reverify_listings -- --ignored --exact`
+  (or get the `plugin-index-reports` artifact from the `plugin-install` job).
+- [ ] Copy `<dir>/index.toml` over `autumn-cli/plugin-index/index.toml`. It
+  has the reports already recorded.
+- [ ] `cargo run -p autumn-cli -- plugin index check --index autumn-cli/plugin-index/index.toml` passes.
+- [ ] Commit `autumn-cli/plugin-index/index.toml` with the release.
+
+A listing that fails is flagged `incompatible`; a second fail on a later
+release delists it. See
+[`autumn-cli/plugin-index/README.md`](../autumn-cli/plugin-index/README.md).
+
 ## Migration Guide Gate
 
 Autumn ships every 2–4 weeks and, pre-1.0, most releases can break existing
@@ -455,9 +482,16 @@ Before pushing the release tag:
 1. **Bump the workspace version** in `Cargo.toml` under `[workspace.package]`.
 2. **Update internal version pins** for inter-crate dependencies
    (e.g. `autumn-web = { version = "X.Y.Z", path = "../autumn" }`).
-3. **Update `CHANGELOG.md`** — move unreleased items under a `## [X.Y.Z]` heading.
-   Every breaking entry carries the `**Breaking:**` marker (or sits under a
+3. **Fold the changelog fragments in** — `./scripts/update-changelog.sh`
+   merges every `changelog.d/` file into `## [Unreleased]` under the kind it
+   declares, then deletes the files. Read the result: it is the release note
+   people get. Then move the items under a `## [X.Y.Z]` heading. Every breaking
+   entry carries the `**Breaking:**` marker (or sits under a
    `### Breaking Changes` heading) and links its migration guide.
+
+   A release PR is the one change allowed to edit `CHANGELOG.md`. Put the
+   literal token `[changelog]` in its body, or apply the `release` label, or
+   `./scripts/check-changelog-fragments.sh` fails it.
 4. **Complete the [Migration Guide Gate](#migration-guide-gate)** — rename
    `docs/migrations/next.md`, repoint the changelog links, and perform and
    record the codemod-first upgrade walk-through.
@@ -474,6 +508,7 @@ Before pushing the release tag:
 7. **Run all gate scripts locally** to catch problems before CI sees the tag:
    ```bash
    ./scripts/check-crate-metadata.sh
+   ./scripts/check-changelog-fragments.sh
    ./scripts/check-release-notes.sh
    ./scripts/check-migration-guides.sh
    ./scripts/check-skill-version-markers.sh
@@ -490,10 +525,15 @@ Before pushing the release tag:
 9. **Publish to crates.io** (in dependency order, after the gate passes):
    Order matters: each crate's Autumn dependencies must already be on
    crates.io, or `cargo publish` fails to resolve them. In particular
-   `autumn-web` pins `autumn-edge` and `autumn-cli` pins `autumn-schema-core`,
-   so both precede them here.
+   `autumn-web` pins `autumn-edge`, the two macro shards and `autumn-macros`,
+   and `autumn-cli` pins `autumn-schema-core`, so all of them precede their
+   dependants here. `autumn-macros-support` is first: the other three macro
+   crates pin it.
    ```bash
+   cargo publish -p autumn-macros-support
    cargo publish -p autumn-macros
+   cargo publish -p autumn-macros-model
+   cargo publish -p autumn-macros-repository
    cargo publish -p autumn-schema-core
    cargo publish -p autumn-edge
    cargo publish -p autumn-web

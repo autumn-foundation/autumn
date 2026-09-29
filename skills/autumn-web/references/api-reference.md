@@ -496,7 +496,9 @@ enforces `max_depth` (default 5) and same-record `reply_to`, and moves
 `comment_count` with the #1325 counter-cache primitive in the same transaction.
 `comment_thread` is one query at any depth; `delete_comment` cascades to the
 descendant subtree and is idempotent, and takes `parent_id` so a comment id
-alone is never authority over a comment on another record.
+alone is never authority over a comment on another record. With
+`soft_delete = false` it refuses (`422`) a subtree that has a reply on another
+record, because the `parent_id` cascade would delete that reply too.
 `recompute_comment_count` is the drift repair (`counter_cache_recompute` would
 be WRONG here — it keys on the fk column alone, which is shared across models).
 Like `react()`, all four take their own pooled connection — never hold a `Db`
@@ -646,6 +648,91 @@ delete actions remain last-write-wins.
   `.read_only()` / `.deferrable()` / `.max_attempts(n)` /
   `.initial_backoff(d)` / `.max_backoff(d)`; retrying constructors default
   to 5 attempts.
+
+## Money and the ledger (`autumn_web::money`, unreleased, #1837)
+
+Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
+
+- `Money<C>` — an amount in currency `C`, as an `i64` count of minor units.
+  No `f64`, and no `Add`/`Sub` impls (an operator cannot report an overflow).
+  `from_minor` / `from_major` / `minor` / `currency` / `to_decimal` /
+  `checked_add` / `checked_sub` / `checked_neg` / `checked_abs` /
+  `checked_mul` / `try_sum` / `is_zero` / `is_positive` / `is_negative` /
+  `to_any`; `ZERO`.
+- `Money::from_decimal(d, Rounding)` and `from_decimal_exact(d)` (refuses to
+  round). `Rounding` {`HalfUp`, `HalfEven`, `HalfDown`, `TowardZero`,
+  `AwayFromZero`, `Floor`, `Ceiling`} — no default, every call names one.
+- `Money::allocate(&[i64])` / `split(n)` — largest-remainder; the parts always
+  sum back to the whole. `split` is bounded by `money::MAX_PARTS`.
+- `Currency` (sealed) with markers `Usd`, `Eur`, `Gbp`, `Jpy`, … (34 ISO 4217
+  codes, exponents 0/2/3). `Usd::currency()` gives the runtime `CurrencyCode`;
+  `CurrencyCode::parse(code)` / `::known()`.
+- `AnyMoney` — runtime-tagged amount for a stored row: `new` / `zero` /
+  `minor` / `currency` / `to_decimal` / `checked_add` / `checked_sub` /
+  `checked_neg` / `try_sum` / `try_into_typed::<C>()`.
+- `MoneyError` {`Overflow`, `CurrencyMismatch`, `UnknownCurrency`, `Inexact`,
+  `InvalidWeights`} → 422, except `Overflow` → 500.
+- `money::ledger::{ensure_account, set_allow_negative, account, post, balance,
+  transaction_by_key, trial_balance}` — all take `&mut RuntimeConnection`, so
+  they nest inside `Db::tx`. `post` **requires** a transaction.
+- `Account::new(id, currency)` / `.disallow_negative()`; `Posting::debit(...)` /
+  `::credit(...)`; `Transaction::new(key, postings).memo(...)` /
+  `.validate()`; `IdempotencyKey::new(s)` / `::derive(namespace, &postings)`;
+  `PostOutcome::{Posted, Replayed}` with `is_posted` / `is_replayed` /
+  `transaction`; `PostedTransaction`, `CurrencyTotal`, `Side`.
+- `LedgerError` {`Money`, `Unbalanced`, `PostingCount`, `OneSided`,
+  `ZeroPosting`, `MixedCurrencies`, `NegativeAmount`, `UnknownAccount`,
+  `AccountCurrency`, `KeyReuse`, `InvalidText`, `NegativeBalance`,
+  `NotInTransaction`, `Conflict`, `EmptyTransaction`, `Database`} — 409 for
+  `KeyReuse` / `NegativeBalance` / `Conflict`, 500 for `NotInTransaction` /
+  `EmptyTransaction` / `Database`, 422 for the rest.
+- Tables `ACCOUNTS_TABLE` / `TRANSACTIONS_TABLE` / `POSTINGS_TABLE`
+  (`_autumn_money_*`), append-only by trigger on both backends, shipped in the
+  framework migration set.
+
+## SLA obligations (`autumn_web::sla`, unreleased, #1826)
+
+Needs the `sla` feature. Deadlines in business time. The clock runs only in working hours and reads
+only the injected `Clock`.
+
+- `BusinessCalendar::new()` / `::weekdays(hours)` + `.hours(Weekday, hours)` /
+  `.holiday(NaiveDate)` / `.annual_holiday(month, day)` / `.zone(Tz)` /
+  `.business_day(Duration)`; reads: `working_time(from, to, tz)`,
+  `deadline(from, budget, tz)`, `is_working`, `next_working_instant`,
+  `day_length`, `is_holiday`, `home_zone`.
+- `WorkingHours` — `"09:00-17:00".parse()`, `::new(open, close)`, `ALL_DAY`.
+- `BusinessDuration` — `"2 business days".parse()`, `::days` / `::hours` /
+  `::minutes` / `::from_parts(days, secs)`, `resolve(&calendar)`.
+- `Obligation::new(name, subject)` + `.within(d)` / `.calendar(name)` /
+  `.zone(tz)` / `.zone_from(&value)` / `.starting_at(t)` / `.met_at(t)`;
+  `key()` is `"<name>/<subject>"` (`/` and `%` in the name percent-encoded); `status_with(&cal, tz, now)` is pure.
+- `#[obligation(name = ident, within = "...", starts = field, calendar = "...",
+  met = field, zone = field, subject = field)]` on a struct adds
+  `<name>_obligation(&self)`. A bad `within` is a compile error.
+- `SlaPlugin::new().calendar(name, cal).store(s).on_breach(name, |state,
+  breach| async { .. }).on_any_breach(..)`; registers jobs `CHECK_JOB`
+  (`autumn_sla_check`) and `ESCALATE_JOB` (`autumn_sla_escalate`).
+- `Sla` extractor (or `Sla::from_state`): `status(&ob)`, `track(&ob)`,
+  `meet(key)`, `get(key)`, `statuses()`, `forget(key)`, `reconcile()` (after a
+  calendar change), `calendar(name)`,
+  `now()`.
+- `ObligationStatus` {`key`, `state`, `zone`, `started_at`, `due_at`,
+  `met_at`, `escalated_at`, `resumes_at`, `budget`, `elapsed`, `remaining`};
+  `ObligationState` {`Running`, `Paused`, `Met`, `Breached`}.
+- `SlaBreach` (serde) {`key`, `obligation`, `subject`, `calendar`, `zone`,
+  `generation`, `started_at`, `due_at`, `escalated_at`, `token`} — the typed
+  escalation.
+- `ObligationStore` trait (`insert` → `(record, created)`, `get`, `list`,
+  `remove`, and the generation-bound writes `mark_met`, `set_due`,
+  `begin_dispatch`, `claim_escalation`, `release_escalation`);
+  `ObligationRecord { obligation, generation, escalated_at, due_at,
+  dispatch_token }` (the stored deadline decides the claim; `reconcile`
+  rewrites it after a calendar change; the first escalate job's token wins
+  the dispatch, so the handler runs once); `track` is idempotent and safe to retry;
+  `MemoryObligationStore` is the per-process default; replicas need one
+  shared store. A breach met late still escalates.
+- `SlaError` {`InvalidHours`, `InvalidDuration`, `UnknownCalendar`,
+  `NotInstalled`, `NoJobRuntime`, `Job`, `Store`} → 500 through `?`.
 
 ## Form helpers (`autumn_web::form`)
 
@@ -1211,6 +1298,7 @@ to a wall-clock jump in production.
 | `MonotonicInstant::saturating_duration_since(earlier)` | Elapsed duration; never negative, never panics (**0.7.0**) |
 | `MonotonicInstant::saturating_add(dur)` | Deadline arithmetic without `Instant + Duration`'s panic (**0.7.0**) |
 | `time::monotonic_now()` | Real monotonic clock, for code with no `ClockSource` in scope (**0.7.0**) |
+| `time::ambient_now()` / `ambient_monotonic()` / `ambient_instant()` / `ambient_system_time()` / `AmbientClock` | For code with no clock in scope: the running `Sim`'s virtual clock on this thread, else the system clock. Measure with `ambient_instant().saturating_duration_since(start)`, never `start.elapsed()` (#2967) |
 | `time::clock_unix_secs(clock)` / `clock_unix_duration(clock)` | Unix time from the injected clock |
 | `ClockSource::now` / `ClockSource::monotonic` | The trait; `monotonic` is defaulted to real time, so a **virtual** clock must override it (**0.7.0**) |
 | `Rng` extractor -> `.uuid_v4()` / `.uuid_v7(ms)` / `.next_u64()` | Ids and randomness from the injected `Entropy` source |
@@ -1221,6 +1309,16 @@ to a wall-clock jump in production.
 `std::time::Instant` — a raw `std::time::Instant` reads the real machine clock
 even inside a `#[sim_test]`. For a deadline whose counterparty is
 `tokio::time::sleep`, use `tokio::time::Instant`.
+
+## Simulation Phase 2 (`autumn_web::sim`, #2967)
+
+| API | Purpose |
+|---|---|
+| `Sim::net(SimNet)` | Route outbound `http_client::Client` calls through a seeded virtual network. `SimNet::new().host("payments", router).latency(min, max).drop_rate(p)`; `net.partition("payments")` / `net.heal(..)`; `net.events()` logs each attempt (`NetFault::{None, Dropped, Partitioned, TimedOut}`). No call reaches the real network; a host with no router falls back to `http_mock`s (`http-client` feature) |
+| `Sim::interleave(Vec<F>)` / `Sim::spawn(fut)` | Seeded poll order for futures / seeded yields for a spawned task, so a sweep explores task interleavings. The same seed replays the same order |
+| `sim::crash_at(index, op)` → `CrashOutcome` | Drop `op` at its `index`-th suspension. Pair with `CrashPoint::await_index` and `Sim::kill` / `Sim::restart` |
+| `Sim::try_run_to_idle()` → `Result<(), SimStall>` | `run_to_idle` panics with the seed when the drain never settles (a job that re-enqueues itself); this returns the `SimStall` instead |
+| `http_client::ClientError::SimNetwork` | A sim drop, partition, timeout or unknown host. `ClientError` is `#[non_exhaustive]` |
 
 ## Authored fault scenarios (`autumn_web::sim::FaultPlan`, #1680)
 
@@ -1825,9 +1923,13 @@ ingress_ipv4     = ["203.0.113.10"]      # A records, for tenant APEX domains
 
 The app drives the journey through
 `autumn_web::custom_domain::CustomDomainRegistry` (published in `AppState`):
-`register(hostname, tenant, now)` connects one, `DnsInstructions::for_hostname`
-renders the exact record to show the tenant, and `list_for_tenant` renders
-status. States are `pending_dns` → `verified` → `issuing` → `active`; a stuck
+`register(hostname, tenant, now)` connects one, `DnsInstructions::for_domain`
+renders the exact records to show the tenant, and `list_for_tenant` renders
+status. A domain verifies only when it points at the ingress AND its
+`_autumn-challenge.<hostname>` TXT record carries the registration's
+`verification_token`; each registration mints a new token, so DNS a previous
+tenant left behind proves nothing. `active` domains from before the token are
+grandfathered. States are `pending_dns` → `verified` → `issuing` → `active`; a stuck
 domain carries `failure_reason`, and an `active` domain that fails renewal STAYS
 active and serving.
 

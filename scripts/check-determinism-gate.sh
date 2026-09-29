@@ -133,13 +133,15 @@ GATED_MODULES=(
   # window on the injected `ClockSource`, so an upgrade's timing is as
   # reproducible under a virtual clock as the drain it replaces.
   autumn/src/upgrade.rs:default
+  # Calendar-aware SLA obligations (#1826). Every deadline, status and
+  # escalation reads the injected clock, so a sim replays a quarter of
+  # business time the same way each run.
+  autumn/src/sla/mod.rs:sla
   # Direct HTTPS termination (#1603). `tls.rs::now_unix` is the module's one
   # deliberate real-wall-time read — certificate validity is a fact about the
   # real world, not about the injected clock — and the gate is what keeps a
   # later off-seam read added beside it (in the bind path or the `CertReloader`
-  # poll loop) from shipping unlinted. NOTE: `autumn/src/acme/renewal.rs` has
-  # its own ungated `default_now_unix`; gating it needs an `--features acme`
-  # enforcing clippy lane, which does not exist yet.
+  # poll loop) from shipping unlinted.
   autumn/src/tls.rs:tls
   # mTLS client-certificate verification (#1640). Certificate validity and the
   # rejection-log rate limiter both read real wall time, through `tls.rs`'s
@@ -147,10 +149,69 @@ GATED_MODULES=(
   # them (in the trust-store reloader's poll loop, or the verifier) from
   # shipping unlinted.
   autumn/src/tls/client_auth.rs:tls
+  # Sim Phase 2 (#2967). These modules read time through the injected clock,
+  # or through `time::ambient_*` where no clock is in scope, so a running `Sim`
+  # controls them. Real-world time (X.509 expiry, SigV4 dates, file mtimes,
+  # waits on real servers) keeps a justified per-site allow.
+  autumn/src/actuator.rs:default
+  autumn/src/alerts.rs:default
+  autumn/src/audit.rs:default
+  autumn/src/capsule/persist.rs:default
+  autumn/src/capsule/schema.rs:default
+  autumn/src/circuit_breaker.rs:default
+  autumn/src/commentable.rs:default
+  autumn/src/consent.rs:default
+  autumn/src/custom_domain.rs:default
+  autumn/src/data_retention.rs:default
+  autumn/src/experiments.rs:default
+  autumn/src/fake.rs:default
+  autumn/src/feature_flags.rs:default
+  autumn/src/gdpr.rs:default
+  autumn/src/http_client.rs:default
+  autumn/src/idempotency.rs:default
+  autumn/src/inspector.rs:default
+  autumn/src/job_tracking.rs:default
+  autumn/src/lock.rs:default
+  autumn/src/log/capture.rs:default
+  autumn/src/metrics.rs:default
+  autumn/src/middleware/access_log.rs:default
+  autumn/src/middleware/metrics.rs:default
+  autumn/src/middleware/server_timing.rs:default
+  autumn/src/migrate.rs:default
+  autumn/src/notifications.rs:default
+  autumn/src/openapi.rs:default
+  autumn/src/push/store.rs:default
+  autumn/src/read_your_writes.rs:default
+  autumn/src/replication/engine.rs:default
+  autumn/src/replication/restore.rs:default
+  autumn/src/replication/s3.rs:default
+  autumn/src/replication/status.rs:default
+  autumn/src/route_listing.rs:default
+  autumn/src/router.rs:default
+  autumn/src/runtime_config.rs:default
+  autumn/src/security/rate_limit.rs:default
+  autumn/src/shadow/layer.rs:default
+  autumn/src/sharding.rs:default
+  autumn/src/static_gen/middleware.rs:default
+  autumn/src/static_gen/types.rs:default
+  autumn/src/step_up.rs:default
+  autumn/src/tenant_cell.rs:default
+  autumn/src/version_history.rs:default
+  autumn/src/webhook.rs:default
+  autumn/src/webhook_outbound.rs:default
+  autumn/src/acme/dns/resolver.rs:acme
+  autumn/src/acme/dns/route53.rs:acme
+  autumn/src/acme/renewal.rs:acme
+  autumn/src/i18n.rs:i18n
+  autumn/src/inbound_mail.rs:inbound-mail
+  autumn/src/plugin_sandbox/capability/audit.rs:plugin-sandbox
+  autumn/src/plugin_sandbox/capability/quota.rs:plugin-sandbox
+  autumn/src/presence.rs:presence
+  autumn/src/sync/server.rs:offline-sync
 )
 
 # The manifest is a ratchet: it may grow, never shrink.
-MODULE_COUNT_FLOOR=20
+MODULE_COUNT_FLOOR=76
 
 # Every lint the gate header must deny.
 REQUIRED_GATE_LINTS=(
@@ -376,6 +437,11 @@ cfg_test_mod_line_set() {
     pending && /^[[:space:]]*$/ { next }
     pending {
       if ($0 ~ /(^|[[:space:]])mod[[:space:]]+[A-Za-z_]/) {
+        # `mod name;` declares a module held in another file. There is no block
+        # here, so latching would never unlatch: at EOF the file reads as
+        # unbalanced, and anywhere else a later stray `}` silently ends the
+        # exemption somewhere arbitrary. The declaration itself exempts nothing.
+        if (index($0, "{") == 0 && $0 ~ /;/) { pending = 0; next }
         intest = 1
         for (k = pending; k < NR; k++) print k
         print NR
@@ -854,6 +920,24 @@ if [[ "$mode" != "--check-only" ]]; then
       printf '#[cfg(test)]\nmod tests {\n    #![allow(clippy::disallowed_methods)]\n    fn t() { let _ = "}}{{"; }\n}\n'; } \
       > "$tmp/realtests/autumn/src/gated.rs"
     expect_pass "$tmp/realtests" "a real cfg(test) mod is still exempt"
+
+    # `#[cfg(test)] mod tests;` declares a module that lives in another file.
+    # There is no block to track, so the scanner must not latch on it — at EOF
+    # that latch has nothing to close it and the whole file reads as unbalanced
+    # (`autumn/src/money/ledger.rs` ends this way).
+    make_fixture "$tmp/moddecl"
+    { printf '%s' "$GOOD_HEADER"
+      printf 'fn f() {}\n\n#[cfg(test)]\nmod tests;\n'; } \
+      > "$tmp/moddecl/autumn/src/gated.rs"
+    expect_pass "$tmp/moddecl" "a cfg(test) mod declaration at EOF is not unbalanced"
+
+    # And it must exempt nothing: the declaration carries no test code, so an
+    # inner suppression after it is still production code.
+    make_fixture "$tmp/moddeclexempt"
+    { printf '%s' "$GOOD_HEADER"
+      printf '#[cfg(test)]\nmod tests;\n\n#![allow(clippy::disallowed_methods)]\n'; } \
+      > "$tmp/moddeclexempt/autumn/src/gated.rs"
+    expect_fail "$tmp/moddeclexempt" "re-permits" "a cfg(test) mod declaration exempts nothing"
 
     self_test_tail "$tmp"
 

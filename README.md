@@ -241,6 +241,9 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 
 ## Documentation
 
+- [**Guide index — every guide page, grouped by task**](docs/guide/index.md) — the
+  full table of contents for `docs/guide/`; the list below is a selection of
+  highlights, not the whole guide
 - [**What's new in 0.7.0**](docs/releases/0.7.0.md) — a walkthrough of the release: host-preparing deploys and fleets, deterministic simulation testing, the new model attributes, failure-capsule replay, and a request path that allocates ~59% less
 - [Getting Started Guide](docs/guide/getting-started.md)
 - [Authentication](docs/guide/authentication.md) — sessions, password policy, login/logout, `#[secured]`, lockout, and remember-me; the hub that links OAuth, step-up, and MFA
@@ -255,6 +258,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Signed Webhook Intake](docs/guide/signed-webhooks.md) — webhooks arriving **in**: verifying a sender's signature, replay protection, and the intake route
 - [Outbound Signed Webhooks](docs/guide/outbound-webhooks.md) — sending outbound webhooks **out** to endpoints your own users/customers register: `WebhookSubscription`, `WebhookOutboundManager::dispatch()`, the retrying `autumn_webhook_delivery` job, and dead-letter inspection and replay under `/actuator/webhooks/*`
 - [Billing](docs/guide/billing.md) — `autumn-billing`: Stripe checkout and portal, a webhook-fed local mirror, the `Entitled<Plan>` gate, and durable dunning retries
+- [Money and the Ledger](docs/guide/money.md) — typed `Money<C>`, currency-safe arithmetic and rounding, and the append-only double-entry ledger with idempotent posting that commits inside your `Db::tx`
 - [Platform Support](docs/guide/platform-support.md) — the Windows tier policy: which commands run natively, which need WSL2, and the `windows-latest` CI job that gates the native journey
 - [Docs Smoke Procedure](docs/guide/docs-smoke.md) - release gate for first-run docs
 - [Release Checklist](docs/release-checklist.md)
@@ -279,7 +283,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Per-User Time Zones](docs/guide/time-zones.md) — rendering timestamps in each user's own time zone: the `TimeZone` extractor resolving their IANA zone, `set_time_zone_in_session`, `local_datetime`, and pairing it with the `Clock` extractor so date/time rendering stays deterministic and test-injectable
 - [Cloud-Native Guide](docs/guide/cloud-native.md)
 - [Capacity Contracts](docs/guide/capacity-contracts.md)
-- [Logging & PII](docs/guide/logging-pii.md)
+- [Logging: levels, format & PII](docs/guide/logging-pii.md)
 - [Failure Capsules](docs/guide/failure-capsules.md) — `[failure_capture]` records a failing request, its database traffic and its clock reads as one replayable file; `autumn replay` re-runs it offline
 - [Edge Capsules](docs/guide/edge.md) — `#[edge]` compiles read-path routes into a portable `wasm32-wasip1` artifact a CDN can run, byte-identical to the origin and falling back to it for anything the edge cannot serve (experimental)
 - [Wire Contracts](docs/guide/wire-contracts.md) — `#[endpoint]` turns a typed handler into a contract, `wire_client!` generates the caller's typed client from it, and `#[contract_checked]` fails the caller's build at the call site when a request or response field the caller actually reads or sets stops matching — including the two breaks the type checker cannot see, a new required field behind `..Default::default()` and a serde-skipped field (experimental)

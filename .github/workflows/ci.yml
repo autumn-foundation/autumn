@@ -113,11 +113,14 @@ jobs:
         # piece that decides whether an offline edit merges or is discarded,
         # was linted by no lane at all.
         #
+        # `sla` (#1826): the SLA engine carries the panic and determinism gates
+        # and is configured out without this feature.
+        #
         # KEEP IN SYNC with the identical list in scripts/pre-push-check.sh --
         # check-panic-gate.sh verifies every gated module's feature is covered by an
         # enforcing CI clippy lane, so a feature dropped from here silently disarms
         # that module's deny block.
-        run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,collab,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme" --all-targets -- -D warnings
+        run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,collab,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme,i18n,presence,sla" --all-targets -- -D warnings
       - name: Clippy (autumn-web, plugin-sandbox — panic gate)
         # `plugin-sandbox` (#1609) is not a default feature, so neither Clippy run
         # above compiles `plugin_sandbox`'s request-path modules and their
@@ -196,6 +199,27 @@ jobs:
         # queueing behind ~20 minutes of workspace clippy in `lint` — and a
         # clippy failure can't stop it from running.
         run: ./scripts/check-migration-guides.sh
+      - name: Changelog fragment gate
+        # A release note used to go straight into CHANGELOG.md, at the top of
+        # the `## [Unreleased]` section — the same few lines every other open
+        # PR wrote to, so every PR conflicted with every other PR over text
+        # that was never the point of either. A note is now its own file under
+        # `changelog.d/`, and this step keeps it that way: it fails a PR that
+        # edits CHANGELOG.md, and fails a fragment the release tooling and the
+        # migration-guide gate above could not read.
+        #
+        # A release commit is exempt through the `release` label or a
+        # [changelog] token in the PR body. CI does not re-run on `labeled`,
+        # so the token is the reliable one: put it in the release PR body when
+        # you open it.
+        #
+        # Shares this docs-only job for the same reason as the gates around
+        # it: no toolchain, no cache, reports in seconds.
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          CHANGELOG_RELEASE_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'release') }}
+        run: ./scripts/check-changelog-fragments.sh --self-test && ./scripts/check-changelog-fragments.sh
       - name: Migration version gate
         # Framework, plugin and app migrations share one version space: diesel
         # keys `__diesel_schema_migrations` on the 14-digit version and
@@ -341,6 +365,35 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-orphans.sh --self-test && ./scripts/check-docs-orphans.sh
+      - name: Guide index completeness gate
+        # The reachability gate above asks "does any inbound link exist". This
+        # asks the question a reader actually has: "is this page somewhere I
+        # would look". They are different, and the gap between them is where
+        # this corpus was losing people — reachability passes when the only
+        # inbound link is a mid-page crosslink from another guide page, or a
+        # mention inside an agent SKILL.md, a surface written for a language
+        # model rather than for a person with a question.
+        #
+        # The step above says `docs/guide/` has no index of its own and that
+        # discovery therefore rests on README.md's hand-maintained list, which
+        # "someone has to remember to update. Nothing noticed when they
+        # forgot." Nothing noticed 92 times: the baseline run of this gate
+        # found 92 of the 147 guide pages in NO reader-facing index, among them
+        # middleware, testing, migrations, repositories, jobs, authorization,
+        # pagination, websockets, rate-limiting, i18n, events and oauth — the
+        # pages a reader needs in their first week. A cold retrieval test over
+        # README.md's list found the answering page absent for 11 of 15
+        # ordinary question classes, while every drift gate was green over
+        # those same pages. The answers were right and unreachable by search,
+        # which from the reader's seat is indistinguishable from absent.
+        #
+        # docs/guide/index.md is the fix, and this gate is what keeps it true:
+        # a page added without an index line fails in the commit that adds it,
+        # which is the only moment anyone has the context to write that line.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-guide-index.sh --self-test && ./scripts/check-docs-guide-index.sh
       - name: TOML config-key drift gate
         # The env-var gate above covers the config a reader SETS. This covers
         # the config they WRITE — a key in `autumn.toml` itself — which is the
@@ -610,6 +663,86 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-scope.sh --self-test && ./scripts/check-docs-scope.sh
+      - name: Reader-vocabulary gate
+        # Most docs gates above ask whether a page is TRUE. The orphan gate is
+        # the near miss: it proves a page is reachable by CLICKING from an entry
+        # surface, which is not the same question — nobody reads down a 150-page
+        # guide index, they type the word they already have. The retrieval gate
+        # asks that typing question over a page's slug, H1 and headings; this
+        # one is its broader, weaker companion, asking whether the answering
+        # page carries the reader's word at all in rendered text.
+        #
+        # A findability defect is quieter than a wrong sentence, because a wrong
+        # sentence is at least read. The reader who never lands on the page
+        # produces no 404, no exit code and no ticket; they conclude the feature
+        # does not exist and go and build it, or pick a framework whose docs
+        # answered them.
+        #
+        # Baseline: `autumn generate auth User --totp` ships two-factor auth,
+        # and `docs/guide/authentication.md` documented it accurately as "TOTP" and
+        # "Multi-factor" while never once saying "2FA" or "two-factor" — the
+        # words essentially everyone types. A corpus-wide grep for the reader's
+        # words returned four hits, none of them an answer: two were `%2F` URL
+        # escapes, one an example URL on the rate-limiting page, one an agent
+        # skill file. That is why this gate unescapes `%XX` before matching and
+        # why a row is satisfied only by the page that answers the question.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-aliases.sh --self-test && ./scripts/check-docs-aliases.sh
+      - name: Docs retrieval gate
+        # Every gate above checks a page a reader HAS REACHED, and
+        # `check-docs-orphans.sh` checks that a path of links to it exists at
+        # all. Neither asks what a reader mid-task actually arrives with: not
+        # "which link do I click" but "what do I type". A page whose title and
+        # headings are spelled in project vocabulary instead of the reader's is
+        # invisible to that search while staying perfectly reachable,
+        # accurate and linked — every other gate green over it.
+        #
+        # The baseline found the log-configuration question class failing
+        # exactly that way. `docs/guide/logging-pii.md` carried `[log] level`,
+        # `log.format` and the access-log switches under the title
+        # "Logging & PII" — the name the README listed it by — so "log level",
+        # "debug logging" and "json logs" returned nothing, while `[log]`
+        # itself appeared in 9 fences across 7 pages. The runtime half,
+        # `PUT /actuator/loggers/{name}`, was on no reader-facing page at all.
+        #
+        # The fixture pins the ANSWERING page, not merely "some hit", so a
+        # retitle that re-aims a page at a different question fails here
+        # rather than passing quietly.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-retrieval.sh --self-test && ./scripts/check-docs-retrieval.sh
+      - name: CLI coverage gate
+        # The twelve docs gates above all run docs -> code: "is what we wrote
+        # still true?", which is DRIFT. This one runs code -> docs: "is what we
+        # shipped written down anywhere?", which is COVERAGE. Nothing asked
+        # that before, and the gap is invisible by construction — a gate that
+        # only reads the docs can never notice a command the docs never
+        # mention, so a command can ship, work, carry good `--help` text, be
+        # documented nowhere, and leave the whole tree green.
+        #
+        # That is how all four `autumn token` subcommands — `issue` since
+        # 0.5.x, `list` / `rotate` since 0.6.0 — reached 0.7 with "revoke api
+        # token" returning zero hits across all 160 guide pages. #2821 fixed
+        # the prose and deferred the gate, on the grounds that a correct one
+        # has to reuse `check-docs-cli.sh`'s `resolve()` rather than
+        # re-implement it. It does: surface, corpus, resolved invocations and
+        # the hidden-command set all come from that gate's `--list`,
+        # `--corpus`, `--resolved` and `--list-hidden` modes, so the two cannot
+        # disagree about what a line names. A private matcher gets the shallow
+        # cases right and the deep ones wrong — `autumn openapi export`
+        # satisfying the top-level `export` (a different command, an offline
+        # diagnostic snapshot) was caught in review on the first attempt.
+        #
+        # Not registered in `check-docs-scope.sh`'s SIBLINGS: it spells no
+        # corpus of its own, it asks `check-docs-cli.sh` for that gate's, so
+        # there is no second spelling for the scope gate to reconcile.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-cli-coverage.sh --self-test && ./scripts/check-docs-cli-coverage.sh
       - name: Plugin surface gate
         # The declared plugin API surface (issue #1601) has a compiled half —
         # the `plugin-contract` job below builds `autumn-plugin-reference`
@@ -662,6 +795,39 @@ jobs:
         # the admin plugin proves a real, non-trivial consumer of it.
         run: cargo check -p autumn-admin-plugin --all-targets
 
+  migration-collisions:
+    name: Diesel migration version collisions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # `autumn migrate check-collisions` compares this branch's migration
+          # versions against every other pushed branch, which needs the
+          # remote-tracking refs a shallow (default) checkout doesn't fetch.
+          # Without this, the gate still runs — it degrades to a working-tree
+          # -only check with a loud warning rather than failing closed — but
+          # would silently lose the cross-branch half of the protection on
+          # every PR in this repo's own CI.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Migration version collision gate
+        # Diesel records applied migrations BY VERSION (the leading
+        # `YYYYMMDDHHMMSS` directory prefix). When two directories share one
+        # version, a fresh database runs exactly one of them and records the
+        # version as done -- the other is skipped forever, with no error
+        # anywhere. This is the enforcing half of `autumn migrate new`, which
+        # hands out a collision-free version at generation time; this gate
+        # catches a collision that generator could not see (a branch pushed
+        # after, a teammate's concurrent PR) before it reaches the default
+        # branch, on the push that introduced it rather than after both land.
+        #
+        # Framework-owned migrations live in `autumn/migrations`, not a
+        # repository-root `migrations/`, so this runs from within `autumn/` —
+        # exactly like a downstream app would run it from its own project
+        # root once `autumn migrate check-collisions` ships in a release.
+        run: (cd autumn && cargo run -p autumn-cli --bin autumn -- migrate check-collisions)
+
   supply-chain:
     name: Supply chain (cargo-deny)
     runs-on: ubuntu-latest
@@ -675,7 +841,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
-      - uses: taiki-e/install-action@v2.87.5
+      - uses: taiki-e/install-action@v2.87.11
         with:
           tool: cargo-deny@0.20.2
       # Advisories go through the shared gate (issue #1600) so PR CI, the
@@ -820,7 +986,16 @@ jobs:
         # The root cause is the tests' sensitivity to contention, which this
         # only sidesteps; making them robust under an oversubscribed pool is
         # worth its own issue.
+        #
+        # The liveness watchdog is armed here (issue #2967): a deadlocked
+        # `#[sim_test]` fails with its seed instead of hanging the job. It is
+        # safe only at `--test-threads=1`, because the paused clock also
+        # advances while a test waits on a lock another test thread holds. The
+        # budget is virtual time, so two years costs nothing and stays far
+        # above the longest `advance` in the suite (about two months).
         shell: bash
+        env:
+          AUTUMN_SIM_LIVENESS_BUDGET_SECS: "63072000"
         run: |
           set -euo pipefail
           cargo test --workspace -- sim_ --test-threads=1 | tee "${RUNNER_TEMP}/sim.log"
@@ -957,6 +1132,7 @@ jobs:
             redis-tls,
             tls,
             acme,
+            sla,
           ]
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     steps:
@@ -1240,6 +1416,30 @@ jobs:
             --test integration_tests acme_pebble:: -- --ignored \
             | tee "${RUNNER_TEMP}/acme-pebble.log"
           assert_ran "${RUNNER_TEMP}/acme-pebble.log" "acme_pebble"
+      - name: Run SLA-gated tests (business-time obligations)
+        if: matrix.lane == 'sla'
+        # `sla` (#1826) is not a default feature, so the `test` job compiles
+        # none of its suites. The `sim_sla*` modules are determinism tests, so
+        # they run at `--test-threads=1`, as in the `test` job's `sim_` step.
+        # `assert_ran`: a filter that matches nothing exits 0.
+        run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the suite is no longer compiled in"; exit 1; }
+          }
+          cargo test -p autumn-web --features sla --lib sla:: | tee "${RUNNER_TEMP}/sla-lib.log"
+          assert_ran "${RUNNER_TEMP}/sla-lib.log" "autumn-web sla unit tests"
+          cargo test -p autumn-web --features sla --doc sla
+          cargo test -p autumn-web --features sla --test integration_tests sla_obligation_macro:: \
+            | tee "${RUNNER_TEMP}/sla-macro.log"
+          assert_ran "${RUNNER_TEMP}/sla-macro.log" "sla_obligation_macro"
+          cargo test -p autumn-web --features sla --test integration_tests sim_sla -- --test-threads=1 \
+            | tee "${RUNNER_TEMP}/sim-sla.log"
+          assert_ran "${RUNNER_TEMP}/sim-sla.log" "sim_sla"
+          cargo test -p autumn-web --features sla --test integration_tests compile_fail::obligation \
+            | tee "${RUNNER_TEMP}/sla-compile-fail.log"
+          assert_ran "${RUNNER_TEMP}/sla-compile-fail.log" "obligation_compile_fail_tests"
 
   # The Docker/testcontainer sweep runs as its own job rather than as the last
   # step of `test` (#1747). As step 16 of that job it inherited a disk already
@@ -1429,6 +1629,23 @@ jobs:
           cargo test -p autumn-billing --test dunning_close_scan_profile -- --ignored
           # autumn-billing: rearm_pending startup job-insert-loop findings profile (Ledger).
           cargo test -p autumn-billing --test dunning_rearm_pending_profile -- --ignored
+          # examples/bookmarks-distributed: link-checker mark_dead batch profile (Ledger).
+          # `bookmarks-distributed` ships no library target, so this lives in
+          # `src/tasks.rs`'s own `#[cfg(test)]` tree (a `--bin` unit test, not a
+          # `tests/*.rs` binary) and needs this explicit line the same way every
+          # other Docker-gated test in a crate with no consolidated sweep does.
+          # A substring filter matches nothing (and exits 0) after a silent
+          # rename, so this guards for a positive pass count the same way the
+          # redis job-admin and pg relative-delay filters above do.
+          (
+            set -o pipefail
+            cargo test -p bookmarks-distributed --bin bookmarks-distributed -- \
+              --ignored link_checker_batches_mark_dead --test-threads=1 \
+              | tee "${RUNNER_TEMP}/bookmarks-distributed-link-checker.log"
+          )
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' \
+            "${RUNNER_TEMP}/bookmarks-distributed-link-checker.log" \
+            || { echo "::error::no link-checker mark_dead batch test ran — the ci.yml filter no longer matches"; exit 1; }
           # examples/react-graphql: the Postgres tier of its GraphQL suite
           # (rows, hooks, normalisation, validation, REST/GraphQL parity).
           # Testcontainer-managed; serial because the tests share one
@@ -1511,7 +1728,8 @@ jobs:
             --skip linked_seed_binary_cargo_checks \
             --skip serve_daemon_start_status_stop_over_unix_socket \
             --skip scaffolded_json_field_generates_compiles_inserts_and_selects \
-            --skip scrubbed_database_migrates_clean_and_boots_the_app
+            --skip scrubbed_database_migrates_clean_and_boots_the_app \
+            --skip documented_scaffold_example_builds_without_warnings
           # Consolidated `integration_tests` binary: discover-and-run ALL the
           # Docker/testcontainer `#[ignore]`d DB tests instead of a hand-curated
           # per-feature allowlist (#1923). Enabling `test-support` (testcontainers)
@@ -1744,7 +1962,7 @@ jobs:
         # Pin @v2 and pass the tool explicitly. The bare @cargo-llvm-cov tag form can
         # resolve with an empty tool input and install nothing (broke the Fuzz
         # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
-        uses: taiki-e/install-action@v2.87.5
+        uses: taiki-e/install-action@v2.87.11
         with:
           tool: cargo-llvm-cov
       - name: Generate coverage (workspace catch-all)
@@ -2055,7 +2273,9 @@ jobs:
             --test sqlite_upsert_isolation \
             --test sqlite_votable \
             --test sqlite_derivation \
+            --test sqlite_money_ledger \
             --test sqlite_dependent_destroy \
+            --test sqlite_commentable \
             --test sqlite_tracked_sessions \
             --test sqlite_commit_hook_worker \
             --test sqlite_framework_migrations \
@@ -2253,7 +2473,26 @@ jobs:
       RUSTFLAGS: "-Clink-arg=/DEBUG:LongSymbolTruncate"
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to the exact MSRV, not `@stable` (2026-09-28 finding, 🚦
+      # Semaphore): every scaffolded app's `rust-toolchain.toml` pins
+      # `channel = "1.88.0"` literally (autumn-cli/src/templates/rust-toolchain.toml.tmpl,
+      # rendered from Cargo.toml's `rust-version`), a DIFFERENT rustup toolchain
+      # name than "stable". When this job only installed `@stable`, the first
+      # `cargo`/`autumn` invocation inside the scaffolded `tier1_app` directory
+      # (during `autumn setup`, which shells out to `cargo metadata`) made
+      # rustup auto-install the separate "1.88.0-x86_64-pc-windows-msvc"
+      # toolchain on the fly. That on-demand install intermittently left a
+      # non-functional `cargo` component behind, failing every later `cargo`
+      # invocation in the job with `"the 'cargo.exe' binary, normally provided
+      # by the 'cargo' component, is not applicable to the '1.88.0-x86_64-pc-windows-msvc'
+      # toolchain"` — a rustup error, not an autumn/CLI defect. Confirmed by
+      # log content on 4 organic occurrences (runs 108204416273, 108534929493,
+      # 108821476268, 108842089677), all identical, all resolved once the
+      # `read_cargo_metadata` stderr fix (#2973) made the underlying rustup
+      # error visible. Installing the exact MSRV toolchain up front — the same
+      # thing the `msrv` job below already does — removes the on-demand
+      # install path entirely, so there is nothing left to race.
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
 
@@ -2408,6 +2647,31 @@ jobs:
           if ($block -match '(?m)^\s*source\s*=') {
             throw "autumn-web resolved from a registry — the [patch.crates-io] override did not take. Its lock entry: $block"
           }
+
+          # Assert the "Journey: autumn setup" step's Tailwind download was
+          # actually CONSUMED, not merely present at the path it wrote to
+          # (issue #2457). Before that fix, `setup` installed to
+          # `target\autumn\tailwindcss` (no `.exe`, and CWD-relative rather
+          # than honoring this job's `CARGO_TARGET_DIR`), the scaffold's
+          # `build.rs` looked for `target/autumn/tailwindcss` and found
+          # nothing on Windows, and — because a missing Tailwind CLI is
+          # treated as optional — the cargo build above passed anyway with no
+          # CSS ever compiled. `static/css/autumn.css` is generated only by a
+          # real Tailwind run (it ships in no template), so its absence here
+          # means the exact silent-degradation this job exists to catch.
+          $tailwindBin = "$env:CARGO_TARGET_DIR\autumn\tailwindcss.exe"
+          if (-not (Test-Path $tailwindBin)) {
+            throw "autumn setup did not install Tailwind where autumn dev/build.rs look for it: $tailwindBin"
+          }
+          $css = "static\css\autumn.css"
+          if (-not (Test-Path $css)) {
+            throw "build.rs never ran Tailwind: $css was not generated"
+          }
+          $cssBytes = (Get-Item $css).Length
+          if ($cssBytes -lt 100) {
+            throw "generated $css is suspiciously small ($cssBytes bytes) — Tailwind likely did not run against real content"
+          }
+          Write-Host "Tailwind CLI consumed from $tailwindBin; generated $css ($cssBytes bytes)"
 
       - name: "Journey: managed Postgres boots and shuts down cleanly"
         # THE regression this whole target exists to prevent, tested at the

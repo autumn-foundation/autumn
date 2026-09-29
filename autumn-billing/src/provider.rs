@@ -40,7 +40,10 @@ impl HostedSession {
 pub struct CustomerRequest {
     /// Local customer id. Sent as provider metadata.
     pub local_customer_id: String,
-    /// Application user id. Sent as provider metadata.
+    /// Application user id. Sent as provider metadata. Always the raw
+    /// session id, even under Autumn's tenancy feature — `customer_for`
+    /// strips any tenant scoping before building this request, since a
+    /// provider is outside Autumn's own tenant boundary.
     pub user_id: String,
     /// Email, when known.
     pub email: Option<String>,

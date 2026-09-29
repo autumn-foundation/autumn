@@ -250,6 +250,8 @@ def bin_target_names(member_dir: Path, workspace_edition: str | None = None) -> 
         src_bin = src / "bin"
         if src_bin.is_dir():
             for path in sorted(src_bin.glob("*.rs")):
+                if path.name.startswith("."):
+                    continue  # cargo ignores dotfiles during auto-discovery
                 if path.resolve() in claimed_paths:
                     continue  # same target, declared explicitly
                 # cargo names these after the file stem — including the odd
@@ -257,6 +259,8 @@ def bin_target_names(member_dir: Path, workspace_edition: str | None = None) -> 
                 # "main", NOT the package name.
                 discovered.append(path.stem)
             for d in sorted(src_bin.iterdir()):
+                if d.name.startswith("."):
+                    continue  # cargo ignores hidden dirs during auto-discovery
                 main = d / "main.rs"
                 if d.is_dir() and main.is_file() and main.resolve() not in claimed_paths:
                     # `src/bin/<name>/main.rs` is named after the directory.
@@ -813,12 +817,40 @@ def self_test() -> int:
             not collisions,
         )
 
+    # Case 22 (issue #2746): cargo ignores dotfiles and hidden directories
+    # during target auto-discovery, so `src/bin/.helper/main.rs` and
+    # `src/bin/.secret.rs` in two members must not invent a ".helper" /
+    # ".secret" target that trips the gate.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["a", "b"])
+        _make_member(
+            tmp / "root", "a",
+            '[package]\nname = "a"\nversion = "0.1.0"\n',
+            {"src/bin/.helper/main.rs": "fn main() {}\n",
+             "src/bin/.secret.rs": "fn main() {}\n"},
+        )
+        _make_member(
+            tmp / "root", "b",
+            '[package]\nname = "b"\nversion = "0.1.0"\n',
+            {"src/bin/.helper/main.rs": "fn main() {}\n"},
+        )
+        total, collisions = check(root)
+        names_a = bin_target_names(root / "a")
+        names_b = bin_target_names(root / "b")
+        expect(
+            "hidden src/bin entries are not auto-discovered; no false collision",
+            not collisions
+            and ".helper" not in names_a and ".helper" not in names_b
+            and ".secret" not in names_a,
+        )
+
     if failures:
         print(f"self-test: {len(failures)} case(s) FAILED", file=sys.stderr)
         for label in failures:
             print(f"  - {label}", file=sys.stderr)
         return 1
-    print("self-test: all 21 cases passed")
+    print("self-test: all 22 cases passed")
     return 0
 
 
