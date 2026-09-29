@@ -4,6 +4,14 @@
 //! such as `StaticRouteMeta` (metadata about a route) and `StaticManifest` (the JSON
 //! ledger of all files generated during the build).
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
@@ -289,10 +297,7 @@ pub fn url_to_file_path(url_path: &str) -> String {
 /// Seconds since the Unix epoch, as a decimal string (avoids pulling in
 /// chrono/time just to stamp a manifest).
 fn unix_timestamp_now() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let secs = crate::time::clock_unix_secs(&crate::time::AmbientClock);
     format!("{secs}")
 }
 
