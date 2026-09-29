@@ -6633,6 +6633,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 password,
                 select: select_specs,
                 exclude,
+                for_destroy: mode == ApplyMode::Destroy,
                 // Encrypted-column flags are auto-detected from the model source.
                 ..Default::default()
             };
