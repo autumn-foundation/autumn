@@ -11166,8 +11166,22 @@ async fn resolve_shard_set(
             // no-database path. A shard set establishing SQLite pools under a
             // nonzero timeout still fails closed.
             #[cfg(feature = "sqlite")]
-            crate::db::reject_sqlite_statement_timeout(config.database.statement_timeout)
+            {
+                // Scope the lock-wait wording to a `cache=shared` shard when
+                // any shard is one (issue #2881).
+                let target = config
+                    .database
+                    .shards
+                    .iter()
+                    .map(|shard| shard.primary_url.as_str())
+                    .find(|url| crate::db::sqlite_target_is_shared_cache(url))
+                    .unwrap_or_default();
+                crate::db::reject_sqlite_statement_timeout(
+                    config.database.statement_timeout,
+                    target,
+                )
                 .map_err(|e| format!("Failed to create shard pools: {e}"))?;
+            }
             crate::sharding::build_shard_set(&config.database, topologies, router)
         }
         None => crate::sharding::create_shard_set(&config.database, router)
@@ -11250,8 +11264,11 @@ async fn setup_database(
     // `resolve_shard_set` applies the same Some-gated guard for shards.
     #[cfg(feature = "sqlite")]
     if topology.is_some() {
-        crate::db::reject_sqlite_statement_timeout(config.database.statement_timeout)
-            .map_err(|e| format!("Failed to create database pool: {e}"))?;
+        crate::db::reject_sqlite_statement_timeout(
+            config.database.statement_timeout,
+            config.database.effective_primary_url().unwrap_or_default(),
+        )
+        .map_err(|e| format!("Failed to create database pool: {e}"))?;
     }
 
     // Spawn the directory invalidation listener only at real runtime — a static

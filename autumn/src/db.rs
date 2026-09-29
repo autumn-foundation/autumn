@@ -1506,7 +1506,7 @@ fn sqlite_target_is_memory(target: &str) -> bool {
 /// [`sqlite_target_is_memory`], which exists precisely so shared-cache targets
 /// are never forced single-slot.
 #[cfg(feature = "sqlite")]
-fn sqlite_target_is_shared_cache(target: &str) -> bool {
+pub(crate) fn sqlite_target_is_shared_cache(target: &str) -> bool {
     target.contains("cache=shared")
 }
 
