@@ -237,6 +237,44 @@ pub trait BlobStore: Send + Sync + 'static {
         })
     }
 
+    /// Stream only the inclusive byte range `[start, end]` of an object.
+    ///
+    /// Powers HTTP `Range` requests (see
+    /// [`Download::into_response_ranged`](crate::download::Download::into_response_ranged)):
+    /// a client seeking within a large video asks for a slice, and the store
+    /// returns just those bytes.
+    ///
+    /// `start` and `end` are inclusive and are assumed to have been validated
+    /// against the object's size by the caller (via
+    /// [`autumn_web::range`](crate::range)).
+    ///
+    /// The default implementation buffers the whole object via
+    /// [`get`](BlobStore::get) and slices it — used by backends that cannot do
+    /// a true ranged read (e.g. the S3 backend until it is overridden there).
+    /// The [`LocalBlobStore`] overrides this to `seek` + `take` so a slice of a
+    /// large file never materializes the whole object in memory.
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        start: u64,
+        end: u64,
+    ) -> BlobFuture<'a, ByteStream<'static>> {
+        Box::pin(async move {
+            let bytes = self.get(key).await?;
+            let lo = usize::try_from(start)
+                .unwrap_or(usize::MAX)
+                .min(bytes.len());
+            let hi = usize::try_from(end)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1)
+                .min(bytes.len());
+            let slice = bytes.slice(lo..hi.max(lo));
+            let stream: ByteStream<'static> =
+                Box::pin(futures::stream::once(async move { Ok(slice) }));
+            Ok(stream)
+        })
+    }
+
     /// Delete the blob at `key`. No-op when the key does not exist.
     fn delete<'a>(&'a self, key: &'a str) -> BlobFuture<'a, ()>;
 

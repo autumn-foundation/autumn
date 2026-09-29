@@ -628,7 +628,16 @@ fn tiers_empty_by_default() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn principal_strategy_keys_on_session_user_id() {
+    // Serialize against the throttle-registry tests and reset it up front, taking
+    // the shared TEST_LOCK FIRST and holding it for the whole test so no sibling
+    // repopulates per-principal buckets mid-assertion (#1725).
+    let _throttle_lock = autumn_web::security::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::security::__throttle_registry_reset();
+
     let mut config = principal_config(0.1, 1);
     config.security.rate_limit.trust_forwarded_headers = true;
     let client = TestApp::new()
@@ -643,6 +652,13 @@ async fn principal_strategy_keys_on_session_user_id() {
         .header("set-cookie")
         .expect("must set cookie")
         .to_owned();
+
+    // Drop user-A's jar cookie before logging in user-B. `TestClient` carries a
+    // cookie jar, so without this the user-B login replays user-A's session
+    // cookie and overwrites that one shared session's `user_id`, collapsing both
+    // "distinct" users onto a single principal bucket — which spuriously 429s the
+    // fresh user (#1725). Explicit per-request cookies below still isolate them.
+    client.log_out();
 
     // 2. Log in user-B
     let resp_b = client.get("/login/user-b").send().await;

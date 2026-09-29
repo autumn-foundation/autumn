@@ -1,5 +1,23 @@
 //! Local offline store: `SQLite` rows + write-through pending journal.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
+
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -196,7 +214,7 @@ fn replace_pending(
     .bind::<Nullable<Text>, _>(payload)
     .bind::<BigInt, _>(base_version)
     .bind::<Text, _>(updated_at)
-    .bind::<Text, _>(Utc::now().to_rfc3339())
+    .bind::<Text, _>(crate::time::ambient_now().to_rfc3339())
     .execute(conn)
     .map(|_| ())
 }
@@ -337,7 +355,7 @@ fn apply_remote_rows_inner(
     conn: &mut SqliteConnection,
     rows: &[RemoteRow],
 ) -> Result<usize, diesel::result::Error> {
-    let mut applied = 0;
+    let mut applied = 0_usize;
     for row in rows {
         if has_pending(conn, &row.collection, &row.pk)? {
             continue;
@@ -346,7 +364,7 @@ fn apply_remote_rows_inner(
             continue;
         }
         upsert_remote_row(conn, row)?;
-        applied += 1;
+        applied = applied.saturating_add(1);
     }
     Ok(applied)
 }
@@ -417,7 +435,7 @@ impl SyncStore {
         // lock (a deliberate deadlock-avoidance rule). Concurrent first
         // opens of one file hit exactly this, so retry the conversion +
         // schema DDL briefly instead of failing the open.
-        let mut attempts = 0;
+        let mut attempts = 0_u32;
         loop {
             let result = conn
                 .batch_execute(
@@ -429,7 +447,7 @@ impl SyncStore {
             match result {
                 Ok(()) => break,
                 Err(err) if attempts < 100 && err.to_string().contains("database is locked") => {
-                    attempts += 1;
+                    attempts = attempts.saturating_add(1);
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 Err(err) => return Err(store_err(err)),
@@ -531,7 +549,7 @@ impl SyncStore {
         op: Op,
         payload: Option<&str>,
     ) -> Result<(), SyncError> {
-        let now = Utc::now().to_rfc3339();
+        let now = crate::time::ambient_now().to_rfc3339();
         let op_name = match op {
             Op::Upsert => "upsert",
             Op::Delete => "delete",

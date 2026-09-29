@@ -28,6 +28,8 @@ pub mod maintenance;
 pub(crate) mod method_override;
 pub(crate) mod metrics;
 pub(crate) mod request_id;
+pub(crate) mod server_timing;
+pub(crate) mod short_circuit;
 #[cfg(feature = "telemetry-otlp")]
 pub(crate) mod trace_context;
 
@@ -45,5 +47,6 @@ pub use method_override::{
 };
 pub use metrics::{MetricsCollector, MetricsLayer};
 pub use request_id::{RequestId, RequestIdLayer};
+pub use server_timing::{ServerTimingEmitted, ServerTimingLayer, ServerTimingService};
 #[cfg(feature = "telemetry-otlp")]
 pub use trace_context::{TraceContextLayer, TraceContextService};

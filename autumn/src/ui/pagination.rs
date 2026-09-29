@@ -529,11 +529,21 @@ mod tests {
         let q = filter_query("?q=foo&page=3", &["page"]);
         assert_eq!(q, "q=foo");
     }
+    #[test]
+    fn filter_query_preserves_unlisted_keys() {
+        let q = filter_query("a=1&b=2&c=3", &["b"]);
+        assert_eq!(q, "a=1&c=3");
+    }
 
     #[test]
     fn window_total_u32_max_does_not_panic() {
         // Must not overflow in debug mode.
         let _ = page_window(1, u32::MAX, 2);
+    }
+    #[test]
+    fn window_total_zero_returns_single_page() {
+        let items = page_window(1, 0, 2);
+        assert_eq!(items, vec![PageItem::Page(1)]);
     }
 
     // include_size is opt-in: verify via pagination_nav output.
