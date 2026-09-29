@@ -5480,7 +5480,7 @@ fn post_commit_fence(endpoint: &ServerEndpoint) -> Vec<String> {
 /// appear, which `pg::sanitize_prefers_query_user_password_dbname_over_url_structure`
 /// pins. Clearing only the userinfo therefore prints the effective password.
 ///
-/// `oauth_client_secret` (PostgreSQL 18) authenticates the same way a password
+/// `oauth_client_secret` (Postgres 18) authenticates the same way a password
 /// does, and the old two-keyword denylist printed it verbatim into `--dry-run`
 /// output — the output that exists to be pasted and shared.
 const SECRET_KEYWORDS: [&str; 3] = ["password", "sslpassword", "oauth_client_secret"];
@@ -5488,7 +5488,7 @@ const SECRET_KEYWORDS: [&str; 3] = ["password", "sslpassword", "oauth_client_sec
 /// Connection-string keywords known to carry no credential.
 ///
 /// An allowlist, not a denylist: this function's contract is credential-free
-/// output, and a denylist fails open the day a PostgreSQL release adds a
+/// output, and a denylist fails open the day a Postgres release adds a
 /// parameter nobody here has heard of — which is exactly how
 /// `oauth_client_secret` arrived above. A keyword on neither list makes the
 /// whole conninfo unprintable: the dry run refuses the target
@@ -5556,7 +5556,7 @@ const PRINTABLE_KEYWORDS: [&str; 40] = [
 ///
 /// The query half is an allowlist (`PRINTABLE_KEYWORDS`), not a denylist: any
 /// keyword that is neither a stripped credential nor known-non-secret refuses
-/// the whole conninfo, so a parameter a future PostgreSQL release invents —
+/// the whole conninfo, so a parameter a future Postgres release invents —
 /// the way 18's `oauth_client_secret` arrived — cannot slip a credential into
 /// printed output.
 fn password_free_conninfo(url: &str) -> Option<String> {
@@ -6766,7 +6766,7 @@ mod tests {
         );
     }
 
-    /// PostgreSQL 18's `oauth_client_secret` authenticates like a password,
+    /// Postgres 18's `oauth_client_secret` authenticates like a password,
     /// and the old two-keyword denylist printed it verbatim into `--dry-run`
     /// output — the output that exists to be pasted and shared.
     #[test]
@@ -6801,7 +6801,7 @@ mod tests {
     /// the target instead of being printed or dropped: dropping `hostaddr`
     /// would reconnect somewhere else, and printing a future credential
     /// parameter would repeat the `oauth_client_secret` disclosure above. A
-    /// denylist cannot know the next PostgreSQL release; the allowlist fails
+    /// denylist cannot know the next Postgres release; the allowlist fails
     /// closed.
     #[test]
     fn an_unknown_keyword_refuses_the_target() {
@@ -6972,7 +6972,6 @@ mod tests {
                 "and say so: {comment}"
             );
         }
-
     }
 
     /// An unsampled target emits nothing: no capture, no assertions.
