@@ -3311,9 +3311,9 @@ Once the container is running:
   snapshot](#capturing-a-diagnostic-snapshot-for-a-bug-report-autumn-export).
 - **Generate traffic**: `autumn simulate --url http://localhost:3000
   --duration 10 --concurrency 50` drives GET requests at an app from that many
-  threads for that many seconds and prints the total and requests/sec — enough
-  to put live data on an `autumn monitor` dashboard without installing `hey`
-  or `wrk`. Point it at a local or staging instance, not production.
+  threads for that many seconds and prints responses, requests/sec, and failed
+  requests (it exits non-zero if nothing answered) — enough to put live data
+  on an `autumn monitor` dashboard without installing `hey` or `wrk`. Point it at a local or staging instance, not production.
 - **Scale**: add `min_machines_running = 1` in `fly.toml` to keep a warm
   instance; use `pool_size` in `autumn.production.toml.example` to tune
   database concurrency.

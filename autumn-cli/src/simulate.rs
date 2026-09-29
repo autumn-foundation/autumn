@@ -4,31 +4,63 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub fn run(url: &str, duration: Duration, concurrency: usize) -> Result<(), String> {
+/// Upper bound on a single request, so one slow response cannot stall a
+/// worker thread for the whole run.
+const PER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Totals from one [`run`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimulationReport {
+    /// Requests that got an HTTP response (any status).
+    pub responses: usize,
+    /// Requests that failed before a response: connection refused, DNS
+    /// failure, timeout.
+    pub errors: usize,
+}
+
+/// Drive GET requests at `url` from `concurrency` threads for `duration`.
+///
+/// No request is started after the deadline, and each request's timeout is
+/// capped at the time left, so a hanging endpoint cannot stretch the run far
+/// past `duration`.
+pub fn run(url: &str, duration: Duration, concurrency: usize) -> Result<SimulationReport, String> {
     if concurrency == 0 {
         return Err("Concurrency must be > 0".into());
     }
 
     let url = url.to_owned();
-    let requests_sent = Arc::new(AtomicUsize::new(0));
+    let responses = Arc::new(AtomicUsize::new(0));
+    let errors = Arc::new(AtomicUsize::new(0));
     let start = Instant::now();
+    let deadline = start + duration;
 
     let mut handles = Vec::with_capacity(concurrency);
 
     for _ in 0..concurrency {
         let url = url.clone();
-        let requests_sent = Arc::clone(&requests_sent);
+        let responses = Arc::clone(&responses);
+        let errors = Arc::clone(&errors);
 
         let handle = thread::spawn(move || {
             let client = Client::builder()
-                .timeout(Duration::from_secs(5))
+                .timeout(PER_REQUEST_TIMEOUT)
                 .build()
                 .unwrap_or_else(|_| Client::new());
 
-            while start.elapsed() < duration {
-                // Ignore the result of the request, we just want to generate load
-                let _ = client.get(&url).send();
-                requests_sent.fetch_add(1, Ordering::Relaxed);
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let outcome = client
+                    .get(&url)
+                    .timeout(remaining.min(PER_REQUEST_TIMEOUT))
+                    .send();
+                if outcome.is_ok() {
+                    responses.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                }
             }
         });
         handles.push(handle);
@@ -38,15 +70,31 @@ pub fn run(url: &str, duration: Duration, concurrency: usize) -> Result<(), Stri
         let _ = handle.join();
     }
 
-    let total = requests_sent.load(Ordering::Relaxed);
+    let report = SimulationReport {
+        responses: responses.load(Ordering::Relaxed),
+        errors: errors.load(Ordering::Relaxed),
+    };
     let elapsed = start.elapsed().as_secs_f64();
     #[allow(clippy::cast_precision_loss)]
-    let rps = total as f64 / elapsed;
+    let rps = if elapsed > 0.0 {
+        report.responses as f64 / elapsed
+    } else {
+        0.0
+    };
 
     println!("Simulation complete.");
-    println!("Sent {total} requests in {elapsed:.2}s ({rps:.2} req/s).");
+    println!(
+        "{} responses in {elapsed:.2}s ({rps:.2} req/s), {} failed requests.",
+        report.responses, report.errors
+    );
+    if report.responses == 0 && report.errors > 0 {
+        return Err(format!(
+            "no request to {url} got a response ({} failed); is the app running?",
+            report.errors
+        ));
+    }
 
-    Ok(())
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -91,11 +139,48 @@ mod tests {
     fn test_simulate_succeeds() {
         let url = spawn_mock_server();
         // A very short duration to keep the test fast
-        let result = run(&url, Duration::from_millis(50), 2);
+        let report = run(&url, Duration::from_millis(50), 2).expect("run succeeds");
+        assert!(report.responses > 0, "{report:?}");
+    }
+
+    #[test]
+    fn test_simulate_unreachable_url_reports_failures_not_traffic() {
+        // Bind then drop a listener so the port is closed.
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let result = run(
+            &format!("http://127.0.0.1:{port}"),
+            Duration::from_millis(50),
+            1,
+        );
+        let err = result.expect_err("a closed port must not count as traffic");
+        assert!(err.contains("got a response"), "{err}");
+    }
+
+    #[test]
+    fn test_simulate_honours_deadline_against_hanging_endpoint() {
+        // Accept connections but never answer.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            // Leak each accepted stream so the connection stays open and silent.
+            for stream in listener.incoming().flatten() {
+                std::mem::forget(stream);
+            }
+        });
+        let start = Instant::now();
+        let _ = run(
+            &format!("http://127.0.0.1:{port}"),
+            Duration::from_millis(200),
+            1,
+        );
         assert!(
-            result.is_ok(),
-            "Expected run to succeed, but got {:?}",
-            result.err()
+            start.elapsed() < Duration::from_secs(2),
+            "run overran its duration: {:?}",
+            start.elapsed()
         );
     }
 
