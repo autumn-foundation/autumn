@@ -4,8 +4,9 @@ The hypothesis that "I can bypass CSRF protection on htmx endpoints by omitting 
 
 # [ERIS-NOTE] HTMX has_oob_attribute Bypass Injection
 
-The hypothesis that "An attacker can hide an `hx-swap-oob` attribute from `has_oob_attribute` with a malformed HTML comment (e.g. `<!--->`)" was tested and not reproduced.
-`has_oob_attribute` consumes the whole comment and resumes scanning at the next tag, so an `hx-swap-oob` attribute after the comment is still detected; text inside the comment is comment content to the browser too, not an active attribute.
+The hypothesis that "An attacker can hide an `hx-swap-oob` attribute from `has_oob_attribute` with a malformed HTML comment" was tested.
+`<!--->` did not reproduce: the scanner and the browser both end that comment at its `>`. The comment-end-bang form did reproduce: browsers also close a comment at `--!>` (and `<!-->` is an empty comment), but `has_oob_attribute` only stopped at `-->`, so in `<!-- --!><div hx-swap-oob="delete:#victim"></div>` it treated the live `<div>` as comment text and returned `false`.
+Fixed: the scanner now ends a comment exactly where the WHATWG tokenizer does (`<!-->`, `<!--->`, the first `-->` or `--!>`, or end of input); see `comment_len` and the `has_oob_attribute_honours_every_browser_comment_terminator` test.
 When `has_oob_attribute` returns `false`, `HtmxFragments::render_to` wraps the fragment in a server-generated carrier: a `<div hx-swap-oob="...">` for `innerHTML` and the positional strategies (`OobSwap::inserts_child_nodes()`), a `<template hx-swap-oob="...">` otherwise. In both cases the carrier's id and strategy are chosen by the server and escaped, and user text interpolated through Maud is HTML-escaped, so a user cannot inject an `hx-swap-oob` attribute of their own.
 
 # [ERIS-NOTE] Method Override bypasses CSRF checks?

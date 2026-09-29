@@ -563,6 +563,35 @@ impl IntoResponse for HtmxFragments {
     }
 }
 
+/// Byte length of the HTML comment at the start of `s` (which begins with
+/// `<!--`), ending where the WHATWG tokenizer ends it:
+///
+/// - `<!-->` and `<!--->` are abruptly-closed empty comments;
+/// - otherwise the first `-->` or `--!>` (the "comment end bang" form) closes
+///   it, whichever starts first;
+/// - an unterminated comment runs to end of input.
+#[cfg(feature = "maud")]
+fn comment_len(s: &str) -> usize {
+    let body = &s[4..];
+    if body.starts_with('>') {
+        return 5;
+    }
+    if body.starts_with("->") {
+        return 6;
+    }
+    let close = body.find("-->").map(|start| (start, 3));
+    let bang = body.find("--!>").map(|start| (start, 4));
+    let body_len = match (close, bang) {
+        (Some(a), Some(b)) => {
+            let (start, len) = if a.0 <= b.0 { a } else { b };
+            start + len
+        }
+        (Some((start, len)), None) | (None, Some((start, len))) => start + len,
+        (None, None) => body.len(),
+    };
+    4 + body_len
+}
+
 #[cfg(feature = "maud")]
 fn has_oob_attribute(html: &str) -> bool {
     let mut in_tag = false;
@@ -621,16 +650,10 @@ fn has_oob_attribute(html: &str) -> bool {
         } else if c == '<' {
             let remaining = &html[idx..];
             if remaining.starts_with("<!--") {
-                while let Some((_, next_c)) = chars.next() {
-                    if next_c == '-' {
-                        let rem = &html[chars.peek().map_or(html.len(), |&(i, _)| i)..];
-                        if rem.starts_with("->") {
-                            chars.next();
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
+                // Skip to wherever a browser ends the comment, so markup after
+                // it is scanned exactly as the browser will parse it.
+                let end = idx + comment_len(remaining);
+                while chars.next_if(|&(i, _)| i < end).is_some() {}
             } else {
                 in_tag = true;
                 in_quote = None;
@@ -1211,6 +1234,7 @@ mod bypass_tests {
 
     /// `<!--->` is a complete (abruptly closed) comment to both the scanner
     /// and the browser, so an `hx-swap-oob` attribute after it is still seen.
+    #[cfg(feature = "maud")]
     #[test]
     fn has_oob_attribute_sees_attribute_after_short_comment() {
         assert!(has_oob_attribute(
@@ -1219,5 +1243,35 @@ mod bypass_tests {
         assert!(!has_oob_attribute(
             "<!--- hx-swap-oob=\"true\" --><div></div>"
         ));
+    }
+
+    /// Every comment terminator a browser honours ends the comment for the
+    /// scanner too, so an OOB attribute placed after it cannot hide.
+    #[cfg(feature = "maud")]
+    #[test]
+    fn has_oob_attribute_honours_every_browser_comment_terminator() {
+        let oob = "<div hx-swap-oob=\"delete:#victim\"></div>";
+        for comment in ["<!-- --!>", "<!-->", "<!--->", "<!-- x -->", "<!----!>"] {
+            assert!(
+                has_oob_attribute(&format!("{comment}{oob}")),
+                "missed OOB attribute after {comment:?}"
+            );
+        }
+        // Still a comment: the attribute text is inert inside it.
+        assert!(!has_oob_attribute("<!-- hx-swap-oob=\"x\" --!><div></div>"));
+        // An unterminated comment swallows the rest, as in the browser.
+        assert!(!has_oob_attribute("<!-- <div hx-swap-oob=\"x\">"));
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn comment_len_matches_the_tokenizer() {
+        assert_eq!(comment_len("<!-->rest"), 5);
+        assert_eq!(comment_len("<!--->rest"), 6);
+        assert_eq!(comment_len("<!-- a -->rest"), 10);
+        assert_eq!(comment_len("<!-- a --!>rest"), 11);
+        assert_eq!(comment_len("<!-- a --!> b -->"), 11);
+        assert_eq!(comment_len("<!-- a --> b --!>"), 10);
+        assert_eq!(comment_len("<!-- open"), 9);
     }
 }
