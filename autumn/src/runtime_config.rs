@@ -42,6 +42,14 @@
 //! - **Auditable**: every mutation records actor, old value, new value, and timestamp.
 //! - **Schema-enforced**: unknown keys are rejected; type drift is caught on write.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -743,10 +751,7 @@ impl ConfigChangeRecord {
         new_value: Option<ConfigValue>,
         actor: Option<&str>,
     ) -> Self {
-        let timestamp_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let timestamp_secs = crate::time::clock_unix_secs(&crate::time::AmbientClock);
         Self {
             key: key.to_owned(),
             old_value,
@@ -1079,7 +1084,7 @@ pub mod pg {
         }
 
         fn cached_raw(&self, key: &str) -> CachedRawLookup {
-            let now = Instant::now();
+            let now = crate::time::ambient_instant();
             let Ok(cache) = self.raw_cache.read() else {
                 return CachedRawLookup::Miss;
             };
@@ -1100,7 +1105,8 @@ pub mod pg {
                 return;
             }
 
-            let Some(expires_at) = Instant::now().checked_add(self.cache_ttl) else {
+            let Some(expires_at) = crate::time::ambient_instant().checked_add(self.cache_ttl)
+            else {
                 return;
             };
 
