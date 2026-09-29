@@ -214,7 +214,7 @@ fn replace_pending(
     .bind::<Nullable<Text>, _>(payload)
     .bind::<BigInt, _>(base_version)
     .bind::<Text, _>(updated_at)
-    .bind::<Text, _>(Utc::now().to_rfc3339())
+    .bind::<Text, _>(crate::time::ambient_now().to_rfc3339())
     .execute(conn)
     .map(|_| ())
 }
@@ -549,7 +549,7 @@ impl SyncStore {
         op: Op,
         payload: Option<&str>,
     ) -> Result<(), SyncError> {
-        let now = Utc::now().to_rfc3339();
+        let now = crate::time::ambient_now().to_rfc3339();
         let op_name = match op {
             Op::Upsert => "upsert",
             Op::Delete => "delete",
