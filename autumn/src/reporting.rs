@@ -323,7 +323,7 @@ async fn persist_capsule(
     crate::capsule::CapsuleRef,
     crate::capsule::persist::ReportingPin,
 )> {
-    let written = tokio::task::spawn_blocking(move || {
+    let written = crate::time::spawn_blocking(move || {
         crate::capsule::persist::persist_pinned(capture.handle.scope(), capture.outcome)
     })
     .await;

@@ -1016,8 +1016,10 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T, diesel::result::Error>>,
 {
+    // No state here, so the ambient clock (issue #2967): a running `Sim`
+    // controls it.
     run_instrumented_with_clock(
-        &crate::time::SystemClock,
+        &crate::time::AmbientClock,
         sql,
         route_key,
         slow_threshold,
