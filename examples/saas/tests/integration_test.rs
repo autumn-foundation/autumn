@@ -571,7 +571,7 @@ async fn create_project_double_submit_creates_exactly_one_project() {
         .send()
         .await;
     dashboard.assert_ok();
-    let token = extract_submit_token(dashboard.text());
+    let token = extract_submit_token(&dashboard.text());
 
     let body = |token: &str| format!("name=DoubleClickTest&_submit_token={token}");
     let first = client
