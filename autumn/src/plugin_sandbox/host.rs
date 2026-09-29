@@ -2011,6 +2011,14 @@ struct ModuleShape {
     code_bytes: usize,
     /// How many globals the module declares.
     global_count: usize,
+    /// Bytes of instruction stream in the global section.
+    ///
+    /// A global's initializer is a constant expression, and the extended-const
+    /// proposal lets that expression run to arbitrary length — one global can
+    /// carry most of the module. Those bytes are instruction volume, the same
+    /// thing the code-section ceiling measures, so they share it rather than
+    /// hiding behind the entry count.
+    global_bytes: usize,
     /// How many tables the module declares.
     ///
     /// Sizes and count are separate ceilings: five empty tables cost no
@@ -2552,6 +2560,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
     let mut table_elements = 0u64;
     let mut table_count = 0usize;
     let mut global_count = 0usize;
+    let mut global_bytes = 0usize;
     let mut code_bytes = 0usize;
     let mut has_start = false;
     let mut function_count = 0usize;
@@ -2631,6 +2640,12 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
             }
             GLOBAL_SECTION => {
                 global_count = global_count.saturating_add(leb128(wasm, after_size)?.0);
+                // The initializers are an instruction stream, not data —
+                // extended-const lets one global's expression run to
+                // arbitrary length — so their bytes count toward the
+                // instruction-volume ceiling the same way the code
+                // section's do. Counted from the header: no walk needed.
+                global_bytes = global_bytes.saturating_add(size);
             }
             MEMORY_SECTION => {
                 memory_count = memory_count.saturating_add(leb128(wasm, after_size)?.0);
@@ -2666,6 +2681,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
         data_end,
         code_bytes,
         global_count,
+        global_bytes,
         table_count,
         table_elements,
     })
@@ -2736,6 +2752,29 @@ fn refuse_unbounded_shape(wasm: &[u8]) -> Result<ModuleShape, SandboxLoadError> 
         return Err(SandboxLoadError::InstantiationTooExpensive {
             what: "code section bytes",
             found: shape.code_bytes,
+            max: MAX_CODE_BYTES,
+        });
+    }
+    // The global section's initializers are an instruction stream too —
+    // extended-const lets one global's expression run to arbitrary length —
+    // so their bytes share the code section's instruction-volume ceiling.
+    // The entry count never saw this: one global sits under `MAX_GLOBALS`
+    // however long its initializer is, and `Module::new` would build a
+    // representation of every one of those instructions. The sum keeps the
+    // two numbers separately recorded on `ModuleShape`, so the refusal can
+    // name the sections that pushed the module over rather than
+    // misattributing it to the code section alone.
+    //
+    // Audit of the other instruction-carrying sections, stated explicitly
+    // rather than assumed: element and data section offset and item
+    // expressions already sit inside `init_bytes`, which has its own
+    // `MAX_INIT_SECTION_BYTES` ceiling above. The global section was the
+    // only one the scanner counted by entries alone.
+    let instruction_bytes = shape.code_bytes.saturating_add(shape.global_bytes);
+    if instruction_bytes > MAX_CODE_BYTES {
+        return Err(SandboxLoadError::InstantiationTooExpensive {
+            what: "code and global section bytes",
+            found: instruction_bytes,
             max: MAX_CODE_BYTES,
         });
     }
@@ -7137,6 +7176,129 @@ path = "/hello/greet"
                 }
             ),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_module_whose_global_section_is_too_large_is_refused_before_compilation() {
+        // The global section's initializers are an instruction stream —
+        // extended-const lets one global's expression run to arbitrary
+        // length — but the scanner only recorded the entry count, so a
+        // single global with a ceiling-scale initializer sat under every
+        // check while handing the compiler that much code to translate.
+        // The section header carries the size, so the refusal costs one
+        // LEB128 and never touches the instruction stream: the fixture
+        // rewrites the global section's declared size rather than building
+        // a module that large, the way the code-section test above does.
+        let mut wasm = wat::parse_str(
+            "(module (memory (export \"memory\") 1) (func (export \"_start\") (nop)))",
+        )
+        .expect("the fixture is valid WAT");
+
+        // One global, claiming just over the instruction-volume ceiling.
+        let over = u32::try_from(MAX_CODE_BYTES + 1).expect("fits");
+        let mut header = vec![6u8]; // the global section id
+        let mut size = over;
+        loop {
+            let mut byte = (size & 0x7f) as u8;
+            size >>= 7;
+            if size != 0 {
+                byte |= 0x80;
+            }
+            header.push(byte);
+            if size == 0 {
+                break;
+            }
+        }
+        // A count of one, then padding: the bytes have to actually be there,
+        // or the header is refused as malformed — a correct refusal, but a
+        // different one from the ceiling under test.
+        header.push(1u8);
+        header.extend(std::iter::repeat_n(0u8, over as usize - 1));
+        wasm.extend_from_slice(&header);
+
+        // First the gate itself: this is about ordering, and the gate that
+        // runs before `Module::new` has to be the one that says no.
+        let err = refuse_unbounded_shape(&wasm)
+            .expect_err("an oversized global section must not reach the compiler");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive {
+                    what: "code and global section bytes",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+
+        // Then both public doors onto the same bytes.
+        let err = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
+            .expect_err("an oversized global section must not load");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive {
+                    what: "code and global section bytes",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let err =
+            SandboxHost::imports_of(&wasm).expect_err("imports_of must apply the same ceiling");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive {
+                    what: "code and global section bytes",
+                    ..
+                }
+            ),
+            "expected the ceiling on imports_of, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_global_section_at_exactly_the_instruction_ceiling_still_passes_the_gate() {
+        // The ceiling is a strict greater-than, so exactly at it must pass.
+        // Asserted through the gate directly: `from_module` would then hand
+        // the padding to `Module::new`, which refuses the malformed bytes
+        // for its own reasons — a correct refusal, but a different one from
+        // the ceiling under test.
+        let mut wasm = wat::parse_str(
+            "(module (memory (export \"memory\") 1) (func (export \"_start\") (nop)))",
+        )
+        .expect("the fixture is valid WAT");
+
+        let at = u32::try_from(MAX_CODE_BYTES).expect("fits");
+        let mut header = vec![6u8]; // the global section id
+        let mut size = at;
+        loop {
+            let mut byte = (size & 0x7f) as u8;
+            size >>= 7;
+            if size != 0 {
+                byte |= 0x80;
+            }
+            header.push(byte);
+            if size == 0 {
+                break;
+            }
+        }
+        header.push(1u8);
+        header.extend(std::iter::repeat_n(0u8, at as usize - 1));
+        wasm.extend_from_slice(&header);
+
+        let shape = refuse_unbounded_shape(&wasm)
+            .expect("a global section at exactly the ceiling must pass the gate");
+        assert_eq!(
+            shape.global_bytes, MAX_CODE_BYTES,
+            "the gate must see the section's full size"
+        );
+        assert_eq!(
+            shape.code_bytes.saturating_add(shape.global_bytes),
+            MAX_CODE_BYTES,
+            "the combined instruction volume sits exactly on the ceiling"
         );
     }
 
