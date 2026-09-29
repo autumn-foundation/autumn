@@ -11,5 +11,4 @@
   screen at 422 with the card's values kept, the reason shown in the card
   (`role="alert"`, tied to the first field with `aria-describedby`) and that
   field focused. The Appearance screen reopens on the page that holds the menu that
-  refused the item, so the message is always beside it. The label input also
-  gained the `maxlength` its model already declares.
+  refused the item, so the message is always beside it.

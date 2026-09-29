@@ -270,7 +270,6 @@ async fn appearance_page(
                                     input #(format!("label-{}", menu.id)) type="text" name="label"
                                           value=[kept.map(|form| form.label.as_str())]
                                           required placeholder="Label"
-                                          maxlength=(crate::hooks::MAX_MENU_ITEM_LABEL)
                                           autofocus[refused.is_some()]
                                           aria-describedby=[refused.map(|_| format!("item-error-{}", menu.id))]
                                           class="w-full border rounded px-2 py-1.5";
