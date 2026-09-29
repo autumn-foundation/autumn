@@ -4868,6 +4868,11 @@ pub async fn import_comments(
                 .push(row.id);
         }
 
+        // What the thread page already cannot show, so the check after the
+        // restore rejects only what *this* import made unreadable: a retry on a
+        // post that was over the window before must not fail forever on it.
+        let unreadable_before = unrendered_approved_replies(conn, post_id).await?;
+
         let mut created = 0usize;
         let mut level: Vec<(Option<i64>, &ImportedComment)> =
             incoming.iter().map(|c| (None, c)).collect();
@@ -4970,7 +4975,7 @@ pub async fn import_comments(
         if let Some(id) = unrendered_approved_replies(conn, post_id)
             .await?
             .into_iter()
-            .next()
+            .find(|id| !unreadable_before.contains(id))
         {
             return Err(AutumnError::unprocessable_msg(format!(
                 "comment {id} is beyond the display budget and cannot be shown"
