@@ -113,11 +113,14 @@ jobs:
         # piece that decides whether an offline edit merges or is discarded,
         # was linted by no lane at all.
         #
+        # `sla` (#1826): the SLA engine carries the panic and determinism gates
+        # and is configured out without this feature.
+        #
         # KEEP IN SYNC with the identical list in scripts/pre-push-check.sh --
         # check-panic-gate.sh verifies every gated module's feature is covered by an
         # enforcing CI clippy lane, so a feature dropped from here silently disarms
         # that module's deny block.
-        run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,collab,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme" --all-targets -- -D warnings
+        run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,collab,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme,i18n,presence,sla" --all-targets -- -D warnings
       - name: Clippy (autumn-web, plugin-sandbox — panic gate)
         # `plugin-sandbox` (#1609) is not a default feature, so neither Clippy run
         # above compiles `plugin_sandbox`'s request-path modules and their
@@ -983,7 +986,16 @@ jobs:
         # The root cause is the tests' sensitivity to contention, which this
         # only sidesteps; making them robust under an oversubscribed pool is
         # worth its own issue.
+        #
+        # The liveness watchdog is armed here (issue #2967): a deadlocked
+        # `#[sim_test]` fails with its seed instead of hanging the job. It is
+        # safe only at `--test-threads=1`, because the paused clock also
+        # advances while a test waits on a lock another test thread holds. The
+        # budget is virtual time, so two years costs nothing and stays far
+        # above the longest `advance` in the suite (about two months).
         shell: bash
+        env:
+          AUTUMN_SIM_LIVENESS_BUDGET_SECS: "63072000"
         run: |
           set -euo pipefail
           cargo test --workspace -- sim_ --test-threads=1 | tee "${RUNNER_TEMP}/sim.log"
@@ -1120,6 +1132,7 @@ jobs:
             redis-tls,
             tls,
             acme,
+            sla,
           ]
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     steps:
@@ -1403,6 +1416,30 @@ jobs:
             --test integration_tests acme_pebble:: -- --ignored \
             | tee "${RUNNER_TEMP}/acme-pebble.log"
           assert_ran "${RUNNER_TEMP}/acme-pebble.log" "acme_pebble"
+      - name: Run SLA-gated tests (business-time obligations)
+        if: matrix.lane == 'sla'
+        # `sla` (#1826) is not a default feature, so the `test` job compiles
+        # none of its suites. The `sim_sla*` modules are determinism tests, so
+        # they run at `--test-threads=1`, as in the `test` job's `sim_` step.
+        # `assert_ran`: a filter that matches nothing exits 0.
+        run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the suite is no longer compiled in"; exit 1; }
+          }
+          cargo test -p autumn-web --features sla --lib sla:: | tee "${RUNNER_TEMP}/sla-lib.log"
+          assert_ran "${RUNNER_TEMP}/sla-lib.log" "autumn-web sla unit tests"
+          cargo test -p autumn-web --features sla --doc sla
+          cargo test -p autumn-web --features sla --test integration_tests sla_obligation_macro:: \
+            | tee "${RUNNER_TEMP}/sla-macro.log"
+          assert_ran "${RUNNER_TEMP}/sla-macro.log" "sla_obligation_macro"
+          cargo test -p autumn-web --features sla --test integration_tests sim_sla -- --test-threads=1 \
+            | tee "${RUNNER_TEMP}/sim-sla.log"
+          assert_ran "${RUNNER_TEMP}/sim-sla.log" "sim_sla"
+          cargo test -p autumn-web --features sla --test integration_tests compile_fail::obligation \
+            | tee "${RUNNER_TEMP}/sla-compile-fail.log"
+          assert_ran "${RUNNER_TEMP}/sla-compile-fail.log" "obligation_compile_fail_tests"
 
   # The Docker/testcontainer sweep runs as its own job rather than as the last
   # step of `test` (#1747). As step 16 of that job it inherited a disk already
@@ -2238,6 +2275,7 @@ jobs:
             --test sqlite_derivation \
             --test sqlite_money_ledger \
             --test sqlite_dependent_destroy \
+            --test sqlite_commentable \
             --test sqlite_tracked_sessions \
             --test sqlite_commit_hook_worker \
             --test sqlite_framework_migrations \
@@ -2435,7 +2473,26 @@ jobs:
       RUSTFLAGS: "-Clink-arg=/DEBUG:LongSymbolTruncate"
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to the exact MSRV, not `@stable` (2026-09-28 finding, 🚦
+      # Semaphore): every scaffolded app's `rust-toolchain.toml` pins
+      # `channel = "1.88.0"` literally (autumn-cli/src/templates/rust-toolchain.toml.tmpl,
+      # rendered from Cargo.toml's `rust-version`), a DIFFERENT rustup toolchain
+      # name than "stable". When this job only installed `@stable`, the first
+      # `cargo`/`autumn` invocation inside the scaffolded `tier1_app` directory
+      # (during `autumn setup`, which shells out to `cargo metadata`) made
+      # rustup auto-install the separate "1.88.0-x86_64-pc-windows-msvc"
+      # toolchain on the fly. That on-demand install intermittently left a
+      # non-functional `cargo` component behind, failing every later `cargo`
+      # invocation in the job with `"the 'cargo.exe' binary, normally provided
+      # by the 'cargo' component, is not applicable to the '1.88.0-x86_64-pc-windows-msvc'
+      # toolchain"` — a rustup error, not an autumn/CLI defect. Confirmed by
+      # log content on 4 organic occurrences (runs 108204416273, 108534929493,
+      # 108821476268, 108842089677), all identical, all resolved once the
+      # `read_cargo_metadata` stderr fix (#2973) made the underlying rustup
+      # error visible. Installing the exact MSRV toolchain up front — the same
+      # thing the `msrv` job below already does — removes the on-demand
+      # install path entirely, so there is nothing left to race.
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
 

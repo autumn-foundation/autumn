@@ -142,3 +142,23 @@ fn sweep_reports_vacuous_when_a_sometimes_label_is_never_satisfied_across_the_ra
         other => panic!("expected a vacuous sweep, got {other:?}"),
     }
 }
+
+/// The sweep and the `sim_ops` fuzz target share one `Op` vocabulary (issue
+/// #2967): every op sequence the sweep strategy draws round-trips through the
+/// fuzz byte format, so a sweep failure replays as a fuzz input.
+#[test]
+fn sweep_strategy_and_fuzz_bytes_share_one_op_vocabulary() {
+    use autumn_web::sim::scenario::{MAX_OPS, ops_from_bytes, ops_strategy, ops_to_bytes};
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+
+    let mut runner = TestRunner::deterministic();
+    for _ in 0..256 {
+        let ops = ops_strategy()
+            .new_tree(&mut runner)
+            .expect("the strategy draws")
+            .current();
+        assert!(!ops.is_empty() && ops.len() <= MAX_OPS);
+        assert_eq!(ops_from_bytes(&ops_to_bytes(&ops)), ops);
+    }
+}

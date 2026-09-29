@@ -36,6 +36,14 @@
 //! the fallback when discovery fails (a split-horizon setup, a resolver that
 //! will not answer `NS`), because a recursive probe is still better than none.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -524,6 +532,10 @@ const fn unspecified_bind(resolver: SocketAddr) -> SocketAddr {
 /// Not a security boundary — the query goes to an explicitly configured resolver
 /// over a connected socket — but a distinct id per query means a late answer to
 /// a previous query is rejected rather than mistaken for this one's.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the id goes to a real DNS server and must differ across real processes"
+)]
 fn query_id() -> u16 {
     use std::sync::atomic::{AtomicU16, Ordering};
     static NEXT: AtomicU16 = AtomicU16::new(1);

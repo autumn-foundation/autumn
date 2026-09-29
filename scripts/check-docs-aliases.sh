@@ -171,6 +171,8 @@ READER_VOCABULARY = (
     ('database migrations', 'docs/guide/migrations.md', (r'\bmigration',)),
     ('testing', 'docs/guide/testing.md', (r'\btest',)),
     ('deployment', 'docs/guide/deployment.md', (r'\bdeploy',)),
+    ('liveness / readiness probes', 'docs/guide/cloud-native.md',
+     (r'\bliveness probe\b', r'\breadiness probe\b', r'\bstartup probe\b')),
 )
 
 PERCENT_ESCAPE = re.compile(r'%[0-9A-Fa-f]{2}')

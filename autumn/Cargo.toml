@@ -23,6 +23,9 @@ presence = ["ws"]
 # The hub half additionally needs `presence`; the CRDT, the marker and the
 # offline-sync resolver compile without it.
 collab = []
+# Calendar-aware SLA obligations (issue #1826). Adds `autumn_web::sla` and
+# `#[obligation]`. Zero new dependencies.
+sla = []
 flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
@@ -552,6 +555,9 @@ features = [
   # `tls` module (TlsListener, CertReloader, load_certified_key) is missing
   # from the published docs.
   "tls",
+  # SLA obligations (#1826). Zero new dependencies. Without it, the `sla`
+  # module and `#[obligation]` are missing from the published docs.
+  "sla",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 
@@ -657,6 +663,15 @@ harness = false
 name = "ledger_post"
 harness = false
 required-features = ["sqlite"]
+
+# Live-typing workload for the collaborative text CRDT (issue #1806): drives
+# `CollabText::insert_after` one keystroke at a time, the same call
+# `CollabHub`'s message loop makes per op. See the file header for the exact
+# commands.
+[[bench]]
+name = "collab_edit"
+harness = false
+required-features = ["collab"]
 
 # W6 PR3 seed-sweep runner (issue #1797): CI-facing driver for
 # `sim::sweep::sweep_proptest`. `required-features` (not a `#![cfg(...)]` file
@@ -1081,6 +1096,15 @@ path = "tests/sqlite_statement_timeout_fail_closed.rs"
 [[test]]
 name = "sqlite_dependent_destroy"
 path = "tests/sqlite_dependent_destroy.rs"
+
+# `#[commentable]` hard-delete on SQLite (Snag charter, issue #2275 follow-up).
+# `docs/guide/commentable.md` claims "Both backends are supported", but the
+# feature's only live-DB suite is Postgres-only (testcontainers). Runs
+# explicitly: `cargo test -p autumn-web --features sqlite --test
+# sqlite_commentable`.
+[[test]]
+name = "sqlite_commentable"
+path = "tests/sqlite_commentable.rs"
 
 # SQLite read-only-transaction safety proof (issue #1614, Codex P2). The SQLite
 # arm of `Db::tx_with` cannot enforce `READ ONLY`, so a `TxOptions::read_only()`

@@ -34,6 +34,14 @@
 //! `Active` stays `Active` with a `failure_reason` set, so one tenant's failed
 //! renewal cannot stop it — or anyone else — being served.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
@@ -2006,7 +2014,7 @@ impl DomainVerifier for SystemDomainVerifier {
         Box::pin(async move {
             let host = hostname.to_owned();
             // `getaddrinfo` blocks; keep it off the async worker.
-            let resolved = tokio::task::spawn_blocking(move || {
+            let resolved = crate::time::spawn_blocking(move || {
                 use std::net::ToSocketAddrs as _;
                 (host.as_str(), 0_u16)
                     .to_socket_addrs()
@@ -2130,6 +2138,10 @@ impl crate::actuator::HealthIndicator for CustomDomainHealthIndicator {
 /// The one reading in the custom-domain path; the orchestrator ticks from it
 /// too, so a status and the decision that produced it never disagree by a
 /// second.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "grades real X.509 expiry dates and paces real ACME orders"
+)]
 pub(crate) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
