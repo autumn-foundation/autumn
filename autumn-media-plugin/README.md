@@ -109,8 +109,10 @@ installs a `RoomService` on `AppState`:
 | `POST` | `/api/media/rooms/{room_id}/heartbeat` | Hold the seat: refresh liveness, renew the token expiry. |
 | `GET`  | `/api/media/rooms/{room_id}` | Member-gated roster (`Authorization: Bearer <token>`). |
 
-These routes ship **no authentication or rate limiting**. Mount them behind your
-application's own middleware.
+Create and join are `#[secured]`: they need an authenticated session and return
+`401` to an anonymous caller. Leave, heartbeat and the roster are authorized by
+the per-room session token `join` returns. The routes ship **no rate limiting**;
+mount them behind your application's own middleware.
 
 A background reaper reclaims seats and rooms that go quiet. A client holds its
 seat by sending a heartbeat, or by polling the roster, on any interval under the

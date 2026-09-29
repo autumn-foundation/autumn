@@ -1407,12 +1407,19 @@ pub fn room_router() -> Router<AppState> {
 pub fn room_route_infos(api_prefix: &str) -> Vec<RouteInfo> {
     let prefix = api_prefix.trim_end_matches('/');
     vec![
-        room_route("POST", format!("{prefix}/rooms"), "rooms::rooms_create"),
-        room_route(
+        // Create and join are `#[secured]`, so the route audit sees them as
+        // gated. The remaining three verify a per-room session token in the
+        // handler rather than an app login, so they stay unclassified here.
+        gated(room_route(
+            "POST",
+            format!("{prefix}/rooms"),
+            "rooms::rooms_create",
+        )),
+        gated(room_route(
             "POST",
             format!("{prefix}/rooms/{{room_id}}/join"),
             "rooms::rooms_join",
-        ),
+        )),
         room_route(
             "POST",
             format!("{prefix}/rooms/{{room_id}}/leave"),
@@ -1429,6 +1436,14 @@ pub fn room_route_infos(api_prefix: &str) -> Vec<RouteInfo> {
             "rooms::rooms_roster",
         ),
     ]
+}
+
+/// Mark a room route as guarded by `#[secured]` for `autumn routes audit`.
+fn gated(info: RouteInfo) -> RouteInfo {
+    RouteInfo {
+        classification: autumn_web::route_listing::RouteClassification::Gated,
+        ..info
+    }
 }
 
 /// Build one plugin [`RouteInfo`] (source is overwritten by
@@ -1993,6 +2008,25 @@ mod tests {
         );
         // A trailing slash on the prefix does not double up.
         assert_eq!(room_route_infos("/api/media/")[0].path, "/api/media/rooms");
+    }
+
+    #[test]
+    fn room_route_infos_classify_secured_create_and_join_as_gated() {
+        use autumn_web::route_listing::RouteClassification;
+        let classes: Vec<RouteClassification> = room_route_infos("/api/media")
+            .iter()
+            .map(|info| info.classification)
+            .collect();
+        assert_eq!(
+            classes,
+            vec![
+                RouteClassification::Gated,
+                RouteClassification::Gated,
+                RouteClassification::Unclassified,
+                RouteClassification::Unclassified,
+                RouteClassification::Unclassified,
+            ]
+        );
     }
 
     // ── Bearer token parsing ─────────────────────────────────────────────────

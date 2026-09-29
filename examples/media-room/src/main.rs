@@ -165,10 +165,10 @@ fn page(rooms: &[RoomEntry]) -> Markup {
                     section {
                         h2 { "Room API (mounted by the plugin)" }
                         ul {
-                            li { code { "POST /api/media/rooms" } " — create a room" }
+                            li { code { "POST /api/media/rooms" } " — create a room (signed-in session required)" }
                             li {
                                 code { "POST /api/media/rooms/{room_id}/join" }
-                                " — join (returns a session token + mesh WHIP/WHEP targets)"
+                                " — join (signed-in session required; returns a session token + mesh WHIP/WHEP targets)"
                             }
                             li { code { "POST /api/media/rooms/{room_id}/leave" } " — leave" }
                             li {
@@ -181,9 +181,10 @@ fn page(rooms: &[RoomEntry]) -> Markup {
                             }
                         }
                         p {
-                            "To join a room, POST its id to the join route, e.g. "
+                            "Create and join require an authenticated session (anonymous calls get 401). "
+                            "Signed in, POST a room id to the join route with your session cookie, e.g. "
                             code {
-                                "curl -X POST localhost:3000/api/media/rooms/<id>/join "
+                                "curl -X POST localhost:3000/api/media/rooms/<id>/join -b 'autumn.sid=<session>' "
                                 "-H 'content-type: application/json' -d '{\"display_name\":\"Ada\"}'"
                             }
                             "."
