@@ -1378,11 +1378,16 @@ fn validate_prefix(prefix: &str) -> Result<(), ManifestError> {
 /// A segment that is a single whole capture (`{name}` / `{*name}`): the router
 /// matches it by position, never by comparing its bytes to the request, so
 /// byte-level rules for literal text do not apply to the name an author chose
-/// for it. Anything else — including a *malformed* capture like `{id` — is
+/// for it. Anything else — including a *malformed* capture like `{id`, and
+/// matchit's escaped braces (`{{café}}` is the literal text `{café}`) — is
 /// literal text as far as the checks below are concerned, and the `matchit`
-/// probe at the end still refuses it with the capture-specific message.
+/// probe at the end still refuses a malformed one with the capture-specific
+/// message.
 fn is_capture_segment(segment: &str) -> bool {
-    segment.len() >= 2 && segment.starts_with('{') && segment.ends_with('}')
+    segment
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .is_some_and(|name| !name.contains(['{', '}']))
 }
 
 /// A declared route path may carry axum captures (`{id}`, `{*rest}`) — they are
@@ -1842,7 +1847,15 @@ max_concurrency = 8
         // route no client can reach while `plugin inspect` prints it as a
         // route the plugin serves. The fix is refusal, not normalisation: the
         // encoded spelling is already the working one.
-        for bad in ["/hello/café", "/café/x", "/hello/中文", "/😀"] {
+        // `{{…}}` is matchit's escaped-brace literal, not a capture, so its
+        // text is compared against the wire like any other literal.
+        for bad in [
+            "/hello/café",
+            "/café/x",
+            "/hello/中文",
+            "/😀",
+            "/hello/{{café}}",
+        ] {
             let src =
                 valid_toml().replace(r#"path = "/hello/greet""#, &format!(r#"path = "{bad}""#));
             let err = SandboxManifest::parse(&src)
