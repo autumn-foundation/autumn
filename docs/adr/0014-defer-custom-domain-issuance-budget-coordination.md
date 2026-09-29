@@ -107,13 +107,31 @@ Reproduce with the commands in **Reproduce** below.
    the cluster" seam. A future option-3 implementation would reach for that
    primitive rather than inventing a fourth coordination mechanism.
 6. **No evidence of multi-replica custom-domain deployment exists in this
-   repository.** Per ADR 0012's Tier-2 finding, 89.4% of this repository's
+   repository — but that is an absence of evidence, not evidence of
+   absence.** Per ADR 0012's Tier-2 finding, 89.4% of this repository's
    commits are from one human author with no second team; nothing in the
    issue tracker, CI matrix, or example apps demonstrates an operator
-   running ≥2 replicas actively issuing certificates for the same domain
-   set today. Item 2 in #2644 is a real gap in what the code *claims*
+   running ≥2 replicas of this feature concurrently, for the same domain or
+   different ones (overlap does not matter — see item 7 and the Trigger
+   section). Item 2 in #2644 is a real gap in what the code *claims*
    (`global_per_hour` "enforced per process-lifetime-hour, not per hour"),
-   but nothing shows it is a gap anyone is currently exposed to.
+   and item 7 below shows that gap is worse than "more than advertised" —
+   but nothing in this repository's own record says whether anyone is
+   currently exposed to it. That is the thinnest link in this ADR's case
+   for deferral, which is why the revisit trigger is written to fire on the
+   first report, not on a pattern.
+7. **The limiter's own "well inside [the limit]" claim holds only for one
+   process, not for the account.** The shipped defaults are
+   `issuance_per_domain_per_day = 5` and `issuance_global_per_hour = 50`
+   (`config.rs:10228-10235`). At 50/hour, one process can attempt 150 orders
+   in any rolling 3-hour window — the same window Let's Encrypt measures
+   its 300-orders-per-account limit over. Two replicas, each independently
+   enforcing that same per-process ceiling (the durable-state-option-1 fix
+   makes each one *reliable*, not smaller), together reach 150 + 150 = 300
+   orders in 3 hours: the account's entire quota, before counting a single
+   order from any other source. Three replicas reach 450 — 1.5× over. "Well
+   inside the limit... at the defaults" is true at N=1 and false starting
+   at N=2, not at some larger N a real deployment is unlikely to reach.
 
 ## Do nothing / decide later — 12-month baseline
 
@@ -132,32 +150,59 @@ fleet-wide coordination (durable-state option 3) in the same pass.
 If durable-state option 3 is deferred and only items 1, 3, and 4 are
 fixed (via durable-state option 1 for item 1): a deployment running
 multiple replicas that are all actively issuing custom-domain certificates
-gets up to N× the advertised `global_per_hour` budget, same as today,
-where N is replica count. That is a real gap, bounded by Let's Encrypt's
-own outer limit (300 orders/3h/account) regardless of how many replicas
-Autumn's own limiter believes exist — the vendor's hard cap is the actual
-backstop, not this framework's budget. Nothing in the record shows a
-deployment operating close enough to that outer limit for the gap to have
-bitten anyone. If it does, revisit per the trigger below.
+gets up to N× the advertised `global_per_hour` budget, same as today, where
+N is replica count. Per Evidence item 7, that is worse than "bounded by
+Let's Encrypt's own outer limit": at the shipped defaults, N=2 already
+*equals* that outer limit (300 orders/3h/account) and N=3 exceeds it by
+50%. This framework's own budget stops being a limit *inside* the vendor's
+backstop at exactly two replicas — it does not stay safely under it for a
+generously wide range of N. Nothing in the record shows a deployment
+currently running ≥2 replicas of this feature (Evidence item 6) — but the
+margin for error once one does is zero, not comfortable, so the fifth
+action item in Default path below (recalibrating the default) closes this
+now rather than waiting for the trigger to fire on a deployment that is
+already over budget the moment it exists.
 
 ## Impact floor check
 
-None of the six clearing conditions are met for option 3 specifically: no
-Tier-1 incident data (no reported case of multi-replica budget overrun); no
-cross-team change count to reduce (single-maintainer repository, per ADR
-0012); no dated Tier-4 fact forcing fleet-wide coordination now (Let's
-Encrypt's limit is real but is a backstop the single-instance fix already
-keeps deployments well inside, per the existing budget defaults); no Tier-3
-spike showing the single-instance-fixed design fails a committed
-requirement; no removed cost exceeding a migration cost (no cost is
-currently being paid — the bug is unshipped-fix, not unshipped-and-paid-for);
-no ≥3-data-point asymptotic trend (this is the first and only instance of a
-hand-rolled, non-pluggable "shared mutable runtime state" counter found in
-this pass — see Reproduce for the negative search across
+Five of the six clearing conditions are not met for *building durable-state
+option 3*: no Tier-1 incident data (no reported case of multi-replica
+budget overrun); no cross-team change count to reduce (single-maintainer
+repository, per ADR 0012); no dated Tier-4 fact — Let's Encrypt's limit is
+real and, per Evidence item 7, is fully consumed by just two replicas at
+the shipped defaults, but it is a standing constraint with no date and no
+owner attached to closing it within two quarters; no removed cost exceeding
+a migration cost (no cost is currently being paid); no ≥3-data-point
+asymptotic trend (this is the first and only instance of a hand-rolled,
+non-pluggable "shared mutable runtime state" counter found in this pass —
+see Reproduce for the negative search across
 `plugin_sandbox::capability::quota` and other `*Limiter`/`*Budget`/`*Quota`
 structs, all of which are correctly request- or process-scoped by design,
-not mis-scoped copies of this same problem). This does not clear the
-floor for option 3 — it is not RFC-worthy today.
+not mis-scoped copies of this same problem).
+
+**The sixth — a Tier-3 spike, or equivalent computed proof, showing the
+design fails a committed requirement — deserves a real look rather than a
+reflexive "not yet."** Evidence item 7 *is* such a proof: not "might
+struggle with," but an exact arithmetic failure, from the shipped default
+constant, of the limiter's own documented guarantee ("well inside [the
+limit]... at the defaults") at N=2. That is real, admissible evidence the
+floor asks for, and it would be dishonest to wave it off as unmet. It does
+not, however, clear the floor *for option 3*: the requirement that fails is
+that the **default value** of `global_per_hour` assumes one process, not
+that the architecture must become distributed to hold the guarantee.
+Lowering the default (or documenting that an operator running N replicas
+must divide their configured `global_per_hour` by N — the same shape
+`rate_limit.rs` already documents for its own multi-replica story) closes
+the identical arithmetic gap at config/doc cost: no new call site, no new
+store, no coordination primitive, smaller even than durable-state option
+1's own fix. Per this framework's instruction to take the smallest decision
+that closes the question, that config/documentation fix — not option 3 —
+is what condition 4 actually calls for; it is added to Default path below
+as a fifth action item rather than left to the trigger. With condition 4's
+gap closed by that cheaper fix instead of by option 3, and none of the
+other five conditions met, this still does not clear the floor for
+*option 3* — it is not RFC-worthy today, but the default-value gap it
+surfaced is real and is not being deferred alongside it.
 
 ## Default path
 
@@ -176,6 +221,17 @@ rather than a door worth an ADR. Leave the limiter's *coordination* model
 per-process; do not add a Redis or Postgres-backed cross-replica layer for
 it in this pass — durability and cross-replica coordination are separate
 questions, and only the latter is what this ADR defers.
+
+A fifth action item, surfaced by this review rather than by #2644 itself:
+recalibrate `default_custom_domains_global_per_hour` (`config.rs:10233`,
+currently `50`) or document a "divide your configured `global_per_hour` by
+your replica count" rule — matching the shape `rate_limit.rs` already
+documents for its own multi-replica story — so that the account stays
+inside Let's Encrypt's 300-orders-per-3-hours limit at whatever replica
+count a deployment actually runs (see Evidence item 7 and Impact floor
+condition 4). This is a config-default or documentation change, not code
+architecture; it needs no ADR of its own and rides the same PR as items
+1/3/4.
 
 ## Seam kept open
 
@@ -260,6 +316,10 @@ grep -n "tick_key\|One replica per hostname" autumn/src/acme/tenant_domains.rs
 # records would silently drop an offboarded domain's still-counting attempts
 grep -n "fn forget" -A 3 autumn/src/custom_domain.rs
 grep -n "pub async fn remove_if" autumn/src/custom_domain.rs
+
+# The shipped default: 50/hour means 150 orders per process per 3-hour
+# window — two replicas already sum to Let's Encrypt's entire 300 limit
+grep -n "fn default_custom_domains_global_per_hour" -A 3 autumn/src/config.rs
 
 # check() and record_attempt() are two separate calls with a real awaited
 # gap between them (try_acquire, record_issuing_for) that the per-hostname
