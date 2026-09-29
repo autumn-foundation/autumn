@@ -400,7 +400,15 @@ fn map_crl_pem_err(path: &Path, source: rustls_pki_types::pem::Error) -> TlsErro
 /// rendering — the comparison is deliberately strict (a reordered RDN
 /// sequence is a different DER and does not match), which is the safe choice
 /// here: a CRL's issuer field is copied byte-for-byte from its CA's subject
-/// when the CRL is minted, so an honest CRL always matches exactly.
+/// when the CRL is minted, so an honest CRL always matches exactly. A name
+/// match is necessary but not sufficient: the CRL's signature must also
+/// verify under that CA's own key, because a renewed CA that keeps its subject
+/// DN under a new key is not covered by the old key's CRL (rustls rejects it).
+///
+/// When any CRL is issued by a CA outside the bundle — an intermediate, in a
+/// PKI whose bundle holds only the root — coverage cannot be read off the
+/// bundle (revocation is checked for the end-entity only, against its issuing
+/// intermediate), so no gap is reported rather than refusing a working setup.
 ///
 /// Returns the empty vector when every CA in the bundle has at least one CRL.
 /// When the CRL file holds several CRLs, one per issuing CA, each CA needs
@@ -433,7 +441,7 @@ fn crl_coverage_gaps_in(
 ) -> Result<Vec<String>, TlsError> {
     use x509_parser::prelude::FromDer as _;
 
-    let mut ca_subjects: Vec<(Vec<u8>, String)> = Vec::new();
+    let mut cas = Vec::with_capacity(ca_certs.len());
     for (idx, cert) in ca_certs.iter().enumerate() {
         let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(cert.as_ref())
             .map_err(|e| TlsError::ParseChainCert {
@@ -441,11 +449,10 @@ fn crl_coverage_gaps_in(
                 position: idx + 1,
                 detail: e.to_string(),
             })?;
-        let subject = parsed.subject();
-        ca_subjects.push((subject.as_raw().to_vec(), subject.to_string()));
+        cas.push(parsed);
     }
 
-    let mut crl_issuers: Vec<Vec<u8>> = Vec::new();
+    let mut parsed_crls = Vec::with_capacity(crls.len());
     for (idx, crl) in crls.iter().enumerate() {
         let (_, parsed) =
             x509_parser::revocation_list::CertificateRevocationList::from_der(crl.as_ref())
@@ -454,13 +461,38 @@ fn crl_coverage_gaps_in(
                     position: idx + 1,
                     detail: e.to_string(),
                 })?;
-        crl_issuers.push(parsed.issuer().as_raw().to_vec());
+        parsed_crls.push(parsed);
     }
 
-    Ok(ca_subjects
-        .into_iter()
-        .filter(|(der, _)| !crl_issuers.iter().any(|issuer| issuer == der))
-        .map(|(_, name)| name)
+    // A CRL whose issuer is no CA in the bundle comes from an intermediate:
+    // the bundle holds the root, the client presents the intermediate, and
+    // with end-entity-only revocation checking that intermediate's CRL is
+    // exactly what rustls consults. Which bundle CAs issue client
+    // certificates directly can then not be read off the bundle, so the
+    // bundle-only check would refuse a working PKI at boot; it stands down.
+    let issued_by_bundle_ca =
+        |crl: &x509_parser::revocation_list::CertificateRevocationList<'_>| {
+            cas.iter()
+                .any(|ca| ca.subject().as_raw() == crl.issuer().as_raw())
+        };
+    if !parsed_crls.iter().all(issued_by_bundle_ca) {
+        return Ok(Vec::new());
+    }
+
+    // Covered means a CRL that is cryptographically this CA's, not merely
+    // one naming it: a renewed CA commonly keeps its subject DN under a new
+    // key, and rustls rejects the old key's CRL for it on signature, so a
+    // name match alone would call the renewed CA covered and recreate the
+    // #2706 outage.
+    Ok(cas
+        .iter()
+        .filter(|ca| {
+            !parsed_crls.iter().any(|crl| {
+                crl.issuer().as_raw() == ca.subject().as_raw()
+                    && crl.verify_signature(ca.public_key()).is_ok()
+            })
+        })
+        .map(|ca| ca.subject().to_string())
         .collect())
 }
 
@@ -1695,6 +1727,46 @@ mod tests {
             "the gap names the CA with no CRL: {}",
             gaps[0]
         );
+    }
+
+    #[test]
+    fn a_crl_from_a_renewed_cas_old_key_does_not_cover_it() {
+        // Same subject DN, new key: the old key's CRL names the renewed CA
+        // but rustls rejects it on signature, so it must not count as cover.
+        const RENEWED_CA_PEM: &str =
+            include_str!("../../tests/fixtures/tls/client/renewed-ca.cert.pem");
+        let (_bundle_dir, bundle) = write_temp("ca.pem", &format!("{CA_PEM}{RENEWED_CA_PEM}"));
+        let (_crl_dir, crl) = write_temp("crl.pem", CRL_PEM);
+        let gaps = crl_coverage_gaps(&bundle, &crl).expect("coverage check runs");
+        assert_eq!(
+            gaps.len(),
+            1,
+            "only the old-key CA is covered by the old-key CRL: {gaps:?}"
+        );
+        assert!(gaps[0].contains("Autumn Test Client CA"), "{gaps:?}");
+    }
+
+    #[test]
+    fn an_intermediate_issued_crl_stands_the_bundle_check_down() {
+        // Bundle holds the root, the CRL comes from an intermediate the
+        // client presents: end-entity revocation is checked against the
+        // intermediate's CRL, so demanding a root CRL would refuse a working
+        // PKI at boot.
+        const INTERMEDIATE_CRL_PEM: &str =
+            include_str!("../../tests/fixtures/tls/client/intermediate-crl.pem");
+        let (_bundle_dir, bundle) = write_temp("ca.pem", CA_PEM);
+        let (_crl_dir, crl) = write_temp("crl.pem", INTERMEDIATE_CRL_PEM);
+        assert_eq!(
+            crl_coverage_gaps(&bundle, &crl).expect("coverage check runs"),
+            Vec::<String>::new()
+        );
+        build_from_paths(
+            &bundle,
+            Some(&crl),
+            ClientAuthMode::Required,
+            &super::super::crypto_provider(),
+        )
+        .expect("an intermediate-based PKI still boots");
     }
 
     #[test]

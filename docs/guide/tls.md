@@ -1163,6 +1163,12 @@ And one hard rule:
   CA. A CRL-file change that breaks coverage hot-reloads the same way any bad
   bundle does: it logs an error and keeps the previous trust store.
 
+  A CRL counts for a CA only if it is signed by that CA's key: a renewed CA
+  that keeps its name under a new key needs a CRL from the new key. If your
+  client certificates chain through an intermediate whose CRL you configure
+  (the bundle holds only the root), the check stands down — revocation is
+  checked against the issuing intermediate, which the bundle cannot show.
+
 **OCSP and OCSP stapling are not supported.** CRL plus short-lived certificates
 first.
 
