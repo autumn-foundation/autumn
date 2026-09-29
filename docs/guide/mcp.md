@@ -497,11 +497,16 @@ CORS `allowed_origins`:
 
 - A request with **no `Origin`** header (curl, SDKs, server-side agents) is
   allowed — non-browser callers aren't subject to DNS rebinding.
-- A request whose `Origin` **isn't** in `cors.allowed_origins` (or `*`) gets
-  **403 Forbidden** before any parsing or dispatch.
+- A request whose `Origin` is **the same origin as the request's own host**, where
+  that host is a trusted host, is allowed without an allowlist entry — a browser
+  client served by the app itself is already covered.
+- Otherwise the `Origin` must be in `cors.allowed_origins` (or the list must hold
+  `*`); anything else gets **403 Forbidden** before any parsing or dispatch.
 
-So to allow a browser-based MCP client from `https://app.example.com`, add that
-origin to your CORS config; agent clients need no configuration.
+So it is specifically a **cross-origin** browser MCP client — one served from
+somewhere other than the app — that needs its origin added to your CORS config
+([CORS and Cross-Origin Requests](cors.md)); a same-origin browser client and an
+agent client both need no configuration.
 
 ---
 

@@ -201,6 +201,18 @@ pub struct FleetHalt {
     pub manual: Vec<(String, &'static str)>,
 }
 
+impl FleetHalt {
+    /// The risk that the failed step leaves, when the step label alone does not
+    /// name it (issue #2279). A `drain-old` halt has a risk only while the host
+    /// is still on the new release. A rollback leaves one slot running.
+    #[must_use]
+    pub fn risk(&self) -> Option<&'static str> {
+        (self.failed_step == fleet::DRAIN_OLD_LABEL
+            && self.still_on_new.contains(&self.failed_host))
+        .then_some(fleet::OLD_SLOT_MAY_RUN_NOTE)
+    }
+}
+
 /// Which `autumn deploy` subcommand to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeployAction {
@@ -4066,16 +4078,19 @@ where
 ///   binaries only; a migration that already ran is never undone. The one exception
 ///   is a post-boundary HOUSEKEEPING failure (`record-proxy-options`, `drain-old`,
 ///   `prune`): the host is live and healthy on the new release, so the rollout
-///   warns, marks it degraded, and CONTINUES. A rollout whose only failures are
-///   housekeeping therefore succeeds (`Ok`) with degraded hosts named in the state
-///   table — rolling a whole fleet back because an `rm -rf` of old release dirs
-///   failed would be a self-inflicted outage.
+///   warns, marks it degraded, and CONTINUES. For a failed `drain-old`, the
+///   driver retries one time. It continues only when the old slot stopped
+///   (#2279). A rollout whose only failures are housekeeping therefore succeeds
+///   (`Ok`) with degraded hosts named in the state table — rolling a whole fleet
+///   back because an `rm -rf` of old release dirs failed would be a
+///   self-inflicted outage.
 ///
 /// **N = 1 is exempt from all of it.** A single-host config takes the pre-#1621
 /// path verbatim: the raw executor error, no fleet vocabulary, no state table, no
 /// compensation (there is no other host to converge with, and its own boundary
 /// teardown already ran). That is AC-1, and it is why the `single` branches below
-/// are not cosmetic.
+/// are not cosmetic. One exception (#2276): when the binaries went back after
+/// `migrate`, the error gets one schema note ([`fleet::single_host_schema_note`]).
 #[allow(clippy::too_many_lines)]
 fn run_up_with<E, P, F>(input: &FleetUpInput<'_, P>, make_executor: F) -> Result<(), DeployError>
 where
@@ -4381,28 +4396,69 @@ where
                 }
             }
             Err(err) => {
-                // A one-host fleet keeps today's error verbatim: the per-host
-                // executor already told the whole story, and inventing a fleet
-                // vocabulary for one host would change pre-#1621 output. This
-                // returns BEFORE any classification, degrade-and-continue or
-                // compensation, so N = 1 is byte-identical on every failure shape,
-                // post-boundary ones included.
+                // A one-host fleet keeps today's error: no fleet vocabulary, no
+                // degrade-and-continue, no compensation. One exception (#2276): if
+                // the binaries went back after `migrate`, add the schema note. The
+                // fleet classifier decides this, so the two paths cannot diverge.
+                outcomes[index] = fleet::classify_host_outcome(&err);
                 if single {
-                    return Err(DeployError::Exec(err.to_string()));
+                    let message = fleet::single_host_schema_note(&plan, &outcomes).map_or_else(
+                        || err.to_string(),
+                        |note| format!("{err}\n\u{26A0}\u{FE0F}  {note}"),
+                    );
+                    return Err(DeployError::Exec(message));
                 }
                 let failed_step = fleet::failed_step_label(&err);
-                outcomes[index] = fleet::classify_host_outcome(&err);
+                // #2279: a live old slot runs workers and the scheduler, so work
+                // runs two times. Retry one time. Continue only on a proven stop.
+                if matches!(
+                    outcomes[index],
+                    fleet::HostOutcome::Degraded { label } if label == fleet::DRAIN_OLD_LABEL
+                ) {
+                    let prefix = format!("[{}/{total} {}]", index + 1, host_plan.host);
+                    let old_slot = match exec::retry_drain_old(cfg, state.slots.live_slot, executor)
+                    {
+                        Ok(old_slot) => old_slot,
+                        Err(retry_err) => {
+                            eprintln!("\u{26A0}\u{FE0F}  {prefix} the retry failed: {retry_err}");
+                            exec::OldSlotState::Unreadable
+                        }
+                    };
+                    outcomes[index] = fleet::drain_old_outcome(old_slot);
+                    if old_slot == exec::OldSlotState::Stopped {
+                        eprintln!(
+                            "\u{26A0}\u{FE0F}  {prefix} `{}` failed, but the retry stopped and \
+                             disabled the old slot.",
+                            fleet::DRAIN_OLD_LABEL,
+                        );
+                    } else {
+                        eprintln!(
+                            "\u{26A0}\u{FE0F}  {prefix} serving {} \u{2014} but `{}` failed \
+                             AFTER the cutover: {}.",
+                            input.release_id,
+                            fleet::DRAIN_OLD_LABEL,
+                            fleet::OLD_SLOT_MAY_RUN_NOTE,
+                        );
+                    }
+                }
                 // Post-boundary housekeeping: the proxy is already serving the new
                 // release on this host and only bookkeeping failed. Warn, record the
                 // debris, and keep rolling — the alternative is an outage caused by
                 // a failed `rm -rf` (#1621, §4.6).
                 if let fleet::HostOutcome::Degraded { label } = outcomes[index] {
                     degraded.push((host_plan.host.clone(), label));
+                    // Only a missing `shared/proxy-options` marker makes the next
+                    // deploy refuse this host.
+                    let refusal = if label == "record-proxy-options" {
+                        ", which will refuse it"
+                    } else {
+                        ""
+                    };
                     eprintln!(
                         "\u{26A0}\u{FE0F}  [{}/{total} {}] serving {} \u{2014} but `{label}` \
                          failed AFTER the cutover. Traffic is healthy, so the rollout \
                          continues; repair this host (a redeploy does) before the next \
-                         deploy, which will refuse it.\n",
+                         deploy{refusal}.\n",
                         index + 1,
                         host_plan.host,
                         input.release_id,
@@ -4937,7 +4993,7 @@ fn join_host_reasons(pairs: &[(String, &'static str)]) -> String {
 /// endpoint with no fleet or rollout data. `autumn deploy status` is the
 /// command that shows the fleet's actual state.
 fn build_fleet_halted_alert(halt: &FleetHalt, app_name: &str, profile: &str) -> Alert {
-    Alert::trigger(
+    let alert = Alert::trigger(
         AlertCondition::ScheduledTaskFailure,
         format!("scheduled_task_failure:deploy-fleet-halted:{app_name}:{profile}"),
     )
@@ -4956,7 +5012,11 @@ fn build_fleet_halted_alert(halt: &FleetHalt, app_name: &str, profile: &str) -> 
         "route_removal_failed",
         join_host_reasons(&halt.route_removal_failed),
     )
-    .detail("manual", join_host_reasons(&halt.manual))
+    .detail("manual", join_host_reasons(&halt.manual));
+    match halt.risk() {
+        Some(risk) => alert.detail("risk", risk),
+        None => alert,
+    }
     .build()
 }
 
@@ -9587,7 +9647,7 @@ mod tests {
             .expect("a bare host is prepared");
         let repair = labels
             .iter()
-            .position(|l| *l == "record-live-slot")
+            .position(|l| *l == exec::LIVE_SLOT_REPAIR_LABEL)
             .expect("a drifted marker is repaired");
         assert!(
             install < repair,
@@ -11234,6 +11294,213 @@ mod tests {
         );
     }
 
+    /// How the `drain-old-retry` probe on `web-b` answers in the #2279 tests.
+    enum DrainRetry {
+        Stdout(&'static str),
+        CommandFails,
+        TransportFails,
+    }
+
+    /// A three-host rollout where `web-b`'s `drain-old` fails and its retry
+    /// answers `retry`. Every host can be compensated, unless `frozen`.
+    fn drain_old_failure_run(
+        retry: &DrainRetry,
+        frozen: bool,
+    ) -> (fleet::test_support::FleetRecorder, Result<(), DeployError>) {
+        let hosts = ["web-a", "web-b", "web-c"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_compensation(script_redeploy(recorder, host), host, "present");
+        }
+        recorder = recorder.fail("web-b", "drain-old");
+        recorder = match retry {
+            DrainRetry::Stdout(stdout) => recorder.script("web-b", "drain-old-retry", *stdout),
+            DrainRetry::CommandFails => recorder.fail("web-b", "drain-old-retry"),
+            DrainRetry::TransportFails => recorder.transport_fail("web-b", "drain-old-retry"),
+        };
+        let fixture = FleetFixture::new();
+        let input = if frozen {
+            fixture.input_frozen(&fleet)
+        } else {
+            fixture.input(&fleet)
+        };
+        let result = run_up_with(&input, |cfg| Ok(recorder.executor(cfg)));
+        (recorder, result)
+    }
+
+    /// Check that `web-b` ran exactly one retry, right after the failed
+    /// `drain-old`, against the same unit.
+    fn assert_one_retry_of_the_drained_unit(recorder: &fleet::test_support::FleetRecorder) {
+        let web_b = recorder.run_labels_for("web-b");
+        assert_eq!(
+            web_b.iter().filter(|l| **l == "drain-old-retry").count(),
+            1,
+            "retry one time only: {web_b:?}"
+        );
+        assert!(
+            web_b
+                .windows(2)
+                .any(|w| w == ["drain-old", "drain-old-retry"]),
+            "the retry runs right after the failed drain: {web_b:?}"
+        );
+        let shell_of = |label: &str| {
+            recorder
+                .calls_for("web-b")
+                .into_iter()
+                .find_map(|call| match call {
+                    exec::test_support::RecordedCall::Run { label: l, shell } if l == label => {
+                        Some(shell)
+                    }
+                    _ => None,
+                })
+                .expect("the op ran")
+        };
+        let drained = shell_of("drain-old");
+        let unit = drained.rsplit(' ').next().expect("drain-old names a unit");
+        assert!(
+            shell_of("drain-old-retry").contains(&format!("unit='{unit}'")),
+            "the retry must target the old slot `{unit}`, never the new one"
+        );
+    }
+
+    #[test]
+    fn a_drain_old_failure_whose_old_slot_may_still_run_halts_the_rollout() {
+        // #2279: the old slot runs job workers and the scheduler. If it can run,
+        // scheduled tasks and jobs run two times. The rollout must not report
+        // success.
+        for retry in [
+            DrainRetry::Stdout("not-stopped"),
+            DrainRetry::Stdout("bash: -c: line 0"),
+            DrainRetry::CommandFails,
+            DrainRetry::TransportFails,
+        ] {
+            let (recorder, result) = drain_old_failure_run(&retry, false);
+            let err = result.expect_err("an old slot that may still run must halt the rollout");
+
+            assert_one_retry_of_the_drained_unit(&recorder);
+            assert!(
+                !recorder.run_labels_for("web-b").contains(&"prune"),
+                "nothing more of the deploy runs on the halted host"
+            );
+            assert_eq!(
+                recorder.run_labels_for("web-c"),
+                READ_ONLY_PROBES.to_vec(),
+                "the host after the halt must not be touched"
+            );
+
+            let halt = fleet_halt_of(&err);
+            assert_eq!(halt.failed_host, "web-b");
+            assert_eq!(halt.failed_step, "drain-old");
+            assert_eq!(
+                halt.rolled_back,
+                vec!["web-a".to_owned(), "web-b".to_owned()],
+                "both cut-over hosts are compensated, so each runs ONE slot again"
+            );
+            assert!(halt.still_on_new.is_empty(), "{:?}", halt.still_on_new);
+            assert!(
+                halt.degraded.is_empty(),
+                "a live old slot is not housekeeping debris: {:?}",
+                halt.degraded
+            );
+            assert_eq!(
+                halt.risk(),
+                None,
+                "compensation left one slot running, so the risk is gone"
+            );
+        }
+    }
+
+    #[test]
+    fn a_frozen_drain_old_halt_leaves_the_hosts_and_names_the_risk() {
+        // #2279 with `--no-rollback`: nothing is compensated, so the old slot may
+        // still run at exit. The halt and its alert must name that risk.
+        let (recorder, result) = drain_old_failure_run(&DrainRetry::Stdout("not-stopped"), true);
+        let err = result.expect_err("a frozen halt is still a failure");
+
+        assert!(
+            recorder.positions_of("resolve-previous").is_empty(),
+            "a frozen halt compensates nothing"
+        );
+        let halt = fleet_halt_of(&err);
+        assert_eq!(halt.failed_step, "drain-old");
+        assert!(halt.rolled_back.is_empty(), "{:?}", halt.rolled_back);
+        assert_eq!(
+            halt.still_on_new,
+            vec!["web-a".to_owned(), "web-b".to_owned()]
+        );
+        assert_eq!(halt.risk(), Some(fleet::OLD_SLOT_MAY_RUN_NOTE));
+        let alert = build_fleet_halted_alert(halt, "myapp", "prod");
+        assert_eq!(
+            alert.details.get("risk").map(String::as_str),
+            Some(fleet::OLD_SLOT_MAY_RUN_NOTE),
+            "the alert must name the risk, not only the step"
+        );
+    }
+
+    #[test]
+    fn a_drain_old_failure_whose_old_slot_is_proven_stopped_still_degrades() {
+        // #2279: a transient failure that the retry clears is housekeeping. The
+        // rollout continues, as it did before.
+        let (recorder, result) = drain_old_failure_run(&DrainRetry::Stdout("stopped"), false);
+        result.expect("a proven-stopped old slot must not fail the rollout");
+
+        assert_one_retry_of_the_drained_unit(&recorder);
+        assert!(
+            !recorder
+                .run_labels_for("web-b")
+                .contains(&"restart-previous"),
+            "the host stays on the new release"
+        );
+        assert_eq!(
+            recorder.run_labels_for("web-c"),
+            READ_ONLY_PROBES
+                .iter()
+                .copied()
+                .chain(
+                    REDEPLOY_RUN_LABELS
+                        .iter()
+                        .copied()
+                        .filter(|label| *label != "migrate")
+                )
+                .collect::<Vec<_>>(),
+            "the rollout must continue past the degraded host"
+        );
+        assert!(
+            recorder.positions_of("resolve-previous").is_empty(),
+            "nothing is compensated"
+        );
+    }
+
+    #[test]
+    fn a_single_host_drain_old_failure_keeps_todays_error_and_does_not_retry() {
+        // #2279 keeps AC-1: N = 1 already fails the deploy, so it gets no retry.
+        let fleet = fleet_of(&["203.0.113.10"]);
+        let recorder = script_redeploy(fleet::test_support::FleetRecorder::new(), "203.0.113.10")
+            .fail("203.0.113.10", "drain-old");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a single-host drain failure must fail the deploy");
+
+        assert!(matches!(err, DeployError::Exec(_)), "{err:?}");
+        assert_eq!(
+            recorder.run_labels_for("203.0.113.10").last(),
+            Some(&"drain-old"),
+            "N = 1 stops at the failed drain and does not retry"
+        );
+    }
+
+    #[test]
+    fn only_a_drain_old_halt_carries_a_risk() {
+        assert_eq!(sample_halt().risk(), None, "a `migrate` halt adds no risk");
+        let alert = build_fleet_halted_alert(&sample_halt(), "myapp", "production");
+        assert!(
+            !alert.details.contains_key("risk"),
+            "other halts keep today's alert details"
+        );
+    }
+
     #[test]
     fn compensation_never_touches_the_schema() {
         // #1621 (AC-3, T1.12). Auto-rollback is BINARY-ONLY. `rollback_ops` and
@@ -11281,13 +11548,160 @@ mod tests {
         );
     }
 
+    /// The `DeployError::Exec` message of a failed single-host deploy.
+    fn single_host_exec_message(err: &DeployError) -> &str {
+        match err {
+            DeployError::Exec(message) => message,
+            other => panic!("N = 1 must never produce fleet vocabulary, got: {other:?}"),
+        }
+    }
+
+    /// The executor error a one-host deploy returns when `failed_step` fails
+    /// before the cutover.
+    fn pre_cutover_error(mode: fleet::HostMode, failed_step: &'static str) -> String {
+        let source = Box::new(exec::DeployExecError::CommandFailed {
+            label: failed_step,
+            message: "scripted failure".to_owned(),
+        });
+        match mode {
+            fleet::HostMode::Redeploy => exec::DeployExecError::CandidateRolledBack {
+                failed_step,
+                source,
+            },
+            fleet::HostMode::First => exec::DeployExecError::FirstDeployTornDown {
+                failed_step,
+                source,
+            },
+        }
+        .to_string()
+    }
+
+    /// Run a one-host deploy in `mode` that fails at `failed_step`. Returns the
+    /// error message and the labels the host ran.
+    fn failed_single_host_deploy(
+        mode: fleet::HostMode,
+        failed_step: &'static str,
+    ) -> (String, Vec<&'static str>) {
+        let host = "203.0.113.10";
+        let recorder = fleet::test_support::FleetRecorder::new();
+        let recorder = match mode {
+            fleet::HostMode::Redeploy => script_redeploy(recorder, host),
+            fleet::HostMode::First => script_first_deploy(recorder, host),
+        }
+        .fail(host, failed_step);
+        let fleet = fleet_of(&[host]);
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("the scripted failure must fail the deploy");
+        (
+            single_host_exec_message(&err).to_owned(),
+            recorder.run_labels_for(host),
+        )
+    }
+
+    #[test]
+    fn a_single_host_redeploy_rolled_back_after_migrate_names_the_schema() {
+        // #2276: the candidate is torn down and the previous release serves, but the
+        // migration stays applied. The error must say so.
+        let (message, labels) =
+            failed_single_host_deploy(fleet::HostMode::Redeploy, "readiness-gate");
+
+        assert_eq!(
+            message,
+            format!(
+                "{}\n\u{26A0}\u{FE0F}  {}",
+                pre_cutover_error(fleet::HostMode::Redeploy, "readiness-gate"),
+                fleet::SINGLE_HOST_SCHEMA_AHEAD_NOTE
+            ),
+            "the executor error stays first; the schema note follows it"
+        );
+        assert!(
+            labels.contains(&"migrate") && !labels.contains(&"proxy-flip"),
+            "the deploy must migrate, then stop at the gate: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_host_marker_repair_failure_keeps_todays_error() {
+        // #2276: the live-slot marker repair runs before `migrate`. If it fails,
+        // the schema did not move, so the error gets no schema note.
+        let host = "203.0.113.10";
+        // The marker says blue (3001), but the proxy serves green (3002).
+        let drifted = "redeploy:blue\t3001\n\
+             ---autumn-kamal-proxy-list---\n\
+             Service   Host          Target            State    TLS\n\
+             myapp     example.com   127.0.0.1:3002   running  no\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 3000\n"
+            .to_owned();
+        let recorder = fleet::test_support::FleetRecorder::new()
+            .script(host, "proxy-compat-probe", compatible_deploy_help())
+            .script(host, "detect-current", drifted)
+            .script(host, "probe-release-dir", "absent")
+            .fail_on_occurrence(host, exec::LIVE_SLOT_REPAIR_LABEL, 1);
+        let fleet = fleet_of(&[host]);
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("the failed repair must fail the deploy");
+
+        let labels = recorder.run_labels_for(host);
+        assert!(
+            !labels.contains(&"migrate"),
+            "the repair runs before `migrate`: {labels:?}"
+        );
+        assert_eq!(
+            single_host_exec_message(&err),
+            pre_cutover_error(fleet::HostMode::Redeploy, exec::LIVE_SLOT_REPAIR_LABEL),
+        );
+    }
+
+    #[test]
+    fn a_single_host_first_deploy_torn_down_after_migrate_names_the_schema() {
+        // #2276: a first deploy migrates, then fails its gate. Nothing serves. The
+        // note must not claim a previous release.
+        let (message, labels) = failed_single_host_deploy(fleet::HostMode::First, "readiness-gate");
+
+        assert_eq!(
+            message,
+            format!(
+                "{}\n\u{26A0}\u{FE0F}  {}",
+                pre_cutover_error(fleet::HostMode::First, "readiness-gate"),
+                fleet::SINGLE_HOST_FIRST_DEPLOY_SCHEMA_NOTE
+            ),
+        );
+        assert!(
+            labels.contains(&"migrate"),
+            "the first deploy must migrate before the gate: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_host_failure_before_migrate_keeps_todays_error() {
+        // #2276: the deploy stopped before `migrate`, so the schema did not move.
+        for mode in [fleet::HostMode::Redeploy, fleet::HostMode::First] {
+            let (message, labels) = failed_single_host_deploy(mode, "daemon-reload");
+
+            assert_eq!(
+                message,
+                pre_cutover_error(mode, "daemon-reload"),
+                "{mode:?}: a failure before `migrate` keeps today's error verbatim"
+            );
+            assert!(
+                !labels.contains(&"migrate"),
+                "{mode:?}: the scripted failure must land before `migrate`: {labels:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_single_host_failure_keeps_todays_error_and_compensates_nothing() {
         // #1621 (AC-1). N = 1 is exempt from the whole fleet vocabulary: a
         // single-host deploy that fails must return the pre-#1621 error verbatim —
-        // no classification, no degrade-and-continue, no compensation, no state
-        // table. `prune` is the sharpest case: in a FLEET it degrades and the deploy
-        // succeeds, while for one host it must stay exactly today's failure.
+        // no degrade-and-continue, no compensation, no state table. `prune` is the
+        // sharpest case: in a FLEET it degrades and the deploy succeeds, while for
+        // one host it must stay exactly today's failure. (The #2276 note is only
+        // for a host whose binaries went back.)
         let fleet = fleet_of(&["203.0.113.10"]);
         let recorder = script_redeploy(fleet::test_support::FleetRecorder::new(), "203.0.113.10")
             .fail("203.0.113.10", "prune");
@@ -12210,6 +12624,32 @@ mod tests {
             serde_json::json!({ "result": "rolled back", "at": "2026-07-14T12:31:10Z" }),
         );
         assert_eq!(json["hosts"][2]["last_deploy"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn status_never_renders_a_green_marker_for_an_unready_host() {
+        // #2273, end to end from the probe: curl's `000` (no answer) and a 503
+        // both render `⚠️`, and neither is drift.
+        let fleet = fleet_of(&["web-a", "web-b", "web-c"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        recorder = script_status(recorder, "web-a", "r1", "200", false);
+        recorder = script_status(recorder, "web-b", "r1", "503", false);
+        recorder = script_status(recorder, "web-c", "r1", "000", false);
+
+        let statuses = drive_status(&fleet, &recorder).expect("status reports");
+        let report = fleet::fleet_drift(&statuses);
+        assert!(!report.drifted(), "{:?}", report.state_drift);
+        let rendered = fleet::fleet_status_lines(&statuses, &report).join("\n");
+        let row = |host: &str| {
+            rendered
+                .lines()
+                .find(|line| line.contains(host))
+                .expect("every host has a row")
+        };
+        assert!(row("web-a").starts_with("  \u{2705}"), "{rendered}");
+        for host in ["web-b", "web-c"] {
+            assert!(row(host).starts_with("  \u{26A0}"), "{rendered}");
+        }
     }
 
     #[test]
