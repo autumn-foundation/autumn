@@ -31,6 +31,13 @@
 //! refused with an actionable message rather than silently failing; a database
 //! that large belongs on the Postgres tier (#1614).
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 // autumn-panic-gate: durability-critical module — production code path must be
 // panic-free. See CONTRIBUTING.md "Request-path panic gate". Justify exceptions
 // with #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
@@ -197,11 +204,16 @@ impl S3Destination {
             .map_err(|e| DestinationError::Rejected {
                 detail: format!("could not build the replication HTTP client: {e}"),
             })?;
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "SigV4 signs with the real date that the S3 server checks"
+        )]
+        let now: fn() -> chrono::DateTime<chrono::Utc> = chrono::Utc::now;
         Ok(Self {
             settings,
             credentials,
             http,
-            now: chrono::Utc::now,
+            now,
         })
     }
 
