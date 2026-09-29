@@ -6,7 +6,7 @@
   materialized-view refreshes, while the real command runs
   `verify_sample_survived_refreshes` there and rolls back on a mismatch.
   The script now captures every sampled table's post-sample count into an
-  `ON COMMIT DROP` temp table (`autumn_sample_counts`) at the same point the
+  `ON COMMIT DROP` temp table (a collision-resistant `pg_temp` name) at the same point the
   executor takes its own `after` snapshot, and asserts those counts plus all
   the sample's FK checks after the refreshes. A refresh whose query calls a
   function that INSERTs now aborts the pasted script the way the real command

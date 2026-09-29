@@ -3480,9 +3480,19 @@ fn sample_count_capture_statements(plan: &sample::SamplePlan) -> Vec<String> {
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
     vec![format!(
-        "CREATE TEMPORARY TABLE autumn_sample_counts ON COMMIT DROP AS {selects}"
+        "CREATE TEMPORARY TABLE {SAMPLE_COUNTS_TABLE} ON COMMIT DROP AS {selects}"
     )]
 }
+
+/// The temp table the printed sample captures its counts into.
+///
+/// `pg_temp` is searched first for unqualified relation names, so for the
+/// rest of the pasted transaction this table would shadow an application
+/// relation of the same name — a rewrite trigger doing an unqualified
+/// `INSERT` would write here instead, and the dry run would diverge from the
+/// executed path, which creates no such table. The suffix makes a collision
+/// implausible, and every read goes through `pg_temp.` explicitly.
+const SAMPLE_COUNTS_TABLE: &str = "autumn_scrub_sample_counts_7c3e91d4a2";
 
 /// Statements re-proving the sample's postconditions after the refreshes.
 ///
@@ -3494,7 +3504,7 @@ fn sample_count_capture_statements(plan: &sample::SamplePlan) -> Vec<String> {
 /// `never_include` table left the run reporting `audit_logs: 503 -> 0 row(s)`
 /// and `✓ Scrub complete` while three rows carrying real addresses survived.
 ///
-/// The counts are asserted against `autumn_sample_counts`
+/// The counts are asserted against [`SAMPLE_COUNTS_TABLE`]
 /// (`sample_count_capture_statements`): the printer has no live values at
 /// print time, and baking the print-time source counts would assert the
 /// wrong thing — the subset is what must survive, not the source. The
@@ -3530,7 +3540,7 @@ fn sample_postcondition_statements(plan: &sample::SamplePlan) -> Vec<(String, St
         .map(|(index, table)| {
             format!(
                 "(SELECT count(*) FROM {}) <> \
-                 (SELECT n FROM autumn_sample_counts WHERE table_index = {index})",
+                 (SELECT n FROM pg_temp.{SAMPLE_COUNTS_TABLE} WHERE table_index = {index})",
                 qualified_ident(&table.table)
             )
         })
@@ -6949,7 +6959,10 @@ mod tests {
         assert_eq!(capture.len(), 1, "one capture statement: {capture:?}");
         let capture = &capture[0];
         assert!(
-            capture.starts_with("CREATE TEMPORARY TABLE autumn_sample_counts ON COMMIT DROP AS "),
+            capture.starts_with(&format!(
+                "CREATE TEMPORARY TABLE {} ON COMMIT DROP AS ",
+                super::SAMPLE_COUNTS_TABLE
+            )),
             "the counts must live in a temp table, not psql variables — psql does not \
              interpolate variables inside dollar-quoted DO blocks: {capture}"
         );
@@ -6979,7 +6992,8 @@ mod tests {
         );
         let (block, comment) = &postconditions[0];
         assert!(
-            block.contains("RAISE EXCEPTION") && block.contains("autumn_sample_counts"),
+            block.contains("RAISE EXCEPTION")
+                && block.contains(&format!("pg_temp.{}", super::SAMPLE_COUNTS_TABLE)),
             "the count check must abort the transaction on mismatch, reading the captured \
              counts rather than print-time values: {block}"
         );
